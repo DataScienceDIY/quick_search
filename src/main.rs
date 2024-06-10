@@ -10,39 +10,28 @@ use tqdm;
 use rusqlite::{params, Connection};
 use dpc_pariter::IteratorExt as _;
 
-const HASHLEN:usize = 1024*1;
+const HASHLEN:usize = 1024*8;
 
 
 fn get_file_hash(size: u64, path: OsString) -> Result<Vec<u8>, std::io::Error> {
     let mut hasher = Sha256::new();
     let mut f: File = File::open(path)?;
-    let mut data = [0u8; 8+2*HASHLEN];
-    data[..8].copy_from_slice(&size.to_le_bytes());
+    hasher.update(&size.to_le_bytes());
     if size > HASHLEN as u64 {
         let mut file_start_block = [0u8; HASHLEN];
         f.read_exact(&mut file_start_block)?;
-        for i in 0..HASHLEN {
-            data[8+i] = file_start_block[i];
-        }
+        hasher.update(file_start_block);
         f.seek(SeekFrom::End(0 - HASHLEN as i64))?;
         let mut file_end_block = [0u8; HASHLEN];
         f.read_exact(&mut file_end_block)?;
-        for i in 0..HASHLEN {
-            let i: usize = i;
-            data[8+i+HASHLEN] = file_end_block[i];
-        }
+        hasher.update(file_end_block);
     } else if size > 0 {
         let mut file_block = Vec::new();
         f.read_to_end(&mut file_block)?;
-        for i in 0..(size as usize) {
-            let i: usize = i;
-            data[8+i] = file_block[i];
-        }
+        hasher.update(file_block);
     }
     drop(f);
-    hasher.update(data);
-    Ok(hasher.finalize().to_vec())
-        
+    Ok(hasher.finalize().to_vec()) 
 }
 
 fn process_entry(conn_mutex: &Arc<Mutex<Connection>>, entry: DirEntry) {
@@ -90,7 +79,7 @@ fn process_entry(conn_mutex: &Arc<Mutex<Connection>>, entry: DirEntry) {
 }
 
 fn main() {
-    let path: &str = "G:\\";
+    let path: &str = "Y:\\";
     let db_path: &str = "YDrive.db";
 
     let conn = Connection::open(db_path).unwrap();
@@ -122,5 +111,10 @@ fn main() {
             },
         };
     }).for_each(drop);
+
+/*
+select name, hash, count(hash) as cnt from files group by hash
+ORDER BY cnt DESC;
+*/
 
 }
