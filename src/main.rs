@@ -12,7 +12,7 @@ use tqdm;
 use rusqlite::{params, Connection};
 
 
-const HASHLEN:usize = 1024*8;
+const HASHLEN:usize = 1024*1;
 
 // struct Finfo {
 //     name: String,
@@ -55,47 +55,49 @@ fn get_file_hash(size: u64, path: OsString) -> Result<Vec<u8>, std::io::Error> {
 
 
 fn main() {
-    let path: &str = "G:\\datasets\\preprocessed_ch_100";
-    let db_path: &str = "GDrive.db";
+    let path: &str = "Y:\\";
+    let db_path: &str = "YDrive.db";
 
-    let mut conn = Connection::open(db_path).unwrap();
-    // conn.execute_batch(
-    //     "PRAGMA journal_mode = OFF;
-    //           PRAGMA synchronous = 0;
-    //           PRAGMA cache_size = 1000000;
-    //           PRAGMA locking_mode = EXCLUSIVE;
-    //           PRAGMA temp_store = MEMORY;",
-    // )
-    // .expect("PRAGMA");
+    let conn = Connection::open(db_path).unwrap();
+    // PRAGMA cache_size is in number of pages with 1024 byte page size by default
+    conn.execute_batch(
+        "PRAGMA journal_mode = OFF;
+              PRAGMA synchronous = 0;
+              PRAGMA cache_size = 1000000;
+              PRAGMA locking_mode = EXCLUSIVE;
+              PRAGMA temp_store = MEMORY;",
+    )
+    .expect("PRAGMA");
     conn.execute("CREATE TABLE IF NOT EXISTS files (
                         name    TEXT,
                         path    TEXT,
                         size    INTEGER,
                         moddate INTEGER,
                         hash    BLOB)", ()).unwrap();
-    let tx = conn.transaction().unwrap();
-    let st1 = "INSERT INTO files VALUES (?1,?2,?3,?4,?5)";
-    let mut stmt = tx.prepare(st1).unwrap();
+
     let mut filecount: i64 = 0;
     let start_time = Instant::now();
 
     for entry in tqdm::tqdm(WalkDir::new(path).into_iter().filter_map(|e| e.ok())) {
         let meta = entry.metadata().unwrap();
         if !meta.is_dir() {
+            let query = "INSERT INTO files VALUES (?1,?2,?3,?4,?5)";
+            let mut stmt = conn.prepare_cached(query).unwrap();
             let fname = entry.path().file_name().unwrap().to_os_string();
             let fpath = entry.path().canonicalize().unwrap().into_os_string();
             let fsize = meta.len();
             let fmodified = meta.modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs();
-            let fhash = get_file_hash(fsize, fpath.clone()).unwrap();
+            // let fhash = get_file_hash(fsize, fpath.clone()).unwrap();
+            let fhash = b"";
             filecount += 1;
             stmt.execute(params![fname.to_str(), fpath.to_str(), fsize, fmodified, fhash]).unwrap();
-            if filecount >= 100 {
-                break;
-            }
         }
     }
-
     let elapsed_time = start_time.elapsed();
     println!("{} files enumerated in {} seconds", filecount, elapsed_time.as_secs());
-    println!("{} files per second", filecount as f32 / elapsed_time.as_secs() as f32);
+    println!("{} files per second", filecount as f32 / elapsed_time.as_millis() as f32 * 1000.0);
+
+    // select name, hash, count(hash) as cnt from files group by hash
+    // ORDER BY cnt DESC;
+
 }
