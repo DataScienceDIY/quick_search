@@ -13,4 +13,4 @@ tqdm = "0.7.0"
 walkdir = "2.5.0"
 zip = "0.6"
 quick-xml = "0.31"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["time"] }
