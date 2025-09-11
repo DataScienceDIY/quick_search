@@ -105,7 +105,7 @@ pub fn App(props: AppProps) -> Element {
                             speed_tracker_clone.set(SpeedTracker::new());
                             "Idle".to_string()
                         },
-                        IndexingStatus::Running { files_processed, total_files, current_file, start_time } => {
+                        IndexingStatus::RunningFileIndex { files_processed, total_files, current_file, start_time } => {
                             // Add data point to speed tracker
                             speed_tracker_clone.with_mut(|tracker| {
                                 tracker.add_data_point(files_processed);
@@ -129,7 +129,7 @@ pub fn App(props: AppProps) -> Element {
                                     (files_processed as f64 / total as f64 * 100.0) as u32 
                                 } else { 0 };
                                 format!(
-                                    "Running: {}/{} files ({}%) - {:.1}s elapsed{}\n{}",
+                                    "Phase 1 - File Index: {}/{} files ({}%) - {:.1}s elapsed{}\n{}",
                                     files_processed,
                                     total,
                                     percentage,
@@ -139,7 +139,49 @@ pub fn App(props: AppProps) -> Element {
                                 )
                             } else {
                                 format!(
-                                    "Running: {} files processed - {:.1}s elapsed{}\n{}",
+                                    "Phase 1 - File Index: {} files processed - {:.1}s elapsed{}\n{}",
+                                    files_processed,
+                                    elapsed.as_secs_f64(),
+                                    speed_display,
+                                    current_file_display
+                                )
+                            }
+                        }
+                        IndexingStatus::RunningTextIndex { files_processed, total_files, current_file, start_time } => {
+                            // Add data point to speed tracker
+                            speed_tracker_clone.with_mut(|tracker| {
+                                tracker.add_data_point(files_processed);
+                            });
+                            
+                            let elapsed = start_time.elapsed();
+                            let current_file_display = current_file
+                                .as_ref()
+                                .map(|f| format!("Current: {}", f))
+                                .unwrap_or_default();
+                            
+                            // Calculate speed
+                            let speed_display = speed_tracker_clone.with(|tracker| {
+                                tracker.calculate_files_per_second()
+                                    .map(|fps| format!(" - {:.1} files/sec", fps))
+                                    .unwrap_or_default()
+                            });
+                            
+                            if let Some(total) = total_files {
+                                let percentage = if total > 0 { 
+                                    (files_processed as f64 / total as f64 * 100.0) as u32 
+                                } else { 0 };
+                                format!(
+                                    "Phase 2 - Text Index: {}/{} files ({}%) - {:.1}s elapsed{}\n{}",
+                                    files_processed,
+                                    total,
+                                    percentage,
+                                    elapsed.as_secs_f64(),
+                                    speed_display,
+                                    current_file_display
+                                )
+                            } else {
+                                format!(
+                                    "Phase 2 - Text Index: {} files processed - {:.1}s elapsed{}\n{}",
                                     files_processed,
                                     elapsed.as_secs_f64(),
                                     speed_display,

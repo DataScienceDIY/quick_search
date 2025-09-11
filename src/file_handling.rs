@@ -26,7 +26,7 @@ pub struct BatchUpdate {
     pub files_to_insert: Vec<DirEntry>,
 }
 
-const PLAINTEXT_EXTENSIONS_LIST: [&'static str; 86] = 
+pub const PLAINTEXT_EXTENSIONS_LIST: [&'static str; 86] = 
     ["","txt","rtf","log", // Text Documents
     "csv", // Spreadsheet
     "sh","bat","cmd","bash","ps1","psm1","psd1","pssc","psrc", // Scripts
@@ -44,7 +44,7 @@ const PLAINTEXT_EXTENSIONS_LIST: [&'static str; 86] =
     "wasm","wat", // Web Assembly
     ];
 
-const SUPPORTED_DOCUMENT_EXTENSIONS_LIST: [&'static str; 9] = 
+pub const SUPPORTED_DOCUMENT_EXTENSIONS_LIST: [&'static str; 9] = 
     ["odt", "docx", "doc", // Office Documents
     "ppt", "pptx", "odp", // Presentation
     "xls", "xlsx", "ods"]; // Spreadsheet
@@ -114,6 +114,21 @@ pub fn analyze_files_for_batch_update(
     }
 }
 
+/// Safely truncate a string to at most max_bytes bytes while respecting UTF-8 character boundaries
+fn safe_truncate_string(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    
+    // Find the last valid UTF-8 character boundary at or before max_bytes
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    
+    s[..end].to_string()
+}
+
 /// Get a hash of a file by reading the first and last hash_length bytes of the file
 fn get_file_hash(size: u64, path: OsString, hash_length: usize) -> Result<Vec<u8>, std::io::Error> {
     let mut hasher = Sha256::new();
@@ -136,8 +151,8 @@ fn get_file_hash(size: u64, path: OsString, hash_length: usize) -> Result<Vec<u8
     Ok(hasher.finalize().to_vec()) 
 }
 
-/// Process updated files in batch with transaction
-pub fn process_batch_updates(
+/// Process updated files in batch with transaction - files table only (no text extraction)
+pub fn process_batch_updates_files_only(
     conn_mutex: &Arc<Mutex<Connection>>,
     files_to_update: &[(DirEntry, FileMetadata)],
     stop_flag: &Arc<Mutex<bool>>,
@@ -176,91 +191,52 @@ pub fn process_batch_updates(
                 let filename = entry.path().file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("unknown");
-                callback(&format!("Updating file {}/{}: {}", global_index, total_files, filename));
+                callback(&format!("Updating file metadata {}/{}: {}", global_index, total_files, filename));
             }
             
             // Update progress counter
             if let Some(ref progress_cb) = progress_callback {
                 progress_cb(global_index);
             }
-        let meta = entry.metadata().map_err(|e| format!("Failed to get metadata: {}", e))?;
-        if meta.is_dir() {
-            continue;
-        }
 
-        let fpath = match entry.path().canonicalize() {
-            Ok(fp) => fp.into_os_string(),
-            Err(_) => continue,
-        };
-
-        let fsize = meta.len();
-        let fmodified = meta.modified()
-            .map_err(|e| format!("Failed to get modified time: {}", e))?
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| format!("Failed to calculate duration: {}", e))?
-            .as_secs();
-
-        let fhash = get_file_hash(fsize, fpath.clone(), config.processing.hash_length)
-            .map_err(|e| format!("Failed to calculate hash: {}", e))?;
-
-        // Check stop flag after hash calculation
-        if *stop_flag.lock().unwrap() {
-            drop(tx);
-            drop(conn);
-            return Ok(());
-        }
-
-        // Update files table
-        tx.execute(
-            "UPDATE files SET size = ?1, moddate = ?2, hash = ?3 WHERE path = ?4",
-            params![fsize, fmodified, fhash, fpath.to_string_lossy()]
-        ).map_err(|e| format!("Failed to update file record: {}", e))?;
-
-        // Delete old searchable text entry
-        tx.execute(
-            "DELETE FROM searchabletext WHERE path = ?1",
-            params![fpath.to_string_lossy()]
-        ).map_err(|e| format!("Failed to delete old searchable text: {}", e))?;
-
-        // Insert new searchable text if applicable
-        if fsize <= config.processing.maximum_file_size {
-            let default_ext = OsString::new();
-            let file_extension = entry.path().extension().unwrap_or(&default_ext)
-                .to_ascii_lowercase().to_str().unwrap_or("").to_string();
-            let ext_str = file_extension.as_str();
-            
-            if PLAINTEXT_EXTENSIONS_LIST.contains(&ext_str) {
-                if let Ok(file_string) = read_to_string(&fpath) {
-                    let trimmed_file_string = if file_string.len() > config.processing.maximum_text_size {
-                        file_string[..config.processing.maximum_text_size].to_string()
-                    } else {
-                        file_string
-                    };
-
-                    let fname = entry.path().file_name().unwrap().to_os_string();
-                    tx.execute(
-                        "INSERT INTO searchabletext VALUES (?1, ?2, ?3)",
-                        params![fname.to_str(), fpath.to_string_lossy(), trimmed_file_string]
-                    ).map_err(|e| format!("Failed to insert searchable text: {}", e))?;
-                }
-            } else if SUPPORTED_DOCUMENT_EXTENSIONS_LIST.contains(&ext_str) {
-                if let Ok(extracted_text) = extract_document_text(&fpath, ext_str) {
-                    if !extracted_text.trim().is_empty() {
-                        let trimmed_file_string = if extracted_text.len() > config.processing.maximum_text_size {
-                            extracted_text[..config.processing.maximum_text_size].to_string()
-                        } else {
-                            extracted_text
-                        };
-
-                        let fname = entry.path().file_name().unwrap().to_os_string();
-                        tx.execute(
-                            "INSERT INTO searchabletext VALUES (?1, ?2, ?3)",
-                            params![fname.to_str(), fpath.to_string_lossy(), trimmed_file_string]
-                        ).map_err(|e| format!("Failed to insert document text: {}", e))?;
-                    }
-                }
+            let meta = entry.metadata().map_err(|e| format!("Failed to get metadata: {}", e))?;
+            if meta.is_dir() {
+                continue;
             }
-        }
+
+            let fpath = match entry.path().canonicalize() {
+                Ok(fp) => fp.into_os_string(),
+                Err(_) => continue,
+            };
+
+            let fsize = meta.len();
+            let fmodified = meta.modified()
+                .map_err(|e| format!("Failed to get modified time: {}", e))?
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| format!("Failed to calculate duration: {}", e))?
+                .as_secs();
+
+            let fhash = get_file_hash(fsize, fpath.clone(), config.processing.hash_length)
+                .map_err(|e| format!("Failed to calculate hash: {}", e))?;
+
+            // Check stop flag after hash calculation
+            if *stop_flag.lock().unwrap() {
+                drop(tx);
+                drop(conn);
+                return Ok(());
+            }
+
+            // Update files table
+            tx.execute(
+                "UPDATE files SET size = ?1, moddate = ?2, hash = ?3 WHERE path = ?4",
+                params![fsize, fmodified, fhash, fpath.to_string_lossy()]
+            ).map_err(|e| format!("Failed to update file record: {}", e))?;
+
+            // Delete old searchable text entry for this file (will be re-added in text indexing phase)
+            tx.execute(
+                "DELETE FROM searchabletext WHERE path = ?1",
+                params![fpath.to_string_lossy()]
+            ).map_err(|e| format!("Failed to delete old searchable text: {}", e))?;
         }
 
         tx.commit().map_err(|e| format!("Failed to commit transaction: {}", e))?;
@@ -269,8 +245,8 @@ pub fn process_batch_updates(
     Ok(())
 }
 
-/// Process new files in batch with transaction
-pub fn process_batch_inserts(
+/// Process new files in batch with transaction - files table only (no text extraction)
+pub fn process_batch_inserts_files_only(
     conn_mutex: &Arc<Mutex<Connection>>,
     files_to_insert: &[DirEntry],
     stop_flag: &Arc<Mutex<bool>>,
@@ -306,80 +282,162 @@ pub fn process_batch_inserts(
 
             // Update status with current file
             if let Some(ref callback) = status_callback {
-                let file_path = entry.path().to_str()
+                let filename = entry.path().file_name()
+                    .and_then(|n| n.to_str())
                     .unwrap_or("unknown");
-                callback(&format!("Indexing file: {}", file_path));
+                callback(&format!("Indexing file metadata {}/{}: {}", global_index, total_files, filename));
             }
             
             // Update progress counter
             if let Some(ref progress_cb) = progress_callback {
                 progress_cb(global_index);
             }
-        let meta = entry.metadata().map_err(|e| format!("Failed to get metadata: {}", e))?;
-        if meta.is_dir() {
-            continue;
+
+            let meta = entry.metadata().map_err(|e| format!("Failed to get metadata: {}", e))?;
+            if meta.is_dir() {
+                continue;
+            }
+
+            let fpath = match entry.path().canonicalize() {
+                Ok(fp) => fp.into_os_string(),
+                Err(_) => continue,
+            };
+
+            let fsize = meta.len();
+            let fmodified = meta.modified()
+                .map_err(|e| format!("Failed to get modified time: {}", e))?
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| format!("Failed to calculate duration: {}", e))?
+                .as_secs();
+
+            let fhash = get_file_hash(fsize, fpath.clone(), config.processing.hash_length)
+                .map_err(|e| format!("Failed to calculate hash: {}", e))?;
+
+            let fname = entry.path().file_name().unwrap().to_os_string();
+
+            // Insert into files table
+            tx.execute(
+                "INSERT INTO files VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![fname.to_str(), fpath.to_string_lossy(), fsize, fmodified, fhash]
+            ).map_err(|e| format!("Failed to insert file record: {}", e))?;
         }
 
-        let fpath = match entry.path().canonicalize() {
-            Ok(fp) => fp.into_os_string(),
-            Err(_) => continue,
-        };
+        tx.commit().map_err(|e| format!("Failed to commit transaction: {}", e))?;
+    }
+    
+    Ok(())
+}
 
-        let fsize = meta.len();
-        let fmodified = meta.modified()
-            .map_err(|e| format!("Failed to get modified time: {}", e))?
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| format!("Failed to calculate duration: {}", e))?
-            .as_secs();
+/// Process text indexing for files - adds entries to searchabletext table
+pub fn process_text_indexing(
+    conn_mutex: &Arc<Mutex<Connection>>,
+    stop_flag: &Arc<Mutex<bool>>,
+    status_callback: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    progress_callback: Option<Box<dyn Fn(usize) + Send + Sync>>,
+    config: &Config
+) -> Result<(), String> {
+    let conn = conn_mutex.lock().unwrap();
+    
+    // Get all files from the files table that don't have corresponding searchabletext entries
+    let mut stmt = conn.prepare(
+        "SELECT f.name, f.path, f.size FROM files f 
+         LEFT JOIN searchabletext s ON f.path = s.path 
+         WHERE s.path IS NULL AND f.size <= ?1"
+    ).map_err(|e| format!("Failed to prepare statement: {}", e))?;
+    
+    let file_rows = stmt.query_map([config.processing.maximum_file_size], |row| {
+        Ok((
+            row.get::<_, String>(0)?, // name
+            row.get::<_, String>(1)?, // path
+            row.get::<_, u64>(2)?     // size
+        ))
+    }).map_err(|e| format!("Failed to query files: {}", e))?;
 
-        let fhash = get_file_hash(fsize, fpath.clone(), config.processing.hash_length)
-            .map_err(|e| format!("Failed to calculate hash: {}", e))?;
+    let files_to_process: Vec<_> = file_rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect files: {}", e))?;
+    
+    drop(stmt);
+    drop(conn);
 
-        let fname = entry.path().file_name().unwrap().to_os_string();
+    let total_files = files_to_process.len();
+    let batch_size = config.processing.batch_size;
 
-        // Insert into files table
-        tx.execute(
-            "INSERT INTO files VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![fname.to_str(), fpath.to_string_lossy(), fsize, fmodified, fhash]
-        ).map_err(|e| format!("Failed to insert file record: {}", e))?;
+    // Process files in batches
+    for (batch_idx, batch) in files_to_process.chunks(batch_size).enumerate() {
+        // Check stop flag at the start of each batch
+        if *stop_flag.lock().unwrap() {
+            return Ok(());
+        }
 
-        // Insert searchable text if applicable
-        if fsize <= config.processing.maximum_file_size {
+        let conn = conn_mutex.lock().unwrap();
+        let tx = conn.unchecked_transaction().map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        for (i, (fname, fpath, _fsize)) in batch.iter().enumerate() {
+            let global_index = batch_idx * batch_size + i + 1;
+            
+            // Check stop flag
+            if *stop_flag.lock().unwrap() {
+                drop(tx);
+                drop(conn);
+                return Ok(());
+            }
+
+            // Update status
+            if let Some(ref callback) = status_callback {
+                callback(&format!("Extracting text for search indexing {}/{}: {}", global_index, total_files, fname));
+            }
+            
+            // Update progress counter
+            if let Some(ref progress_cb) = progress_callback {
+                progress_cb(global_index);
+            }
+
+            let path = std::path::Path::new(fpath);
             let default_ext = OsString::new();
-            let file_extension = entry.path().extension().unwrap_or(&default_ext)
+            let file_extension = path.extension().unwrap_or(&default_ext)
                 .to_ascii_lowercase().to_str().unwrap_or("").to_string();
             let ext_str = file_extension.as_str();
             
-            if PLAINTEXT_EXTENSIONS_LIST.contains(&ext_str) {
-                if let Ok(file_string) = read_to_string(&fpath) {
-                    let trimmed_file_string = if file_string.len() > config.processing.maximum_text_size {
-                        file_string[..config.processing.maximum_text_size].to_string()
-                    } else {
-                        file_string
-                    };
-
-                    tx.execute(
-                        "INSERT INTO searchabletext VALUES (?1, ?2, ?3)",
-                        params![fname.to_str(), fpath.to_string_lossy(), trimmed_file_string]
-                    ).map_err(|e| format!("Failed to insert searchable text: {}", e))?;
-                }
-            } else if SUPPORTED_DOCUMENT_EXTENSIONS_LIST.contains(&ext_str) {
-                if let Ok(extracted_text) = extract_document_text(&fpath, ext_str) {
-                    if !extracted_text.trim().is_empty() {
-                        let trimmed_file_string = if extracted_text.len() > config.processing.maximum_text_size {
-                            extracted_text[..config.processing.maximum_text_size].to_string()
-                        } else {
-                            extracted_text
-                        };
-
-                        tx.execute(
-                            "INSERT INTO searchabletext VALUES (?1, ?2, ?3)",
-                            params![fname.to_str(), fpath.to_string_lossy(), trimmed_file_string]
-                        ).map_err(|e| format!("Failed to insert document text: {}", e))?;
+            // Process text content with error handling for individual files
+            let text_result = if PLAINTEXT_EXTENSIONS_LIST.contains(&ext_str) {
+                match read_to_string(fpath) {
+                    Ok(file_string) => {
+                        let trimmed_file_string = safe_truncate_string(&file_string, config.processing.maximum_text_size);
+                        Some(trimmed_file_string)
+                    }
+                    Err(e) => {
+                        // eprintln!("Warning: Failed to read plaintext file {}: {}", fpath, e);
+                        None
                     }
                 }
+            } else if SUPPORTED_DOCUMENT_EXTENSIONS_LIST.contains(&ext_str) {
+                match extract_document_text(&std::ffi::OsString::from(fpath), ext_str) {
+                    Ok(extracted_text) => {
+                        if !extracted_text.trim().is_empty() {
+                            let trimmed_file_string = safe_truncate_string(&extracted_text, config.processing.maximum_text_size);
+                            Some(trimmed_file_string)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to extract text from document {}: {}", fpath, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Insert the text content if we successfully extracted it
+            if let Some(text_content) = text_result {
+                if let Err(e) = tx.execute(
+                    "INSERT INTO searchabletext VALUES (?1, ?2, ?3)",
+                    params![fname, fpath, text_content]
+                ) {
+                    eprintln!("Warning: Failed to insert searchable text for {}: {}", fpath, e);
+                }
             }
-        }
         }
 
         tx.commit().map_err(|e| format!("Failed to commit transaction: {}", e))?;

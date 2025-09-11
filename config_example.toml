@@ -11,3 +11,6 @@ maximum_text_size = 524288
 maximum_file_size = 52428800
 # Number of files to process in each batch
 batch_size = 200
+# FTS5 tokenization method (e.g., 'trigram', 'porter', 'unicode61')
+# Look here for more information https://www.sqlite.org/fts5.html#tokenizers
+tokenize = "trigram"

@@ -20,6 +20,7 @@ pub struct ProcessingConfig {
     pub maximum_text_size: usize,
     pub maximum_file_size: u64,
     pub batch_size: usize,
+    pub tokenize: String,
 }
 
 impl Default for Config {
@@ -34,6 +35,7 @@ impl Default for Config {
                 maximum_text_size: 1024 * 512,
                 maximum_file_size: 1024 * 1024 * 50,
                 batch_size: 200,
+                tokenize: "trigram".to_string(),
             },
         }
     }
