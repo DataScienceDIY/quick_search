@@ -5,6 +5,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     pub paths: PathConfig,
+    pub processing: ProcessingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -13,12 +14,26 @@ pub struct PathConfig {
     pub database_path: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProcessingConfig {
+    pub hash_length: usize,
+    pub maximum_text_size: usize,
+    pub maximum_file_size: u64,
+    pub batch_size: usize,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             paths: PathConfig {
                 default_indexing_path: "C:\\".to_string(),
                 database_path: "QuickSearch.db".to_string(),
+            },
+            processing: ProcessingConfig {
+                hash_length: 1024 * 8,
+                maximum_text_size: 1024 * 512,
+                maximum_file_size: 1024 * 1024 * 50,
+                batch_size: 200,
             },
         }
     }
