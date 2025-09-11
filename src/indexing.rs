@@ -4,13 +4,19 @@ use std::time::Instant;
 use walkdir::WalkDir;
 use rusqlite::{Connection, params};
 
-use crate::file_handling::{load_existing_files, analyze_files_for_batch_update, process_batch_updates, process_batch_inserts};
+use crate::file_handling::{load_existing_files, analyze_files_for_batch_update, process_batch_updates_files_only, process_batch_inserts_files_only, process_text_indexing};
 use crate::config::Config;
 
 #[derive(Debug, Clone)]
 pub enum IndexingStatus {
     Idle,
-    Running {
+    RunningFileIndex {
+        files_processed: usize,
+        total_files: Option<usize>,
+        current_file: Option<String>,
+        start_time: Instant,
+    },
+    RunningTextIndex {
         files_processed: usize,
         total_files: Option<usize>,
         current_file: Option<String>,
@@ -30,9 +36,11 @@ pub enum IndexingCommand {
     Stop,
 }
 
+#[derive(Debug)]
 pub struct IndexingService {
     status: Arc<Mutex<IndexingStatus>>,
     command_tx: mpsc::Sender<IndexingCommand>,
+    db_connection: Arc<Mutex<Option<Arc<Mutex<Connection>>>>>,
     _handle: thread::JoinHandle<()>,
 }
 
@@ -68,15 +76,18 @@ impl IndexingService {
     pub fn new() -> Self {
         let status = Arc::new(Mutex::new(IndexingStatus::Idle));
         let (command_tx, command_rx) = mpsc::channel();
+        let db_connection = Arc::new(Mutex::new(None));
         
         let status_clone = status.clone();
+        let db_connection_clone = db_connection.clone();
         let handle = thread::spawn(move || {
-            Self::indexing_thread(status_clone, command_rx);
+            Self::indexing_thread(status_clone, command_rx, db_connection_clone);
         });
 
         IndexingService {
             status,
             command_tx,
+            db_connection,
             _handle: handle,
         }
     }
@@ -88,13 +99,54 @@ impl IndexingService {
     }
 
     pub fn stop_indexing(&self) -> Result<(), String> {
+        // First send the stop command
         self.command_tx
             .send(IndexingCommand::Stop)
-            .map_err(|e| format!("Failed to send stop command: {}", e))
+            .map_err(|e| format!("Failed to send stop command: {}", e))?;
+
+        // Wait for indexing to transition to stopping state
+        let mut attempts = 0;
+        while attempts < 50 { // Wait up to 5 seconds
+            match self.get_status() {
+                IndexingStatus::Stopping => break,
+                IndexingStatus::Idle => return Ok(()), // Already stopped
+                IndexingStatus::Error(_) => return Ok(()), // Consider error state as stopped
+                _ => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    attempts += 1;
+                }
+            }
+        }
+
+        // Flush and close database connection if it exists
+        if let Ok(mut db_opt) = self.db_connection.lock() {
+            if let Some(db_conn_arc) = db_opt.take() {
+                if let Ok(conn) = db_conn_arc.lock() {
+                    // Re-enable journal mode and synchronous writes for proper flushing
+                    let _ = conn.execute_batch(
+                        "PRAGMA journal_mode = DELETE;
+                         PRAGMA synchronous = FULL;"
+                    );
+                    
+                    // Force a checkpoint to flush any remaining WAL data
+                    let _ = conn.execute("PRAGMA wal_checkpoint(FULL);", ());
+                    
+                    // Explicitly close the connection by dropping it
+                    drop(conn);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub fn get_status(&self) -> IndexingStatus {
         self.status.lock().unwrap().clone()
+    }
+
+    /// Force graceful shutdown - used for signal handling
+    pub fn graceful_shutdown(&self) -> Result<(), String> {
+        self.stop_indexing()
     }
 
     /// Check if configuration changes require index recreation
@@ -124,7 +176,7 @@ impl IndexingService {
         while attempts < 50 { // Wait up to 5 seconds
             match self.get_status() {
                 IndexingStatus::Idle => break,
-                IndexingStatus::Stopping | IndexingStatus::Running { .. } => {
+                IndexingStatus::Stopping | IndexingStatus::RunningFileIndex { .. } | IndexingStatus::RunningTextIndex { .. } => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     attempts += 1;
                 }
@@ -141,14 +193,18 @@ impl IndexingService {
         Ok(())
     }
 
-    fn indexing_thread(status: Arc<Mutex<IndexingStatus>>, command_rx: mpsc::Receiver<IndexingCommand>) {
+    fn indexing_thread(
+        status: Arc<Mutex<IndexingStatus>>, 
+        command_rx: mpsc::Receiver<IndexingCommand>,
+        db_connection: Arc<Mutex<Option<Arc<Mutex<Connection>>>>>
+    ) {
         let stop_flag = Arc::new(Mutex::new(false));
         let mut indexing_handle: Option<thread::JoinHandle<()>> = None;
         
         while let Ok(command) = command_rx.recv() {
             match command {
                 IndexingCommand::Start { path, db_path, config } => {
-                    if matches!(*status.lock().unwrap(), IndexingStatus::Running { .. }) {
+                    if matches!(*status.lock().unwrap(), IndexingStatus::RunningFileIndex { .. } | IndexingStatus::RunningTextIndex { .. }) {
                         continue; // Already running
                     }
 
@@ -158,7 +214,7 @@ impl IndexingService {
                     }
 
                     *stop_flag.lock().unwrap() = false;
-                    *status.lock().unwrap() = IndexingStatus::Running {
+                    *status.lock().unwrap() = IndexingStatus::RunningFileIndex {
                         files_processed: 0,
                         total_files: None,
                         current_file: None,
@@ -172,8 +228,9 @@ impl IndexingService {
                     let db_path_owned = db_path.clone();
                     let config_owned = config.clone();
                     
+                    let db_connection_clone = db_connection.clone();
                     indexing_handle = Some(thread::spawn(move || {
-                        if let Err(e) = Self::run_indexing(&status_clone, &path_owned, &db_path_owned, &stop_flag_clone, &config_owned) {
+                        if let Err(e) = Self::run_indexing(&status_clone, &path_owned, &db_path_owned, &stop_flag_clone, &config_owned, &db_connection_clone) {
                             *status_clone.lock().unwrap() = IndexingStatus::Error(e);
                         } else {
                             // Only set to Idle if we weren't stopped
@@ -181,10 +238,15 @@ impl IndexingService {
                                 *status_clone.lock().unwrap() = IndexingStatus::Idle;
                             }
                         }
+                        
+                        // Clear the database connection when indexing completes
+                        if let Ok(mut db_opt) = db_connection_clone.lock() {
+                            *db_opt = None;
+                        }
                     }));
                 }
                 IndexingCommand::Stop => {
-                    if matches!(*status.lock().unwrap(), IndexingStatus::Running { .. }) {
+                    if matches!(*status.lock().unwrap(), IndexingStatus::RunningFileIndex { .. } | IndexingStatus::RunningTextIndex { .. }) {
                         *status.lock().unwrap() = IndexingStatus::Stopping;
                         *stop_flag.lock().unwrap() = true;
                     }
@@ -204,6 +266,7 @@ impl IndexingService {
         db_path: &str,
         stop_flag: &Arc<Mutex<bool>>,
         config: &Config,
+        db_connection: &Arc<Mutex<Option<Arc<Mutex<Connection>>>>>,
     ) -> Result<(), String> {
         // Set up database
         let conn = Connection::open(db_path)
@@ -228,11 +291,12 @@ impl IndexingService {
         )
         .map_err(|e| format!("Failed to create files table: {}", e))?;
 
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS searchabletext USING fts5 (name, path, text, tokenize = 'trigram');",
-            (),
-        )
-        .map_err(|e| format!("Failed to create searchabletext table: {}", e))?;
+        let create_fts_sql = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS searchabletext USING fts5 (name, path, text, tokenize = '{}');",
+            config.processing.tokenize
+        );
+        conn.execute(&create_fts_sql, ())
+            .map_err(|e| format!("Failed to create searchabletext table: {}", e))?;
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS config_validation (
@@ -253,6 +317,11 @@ impl IndexingService {
         };
 
         let conn_mutex = Arc::new(Mutex::new(conn));
+        
+        // Store the database connection for proper cleanup on stop
+        if let Ok(mut db_opt) = db_connection.lock() {
+            *db_opt = Some(conn_mutex.clone());
+        }
 
         // Collect all file entries
         let walker = WalkDir::new(path).into_iter();
@@ -265,7 +334,7 @@ impl IndexingService {
 
         // Update status with total file count
         if let Ok(mut status_guard) = status.lock() {
-            if let IndexingStatus::Running { ref mut total_files, .. } = *status_guard {
+            if let IndexingStatus::RunningFileIndex { ref mut total_files, .. } = *status_guard {
                 *total_files = Some(total_file_count);
             }
         }
@@ -277,7 +346,7 @@ impl IndexingService {
         
         // Update status to show actual work needed
         if let Ok(mut status_guard) = status.lock() {
-            if let IndexingStatus::Running { ref mut total_files, .. } = *status_guard {
+            if let IndexingStatus::RunningFileIndex { ref mut total_files, .. } = *status_guard {
                 *total_files = Some(total_work);
             }
         }
@@ -287,7 +356,7 @@ impl IndexingService {
         // Process updated files in batches
         if !batch_update.files_to_update.is_empty() {
             if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::Running { ref mut current_file, .. } = *status_guard {
+                if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard {
                     *current_file = Some(format!("Updating {} modified files...", batch_update.files_to_update.len()));
                 }
             }
@@ -296,7 +365,7 @@ impl IndexingService {
             let status_clone_1 = status.clone();
             let status_callback = Box::new(move |file_status: &str| {
                 if let Ok(mut status_guard) = status_clone_1.lock() {
-                    if let IndexingStatus::Running { ref mut current_file, .. } = *status_guard {
+                    if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard {
                         *current_file = Some(file_status.to_string());
                     }
                 }
@@ -307,20 +376,20 @@ impl IndexingService {
             let base_work_completed = work_completed;
             let progress_callback = Box::new(move |current_index: usize| {
                 if let Ok(mut status_guard) = status_clone_2.lock() {
-                    if let IndexingStatus::Running { ref mut files_processed, .. } = *status_guard {
+                    if let IndexingStatus::RunningFileIndex { ref mut files_processed, .. } = *status_guard {
                         *files_processed = base_work_completed + current_index;
                     }
                 }
             });
 
-            if let Err(e) = process_batch_updates(&conn_mutex, &batch_update.files_to_update, &stop_flag, Some(status_callback), Some(progress_callback), config) {
+            if let Err(e) = process_batch_updates_files_only(&conn_mutex, &batch_update.files_to_update, &stop_flag, Some(status_callback), Some(progress_callback), config) {
                 return Err(format!("Failed to process batch updates: {}", e));
             }
             
             work_completed += batch_update.files_to_update.len();
             
             if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::Running { ref mut files_processed, .. } = *status_guard {
+                if let IndexingStatus::RunningFileIndex { ref mut files_processed, .. } = *status_guard {
                     *files_processed = work_completed;
                 }
             }
@@ -337,7 +406,7 @@ impl IndexingService {
         // Process new files in batches
         if !batch_update.files_to_insert.is_empty() {
             if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::Running { ref mut current_file, .. } = *status_guard {
+                if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard {
                     *current_file = Some(format!("Indexing {} new files...", batch_update.files_to_insert.len()));
                 }
             }
@@ -346,7 +415,7 @@ impl IndexingService {
             let status_clone_3 = status.clone();
             let status_callback = Box::new(move |file_status: &str| {
                 if let Ok(mut status_guard) = status_clone_3.lock() {
-                    if let IndexingStatus::Running { ref mut current_file, .. } = *status_guard {
+                    if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard {
                         *current_file = Some(file_status.to_string());
                     }
                 }
@@ -357,32 +426,82 @@ impl IndexingService {
             let base_work_completed = work_completed;
             let progress_callback = Box::new(move |current_index: usize| {
                 if let Ok(mut status_guard) = status_clone_4.lock() {
-                    if let IndexingStatus::Running { ref mut files_processed, .. } = *status_guard {
+                    if let IndexingStatus::RunningFileIndex { ref mut files_processed, .. } = *status_guard {
                         *files_processed = base_work_completed + current_index;
                     }
                 }
             });
 
-            if let Err(e) = process_batch_inserts(&conn_mutex, &batch_update.files_to_insert, &stop_flag, Some(status_callback), Some(progress_callback), config) {
+            if let Err(e) = process_batch_inserts_files_only(&conn_mutex, &batch_update.files_to_insert, &stop_flag, Some(status_callback), Some(progress_callback), config) {
                 return Err(format!("Failed to process batch inserts: {}", e));
             }
             
             work_completed += batch_update.files_to_insert.len();
             
             if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::Running { ref mut files_processed, .. } = *status_guard {
+                if let IndexingStatus::RunningFileIndex { ref mut files_processed, .. } = *status_guard {
                     *files_processed = work_completed;
                 }
             }
         }
 
-        // If no incremental work was needed, show completion status
+        // If no incremental work was needed, show completion status for file indexing phase
         if total_work == 0 {
             if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::Running { ref mut current_file, ref mut files_processed, .. } = *status_guard {
-                    *current_file = Some("Index is up to date".to_string());
+                if let IndexingStatus::RunningFileIndex { ref mut current_file, ref mut files_processed, .. } = *status_guard {
+                    *current_file = Some("File index is up to date".to_string());
                     *files_processed = total_file_count;
                 }
+            }
+        }
+
+        // Check for stop signal before starting text indexing
+        if *stop_flag.lock().unwrap() {
+            if let Ok(mut status_guard) = status.lock() {
+                *status_guard = IndexingStatus::Idle;
+            }
+            return Ok(());
+        }
+
+        // Phase 2: Text indexing
+        if let Ok(mut status_guard) = status.lock() {
+            *status_guard = IndexingStatus::RunningTextIndex {
+                files_processed: 0,
+                total_files: None,
+                current_file: Some("Starting text indexing...".to_string()),
+                start_time: Instant::now(),
+            };
+        }
+
+        // Create status callback for text indexing
+        let status_clone_5 = status.clone();
+        let text_status_callback = Box::new(move |file_status: &str| {
+            if let Ok(mut status_guard) = status_clone_5.lock() {
+                if let IndexingStatus::RunningTextIndex { ref mut current_file, .. } = *status_guard {
+                    *current_file = Some(file_status.to_string());
+                }
+            }
+        });
+        
+        // Create progress callback for text indexing
+        let status_clone_6 = status.clone();
+        let text_progress_callback = Box::new(move |current_index: usize| {
+            if let Ok(mut status_guard) = status_clone_6.lock() {
+                if let IndexingStatus::RunningTextIndex { ref mut files_processed, .. } = *status_guard {
+                    *files_processed = current_index;
+                }
+            }
+        });
+
+        // Process text indexing
+        if let Err(e) = process_text_indexing(&conn_mutex, &stop_flag, Some(text_status_callback), Some(text_progress_callback), config) {
+            return Err(format!("Failed to process text indexing: {}", e));
+        }
+
+        // Mark text indexing as complete
+        if let Ok(mut status_guard) = status.lock() {
+            if let IndexingStatus::RunningTextIndex { ref mut current_file, .. } = *status_guard {
+                *current_file = Some("Text indexing complete".to_string());
             }
         }
 
@@ -393,9 +512,11 @@ impl IndexingService {
     /// Critical configuration changes that require index recreation:
     /// - hash_length: affects file hash computation, invalidates existing file metadata
     /// - indexing_path: changes the scope of indexed files
+    /// - tokenize: changes FTS5 tokenization, invalidates text search index
     fn validate_config(conn: &Connection, config: &Config, indexing_path: &str) -> Result<Option<Vec<String>>, String> {
         // Critical configuration values that require index recreation
         let hash_length = config.processing.hash_length.to_string();
+        let tokenize = config.processing.tokenize.clone();
         let normalized_path = std::path::Path::new(indexing_path)
             .canonicalize()
             .unwrap_or_else(|_| std::path::PathBuf::from(indexing_path))
@@ -405,8 +526,9 @@ impl IndexingService {
         // Check stored configuration values
         let mut stored_hash_length: Option<String> = None;
         let mut stored_indexing_path: Option<String> = None;
+        let mut stored_tokenize: Option<String> = None;
         
-        if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM config_validation WHERE key IN ('hash_length', 'indexing_path')") {
+        if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM config_validation WHERE key IN ('hash_length', 'indexing_path', 'tokenize')") {
             if let Ok(rows) = stmt.query_map([], |row| {
                 let key: String = row.get(0)?;
                 let value: String = row.get(1)?;
@@ -416,6 +538,7 @@ impl IndexingService {
                     match row.0.as_str() {
                         "hash_length" => stored_hash_length = Some(row.1),
                         "indexing_path" => stored_indexing_path = Some(row.1),
+                        "tokenize" => stored_tokenize = Some(row.1),
                         _ => {}
                     }
                 }
@@ -425,8 +548,9 @@ impl IndexingService {
         // Check if configuration is invalid
         let hash_length_changed = stored_hash_length.as_ref().map_or(false, |stored| stored != &hash_length);
         let indexing_path_changed = stored_indexing_path.as_ref().map_or(false, |stored| stored != &normalized_path);
+        let tokenize_changed = stored_tokenize.as_ref().map_or(false, |stored| stored != &tokenize);
         
-        if hash_length_changed || indexing_path_changed {
+        if hash_length_changed || indexing_path_changed || tokenize_changed {
             let mut changes = Vec::new();
             if hash_length_changed {
                 changes.push(format!("hash_length: {} -> {}", 
@@ -435,6 +559,10 @@ impl IndexingService {
             if indexing_path_changed {
                 changes.push(format!("indexing_path: {} -> {}", 
                     stored_indexing_path.unwrap_or_else(|| "unknown".to_string()), normalized_path));
+            }
+            if tokenize_changed {
+                changes.push(format!("tokenize: {} -> {}", 
+                    stored_tokenize.unwrap_or_else(|| "unknown".to_string()), tokenize));
             }
             
             return Ok(Some(changes));
@@ -448,6 +576,7 @@ impl IndexingService {
     /// Updates stored configuration values without clearing the index
     fn update_config(conn: &Connection, config: &Config, indexing_path: &str) -> Result<(), String> {
         let hash_length = config.processing.hash_length.to_string();
+        let tokenize = config.processing.tokenize.clone();
         let normalized_path = std::path::Path::new(indexing_path)
             .canonicalize()
             .unwrap_or_else(|_| std::path::PathBuf::from(indexing_path))
@@ -464,8 +593,20 @@ impl IndexingService {
             "INSERT OR REPLACE INTO config_validation (key, value) VALUES ('indexing_path', ?1)",
             params![normalized_path],
         ).map_err(|e| format!("Failed to store indexing_path config: {}", e))?;
+        
+        conn.execute(
+            "INSERT OR REPLACE INTO config_validation (key, value) VALUES ('tokenize', ?1)",
+            params![tokenize],
+        ).map_err(|e| format!("Failed to store tokenize config: {}", e))?;
 
         Ok(())
+    }
+}
+
+impl Drop for IndexingService {
+    fn drop(&mut self) {
+        // Ensure graceful shutdown when the service is dropped
+        let _ = self.stop_indexing();
     }
 }
 
