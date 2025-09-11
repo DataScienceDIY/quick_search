@@ -1,9 +1,63 @@
 #![allow(non_snake_case)]
 
 use std::sync::Arc;
+use std::collections::VecDeque;
+use std::time::Instant;
 use dioxus::prelude::*;
 use crate::indexing::{IndexingService, IndexingStatus};
 use crate::config::Config;
+
+#[derive(Debug, Clone)]
+struct SpeedDataPoint {
+    timestamp: Instant,
+    files_processed: usize,
+}
+
+struct SpeedTracker {
+    data_points: VecDeque<SpeedDataPoint>,
+}
+
+impl SpeedTracker {
+    fn new() -> Self {
+        Self {
+            data_points: VecDeque::new(),
+        }
+    }
+
+    fn add_data_point(&mut self, files_processed: usize) {
+        let now = Instant::now();
+        self.data_points.push_back(SpeedDataPoint {
+            timestamp: now,
+            files_processed,
+        });
+        
+        // Prune data points older than 1 second
+        while let Some(front) = self.data_points.front() {
+            if now.duration_since(front.timestamp).as_secs_f64() > 1.0 {
+                self.data_points.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn calculate_files_per_second(&self) -> Option<f64> {
+        if self.data_points.len() < 2 {
+            return None;
+        }
+
+        let newest = self.data_points.back()?;
+        let oldest = self.data_points.front()?;
+        
+        let time_span = newest.timestamp.duration_since(oldest.timestamp).as_secs_f64();
+        if time_span < 0.1 { // Avoid division by very small numbers
+            return None;
+        }
+        
+        let files_diff = newest.files_processed.saturating_sub(oldest.files_processed);
+        Some(files_diff as f64 / time_span)
+    }
+}
 
 #[derive(Props, Clone)]
 pub struct AppProps {
@@ -23,6 +77,7 @@ pub fn App(props: AppProps) -> Element {
     let mut status_text = use_signal(|| "Idle".to_string());
     let mut show_config_dialog = use_signal(|| false);
     let mut config_changes = use_signal(|| Vec::<String>::new());
+    let speed_tracker = use_signal(|| SpeedTracker::new());
 
     let indexing_service_for_start = props.indexing_service.clone();
     let indexing_service_for_start_dialog = props.indexing_service.clone();
@@ -35,6 +90,7 @@ pub fn App(props: AppProps) -> Element {
     // Automatic status updates every second
     {
         let mut status_text_clone = status_text.clone();
+        let mut speed_tracker_clone = speed_tracker.clone();
         let service_clone = indexing_service_for_timer.clone();
         use_future(move || {
             let service = service_clone.clone();
@@ -44,31 +100,49 @@ pub fn App(props: AppProps) -> Element {
                     
                     let status = service.get_status();
                     let status_str = match status {
-                        IndexingStatus::Idle => "Idle".to_string(),
+                        IndexingStatus::Idle => {
+                            // Reset speed tracker when idle
+                            speed_tracker_clone.set(SpeedTracker::new());
+                            "Idle".to_string()
+                        },
                         IndexingStatus::Running { files_processed, total_files, current_file, start_time } => {
+                            // Add data point to speed tracker
+                            speed_tracker_clone.with_mut(|tracker| {
+                                tracker.add_data_point(files_processed);
+                            });
+                            
                             let elapsed = start_time.elapsed();
                             let current_file_display = current_file
                                 .as_ref()
                                 .map(|f| format!("Current: {}", f))
                                 .unwrap_or_default();
                             
+                            // Calculate speed
+                            let speed_display = speed_tracker_clone.with(|tracker| {
+                                tracker.calculate_files_per_second()
+                                    .map(|fps| format!(" - {:.1} files/sec", fps))
+                                    .unwrap_or_default()
+                            });
+                            
                             if let Some(total) = total_files {
                                 let percentage = if total > 0 { 
                                     (files_processed as f64 / total as f64 * 100.0) as u32 
                                 } else { 0 };
                                 format!(
-                                    "Running: {}/{} files ({}%) - {:.1}s elapsed\n{}",
+                                    "Running: {}/{} files ({}%) - {:.1}s elapsed{}\n{}",
                                     files_processed,
                                     total,
                                     percentage,
                                     elapsed.as_secs_f64(),
+                                    speed_display,
                                     current_file_display
                                 )
                             } else {
                                 format!(
-                                    "Running: {} files processed - {:.1}s elapsed\n{}",
+                                    "Running: {} files processed - {:.1}s elapsed{}\n{}",
                                     files_processed,
                                     elapsed.as_secs_f64(),
+                                    speed_display,
                                     current_file_display
                                 )
                             }
