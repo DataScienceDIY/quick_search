@@ -60,7 +60,7 @@ pub fn App(props: AppProps) -> Element {
                     )
                 }
             }
-            IndexingStatus::Stopping => "Stopping...".to_string(),
+            IndexingStatus::Stopping => "Indexing Stopped".to_string(),
             IndexingStatus::Error(ref e) => format!("Error: {}", e),
         };
         status_text.set(status_str);
@@ -107,7 +107,7 @@ pub fn App(props: AppProps) -> Element {
                                 )
                             }
                         }
-                        IndexingStatus::Stopping => "Stopping...".to_string(),
+                        IndexingStatus::Stopping => "Indexing Stopped".to_string(),
                         IndexingStatus::Error(ref e) => format!("Error: {}", e),
                     };
                     status_text_clone.set(status_str);
