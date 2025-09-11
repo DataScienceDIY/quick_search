@@ -3,21 +3,23 @@
 use std::sync::Arc;
 use dioxus::prelude::*;
 use crate::indexing::{IndexingService, IndexingStatus};
+use crate::config::Config;
 
 #[derive(Props, Clone)]
 pub struct AppProps {
     pub indexing_service: Arc<IndexingService>,
+    pub config: Config,
 }
 
 impl PartialEq for AppProps {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.indexing_service, &other.indexing_service)
+        Arc::ptr_eq(&self.indexing_service, &other.indexing_service) && self.config.paths.default_indexing_path == other.config.paths.default_indexing_path && self.config.paths.database_path == other.config.paths.database_path
     }
 }
 
 pub fn App(props: AppProps) -> Element {
-    let mut indexing_path = use_signal(|| "C:\\".to_string());
-    let mut db_path = use_signal(|| "QuickSearch.db".to_string());
+    let mut indexing_path = use_signal(|| props.config.paths.default_indexing_path.clone());
+    let mut db_path = use_signal(|| props.config.paths.database_path.clone());
     let mut status_text = use_signal(|| "Idle".to_string());
 
     let indexing_service_for_start = props.indexing_service.clone();
