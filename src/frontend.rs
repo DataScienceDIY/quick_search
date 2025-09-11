@@ -21,50 +21,16 @@ pub fn App(props: AppProps) -> Element {
     let mut indexing_path = use_signal(|| props.config.paths.default_indexing_path.clone());
     let mut db_path = use_signal(|| props.config.paths.database_path.clone());
     let mut status_text = use_signal(|| "Idle".to_string());
+    let mut show_config_dialog = use_signal(|| false);
+    let mut config_changes = use_signal(|| Vec::<String>::new());
 
     let indexing_service_for_start = props.indexing_service.clone();
+    let indexing_service_for_start_dialog = props.indexing_service.clone();
     let indexing_service_for_stop = props.indexing_service.clone();
-    let indexing_service_for_refresh = props.indexing_service.clone();
     let indexing_service_for_timer = props.indexing_service.clone();
+    let config_for_start = props.config.clone();
+    let config_for_dialog = props.config.clone();
 
-    // Manual status refresh function
-    let refresh_status = move |_| {
-        let status = indexing_service_for_refresh.get_status();
-        let status_str = match status {
-            IndexingStatus::Idle => "Idle".to_string(),
-            IndexingStatus::Running { files_processed, total_files, current_file, start_time } => {
-                let elapsed = start_time.elapsed();
-                let current_file_display = current_file
-                    .as_ref()
-                    .map(|f| format!("Current: {}", f.split('\\').last().unwrap_or(f)))
-                    .unwrap_or_default();
-                
-                if let Some(total) = total_files {
-                    let percentage = if total > 0 { 
-                        (files_processed as f64 / total as f64 * 100.0) as u32 
-                    } else { 0 };
-                    format!(
-                        "Running: {}/{} files ({}%) - {:.1}s elapsed\n{}",
-                        files_processed,
-                        total,
-                        percentage,
-                        elapsed.as_secs_f64(),
-                        current_file_display
-                    )
-                } else {
-                    format!(
-                        "Running: {} files processed - {:.1}s elapsed\n{}",
-                        files_processed,
-                        elapsed.as_secs_f64(),
-                        current_file_display
-                    )
-                }
-            }
-            IndexingStatus::Stopping => "Indexing Stopped".to_string(),
-            IndexingStatus::Error(ref e) => format!("Error: {}", e),
-        };
-        status_text.set(status_str);
-    };
 
     // Automatic status updates every second
     {
@@ -74,7 +40,7 @@ pub fn App(props: AppProps) -> Element {
             let service = service_clone.clone();
             async move {
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     
                     let status = service.get_status();
                     let status_str = match status {
@@ -83,7 +49,7 @@ pub fn App(props: AppProps) -> Element {
                             let elapsed = start_time.elapsed();
                             let current_file_display = current_file
                                 .as_ref()
-                                .map(|f| format!("Current: {}", f.split('\\').last().unwrap_or(f)))
+                                .map(|f| format!("Current: {}", f))
                                 .unwrap_or_default();
                             
                             if let Some(total) = total_files {
@@ -159,10 +125,26 @@ pub fn App(props: AppProps) -> Element {
                     button { 
                         style: "margin-right: 10px; padding: 10px 20px; background-color: #4CAF50; color: white; border: none; cursor: pointer;",
                         onclick: move |_| {
-                            let _ = indexing_service_for_start.start_indexing(
-                                indexing_path().clone(),
-                                db_path().clone()
-                            );
+                            let service = indexing_service_for_start.clone();
+                            let config = config_for_start.clone();
+                            let path = indexing_path().clone();
+                            let db = db_path().clone();
+                            
+                            // Check for configuration validation
+                            match service.check_config_validation(&db, &config, &path) {
+                                Ok(Some(changes)) => {
+                                    // Configuration changes detected, show dialog
+                                    config_changes.set(changes);
+                                    show_config_dialog.set(true);
+                                }
+                                Ok(None) => {
+                                    // No configuration issues, start indexing
+                                    let _ = service.start_indexing(path, db, config);
+                                }
+                                Err(e) => {
+                                    status_text.set(format!("Configuration validation error: {}", e));
+                                }
+                            }
                         },
                         "Start Indexing"
                     }
@@ -173,11 +155,6 @@ pub fn App(props: AppProps) -> Element {
                         },
                         "Stop Indexing"
                     }
-                    button { 
-                        style: "margin-left: 10px; padding: 10px 20px; background-color: #2196F3; color: white; border: none; cursor: pointer;",
-                        onclick: refresh_status,
-                        "Refresh Status"
-                    }
                 }
             }
             
@@ -186,6 +163,79 @@ pub fn App(props: AppProps) -> Element {
                 pre { 
                     style: "background-color: #f5f5f5; padding: 10px; border-radius: 5px; font-family: monospace;",
                     "{status_text}"
+                }
+            }
+        }
+        
+        // Configuration validation dialog
+        if show_config_dialog() {
+            div {
+                style: "position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;",
+                div {
+                    style: "background-color: white; padding: 30px; border-radius: 10px; max-width: 600px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);",
+                    h3 { 
+                        style: "margin-top: 0; color: #d32f2f;",
+                        "⚠️ Configuration Changes Detected"
+                    }
+                    p { 
+                        style: "margin: 15px 0;",
+                        "The following configuration changes require deleting and rebuilding the search index:"
+                    }
+                    ul {
+                        style: "margin: 15px 0; padding-left: 20px;",
+                        for change in config_changes().iter() {
+                            li { 
+                                style: "margin: 5px 0; font-family: monospace; background-color: #f5f5f5; padding: 5px; border-radius: 3px;",
+                                "{change}"
+                            }
+                        }
+                    }
+                    p {
+                        style: "margin: 15px 0; font-weight: bold;",
+                        "This will delete the existing index and rebuild it from scratch."
+                    }
+                    div {
+                        style: "display: flex; gap: 10px; margin-top: 20px;",
+                        button {
+                            style: "padding: 10px 20px; background-color: #d32f2f; color: white; border: none; border-radius: 5px; cursor: pointer;",
+                            onclick: move |_| {
+                                let service = indexing_service_for_start_dialog.clone();
+                                let config = config_for_dialog.clone();
+                                let path = indexing_path().clone();
+                                let db = db_path().clone();
+                                
+                                show_config_dialog.set(false);
+                                status_text.set("Stopping indexing and deleting database...".to_string());
+                                
+                                // Delete database file and restart indexing
+                                let service_clone = service.clone();
+                                let path_clone = path.clone();
+                                let db_clone = db.clone();
+                                let config_clone = config.clone();
+                                let mut status_clone = status_text.clone();
+                                
+                                spawn(async move {
+                                    match service_clone.delete_index_for_rebuild(&db_clone) {
+                                        Ok(()) => {
+                                            status_clone.set("Database deleted. Starting fresh indexing...".to_string());
+                                            let _ = service_clone.start_indexing(path_clone, db_clone, config_clone);
+                                        }
+                                        Err(e) => {
+                                            status_clone.set(format!("Error deleting database: {}", e));
+                                        }
+                                    }
+                                });
+                            },
+                            "Yes, Rebuild Index"
+                        }
+                        button {
+                            style: "padding: 10px 20px; background-color: #666; color: white; border: none; border-radius: 5px; cursor: pointer;",
+                            onclick: move |_| {
+                                show_config_dialog.set(false);
+                            },
+                            "Cancel"
+                        }
+                    }
                 }
             }
         }
