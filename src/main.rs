@@ -1,6 +1,5 @@
 use std::sync::{Arc, OnceLock};
 use dioxus::prelude::*;
-
 mod frontend;
 mod file_handling;
 mod document_extraction;
@@ -27,8 +26,19 @@ fn main() {
         std::process::exit(0);
     }).expect("Error setting Ctrl-C handler");
     
-    launch(app);
+    LaunchBuilder::desktop()
+        .with_cfg(
+            dioxus_desktop::Config::new()
+                .with_custom_head(format!("<style>{}</style>", include_str!("../assets/styles.css")))
+                .with_window(dioxus_desktop::WindowBuilder::new()
+                    .with_title("QuickSearch - File Indexer & Search")
+                    .with_resizable(true)
+                    .with_inner_size(dioxus_desktop::LogicalSize::new(1000.0, 700.0))
+                )
+        )
+        .launch(app);
 }
+
 
 fn app() -> Element {
     let config = match config::Config::load() {

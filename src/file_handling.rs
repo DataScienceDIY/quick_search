@@ -85,7 +85,15 @@ pub fn analyze_files_for_batch_update(
         };
 
         let fpath = match entry.path().canonicalize() {
-            Ok(fp) => fp.to_string_lossy().to_string(),
+            Ok(fp) => {
+                let path_str = fp.to_string_lossy().to_string();
+                // Remove Windows UNC prefix \\?\
+                if path_str.starts_with("\\\\?\\") {
+                    path_str[4..].to_string()
+                } else {
+                    path_str
+                }
+            },
             Err(_) => continue,
         };
 
@@ -205,7 +213,15 @@ pub fn process_batch_updates_files_only(
             }
 
             let fpath = match entry.path().canonicalize() {
-                Ok(fp) => fp.into_os_string(),
+                Ok(fp) => {
+                    let path_str = fp.to_string_lossy().to_string();
+                    // Remove Windows UNC prefix \\?\
+                    if path_str.starts_with("\\\\?\\") {
+                        std::ffi::OsString::from(&path_str[4..])
+                    } else {
+                        fp.into_os_string()
+                    }
+                },
                 Err(_) => continue,
             };
 
@@ -299,7 +315,15 @@ pub fn process_batch_inserts_files_only(
             }
 
             let fpath = match entry.path().canonicalize() {
-                Ok(fp) => fp.into_os_string(),
+                Ok(fp) => {
+                    let path_str = fp.to_string_lossy().to_string();
+                    // Remove Windows UNC prefix \\?\
+                    if path_str.starts_with("\\\\?\\") {
+                        std::ffi::OsString::from(&path_str[4..])
+                    } else {
+                        fp.into_os_string()
+                    }
+                },
                 Err(_) => continue,
             };
 
@@ -377,7 +401,8 @@ pub fn process_text_indexing(
             
             // Check stop flag
             if *stop_flag.lock().unwrap() {
-                drop(tx);
+                // Commit current transaction before stopping
+                let _ = tx.commit();
                 drop(conn);
                 return Ok(());
             }
@@ -405,7 +430,7 @@ pub fn process_text_indexing(
                         let trimmed_file_string = safe_truncate_string(&file_string, config.processing.maximum_text_size);
                         Some(trimmed_file_string)
                     }
-                    Err(e) => {
+                    Err(_e) => {
                         // eprintln!("Warning: Failed to read plaintext file {}: {}", fpath, e);
                         None
                     }
