@@ -78,6 +78,7 @@ pub fn App(props: AppProps) -> Element {
     let mut show_config_dialog = use_signal(|| false);
     let mut config_changes = use_signal(|| Vec::<String>::new());
     let speed_tracker = use_signal(|| SpeedTracker::new());
+    
 
     let indexing_service_for_start = props.indexing_service.clone();
     let indexing_service_for_start_dialog = props.indexing_service.clone();
@@ -280,6 +281,11 @@ pub fn App(props: AppProps) -> Element {
                     style: "background-color: #f5f5f5; padding: 10px; border-radius: 5px; font-family: monospace;",
                     "{status_text}"
                 }
+            }
+            
+            crate::search::Search {
+                indexing_service: props.indexing_service.clone(),
+                db_path: db_path().clone()
             }
         }
         

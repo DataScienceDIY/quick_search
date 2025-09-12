@@ -7,15 +7,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'quiksearch'",
+            "name": "Debug executable 'quicksearch'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=quiksearch",
-                    "--package=quiksearch"
+                    "--bin=quicksearch",
+                    "--package=quicksearch"
                 ],
                 "filter": {
-                    "name": "quiksearch",
+                    "name": "quicksearch",
                     "kind": "bin"
                 }
             },
@@ -25,16 +25,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'quiksearch'",
+            "name": "Debug unit tests in executable 'quicksearch'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=quiksearch",
-                    "--package=quiksearch"
+                    "--bin=quicksearch",
+                    "--package=quicksearch"
                 ],
                 "filter": {
-                    "name": "quiksearch",
+                    "name": "quicksearch",
                     "kind": "bin"
                 }
             },
