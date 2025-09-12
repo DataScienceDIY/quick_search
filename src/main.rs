@@ -6,6 +6,7 @@ mod file_handling;
 mod document_extraction;
 mod indexing;
 mod config;
+mod search;
 
 // Global indexing service for signal handling
 static INDEXING_SERVICE: OnceLock<Arc<indexing::IndexingService>> = OnceLock::new();
@@ -49,7 +50,12 @@ fn app() -> Element {
 }
 
 /*
-SELECT name, hash, count(*) as cnt FROM files GROUP BY hash ORDER BY cnt DESC;
+Duplicate files:
+SELECT name, count(*) as cnt, path FROM files GROUP BY hash HAVING cnt > 1 ORDER BY cnt DESC;
 
-SELECT name, path, text, snippet(searchabletext, 2 , "<b>", "</b>", "...", 64) as "snip" FROM searchabletext WHERE text MATCH 'Terrasound' LIMIT 100;
+Full text search:
+SELECT name, path, text, snippet(searchabletext, 2 , "<b>", "</b>", "<b>...</b>", 64) as "snip" FROM searchabletext WHERE text MATCH 'searchstring'
+
+Filename search:
+SELECT name, path FROM files WHERE name LIKE '%searchstring%';
 */

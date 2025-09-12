@@ -3103,7 +3103,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "quiksearch"
+name = "quicksearch"
 version = "0.1.0"
 dependencies = [
  "ctrlc",

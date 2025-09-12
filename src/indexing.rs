@@ -8,6 +8,17 @@ use crate::file_handling::{load_existing_files, analyze_files_for_batch_update, 
 use crate::config::Config;
 
 #[derive(Debug, Clone)]
+pub struct SearchResultRow {
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<SearchResultRow>,
+}
+
+#[derive(Debug, Clone)]
 pub enum IndexingStatus {
     Idle,
     RunningFileIndex {
@@ -147,6 +158,49 @@ impl IndexingService {
     /// Force graceful shutdown - used for signal handling
     pub fn graceful_shutdown(&self) -> Result<(), String> {
         self.stop_indexing()
+    }
+
+    /// Execute a search query against the database
+    pub fn execute_search(&self, db_path: &str, query: &str) -> Result<Vec<SearchResult>, String> {
+        let conn = Connection::open(db_path)
+            .map_err(|e| format!("Failed to open database: {}", e))?;
+        
+        let mut stmt = conn.prepare(query)
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+        
+        let column_count = stmt.column_count();
+        let column_names: Vec<String> = (0..column_count)
+            .map(|i| stmt.column_name(i).unwrap_or("").to_string())
+            .collect();
+        
+        let rows = stmt.query_map([], |row| {
+            let mut values = Vec::new();
+            for i in 0..column_count {
+                let value = match row.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                    rusqlite::types::ValueRef::Integer(i) => i.to_string(),
+                    rusqlite::types::ValueRef::Real(f) => f.to_string(),
+                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
+                    rusqlite::types::ValueRef::Blob(b) => format!("BLOB({} bytes)", b.len()),
+                };
+                values.push(value);
+            }
+            Ok(SearchResultRow { values })
+        })
+        .map_err(|e| format!("Failed to execute query: {}", e))?;
+        
+        let mut results = Vec::new();
+        for row in rows {
+            match row {
+                Ok(search_row) => results.push(search_row),
+                Err(e) => return Err(format!("Error reading row: {}", e)),
+            }
+        }
+        
+        Ok(vec![SearchResult {
+            columns: column_names,
+            rows: results,
+        }])
     }
 
     /// Check if configuration changes require index recreation

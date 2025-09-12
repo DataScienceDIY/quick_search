@@ -3,8 +3,8 @@ default_indexing_path = "C:\\"
 database_path = "QuickSearch.db"
 
 [processing]
-# Size of hash blocks read from start/end of files (bytes)
-hash_length = 4096
+# Amount of data in bytes read from start/end of files used to calculate hash
+hash_length = 8192
 # Maximum text content to index per file (bytes) 
 maximum_text_size = 524288
 # Maximum file size to process for text extraction (bytes)
