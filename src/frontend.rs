@@ -201,22 +201,25 @@ pub fn App(props: AppProps) -> Element {
 
     rsx! {
         div { 
-            style: "padding: 20px; font-family: Arial, sans-serif;",
+            class: "app-container",
             
-            h1 { "QuickSearch File Indexer" }
+            div {
+                class: "app-header",
+                h1 { "QuickSearch File Indexer" }
+            }
+            
+            div {
+                class: "app-content",
             
             div { 
-                style: "margin-bottom: 20px;",
+                class: "section",
                 h2 { "Indexing Controls" }
                 
                 div { 
-                    style: "margin-bottom: 10px;",
-                    label { 
-                        style: "display: block; margin-bottom: 5px;",
-                        "Path to index:" 
-                    }
+                    class: "form-group",
+                    label { "Path to index:" }
                     input { 
-                        style: "width: 400px; padding: 5px;",
+                        class: "form-control",
                         r#type: "text",
                         value: "{indexing_path}",
                         oninput: move |evt| indexing_path.set(evt.value())
@@ -224,13 +227,10 @@ pub fn App(props: AppProps) -> Element {
                 }
                 
                 div { 
-                    style: "margin-bottom: 10px;",
-                    label { 
-                        style: "display: block; margin-bottom: 5px;",
-                        "Database path:" 
-                    }
+                    class: "form-group",
+                    label { "Database path:" }
                     input { 
-                        style: "width: 400px; padding: 5px;",
+                        class: "form-control",
                         r#type: "text",
                         value: "{db_path}",
                         oninput: move |evt| db_path.set(evt.value())
@@ -238,9 +238,9 @@ pub fn App(props: AppProps) -> Element {
                 }
                 
                 div {
-                    style: "margin-bottom: 20px;",
+                    class: "form-group",
                     button { 
-                        style: "margin-right: 10px; padding: 10px 20px; background-color: #4CAF50; color: white; border: none; cursor: pointer;",
+                        class: "btn btn-primary",
                         onclick: move |_| {
                             let service = indexing_service_for_start.clone();
                             let config = config_for_start.clone();
@@ -266,7 +266,7 @@ pub fn App(props: AppProps) -> Element {
                         "Start Indexing"
                     }
                     button { 
-                        style: "padding: 10px 20px; background-color: #f44336; color: white; border: none; cursor: pointer;",
+                        class: "btn btn-danger",
                         onclick: move |_| {
                             let _ = indexing_service_for_stop.stop_indexing();
                         },
@@ -276,9 +276,10 @@ pub fn App(props: AppProps) -> Element {
             }
             
             div {
+                class: "section",
                 h2 { "Status" }
                 pre { 
-                    style: "background-color: #f5f5f5; padding: 10px; border-radius: 5px; font-family: monospace;",
+                    class: "status-display",
                     "{status_text}"
                 }
             }
@@ -287,14 +288,16 @@ pub fn App(props: AppProps) -> Element {
                 indexing_service: props.indexing_service.clone(),
                 db_path: db_path().clone()
             }
+            
+            } // Close app-content
         }
         
         // Configuration validation dialog
         if show_config_dialog() {
             div {
-                style: "position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000;",
+                class: "modal-backdrop",
                 div {
-                    style: "background-color: white; padding: 30px; border-radius: 10px; max-width: 600px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);",
+                    class: "modal-dialog",
                     h3 { 
                         style: "margin-top: 0; color: #d32f2f;",
                         "⚠️ Configuration Changes Detected"

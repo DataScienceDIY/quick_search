@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
+use std::process::Command;
 use walkdir::WalkDir;
 use rusqlite::{Connection, params};
 
@@ -163,10 +164,25 @@ impl IndexingService {
     /// Execute a search query against the database
     pub fn execute_search(&self, db_path: &str, query: &str) -> Result<Vec<SearchResult>, String> {
         let conn = Connection::open(db_path)
-            .map_err(|e| format!("Failed to open database: {}", e))?;
+            .map_err(|e| {
+                if e.to_string().contains("corrupt") || e.to_string().contains("malformed") {
+                    format!("DATABASE_CORRUPTED: {}", e)
+                } else {
+                    format!("Failed to open database: {}", e)
+                }
+            })?;
         
         let mut stmt = conn.prepare(query)
-            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+            .map_err(|e| {
+                let error_msg = e.to_string();
+                if error_msg.contains("malformed") || error_msg.contains("corrupt") || error_msg.contains("database disk image is malformed") {
+                    format!("DATABASE_CORRUPTED: {}", error_msg)
+                } else if error_msg.contains("fts5: syntax error") {
+                    format!("Search syntax error: The search term contains characters that cannot be processed. Please try a simpler search term.")
+                } else {
+                    format!("Failed to prepare query: {}", error_msg)
+                }
+            })?;
         
         let column_count = stmt.column_count();
         let column_names: Vec<String> = (0..column_count)
@@ -187,13 +203,31 @@ impl IndexingService {
             }
             Ok(SearchResultRow { values })
         })
-        .map_err(|e| format!("Failed to execute query: {}", e))?;
+        .map_err(|e| {
+            let error_msg = e.to_string();
+            if error_msg.contains("malformed") || error_msg.contains("corrupt") || error_msg.contains("database disk image is malformed") {
+                format!("DATABASE_CORRUPTED: {}", error_msg)
+            } else if error_msg.contains("fts5: syntax error") {
+                format!("Search syntax error: The search term contains characters that cannot be processed. Please try a simpler search term.")
+            } else {
+                format!("Failed to execute query: {}", error_msg)
+            }
+        })?;
         
         let mut results = Vec::new();
         for row in rows {
             match row {
                 Ok(search_row) => results.push(search_row),
-                Err(e) => return Err(format!("Error reading row: {}", e)),
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    if error_msg.contains("malformed") || error_msg.contains("corrupt") || error_msg.contains("database disk image is malformed") {
+                        return Err(format!("DATABASE_CORRUPTED: {}", error_msg));
+                    } else if error_msg.contains("fts5: syntax error") {
+                        return Err(format!("Search syntax error: The search term contains characters that cannot be processed. Please try a simpler search term."));
+                    } else {
+                        return Err(format!("Error reading row: {}", error_msg));
+                    }
+                }
             }
         }
         
@@ -201,6 +235,98 @@ impl IndexingService {
             columns: column_names,
             rows: results,
         }])
+    }
+
+    /// Open file explorer to the directory containing the specified file path
+    pub fn open_file_explorer(&self, file_path: &str) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            Command::new("explorer")
+                .arg("/select,")
+                .arg(file_path)
+                .spawn()
+                .map_err(|e| format!("Failed to open file explorer: {}", e))?;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("open")
+                .arg("-R")
+                .arg(file_path)
+                .spawn()
+                .map_err(|e| format!("Failed to open file explorer: {}", e))?;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let path = std::path::Path::new(file_path);
+            let dir_path = if path.is_file() {
+                path.parent().unwrap_or(path)
+            } else {
+                path
+            };
+            
+            // Try different file managers
+            let managers = ["xdg-open", "nautilus", "dolphin", "thunar", "pcmanfm"];
+            let mut success = false;
+            
+            for manager in &managers {
+                if let Ok(_) = Command::new(manager)
+                    .arg(dir_path)
+                    .spawn() {
+                    success = true;
+                    break;
+                }
+            }
+            
+            if !success {
+                return Err("No suitable file manager found".to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clean up UNC prefixes from existing database entries
+    pub fn clean_unc_prefixes(&self, db_path: &str) -> Result<(), String> {
+        let conn = Connection::open(db_path)
+            .map_err(|e| format!("Failed to open database: {}", e))?;
+
+        // Clean UNC prefixes from files table
+        conn.execute(
+            "UPDATE files SET path = SUBSTR(path, 5) WHERE path LIKE '\\\\?\\%'",
+            (),
+        ).map_err(|e| format!("Failed to update files table: {}", e))?;
+
+        // Clean UNC prefixes from searchabletext table  
+        conn.execute(
+            "UPDATE searchabletext SET path = SUBSTR(path, 5) WHERE path LIKE '\\\\?\\%'",
+            (),
+        ).map_err(|e| format!("Failed to update searchabletext table: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Check if the database is corrupted or malformed
+    pub fn check_database_health(&self, db_path: &str) -> Result<bool, String> {
+        match Connection::open(db_path) {
+            Ok(conn) => {
+                // Try to run integrity check
+                match conn.prepare("PRAGMA integrity_check") {
+                    Ok(mut stmt) => {
+                        match stmt.query_row([], |row| {
+                            let result: String = row.get(0)?;
+                            Ok(result == "ok")
+                        }) {
+                            Ok(is_ok) => Ok(is_ok),
+                            Err(_) => Ok(false)
+                        }
+                    },
+                    Err(_) => Ok(false)
+                }
+            },
+            Err(_) => Ok(false)
+        }
     }
 
     /// Check if configuration changes require index recreation
@@ -571,11 +697,19 @@ impl IndexingService {
         // Critical configuration values that require index recreation
         let hash_length = config.processing.hash_length.to_string();
         let tokenize = config.processing.tokenize.clone();
-        let normalized_path = std::path::Path::new(indexing_path)
-            .canonicalize()
-            .unwrap_or_else(|_| std::path::PathBuf::from(indexing_path))
-            .to_string_lossy()
-            .to_string();
+        let normalized_path = {
+            let path = std::path::Path::new(indexing_path)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(indexing_path))
+                .to_string_lossy()
+                .to_string();
+            // Remove Windows UNC prefix \\?\
+            if path.starts_with("\\\\?\\") {
+                path[4..].to_string()
+            } else {
+                path
+            }
+        };
         
         // Check stored configuration values
         let mut stored_hash_length: Option<String> = None;
@@ -631,11 +765,19 @@ impl IndexingService {
     fn update_config(conn: &Connection, config: &Config, indexing_path: &str) -> Result<(), String> {
         let hash_length = config.processing.hash_length.to_string();
         let tokenize = config.processing.tokenize.clone();
-        let normalized_path = std::path::Path::new(indexing_path)
-            .canonicalize()
-            .unwrap_or_else(|_| std::path::PathBuf::from(indexing_path))
-            .to_string_lossy()
-            .to_string();
+        let normalized_path = {
+            let path = std::path::Path::new(indexing_path)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(indexing_path))
+                .to_string_lossy()
+                .to_string();
+            // Remove Windows UNC prefix \\?\
+            if path.starts_with("\\\\?\\") {
+                path[4..].to_string()
+            } else {
+                path
+            }
+        };
 
         // Update stored configuration values
         conn.execute(
