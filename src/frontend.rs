@@ -164,7 +164,7 @@ pub fn App(props: AppProps) -> Element {
                                 )
                             }
                         }
-                        IndexingStatus::RunningTextIndex { files_processed, total_files, current_file, start_time } => {
+                        IndexingStatus::RunningTextIndex { files_processed, current_file, start_time } => {
                             // Add data point to speed tracker
                             speed_tracker_clone.with_mut(|tracker| {
                                 tracker.add_data_point(files_processed);
@@ -182,29 +182,13 @@ pub fn App(props: AppProps) -> Element {
                                     .map(|fps| format!(" - {:.1} files/sec", fps))
                                     .unwrap_or_default()
                             });
-                            
-                            if let Some(total) = total_files {
-                                let percentage = if total > 0 { 
-                                    (files_processed as f64 / total as f64 * 100.0) as u32 
-                                } else { 0 };
-                                format!(
-                                    "Phase 2 - Text Index: {}/{} files ({}%) - {:.1}s elapsed{}\n{}",
-                                    files_processed,
-                                    total,
-                                    percentage,
-                                    elapsed.as_secs_f64(),
-                                    speed_display,
-                                    current_file_display
-                                )
-                            } else {
-                                format!(
-                                    "Phase 2 - Text Index: {} files processed - {:.1}s elapsed{}\n{}",
-                                    files_processed,
-                                    elapsed.as_secs_f64(),
-                                    speed_display,
-                                    current_file_display
-                                )
-                            }
+                            format!(
+                                "Phase 2 - Text Index: {} files processed - {:.1}s elapsed{}\n{}",
+                                files_processed,
+                                elapsed.as_secs_f64(),
+                                speed_display,
+                                current_file_display
+                            )
                         }
                         IndexingStatus::Stopping => "Indexing Stopped".to_string(),
                         IndexingStatus::Error(ref e) => format!("Error: {}", e),

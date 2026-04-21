@@ -31,6 +31,8 @@ pub struct ProcessingConfig {
     pub precount_files_for_progress: bool,
     #[serde(default)]
     pub follow_symlinks: bool,
+    #[serde(default)]
+    pub include_hidden: bool,
 }
 
 impl Default for Config {
@@ -49,6 +51,7 @@ impl Default for Config {
                 tokenize: "trigram".to_string(),
                 precount_files_for_progress: false,
                 follow_symlinks: false,
+                include_hidden: false,
             },
         }
     }

@@ -2,6 +2,7 @@ use std::sync::{Mutex, Arc};
 use std::ffi::OsString;
 use std::fs::{File,read_to_string};
 use std::io::{Read, Seek, SeekFrom};
+use std::path::Component;
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 use std::collections::HashMap;
@@ -78,12 +79,24 @@ pub fn load_existing_files(conn: &Connection) -> Result<HashMap<String, Existing
     Ok(existing_files)
 }
 
-pub fn indexed_walk_file_entries(path: &str, follow_symlinks: bool) -> impl Iterator<Item = DirEntry> {
+pub fn indexed_walk_file_entries(
+    path: &str,
+    follow_symlinks: bool,
+) -> impl Iterator<Item = DirEntry> {
     WalkDir::new(path)
         .follow_links(follow_symlinks)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|entry| !entry.metadata().map(|m| m.is_dir()).unwrap_or(true))
+}
+
+pub fn path_has_hidden_component(path: &std::path::Path) -> bool {
+    path.components().any(|c| {
+        matches!(
+            c,
+            Component::Normal(name) if name.to_string_lossy().starts_with('.')
+        )
+    })
 }
 
 fn parse_wc_l_stdout(bytes: &[u8]) -> Result<usize, String> {
@@ -770,6 +783,10 @@ pub fn process_text_indexing(
                     eprintln!("Warning: Failed to insert document row for {}: {}", fpath, e);
                 }
             }
+        }
+
+        if let Some(ref callback) = status_callback {
+            callback("Rebuilding FTS index after text addition...");
         }
 
         tx.commit()

@@ -18,6 +18,8 @@ fts_update_batch_size = 1000
 precount_files_for_progress = false
 # If true, follow symbolic links during directory walks (indexing only; shell precount unchanged).
 follow_symlinks = false
+# If true, hidden files and directories will be indexed.
+include_hidden = false
 # FTS5 tokenization method (e.g., 'trigram', 'porter', 'unicode61')
 # Look here for more information https://www.sqlite.org/fts5.html#tokenizers
 tokenize = "trigram"

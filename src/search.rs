@@ -139,7 +139,7 @@ pub fn Search(props: SearchProps) -> Element {
                         }
 
                         format!(
-                            "SELECT d.name, d.path, snippet(st, 1, '<b>', '</b>', '<b>...</b>', 64) as snippet FROM searchabletext AS st JOIN documents d ON d.id = st.rowid WHERE {} ORDER BY rank",
+                            "SELECT d.name, d.path, snippet(searchabletext, 1, '<b>', '</b>', '<b>...</b>', 64) as snippet FROM searchabletext AS st JOIN documents d ON d.id = st.rowid WHERE {} ORDER BY rank",
                             where_clause
                         )
                     },
@@ -151,7 +151,7 @@ pub fn Search(props: SearchProps) -> Element {
                         }
                         format!("SELECT name, path FROM files WHERE name LIKE '%{}%'", search_term_val.replace("'", "''"))
                     },
-                    "duplicates" => "SELECT name, count(*) as cnt, path FROM files GROUP BY hash HAVING cnt > 1 ORDER BY cnt DESC".to_string(),
+                    "duplicates" => "SELECT name, count(*) as cnt, path FROM files WHERE hash IS NOT NULL GROUP BY hash HAVING cnt > 1 ORDER BY cnt DESC LIMIT 5000".to_string(),
                     _ => {
                         is_searching_clone.set(false);
                         return;
