@@ -2,10 +2,21 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 use std::process::Command;
-use walkdir::WalkDir;
-use rusqlite::{Connection, params};
+use std::collections::HashSet;
+use rusqlite::{Connection, OptionalExtension, params};
+use walkdir::DirEntry;
 
-use crate::file_handling::{load_existing_files, analyze_files_for_batch_update, process_batch_updates_files_only, process_batch_inserts_files_only, process_text_indexing};
+use crate::file_handling::{
+    classify_dir_entry_for_indexing,
+    cleanup_stale_index_entries,
+    count_tree_entries_fast,
+    indexed_walk_file_entries,
+    load_existing_files,
+    process_batch_inserts_files_only,
+    process_batch_updates_files_only,
+    process_text_indexing,
+    FileIndexAction,
+};
 use crate::config::Config;
 
 #[derive(Debug, Clone)]
@@ -22,6 +33,12 @@ pub struct SearchResult {
 #[derive(Debug, Clone)]
 pub enum IndexingStatus {
     Idle,
+    CountingFiles {
+        _entries_scanned: usize,
+        _indexable_files_counted: usize,
+        current_file: Option<String>,
+        start_time: Instant,
+    },
     RunningFileIndex {
         files_processed: usize,
         total_files: Option<usize>,
@@ -288,6 +305,7 @@ impl IndexingService {
     }
 
     /// Clean up UNC prefixes from existing database entries
+    #[allow(dead_code)]
     pub fn clean_unc_prefixes(&self, db_path: &str) -> Result<(), String> {
         let conn = Connection::open(db_path)
             .map_err(|e| format!("Failed to open database: {}", e))?;
@@ -298,16 +316,26 @@ impl IndexingService {
             (),
         ).map_err(|e| format!("Failed to update files table: {}", e))?;
 
-        // Clean UNC prefixes from searchabletext table  
-        conn.execute(
-            "UPDATE searchabletext SET path = SUBSTR(path, 5) WHERE path LIKE '\\\\?\\%'",
-            (),
-        ).map_err(|e| format!("Failed to update searchabletext table: {}", e))?;
+        let doc_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='documents'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if doc_table > 0 {
+            conn.execute(
+                "UPDATE documents SET path = SUBSTR(path, 5) WHERE path LIKE '\\\\?\\%'",
+                (),
+            )
+            .map_err(|e| format!("Failed to update documents table: {}", e))?;
+        }
 
         Ok(())
     }
 
     /// Check if the database is corrupted or malformed
+    #[allow(dead_code)]
     pub fn check_database_health(&self, db_path: &str) -> Result<bool, String> {
         match Connection::open(db_path) {
             Ok(conn) => {
@@ -356,7 +384,10 @@ impl IndexingService {
         while attempts < 50 { // Wait up to 5 seconds
             match self.get_status() {
                 IndexingStatus::Idle => break,
-                IndexingStatus::Stopping | IndexingStatus::RunningFileIndex { .. } | IndexingStatus::RunningTextIndex { .. } => {
+                IndexingStatus::Stopping
+                | IndexingStatus::CountingFiles { .. }
+                | IndexingStatus::RunningFileIndex { .. }
+                | IndexingStatus::RunningTextIndex { .. } => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     attempts += 1;
                 }
@@ -384,7 +415,12 @@ impl IndexingService {
         while let Ok(command) = command_rx.recv() {
             match command {
                 IndexingCommand::Start { path, db_path, config } => {
-                    if matches!(*status.lock().unwrap(), IndexingStatus::RunningFileIndex { .. } | IndexingStatus::RunningTextIndex { .. }) {
+                    if matches!(
+                        *status.lock().unwrap(),
+                        IndexingStatus::CountingFiles { .. }
+                            | IndexingStatus::RunningFileIndex { .. }
+                            | IndexingStatus::RunningTextIndex { .. }
+                    ) {
                         continue; // Already running
                     }
 
@@ -394,11 +430,20 @@ impl IndexingService {
                     }
 
                     *stop_flag.lock().unwrap() = false;
-                    *status.lock().unwrap() = IndexingStatus::RunningFileIndex {
-                        files_processed: 0,
-                        total_files: None,
-                        current_file: None,
-                        start_time: Instant::now(),
+                    *status.lock().unwrap() = if config.processing.precount_files_for_progress {
+                        IndexingStatus::CountingFiles {
+                            _entries_scanned: 0,
+                            _indexable_files_counted: 0,
+                            current_file: Some("Preparing database...".to_string()),
+                            start_time: Instant::now(),
+                        }
+                    } else {
+                        IndexingStatus::RunningFileIndex {
+                            files_processed: 0,
+                            total_files: None,
+                            current_file: None,
+                            start_time: Instant::now(),
+                        }
                     };
 
                     // Run indexing in a separate thread
@@ -426,7 +471,12 @@ impl IndexingService {
                     }));
                 }
                 IndexingCommand::Stop => {
-                    if matches!(*status.lock().unwrap(), IndexingStatus::RunningFileIndex { .. } | IndexingStatus::RunningTextIndex { .. }) {
+                    if matches!(
+                        *status.lock().unwrap(),
+                        IndexingStatus::CountingFiles { .. }
+                            | IndexingStatus::RunningFileIndex { .. }
+                            | IndexingStatus::RunningTextIndex { .. }
+                    ) {
                         *status.lock().unwrap() = IndexingStatus::Stopping;
                         *stop_flag.lock().unwrap() = true;
                     }
@@ -438,6 +488,20 @@ impl IndexingService {
         if let Some(handle) = indexing_handle {
             let _ = handle.join();
         }
+    }
+
+    fn file_index_status_callback(
+        status: &Arc<Mutex<IndexingStatus>>,
+    ) -> Box<dyn Fn(&str) + Send + Sync> {
+        let st = status.clone();
+        Box::new(move |file_status: &str| {
+            if let Ok(mut status_guard) = st.lock() {
+                if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard
+                {
+                    *current_file = Some(file_status.to_string());
+                }
+            }
+        })
     }
 
     fn run_indexing(
@@ -452,7 +516,7 @@ impl IndexingService {
         let conn = Connection::open(db_path)
             .map_err(|e| format!("Failed to open database: {}", e))?;
 
-        conn.execute_batch(
+        conn.execute_batch( // Default SQLITE page size is 4kB, and our memory cache is in units of page count
             "PRAGMA journal_mode = OFF;
              PRAGMA synchronous = 0;
              PRAGMA cache_size = 10000;
@@ -471,12 +535,35 @@ impl IndexingService {
         )
         .map_err(|e| format!("Failed to create files table: {}", e))?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS documents (
+                id      INTEGER PRIMARY KEY,
+                name    TEXT,
+                path    TEXT NOT NULL UNIQUE,
+                text    TEXT NOT NULL)",
+            (),
+        )
+        .map_err(|e| format!("Failed to create documents table: {}", e))?;
+
+        let fts_external = Self::searchabletext_is_external_content(&conn)?;
+        if !fts_external {
+            conn.execute("DROP TABLE IF EXISTS searchabletext", ())
+                .map_err(|e| format!("Failed to drop legacy searchabletext: {}", e))?;
+            conn.execute("DROP TABLE IF EXISTS searchabletext_doc", ())
+                .map_err(|e| format!("Failed to drop legacy searchabletext_doc: {}", e))?;
+        }
+
         let create_fts_sql = format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS searchabletext USING fts5 (name, path, text, tokenize = '{}');",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS searchabletext USING fts5(name, text, content='documents', content_rowid='id', tokenize='{}');",
             config.processing.tokenize
         );
         conn.execute(&create_fts_sql, ())
             .map_err(|e| format!("Failed to create searchabletext table: {}", e))?;
+
+        if !fts_external {
+            conn.execute("INSERT INTO searchabletext(searchabletext) VALUES('rebuild')", ())
+                .map_err(|e| format!("Failed to rebuild searchabletext: {}", e))?;
+        }
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS config_validation (
@@ -503,134 +590,166 @@ impl IndexingService {
             *db_opt = Some(conn_mutex.clone());
         }
 
-        // Collect all file entries
-        let walker = WalkDir::new(path).into_iter();
-        let entries: Vec<_> = walker
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| !entry.metadata().map(|m| m.is_dir()).unwrap_or(true))
+        let progress_display_total: Option<usize> =
+            if config.processing.precount_files_for_progress {
+                if *stop_flag.lock().unwrap() {
+                    if let Ok(mut status_guard) = status.lock() {
+                        *status_guard = IndexingStatus::Idle;
+                    }
+                    return Ok(());
+                }
+                if let Ok(mut g) = status.lock() {
+                    if let IndexingStatus::CountingFiles { ref mut current_file, .. } = *g {
+                        *current_file = Some("Counting paths (shell)...".to_string());
+                    }
+                }
+                let n = count_tree_entries_fast(path).map_err(|e| format!("Precount: {}", e))?;
+                if *stop_flag.lock().unwrap() {
+                    if let Ok(mut status_guard) = status.lock() {
+                        *status_guard = IndexingStatus::Idle;
+                    }
+                    return Ok(());
+                }
+                if let Ok(mut status_guard) = status.lock() {
+                    *status_guard = IndexingStatus::RunningFileIndex {
+                        files_processed: 0,
+                        total_files: Some(n),
+                        current_file: None,
+                        start_time: Instant::now(),
+                    };
+                }
+                Some(n)
+            } else {
+                None
+            };
+
+        let batch_size = config.processing.batch_size;
+        let mut pending_updates: Vec<(DirEntry, usize)> = Vec::new();
+        let mut pending_inserts: Vec<(DirEntry, usize)> = Vec::new();
+        let mut seen_existing_paths: HashSet<String> = HashSet::new();
+        let mut visit: usize = 0;
+        let mut had_incremental_work = false;
+        let flush_updates = |buf: &mut Vec<(DirEntry, usize)>| -> Result<(), String> {
+            if buf.is_empty() {
+                return Ok(());
+            }
+            process_batch_updates_files_only(
+                &conn_mutex,
+                buf.as_slice(),
+                stop_flag,
+                Some(Self::file_index_status_callback(status)),
+                None,
+                config,
+                progress_display_total,
+            )?;
+            buf.clear();
+            Ok(())
+        };
+
+        let flush_inserts = |buf: &mut Vec<(DirEntry, usize)>| -> Result<(), String> {
+                if buf.is_empty() {
+                    return Ok(());
+                }
+                process_batch_inserts_files_only(
+                    &conn_mutex,
+                    buf.as_slice(),
+                    stop_flag,
+                    Some(Self::file_index_status_callback(status)),
+                    None,
+                    config,
+                    progress_display_total,
+                )?;
+                buf.clear();
+                Ok(())
+            };
+
+        for entry in indexed_walk_file_entries(path, config.processing.follow_symlinks) {
+            if *stop_flag.lock().unwrap() {
+                flush_updates(&mut pending_updates)?;
+                flush_inserts(&mut pending_inserts)?;
+                if let Ok(mut status_guard) = status.lock() {
+                    *status_guard = IndexingStatus::Idle;
+                }
+                return Ok(());
+            }
+
+            let action = classify_dir_entry_for_indexing(&entry, &existing_files);
+            let Some(action) = action else {
+                continue;
+            };
+            let current_path = entry
+                .path()
+                .canonicalize()
+                .ok()
+                .map(|fp| {
+                    let path_str = fp.to_string_lossy().to_string();
+                    if path_str.starts_with("\\\\?\\") {
+                        path_str[4..].to_string()
+                    } else {
+                        path_str
+                    }
+                });
+
+            visit += 1;
+            if let Ok(mut g) = status.lock() {
+                if let IndexingStatus::RunningFileIndex {
+                    ref mut files_processed,
+                    ..
+                } = *g
+                {
+                    *files_processed = visit;
+                }
+            }
+
+            match action {
+                FileIndexAction::Skip => {
+                    if let Some(path) = current_path {
+                        seen_existing_paths.insert(path);
+                    }
+                }
+                FileIndexAction::Update => {
+                    if let Some(path) = current_path {
+                        seen_existing_paths.insert(path);
+                    }
+                    had_incremental_work = true;
+                    pending_updates.push((entry, visit));
+                    if pending_updates.len() >= batch_size {
+                        flush_updates(&mut pending_updates)?;
+                    }
+                }
+                FileIndexAction::Insert => {
+                    had_incremental_work = true;
+                    pending_inserts.push((entry, visit));
+                    if pending_inserts.len() >= batch_size {
+                        flush_inserts(&mut pending_inserts)?;
+                    }
+                }
+            }
+        }
+
+        flush_updates(&mut pending_updates)?;
+        flush_inserts(&mut pending_inserts)?;
+
+        let stale_paths: Vec<String> = existing_files
+            .keys()
+            .filter(|p| !seen_existing_paths.contains(*p))
+            .cloned()
             .collect();
-
-        let total_file_count = entries.len();
-
-        // Update status with total file count
-        if let Ok(mut status_guard) = status.lock() {
-            if let IndexingStatus::RunningFileIndex { ref mut total_files, .. } = *status_guard {
-                *total_files = Some(total_file_count);
-            }
+        let stale_deleted = cleanup_stale_index_entries(
+            &conn_mutex,
+            stale_paths.as_slice(),
+            stop_flag,
+            Some(Self::file_index_status_callback(status)),
+        )?;
+        if stale_deleted > 0 {
+            had_incremental_work = true;
         }
 
-        // Analyze which files need updates vs inserts
-        let batch_update = analyze_files_for_batch_update(&entries, &existing_files);
-        
-        let total_work = batch_update.files_to_update.len() + batch_update.files_to_insert.len();
-        
-        // Update status to show actual work needed
-        if let Ok(mut status_guard) = status.lock() {
-            if let IndexingStatus::RunningFileIndex { ref mut total_files, .. } = *status_guard {
-                *total_files = Some(total_work);
-            }
-        }
-
-        let mut work_completed = 0;
-
-        // Process updated files in batches
-        if !batch_update.files_to_update.is_empty() {
+        if !had_incremental_work {
             if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard {
-                    *current_file = Some(format!("Updating {} modified files...", batch_update.files_to_update.len()));
-                }
-            }
-
-            // Create status callback to update current file
-            let status_clone_1 = status.clone();
-            let status_callback = Box::new(move |file_status: &str| {
-                if let Ok(mut status_guard) = status_clone_1.lock() {
-                    if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard {
-                        *current_file = Some(file_status.to_string());
-                    }
-                }
-            });
-            
-            // Create progress callback to update files_processed
-            let status_clone_2 = status.clone();
-            let base_work_completed = work_completed;
-            let progress_callback = Box::new(move |current_index: usize| {
-                if let Ok(mut status_guard) = status_clone_2.lock() {
-                    if let IndexingStatus::RunningFileIndex { ref mut files_processed, .. } = *status_guard {
-                        *files_processed = base_work_completed + current_index;
-                    }
-                }
-            });
-
-            if let Err(e) = process_batch_updates_files_only(&conn_mutex, &batch_update.files_to_update, &stop_flag, Some(status_callback), Some(progress_callback), config) {
-                return Err(format!("Failed to process batch updates: {}", e));
-            }
-            
-            work_completed += batch_update.files_to_update.len();
-            
-            if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::RunningFileIndex { ref mut files_processed, .. } = *status_guard {
-                    *files_processed = work_completed;
-                }
-            }
-        }
-
-        // Check for stop signal
-        if *stop_flag.lock().unwrap() {
-            if let Ok(mut status_guard) = status.lock() {
-                *status_guard = IndexingStatus::Idle;
-            }
-            return Ok(());
-        }
-
-        // Process new files in batches
-        if !batch_update.files_to_insert.is_empty() {
-            if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard {
-                    *current_file = Some(format!("Indexing {} new files...", batch_update.files_to_insert.len()));
-                }
-            }
-
-            // Create status callback for inserts
-            let status_clone_3 = status.clone();
-            let status_callback = Box::new(move |file_status: &str| {
-                if let Ok(mut status_guard) = status_clone_3.lock() {
-                    if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard {
-                        *current_file = Some(file_status.to_string());
-                    }
-                }
-            });
-            
-            // Create progress callback for inserts
-            let status_clone_4 = status.clone();
-            let base_work_completed = work_completed;
-            let progress_callback = Box::new(move |current_index: usize| {
-                if let Ok(mut status_guard) = status_clone_4.lock() {
-                    if let IndexingStatus::RunningFileIndex { ref mut files_processed, .. } = *status_guard {
-                        *files_processed = base_work_completed + current_index;
-                    }
-                }
-            });
-
-            if let Err(e) = process_batch_inserts_files_only(&conn_mutex, &batch_update.files_to_insert, &stop_flag, Some(status_callback), Some(progress_callback), config) {
-                return Err(format!("Failed to process batch inserts: {}", e));
-            }
-            
-            work_completed += batch_update.files_to_insert.len();
-            
-            if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::RunningFileIndex { ref mut files_processed, .. } = *status_guard {
-                    *files_processed = work_completed;
-                }
-            }
-        }
-
-        // If no incremental work was needed, show completion status for file indexing phase
-        if total_work == 0 {
-            if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::RunningFileIndex { ref mut current_file, ref mut files_processed, .. } = *status_guard {
+                if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard
+                {
                     *current_file = Some("File index is up to date".to_string());
-                    *files_processed = total_file_count;
                 }
             }
         }
@@ -686,6 +805,25 @@ impl IndexingService {
         }
 
         Ok(())
+    }
+
+    fn searchabletext_is_external_content(conn: &Connection) -> Result<bool, String> {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='searchabletext'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("sqlite_master searchabletext: {}", e))?;
+        Ok(sql
+            .as_deref()
+            .map(|s| {
+                s.contains("content='documents'")
+                    || s.contains("content=\"documents\"")
+                    || s.contains("content=documents")
+            })
+            .unwrap_or(false))
     }
 
     /// Validates configuration against stored values and returns validation results.
