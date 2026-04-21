@@ -12,6 +12,7 @@ use crate::file_handling::{
     count_tree_entries_fast,
     indexed_walk_file_entries,
     load_existing_files,
+    path_has_hidden_component,
     process_batch_inserts_files_only,
     process_batch_updates_files_only,
     process_text_indexing,
@@ -47,7 +48,6 @@ pub enum IndexingStatus {
     },
     RunningTextIndex {
         files_processed: usize,
-        total_files: Option<usize>,
         current_file: Option<String>,
         start_time: Instant,
     },
@@ -188,6 +188,12 @@ impl IndexingService {
                     format!("Failed to open database: {}", e)
                 }
             })?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);",
+            (),
+        )
+        .map_err(|e| format!("Failed to prepare duplicate-search index: {}", e))?;
         
         let mut stmt = conn.prepare(query)
             .map_err(|e| {
@@ -536,6 +542,12 @@ impl IndexingService {
         .map_err(|e| format!("Failed to create files table: {}", e))?;
 
         conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);",
+            (),
+        )
+        .map_err(|e| format!("Failed to create files hash index: {}", e))?;
+
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS documents (
                 id      INTEGER PRIMARY KEY,
                 name    TEXT,
@@ -673,6 +685,21 @@ impl IndexingService {
                 return Ok(());
             }
 
+            visit += 1;
+            if let Ok(mut g) = status.lock() {
+                if let IndexingStatus::RunningFileIndex {
+                    ref mut files_processed,
+                    ..
+                } = *g
+                {
+                    *files_processed = visit;
+                }
+            }
+
+            if !config.processing.include_hidden && path_has_hidden_component(entry.path()) {
+                continue;
+            }
+
             let action = classify_dir_entry_for_indexing(&entry, &existing_files);
             let Some(action) = action else {
                 continue;
@@ -689,17 +716,6 @@ impl IndexingService {
                         path_str
                     }
                 });
-
-            visit += 1;
-            if let Ok(mut g) = status.lock() {
-                if let IndexingStatus::RunningFileIndex {
-                    ref mut files_processed,
-                    ..
-                } = *g
-                {
-                    *files_processed = visit;
-                }
-            }
 
             match action {
                 FileIndexAction::Skip => {
@@ -766,7 +782,6 @@ impl IndexingService {
         if let Ok(mut status_guard) = status.lock() {
             *status_guard = IndexingStatus::RunningTextIndex {
                 files_processed: 0,
-                total_files: None,
                 current_file: Some("Starting text indexing...".to_string()),
                 start_time: Instant::now(),
             };
@@ -835,6 +850,7 @@ impl IndexingService {
         // Critical configuration values that require index recreation
         let hash_length = config.processing.hash_length.to_string();
         let tokenize = config.processing.tokenize.clone();
+        let include_hidden = config.processing.include_hidden.to_string();
         let normalized_path = {
             let path = std::path::Path::new(indexing_path)
                 .canonicalize()
@@ -853,8 +869,9 @@ impl IndexingService {
         let mut stored_hash_length: Option<String> = None;
         let mut stored_indexing_path: Option<String> = None;
         let mut stored_tokenize: Option<String> = None;
+        let mut stored_include_hidden: Option<String> = None;
         
-        if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM config_validation WHERE key IN ('hash_length', 'indexing_path', 'tokenize')") {
+        if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM config_validation WHERE key IN ('hash_length', 'indexing_path', 'tokenize', 'include_hidden')") {
             if let Ok(rows) = stmt.query_map([], |row| {
                 let key: String = row.get(0)?;
                 let value: String = row.get(1)?;
@@ -865,6 +882,7 @@ impl IndexingService {
                         "hash_length" => stored_hash_length = Some(row.1),
                         "indexing_path" => stored_indexing_path = Some(row.1),
                         "tokenize" => stored_tokenize = Some(row.1),
+                        "include_hidden" => stored_include_hidden = Some(row.1),
                         _ => {}
                     }
                 }
@@ -875,8 +893,9 @@ impl IndexingService {
         let hash_length_changed = stored_hash_length.as_ref().map_or(false, |stored| stored != &hash_length);
         let indexing_path_changed = stored_indexing_path.as_ref().map_or(false, |stored| stored != &normalized_path);
         let tokenize_changed = stored_tokenize.as_ref().map_or(false, |stored| stored != &tokenize);
+        let include_hidden_changed = stored_include_hidden.as_ref().map_or(false, |stored| stored != &include_hidden);
         
-        if hash_length_changed || indexing_path_changed || tokenize_changed {
+        if hash_length_changed || indexing_path_changed || tokenize_changed || include_hidden_changed {
             let mut changes = Vec::new();
             if hash_length_changed {
                 changes.push(format!("hash_length: {} -> {}", 
@@ -889,6 +908,13 @@ impl IndexingService {
             if tokenize_changed {
                 changes.push(format!("tokenize: {} -> {}", 
                     stored_tokenize.unwrap_or_else(|| "unknown".to_string()), tokenize));
+            }
+            if include_hidden_changed {
+                changes.push(format!(
+                    "include_hidden: {} -> {}",
+                    stored_include_hidden.unwrap_or_else(|| "unknown".to_string()),
+                    include_hidden
+                ));
             }
             
             return Ok(Some(changes));
@@ -903,6 +929,7 @@ impl IndexingService {
     fn update_config(conn: &Connection, config: &Config, indexing_path: &str) -> Result<(), String> {
         let hash_length = config.processing.hash_length.to_string();
         let tokenize = config.processing.tokenize.clone();
+        let include_hidden = config.processing.include_hidden.to_string();
         let normalized_path = {
             let path = std::path::Path::new(indexing_path)
                 .canonicalize()
@@ -932,6 +959,11 @@ impl IndexingService {
             "INSERT OR REPLACE INTO config_validation (key, value) VALUES ('tokenize', ?1)",
             params![tokenize],
         ).map_err(|e| format!("Failed to store tokenize config: {}", e))?;
+        
+        conn.execute(
+            "INSERT OR REPLACE INTO config_validation (key, value) VALUES ('include_hidden', ?1)",
+            params![include_hidden],
+        ).map_err(|e| format!("Failed to store include_hidden config: {}", e))?;
 
         Ok(())
     }
