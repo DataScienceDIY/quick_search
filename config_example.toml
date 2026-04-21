@@ -6,11 +6,18 @@ database_path = "QuickSearch.db"
 # Amount of data in bytes read from start/end of files used to calculate hash
 hash_length = 8192
 # Maximum text content to index per file (bytes) 
-maximum_text_size = 524288
+maximum_text_size = 262144
 # Maximum file size to process for text extraction (bytes)
-maximum_file_size = 52428800
-# Number of files to process in each batch
+maximum_text_file_size = 2097152
+# Number of files to process in each batch (directory walk / inserts / text extraction batches)
 batch_size = 200
+# Files per transaction for incremental UPDATE files + DELETE from searchabletext (FTS); larger = fewer commits, more RAM per chunk
+fts_update_batch_size = 1000
+# If true, run a fast shell-backed tree count before Phase 1 (enables % progress; Linux uses GNU find -printf '\n' | wc -l when available).
+# If false, Phase 1 shows file counts without a percentage.
+precount_files_for_progress = false
+# If true, follow symbolic links during directory walks (indexing only; shell precount unchanged).
+follow_symlinks = false
 # FTS5 tokenization method (e.g., 'trigram', 'porter', 'unicode61')
 # Look here for more information https://www.sqlite.org/fts5.html#tokenizers
 tokenize = "trigram"

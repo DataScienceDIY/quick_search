@@ -20,6 +20,8 @@ impl PartialEq for SearchProps {
 pub fn Search(props: SearchProps) -> Element {
     let mut search_type = use_signal(|| "fulltext".to_string());
     let mut search_term = use_signal(|| String::new());
+    let mut fulltext_exact = use_signal(|| false);
+    let mut fulltext_case_sensitive = use_signal(|| false);
     let search_results = use_signal(|| Vec::<SearchResult>::new());
     let mut search_error = use_signal(|| None::<String>);
     let is_searching = use_signal(|| false);
@@ -35,6 +37,8 @@ pub fn Search(props: SearchProps) -> Element {
         let db_path = db_path.clone();
         let search_type = search_type.clone();
         let search_term = search_term.clone();
+        let fulltext_exact = fulltext_exact.clone();
+        let fulltext_case_sensitive = fulltext_case_sensitive.clone();
         let search_results = search_results.clone();
         let search_error = search_error.clone();
         let is_searching = is_searching.clone();
@@ -46,6 +50,8 @@ pub fn Search(props: SearchProps) -> Element {
             let db_clone = db_path.clone();
             let search_type_val = search_type().clone();
             let search_term_val = search_term().clone();
+            let fulltext_exact_val = fulltext_exact();
+            let fulltext_case_sensitive_val = fulltext_case_sensitive();
             
             let mut search_results_clone = search_results.clone();
             let mut search_error_clone = search_error.clone();
@@ -61,38 +67,81 @@ pub fn Search(props: SearchProps) -> Element {
                 
                 let query = match search_type_val.as_str() {
                     "fulltext" => {
-                        if search_term_val.trim().is_empty() {
+                        let trimmed = search_term_val.trim();
+                        if trimmed.is_empty() {
                             search_error_clone.set(Some("Please enter a search term".to_string()));
                             is_searching_clone.set(false);
                             return;
                         }
-                        
-                        // Sanitize search term for FTS5 by removing problematic characters
-                        let sanitized_term = search_term_val
-                            .replace("'", "''")  // Escape single quotes for SQL
-                            .replace(":", " ")   // Replace colons with spaces (common in file paths, times, etc.)
-                            .replace(";", " ")   // Replace semicolons with spaces
-                            .replace("(", " ")   // Replace parentheses with spaces
-                            .replace(")", " ")
-                            .replace("[", " ")   // Replace brackets with spaces
-                            .replace("]", " ")
-                            .replace("{", " ")   // Replace braces with spaces
-                            .replace("}", " ")
-                            .replace("^", " ")   // Replace carets with spaces
-                            .replace("~", " ")   // Replace tildes with spaces
-                            .replace("\"", " ");  // Replace quotes with spaces to avoid nesting issues
-                        
-                        // Split into words and rejoin to handle multiple spaces and create a proper FTS5 query
-                        let words: Vec<&str> = sanitized_term.split_whitespace().collect();
-                        if words.is_empty() {
+
+                        let sanitized_term = trimmed
+                            .replace(':', " ")
+                            .replace(';', " ")
+                            .replace('(', " ")
+                            .replace(')', " ")
+                            .replace('[', " ")
+                            .replace(']', " ")
+                            .replace('{', " ")
+                            .replace('}', " ")
+                            .replace('^', " ")
+                            .replace('~', " ")
+                            .replace('"', " ");
+
+                        let tokens: Vec<&str> = sanitized_term.split_whitespace().collect();
+                        if tokens.is_empty() {
                             search_error_clone.set(Some("Please enter a valid search term".to_string()));
                             is_searching_clone.set(false);
                             return;
                         }
-                        
-                        // Join words with AND for better matching
-                        let fts_query = words.join(" AND ");
-                        format!("SELECT name, path, snippet(searchabletext, 2, '<b>', '</b>', '<b>...</b>', 64) as snippet FROM searchabletext WHERE text MATCH '{}'", fts_query)
+
+                        let words: Vec<&str> = if fulltext_exact_val {
+                            tokens
+                        } else {
+                            let filtered: Vec<&str> = tokens
+                                .into_iter()
+                                .filter(|w| w.chars().count() >= 3)
+                                .collect();
+                            if filtered.is_empty() {
+                                search_error_clone.set(Some(
+                                    "Trigram index needs each word to be at least 3 characters unless you use exact phrase search.".to_string(),
+                                ));
+                                is_searching_clone.set(false);
+                                return;
+                            }
+                            filtered
+                        };
+
+                        let sql_quote = |s: &str| s.replace('\'', "''");
+
+                        let fts_match = if fulltext_exact_val {
+                            let phrase = words.join(" ");
+                            format!("\"{}\"", phrase.replace('"', "\"\""))
+                        } else {
+                            words.join(" AND ")
+                        };
+
+                        let mut where_clause = format!("st.text MATCH '{}'", sql_quote(&fts_match));
+                        if fulltext_case_sensitive_val {
+                            if fulltext_exact_val {
+                                let literal = words.join(" ");
+                                where_clause.push_str(&format!(
+                                    " AND instr(st.text, '{}') > 0",
+                                    sql_quote(&literal)
+                                ));
+                            } else {
+                                for w in &words {
+                                    where_clause.push_str(&format!(
+                                        " AND instr(st.text, '{}') > 0",
+                                        sql_quote(w)
+                                    ));
+                                }
+                            }
+                        }
+
+                        format!(
+                            "SELECT d.name, d.path, snippet(st, 1, '<b>', '</b>', '<b>...</b>', 64) as snippet FROM searchabletext AS st JOIN documents d ON d.id = st.rowid WHERE {} ORDER BY rank",
+                            where_clause
+                        )
                     },
                     "filename" => {
                         if search_term_val.trim().is_empty() {
@@ -158,6 +207,32 @@ pub fn Search(props: SearchProps) -> Element {
                     option { value: "fulltext", "Full Text Search" }
                     option { value: "filename", "Filename Search" }
                     option { value: "duplicates", "Find Duplicate Files" }
+                }
+            }
+
+            if search_type() == "fulltext" {
+                div {
+                    class: "form-group",
+                    style: "display: flex; flex-direction: column; gap: 6px;",
+                    span { style: "font-weight: 600;", "Full text options" }
+                    label {
+                        style: "display: flex; align-items: center; gap: 8px; cursor: pointer;",
+                        input {
+                            r#type: "checkbox",
+                            checked: fulltext_exact(),
+                            onchange: move |evt| fulltext_exact.set(evt.checked()),
+                        }
+                        "Exact phrase match"
+                    }
+                    label {
+                        style: "display: flex; align-items: center; gap: 8px; cursor: pointer;",
+                        input {
+                            r#type: "checkbox",
+                            checked: fulltext_case_sensitive(),
+                            onchange: move |evt| fulltext_case_sensitive.set(evt.checked()),
+                        }
+                        "Case-sensitive match"
+                    }
                 }
             }
             

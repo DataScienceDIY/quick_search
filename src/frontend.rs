@@ -106,6 +106,22 @@ pub fn App(props: AppProps) -> Element {
                             speed_tracker_clone.set(SpeedTracker::new());
                             "Idle".to_string()
                         },
+                        IndexingStatus::CountingFiles {
+                            current_file,
+                            start_time,
+                            ..
+                        } => {
+                            let elapsed = start_time.elapsed();
+                            let current_file_display = current_file
+                                .as_ref()
+                                .map(|f| format!("{}", f))
+                                .unwrap_or_else(|| "...".to_string());
+                            format!(
+                                "Phase 0 - Counting paths (shell) - {:.1}s elapsed\n{}",
+                                elapsed.as_secs_f64(),
+                                current_file_display
+                            )
+                        }
                         IndexingStatus::RunningFileIndex { files_processed, total_files, current_file, start_time } => {
                             // Add data point to speed tracker
                             speed_tracker_clone.with_mut(|tracker| {

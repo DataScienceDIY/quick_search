@@ -14,13 +14,23 @@ pub struct PathConfig {
     pub database_path: String,
 }
 
+fn default_fts_update_batch_size() -> usize {
+    1000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProcessingConfig {
     pub hash_length: usize,
     pub maximum_text_size: usize,
-    pub maximum_file_size: u64,
+    pub maximum_text_file_size: u64,
     pub batch_size: usize,
+    #[serde(default = "default_fts_update_batch_size")]
+    pub fts_update_batch_size: usize,
     pub tokenize: String,
+    #[serde(default)]
+    pub precount_files_for_progress: bool,
+    #[serde(default)]
+    pub follow_symlinks: bool,
 }
 
 impl Default for Config {
@@ -32,10 +42,13 @@ impl Default for Config {
             },
             processing: ProcessingConfig {
                 hash_length: 1024 * 8,
-                maximum_text_size: 1024 * 512,
-                maximum_file_size: 1024 * 1024 * 50,
+                maximum_text_size: 1024 * 256,
+                maximum_text_file_size: 1024 * 1024 * 2,
                 batch_size: 200,
+                fts_update_batch_size: 1000,
                 tokenize: "trigram".to_string(),
+                precount_files_for_progress: false,
+                follow_symlinks: false,
             },
         }
     }
