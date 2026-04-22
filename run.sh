@@ -1,2 +1,2 @@
-cargo build --release
+cargo build --release -p quicksearch-gui
 ./target/release/quicksearch

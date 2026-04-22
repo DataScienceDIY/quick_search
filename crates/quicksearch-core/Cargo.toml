@@ -1,0 +1,25 @@
+[package]
+name = "quicksearch-core"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "quicksearch_core"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+sha2 = "0.10.8"
+walkdir = "2.5.0"
+zip = "0.6"
+quick-xml = "0.31"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+mime_guess = "2.0"
+infer = "0.15"
+pdf-extract = "0.7"
+lopdf = "0.32"
+lofty = "0.19"
+kamadak-exif = "0.5"
+notify = "6.1"
+ctrlc = "3.4"

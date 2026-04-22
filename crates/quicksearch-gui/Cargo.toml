@@ -1,0 +1,15 @@
+[package]
+name = "quicksearch-gui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "quicksearch"
+path = "src/main.rs"
+
+[dependencies]
+quicksearch-core = { path = "../quicksearch-core" }
+
+dioxus = { version = "0.5.1", features = ["desktop"] }
+dioxus-desktop = "0.5.1"
+tokio = { version = "1.0", features = ["time", "signal"] }

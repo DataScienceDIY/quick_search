@@ -1,1 +1,1 @@
-cargo run
+cargo run -p quicksearch-gui

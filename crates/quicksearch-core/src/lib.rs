@@ -1,0 +1,12 @@
+pub mod cli;
+pub mod config;
+pub mod db;
+pub mod document_extraction;
+pub mod extract;
+pub mod file_handling;
+pub mod indexing;
+pub mod mime;
+pub mod query;
+pub mod search_sql;
+pub mod shutdown;
+pub mod watcher;

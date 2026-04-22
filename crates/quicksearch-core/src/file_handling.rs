@@ -1,22 +1,26 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, Arc};
 use std::ffi::OsString;
-use std::fs::{File,read_to_string};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Component;
+use std::path::{Component, Path};
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 use std::collections::HashMap;
 
 use sha2::{Sha256, Digest};
 use walkdir::{DirEntry, WalkDir};
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 
-use crate::document_extraction::extract_document_text;
 use crate::config::Config;
+use crate::db::repo::{self, NewFile};
+use crate::extract::Registry;
+use crate::indexing::should_abort;
+use crate::mime::{guess_mime, mime_to_type, FileType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExistingFileEntry {
-    pub moddate: u64,
+    pub mtime: u64,
 }
 
 pub const PLAINTEXT_EXTENSIONS_LIST: [&'static str; 84] = 
@@ -58,15 +62,15 @@ pub const SUPPORTED_DOCUMENT_EXTENSIONS_LIST: [&'static str; 9] =
     "ppt", "pptx", "odp", // Presentation
     "xls", "xlsx", "ods"]; // Spreadsheet
 
-/// Load path and moddate per row for incremental classification (hash/size loaded only when updating a file).
+/// Load path and mtime per row for incremental classification (hash/size loaded only when updating a file).
 pub fn load_existing_files(conn: &Connection) -> Result<HashMap<String, ExistingFileEntry>, rusqlite::Error> {
     let mut existing_files = HashMap::new();
-    let mut stmt = conn.prepare("SELECT path, moddate FROM files")?;
+    let mut stmt = conn.prepare("SELECT path, mtime FROM files")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             ExistingFileEntry {
-                moddate: row.get(1)?,
+                mtime: row.get(1)?,
             },
         ))
     })?;
@@ -78,6 +82,29 @@ pub fn load_existing_files(conn: &Connection) -> Result<HashMap<String, Existing
 
     Ok(existing_files)
 }
+
+/// Derive (inode, device_id) from a `std::fs::Metadata` on platforms that
+/// expose them. Returns `(None, None)` on Windows and other non-Unix targets.
+fn inode_and_device(_meta: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (Some(_meta.ino()), Some(_meta.dev()))
+    }
+    #[cfg(not(unix))]
+    {
+        (None, None)
+    }
+}
+
+/// Parent directory of a path as a UTF-8 string, empty if root.
+fn parent_str(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 
 pub fn indexed_walk_file_entries(
     path: &str,
@@ -240,7 +267,7 @@ pub fn classify_dir_entry_for_indexing(
     };
 
     if let Some(existing) = existing_files.get(&fpath) {
-        if existing.moddate != fmodified {
+        if existing.mtime != fmodified {
             Some(FileIndexAction::Update)
         } else {
             Some(FileIndexAction::Skip)
@@ -294,39 +321,14 @@ fn format_progress_pair(visit_index: usize, progress_display_total: Option<usize
     }
 }
 
-const FTS_SQL_AUTOMERGE_8: &str =
-    "INSERT INTO searchabletext(searchabletext, rank) VALUES('automerge', 8)";
-const FTS_SQL_REBUILD: &str = "INSERT INTO searchabletext(searchabletext) VALUES('rebuild')";
-
+/// Nudge FTS5 to merge its index segments. Best-effort optimization; any
+/// error is logged but not fatal.
 pub fn fts_finalize_after_text_indexing(conn: &Connection) -> Result<(), String> {
-    conn.execute(FTS_SQL_AUTOMERGE_8, [])
-        .map_err(|e| format!("FTS automerge(8): {}", e))?;
-    conn.execute(FTS_SQL_REBUILD, [])
-        .map_err(|e| format!("FTS rebuild: {}", e))?;
-    Ok(())
-}
-
-fn fts_remove_document_for_path(
-    tx: &rusqlite::Transaction<'_>,
-    path: &str,
-) -> Result<(), String> {
-    let id_opt: Option<i64> = match tx.query_row(
-        "SELECT id FROM documents WHERE path = ?1",
-        params![path],
-        |r| r.get(0),
+    if let Err(e) = conn.execute(
+        "INSERT INTO searchabletext(searchabletext, rank) VALUES('automerge', 8)",
+        [],
     ) {
-        Ok(id) => Some(id),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(format!("documents id lookup: {}", e)),
-    };
-    if let Some(doc_id) = id_opt {
-        tx.execute(
-            "INSERT INTO searchabletext(searchabletext, rowid) VALUES('delete', ?1)",
-            params![doc_id],
-        )
-        .map_err(|e| format!("FTS delete doc {}: {}", doc_id, e))?;
-        tx.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])
-            .map_err(|e| format!("delete documents row: {}", e))?;
+        eprintln!("Warning: FTS automerge failed (non-fatal): {}", e);
     }
     Ok(())
 }
@@ -459,15 +461,24 @@ pub fn process_batch_updates_files_only(
                 ));
             }
 
-            tx.execute(
-                "UPDATE files SET size = ?1, moddate = ?2, hash = ?3 WHERE path = ?4",
-                params![row.fsize, row.fmodified, row.fhash, row.path_db],
+            let p = Path::new(row.path_db.as_str());
+            let guessed_mime = guess_mime(p);
+            let ftype = guessed_mime
+                .as_deref()
+                .map(mime_to_type)
+                .unwrap_or(FileType::EMPTY);
+            let _ = repo::update_file_basic(
+                &tx,
+                &row.path_db,
+                row.fsize,
+                row.fmodified,
+                Some(row.fhash.as_slice()),
+                guessed_mime.as_deref(),
+                ftype,
             )
-            .map_err(|e| format!("Failed to update file record: {}", e))?;
-
-            fts_remove_document_for_path(&tx, &row.path_db).map_err(|e| {
+            .map_err(|e| {
                 format!(
-                    "Failed to remove old document / FTS entry for {}: {}",
+                    "Failed to update file record + clear stale content for {}: {}",
                     row.path_db, e
                 )
             })?;
@@ -565,12 +576,32 @@ pub fn process_batch_inserts_files_only(
             };
 
             let fname = entry.path().file_name().unwrap().to_os_string();
+            let fname_str = fname.to_string_lossy().into_owned();
+            let fpath_str = fpath.to_string_lossy().into_owned();
+            let parent = parent_str(&fpath_str);
+            let (inode, device_id) = inode_and_device(&meta);
+            let guessed_mime = guess_mime(Path::new(&fpath_str));
+            let ftype = guessed_mime
+                .as_deref()
+                .map(mime_to_type)
+                .unwrap_or(FileType::EMPTY);
 
-            // Insert into files table
-            tx.execute(
-                "INSERT INTO files VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![fname.to_str(), fpath.to_string_lossy(), fsize, fmodified, fhash]
-            ).map_err(|e| format!("Failed to insert file record: {}", e))?;
+            repo::insert_file(
+                &tx,
+                &NewFile {
+                    name: &fname_str,
+                    path: &fpath_str,
+                    parent: &parent,
+                    size: fsize,
+                    mtime: fmodified,
+                    inode,
+                    device_id,
+                    mime: guessed_mime.as_deref(),
+                    ftype,
+                    hash: Some(fhash.as_slice()),
+                },
+            )
+            .map_err(|e| format!("Failed to insert file record: {}", e))?;
         }
 
         // Update status with current file
@@ -588,6 +619,7 @@ pub fn cleanup_stale_index_entries(
     conn_mutex: &Arc<Mutex<Connection>>,
     stale_paths: &[String],
     stop_flag: &Arc<Mutex<bool>>,
+    suspend_flag: &Arc<AtomicBool>,
     status_callback: Option<Box<dyn Fn(&str) + Send + Sync>>,
 ) -> Result<usize, String> {
     if stale_paths.is_empty() {
@@ -601,7 +633,7 @@ pub fn cleanup_stale_index_entries(
 
     let mut deleted_count = 0usize;
     for path in stale_paths {
-        if *stop_flag.lock().unwrap() {
+        if should_abort(stop_flag, suspend_flag) {
             let _ = tx.commit();
             drop(conn);
             return Ok(deleted_count);
@@ -611,23 +643,22 @@ pub fn cleanup_stale_index_entries(
             callback(&format!("Removing stale index entry: {}", path));
         }
 
-        fts_remove_document_for_path(&tx, path).map_err(|e| {
+        if repo::delete_file_by_path(&tx, path).map_err(|e| {
             format!(
-                "Failed to remove stale document / FTS entry for {}: {}",
+                "Failed to remove stale index entry for {}: {}",
                 path, e
             )
-        })?;
-        tx.execute("DELETE FROM files WHERE path = ?1", params![path])
-            .map_err(|e| format!("Failed to delete stale file record {}: {}", path, e))?;
-        deleted_count += 1;
+        })? {
+            deleted_count += 1;
+        }
     }
 
     tx.commit()
         .map_err(|e| format!("Failed to commit stale cleanup transaction: {}", e))?;
 
-    if deleted_count > 0 && !*stop_flag.lock().unwrap() {
+    if deleted_count > 0 && !should_abort(stop_flag, suspend_flag) {
         if let Some(ref callback) = status_callback {
-            callback("Rebuilding FTS index after stale cleanup...");
+            callback("Optimizing FTS index after stale cleanup...");
         }
         fts_finalize_after_text_indexing(&conn)?;
     }
@@ -635,14 +666,19 @@ pub fn cleanup_stale_index_entries(
     Ok(deleted_count)
 }
 
-/// Process text indexing for files - writes `documents`; FTS rebuilt in `fts_finalize_after_text_indexing`.
+/// Process text indexing for all files with `content_state = pending`. For
+/// each file dispatches to the configured extractor [`Registry`], writes the
+/// extracted text + properties via the repo helpers, then flips the row's
+/// `content_state` to done/failed/na so it won't be retried next run.
 pub fn process_text_indexing(
     conn_mutex: &Arc<Mutex<Connection>>,
     stop_flag: &Arc<Mutex<bool>>,
+    suspend_flag: &Arc<AtomicBool>,
     status_callback: Option<Box<dyn Fn(&str) + Send + Sync>>,
     progress_callback: Option<Box<dyn Fn(usize) + Send + Sync>>,
-    config: &Config
+    config: &Config,
 ) -> Result<(), String> {
+    let registry = Registry::default_set();
     let max_size = config.processing.maximum_text_file_size;
     let batch_size = config.processing.batch_size;
     let batch_limit = batch_size as i64;
@@ -654,43 +690,40 @@ pub fn process_text_indexing(
     let total_files: usize = {
         let conn = conn_mutex.lock().unwrap();
         conn.query_row(
-            "SELECT COUNT(*) FROM files f
-             LEFT JOIN documents d ON f.path = d.path
-             WHERE d.path IS NULL AND f.size <= ?1",
+            "SELECT COUNT(*) FROM files WHERE content_state = 0 AND size <= ?1",
             [max_size],
             |row| row.get(0),
         )
         .map_err(|e| format!("Failed to count pending text files: {}", e))?
     };
 
-    let mut cursor_path = String::new();
+    let mut cursor_id: i64 = 0;
     let mut global_index: usize = 0;
 
     loop {
-        if *stop_flag.lock().unwrap() {
+        if should_abort(stop_flag, suspend_flag) {
             return Ok(());
         }
 
-        let batch: Vec<(String, String, u64)> = {
+        let batch: Vec<(i64, String, String, Option<String>)> = {
             let conn = conn_mutex.lock().unwrap();
             let mut stmt = conn
                 .prepare(
-                    "SELECT f.name, f.path, f.size FROM files f
-                     LEFT JOIN documents d ON f.path = d.path
-                     WHERE d.path IS NULL AND f.size <= ?1
-                       AND (?2 = '' OR f.path > ?2)
-                     ORDER BY f.path
-                     LIMIT ?3",
+                    "SELECT id, name, path, mime FROM files
+                      WHERE content_state = 0 AND size <= ?1 AND id > ?2
+                      ORDER BY id
+                      LIMIT ?3",
                 )
                 .map_err(|e| format!("Failed to prepare text indexing query: {}", e))?;
             let rows = stmt
                 .query_map(
-                    rusqlite::params![max_size, cursor_path.as_str(), batch_limit],
+                    rusqlite::params![max_size, cursor_id, batch_limit],
                     |row| {
                         Ok((
-                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(0)?,
                             row.get::<_, String>(1)?,
-                            row.get::<_, u64>(2)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
                         ))
                     },
                 )
@@ -703,15 +736,14 @@ pub fn process_text_indexing(
             break;
         }
 
-        let last_path = batch.last().unwrap().1.clone();
-        cursor_path = last_path;
+        cursor_id = batch.last().unwrap().0;
 
         let conn = conn_mutex.lock().unwrap();
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
-        for (fname, fpath, _fsize) in batch.iter() {
+        for (file_id, fname, fpath, fmime) in batch.iter() {
             if *stop_flag.lock().unwrap() {
                 let _ = tx.commit();
                 drop(conn);
@@ -731,69 +763,43 @@ pub fn process_text_indexing(
                 progress_cb(global_index);
             }
 
-            let path = std::path::Path::new(fpath.as_str());
-            let default_ext = OsString::new();
-            let file_extension = path
-                .extension()
-                .unwrap_or(&default_ext)
-                .to_ascii_lowercase()
-                .to_str()
-                .unwrap_or("")
-                .to_string();
-            let ext_str = file_extension.as_str();
-
-            let text_result = if PLAINTEXT_EXTENSIONS_LIST.contains(&ext_str) {
-                match read_to_string(fpath) {
-                    Ok(file_string) => {
-                        let trimmed_file_string =
-                            safe_truncate_string(&file_string, config.processing.maximum_text_size);
-                        Some(trimmed_file_string)
-                    }
-                    Err(_e) => None,
-                }
-            } else if SUPPORTED_DOCUMENT_EXTENSIONS_LIST.contains(&ext_str) {
-                match extract_document_text(&std::ffi::OsString::from(fpath), ext_str) {
-                    Ok(extracted_text) => {
-                        if !extracted_text.trim().is_empty() {
-                            Some(safe_truncate_string(
-                                &extracted_text,
-                                config.processing.maximum_text_size,
-                            ))
-                        } else {
-                            None
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to extract text from document {}: {}",
-                            fpath, e
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
+            let mime_str = fmime.clone().or_else(|| guess_mime(Path::new(fpath)));
+            let result = match mime_str.as_deref() {
+                Some(m) => registry.extract(Path::new(fpath), m),
+                None => Ok(None),
             };
-
-            if let Some(text_content) = text_result {
-                if let Err(e) = tx.execute(
-                    "INSERT OR REPLACE INTO documents(name, path, text) VALUES (?1, ?2, ?3)",
-                    params![fname, fpath, text_content],
-                ) {
-                    eprintln!("Warning: Failed to insert document row for {}: {}", fpath, e);
+            match result {
+                Ok(Some(mut content)) => {
+                    // Truncate extracted text to configured limit before storage.
+                    if content.text.len() > config.processing.maximum_text_size {
+                        content.text =
+                            safe_truncate_string(&content.text, config.processing.maximum_text_size);
+                    }
+                    let props = content.properties_sorted();
+                    if let Err(e) =
+                        repo::set_content_done(&tx, *file_id, fname, &content.text, &props)
+                    {
+                        eprintln!("Warning: set_content_done for {}: {}", fpath, e);
+                    }
+                }
+                Ok(None) => {
+                    if let Err(e) = repo::set_content_na(&tx, *file_id) {
+                        eprintln!("Warning: set_content_na for {}: {}", fpath, e);
+                    }
+                }
+                Err(reason) => {
+                    if let Err(e) = repo::set_content_failed(&tx, *file_id, &reason) {
+                        eprintln!("Warning: set_content_failed for {}: {}", fpath, e);
+                    }
                 }
             }
-        }
-
-        if let Some(ref callback) = status_callback {
-            callback("Rebuilding FTS index after text addition...");
         }
 
         tx.commit()
             .map_err(|e| format!("Failed to commit transaction: {}", e))?;
     }
 
-    if total_files > 0 && !*stop_flag.lock().unwrap() {
+    if total_files > 0 && !should_abort(stop_flag, suspend_flag) {
         let conn = conn_mutex.lock().unwrap();
         fts_finalize_after_text_indexing(&conn)?;
     }
