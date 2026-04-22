@@ -1,19 +1,10 @@
-[package]
-name = "quicksearch"
+[workspace]
+resolver = "2"
+members = [
+    "crates/quicksearch-core",
+    "crates/quicksearch-gui",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-
-[dependencies]
-dioxus = { version = "0.5.1", features = ["desktop"] }
-dioxus-desktop = "0.5.1"
-dpc-pariter = "0.5.1"
-rusqlite = { version = "0.31.0", features = ["bundled"] }
-sha2 = "0.10.8"
-tqdm = "0.7.0"
-walkdir = "2.5.0"
-zip = "0.6"
-quick-xml = "0.31"
-tokio = { version = "1.0", features = ["time", "signal"] }
-serde = { version = "1.0", features = ["derive"] }
-toml = "0.8"
-ctrlc = "3.4"

@@ -1,5 +1,7 @@
 [paths]
-default_indexing_path = "C:\\"
+# One or more directory roots to index. Walked in order; duplicate and
+# nested roots are de-duplicated automatically.
+indexing_paths = ["C:\\"]
 database_path = "QuickSearch.db"
 
 [processing]
