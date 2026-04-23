@@ -31,6 +31,10 @@ fn default_home_path() -> String {
     ".".to_string()
 }
 
+fn default_store_text_for_snippets() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProcessingConfig {
     pub hash_length: usize,
@@ -46,6 +50,17 @@ pub struct ProcessingConfig {
     pub follow_symlinks: bool,
     #[serde(default)]
     pub include_hidden: bool,
+    /// When `true` (default), extracted text is stored zstd-compressed in
+    /// `documents_text` so search results can render snippet/highlight
+    /// previews without re-reading the source file. When `false` the
+    /// inverted FTS5 index still gets the tokens (so queries return the
+    /// same hits) but nothing is stored alongside; search results carry
+    /// no snippet text and rely on filename/path only. This mode drops
+    /// the on-disk footprint to roughly what stock Baloo uses, at the
+    /// cost of snippet functionality — useful for apples-to-apples size
+    /// comparisons and for users who never look at result previews.
+    #[serde(default = "default_store_text_for_snippets")]
+    pub store_text_for_snippets: bool,
 }
 
 impl Default for Config {
@@ -65,6 +80,7 @@ impl Default for Config {
                 precount_files_for_progress: false,
                 follow_symlinks: false,
                 include_hidden: false,
+                store_text_for_snippets: true,
             },
         }
     }

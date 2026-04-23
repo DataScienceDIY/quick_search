@@ -68,20 +68,35 @@ pub fn Search(props: SearchProps) -> Element {
                 };
 
                 let offset = page.saturating_sub(1).saturating_mul(PAGE_SIZE);
-                let select_sql = match build_select(&args, PAGE_SIZE, offset) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        search_error.set(Some(e));
-                        is_searching.set(false);
-                        return;
+                // Validate early for the filename/duplicates branch so we
+                // surface parse errors before dispatching the blocking task.
+                let precomputed_select_sql = if args.search_type == "fulltext" {
+                    None
+                } else {
+                    match build_select(&args, PAGE_SIZE, offset) {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            search_error.set(Some(e));
+                            is_searching.set(false);
+                            return;
+                        }
                     }
                 };
 
-                // Run select + (optional) count in parallel on the blocking pool.
+                // Fulltext takes the snippet-aware path (decompresses
+                // documents_text and highlights in Rust); filename +
+                // duplicates go through the plain SQL executor.
                 let svc1 = service.clone();
                 let db1 = db_path.clone();
+                let args_for_select = args.clone();
                 let select_handle = tokio::task::spawn_blocking(move || {
-                    svc1.execute_search(&db1, &select_sql)
+                    if args_for_select.search_type == "fulltext" {
+                        svc1.execute_fulltext_search(&db1, &args_for_select, PAGE_SIZE, offset)
+                    } else {
+                        let sql = precomputed_select_sql
+                            .expect("non-fulltext select SQL was prebuilt above");
+                        svc1.execute_search(&db1, &sql)
+                    }
                 });
 
                 let count_handle = count_sql.map(|sql| {

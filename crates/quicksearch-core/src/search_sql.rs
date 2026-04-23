@@ -47,14 +47,21 @@ pub fn build_count(args: &SearchArgs) -> Result<String, String> {
     }
 }
 
-/// SQL that returns one page of results.
+/// SQL that returns one page of results. Columns emitted by the `fulltext`
+/// branch are `(name, path, file_id, text_zstd)` — the snippet is rendered
+/// in Rust from the zstd-compressed `documents_text` row (FTS5 is
+/// contentless, so SQLite's `snippet()` doesn't work on it). The GUI
+/// should use [`crate::indexing::IndexingService::execute_fulltext_search`]
+/// which stitches the decompress + snippet step on top of this SQL.
 pub fn build_select(args: &SearchArgs, limit: u32, offset: u32) -> Result<String, String> {
     match args.search_type.as_str() {
         "fulltext" => {
             let where_clause = build_fulltext_where(args)?;
             Ok(format!(
-                "SELECT f.name, f.path, snippet(searchabletext, 1, '<b>', '</b>', '<b>...</b>', 64) as snippet \
-                 FROM searchabletext AS st JOIN files f ON f.id = st.rowid \
+                "SELECT f.name, f.path, f.id, dt.text_zstd \
+                 FROM searchabletext AS st \
+                 JOIN files f ON f.id = st.rowid \
+                 LEFT JOIN documents_text dt ON dt.file_id = f.id \
                  WHERE {} ORDER BY rank LIMIT {} OFFSET {}",
                 where_clause, limit, offset
             ))
@@ -137,30 +144,62 @@ fn build_fulltext_where(args: &SearchArgs) -> Result<String, String> {
         words.join(" AND ")
     };
 
-    let mut where_clause = format!("st.text MATCH '{}'", sql_quote(&fts_match));
-    if args.fulltext_case_sensitive {
-        if args.fulltext_exact {
-            let literal = words.join(" ");
-            where_clause.push_str(&format!(
-                " AND instr(st.text, '{}') > 0",
-                sql_quote(&literal)
-            ));
-        } else {
-            for w in &words {
-                where_clause.push_str(&format!(
-                    " AND instr(st.text, '{}') > 0",
-                    sql_quote(w)
-                ));
-            }
-        }
-    }
+    // Contentless FTS5 doesn't store column text, so case-sensitive
+    // filtering can't live in SQL anymore. It's re-applied in
+    // `IndexingService::execute_fulltext_search` by checking the
+    // decompressed body text for literal-case matches before returning
+    // the row. The MATCH itself stays case-insensitive (tokenizer folds),
+    // which is the correct candidate-set for a post-filter.
+    let where_clause = format!("st.text MATCH '{}'", sql_quote(&fts_match));
     Ok(where_clause)
+}
+
+/// Pull out the raw words the user typed so the snippet renderer and the
+/// case-sensitive post-filter can see the same tokens `build_fulltext_where`
+/// fed into FTS5. Returns empty when the user's term is empty or contains
+/// only too-short words under the non-exact path.
+pub fn fulltext_terms(args: &SearchArgs) -> Vec<String> {
+    let trimmed = args.term.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let sanitized: String = trimmed
+        .chars()
+        .map(|c| {
+            if matches!(
+                c,
+                ':' | ';' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '~' | '"'
+            ) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let tokens: Vec<String> = sanitized
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    if args.fulltext_exact {
+        // One composite phrase. Snippet rendering wants to highlight the
+        // whole phrase contiguously; the renderer supports multiple terms
+        // already so we collapse to the joined form.
+        vec![tokens.join(" ")]
+    } else {
+        tokens
+            .into_iter()
+            .filter(|w| w.chars().count() >= 3)
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{open_and_migrate, repo::{insert_file, set_content_done, NewFile}};
+    use crate::db::{open_or_recreate, repo::{insert_file, set_content_done, NewFile}};
     use crate::mime::FileType;
 
     fn args(search_type: &str, term: &str) -> SearchArgs {
@@ -178,7 +217,36 @@ mod tests {
         assert!(sql.contains("LIMIT 50"));
         assert!(sql.contains("OFFSET 100"));
         assert!(sql.contains("ORDER BY rank"));
-        assert!(sql.contains("snippet(searchabletext"));
+        // Snippet rendering moved to Rust; SQL returns the compressed blob
+        // so the post-processor can decompress + highlight.
+        assert!(sql.contains("dt.text_zstd"), "got {sql}");
+    }
+
+    #[test]
+    fn fulltext_case_sensitive_no_longer_in_sql() {
+        let mut a = args("fulltext", "Hello");
+        a.fulltext_case_sensitive = true;
+        let sql = build_select(&a, 50, 0).unwrap();
+        // Post-filter lives in Rust now — no instr() or st.text reference.
+        assert!(!sql.contains("instr("), "got {sql}");
+    }
+
+    #[test]
+    fn fulltext_terms_extract_non_exact() {
+        let a = args("fulltext", "the quick brown");
+        let t = fulltext_terms(&a);
+        // Short words like "the" are dropped (trigram min length 3 applies
+        // in non-exact mode — matches the SQL build rules).
+        assert!(t.iter().any(|s| s == "quick"));
+        assert!(t.iter().any(|s| s == "brown"));
+    }
+
+    #[test]
+    fn fulltext_terms_exact_mode_returns_joined_phrase() {
+        let mut a = args("fulltext", "hello world");
+        a.fulltext_exact = true;
+        let t = fulltext_terms(&a);
+        assert_eq!(t, vec!["hello world".to_string()]);
     }
 
     #[test]
@@ -253,7 +321,7 @@ mod tests {
     #[test]
     fn end_to_end_pagination_smoke() {
         let p = tmp_path();
-        let mut conn = open_and_migrate(p.to_str().unwrap(), "trigram").unwrap();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         {
             let tx = conn.transaction().unwrap();
             for i in 0..7 {
@@ -275,7 +343,7 @@ mod tests {
                 )
                 .unwrap()
                 .expect("unique path");
-                set_content_done(&tx, id, &format!("file_{}.txt", i), "shared body content", &[]).unwrap();
+                set_content_done(&tx, id, &format!("file_{}.txt", i), "shared body content", &[], true).unwrap();
             }
             tx.commit().unwrap();
         }

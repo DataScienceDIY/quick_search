@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn end_to_end_combined_filter_executes() {
         use crate::db::{
-            open_and_migrate,
+            open_or_recreate,
             repo::{insert_file, set_content_done, NewFile},
         };
         use crate::mime::FileType;
@@ -562,7 +562,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let mut conn = open_and_migrate(p.to_str().unwrap(), "trigram").unwrap();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
 
         // Two audio files, one document. Only the "audio with beatles" file
         // should be returned for `type:Audio beatles`.
@@ -591,6 +591,7 @@ mod tests {
                 "beatles-track.mp3",
                 "beatles hey jude",
                 &[("artist".into(), "The Beatles".into())],
+                true,
             )
             .unwrap();
             let b = insert_file(
@@ -610,7 +611,7 @@ mod tests {
             )
             .unwrap()
             .expect("unique path");
-            set_content_done(&tx, b, "bach.flac", "bach prelude", &[]).unwrap();
+            set_content_done(&tx, b, "bach.flac", "bach prelude", &[], true).unwrap();
             let c = insert_file(
                 &tx,
                 &NewFile {
@@ -628,7 +629,7 @@ mod tests {
             )
             .unwrap()
             .expect("unique path");
-            set_content_done(&tx, c, "notes.txt", "beatles biography", &[]).unwrap();
+            set_content_done(&tx, c, "notes.txt", "beatles biography", &[], true).unwrap();
             tx.commit().unwrap();
             vec![a, b, c]
         };

@@ -8,7 +8,7 @@
 
 use rusqlite::{params, OptionalExtension};
 
-use crate::db::open_and_migrate;
+use crate::db::open_or_recreate;
 use crate::db::repo::{STATE_DONE, STATE_FAILED, STATE_NA, STATE_PENDING};
 
 /// Per-file indexing status, mirroring Baloo's multi-state reporting.
@@ -55,19 +55,38 @@ pub struct FailedEntry {
 /// Storage footprint report. "Partitions" correspond to SQL tables for our
 /// SQLite layout (Baloo's LMDB has named sub-DBs; our equivalent is per-table
 /// row/size counts).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `documents_text_*` fields cover the zstd-compressed extracted-text
+/// sidecar that replaced the regular FTS5 stored text in schema v3. Ratio
+/// is `compressed / raw` so a value of ~0.3 means we saved ~70% vs storing
+/// the plaintext verbatim.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SizeReport {
     pub file_size_bytes: u64,
     pub files_row_count: i64,
     pub properties_row_count: i64,
     pub failed_files_row_count: i64,
     pub searchabletext_row_count: i64,
+    pub documents_text_row_count: i64,
+    pub documents_text_raw_bytes: i64,
+    pub documents_text_compressed_bytes: i64,
+}
+
+impl SizeReport {
+    /// Compressed:raw ratio for the stored extracted text. `None` when no
+    /// rows have been written yet (avoids divide-by-zero).
+    pub fn documents_text_ratio(&self) -> Option<f64> {
+        if self.documents_text_raw_bytes <= 0 {
+            return None;
+        }
+        Some(self.documents_text_compressed_bytes as f64 / self.documents_text_raw_bytes as f64)
+    }
 }
 
 /// Query the per-file indexing status. Returns `FileStatus` with
 /// `basic == NotIndexed` if the path isn't in the database.
 pub fn status_for_path(db_path: &str, path: &str) -> Result<FileStatus, String> {
-    let conn = open_and_migrate(db_path, "trigram")?;
+    let conn = open_or_recreate(db_path, "trigram")?;
     let row: Option<(i64, i64, Option<String>)> = conn
         .query_row(
             "SELECT basic_state, content_state, failure_msg FROM files WHERE path = ?1",
@@ -94,7 +113,7 @@ pub fn status_for_path(db_path: &str, path: &str) -> Result<FileStatus, String> 
 
 /// Return every file that failed content extraction, newest first.
 pub fn list_failed(db_path: &str, limit: Option<u32>) -> Result<Vec<FailedEntry>, String> {
-    let conn = open_and_migrate(db_path, "trigram")?;
+    let conn = open_or_recreate(db_path, "trigram")?;
     let limit_sql = match limit {
         Some(n) => format!(" LIMIT {}", n),
         None => String::new(),
@@ -128,17 +147,29 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
     let file_size_bytes = std::fs::metadata(db_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let conn = open_and_migrate(db_path, "trigram")?;
+    let conn = open_or_recreate(db_path, "trigram")?;
     let count = |table: &str| -> Result<i64, String> {
         conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |r| r.get(0))
             .map_err(|e| format!("count {}: {}", table, e))
     };
+    let dt_row_count: i64 = count("documents_text")?;
+    let (dt_raw, dt_compressed): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(text_len), 0), COALESCE(SUM(LENGTH(text_zstd)), 0) FROM documents_text",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| format!("documents_text size sum: {}", e))?;
+
     Ok(SizeReport {
         file_size_bytes,
         files_row_count: count("files")?,
         properties_row_count: count("properties")?,
         failed_files_row_count: count("failed_files")?,
         searchabletext_row_count: count("searchabletext")?,
+        documents_text_row_count: dt_row_count,
+        documents_text_raw_bytes: dt_raw,
+        documents_text_compressed_bytes: dt_compressed,
     })
 }
 
@@ -150,7 +181,7 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
 /// Used by the Baloo compat daemon to report the "Files waiting for content
 /// indexing" figure both to balooctl and to the LMDB mirror.
 pub fn pending_content_count(db_path: &str) -> Result<i64, String> {
-    let conn = open_and_migrate(db_path, "trigram")?;
+    let conn = open_or_recreate(db_path, "trigram")?;
     conn.query_row(
         "SELECT COUNT(*) FROM files WHERE content_state = ?1",
         rusqlite::params![crate::db::repo::STATE_PENDING],
@@ -162,7 +193,7 @@ pub fn pending_content_count(db_path: &str) -> Result<i64, String> {
 /// Remove a single file from the index. Returns whether a row was deleted.
 /// Keeps FTS/documents/properties in sync via the repo helpers.
 pub fn clear_path(db_path: &str, path: &str) -> Result<bool, String> {
-    let mut conn = open_and_migrate(db_path, "trigram")?;
+    let mut conn = open_or_recreate(db_path, "trigram")?;
     let tx = conn
         .transaction()
         .map_err(|e| format!("clear_path begin tx: {}", e))?;
@@ -192,7 +223,7 @@ mod tests {
     }
 
     fn seed_fixture(db_path: &str) -> (i64, i64) {
-        let mut conn = open_and_migrate(db_path, "trigram").unwrap();
+        let mut conn = open_or_recreate(db_path, "trigram").unwrap();
         let (a, b) = {
             let tx = conn.transaction().unwrap();
             let a = insert_file(
@@ -212,7 +243,7 @@ mod tests {
             )
             .unwrap()
             .expect("unique path");
-            set_content_done(&tx, a, "a.txt", "hello", &[]).unwrap();
+            set_content_done(&tx, a, "a.txt", "hello", &[], true).unwrap();
             let b = insert_file(
                 &tx,
                 &NewFile {
@@ -281,6 +312,52 @@ mod tests {
         assert!(r.file_size_bytes > 0);
         assert_eq!(r.files_row_count, 2);
         assert_eq!(r.failed_files_row_count, 1);
+        // File a got content ("hello"); file b failed. Only one documents_text row.
+        assert_eq!(r.documents_text_row_count, 1);
+        assert_eq!(r.documents_text_raw_bytes, "hello".len() as i64);
+        assert!(r.documents_text_compressed_bytes > 0);
+
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn documents_text_ratio_reports_savings_on_compressible_prose() {
+        // Feed highly-compressible prose (lots of repeated words) and verify
+        // the reported ratio reflects real savings. Guards against anyone
+        // silently swapping the compression step for a pass-through.
+        let p = tmp_path();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            let id = insert_file(
+                &tx,
+                &NewFile {
+                    name: "big.txt",
+                    path: "/tmp/big.txt",
+                    parent: "/tmp",
+                    size: 1,
+                    mtime: 1,
+                    inode: None,
+                    device_id: None,
+                    mime: Some("text/plain"),
+                    ftype: FileType::TEXT,
+                    hash: None,
+                },
+            )
+            .unwrap()
+            .expect("unique path");
+            let prose = "the quick brown fox jumps over the lazy dog. ".repeat(500);
+            set_content_done(&tx, id, "big.txt", &prose, &[], true).unwrap();
+            tx.commit().unwrap();
+        }
+        drop(conn);
+
+        let r = index_size_breakdown(p.to_str().unwrap()).unwrap();
+        let ratio = r.documents_text_ratio().expect("has rows");
+        // Repeating a 44-byte sentence 500x → zstd should hit <20% ratio
+        // trivially. Loose bound protects the test from zstd version churn.
+        assert!(ratio < 0.3, "ratio too high: {ratio} raw={} comp={}",
+            r.documents_text_raw_bytes, r.documents_text_compressed_bytes);
 
         std::fs::remove_file(&p).ok();
     }
