@@ -687,6 +687,23 @@ pub fn process_text_indexing(
         callback("Counting files pending text index…");
     }
 
+    // Files bigger than our text-file cap can never graduate from
+    // `content_state = 0`, so they'd otherwise sit in the "pending content
+    // indexing" column forever and peg System Settings' progress below
+    // 100%. Flip them to `content_state = 3` (not-applicable) now. Doing
+    // this every run is idempotent and also handles the case where a user
+    // *lowers* `maximum_text_file_size` between runs — previously-pending
+    // files that cross the threshold get correctly marked.
+    {
+        let conn = conn_mutex.lock().unwrap();
+        conn.execute(
+            "UPDATE files SET content_state = 3 \
+             WHERE content_state = 0 AND size > ?1",
+            [max_size],
+        )
+        .map_err(|e| format!("mark oversize files NA: {}", e))?;
+    }
+
     let total_files: usize = {
         let conn = conn_mutex.lock().unwrap();
         conn.query_row(

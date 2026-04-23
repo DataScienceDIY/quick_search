@@ -14,7 +14,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::schema::{fts_create_sql, PRAGMAS_FAST, SCHEMA_CURRENT};
+use super::schema::{effective_tokenizer, fts_create_sql, PRAGMAS_FAST, SCHEMA_CURRENT};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
@@ -34,7 +34,15 @@ pub fn open_and_migrate(db_path: &str, tokenizer: &str) -> Result<Connection, St
 
     let version = read_schema_version(&conn)?;
     match version {
-        Some(v) if v == CURRENT_SCHEMA_VERSION => {}
+        Some(v) if v == CURRENT_SCHEMA_VERSION => {
+            // Schema version matches. Before returning, check whether the
+            // FTS5 tokenizer config has drifted (e.g. someone upgraded to a
+            // build that switched the default to `trigram remove_diacritics 1`).
+            // If so, rebuild the FTS table in place — cheaper than a full
+            // DB wipe since `files` rows stay intact; only content
+            // extraction (phase 2) re-runs.
+            maybe_rebuild_fts_for_tokenizer_change(&conn, tokenizer)?;
+        }
         Some(v) if v > CURRENT_SCHEMA_VERSION => {
             return Err(format!(
                 "Database schema version {} is newer than this build ({}). \
@@ -71,6 +79,53 @@ pub fn open_and_migrate(db_path: &str, tokenizer: &str) -> Result<Connection, St
     }
 
     Ok(conn)
+}
+
+/// If the stored `schema_info.tokenize` value doesn't match the effective
+/// tokenizer the caller wants now, drop and recreate `searchabletext` with
+/// the new tokenizer and reset `files.content_state` so the text-extraction
+/// phase re-runs on next indexing pass. Keeps the `files`, `properties`,
+/// and `failed_files` rows intact.
+fn maybe_rebuild_fts_for_tokenizer_change(
+    conn: &Connection,
+    tokenizer: &str,
+) -> Result<(), String> {
+    let want = effective_tokenizer(tokenizer);
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM schema_info WHERE key = 'tokenize'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("read schema_info.tokenize: {}", e))?;
+
+    if stored.as_deref() == Some(&*want) {
+        return Ok(());
+    }
+
+    eprintln!(
+        "QuickSearch: FTS5 tokenizer changed from {:?} to {:?}; rebuilding searchabletext. \
+         File metadata is preserved; content extraction will re-run on next indexing pass.",
+        stored.as_deref().unwrap_or("(none)"),
+        want
+    );
+    conn.execute("DROP TABLE IF EXISTS searchabletext", [])
+        .map_err(|e| format!("drop searchabletext: {}", e))?;
+    let create_sql = fts_create_sql(tokenizer);
+    conn.execute_batch(&create_sql)
+        .map_err(|e| format!("recreate searchabletext: {}", e))?;
+    conn.execute(
+        "UPDATE files SET content_state = 0 WHERE content_state != 0",
+        [],
+    )
+    .map_err(|e| format!("reset content_state: {}", e))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_info(key, value) VALUES ('tokenize', ?1)",
+        params![want],
+    )
+    .map_err(|e| format!("update schema_info.tokenize: {}", e))?;
+    Ok(())
 }
 
 fn wipe_and_reopen(
@@ -166,9 +221,13 @@ fn apply_current_schema(conn: &Connection, tokenizer: &str) -> Result<(), String
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    // Store the *effective* tokenizer string (with any default options we
+    // auto-applied). On subsequent opens we compare this against what the
+    // caller asks for and rebuild the FTS table if it changed.
+    let effective = effective_tokenizer(tokenizer);
     conn.execute(
         "INSERT INTO schema_info(key, value) VALUES ('version', ?1), ('created_at', ?2), ('tokenize', ?3)",
-        params![CURRENT_SCHEMA_VERSION.to_string(), now.to_string(), tokenizer],
+        params![CURRENT_SCHEMA_VERSION.to_string(), now.to_string(), effective],
     )
     .map_err(|e| format!("Failed to seed schema_info: {}", e))?;
 
