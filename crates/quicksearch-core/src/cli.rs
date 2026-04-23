@@ -142,6 +142,23 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
     })
 }
 
+/// Count files with `content_state = 0` (pending). Distinct from
+/// `files_row_count − searchabletext_row_count`, which over-counts because
+/// files whose content doesn't apply (binary formats, too-large files) sit
+/// with `content_state = 3` (NA) forever and never become FTS rows.
+///
+/// Used by the Baloo compat daemon to report the "Files waiting for content
+/// indexing" figure both to balooctl and to the LMDB mirror.
+pub fn pending_content_count(db_path: &str) -> Result<i64, String> {
+    let conn = open_and_migrate(db_path, "trigram")?;
+    conn.query_row(
+        "SELECT COUNT(*) FROM files WHERE content_state = ?1",
+        rusqlite::params![crate::db::repo::STATE_PENDING],
+        |r| r.get(0),
+    )
+    .map_err(|e| format!("pending_content_count: {}", e))
+}
+
 /// Remove a single file from the index. Returns whether a row was deleted.
 /// Keeps FTS/documents/properties in sync via the repo helpers.
 pub fn clear_path(db_path: &str, path: &str) -> Result<bool, String> {

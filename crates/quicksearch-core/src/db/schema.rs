@@ -74,11 +74,52 @@ CREATE TABLE config_validation (
 /// INSERT/UPDATE/DELETE work with normal SQL semantics. `rowid` is supplied
 /// by the caller and must equal `files.id`.
 pub fn fts_create_sql(tokenizer: &str) -> String {
+    let effective = effective_tokenizer(tokenizer);
     format!(
         "CREATE VIRTUAL TABLE searchabletext USING fts5(\
             name, text, properties, \
             tokenize='{}'\
         );",
-        tokenizer.replace('\'', "''")
+        effective.replace('\'', "''")
     )
+}
+
+/// Map a user-facing tokenizer name to the actual FTS5 option string we
+/// apply. The default `trigram` gets `remove_diacritics 1` appended so an
+/// ASCII query like `cafe` matches indexed `café`, and vice versa.
+/// Without this, the default trigram tokenizer would emit disjoint
+/// trigram sets for the two spellings and `MATCH` would miss one of them.
+/// Users who want precise match semantics can pass the full option string
+/// (e.g. `"trigram case_sensitive 1 remove_diacritics 0"`) and we'll use
+/// it verbatim.
+pub fn effective_tokenizer(tokenizer: &str) -> String {
+    let trimmed = tokenizer.trim();
+    if trimmed.eq_ignore_ascii_case("trigram") {
+        // Explicit default includes accent stripping. `case_sensitive 0`
+        // is FTS5's default too; we repeat it here for clarity.
+        "trigram remove_diacritics 1".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_trigram_gets_accent_stripping() {
+        assert_eq!(effective_tokenizer("trigram"), "trigram remove_diacritics 1");
+        assert_eq!(effective_tokenizer("  trigram  "), "trigram remove_diacritics 1");
+    }
+
+    #[test]
+    fn explicit_tokenizers_pass_through() {
+        assert_eq!(
+            effective_tokenizer("trigram remove_diacritics 0"),
+            "trigram remove_diacritics 0"
+        );
+        assert_eq!(effective_tokenizer("porter"), "porter");
+        assert_eq!(effective_tokenizer("unicode61"), "unicode61");
+    }
 }
