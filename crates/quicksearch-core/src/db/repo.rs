@@ -121,15 +121,21 @@ pub fn update_file_basic(
 }
 
 /// Mark a file's content indexing as complete and write the extracted text +
-/// properties atomically. FTS5 stores the canonical text for this file;
-/// `properties` are stored both as a structured side-table (for exact
-/// retrieval) and concatenated into the FTS `properties` column (for MATCH).
+/// properties atomically. The plaintext is fed to the contentless FTS5
+/// tokenizer (which keeps only the inverted index) and — when `store_text`
+/// is `true` — separately stored zstd-compressed in `documents_text` for
+/// on-demand snippet rendering. When `store_text=false` the sidecar INSERT
+/// is skipped: queries still match the right files but result rows can't
+/// render snippets. `properties` are stored both as a structured side-
+/// table (for exact retrieval) and concatenated into the FTS `properties`
+/// column (for MATCH).
 pub fn set_content_done(
     tx: &Transaction<'_>,
     file_id: i64,
     name: &str,
     text: &str,
     properties: &[(String, String)],
+    store_text: bool,
 ) -> Result<(), String> {
     // Clear any previous extraction (in case of re-run).
     remove_content_for_id(tx, file_id)?;
@@ -142,11 +148,27 @@ pub fn set_content_done(
         .map_err(|e| format!("insert property {}={}: {}", k, v, e))?;
     }
     let props_blob = encode_properties_for_fts(properties);
+    // Contentless FTS5 still accepts values on INSERT — the tokenizer needs
+    // them — it simply doesn't persist the raw column values.
     tx.execute(
         "INSERT INTO searchabletext(rowid, name, text, properties) VALUES (?1, ?2, ?3, ?4)",
         params![file_id, name, text, props_blob],
     )
     .map_err(|e| format!("insert FTS row {}: {}", file_id, e))?;
+
+    // Skip the compressed sidecar when: the config disables snippet storage
+    // outright, or there's no body text (e.g. an image whose extractor
+    // returned only EXIF properties). The second case saves a zstd frame
+    // on what would otherwise be an empty blob.
+    if store_text && !text.is_empty() {
+        let compressed = zstd::encode_all(text.as_bytes(), ZSTD_LEVEL)
+            .map_err(|e| format!("zstd encode for file {}: {}", file_id, e))?;
+        tx.execute(
+            "INSERT INTO documents_text(file_id, text_zstd, text_len) VALUES (?1, ?2, ?3)",
+            params![file_id, compressed, text.len() as i64],
+        )
+        .map_err(|e| format!("insert documents_text {}: {}", file_id, e))?;
+    }
 
     tx.execute(
         "UPDATE files SET content_state = ?1, failure_msg = NULL WHERE id = ?2",
@@ -158,6 +180,13 @@ pub fn set_content_done(
         .map_err(|e| format!("clear failed_files {}: {}", file_id, e))?;
     Ok(())
 }
+
+/// zstd level tuned for extracted-text prose. Level 3 hits ~3-5× on English
+/// prose at high throughput (hundreds of MB/s) — level 9+ would shave a few
+/// percent more but at 10× the CPU cost during indexing. Wrong knob to
+/// tune: readers decompress far faster than writers compress, so keep
+/// write-side cost low.
+const ZSTD_LEVEL: i32 = 3;
 
 /// Mark a file's content extraction as failed. Keeps the basic row in place.
 pub fn set_content_failed(
@@ -213,16 +242,22 @@ pub fn delete_file_by_path(tx: &Transaction<'_>, path: &str) -> Result<bool, Str
     Ok(true)
 }
 
-/// Remove the FTS row and any `properties` rows for a given file id. Does
-/// not touch the `files` row itself. Idempotent — a missing FTS row is fine.
+/// Remove the FTS row, compressed text blob, and any `properties` rows for
+/// a given file id. Does not touch the `files` row itself. Idempotent — a
+/// missing row is fine.
 pub fn remove_content_for_id(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
-    // Regular FTS5 supports a plain DELETE by rowid; no need to supply the
-    // old column values the way a contentless table would require.
+    // `contentless_delete=1` on the FTS5 table makes this work without
+    // re-supplying the old column values (it tombstones the rowid).
     tx.execute(
         "DELETE FROM searchabletext WHERE rowid = ?1",
         params![file_id],
     )
     .map_err(|e| format!("FTS delete row {}: {}", file_id, e))?;
+    tx.execute(
+        "DELETE FROM documents_text WHERE file_id = ?1",
+        params![file_id],
+    )
+    .map_err(|e| format!("delete documents_text {}: {}", file_id, e))?;
     tx.execute("DELETE FROM properties WHERE file_id = ?1", params![file_id])
         .map_err(|e| format!("delete properties {}: {}", file_id, e))?;
     Ok(())
@@ -257,7 +292,7 @@ pub fn checkpoint_and_close(conn: Connection) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::open_and_migrate;
+    use crate::db::open_or_recreate;
 
     fn tmp_path() -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -275,7 +310,7 @@ mod tests {
     #[test]
     fn insert_update_delete_round_trip() {
         let p = tmp_path();
-        let mut conn = open_and_migrate(p.to_str().unwrap(), "trigram").unwrap();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         {
             let tx = conn.transaction().unwrap();
             let id = insert_file(
@@ -301,6 +336,7 @@ mod tests {
                 "a.txt",
                 "hello world",
                 &[("title".to_string(), "hi".to_string())],
+                true,
             )
             .unwrap();
             tx.commit().unwrap();
@@ -338,7 +374,7 @@ mod tests {
     #[test]
     fn update_resets_content_state() {
         let p = tmp_path();
-        let mut conn = open_and_migrate(p.to_str().unwrap(), "trigram").unwrap();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         let id = {
             let tx = conn.transaction().unwrap();
             let id = insert_file(
@@ -358,7 +394,7 @@ mod tests {
             )
             .unwrap()
             .expect("unique path");
-            set_content_done(&tx, id, "a.txt", "old text", &[]).unwrap();
+            set_content_done(&tx, id, "a.txt", "old text", &[], true).unwrap();
             tx.commit().unwrap();
             id
         };
@@ -409,7 +445,7 @@ mod tests {
         // (overlapping roots, symlink resolution quirks), the second INSERT
         // must be a silent no-op, not a run-ending error.
         let p = tmp_path();
-        let mut conn = open_and_migrate(p.to_str().unwrap(), "trigram").unwrap();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         let tx = conn.transaction().unwrap();
         let row = NewFile {
             name: "dup.txt",
@@ -447,7 +483,7 @@ mod tests {
     #[test]
     fn set_content_failed_writes_failed_table() {
         let p = tmp_path();
-        let mut conn = open_and_migrate(p.to_str().unwrap(), "trigram").unwrap();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         let id = {
             let tx = conn.transaction().unwrap();
             let id = insert_file(

@@ -793,9 +793,14 @@ pub fn process_text_indexing(
                             safe_truncate_string(&content.text, config.processing.maximum_text_size);
                     }
                     let props = content.properties_sorted();
-                    if let Err(e) =
-                        repo::set_content_done(&tx, *file_id, fname, &content.text, &props)
-                    {
+                    if let Err(e) = repo::set_content_done(
+                        &tx,
+                        *file_id,
+                        fname,
+                        &content.text,
+                        &props,
+                        config.processing.store_text_for_snippets,
+                    ) {
                         eprintln!("Warning: set_content_done for {}: {}", fpath, e);
                     }
                 }

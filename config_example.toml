@@ -25,3 +25,13 @@ include_hidden = false
 # FTS5 tokenization method (e.g., 'trigram', 'porter', 'unicode61')
 # Look here for more information https://www.sqlite.org/fts5.html#tokenizers
 tokenize = "trigram"
+# If true (default), extracted text is stored zstd-compressed in a sidecar
+# table so the GUI's search results can render snippet previews with the
+# query terms highlighted. If false, the inverted FTS5 index is still
+# populated (so queries match the same files) but nothing is stored
+# alongside; result rows carry no snippet. Turning this off drops the
+# on-disk footprint to roughly what stock Baloo uses, useful for
+# apples-to-apples comparisons and for users who never read snippet text.
+# Changing this only affects files indexed *after* the change; existing
+# sidecar rows are kept until re-indexed.
+store_text_for_snippets = true

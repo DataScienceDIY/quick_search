@@ -9,4 +9,5 @@ pub mod mime;
 pub mod query;
 pub mod search_sql;
 pub mod shutdown;
+pub mod snippet;
 pub mod watcher;

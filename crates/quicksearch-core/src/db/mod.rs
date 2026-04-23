@@ -1,13 +1,13 @@
-//! SQLite schema, migrations, and row-level repository helpers.
+//! SQLite schema, on-disk open/recreate, and row-level repository helpers.
 //!
-//! The only "live" schema is `CURRENT_SCHEMA_VERSION` (see [`schema`]). Older
-//! databases are detected in [`migrate::open_and_migrate`] and recreated from
-//! scratch — Set A of the QuickSearch → Baloo work is the first schema bump
-//! and carries no rows we'd want to preserve. Subsequent migrations should
-//! prefer `ALTER TABLE` and versioned steps.
+//! Policy: a single [`open::open_or_recreate`] is the only entry point. Any
+//! schema mismatch — wrong version, drifted tokenizer, absent `schema_info`
+//! — wipes the DB and rebuilds from [`schema::SCHEMA_CURRENT`]. There are
+//! no in-place migrations by design; re-indexing is accepted as the cost
+//! of avoiding migration-path complexity.
 
-pub mod migrate;
+pub mod open;
 pub mod repo;
 pub mod schema;
 
-pub use migrate::{open_and_migrate, CURRENT_SCHEMA_VERSION};
+pub use open::{open_or_recreate, CURRENT_SCHEMA_VERSION};

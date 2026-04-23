@@ -81,6 +81,24 @@ pub struct IndexingService {
 /// Polling interval for `should_abort` while suspended.
 const SUSPEND_POLL_MS: u64 = 100;
 
+/// Map a rusqlite/SQLite error string into the tagged form the GUI's
+/// search panel recognises (so it can pop the corruption-recovery dialog,
+/// special-case FTS5 syntax errors, etc.). Centralized so both generic
+/// `execute_search` and the fulltext-specific path classify errors the
+/// same way.
+fn classify_sql_err(error_msg: &str) -> String {
+    if error_msg.contains("malformed")
+        || error_msg.contains("corrupt")
+        || error_msg.contains("database disk image is malformed")
+    {
+        format!("DATABASE_CORRUPTED: {}", error_msg)
+    } else if error_msg.contains("fts5: syntax error") {
+        "Search syntax error: The search term contains characters that cannot be processed. Please try a simpler search term.".into()
+    } else {
+        format!("Failed to execute query: {}", error_msg)
+    }
+}
+
 /// Combined stop/suspend check used by worker loops. Returns `true` iff the
 /// caller should abort the operation. While the suspend flag is set and stop
 /// is not, this parks the thread by sleeping in short increments so a later
@@ -237,9 +255,97 @@ impl IndexingService {
         self.stop_indexing()
     }
 
+    /// Fulltext-specific search path that emits rendered snippets. Runs the
+    /// SQL produced by [`crate::search_sql::build_select`] for a fulltext
+    /// `SearchArgs`, which returns `(name, path, file_id, text_zstd)`, then
+    /// decompresses each text blob and hands it to [`crate::snippet::render`]
+    /// together with the query terms. Case-sensitive mode is re-applied in
+    /// Rust since contentless FTS5 no longer stores the raw text.
+    ///
+    /// The shape of the returned [`SearchResult`] matches what the GUI's
+    /// results table expects: columns `(name, path, snippet)`.
+    pub fn execute_fulltext_search(
+        &self,
+        db_path: &str,
+        args: &crate::search_sql::SearchArgs,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<SearchResult>, String> {
+        use crate::search_sql::{build_select, fulltext_terms};
+        use crate::snippet;
+
+        let sql = build_select(args, limit, offset)?;
+        let terms = fulltext_terms(args);
+        let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+
+        let conn = db::open_or_recreate(db_path, "trigram").map_err(|e| {
+            if e.contains("corrupt") || e.contains("malformed") {
+                format!("DATABASE_CORRUPTED: {}", e)
+            } else {
+                e
+            }
+        })?;
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| classify_sql_err(&e.to_string()))?;
+
+        let rows_iter = stmt
+            .query_map([], |row| {
+                let name: String = row.get(0)?;
+                let path: String = row.get(1)?;
+                let _file_id: i64 = row.get(2)?;
+                let blob: Option<Vec<u8>> = row.get(3)?;
+                Ok((name, path, blob))
+            })
+            .map_err(|e| classify_sql_err(&e.to_string()))?;
+
+        let snippet_opts = snippet::Options::default();
+        let mut out_rows: Vec<SearchResultRow> = Vec::new();
+        for r in rows_iter {
+            let (name, path, blob) =
+                r.map_err(|e| classify_sql_err(&e.to_string()))?;
+            let body = match blob {
+                None => String::new(),
+                Some(bytes) if bytes.is_empty() => String::new(),
+                Some(bytes) => match zstd::decode_all(bytes.as_slice()) {
+                    Ok(raw) => String::from_utf8_lossy(&raw).into_owned(),
+                    Err(_) => String::new(),
+                },
+            };
+
+            // Case-sensitive post-filter: every query term must appear with
+            // the exact case supplied by the user. Applied to the body
+            // text; filename hits are still matched by the FTS MATCH which
+            // is case-insensitive (filenames are usually mixed case and the
+            // user probably doesn't care). Exact-phrase mode treats the
+            // whole quoted phrase as one token.
+            if args.fulltext_case_sensitive && !body.is_empty() {
+                let all_present = terms.iter().all(|t| body.contains(t.as_str()));
+                if !all_present {
+                    continue;
+                }
+            }
+
+            let rendered = if body.is_empty() {
+                String::new()
+            } else {
+                snippet::render(&body, &term_refs, &snippet_opts)
+            };
+            out_rows.push(SearchResultRow {
+                values: vec![name, path, rendered],
+            });
+        }
+
+        Ok(vec![SearchResult {
+            columns: vec!["name".into(), "path".into(), "snippet".into()],
+            rows: out_rows,
+        }])
+    }
+
     /// Execute a search query against the database
     pub fn execute_search(&self, db_path: &str, query: &str) -> Result<Vec<SearchResult>, String> {
-        let conn = db::open_and_migrate(db_path, "trigram")
+        let conn = db::open_or_recreate(db_path, "trigram")
             .map_err(|e| {
                 if e.contains("corrupt") || e.contains("malformed") {
                     format!("DATABASE_CORRUPTED: {}", e)
@@ -404,7 +510,7 @@ impl IndexingService {
 
     /// Check if configuration changes require index recreation
     pub fn check_config_validation(&self, db_path: &str, config: &Config, indexing_path: &str) -> Result<Option<Vec<String>>, String> {
-        let conn = db::open_and_migrate(db_path, &config.processing.tokenize)?;
+        let conn = db::open_or_recreate(db_path, &config.processing.tokenize)?;
         Self::validate_config(&conn, config, indexing_path)
     }
 
@@ -580,7 +686,7 @@ impl IndexingService {
             .collect();
 
         // Open and migrate the database to the current schema version.
-        let conn = db::open_and_migrate(db_path, &config.processing.tokenize)?;
+        let conn = db::open_or_recreate(db_path, &config.processing.tokenize)?;
 
         // Update configuration (for new installations or when no validation issues).
         // `indexing_path` in the validation table stores the joined list so

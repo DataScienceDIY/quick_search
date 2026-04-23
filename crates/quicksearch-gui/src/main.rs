@@ -52,13 +52,3 @@ fn app() -> Element {
     }
 }
 
-/*
-Duplicate files:
-SELECT name, count(*) as cnt, path FROM files WHERE hash IS NOT NULL GROUP BY hash HAVING cnt > 1 ORDER BY cnt DESC;
-
-Full text search:
-SELECT f.name, f.path, snippet(searchabletext, 1, "<b>", "</b>", "<b>...</b>", 64) as "snip" FROM searchabletext AS st JOIN files f ON f.id = st.rowid WHERE st.text MATCH 'searchstring';
-
-Filename search:
-SELECT name, path FROM files WHERE name LIKE '%searchstring%';
-*/

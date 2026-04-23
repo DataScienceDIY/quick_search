@@ -12,12 +12,16 @@ pub const PRAGMAS_FAST: &str = "
     PRAGMA foreign_keys = ON;
 ";
 
-/// The full current schema. Applied by [`migrate::open_and_migrate`] when
-/// the DB is fresh or has been wiped during upgrade.
+/// The full current schema. Applied by [`super::open::open_or_recreate`]
+/// when the DB is fresh or has just been wiped because it drifted from
+/// [`super::open::CURRENT_SCHEMA_VERSION`].
 ///
-/// FTS5 is a *regular* (non-contentless) virtual table so `snippet()` and
-/// `highlight()` can read the stored text. This also means there is no
-/// separate `documents` table — FTS5 *is* the text store.
+/// FTS5 is *contentless* (see [`fts_create_sql`]): the inverted index is kept
+/// but the column values aren't stored. The canonical extracted text lives
+/// in a separate `documents_text` table, zstd-compressed. Snippet rendering
+/// for search results decompresses on demand and highlights matches in Rust
+/// (see `crate::snippet`). This keeps the on-disk footprint close to Baloo's
+/// LMDB-only size while still supporting snippet/highlight features.
 pub const SCHEMA_CURRENT: &str = r#"
 CREATE TABLE schema_info (
     key   TEXT PRIMARY KEY,
@@ -61,6 +65,16 @@ CREATE TABLE failed_files (
     ts      INTEGER NOT NULL
 );
 
+-- Canonical extracted text for every successfully content-indexed file.
+-- Compressed with zstd (see `crate::db::repo::set_content_done`). Only
+-- written when the extractor produced text; absent rows mean "no body
+-- text" (e.g. an image with only EXIF properties).
+CREATE TABLE documents_text (
+    file_id    INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    text_zstd  BLOB    NOT NULL,
+    text_len   INTEGER NOT NULL   -- original byte length pre-compression
+);
+
 CREATE TABLE config_validation (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -69,16 +83,26 @@ CREATE TABLE config_validation (
 
 /// FTS5 virtual table DDL. Separate because the tokenizer is config-driven.
 ///
-/// Regular (not contentless, not external-content) FTS5: the table stores
-/// its own text, which enables `snippet()`/`highlight()` and makes row-level
-/// INSERT/UPDATE/DELETE work with normal SQL semantics. `rowid` is supplied
-/// by the caller and must equal `files.id`.
+/// *Contentless* FTS5 (`content=''`): the inverted index is built from the
+/// column values supplied on INSERT, but those values are not stored. This
+/// is the main lever that pulls our on-disk footprint down toward Baloo's.
+/// `contentless_delete=1` (SQLite 3.43+) lets us `DELETE FROM … WHERE
+/// rowid=?` without replaying the original row text, at the cost of a
+/// modest tombstone bitmap. The tokenizer is config-driven; by default
+/// (`trigram`) we append `remove_diacritics 1` so queries and stored text
+/// fold the same way.
+///
+/// Snippet/highlight aren't available through SQLite's built-in `snippet()`
+/// in contentless mode — we render them in Rust from the zstd-compressed
+/// `documents_text` sidecar instead.
 pub fn fts_create_sql(tokenizer: &str) -> String {
     let effective = effective_tokenizer(tokenizer);
     format!(
         "CREATE VIRTUAL TABLE searchabletext USING fts5(\
             name, text, properties, \
-            tokenize='{}'\
+            tokenize='{}', \
+            content='', \
+            contentless_delete=1\
         );",
         effective.replace('\'', "''")
     )
