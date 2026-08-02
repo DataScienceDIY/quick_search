@@ -22,7 +22,12 @@
 pub mod ast;
 pub mod lexer;
 pub mod parser;
+pub mod pattern;
+pub mod split;
 pub mod translator;
 
 pub use ast::{Op, Term};
-pub use translator::{parse_and_build, SqlQuery};
+pub use lexer::tokenize_spanned;
+pub use pattern::{RegexQuery, TermPattern};
+pub use split::{split_for_cascade, CascadeQuery};
+pub use translator::{parse_and_build, SqlQuery, TranslateError};

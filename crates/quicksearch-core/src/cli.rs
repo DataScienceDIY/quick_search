@@ -8,7 +8,7 @@
 
 use rusqlite::{params, OptionalExtension};
 
-use crate::db::open_or_recreate;
+use crate::db::open_existing;
 use crate::db::repo::{STATE_DONE, STATE_FAILED, STATE_NA, STATE_PENDING};
 
 /// Per-file indexing status, mirroring Baloo's multi-state reporting.
@@ -86,7 +86,7 @@ impl SizeReport {
 /// Query the per-file indexing status. Returns `FileStatus` with
 /// `basic == NotIndexed` if the path isn't in the database.
 pub fn status_for_path(db_path: &str, path: &str) -> Result<FileStatus, String> {
-    let conn = open_or_recreate(db_path, "trigram")?;
+    let conn = open_existing(db_path, false)?;
     let row: Option<(i64, i64, Option<String>)> = conn
         .query_row(
             "SELECT basic_state, content_state, failure_msg FROM files WHERE path = ?1",
@@ -113,7 +113,7 @@ pub fn status_for_path(db_path: &str, path: &str) -> Result<FileStatus, String> 
 
 /// Return every file that failed content extraction, newest first.
 pub fn list_failed(db_path: &str, limit: Option<u32>) -> Result<Vec<FailedEntry>, String> {
-    let conn = open_or_recreate(db_path, "trigram")?;
+    let conn = open_existing(db_path, false)?;
     let limit_sql = match limit {
         Some(n) => format!(" LIMIT {}", n),
         None => String::new(),
@@ -147,7 +147,7 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
     let file_size_bytes = std::fs::metadata(db_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let conn = open_or_recreate(db_path, "trigram")?;
+    let conn = open_existing(db_path, false)?;
     let count = |table: &str| -> Result<i64, String> {
         conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |r| r.get(0))
             .map_err(|e| format!("count {}: {}", table, e))
@@ -181,7 +181,7 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
 /// Used by the Baloo compat daemon to report the "Files waiting for content
 /// indexing" figure both to balooctl and to the LMDB mirror.
 pub fn pending_content_count(db_path: &str) -> Result<i64, String> {
-    let conn = open_or_recreate(db_path, "trigram")?;
+    let conn = open_existing(db_path, false)?;
     conn.query_row(
         "SELECT COUNT(*) FROM files WHERE content_state = ?1",
         rusqlite::params![crate::db::repo::STATE_PENDING],
@@ -190,10 +190,33 @@ pub fn pending_content_count(db_path: &str) -> Result<i64, String> {
     .map_err(|e| format!("pending_content_count: {}", e))
 }
 
+/// Cheap aggregate counts for the GUI's idle status bar ("N files
+/// indexed"). Callers cache the result; it's three COUNT scans, not
+/// something to run per frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexCounts {
+    pub files: i64,
+    pub content_done: i64,
+    pub content_pending: i64,
+}
+
+pub fn index_counts(db_path: &str) -> Result<IndexCounts, String> {
+    let conn = open_existing(db_path, false)?;
+    let count = |sql: &str| -> Result<i64, String> {
+        conn.query_row(sql, [], |r| r.get(0))
+            .map_err(|e| format!("index_counts: {}", e))
+    };
+    Ok(IndexCounts {
+        files: count("SELECT COUNT(*) FROM files")?,
+        content_done: count("SELECT COUNT(*) FROM files WHERE content_state = 1")?,
+        content_pending: count("SELECT COUNT(*) FROM files WHERE content_state = 0")?,
+    })
+}
+
 /// Remove a single file from the index. Returns whether a row was deleted.
 /// Keeps FTS/documents/properties in sync via the repo helpers.
 pub fn clear_path(db_path: &str, path: &str) -> Result<bool, String> {
-    let mut conn = open_or_recreate(db_path, "trigram")?;
+    let mut conn = open_existing(db_path, true)?;
     let tx = conn
         .transaction()
         .map_err(|e| format!("clear_path begin tx: {}", e))?;
@@ -206,6 +229,7 @@ pub fn clear_path(db_path: &str, path: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::open_or_recreate;
     use crate::db::repo::{insert_file, set_content_done, set_content_failed, NewFile};
     use crate::mime::FileType;
 
@@ -371,6 +395,53 @@ mod tests {
         let st = status_for_path(p.to_str().unwrap(), "/tmp/a.txt").unwrap();
         assert_eq!(st.basic, IndexState::NotIndexed);
         assert!(!clear_path(p.to_str().unwrap(), "/tmp/a.txt").unwrap());
+
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn clear_path_on_nondefault_tokenizer_db_removes_only_target() {
+        // Regression: clear_path used to open with a hardcoded "trigram", so on
+        // an index built with a non-default tokenizer the schema-mismatch wipe
+        // destroyed the WHOLE index instead of deleting one row. With
+        // open_existing it must delete only the target and leave the rest.
+        let p = tmp_path();
+        let dbp = p.to_str().unwrap();
+        {
+            let mut conn = open_or_recreate(dbp, "unicode61").unwrap();
+            let tx = conn.transaction().unwrap();
+            for (name, path) in [("a.txt", "/tmp/a.txt"), ("b.txt", "/tmp/b.txt")] {
+                insert_file(
+                    &tx,
+                    &NewFile {
+                        name,
+                        path,
+                        parent: "/tmp",
+                        size: 1,
+                        mtime: 1,
+                        inode: None,
+                        device_id: None,
+                        mime: Some("text/plain"),
+                        ftype: FileType::TEXT,
+                        hash: None,
+                    },
+                )
+                .unwrap()
+                .expect("unique path");
+            }
+            tx.commit().unwrap();
+        }
+
+        assert!(clear_path(dbp, "/tmp/a.txt").unwrap());
+        // The other row must survive — proof we deleted one row, not wiped.
+        assert_eq!(
+            status_for_path(dbp, "/tmp/b.txt").unwrap().basic,
+            IndexState::Done
+        );
+        assert_eq!(
+            status_for_path(dbp, "/tmp/a.txt").unwrap().basic,
+            IndexState::NotIndexed
+        );
 
         std::fs::remove_file(&p).ok();
     }

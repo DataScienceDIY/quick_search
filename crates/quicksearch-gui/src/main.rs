@@ -1,54 +1,95 @@
-use std::sync::{Arc, OnceLock};
-use dioxus::prelude::*;
-use quicksearch_core::{config, indexing, shutdown};
-mod frontend;
-mod search;
+//! QuickSearch binary: `quicksearch <query>` searches from the terminal;
+//! without a query it opens the egui desktop app.
+//!
+//! On Windows this is the GUI only, built as a window-subsystem app so no
+//! console flashes behind it. Terminal search there is `quicksearch-cli`,
+//! which is a console app and so keeps working pipes, exit codes, and a shell
+//! that waits for it. A query passed here still does something useful: it
+//! seeds the search box.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
-static INDEXING_SERVICE: OnceLock<Arc<indexing::IndexingService>> = OnceLock::new();
+mod app;
+mod backend;
+#[cfg(not(windows))]
+mod cli;
+mod duplicates_tab;
+mod format;
+mod logs_tab;
+mod manage_tab;
+mod options;
+mod platform;
+mod query_highlight;
+mod search_tab;
+mod tracker;
+
+use quicksearch_core::config::Config;
+
+/// The window icon, shown in the titlebar, taskbar and alt-tab switcher.
+///
+/// X11 takes these pixels directly via `_NET_WM_ICON`. Wayland ignores them and
+/// instead looks up the app id in `/usr/share/applications/`, so the id below has
+/// to match the installed `quicksearch.desktop` for the icon to appear there.
+fn app_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/quicksearch-256.png"))
+        .expect("bundled icon is a valid PNG")
+}
+
+/// Leftover positional arguments, joined — used to seed the search box.
+///
+/// Flags are dropped rather than parsed: eframe and winit take some of their
+/// own, and a stray `--foo` should not end up in the query.
+fn seed_query() -> Option<String> {
+    let terms: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
+}
 
 fn main() {
-    let indexing_service = Arc::new(indexing::IndexingService::new());
-    INDEXING_SERVICE
-        .set(indexing_service.clone())
-        .expect("Failed to set global indexing service");
+    // Must come first: anything below may print, and printing without a
+    // stdio handle panics rather than failing quietly.
+    #[cfg(windows)]
+    platform::redirect_null_stdio();
 
-    if let Err(e) = shutdown::install_signal_handler(indexing_service.clone()) {
-        eprintln!("Warning: failed to install signal handler: {}", e);
+    #[cfg(not(windows))]
+    if let Some(code) = cli::maybe_run_cli() {
+        std::process::exit(code);
     }
 
-    LaunchBuilder::desktop()
-        .with_cfg(
-            dioxus_desktop::Config::new()
-                .with_custom_head(format!("<style>{}</style>", include_str!("../assets/styles.css")))
-                .with_window(dioxus_desktop::WindowBuilder::new()
-                    .with_title("QuickSearch - File Indexer & Search")
-                    .with_resizable(true)
-                    .with_inner_size(dioxus_desktop::LogicalSize::new(1000.0, 700.0))
-                )
-        )
-        .launch(app);
-}
+    // A broken config file should never keep the window from opening —
+    // surface the error in-app and run on defaults.
+    let (config, config_error) = match Config::load() {
+        Ok(c) => (c, None),
+        Err(e) => (Config::default(), Some(e)),
+    };
+    let initial_query = seed_query();
 
-
-fn app() -> Element {
-    let cfg = match config::Config::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to load config: {}", e);
-            return rsx! { div { "Failed to load configuration" } };
-        }
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("QuickSearch")
+            .with_app_id("quicksearch")
+            .with_icon(app_icon())
+            .with_inner_size([1000.0, 700.0])
+            .with_min_inner_size([640.0, 400.0]),
+        ..Default::default()
     };
 
-    let indexing_service = INDEXING_SERVICE
-        .get()
-        .expect("Indexing service not initialized")
-        .clone();
-
-    rsx! {
-        frontend::App {
-            indexing_service: indexing_service,
-            config: cfg
-        }
+    let result = eframe::run_native(
+        "QuickSearch",
+        native_options,
+        Box::new(move |cc| {
+            app::QuickSearchApp::new(cc, config, config_error, initial_query)
+                .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                .map_err(|e| e.into())
+        }),
+    );
+    if let Err(e) = result {
+        eprintln!("failed to start GUI: {}", e);
+        std::process::exit(1);
     }
 }
-

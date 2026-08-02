@@ -35,6 +35,7 @@ pub enum TranslateError {
     Parse(ParseError),
     UnknownProperty(String),
     BadDate(String),
+    BadRegex(String),
     UnsupportedOp {
         key: String,
         op: Op,
@@ -47,6 +48,7 @@ impl std::fmt::Display for TranslateError {
             TranslateError::Parse(e) => write!(f, "{}", e),
             TranslateError::UnknownProperty(k) => write!(f, "unknown property '{}'", k),
             TranslateError::BadDate(s) => write!(f, "bad date '{}'", s),
+            TranslateError::BadRegex(s) => write!(f, "regex error: {}", s),
             TranslateError::UnsupportedOp { key, op } => {
                 write!(f, "operator {:?} is not supported for property '{}'", op, key)
             }
@@ -172,8 +174,10 @@ fn fts_expr(parts: &[FtsFragment]) -> String {
 }
 
 /// Escape a phrase for FTS5 MATCH. FTS5 itself uses doubled quotes for
-/// literal quotes inside a quoted phrase.
-fn quote_phrase(s: &str) -> String {
+/// literal quotes inside a quoted phrase; wrapping in quotes renders all
+/// other MATCH metacharacters (`( ) * :` etc.) inert. Injection-safe by
+/// construction.
+pub fn quote_phrase(s: &str) -> String {
     let mut buf = String::with_capacity(s.len() + 2);
     buf.push('"');
     for c in s.chars() {
@@ -243,119 +247,214 @@ impl Builder {
         }
     }
 
+    /// Delegate to the shared [`build_filter`] fragment builder, then
+    /// convert its anonymous `?` placeholders to this builder's numbered
+    /// scheme (params[0] is reserved for the FTS MATCH when one exists;
+    /// `build` shifts numbers afterwards).
     fn translate_property(
         &mut self,
         key: &str,
         op: Op,
         value: &str,
     ) -> Result<String, TranslateError> {
-        let lower_key = key.to_ascii_lowercase();
-        match lower_key.as_str() {
-            "type" => self.prop_type(op, value, key),
-            "modified" | "mtime" => self.prop_mtime(op, value, key),
-            "path" | "folder" | "includefolder" => self.prop_path(op, value, key),
-            "name" | "filename" => self.prop_name(op, value, key),
-            "mime" => self.prop_mime(op, value, key),
-            _ => Err(TranslateError::UnknownProperty(key.to_string())),
+        let frag = build_filter(key, op, value, false)?;
+        let mut params = frag.params.into_iter();
+        let mut out = String::with_capacity(frag.sql.len() + 8);
+        for c in frag.sql.chars() {
+            if c == '?' {
+                let v = params
+                    .next()
+                    .expect("FilterFragment placeholder/param counts match");
+                self.all_params.push(v);
+                out.push('?');
+                out.push_str(&self.all_params.len().to_string());
+            } else {
+                out.push(c);
+            }
         }
+        Ok(out)
     }
+}
 
-    fn prop_type(&mut self, op: Op, value: &str, key: &str) -> Result<String, TranslateError> {
+/// A structured-filter fragment over table alias `f`: SQL with anonymous
+/// `?` placeholders plus the values they bind. Anonymous placeholders
+/// compose by simple appending — the search cascade tacks fragments onto
+/// every stage's WHERE clause with `AND (...)`.
+#[derive(Debug, Clone)]
+pub struct FilterFragment {
+    pub sql: String,
+    pub params: Vec<rusqlite::types::Value>,
+}
+
+/// Whether `key` is a recognized structured-filter property.
+pub fn is_filter_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "type" | "modified" | "mtime" | "path" | "folder" | "includefolder" | "name"
+            | "filename" | "mime"
+    )
+}
+
+/// Translate one `key op value` filter into a [`FilterFragment`]. The
+/// single source of filter semantics, shared by the legacy numbered
+/// [`build`] path and the cascade's [`super::split`].
+///
+/// `glob` marks a value whose unquoted `*` should act as a wildcard — only
+/// `name:`/`filename:` honor it; every other key treats the star literally.
+/// The caller decides, because only the tokenizer knows whether the value
+/// was quoted (quoted stars are always literal).
+pub fn build_filter(
+    key: &str,
+    op: Op,
+    value: &str,
+    glob: bool,
+) -> Result<FilterFragment, TranslateError> {
+    use rusqlite::types::Value;
+    let frag = |sql: &str, params: Vec<Value>| FilterFragment {
+        sql: sql.to_string(),
+        params,
+    };
+    let eq_like_only = |op: Op| -> Result<(), TranslateError> {
         if op != Op::Contains && op != Op::Eq {
             return Err(TranslateError::UnsupportedOp {
                 key: key.into(),
                 op,
             });
         }
-        let bits = FileType::from_name(value).bits() as i64;
-        if bits == 0 {
-            return Err(TranslateError::UnknownProperty(format!(
-                "type name '{}'",
+        Ok(())
+    };
+
+    match key.to_ascii_lowercase().as_str() {
+        "type" => {
+            eq_like_only(op)?;
+            let bits = FileType::from_name(value).bits() as i64;
+            if bits == 0 {
+                return Err(TranslateError::UnknownProperty(format!(
+                    "type name '{}'",
+                    value
+                )));
+            }
+            Ok(frag("(f.type & ?) != 0", vec![Value::Integer(bits)]))
+        }
+        "modified" | "mtime" => {
+            let unix =
+                parse_date_to_unix(value).ok_or_else(|| TranslateError::BadDate(value.into()))?;
+            // `modified:=2024-01-01` matches the whole day, not the second.
+            if op == Op::Eq || op == Op::Contains {
+                return Ok(frag(
+                    "(f.mtime >= ? AND f.mtime < ?)",
+                    vec![Value::Integer(unix), Value::Integer(unix + 86_400)],
+                ));
+            }
+            let sql_op = match op {
+                Op::Lt => "<",
+                Op::Le => "<=",
+                Op::Gt => ">",
+                Op::Ge => ">=",
+                Op::Contains | Op::Eq => unreachable!(),
+            };
+            Ok(frag(
+                &format!("f.mtime {} ?", sql_op),
+                vec![Value::Integer(unix)],
+            ))
+        }
+        "path" | "folder" | "includefolder" => {
+            eq_like_only(op)?;
+            let base = normalize_folder_value(value);
+            if base.is_empty() {
+                // "everything". On Unix the old `parent = '/' OR parent LIKE
+                // '/%'` happened to match every absolute path; Windows has no
+                // single root, so say it directly rather than by accident.
+                return Ok(frag("1=1", Vec::new()));
+            }
+            // The `=` half needs the collation spelled out: `LIKE` folds ASCII
+            // case on its own, so without this the two halves of the same
+            // filter disagree about `C:\Users` versus `c:\users`.
+            Ok(frag(
+                &format!(
+                    "(f.parent = ? COLLATE {} OR f.parent LIKE ? ESCAPE '\\')",
+                    crate::platform::PATH_COLLATION
+                ),
+                vec![
+                    Value::Text(base.clone()),
+                    Value::Text(like_subtree_pattern(&base)),
+                ],
+            ))
+        }
+        "name" | "filename" => {
+            if op != Op::Contains {
+                return Err(TranslateError::UnsupportedOp {
+                    key: key.into(),
+                    op,
+                });
+            }
+            // With `glob`, each `*` becomes an unescaped `%`; the pieces
+            // around it still get `%`/`_`/`\` escaped so user metacharacters
+            // stay literal either way.
+            let pattern = if glob && value.contains('*') {
                 value
-            )));
+                    .split('*')
+                    .map(escape_like)
+                    .collect::<Vec<_>>()
+                    .join("%")
+            } else {
+                escape_like(value)
+            };
+            Ok(frag(
+                "f.name LIKE ? ESCAPE '\\'",
+                vec![Value::Text(format!("%{}%", pattern))],
+            ))
         }
-        self.all_params
-            .push(rusqlite::types::Value::Integer(bits));
-        Ok(format!("(f.type & ?{}) != 0", self.param_placeholder_idx()))
-    }
-
-    fn prop_mtime(&mut self, op: Op, value: &str, key: &str) -> Result<String, TranslateError> {
-        let unix = parse_date_to_unix(value).ok_or_else(|| TranslateError::BadDate(value.into()))?;
-        let col = "f.mtime";
-        let sql_op = match op {
-            Op::Contains | Op::Eq => "=",
-            Op::Lt => "<",
-            Op::Le => "<=",
-            Op::Gt => ">",
-            Op::Ge => ">=",
-        };
-        // `modified:=2024-01-01` should match the whole day, not the second.
-        if op == Op::Eq || op == Op::Contains {
-            let start = unix;
-            let end = unix + 86_400;
-            self.all_params.push(rusqlite::types::Value::Integer(start));
-            let i = self.param_placeholder_idx();
-            self.all_params.push(rusqlite::types::Value::Integer(end));
-            let j = self.param_placeholder_idx();
-            return Ok(format!("({} >= ?{} AND {} < ?{})", col, i, col, j));
+        "mime" => {
+            eq_like_only(op)?;
+            Ok(frag("f.mime = ?", vec![Value::Text(value.into())]))
         }
-        self.all_params.push(rusqlite::types::Value::Integer(unix));
-        let i = self.param_placeholder_idx();
-        let _ = key;
-        Ok(format!("{} {} ?{}", col, sql_op, i))
+        _ => Err(TranslateError::UnknownProperty(key.to_string())),
     }
+}
 
-    fn prop_path(&mut self, op: Op, value: &str, key: &str) -> Result<String, TranslateError> {
-        if op != Op::Contains && op != Op::Eq {
-            return Err(TranslateError::UnsupportedOp {
-                key: key.into(),
-                op,
-            });
+/// Escape `%`, `_` and `\` for use inside a `LIKE ... ESCAPE '\'` pattern.
+pub fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
         }
-        self.all_params
-            .push(rusqlite::types::Value::Text(value.into()));
-        let i = self.param_placeholder_idx();
-        self.all_params
-            .push(rusqlite::types::Value::Text(format!("{}/%", value.trim_end_matches('/'))));
-        let j = self.param_placeholder_idx();
-        Ok(format!("(f.parent = ?{} OR f.parent LIKE ?{})", i, j))
+        out.push(c);
     }
+    out
+}
 
-    fn prop_name(&mut self, op: Op, value: &str, key: &str) -> Result<String, TranslateError> {
-        if op != Op::Contains {
-            return Err(TranslateError::UnsupportedOp {
-                key: key.into(),
-                op,
-            });
-        }
-        self.all_params
-            .push(rusqlite::types::Value::Text(format!("%{}%", value)));
-        let i = self.param_placeholder_idx();
-        Ok(format!("f.name LIKE ?{}", i))
+/// Tidy a user-supplied folder value into the spelling `files.parent` stores.
+///
+/// Trailing separators are how people naturally write directories, and either
+/// separator may show up on Windows. A bare drive (`C:`) is *not* a path — the
+/// stored parent is `C:\` — so the separator goes back on.
+fn normalize_folder_value(value: &str) -> String {
+    let base = value.trim().trim_end_matches(['/', '\\']);
+    if base.len() == 2 && base.ends_with(':') && base.starts_with(|c: char| c.is_ascii_alphabetic())
+    {
+        return format!("{}{}", base, std::path::MAIN_SEPARATOR);
     }
+    base.to_string()
+}
 
-    fn prop_mime(&mut self, op: Op, value: &str, key: &str) -> Result<String, TranslateError> {
-        if op != Op::Contains && op != Op::Eq {
-            return Err(TranslateError::UnsupportedOp {
-                key: key.into(),
-                op,
-            });
-        }
-        self.all_params
-            .push(rusqlite::types::Value::Text(value.into()));
-        let i = self.param_placeholder_idx();
-        Ok(format!("f.mime = ?{}", i))
-    }
-
-    fn param_placeholder_idx(&self) -> usize {
-        // params[0] is reserved for the FTS MATCH if one is built; structured
-        // params start at index 2 in that case (1-based). We track it by
-        // calling this *after* pushing the value; result is `len` so the SQL
-        // says `?<len>` which matches the 1-based positional binding rusqlite
-        // uses for `?N` placeholders. When an FTS match is prepended at
-        // `build`, each index shifts by 1 implicitly.
-        self.all_params.len()
-    }
+/// A `LIKE ... ESCAPE '\'` pattern matching every path strictly beneath `dir`.
+///
+/// The separator is escaped along with the base, because on Windows the
+/// separator *is* the escape character — a hand-written `format!("{}/%", dir)`
+/// is wrong twice over there: wrong separator, and the one it emits would be
+/// swallowed as an escape.
+///
+/// SQLite's `patternCompare` takes the character after the escape literally
+/// whatever it is, so a doubled `\` is well defined here; the folklore that an
+/// escape must be followed by `%`, `_` or itself does not apply.
+pub fn like_subtree_pattern(dir: &str) -> String {
+    format!(
+        "{}{}%",
+        escape_like(dir.trim_end_matches(['/', '\\'])),
+        escape_like(std::path::MAIN_SEPARATOR_STR)
+    )
 }
 
 fn join_with(sep: &str, pieces: &[String]) -> String {
@@ -497,6 +596,101 @@ mod tests {
         let q = build_q("path:/home/me/docs");
         assert!(q.sql.contains("f.parent = ?"));
         assert!(q.sql.contains("f.parent LIKE ?"));
+        // The LIKE half must be escaped and declare its escape character;
+        // without the clause a Windows separator would be eaten as an escape.
+        assert!(q.sql.contains("ESCAPE '\\'"), "{}", q.sql);
+    }
+
+    /// The subtree pattern is the one place the separator and the LIKE escape
+    /// character collide (on Windows they are the same byte), so it is checked
+    /// against real SQLite rather than by string comparison.
+    #[test]
+    fn like_subtree_pattern_matches_only_the_subtree() {
+        use std::path::MAIN_SEPARATOR as SEP;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE files (parent TEXT NOT NULL)", [])
+            .unwrap();
+
+        let base = format!("{}a{}b", root_prefix(), SEP);
+        let rows = [
+            format!("{}{}sub", base, SEP),          // inside
+            format!("{}{}sub{}deep", base, SEP, SEP), // deeper
+            base.clone(),                            // the folder itself
+            format!("{}a{}bc", root_prefix(), SEP),  // prefix sibling: outside
+            format!("{}a", root_prefix()),           // parent: outside
+        ];
+        for r in &rows {
+            conn.execute("INSERT INTO files (parent) VALUES (?1)", [r])
+                .unwrap();
+        }
+
+        let matched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE parent LIKE ?1 ESCAPE '\\'",
+                [like_subtree_pattern(&base)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(matched, 2, "only the two rows strictly beneath {}", base);
+    }
+
+    #[test]
+    fn like_subtree_pattern_escapes_metacharacters() {
+        use std::path::MAIN_SEPARATOR as SEP;
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE files (parent TEXT NOT NULL)", [])
+            .unwrap();
+
+        let base = format!("{}a_b", root_prefix());
+        for r in [
+            format!("{}{}inside", base, SEP),         // real child
+            format!("{}axb{}bait", root_prefix(), SEP), // `_` must not glob to `x`
+            format!("{}100%_done{}x", root_prefix(), SEP),
+        ] {
+            conn.execute("INSERT INTO files (parent) VALUES (?1)", [&r])
+                .unwrap();
+        }
+
+        let matched: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE parent LIKE ?1 ESCAPE '\\'",
+                [like_subtree_pattern(&base)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(matched, 1, "`_` and `%` are literals, not wildcards");
+    }
+
+    #[test]
+    fn folder_value_normalization() {
+        use std::path::MAIN_SEPARATOR as SEP;
+        // Trailing separators of either flavour are stripped.
+        assert_eq!(normalize_folder_value("/home/me/"), "/home/me");
+        assert_eq!(normalize_folder_value(r"C:\Users\me\"), r"C:\Users\me");
+        // A bare drive is not a path; the stored parent is `C:\`.
+        assert_eq!(normalize_folder_value("C:"), format!("C:{}", SEP));
+        assert_eq!(normalize_folder_value(r"C:\"), format!("C:{}", SEP));
+        // Empty means "everywhere".
+        assert_eq!(normalize_folder_value("/"), "");
+        assert_eq!(normalize_folder_value("  "), "");
+    }
+
+    #[test]
+    fn empty_folder_value_matches_everything() {
+        let frag = build_filter("path", Op::Contains, "/", false).unwrap();
+        assert_eq!(frag.sql, "1=1");
+        assert!(frag.params.is_empty(), "no placeholders to renumber");
+    }
+
+    /// An absolute-path prefix for the running platform.
+    fn root_prefix() -> String {
+        if cfg!(windows) {
+            r"C:\".to_string()
+        } else {
+            "/".to_string()
+        }
     }
 
     #[test]

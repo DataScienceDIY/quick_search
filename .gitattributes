@@ -1,0 +1,6 @@
+# cmd.exe is sensitive to line endings — a run.bat checked out with LF can
+# misparse labels and multi-line constructs — while sh requires LF regardless
+# of the platform it is checked out on.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.sh  text eol=lf

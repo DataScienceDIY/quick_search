@@ -2,8 +2,15 @@
 //!
 //! An [`Extractor`] decides whether it can handle a given MIME type and, if
 //! so, produces [`ExtractedContent`] for the file. The [`Registry`] picks the
-//! first registered extractor that accepts the MIME and runs it. Callers can
-//! also fall back to an extension-based match for files with no detected MIME.
+//! first registered extractor that accepts the MIME and runs it.
+//!
+//! Dispatch is by MIME only — a file with no detected type is recorded as
+//! "not applicable" rather than guessed at again here. Extensions that
+//! `mime_guess` misses or mistypes are corrected upstream instead, in
+//! [`crate::mime::guess_mime_from_head`], so there is one place where "what is
+//! this file" gets decided, and it is decided once: the walk sniffs the head it
+//! already read, stores the answer, and nothing downstream reopens the file to
+//! ask again.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -70,6 +77,32 @@ pub trait Extractor: Send + Sync {
     /// [`ExtractError`] to mark the file's content state as failed (so it
     /// won't be retried every run).
     fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError>;
+
+    /// Extract from bytes the caller already holds, when those bytes are the
+    /// file's *entire* contents.
+    ///
+    /// Indexing hashes the head of every new or changed file, so for anything
+    /// no larger than `hash_length` the whole file is already in memory by the
+    /// time the walk classifies it. An extractor that can work from that buffer
+    /// saves the content pass an open/read/close — several round trips per
+    /// file on a network share — and closes a consistency gap, because the
+    /// text then comes from the same `read` as the size, mtime and hash stored
+    /// alongside it.
+    ///
+    /// The default is `None`: "I need the file on disk." Formats that seek,
+    /// or that read a central directory at the end of the file, must keep it.
+    /// Returning `Some(Err(_))` is a real extraction failure, recorded like
+    /// any other; returning `None` simply defers to [`Extractor::extract`].
+    ///
+    /// `path` is passed only so failures name the same file the on-disk path
+    /// would — nothing here may open it.
+    fn extract_from_head(
+        &self,
+        _path: &Path,
+        _head: &[u8],
+    ) -> Option<Result<ExtractedContent, ExtractError>> {
+        None
+    }
 }
 
 /// An ordered dispatch table of extractors. The first extractor whose
@@ -105,6 +138,28 @@ impl Registry {
         Ok(None)
     }
 
+    /// [`Registry::extract`] for a file whose complete contents the caller
+    /// already holds. `Ok(None)` when no extractor claims the MIME, and
+    /// `None` when the one that does needs the file on disk after all —
+    /// both mean "leave this to the content pass".
+    ///
+    /// Dispatch stays here rather than at the call site so there is still
+    /// exactly one place that decides what an extractor sees for a given MIME.
+    pub fn extract_complete_head(
+        &self,
+        path: &Path,
+        mime: &str,
+        head: &[u8],
+    ) -> Option<Result<ExtractedContent, ExtractError>> {
+        let lower = mime.to_ascii_lowercase();
+        for e in &self.extractors {
+            if e.supports(&lower) {
+                return e.extract_from_head(path, head);
+            }
+        }
+        None
+    }
+
     /// The default set wired up for Set A: plaintext, office docs, PDF,
     /// audio tags, image EXIF.
     pub fn default_set() -> Self {
@@ -134,6 +189,38 @@ mod tests {
             .extract(Path::new("/tmp/x"), "text/plain")
             .expect("no error");
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn complete_head_extraction_dispatches_only_to_extractors_that_opt_in() {
+        let r = Registry::default_set();
+        let p = Path::new("/tmp/whatever");
+
+        // Plaintext opts in, so a small text file never reaches the disk pass.
+        let out = r.extract_complete_head(p, "text/plain", b"hello");
+        assert!(matches!(out, Some(Ok(ref c)) if c.text == "hello"));
+
+        // A format that seeks or reads a trailer must not be handed a buffer.
+        // `None` here is what routes it back to the on-disk extractor.
+        assert!(r.extract_complete_head(p, "application/pdf", b"%PDF-1.4").is_none());
+        assert!(r.extract_complete_head(p, "image/png", b"\x89PNG").is_none());
+
+        // No extractor claims the MIME at all.
+        assert!(r.extract_complete_head(p, "application/x-nonesuch", b"..").is_none());
+    }
+
+    #[test]
+    fn complete_head_extraction_matches_the_on_disk_dispatch() {
+        // Both entry points must pick the same extractor for a MIME, or a
+        // file's text would depend on which pass happened to handle it.
+        let r = Registry::default_set();
+        let p = Path::new("/tmp/whatever");
+        for mime in ["text/plain", "TEXT/PLAIN", "application/json", "application/x-sql"] {
+            assert!(
+                r.extract_complete_head(p, mime, b"x").is_some(),
+                "{} should extract from a head", mime
+            );
+        }
     }
 
     #[test]

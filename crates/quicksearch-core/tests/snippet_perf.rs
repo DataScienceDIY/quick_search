@@ -207,12 +207,7 @@ fn snippet_paths_perf_comparison() {
     let b_reps = 10;
     let start_b = Instant::now();
     let mut rows_b_total = 0usize;
-    let opts = snippet::Options {
-        pre: "<b>",
-        post: "</b>",
-        ellipsis: "...",
-        approx_chars: 64,
-    };
+    let opts = snippet::Options { approx_chars: 64 };
     for _ in 0..b_reps {
         for q in QUERIES {
             // Contentless FTS5 returns NULL for stored columns (that's the
@@ -245,7 +240,7 @@ fn snippet_paths_perf_comparison() {
                     }
                     None => String::new(),
                 };
-                let _snip = snippet::render(&text, &[q], &opts);
+                let _snip = snippet::extract(&text, &[q], &opts);
                 rows_b_total += 1;
             }
         }

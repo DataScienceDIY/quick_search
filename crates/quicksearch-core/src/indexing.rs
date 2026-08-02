@@ -1,60 +1,82 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::process::Command;
 use std::collections::HashSet;
-use rusqlite::{Connection, params};
-use walkdir::DirEntry;
+use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::extract::Registry;
 use crate::file_handling::{
-    classify_dir_entry_for_indexing,
     cleanup_stale_index_entries,
     count_tree_entries_fast,
-    indexed_walk_file_entries,
+    extract_one_batch,
+    extract_scope_prepare,
+    fts_finalize_after_text_indexing,
     load_existing_files,
-    path_has_hidden_component,
-    process_batch_inserts_files_only,
-    process_batch_updates_files_only,
-    process_text_indexing,
+    process_batch_inserts,
+    process_batch_updates,
+    path_to_db_string,
+    ExtractCursor,
     FileIndexAction,
+    OwnedNewFile,
 };
 use crate::config::Config;
+use crate::walk::{thread_count_for, walk_indexable_files, ParallelWalk, TryNext, WorkerStats};
 use crate::db;
 
-#[derive(Debug, Clone)]
-pub struct SearchResultRow {
-    pub values: Vec<String>,
+/// Where one root's pipeline is in its life cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootPhase {
+    /// The parallel walk is discovering and writing file metadata.
+    Walking,
+    /// The walk finished; content extraction is draining this root's
+    /// pending rows.
+    Extracting,
+    Done,
 }
 
+/// Progress for one indexing root. Each root runs its own walker and its
+/// own extraction cursor; the GUI shows one row per root.
 #[derive(Debug, Clone)]
-pub struct SearchResult {
-    pub columns: Vec<String>,
-    pub rows: Vec<SearchResultRow>,
+pub struct RootProgress {
+    pub root: String,
+    pub phase: RootPhase,
+    /// Files the walk has seen so far.
+    pub walked: usize,
+    /// Concurrent `find`-based denominator; `None` until the count lands.
+    pub walk_total: Option<usize>,
+    /// Rows with searchable text: extracted in earlier runs plus this one.
+    pub extracted: usize,
+    /// The root's whole searchable set: pending + already-extracted rows
+    /// at the moment the walk finished.
+    pub extract_total: usize,
+    pub current_file: Option<String>,
+    /// Walker threads busy right now / pool size.
+    pub active_workers: usize,
+    pub total_workers: usize,
 }
 
 #[derive(Debug, Clone)]
 pub enum IndexingStatus {
     Idle,
-    CountingFiles {
-        _entries_scanned: usize,
-        _indexable_files_counted: usize,
-        current_file: Option<String>,
+    Running {
         start_time: Instant,
-    },
-    RunningFileIndex {
-        files_processed: usize,
-        total_files: Option<usize>,
-        current_file: Option<String>,
-        start_time: Instant,
-    },
-    RunningTextIndex {
-        files_processed: usize,
-        current_file: Option<String>,
-        start_time: Instant,
+        roots: Vec<RootProgress>,
     },
     Stopping,
     Error(String),
+}
+
+/// One setting whose stored (index-build-time) value differs from the
+/// current config. Values that hold lists (roots, patterns, extensions)
+/// are newline-joined — display them as multi-line columns, not inline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigChange {
+    pub key: String,
+    /// What the index was built with.
+    pub stored: String,
+    /// What the config says now.
+    pub current: String,
 }
 
 #[derive(Debug, Clone)]
@@ -80,24 +102,6 @@ pub struct IndexingService {
 
 /// Polling interval for `should_abort` while suspended.
 const SUSPEND_POLL_MS: u64 = 100;
-
-/// Map a rusqlite/SQLite error string into the tagged form the GUI's
-/// search panel recognises (so it can pop the corruption-recovery dialog,
-/// special-case FTS5 syntax errors, etc.). Centralized so both generic
-/// `execute_search` and the fulltext-specific path classify errors the
-/// same way.
-fn classify_sql_err(error_msg: &str) -> String {
-    if error_msg.contains("malformed")
-        || error_msg.contains("corrupt")
-        || error_msg.contains("database disk image is malformed")
-    {
-        format!("DATABASE_CORRUPTED: {}", error_msg)
-    } else if error_msg.contains("fts5: syntax error") {
-        "Search syntax error: The search term contains characters that cannot be processed. Please try a simpler search term.".into()
-    } else {
-        format!("Failed to execute query: {}", error_msg)
-    }
-}
 
 /// Combined stop/suspend check used by worker loops. Returns `true` iff the
 /// caller should abort the operation. While the suspend flag is set and stop
@@ -145,6 +149,34 @@ pub(crate) fn should_abort(
 //         }
 //     }
 // }
+
+/// Flips an [`AtomicBool`] when dropped. Held by `run_indexing` so the
+/// per-root count subprocesses die on every exit path of a run.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// One root's in-flight indexing state, owned by the writer loop.
+struct RootPipeline {
+    root: String,
+    walk: ParallelWalk,
+    stats: WorkerStats,
+    /// Concurrent `find` count; 0 = not yet known.
+    count_total: Arc<AtomicUsize>,
+    pending_updates: Vec<OwnedNewFile>,
+    pending_inserts: Vec<OwnedNewFile>,
+    walked: usize,
+    walk_clean: bool,
+    phase: RootPhase,
+    extract: Option<ExtractCursor>,
+    extract_total: usize,
+    extracted: usize,
+    current_file: Option<String>,
+}
 
 impl IndexingService {
     pub fn new() -> Self {
@@ -204,6 +236,13 @@ impl IndexingService {
             .map_err(|e| format!("Failed to send start command: {}", e))
     }
 
+    /// Signal a running index pass to stop without waiting for it. Used
+    /// on shutdown paths that must stay responsive — the worker notices
+    /// the flag between batches and WAL makes an unflushed exit safe.
+    pub fn request_stop(&self) {
+        let _ = self.command_tx.send(IndexingCommand::Stop);
+    }
+
     pub fn stop_indexing(&self) -> Result<(), String> {
         // First send the stop command
         self.command_tx
@@ -224,21 +263,12 @@ impl IndexingService {
             }
         }
 
-        // Flush and close database connection if it exists
+        // Flush the WAL and release the shared connection. WAL mode itself
+        // stays on — it's the persistent journal mode for the index.
         if let Ok(mut db_opt) = self.db_connection.lock() {
             if let Some(db_conn_arc) = db_opt.take() {
                 if let Ok(conn) = db_conn_arc.lock() {
-                    // Re-enable journal mode and synchronous writes for proper flushing
-                    let _ = conn.execute_batch(
-                        "PRAGMA journal_mode = DELETE;
-                         PRAGMA synchronous = FULL;"
-                    );
-                    
-                    // Force a checkpoint to flush any remaining WAL data
-                    let _ = conn.execute("PRAGMA wal_checkpoint(FULL);", ());
-                    
-                    // Explicitly close the connection by dropping it
-                    drop(conn);
+                    let _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE);", ());
                 }
             }
         }
@@ -255,263 +285,17 @@ impl IndexingService {
         self.stop_indexing()
     }
 
-    /// Fulltext-specific search path that emits rendered snippets. Runs the
-    /// SQL produced by [`crate::search_sql::build_select`] for a fulltext
-    /// `SearchArgs`, which returns `(name, path, file_id, text_zstd)`, then
-    /// decompresses each text blob and hands it to [`crate::snippet::render`]
-    /// together with the query terms. Case-sensitive mode is re-applied in
-    /// Rust since contentless FTS5 no longer stores the raw text.
-    ///
-    /// The shape of the returned [`SearchResult`] matches what the GUI's
-    /// results table expects: columns `(name, path, snippet)`.
-    pub fn execute_fulltext_search(
-        &self,
-        db_path: &str,
-        args: &crate::search_sql::SearchArgs,
-        limit: u32,
-        offset: u32,
-    ) -> Result<Vec<SearchResult>, String> {
-        use crate::search_sql::{build_select, fulltext_terms};
-        use crate::snippet;
-
-        let sql = build_select(args, limit, offset)?;
-        let terms = fulltext_terms(args);
-        let term_refs: Vec<&str> = terms.iter().map(String::as_str).collect();
-
-        let conn = db::open_or_recreate(db_path, "trigram").map_err(|e| {
-            if e.contains("corrupt") || e.contains("malformed") {
-                format!("DATABASE_CORRUPTED: {}", e)
-            } else {
-                e
-            }
-        })?;
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| classify_sql_err(&e.to_string()))?;
-
-        let rows_iter = stmt
-            .query_map([], |row| {
-                let name: String = row.get(0)?;
-                let path: String = row.get(1)?;
-                let _file_id: i64 = row.get(2)?;
-                let blob: Option<Vec<u8>> = row.get(3)?;
-                Ok((name, path, blob))
-            })
-            .map_err(|e| classify_sql_err(&e.to_string()))?;
-
-        let snippet_opts = snippet::Options::default();
-        let mut out_rows: Vec<SearchResultRow> = Vec::new();
-        for r in rows_iter {
-            let (name, path, blob) =
-                r.map_err(|e| classify_sql_err(&e.to_string()))?;
-            let body = match blob {
-                None => String::new(),
-                Some(bytes) if bytes.is_empty() => String::new(),
-                Some(bytes) => match zstd::decode_all(bytes.as_slice()) {
-                    Ok(raw) => String::from_utf8_lossy(&raw).into_owned(),
-                    Err(_) => String::new(),
-                },
-            };
-
-            // Case-sensitive post-filter: every query term must appear with
-            // the exact case supplied by the user. Applied to the body
-            // text; filename hits are still matched by the FTS MATCH which
-            // is case-insensitive (filenames are usually mixed case and the
-            // user probably doesn't care). Exact-phrase mode treats the
-            // whole quoted phrase as one token.
-            if args.fulltext_case_sensitive && !body.is_empty() {
-                let all_present = terms.iter().all(|t| body.contains(t.as_str()));
-                if !all_present {
-                    continue;
-                }
-            }
-
-            let rendered = if body.is_empty() {
-                String::new()
-            } else {
-                snippet::render(&body, &term_refs, &snippet_opts)
-            };
-            out_rows.push(SearchResultRow {
-                values: vec![name, path, rendered],
-            });
+    /// Check if configuration changes require index recreation. A pure
+    /// *read* check: opens the existing index without ever wiping it (the
+    /// old `open_or_recreate` here could destroy the index before the user
+    /// confirmed the rebuild dialog). A missing or incompatible DB means
+    /// there is nothing to validate — the indexer will (re)build under its
+    /// own policy anyway.
+    pub fn check_config_validation(&self, db_path: &str, config: &Config, indexing_path: &str) -> Result<Option<Vec<ConfigChange>>, String> {
+        match db::open_existing(db_path, false) {
+            Ok(conn) => Self::validate_config(&conn, config, indexing_path),
+            Err(_) => Ok(None),
         }
-
-        Ok(vec![SearchResult {
-            columns: vec!["name".into(), "path".into(), "snippet".into()],
-            rows: out_rows,
-        }])
-    }
-
-    /// Execute a search query against the database
-    pub fn execute_search(&self, db_path: &str, query: &str) -> Result<Vec<SearchResult>, String> {
-        let conn = db::open_or_recreate(db_path, "trigram")
-            .map_err(|e| {
-                if e.contains("corrupt") || e.contains("malformed") {
-                    format!("DATABASE_CORRUPTED: {}", e)
-                } else {
-                    e
-                }
-            })?;
-
-        let mut stmt = conn.prepare(query)
-            .map_err(|e| {
-                let error_msg = e.to_string();
-                if error_msg.contains("malformed") || error_msg.contains("corrupt") || error_msg.contains("database disk image is malformed") {
-                    format!("DATABASE_CORRUPTED: {}", error_msg)
-                } else if error_msg.contains("fts5: syntax error") {
-                    format!("Search syntax error: The search term contains characters that cannot be processed. Please try a simpler search term.")
-                } else {
-                    format!("Failed to prepare query: {}", error_msg)
-                }
-            })?;
-        
-        let column_count = stmt.column_count();
-        let column_names: Vec<String> = (0..column_count)
-            .map(|i| stmt.column_name(i).unwrap_or("").to_string())
-            .collect();
-        
-        let rows = stmt.query_map([], |row| {
-            let mut values = Vec::new();
-            for i in 0..column_count {
-                let value = match row.get_ref(i)? {
-                    rusqlite::types::ValueRef::Null => "NULL".to_string(),
-                    rusqlite::types::ValueRef::Integer(i) => i.to_string(),
-                    rusqlite::types::ValueRef::Real(f) => f.to_string(),
-                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).to_string(),
-                    rusqlite::types::ValueRef::Blob(b) => format!("BLOB({} bytes)", b.len()),
-                };
-                values.push(value);
-            }
-            Ok(SearchResultRow { values })
-        })
-        .map_err(|e| {
-            let error_msg = e.to_string();
-            if error_msg.contains("malformed") || error_msg.contains("corrupt") || error_msg.contains("database disk image is malformed") {
-                format!("DATABASE_CORRUPTED: {}", error_msg)
-            } else if error_msg.contains("fts5: syntax error") {
-                format!("Search syntax error: The search term contains characters that cannot be processed. Please try a simpler search term.")
-            } else {
-                format!("Failed to execute query: {}", error_msg)
-            }
-        })?;
-        
-        let mut results = Vec::new();
-        for row in rows {
-            match row {
-                Ok(search_row) => results.push(search_row),
-                Err(e) => {
-                    let error_msg = e.to_string();
-                    if error_msg.contains("malformed") || error_msg.contains("corrupt") || error_msg.contains("database disk image is malformed") {
-                        return Err(format!("DATABASE_CORRUPTED: {}", error_msg));
-                    } else if error_msg.contains("fts5: syntax error") {
-                        return Err(format!("Search syntax error: The search term contains characters that cannot be processed. Please try a simpler search term."));
-                    } else {
-                        return Err(format!("Error reading row: {}", error_msg));
-                    }
-                }
-            }
-        }
-        
-        Ok(vec![SearchResult {
-            columns: column_names,
-            rows: results,
-        }])
-    }
-
-    /// Open file explorer to the directory containing the specified file path
-    pub fn open_file_explorer(&self, file_path: &str) -> Result<(), String> {
-        #[cfg(windows)]
-        {
-            Command::new("explorer")
-                .arg("/select,")
-                .arg(file_path)
-                .spawn()
-                .map_err(|e| format!("Failed to open file explorer: {}", e))?;
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            Command::new("open")
-                .arg("-R")
-                .arg(file_path)
-                .spawn()
-                .map_err(|e| format!("Failed to open file explorer: {}", e))?;
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            let path = std::path::Path::new(file_path);
-            let dir_path = if path.is_file() {
-                path.parent().unwrap_or(path)
-            } else {
-                path
-            };
-            
-            // Try different file managers
-            let managers = ["xdg-open", "nautilus", "dolphin", "thunar", "pcmanfm"];
-            let mut success = false;
-            
-            for manager in &managers {
-                if let Ok(_) = Command::new(manager)
-                    .arg(dir_path)
-                    .spawn() {
-                    success = true;
-                    break;
-                }
-            }
-            
-            if !success {
-                return Err("No suitable file manager found".to_string());
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Clean up Windows UNC prefixes (\\?\) from existing `files.path`
-    /// entries. Relic of pre-A layouts where paths were stored with the
-    /// prefix; current code strips them at insert time, so this is a
-    /// one-shot cleanup users can invoke manually if needed.
-    #[allow(dead_code)]
-    pub fn clean_unc_prefixes(&self, db_path: &str) -> Result<(), String> {
-        let conn = Connection::open(db_path)
-            .map_err(|e| format!("Failed to open database: {}", e))?;
-        conn.execute(
-            "UPDATE files SET path = SUBSTR(path, 5) WHERE path LIKE '\\\\?\\%'",
-            (),
-        )
-        .map_err(|e| format!("Failed to update files table: {}", e))?;
-        Ok(())
-    }
-
-    /// Check if the database is corrupted or malformed
-    #[allow(dead_code)]
-    pub fn check_database_health(&self, db_path: &str) -> Result<bool, String> {
-        match Connection::open(db_path) {
-            Ok(conn) => {
-                // Try to run integrity check
-                match conn.prepare("PRAGMA integrity_check") {
-                    Ok(mut stmt) => {
-                        match stmt.query_row([], |row| {
-                            let result: String = row.get(0)?;
-                            Ok(result == "ok")
-                        }) {
-                            Ok(is_ok) => Ok(is_ok),
-                            Err(_) => Ok(false)
-                        }
-                    },
-                    Err(_) => Ok(false)
-                }
-            },
-            Err(_) => Ok(false)
-        }
-    }
-
-    /// Check if configuration changes require index recreation
-    pub fn check_config_validation(&self, db_path: &str, config: &Config, indexing_path: &str) -> Result<Option<Vec<String>>, String> {
-        let conn = db::open_or_recreate(db_path, &config.processing.tokenize)?;
-        Self::validate_config(&conn, config, indexing_path)
     }
 
     /// Stop indexing and delete the database file for a clean rebuild
@@ -525,10 +309,7 @@ impl IndexingService {
         while attempts < 50 { // Wait up to 5 seconds
             match self.get_status() {
                 IndexingStatus::Idle => break,
-                IndexingStatus::Stopping
-                | IndexingStatus::CountingFiles { .. }
-                | IndexingStatus::RunningFileIndex { .. }
-                | IndexingStatus::RunningTextIndex { .. } => {
+                IndexingStatus::Stopping | IndexingStatus::Running { .. } => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                     attempts += 1;
                 }
@@ -536,10 +317,13 @@ impl IndexingService {
             }
         }
 
-        // Delete the database file
+        // Delete the database file and its WAL sidecars.
         if std::path::Path::new(db_path).exists() {
             std::fs::remove_file(db_path)
                 .map_err(|e| format!("Failed to delete database file: {}", e))?;
+        }
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(format!("{}{}", db_path, suffix));
         }
 
         Ok(())
@@ -557,12 +341,7 @@ impl IndexingService {
         while let Ok(command) = command_rx.recv() {
             match command {
                 IndexingCommand::Start { paths, db_path, config } => {
-                    if matches!(
-                        *status.lock().unwrap(),
-                        IndexingStatus::CountingFiles { .. }
-                            | IndexingStatus::RunningFileIndex { .. }
-                            | IndexingStatus::RunningTextIndex { .. }
-                    ) {
+                    if matches!(*status.lock().unwrap(), IndexingStatus::Running { .. }) {
                         continue; // Already running
                     }
 
@@ -572,20 +351,24 @@ impl IndexingService {
                     }
 
                     *stop_flag.lock().unwrap() = false;
-                    *status.lock().unwrap() = if config.processing.precount_files_for_progress {
-                        IndexingStatus::CountingFiles {
-                            _entries_scanned: 0,
-                            _indexable_files_counted: 0,
-                            current_file: Some("Preparing database...".to_string()),
-                            start_time: Instant::now(),
-                        }
-                    } else {
-                        IndexingStatus::RunningFileIndex {
-                            files_processed: 0,
-                            total_files: None,
-                            current_file: None,
-                            start_time: Instant::now(),
-                        }
+                    // One placeholder row per root so the GUI has structure
+                    // to draw before the writer loop publishes real numbers.
+                    *status.lock().unwrap() = IndexingStatus::Running {
+                        start_time: Instant::now(),
+                        roots: paths
+                            .iter()
+                            .map(|p| RootProgress {
+                                root: p.clone(),
+                                phase: RootPhase::Walking,
+                                walked: 0,
+                                walk_total: None,
+                                extracted: 0,
+                                extract_total: 0,
+                                current_file: Some("Starting…".to_string()),
+                                active_workers: 0,
+                                total_workers: 0,
+                            })
+                            .collect(),
                     };
 
                     // Run indexing in a separate thread
@@ -614,12 +397,7 @@ impl IndexingService {
                     }));
                 }
                 IndexingCommand::Stop => {
-                    if matches!(
-                        *status.lock().unwrap(),
-                        IndexingStatus::CountingFiles { .. }
-                            | IndexingStatus::RunningFileIndex { .. }
-                            | IndexingStatus::RunningTextIndex { .. }
-                    ) {
+                    if matches!(*status.lock().unwrap(), IndexingStatus::Running { .. }) {
                         *status.lock().unwrap() = IndexingStatus::Stopping;
                         *stop_flag.lock().unwrap() = true;
                     }
@@ -631,20 +409,6 @@ impl IndexingService {
         if let Some(handle) = indexing_handle {
             let _ = handle.join();
         }
-    }
-
-    fn file_index_status_callback(
-        status: &Arc<Mutex<IndexingStatus>>,
-    ) -> Box<dyn Fn(&str) + Send + Sync> {
-        let st = status.clone();
-        Box::new(move |file_status: &str| {
-            if let Ok(mut status_guard) = st.lock() {
-                if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard
-                {
-                    *current_file = Some(file_status.to_string());
-                }
-            }
-        })
     }
 
     fn run_indexing(
@@ -672,14 +436,12 @@ impl IndexingService {
                 std::path::Path::new(p)
                     .canonicalize()
                     .ok()
-                    .map(|c| {
-                        let s = c.to_string_lossy().to_string();
-                        if s.starts_with("\\\\?\\") {
-                            s[4..].to_string()
-                        } else {
-                            s
-                        }
-                    })
+                    // Same spelling rules as `files.path`: a hand-rolled
+                    // four-character strip turns `\\?\UNC\server\share` into
+                    // `UNC\server\share`, which is not a path — and no longer
+                    // looks like a share, so the root would silently walk with
+                    // the local thread count instead of the network one.
+                    .map(|c| path_to_db_string(&c))
                     .unwrap_or_else(|| p.clone())
             })
             .filter(|p| seen_roots.insert(p.clone()))
@@ -695,11 +457,12 @@ impl IndexingService {
         Self::update_config(&conn, config, &roots.join("\n"))?;
 
         // Load existing files from database for incremental indexing
-        let existing_files = {
+        // Shared read-only with the walk threads, which classify against it.
+        let existing_files = Arc::new({
             let conn_ref = &conn;
             load_existing_files(conn_ref)
                 .map_err(|e| format!("Failed to load existing files: {}", e))?
-        };
+        });
 
         let conn_mutex = Arc::new(Mutex::new(conn));
         
@@ -708,375 +471,436 @@ impl IndexingService {
             *db_opt = Some(conn_mutex.clone());
         }
 
-        let progress_display_total: Option<usize> =
-            if config.processing.precount_files_for_progress {
-                if *stop_flag.lock().unwrap() {
-                    if let Ok(mut status_guard) = status.lock() {
-                        *status_guard = IndexingStatus::Idle;
-                    }
-                    return Ok(());
-                }
-                if let Ok(mut g) = status.lock() {
-                    if let IndexingStatus::CountingFiles { ref mut current_file, .. } = *g {
-                        *current_file = Some("Counting paths (shell)...".to_string());
-                    }
-                }
-                let mut n: usize = 0;
-                for root in &roots {
-                    if *stop_flag.lock().unwrap() {
-                        break;
-                    }
-                    // A failing precount on one root (e.g. permission denied)
-                    // shouldn't abort all indexing; just skip its contribution.
-                    match count_tree_entries_fast(root) {
-                        Ok(c) => n += c,
-                        Err(e) => eprintln!("Warning: precount for {}: {}", root, e),
-                    }
-                }
-                if *stop_flag.lock().unwrap() {
-                    if let Ok(mut status_guard) = status.lock() {
-                        *status_guard = IndexingStatus::Idle;
-                    }
-                    return Ok(());
-                }
-                if let Ok(mut status_guard) = status.lock() {
-                    *status_guard = IndexingStatus::RunningFileIndex {
-                        files_processed: 0,
-                        total_files: Some(n),
-                        current_file: None,
-                        start_time: Instant::now(),
-                    };
-                }
-                Some(n)
-            } else {
-                None
-            };
+        let run_start = Instant::now();
 
-        let batch_size = config.processing.batch_size;
-        let mut pending_updates: Vec<(DirEntry, usize)> = Vec::new();
-        let mut pending_inserts: Vec<(DirEntry, usize)> = Vec::new();
-        // Every path seen during this walk, regardless of outcome. Dedupes
-        // duplicate visits that can happen when two roots overlap (e.g.
-        // `/home` and `/home/user`) or when canonicalization collapses
-        // symlinks. Also feeds the stale-entry cleanup at the end of the walk.
-        let mut seen_paths: HashSet<String> = HashSet::new();
-        let mut visit: usize = 0;
-        let mut had_incremental_work = false;
-        let flush_updates = |buf: &mut Vec<(DirEntry, usize)>| -> Result<(), String> {
-            if buf.is_empty() {
-                return Ok(());
-            }
-            process_batch_updates_files_only(
-                &conn_mutex,
-                buf.as_slice(),
-                stop_flag,
-                Some(Self::file_index_status_callback(status)),
-                None,
-                config,
-                progress_display_total,
-            )?;
-            buf.clear();
-            Ok(())
-        };
+        // Per-root concurrent counts, killed the moment this run exits by
+        // any path — the guard flips the token on drop and the count
+        // threads' subprocesses die within one poll interval.
+        let count_cancel = Arc::new(AtomicBool::new(false));
+        let _count_guard = CancelOnDrop(count_cancel.clone());
 
-        let flush_inserts = |buf: &mut Vec<(DirEntry, usize)>| -> Result<(), String> {
-                if buf.is_empty() {
-                    return Ok(());
-                }
-                process_batch_inserts_files_only(
-                    &conn_mutex,
-                    buf.as_slice(),
-                    stop_flag,
-                    Some(Self::file_index_status_callback(status)),
-                    None,
-                    config,
-                    progress_display_total,
-                )?;
-                buf.clear();
-                Ok(())
-            };
+        // Shared with every root's walk workers, which use it to finish small
+        // text files without handing them to the content pass below.
+        let registry = Arc::new(Registry::default_set());
+        let quantum = config.processing.batch_size.max(1);
 
-        let root_iter = roots
-            .iter()
-            .flat_map(|r| indexed_walk_file_entries(r, config.processing.follow_symlinks));
-        for entry in root_iter {
-            if should_abort(stop_flag, suspend_flag) {
-                flush_updates(&mut pending_updates)?;
-                flush_inserts(&mut pending_inserts)?;
-                if let Ok(mut status_guard) = status.lock() {
-                    *status_guard = IndexingStatus::Idle;
-                }
-                return Ok(());
-            }
+        // One pipeline per root: its own walker (with per-root worker
+        // count), its own count thread, its own buffers and extraction
+        // cursor. They all funnel into this single writer thread.
+        let mut pipelines: Vec<RootPipeline> = Vec::with_capacity(roots.len());
+        for root in &roots {
+            let ignore = crate::config::IgnoreSet::compile(&config.indexing.ignore_patterns)
+                .map_err(|e| format!("ignore patterns: {}", e))?;
+            let workers = config
+                .indexing
+                .root_workers
+                .get(root)
+                .copied()
+                .filter(|w| *w > 0)
+                .unwrap_or_else(|| thread_count_for(std::slice::from_ref(root)))
+                .clamp(1, 64);
+            let walk = walk_indexable_files(
+                std::slice::from_ref(root),
+                config.indexing.follow_symlinks,
+                config.indexing.include_hidden,
+                ignore,
+                existing_files.clone(),
+                config.clone(),
+                registry.clone(),
+                stop_flag.clone(),
+                suspend_flag.clone(),
+                workers,
+            );
+            let stats = walk.worker_stats();
 
-            visit += 1;
-            if let Ok(mut g) = status.lock() {
-                if let IndexingStatus::RunningFileIndex {
-                    ref mut files_processed,
-                    ..
-                } = *g
-                {
-                    *files_processed = visit;
-                }
-            }
-
-            if !config.processing.include_hidden && path_has_hidden_component(entry.path()) {
-                continue;
-            }
-
-            let action = classify_dir_entry_for_indexing(&entry, &existing_files);
-            let Some(action) = action else {
-                continue;
-            };
-            let current_path = entry
-                .path()
-                .canonicalize()
-                .ok()
-                .map(|fp| {
-                    let path_str = fp.to_string_lossy().to_string();
-                    if path_str.starts_with("\\\\?\\") {
-                        path_str[4..].to_string()
-                    } else {
-                        path_str
+            let count_total = Arc::new(AtomicUsize::new(0));
+            {
+                let root = root.clone();
+                let cancel = count_cancel.clone();
+                let total = count_total.clone();
+                let _ = thread::Builder::new().name("qs-count".into()).spawn(move || {
+                    match count_tree_entries_fast(&root, &cancel) {
+                        // A genuinely empty root stores 1 so "known" stays
+                        // distinguishable from the 0 = unknown sentinel; an
+                        // empty root's walk finishes instantly anyway.
+                        Ok(n) => total.store(n.max(1), Ordering::Relaxed),
+                        Err(e) => {
+                            if !e.contains("cancelled") {
+                                crate::log_warn!("count for {}: {}", root, e);
+                            }
+                        }
                     }
                 });
-
-            // Skip this entry if its canonical path was already queued in
-            // this run. Prevents UNIQUE(path) violations when overlapping
-            // roots or symlinks lead the walker to the same file twice.
-            let path_for_dedup = match &current_path {
-                Some(p) => p.clone(),
-                None => continue,
-            };
-            if !seen_paths.insert(path_for_dedup) {
-                continue;
             }
 
-            match action {
-                FileIndexAction::Skip => {}
-                FileIndexAction::Update => {
-                    had_incremental_work = true;
-                    pending_updates.push((entry, visit));
-                    if pending_updates.len() >= batch_size {
-                        flush_updates(&mut pending_updates)?;
+            pipelines.push(RootPipeline {
+                root: root.clone(),
+                walk,
+                stats,
+                count_total,
+                pending_updates: Vec::new(),
+                pending_inserts: Vec::new(),
+                walked: 0,
+                walk_clean: true,
+                phase: RootPhase::Walking,
+                extract: None,
+                extract_total: 0,
+                extracted: 0,
+                current_file: None,
+            });
+        }
+
+        // Publish a status snapshot. Never clobbers Stopping — the command
+        // thread owns that transition.
+        let publish = |pipelines: &[RootPipeline]| {
+            let roots: Vec<RootProgress> = pipelines
+                .iter()
+                .map(|p| RootProgress {
+                    root: p.root.clone(),
+                    phase: p.phase,
+                    walked: p.walked,
+                    walk_total: match p.count_total.load(Ordering::Relaxed) {
+                        0 => None,
+                        n => Some(n),
+                    },
+                    extracted: p.extracted,
+                    extract_total: p.extract_total,
+                    current_file: p.current_file.clone(),
+                    active_workers: p.stats.active(),
+                    total_workers: p.stats.total(),
+                })
+                .collect();
+            if let Ok(mut g) = status.lock() {
+                if !matches!(*g, IndexingStatus::Stopping) {
+                    *g = IndexingStatus::Running { start_time: run_start, roots };
+                }
+            }
+        };
+        publish(&pipelines);
+
+        // Round-robin with skipping: each round takes at most one quantum
+        // from every root that has work ready. Write-bottlenecked, all
+        // active roots get even quanta; read-bottlenecked, roots with
+        // empty channels are skipped and the firehose roots get the
+        // writer's full attention.
+        let mut seen_paths: HashSet<String> = HashSet::new();
+        let mut aborted = false;
+        let mut stale_cleanup_ok = true;
+        let mut cleanup_done = false;
+        let mut stale_deleted = 0usize;
+        let mut rr = 0usize;
+
+        loop {
+            if should_abort(stop_flag, suspend_flag) {
+                aborted = true;
+                break;
+            }
+            let mut progressed = false;
+            let n = pipelines.len();
+            for k in 0..n {
+                let p = &mut pipelines[(rr + k) % n];
+                match p.phase {
+                    RootPhase::Walking => {
+                        let mut took = 0usize;
+                        while took < quantum {
+                            match p.walk.try_next() {
+                                TryNext::Item(file) => {
+                                    took += 1;
+                                    p.walked += 1;
+                                    if p.walked % 64 == 0 {
+                                        p.current_file = Some(file.path.clone());
+                                    }
+                                    // Membership decides what survives stale
+                                    // cleanup: "the walk saw this", never
+                                    // "processed successfully". Also dedupes
+                                    // symlinked spellings across roots.
+                                    if !seen_paths.insert(file.path.clone()) {
+                                        continue;
+                                    }
+                                    let Some(rec) = file.record else { continue };
+                                    if file.action == FileIndexAction::Update {
+                                        p.pending_updates.push(rec);
+                                        if p.pending_updates.len() >= quantum {
+                                            process_batch_updates(
+                                                &conn_mutex,
+                                                &p.pending_updates,
+                                                stop_flag,
+                                                config,
+                                            )?;
+                                            p.pending_updates.clear();
+                                        }
+                                    } else {
+                                        p.pending_inserts.push(rec);
+                                        if p.pending_inserts.len() >= quantum {
+                                            process_batch_inserts(
+                                                &conn_mutex,
+                                                &p.pending_inserts,
+                                                stop_flag,
+                                                config,
+                                            )?;
+                                            p.pending_inserts.clear();
+                                        }
+                                    }
+                                }
+                                TryNext::Empty => break,
+                                TryNext::Finished => {
+                                    // Join before deciding anything: workers
+                                    // close the channel when they stop for
+                                    // *any* reason, so a panic and a finished
+                                    // walk look identical from here.
+                                    p.walk_clean = p.walk.finish();
+                                    process_batch_updates(
+                                        &conn_mutex,
+                                        &p.pending_updates,
+                                        stop_flag,
+                                        config,
+                                    )?;
+                                    p.pending_updates.clear();
+                                    process_batch_inserts(
+                                        &conn_mutex,
+                                        &p.pending_inserts,
+                                        stop_flag,
+                                        config,
+                                    )?;
+                                    p.pending_inserts.clear();
+
+                                    if !p.walk_clean {
+                                        crate::log_warn!(
+                                            "a walk worker for {} terminated abnormally; \
+                                             skipping stale cleanup",
+                                            p.root
+                                        );
+                                        stale_cleanup_ok = false;
+                                        p.phase = RootPhase::Done;
+                                    } else if *stop_flag.lock().unwrap() {
+                                        p.phase = RootPhase::Done;
+                                    } else {
+                                        let cursor = ExtractCursor::for_root(&p.root);
+                                        let scope =
+                                            extract_scope_prepare(&conn_mutex, &cursor, config)?;
+                                        // Progress counts the root's whole
+                                        // searchable set: files extracted in
+                                        // earlier runs start the counter, so
+                                        // an unchanged root shows "X of X"
+                                        // rather than "0 of 0".
+                                        p.extract_total = scope.pending + scope.already_done;
+                                        p.extracted = scope.already_done;
+                                        if scope.pending == 0 {
+                                            p.phase = RootPhase::Done;
+                                        } else {
+                                            p.extract = Some(cursor);
+                                            p.phase = RootPhase::Extracting;
+                                        }
+                                    }
+                                    progressed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        progressed |= took > 0;
+                    }
+                    RootPhase::Extracting => {
+                        let cursor = p.extract.as_mut().expect("extracting root has a cursor");
+                        let mut last_file: Option<String> = None;
+                        let processed = extract_one_batch(
+                            &conn_mutex,
+                            cursor,
+                            &registry,
+                            config,
+                            stop_flag,
+                            suspend_flag,
+                            &mut |name| last_file = Some(name.to_string()),
+                        )?;
+                        if last_file.is_some() {
+                            p.current_file = last_file;
+                        }
+                        if processed == 0 {
+                            p.extract = None;
+                            p.phase = RootPhase::Done;
+                        } else {
+                            p.extracted += processed;
+                        }
+                        progressed = true;
+                    }
+                    RootPhase::Done => {}
+                }
+            }
+            rr = rr.wrapping_add(1);
+
+            // Once every walk has ended, reconcile deletions — globally,
+            // because a file may be reachable through more than one root's
+            // symlinks. Runs at most once per run, on this writer thread.
+            if !cleanup_done && pipelines.iter().all(|p| p.phase != RootPhase::Walking) {
+                cleanup_done = true;
+                let stopped = *stop_flag.lock().unwrap();
+                if stale_cleanup_ok && !stopped {
+                    let stale_paths: Vec<String> = existing_files
+                        .keys()
+                        .filter(|path| !seen_paths.contains(*path))
+                        .filter(|path| {
+                            !pipelines.iter().any(|p| p.walk.unreadable().covers(path))
+                        })
+                        .cloned()
+                        .collect();
+                    let unreadable_count: usize = pipelines
+                        .iter()
+                        .map(|p| p.walk.unreadable().paths().len())
+                        .sum();
+                    if unreadable_count > 0 {
+                        crate::log_warn!(
+                            "{} director{} could not be read; index entries beneath \
+                             them were kept rather than deleted",
+                            unreadable_count,
+                            if unreadable_count == 1 { "y" } else { "ies" }
+                        );
+                    }
+                    if !stale_paths.is_empty() {
+                        if let Some(first) = pipelines.first_mut() {
+                            first.current_file =
+                                Some("Removing stale index entries…".to_string());
+                        }
+                        stale_deleted = cleanup_stale_index_entries(
+                            &conn_mutex,
+                            stale_paths.as_slice(),
+                            stop_flag,
+                            suspend_flag,
+                        )?;
                     }
                 }
-                FileIndexAction::Insert => {
-                    had_incremental_work = true;
-                    pending_inserts.push((entry, visit));
-                    if pending_inserts.len() >= batch_size {
-                        flush_inserts(&mut pending_inserts)?;
-                    }
-                }
+                progressed = true;
+            }
+
+            publish(&pipelines);
+
+            if pipelines.iter().all(|p| p.phase == RootPhase::Done) {
+                break;
+            }
+            if !progressed {
+                thread::sleep(Duration::from_millis(2));
             }
         }
 
-        flush_updates(&mut pending_updates)?;
-        flush_inserts(&mut pending_inserts)?;
-
-        let stale_paths: Vec<String> = existing_files
-            .keys()
-            .filter(|p| !seen_paths.contains(*p))
-            .cloned()
-            .collect();
-        let stale_deleted = cleanup_stale_index_entries(
-            &conn_mutex,
-            stale_paths.as_slice(),
-            stop_flag,
-            suspend_flag,
-            Some(Self::file_index_status_callback(status)),
-        )?;
-        if stale_deleted > 0 {
-            had_incremental_work = true;
-        }
-
-        if !had_incremental_work {
-            if let Ok(mut status_guard) = status.lock() {
-                if let IndexingStatus::RunningFileIndex { ref mut current_file, .. } = *status_guard
-                {
-                    *current_file = Some("File index is up to date".to_string());
-                }
+        if aborted {
+            // Buffered records are valid work — land them before leaving.
+            for p in &mut pipelines {
+                process_batch_updates(&conn_mutex, &p.pending_updates, stop_flag, config)?;
+                p.pending_updates.clear();
+                process_batch_inserts(&conn_mutex, &p.pending_inserts, stop_flag, config)?;
+                p.pending_inserts.clear();
             }
-        }
-
-        // Check for stop signal (and park if suspended) before starting text indexing.
-        if should_abort(stop_flag, suspend_flag) {
             if let Ok(mut status_guard) = status.lock() {
                 *status_guard = IndexingStatus::Idle;
             }
+            // Deliberately no stale cleanup: a partial walk has a partial
+            // seen set, and deleting everything it did not reach would
+            // empty most of the index.
             return Ok(());
         }
 
-        // Phase 2: Text indexing
-        if let Ok(mut status_guard) = status.lock() {
-            *status_guard = IndexingStatus::RunningTextIndex {
-                files_processed: 0,
-                current_file: Some("Starting text indexing...".to_string()),
-                start_time: Instant::now(),
-            };
+        // FTS housekeeping once per completed run (cheap if nothing changed).
+        let _ = stale_deleted;
+        {
+            let conn = conn_mutex.lock().unwrap();
+            fts_finalize_after_text_indexing(&conn)?;
         }
 
-        // Create status callback for text indexing
-        let status_clone_5 = status.clone();
-        let text_status_callback = Box::new(move |file_status: &str| {
-            if let Ok(mut status_guard) = status_clone_5.lock() {
-                if let IndexingStatus::RunningTextIndex { ref mut current_file, .. } = *status_guard {
-                    *current_file = Some(file_status.to_string());
-                }
-            }
-        });
-        
-        // Create progress callback for text indexing
-        let status_clone_6 = status.clone();
-        let text_progress_callback = Box::new(move |current_index: usize| {
-            if let Ok(mut status_guard) = status_clone_6.lock() {
-                if let IndexingStatus::RunningTextIndex { ref mut files_processed, .. } = *status_guard {
-                    *files_processed = current_index;
-                }
-            }
-        });
-
-        // Process text indexing
-        if let Err(e) = process_text_indexing(&conn_mutex, &stop_flag, suspend_flag, Some(text_status_callback), Some(text_progress_callback), config) {
-            return Err(format!("Failed to process text indexing: {}", e));
-        }
-
-        // Mark text indexing as complete
-        if let Ok(mut status_guard) = status.lock() {
-            if let IndexingStatus::RunningTextIndex { ref mut current_file, .. } = *status_guard {
-                *current_file = Some("Text indexing complete".to_string());
-            }
+        // Stamp the successful run so the coordinator can schedule the next
+        // periodic reindex from it.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(conn) = conn_mutex.lock() {
+            let _ = crate::db::repo::set_last_full_index(&conn, now);
         }
 
         Ok(())
     }
 
-    /// Validates configuration against stored values and returns validation results.
-    /// Critical configuration changes that require index recreation:
-    /// - hash_length: affects file hash computation, invalidates existing file metadata
-    /// - indexing_path: changes the scope of indexed files
-    /// - tokenize: changes FTS5 tokenization, invalidates text search index
-    fn validate_config(conn: &Connection, config: &Config, indexing_path: &str) -> Result<Option<Vec<String>>, String> {
-        // Critical configuration values that require index recreation
-        let hash_length = config.processing.hash_length.to_string();
-        let tokenize = config.processing.tokenize.clone();
-        let include_hidden = config.processing.include_hidden.to_string();
-        let normalized_path = {
-            let path = std::path::Path::new(indexing_path)
-                .canonicalize()
-                .unwrap_or_else(|_| std::path::PathBuf::from(indexing_path))
-                .to_string_lossy()
-                .to_string();
-            // Remove Windows UNC prefix \\?\
-            if path.starts_with("\\\\?\\") {
-                path[4..].to_string()
-            } else {
-                path
-            }
+    /// The config keys whose change invalidates the stored index, paired
+    /// with their current values. One list drives both [`validate_config`]
+    /// and [`update_config`] so the two can never drift apart.
+    fn config_validation_entries(config: &Config, indexing_path: &str) -> Vec<(&'static str, String)> {
+        let sorted_joined = |v: &[String]| {
+            let mut v: Vec<String> = v.to_vec();
+            v.sort();
+            v.join("\n")
         };
-        
-        // Check stored configuration values
-        let mut stored_hash_length: Option<String> = None;
-        let mut stored_indexing_path: Option<String> = None;
-        let mut stored_tokenize: Option<String> = None;
-        let mut stored_include_hidden: Option<String> = None;
-        
-        if let Ok(mut stmt) = conn.prepare("SELECT key, value FROM config_validation WHERE key IN ('hash_length', 'indexing_path', 'tokenize', 'include_hidden')") {
-            if let Ok(rows) = stmt.query_map([], |row| {
-                let key: String = row.get(0)?;
-                let value: String = row.get(1)?;
-                Ok((key, value))
-            }) {
-                for row in rows.flatten() {
-                    match row.0.as_str() {
-                        "hash_length" => stored_hash_length = Some(row.1),
-                        "indexing_path" => stored_indexing_path = Some(row.1),
-                        "tokenize" => stored_tokenize = Some(row.1),
-                        "include_hidden" => stored_include_hidden = Some(row.1),
-                        _ => {}
-                    }
+        vec![
+            ("hash_length", config.processing.hash_length.to_string()),
+            // Hashes are only comparable within one algorithm, and
+            // duplicate detection groups purely by hash. Bump this string
+            // whenever the digest input changes so existing indexes are
+            // offered a rebuild instead of silently mixing schemes.
+            ("hash_algorithm", "size+head".to_string()),
+            ("indexing_path", normalize_root_string(indexing_path)),
+            ("tokenize", config.processing.tokenize.clone()),
+            ("include_hidden", config.indexing.include_hidden.to_string()),
+            (
+                "ignore_patterns",
+                sorted_joined(&config.indexing.ignore_patterns),
+            ),
+            (
+                "content_extensions",
+                sorted_joined(&config.indexing.content_extensions),
+            ),
+        ]
+    }
+
+    /// Compare current config against the values stored in the index.
+    /// Returns `Some(changes)` when the index was built under settings
+    /// that no longer match — the caller offers a rebuild. A key absent
+    /// from the DB (older index) only counts as changed when the DB has
+    /// stored *any* validation state before.
+    fn validate_config(
+        conn: &Connection,
+        config: &Config,
+        indexing_path: &str,
+    ) -> Result<Option<Vec<ConfigChange>>, String> {
+        let mut changes = Vec::new();
+        for (key, current) in Self::config_validation_entries(config, indexing_path) {
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT value FROM config_validation WHERE key = ?1",
+                    params![key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("read config_validation.{}: {}", key, e))?;
+            if let Some(stored) = stored {
+                if stored != current {
+                    changes.push(ConfigChange {
+                        key: key.to_string(),
+                        stored,
+                        current,
+                    });
                 }
             }
         }
-        
-        // Check if configuration is invalid
-        let hash_length_changed = stored_hash_length.as_ref().map_or(false, |stored| stored != &hash_length);
-        let indexing_path_changed = stored_indexing_path.as_ref().map_or(false, |stored| stored != &normalized_path);
-        let tokenize_changed = stored_tokenize.as_ref().map_or(false, |stored| stored != &tokenize);
-        let include_hidden_changed = stored_include_hidden.as_ref().map_or(false, |stored| stored != &include_hidden);
-        
-        if hash_length_changed || indexing_path_changed || tokenize_changed || include_hidden_changed {
-            let mut changes = Vec::new();
-            if hash_length_changed {
-                changes.push(format!("hash_length: {} -> {}", 
-                    stored_hash_length.unwrap_or_else(|| "unknown".to_string()), hash_length));
-            }
-            if indexing_path_changed {
-                changes.push(format!("indexing_path: {} -> {}", 
-                    stored_indexing_path.unwrap_or_else(|| "unknown".to_string()), normalized_path));
-            }
-            if tokenize_changed {
-                changes.push(format!("tokenize: {} -> {}", 
-                    stored_tokenize.unwrap_or_else(|| "unknown".to_string()), tokenize));
-            }
-            if include_hidden_changed {
-                changes.push(format!(
-                    "include_hidden: {} -> {}",
-                    stored_include_hidden.unwrap_or_else(|| "unknown".to_string()),
-                    include_hidden
-                ));
-            }
-            
-            return Ok(Some(changes));
-        }
-        
-        // No configuration changes detected
-        Ok(None)
+        Ok(if changes.is_empty() { None } else { Some(changes) })
     }
 
-
-    /// Updates stored configuration values without clearing the index
+    /// Stamp the index with the settings it's being built under.
     fn update_config(conn: &Connection, config: &Config, indexing_path: &str) -> Result<(), String> {
-        let hash_length = config.processing.hash_length.to_string();
-        let tokenize = config.processing.tokenize.clone();
-        let include_hidden = config.processing.include_hidden.to_string();
-        let normalized_path = {
-            let path = std::path::Path::new(indexing_path)
-                .canonicalize()
-                .unwrap_or_else(|_| std::path::PathBuf::from(indexing_path))
-                .to_string_lossy()
-                .to_string();
-            // Remove Windows UNC prefix \\?\
-            if path.starts_with("\\\\?\\") {
-                path[4..].to_string()
-            } else {
-                path
-            }
-        };
-
-        // Update stored configuration values
-        conn.execute(
-            "INSERT OR REPLACE INTO config_validation (key, value) VALUES ('hash_length', ?1)",
-            params![hash_length],
-        ).map_err(|e| format!("Failed to store hash_length config: {}", e))?;
-        
-        conn.execute(
-            "INSERT OR REPLACE INTO config_validation (key, value) VALUES ('indexing_path', ?1)",
-            params![normalized_path],
-        ).map_err(|e| format!("Failed to store indexing_path config: {}", e))?;
-        
-        conn.execute(
-            "INSERT OR REPLACE INTO config_validation (key, value) VALUES ('tokenize', ?1)",
-            params![tokenize],
-        ).map_err(|e| format!("Failed to store tokenize config: {}", e))?;
-        
-        conn.execute(
-            "INSERT OR REPLACE INTO config_validation (key, value) VALUES ('include_hidden', ?1)",
-            params![include_hidden],
-        ).map_err(|e| format!("Failed to store include_hidden config: {}", e))?;
-
+        for (key, current) in Self::config_validation_entries(config, indexing_path) {
+            conn.execute(
+                "INSERT OR REPLACE INTO config_validation (key, value) VALUES (?1, ?2)",
+                params![key, current],
+            )
+            .map_err(|e| format!("store config_validation.{}: {}", key, e))?;
+        }
         Ok(())
     }
+}
+
+/// Canonicalize a root string for storage/comparison, stripping the Windows
+/// UNC prefix. Multi-root strings (newline-joined) fail canonicalize and
+/// pass through verbatim, which still compares consistently.
+fn normalize_root_string(indexing_path: &str) -> String {
+    let path = std::path::Path::new(indexing_path)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(indexing_path));
+    path_to_db_string(&path)
 }
 
 impl Drop for IndexingService {

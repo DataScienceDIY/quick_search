@@ -1,12 +1,32 @@
 //! SQL strings for the current schema. Versioned; [`migrate`](super::migrate)
 //! drives the upgrade path.
 
-/// Pragmas applied on every connection open. Tuned for write throughput during
-/// indexing; a clean shutdown re-enables journal_mode/synchronous via
+/// Pragmas applied on every writable connection open.
+///
+/// WAL, not journal-off: auto-indexing writes continuously while searches
+/// stream from their own read-only connections, and WAL is what lets those
+/// readers proceed without ever blocking the writer (or vice versa).
+/// `synchronous = NORMAL` under WAL risks only the last commit on power
+/// loss — acceptable for an index that is re-derivable from disk. Only two
+/// writers exist (full index runs and the coordinator's incremental
+/// updates) and they're serialized by design; `busy_timeout` is a backstop,
+/// not a coordination mechanism. A clean shutdown truncates the log via
 /// [`super::repo::checkpoint_and_close`].
 pub const PRAGMAS_FAST: &str = "
-    PRAGMA journal_mode = OFF;
-    PRAGMA synchronous = 0;
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA cache_size = 10000;
+    PRAGMA temp_store = MEMORY;
+    PRAGMA foreign_keys = ON;
+";
+
+/// Pragmas safe to apply on a read-only connection, where `journal_mode`
+/// and `synchronous` can't be changed on the file. Used by
+/// [`super::open::open_existing`] for read-only opens; write paths get the
+/// full [`PRAGMAS_FAST`] set.
+pub const PRAGMAS_READONLY: &str = "
+    PRAGMA busy_timeout = 5000;
     PRAGMA cache_size = 10000;
     PRAGMA temp_store = MEMORY;
     PRAGMA foreign_keys = ON;
