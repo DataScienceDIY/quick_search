@@ -1,37 +1,112 @@
+# QuickSearch configuration reference.
+#
+# The live config is auto-created at ~/.config/quicksearch/config.toml
+# (Windows: %APPDATA%\quicksearch\config.toml). A config.toml placed next
+# to the quicksearch binary overrides it entirely (portable mode).
+# Relative paths resolve against the directory containing the config
+# file, so a portable folder can be moved wholesale.
+#
+# Every key is optional; missing keys take the defaults shown here.
+
 [paths]
 # One or more directory roots to index. Walked in order; duplicate and
-# nested roots are de-duplicated automatically.
-indexing_paths = ["/"]
-database_path = "QuickSearch.db"
+# nested roots are de-duplicated automatically. `~` expands to home.
+indexing_paths = ["~"]
+# SQLite index location. Default: ~/.local/share/quicksearch/index.sqlite
+# On Windows the default is %LOCALAPPDATA%\quicksearch\index.sqlite. Write
+# Windows paths as TOML *literal* strings (single quotes) so the
+# backslashes need no escaping, and keep the index out of a roaming
+# profile — it is far too large to synchronise:
+#   database_path = 'C:\Users\you\AppData\Local\quicksearch\index.sqlite'
+database_path = "~/.local/share/quicksearch/index.sqlite"
+
+[indexing]
+# Automatic mode: filesystem watchers apply changes as they happen and a
+# full reindex runs every reindex_interval_minutes. The watcher catches
+# changes as they happen, so this only needs to be often enough to cover
+# whatever the watcher missed.
+auto_index = true
+reindex_interval_minutes = 1440
+# Follow symbolic links during directory walks.
+follow_symlinks = false
+# Index hidden files and directories. That means dot-files everywhere, and
+# additionally anything carrying the Hidden or System attribute on Windows
+# (AppData, $RECYCLE.BIN, System Volume Information, pagefile.sys ...).
+include_hidden = false
+# Empty = extract text from every supported format. Non-empty = content
+# indexing only for these extensions; other files are still listed for
+# filename search. Entries are case-insensitive, leading dot optional.
+content_extensions = []
+# Excluded from the index entirely. A pattern without a separator matches
+# any single path component (so ".git" prunes whole subtrees); patterns
+# containing one match full paths. Glob syntax (*, ?, [..]). Matching is
+# case-insensitive on Windows and macOS, case-sensitive elsewhere,
+# following the filesystem.
+#
+# The Windows defaults add: "$RECYCLE.BIN", "System Volume Information",
+# "pagefile.sys", "hiberfil.sys", "swapfile.sys", "Thumbs.db",
+# "desktop.ini".
+ignore_patterns = [".git", "node_modules", "*.tmp", ".venv", "venv"]
+
+# Worth adding by hand if you index a whole Windows drive rather than just
+# your profile. Neither is excluded by default, because the default root
+# is your profile and a bare "Windows" pattern would also match a folder
+# of your own with that name:
+#   'C:\Windows'        — system files, nothing you would search for
+#   'C:\Windows\WinSxS' — a hardlink farm that floods the Duplicates tab
+
+# Walker threads per root, keyed by the exact root string from
+# indexing_paths. Absent or 0 = auto (4 on local storage, 16 on network
+# mounts, detected per root). Applies at the start of the next run.
+# root_workers = { "/media/share" = 24 }
 
 [processing]
-# Amount of data in bytes read from start/end of files used to calculate hash
+# Bytes read from the start of each file for its content hash, which is
+# `sha256(size || first hash_length bytes)` and backs duplicate detection.
+# Only the head is read: seeking to the end for a second block costs an
+# extra round trip per file on network shares.
+#
+# Known limitation: files of identical size whose heads match will be
+# reported as duplicates. In practice that means pre-allocated VM disk
+# images: a fixed-size VHD stores its unique footer at the end of the
+# file, and a freshly pre-allocated raw/qcow2/VMDK image is all zeros at
+# the head until it is partitioned.
 hash_length = 8192
-# Maximum text content to index per file (bytes) 
+# Maximum extracted text stored per file (bytes).
 maximum_text_size = 262144
-# Maximum file size to process for text extraction (bytes)
+# Files larger than this skip text extraction entirely (bytes).
 maximum_text_file_size = 2097152
-# Number of files to process in each batch (directory walk / inserts / text extraction batches)
+# Files per batch during walks / inserts / extraction.
 batch_size = 200
-# Files per transaction for incremental UPDATE files + DELETE from searchabletext (FTS); larger = fewer commits, more RAM per chunk
+# Files per transaction for incremental FTS updates.
 fts_update_batch_size = 1000
-# If true, run a fast shell-backed tree count before Phase 1 (enables % progress; Linux uses GNU find -printf '\n' | wc -l when available).
-# If false, Phase 1 shows file counts without a percentage.
-precount_files_for_progress = false
-# If true, follow symbolic links during directory walks (indexing only; shell precount unchanged).
-follow_symlinks = false
-# If true, hidden files and directories will be indexed.
-include_hidden = false
-# FTS5 tokenization method (e.g., 'trigram', 'porter', 'unicode61')
-# Look here for more information https://www.sqlite.org/fts5.html#tokenizers
+# FTS5 tokenizer: 'trigram' (substring matching, the default; gets
+# remove_diacritics 1 appended), 'unicode61', 'porter', or a full FTS5
+# option string. See https://www.sqlite.org/fts5.html#tokenizers
 tokenize = "trigram"
-# If true (default), extracted text is stored zstd-compressed in a sidecar
-# table so the GUI's search results can render snippet previews with the
-# query terms highlighted. If false, the inverted FTS5 index is still
-# populated (so queries match the same files) but nothing is stored
-# alongside; result rows carry no snippet. Turning this off drops the
-# on-disk footprint to roughly what stock Baloo uses, useful for
-# apples-to-apples comparisons and for users who never read snippet text.
-# Changing this only affects files indexed *after* the change; existing
-# sidecar rows are kept until re-indexed.
+# Store extracted text (zstd-compressed) alongside the FTS index. Off:
+# the index shrinks to roughly stock-Baloo size, but search loses snippet
+# previews, occurrence ranking, case verification, and fuzzy full-text.
 store_text_for_snippets = true
+
+[ui]
+# Zoom factor for the whole GUI: fonts, spacing, and widgets scale
+# together (0.5 – 2.5). Ctrl +/- and Ctrl 0 adjust it temporarily at
+# runtime; this value is the persistent baseline.
+scale = 1.1
+
+[search]
+# Start with the fuzzy passes enabled.
+fuzzy_default = false
+# Ceiling on the fuzzy stages' typo budget. The allowance grows with the
+# search term, one edit per three characters, up to this value, so 2
+# means "1 edit for 3-5 character terms, 2 for anything longer". 0 turns
+# the fuzzy stages off. Above 3 is allowed but not recommended: matches
+# become dominated by coincidence and every fuzzy pass slows down.
+fuzzy_max_edits = 2
+# Hard cap on results per search (the GUI's scroll list length).
+display_limit = 1000
+# Results per streamed batch (latency/overhead knob, not a page size).
+results_per_page = 100
+# How long the GUI waits after the last keystroke before searching (ms).
+debounce_ms = 150

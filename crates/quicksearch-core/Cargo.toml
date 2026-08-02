@@ -2,6 +2,10 @@
 name = "quicksearch-core"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Indexing, storage and search engine behind QuickSearch."
 
 [lib]
 name = "quicksearch_core"
@@ -17,10 +21,25 @@ serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 mime_guess = "2.0"
 infer = "0.15"
-pdf-extract = "0.7"
+pdf-extract = "0.12"
 lopdf = "0.32"
 lofty = "0.19"
 kamadak-exif = "0.5"
 notify = "6.1"
 ctrlc = "3.4"
 zstd = "0.13"
+globset = "0.4"
+regex = "1"
+
+# `GetDriveTypeW` (a mapped drive letter is the only way to spot an SMB share
+# that isn't written as UNC) plus the FILE_ATTRIBUTE_* constants for hidden
+# detection. Pinned to 0.52 deliberately: walkdir → winapi-util already
+# resolves exactly that version, so this adds no new crate compilations.
+[target.'cfg(windows)'.dependencies]
+# GetDriveTypeW and the FILE_ATTRIBUTE_* constants live in
+# Win32_Storage_FileSystem; DRIVE_REMOTE, oddly, is filed under
+# Win32_System_WindowsProgramming.
+windows-sys = { version = "0.52", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+] }

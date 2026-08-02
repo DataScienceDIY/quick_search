@@ -278,15 +278,39 @@ fn encode_properties_for_fts(props: &[(String, String)]) -> String {
     buf
 }
 
-/// Flush and close a connection, restoring durable PRAGMAs. Call on clean
-/// shutdown so the next open sees a consistent DB.
+/// Flush the WAL into the main DB file and close. Call on clean shutdown so
+/// the next open starts with an empty log. WAL mode itself is persistent in
+/// the file — deliberately left on.
 pub fn checkpoint_and_close(conn: Connection) {
-    let _ = conn.execute_batch(
-        "PRAGMA journal_mode = DELETE; \
-         PRAGMA synchronous = FULL; \
-         PRAGMA wal_checkpoint(FULL);",
-    );
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     drop(conn);
+}
+
+/// Read the `last_full_index` marker (unix seconds of the last *successful*
+/// full indexing run) from `schema_info`. Absent key — fresh DB, or a DB
+/// from before this marker existed — means "never".
+pub fn get_last_full_index(conn: &Connection) -> Option<u64> {
+    conn.query_row(
+        "SELECT value FROM schema_info WHERE key = 'last_full_index'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|v| v.parse().ok())
+}
+
+/// Stamp `last_full_index` with `ts` (unix seconds). Called at the end of
+/// every successful full indexing run; the coordinator reads it to schedule
+/// periodic reindexing.
+pub fn set_last_full_index(conn: &Connection, ts: u64) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_info(key, value) VALUES ('last_full_index', ?1)",
+        params![ts.to_string()],
+    )
+    .map_err(|e| format!("write last_full_index: {}", e))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -476,6 +500,59 @@ mod tests {
             .unwrap();
         assert_eq!(id_read, id1);
         tx.commit().unwrap();
+        drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn last_full_index_round_trip() {
+        let p = tmp_path();
+        let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        assert_eq!(get_last_full_index(&conn), None, "fresh DB has no marker");
+        set_last_full_index(&conn, 1_700_000_123).unwrap();
+        assert_eq!(get_last_full_index(&conn), Some(1_700_000_123));
+        // Overwrite, not accumulate.
+        set_last_full_index(&conn, 1_700_000_999).unwrap();
+        assert_eq!(get_last_full_index(&conn), Some(1_700_000_999));
+        drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn checkpoint_and_close_truncates_wal() {
+        let p = tmp_path();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            insert_file(
+                &tx,
+                &NewFile {
+                    name: "w.txt",
+                    path: "/tmp/w.txt",
+                    parent: "/tmp",
+                    size: 1,
+                    mtime: 1,
+                    inode: None,
+                    device_id: None,
+                    mime: None,
+                    ftype: FileType::EMPTY,
+                    hash: None,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        checkpoint_and_close(conn);
+        // After a TRUNCATE checkpoint + close of the last connection the WAL
+        // sidecar is gone or empty; the row lives in the main file.
+        let wal = std::path::PathBuf::from(format!("{}-wal", p.display()));
+        let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(wal_len, 0, "WAL should be truncated on clean close");
+        let conn = crate::db::open_existing(p.to_str().unwrap(), false).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
         drop(conn);
         std::fs::remove_file(&p).ok();
     }

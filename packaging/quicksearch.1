@@ -1,0 +1,136 @@
+.TH QUICKSEARCH 1 "2026-08-02" "quicksearch 0.1.0" "User Commands"
+.SH NAME
+quicksearch, quicksearch\-cli \- fast full\-text search across your files
+.SH SYNOPSIS
+.B quicksearch
+.br
+.B quicksearch
+.RI [ FLAGS ]
+.IR "query terms" ...
+.br
+.B quicksearch\-cli
+.RI [ FLAGS ]
+.IR "query terms" ...
+.SH DESCRIPTION
+.B quicksearch
+maintains a SQLite/FTS5 index of the paths listed in its configuration and
+searches it by filename and file content.
+.PP
+Invoked with no positional arguments it opens the desktop application, which
+owns the indexer: it walks the configured roots, watches them for changes and
+periodically reindexes.
+.PP
+Invoked with one or more query terms it runs the same ranked search cascade the
+application uses, prints the results and exits. Terminal mode never starts the
+indexer, the filesystem watcher or any background thread, so a one\-shot query
+neither leaves anything running nor competes for inotify watches with a running
+application. It requires an index that already exists; run the application once
+to build one.
+.PP
+.B quicksearch\-cli
+is terminal search and nothing else, and accepts the same flags and query
+syntax. On this platform it is equivalent to giving
+.B quicksearch
+a query, and exists so that scripts and documentation have one name that never
+opens a window. It matters on Windows, where the two cannot be one executable:
+a GUI built as a console application flashes a console window at every launch,
+and a console tool built as a GUI application cannot write back to the shell
+that invoked it. Given no query it prints usage and exits 2 rather than falling
+back to the application.
+.SH OPTIONS
+.TP
+.B \-\-fuzzy
+Also run the fuzzy filename and full\-text passes, which tolerate spelling
+differences at the cost of speed. The edit distance comes from
+.I [search].fuzzy_max_edits
+in the configuration.
+.TP
+.BI \-\-limit " N"
+Return at most
+.I N
+results. Defaults to
+.I [search].display_limit
+in the configuration.
+.B \-\-limit=N
+is also accepted.
+.TP
+.B \-\-long
+Print rank, size, modification time and a matching snippet for each hit instead
+of bare paths. Highlights the match in bold when stdout is a terminal.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.PP
+An unrecognised option given without any query terms is passed through and the
+application is opened, since it may be an option for the windowing backend.
+.SH QUERY SYNTAX
+Plain words form a single phrase. Filters may be combined with it:
+.TP
+.B type:\fIName\fR
+Match a file class, for example
+.IR type:Document ", " type:Image ", " type:Audio .
+.TP
+.B modified:\fIexpr\fR
+Compare against the modification date, for example
+.IR modified:>=2024-01-01 .
+.TP
+.B path:\fI/dir\fR
+Restrict results to a directory.
+.TP
+.B mime:\fItype\fR
+Match a MIME type, for example
+.IR mime:application/pdf .
+.TP
+.B name:\fIfragment\fR
+Match a fragment of the filename.
+.SH FILES
+.TP
+.I ~/.config/quicksearch/config.toml
+Configuration. Created with defaults on first run. See
+.I /usr/share/doc/quicksearch/config_example.toml
+for the annotated reference.
+.TP
+.I ~/.local/share/quicksearch/index.sqlite
+The index. The location is set by
+.I [paths].database_path
+in the configuration.
+.TP
+.I ./config.toml
+A configuration file placed next to the
+.B quicksearch
+executable selects portable mode and overrides the per\-user configuration
+entirely. The packaged build deliberately installs no such file.
+.PP
+.I XDG_CONFIG_HOME
+and
+.I XDG_DATA_HOME
+are honoured when set to absolute paths.
+.SH EXIT STATUS
+.TP
+.B 0
+The search completed, or
+.B \-\-help
+was requested.
+.TP
+.B 1
+The application failed to start.
+.TP
+.B 2
+The configuration could not be read, the index could not be opened, the query
+was rejected, or
+.B quicksearch\-cli
+was given no query.
+.SH EXAMPLES
+.TP
+Search for a phrase:
+.B quicksearch quarterly revenue report
+.TP
+Recent PDFs under a directory, with details:
+.B quicksearch \-\-long type:Document mime:application/pdf path:/home/me/docs modified:>=2026-01-01
+.TP
+Tolerate misspellings and cap the output:
+.B quicksearch \-\-fuzzy \-\-limit 10 recieve
+.SH SEE ALSO
+.I /usr/share/doc/quicksearch/README.md
+.SH AUTHOR
+Jeremy <jeremy@karsttech.com>

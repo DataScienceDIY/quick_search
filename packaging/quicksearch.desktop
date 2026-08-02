@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=QuickSearch
+GenericName=File Search
+Comment=Fast full-text search across your files
+Exec=quicksearch
+TryExec=quicksearch
+Icon=quicksearch
+Terminal=false
+# One main category only (Utility), so the app shows up exactly once in the
+# menu; Filesystem is the additional category that describes what it does.
+Categories=Utility;Filesystem;
+Keywords=search;find;index;full-text;files;content;
+StartupNotify=true
+# Matches ViewportBuilder::with_app_id("quicksearch") in the GUI, which becomes
+# the Wayland app id and the X11 WM_CLASS. Without the match the desktop shows a
+# generic window icon.
+StartupWMClass=quicksearch

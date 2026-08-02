@@ -2,14 +2,52 @@
 name = "quicksearch-gui"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Fast full-text search across your files: desktop app and terminal search tool."
 
 [[bin]]
 name = "quicksearch"
 path = "src/main.rs"
 
+# Terminal search lives in its own binary because the two want opposite
+# Windows subsystems: a GUI built as a console app flashes a console window on
+# every launch, and a console tool built as a GUI app cannot write to the shell
+# that invoked it (cmd and PowerShell do not even wait for it). Splitting is
+# the only arrangement that is correct in both cases. On Unix the distinction
+# does not exist and `quicksearch` still does both.
+[[bin]]
+name = "quicksearch-cli"
+path = "src/cli_main.rs"
+
 [dependencies]
 quicksearch-core = { path = "../quicksearch-core" }
 
-dioxus = { version = "0.5.1", features = ["desktop"] }
-dioxus-desktop = "0.5.1"
-tokio = { version = "1.0", features = ["time", "signal"] }
+eframe = { version = "0.32", default-features = false, features = [
+    "glow",
+    "persistence",
+] }
+egui = "0.32"
+egui_extras = "0.32"
+rfd = "0.15"
+open = "5"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Display backends, which only exist on Linux/BSD. `default-features = false`
+# has to be repeated: feature resolution unions the two stanzas, so a single
+# permissive one would switch defaults back on for every target.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+eframe = { version = "0.32", default-features = false, features = [
+    "wayland",
+    "x11",
+] }
+
+# Console attachment for the GUI binary (which has no stdio when launched from
+# Explorer) and VT-mode enabling for the CLI binary. 0.59 matches what eframe
+# and rfd already resolve, so no extra crate is compiled.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
