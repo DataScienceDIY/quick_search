@@ -65,7 +65,7 @@ impl DuplicatesTab {
                         egui::RichText::new("Showing the 500 largest groups.").small().weak(),
                     );
                 }
-                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                let scroll = egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                     for (i, group) in groups.iter().enumerate() {
                         let name = group
                             .members
@@ -104,6 +104,7 @@ impl DuplicatesTab {
                         });
                     }
                 });
+                crate::ui_util::more_below_hint(ui, &scroll);
             }
         }
         actions

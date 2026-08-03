@@ -24,6 +24,15 @@ path = "src/cli_main.rs"
 [dependencies]
 quicksearch-core = { path = "../quicksearch-core" }
 
+# Index-password support: OS keychain for "remember on this device"
+# (Secret Service on Linux, Credential Manager on Windows), hidden terminal
+# prompt, and best-effort scrubbing of password buffers.
+# `vendored` compiles libdbus statically, so neither the build machine nor
+# the .deb needs a dbus development/runtime package.
+keyring = { version = "3", features = ["sync-secret-service", "vendored", "windows-native"] }
+rpassword = "7"
+zeroize = "1"
+
 eframe = { version = "0.32", default-features = false, features = [
     "glow",
     "persistence",

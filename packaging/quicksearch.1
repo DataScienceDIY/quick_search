@@ -83,6 +83,26 @@ Match a MIME type, for example
 .TP
 .B name:\fIfragment\fR
 Match a fragment of the filename.
+.SH PASSWORD PROTECTION
+The index can be encrypted with a password (application Options, Security).
+A protected index must be unlocked every time either binary starts. The
+application shows an unlock screen; terminal mode resolves the key from, in
+order: the OS keychain (when \(lqRemember on this device\(rq is enabled),
+the
+.B QUICKSEARCH_PASSWORD
+environment variable, then a hidden interactive prompt with three attempts.
+Without a terminal and with neither source available it exits 2 with an
+explanatory message. A wrong password never modifies the index.
+.PP
+Enabling, disabling or changing the password deletes and rebuilds the index
+from the application; the password itself is never stored, only a derived
+key in the OS keychain when explicitly requested.
+.SH ENVIRONMENT
+.TP
+.B QUICKSEARCH_PASSWORD
+Password for a protected index, for scripted terminal search. Environment
+variables are readable by other processes of the same user; prefer the
+keychain where possible.
 .SH FILES
 .TP
 .I ~/.config/quicksearch/config.toml
@@ -116,8 +136,8 @@ was requested.
 The application failed to start.
 .TP
 .B 2
-The configuration could not be read, the index could not be opened, the query
-was rejected, or
+The configuration could not be read, the index could not be opened or
+unlocked, the query was rejected, or
 .B quicksearch\-cli
 was given no query.
 .SH EXAMPLES

@@ -8,8 +8,13 @@
 //! size, `clear`) instead use [`open::open_existing`], which never creates or
 //! wipes — a tokenizer difference or stale version is an error, not data loss.
 
+pub mod key;
 pub mod open;
 pub mod repo;
 pub mod schema;
 
-pub use open::{open_existing, open_or_recreate, CURRENT_SCHEMA_VERSION};
+pub use key::{process_key_hex, set_process_key};
+pub use open::{
+    open_existing, open_or_recreate, verify_process_key, CURRENT_SCHEMA_VERSION,
+    KEY_MISMATCH_PREFIX,
+};

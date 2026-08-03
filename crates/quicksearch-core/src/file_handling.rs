@@ -32,7 +32,8 @@ pub fn load_existing_files(conn: &Connection) -> Result<HashMap<String, Existing
         Ok((
             row.get::<_, String>(0)?,
             ExistingFileEntry {
-                mtime: row.get(1)?,
+                // SQLite stores i64; mtimes are non-negative in practice.
+                mtime: row.get::<_, i64>(1)?.max(0) as u64,
             },
         ))
     })?;
@@ -992,7 +993,7 @@ pub fn extract_scope_prepare(
     cursor: &ExtractCursor,
     config: &Config,
 ) -> Result<ExtractScope, String> {
-    let max_size = config.processing.maximum_text_file_size;
+    let max_size = i64::try_from(config.processing.maximum_text_file_size).unwrap_or(i64::MAX);
     let conn = conn_mutex.lock().unwrap();
     conn.execute(
         "UPDATE files SET content_state = 3 \
@@ -1039,7 +1040,7 @@ pub fn extract_one_batch(
     if should_abort(stop_flag, suspend_flag) {
         return Ok(0);
     }
-    let max_size = config.processing.maximum_text_file_size;
+    let max_size = i64::try_from(config.processing.maximum_text_file_size).unwrap_or(i64::MAX);
     let batch_limit = config.processing.batch_size.max(1) as i64;
 
     let batch: Vec<(i64, String, String, Option<String>)> = {

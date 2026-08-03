@@ -8,30 +8,46 @@ compact egui desktop app, or straight to your terminal.
 
 ## Build & run
 
-Requirements: a Rust toolchain (edition 2021). The old WebKit/WebView
-dependencies (`setup.sh`) are gone; the GUI renders with OpenGL via egui.
+```sh
+./build.sh          # Linux
+build.bat           # Windows
+```
 
-SQLite and zstd are compiled from bundled C sources, so a C toolchain is
-required on every platform:
+These take a fresh machine all the way to a running app: install whatever
+build dependencies are missing, build release, then launch the GUI. Each
+setup stage is skipped when what it provides is already there, so a normal
+run costs one `cargo build`. `build.sh` installs Linux system packages with
+the distribution's package manager via `sudo` (apt/dnf/pacman/zypper) and the
+Rust toolchain with rustup; `build.bat` uses winget and rustup. Both take
+`--check` to report dependency status without installing or building,
+`--no-run` to stop after the build, and `--` to pass the rest to the binary.
+
+Building by hand needs a Rust toolchain (edition 2021) plus, on every
+platform, a C toolchain and Perl: SQLCipher, zstd and OpenSSL are compiled
+from bundled C sources, and OpenSSL's `Configure` is a Perl script. The old
+WebKit/WebView dependencies (`setup.sh`) are gone; the GUI renders with
+OpenGL via egui.
 
 - Linux: working OpenGL 3.3 drivers; `xdg-desktop-portal` (present on all
   mainstream desktops) provides the native folder picker. On minimal
-  images you may need `build-essential pkg-config libxkbcommon-dev`.
+  images you may need `build-essential perl pkg-config`. No X11, Wayland or
+  xkbcommon `-dev` packages are needed: winit dlopens the display stack at
+  run time, so only the runtime libraries matter.
 - Windows: Visual Studio 2022 Build Tools with the "Desktop development
-  with C++" workload (MSVC v143 plus a Windows SDK). For the GNU target
-  instead, `rustup target add x86_64-pc-windows-gnu` and a mingw-w64
-  toolchain. Note that Windows ships only a software OpenGL 1.1 driver, so
-  a bare VM or an RDP session without a vendor GPU driver cannot create a
-  context and the window will fail to open.
-- macOS: Xcode command line tools.
+  with C++" workload (MSVC v143 plus a Windows SDK), and Perl (Strawberry
+  Perl); NASM is optional and only enables OpenSSL's assembly paths. For the
+  GNU target instead, `rustup target add x86_64-pc-windows-gnu` and a
+  mingw-w64 toolchain. Note that Windows ships only a software OpenGL 1.1
+  driver, so a bare VM or an RDP session without a vendor GPU driver cannot
+  create a context and the window will fail to open.
+- macOS: Xcode command line tools (`build.sh` does not auto-install these —
+  only Linux package managers are handled).
 
 ```sh
 cargo build --release -p quicksearch-gui   # binaries: target/release/quicksearch{,-cli}
 cargo run -p quicksearch-gui               # or just run it
 cargo test -p quicksearch-core             # backend test suite
 ```
-
-`run.sh` / `run.bat` wrap the same commands.
 
 Two binaries are produced. `quicksearch` is the desktop app; on Windows it
 is built as a window-subsystem app so no console appears behind it.
@@ -95,10 +111,11 @@ the package is installed.
 
 - **Search**: results appear as you type; every keystroke cancels the
   previous search. One checkbox enables the two fuzzy passes. Sort by
-  rank, name, path, size, or modified; right-click a result to open it,
-  reveal it in the file manager, or build an ignore filter from it
-  (session-only by default, optionally persisted to the config). Matches
-  in file contents show highlighted snippets.
+  rank, name, path, size, or modified. Double-click a result to open it;
+  right-click it to reveal it in the file manager, open it, copy its
+  path, or build an ignore filter from it (session-only by default,
+  optionally persisted to the config). Result text can be selected and
+  copied in place. Matches in file contents show highlighted snippets.
 - **Manage Index**: full indexing status, Start/Stop/Automatic controls,
   indexed folder list, full-text extension filters, ignore patterns, and
   the indexing options.
@@ -108,6 +125,8 @@ the package is installed.
   filter box and Copy button. Launched from a desktop launcher (or on
   Windows, where the app has no console at all) this is the only place
   they are visible.
+- **Help**: an in-app quickstart — first indexing run, example queries,
+  what each tab does — pointing here for everything technical.
 
 The bottom status bar always shows what the indexer is doing (phase,
 percent, files/sec) or the total indexed file count when idle.
@@ -127,6 +146,37 @@ On Windows use `quicksearch-cli` for all of the above — `quicksearch.exe`
 opens the app, and any query given to it seeds the search box instead of
 printing. Colour in `--long` output needs a console with virtual-terminal
 processing; Windows Terminal has it, and older consoles get plain text.
+
+### Password protection
+
+The index contains the names and (by default) the full text of everything
+it indexes — for most setups, your entire home directory. That is a lot of
+concentrated risk in one file. **Options → Security → Enable password
+protection** encrypts the index on disk with SQLCipher; from then on
+QuickSearch asks for the password every time it starts, in the GUI (an
+unlock screen before anything opens the index) and in the terminal (a
+hidden prompt). Enabling, disabling, or changing the password deletes and
+rebuilds the index — there is no in-place conversion.
+
+- The key is derived as `Argon2id(password, salt)`; the salt is written to
+  `config.toml` when the password is set (it is unique, not secret, and
+  required — keep it with the config if you copy a protected setup).
+- **Remember on this device** stores the derived key (never the password)
+  in the OS keychain — Secret Service/KWallet on Linux, Credential Manager
+  on Windows — and skips the prompt. Without a keychain daemon the option
+  quietly falls back to prompting.
+- Scripts can set `QUICKSEARCH_PASSWORD` for non-interactive terminal
+  search. Environment variables are readable by other processes of the
+  same user (`/proc/<pid>/environ`) — prefer the keychain.
+- Forgot the password? The unlock screen can delete the index and disable
+  protection; your files are untouched and re-indexing rebuilds it.
+
+What this protects: the index file at rest — disk theft, backups, other
+accounts reading the file. What it does not protect: a compromised running
+session (the derived key is in process memory while the app runs), and the
+files themselves, which are exactly as readable as before. A wrong
+password can never wipe the index; it is refused without touching the
+file.
 
 ### Query syntax
 
@@ -210,7 +260,8 @@ crates/quicksearch-gui    binary "quicksearch": egui app + terminal mode
 
 Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
 
-- **Storage** (`db/`): SQLite via rusqlite (bundled), WAL mode so the
+- **Storage** (`db/`): SQLite via rusqlite (bundled SQLCipher build —
+  identical to stock SQLite until a key is applied), WAL mode so the
   single writer never blocks streaming read-only searches. `files` holds
   metadata (name, path, size, mtime, hash, MIME/type bitmask, per-row
   index state); `searchabletext` is a *contentless* FTS5 table (postings
@@ -219,7 +270,11 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   occurrence ranking, and fuzzy full-text search. Schema changes wipe and
   rebuild by policy; the indexer (`open_or_recreate`) is the only code
   allowed to do that; every consumer uses `open_existing`, which treats
-  drift as an error, never data loss.
+  drift as an error, never data loss. With password protection on, every
+  open applies the Argon2id-derived raw key (`security.rs`, process-global
+  in `db/key.rs`) before anything reads the file; a wrong key is a tagged
+  `KEY_MISMATCH` error, structurally distinct from the schema drift that
+  may wipe, so it can never destroy an intact index.
 - **Indexing** (`indexing.rs`, `file_handling.rs`): full runs walk each
   root (`filtered_walk` prunes hidden/ignored subtrees before descending),
   classify files by mtime into insert/update/skip, batch-write metadata,

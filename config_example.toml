@@ -89,6 +89,20 @@ tokenize = "trigram"
 # previews, occurrence ranking, case verification, and fuzzy full-text.
 store_text_for_snippets = true
 
+[security]
+# Encrypt the index with a password (SQLCipher). The password is asked
+# for every time QuickSearch starts; turning this on or off deletes and
+# rebuilds the index. Change it from the GUI (Options → Security), not by
+# hand: enabling protection also generates the KDF salt below.
+password_protected = false
+# Store the derived key in the OS keychain (Secret Service / KWallet on
+# Linux, Credential Manager on Windows) and skip the startup prompt.
+use_keychain = false
+# When a password is set, the app writes a `salt` value here (32 hex
+# digits). It is not a secret, but it is unique to your index: do not
+# create or edit it by hand, and keep it if you copy this file — the
+# password only unlocks the index together with its salt.
+
 [ui]
 # Zoom factor for the whole GUI: fonts, spacing, and widgets scale
 # together (0.5 – 2.5). Ctrl +/- and Ctrl 0 adjust it temporarily at

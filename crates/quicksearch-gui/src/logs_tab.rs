@@ -148,7 +148,7 @@ impl LogsTab {
         // only while every row is exactly one line tall.
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-        egui::ScrollArea::both()
+        let scroll = egui::ScrollArea::both()
             .auto_shrink([false; 2])
             .stick_to_bottom(self.follow)
             .show_rows(ui, row_height, shown.len(), |ui, range| {
@@ -172,6 +172,7 @@ impl LogsTab {
                     });
                 }
             });
+        crate::ui_util::more_below_hint(ui, &scroll);
     }
 }
 

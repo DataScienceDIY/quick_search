@@ -12,7 +12,15 @@ name = "quicksearch_core"
 path = "src/lib.rs"
 
 [dependencies]
-rusqlite = { version = "0.31.0", features = ["bundled"] }
+# `bundled-sqlcipher-vendored-openssl` compiles the SQLCipher amalgamation
+# (a superset of the stock SQLite `bundled` build — FTS5 etc. included) and
+# statically links a vendored OpenSSL libcrypto, so encryption support adds
+# no runtime library dependencies. With no `PRAGMA key` applied, SQLCipher
+# behaves identically to stock SQLite, so unencrypted indexes are unaffected.
+rusqlite = { version = "0.39", features = ["bundled-sqlcipher-vendored-openssl"] }
+argon2 = { version = "0.5", features = ["zeroize"] }
+zeroize = { version = "1", features = ["derive"] }
+getrandom = "0.2"
 sha2 = "0.10.8"
 walkdir = "2.5.0"
 zip = "0.6"

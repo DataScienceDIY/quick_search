@@ -24,6 +24,7 @@ pub struct Config {
     pub processing: ProcessingConfig,
     pub search: SearchConfig,
     pub ui: UiConfig,
+    pub security: SecurityConfig,
     /// File this config was loaded from; `save()` writes back to it.
     /// `None` for hand-built configs (tests), which save to the default
     /// location.
@@ -193,6 +194,42 @@ impl Default for SearchConfig {
     }
 }
 
+/// Index encryption. The password itself is never stored anywhere — only
+/// the KDF salt lives here, and it is not a secret (it makes the derivation
+/// unique per install, nothing more).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Encrypt the index (SQLCipher) with a password asked for at startup.
+    /// Turning this on or off requires deleting and rebuilding the index.
+    pub password_protected: bool,
+    /// KDF salt, exactly 32 lowercase hex digits (16 bytes). Written by the
+    /// app at the moment a password is set — never generated as a default,
+    /// never edited by hand, and never shown in the GUI. Absent until a
+    /// password exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
+    /// Store the derived key in the OS keychain (Secret Service / Windows
+    /// Credential Manager) and skip the startup prompt on this machine.
+    pub use_keychain: bool,
+}
+
+impl SecurityConfig {
+    /// The decoded salt. An error means the config is unusable for
+    /// unlocking: protection is on but no salt was ever written, or the
+    /// value was tampered with — both surfaced to the user, never guessed
+    /// around.
+    pub fn salt_bytes(&self) -> Result<[u8; crate::security::SALT_LEN], String> {
+        match &self.salt {
+            None => Err("password protection is enabled but the config has no salt; \
+                         disable protection or set the password again"
+                .to_string()),
+            Some(hex) => crate::security::salt_from_hex(hex)
+                .map_err(|e| format!("invalid salt in config: {}", e)),
+        }
+    }
+}
+
 /// Interface preferences.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -227,6 +264,7 @@ impl Default for Config {
             processing: ProcessingConfig::default(),
             search: SearchConfig::default(),
             ui: UiConfig::default(),
+            security: SecurityConfig::default(),
             source: None,
         }
     }
@@ -254,7 +292,7 @@ impl Default for Config {
 /// to catch it would also catch a user folder named `Windows`.
 /// `config_example.toml` documents it for people who add a drive root.
 fn default_ignore_patterns() -> Vec<String> {
-    let mut patterns = vec![".git", "node_modules", "*.tmp", ".venv", "venv"];
+    let mut patterns = vec![".git", "node_modules", "*.tmp", ".venv", "venv", "*.pdf"];
     if cfg!(windows) {
         patterns.extend([
             "$RECYCLE.BIN",
@@ -601,11 +639,18 @@ pub fn nested_roots(roots: &[String]) -> Vec<(String, String)> {
 
 pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
     let roots_changed = old.paths.indexing_paths != new.paths.indexing_paths;
+    // Encryption on↔off or a different salt (⇒ a different key) makes the
+    // on-disk file unreadable to the new configuration: rebuild. The GUI's
+    // security flows drive their own explicit rebuild dialog; this covers
+    // hand-edited configs applied through the generic path. `use_keychain`
+    // only changes where the key is remembered, not the file.
     let requires_rebuild = old.processing.hash_length != new.processing.hash_length
         || old.processing.tokenize != new.processing.tokenize
         || old.indexing.include_hidden != new.indexing.include_hidden
         || old.indexing.ignore_patterns != new.indexing.ignore_patterns
         || old.indexing.content_extensions != new.indexing.content_extensions
+        || old.security.password_protected != new.security.password_protected
+        || old.security.salt != new.security.salt
         || roots_changed;
     ConfigActions {
         requires_rebuild,
@@ -952,6 +997,82 @@ mod tests {
             },
             "soft knobs never force restarts"
         );
+
+        // Security: protection on↔off and salt changes rebuild; the
+        // keychain preference is a soft knob.
+        let mut c = base.clone();
+        c.security.password_protected = true;
+        assert!(diff_actions(&base, &c).requires_rebuild);
+        let mut c = base.clone();
+        c.security.salt = Some("00".repeat(16));
+        assert!(diff_actions(&base, &c).requires_rebuild);
+        let mut c = base.clone();
+        c.security.use_keychain = true;
+        assert!(!diff_actions(&base, &c).requires_rebuild);
+    }
+
+    #[test]
+    fn security_config_round_trips_and_salt_is_omitted_when_none() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+
+        // Defaults: protection off, no salt — and crucially the file must
+        // not contain an invented salt value.
+        let cfg = Config::load_from(&path).unwrap();
+        assert!(!cfg.security.password_protected);
+        assert_eq!(cfg.security.salt, None);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("salt"), "no default salt may be written");
+
+        // With a salt set, it round-trips exactly.
+        let mut cfg = cfg;
+        cfg.security.password_protected = true;
+        cfg.security.salt = Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string());
+        cfg.security.use_keychain = true;
+        cfg.save().unwrap();
+        let reloaded = Config::load_from(&path).unwrap();
+        assert_eq!(reloaded.security, cfg.security);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn absent_security_section_is_default() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        fs::write(&path, "[paths]\ndatabase_path = \"x.sqlite\"\n").unwrap();
+        let cfg = Config::load_from(&path).unwrap();
+        assert_eq!(cfg.security, SecurityConfig::default());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn salt_bytes_validates_hostile_configs() {
+        // Protected but no salt: hard error, nothing invented.
+        let mut sec = SecurityConfig {
+            password_protected: true,
+            salt: None,
+            use_keychain: false,
+        };
+        assert!(sec.salt_bytes().is_err());
+
+        // Hand-crafted hostile values: truncated, oversized, non-hex,
+        // embedded whitespace/quotes. All rejected.
+        for bad in [
+            "",
+            "abcd",
+            &"ab".repeat(17),
+            &"ab".repeat(4096),
+            "0g1e2d3c4b5a69788796a5b4c3d2e1f0",
+            "0f1e2d3c4b5a6978 796a5b4c3d2e1f0",
+            "0f1e2d3c4b5a69788796a5b4c3d2e1f'",
+        ] {
+            sec.salt = Some(bad.to_string());
+            assert!(sec.salt_bytes().is_err(), "must reject salt {:?}", bad);
+        }
+
+        // A valid salt decodes, upper- or lowercase.
+        sec.salt = Some("0F1E2D3C4B5A69788796A5B4C3D2E1F0".to_string());
+        assert!(sec.salt_bytes().is_ok());
     }
 
     /// Dismissing the watch-cap warning must not trigger a rebuild or a

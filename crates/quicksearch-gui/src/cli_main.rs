@@ -9,6 +9,9 @@ mod cli;
 // The GUI uses more of this module than the CLI does.
 #[allow(dead_code)]
 mod format;
+// The GUI stores/deletes keychain entries; the CLI only reads them.
+#[allow(dead_code)]
+mod keychain;
 
 fn main() {
     // `maybe_run_cli` returns `None` for "no query given", which the combined
