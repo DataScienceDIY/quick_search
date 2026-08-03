@@ -287,11 +287,17 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
 - **Indexing** (`indexing.rs`, `file_handling.rs`): full runs walk each
   root (`filtered_walk` prunes hidden/ignored subtrees before descending),
   classify files by mtime into insert/update/skip, batch-write metadata,
-  sweep stale rows, then extract content (plaintext, Office, PDF, audio
-  tags, EXIF; see `extract/`) for FTS. Files no larger than
-  `processing.hash_length` skip that second pass entirely: the head the walk
-  reads to hash them is already their whole content, so a plaintext body is
-  extracted in the same `read` and stored complete. Every run ends — whether
+  sweep stale rows, then extract content (plaintext, RTF, Office, PDF,
+  audio tags, EXIF; see `extract/`) for FTS. Files whose extension no MIME
+  table knows — including extensionless ones like `README` or `Makefile` —
+  are sniffed from their head bytes and indexed as text when they read as
+  text (`mime.rs`, `textenc.rs`); non-UTF-8 text (UTF-16 with BOM, legacy
+  charsets via chardetng) is decoded and stored as UTF-8. More claimed
+  files means a bigger index — `indexing.content_extensions` remains the
+  throttle. Files no larger than `processing.hash_length` skip that second
+  pass entirely: the head the walk reads to hash them is already their
+  whole content, so a plaintext body is extracted in the same `read` and
+  stored complete. Every run ends — whether
   it completed or was stopped — with an optimize pass on its own connection:
   checkpoint, VACUUM if the file has at least 10% slack to reclaim, `PRAGMA
   optimize`, checkpoint again. Progress streams through a polled
@@ -377,5 +383,6 @@ pagination: the table is virtualized, so a single scroll list capped at
 - `QSB_SNIPPET_PERF=1 cargo test --release -p quicksearch-core --test
   snippet_perf -- --nocapture`: snippet pipeline benchmark.
 - New extractors: implement `extract::Extractor` and register it in
-  `Registry::default_set()`. New cascade behavior: `search/cascade.rs`
+  `Registry::default_set()` — order matters, the first extractor whose
+  `supports` accepts a MIME wins. New cascade behavior: `search/cascade.rs`
   documents the rank invariants that keep streamed results append-only.

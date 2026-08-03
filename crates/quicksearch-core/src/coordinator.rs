@@ -821,6 +821,12 @@ impl Inner {
         let idle = matches!(status, IndexingStatus::Idle | IndexingStatus::Error(_));
         if !idle {
             self.indexing.request_stop();
+            // Dropping the service joins its worker, and a VACUUM answers to
+            // nothing but `sqlite3_interrupt` — without this, closing the
+            // window during an optimize pass would wait out a rewrite of the
+            // whole index. The interrupted VACUUM rolls back, and the next
+            // run's checkpoints land the log.
+            self.indexing.cancel_optimizing();
         }
         if let Some(conn) = self.write_conn.take() {
             if idle {

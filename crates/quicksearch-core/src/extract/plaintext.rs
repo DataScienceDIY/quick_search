@@ -1,5 +1,7 @@
-//! Read the file as UTF-8 text. Handles text/plain, text/x-*, application/json
-//! and most source-code MIMEs.
+//! Read the file as text, decoding UTF-8, BOM-marked UTF-16, and detected
+//! legacy charsets to UTF-8 for storage (see [`crate::textenc`]). Handles
+//! text/plain, text/x-*, and the non-`text/*` formats in
+//! [`EXTRA_TEXT_MIMES`].
 
 use std::fs::File;
 use std::io::Read;
@@ -7,36 +9,57 @@ use std::path::Path;
 
 use super::{ExtractError, ExtractedContent, Extractor};
 
+/// Non-`text/*` MIMEs the plaintext extractor claims. Every entry must be
+/// reachable — emitted by [`crate::mime::guess_mime_from_head`] via the
+/// override table, `mime_guess`, `infer`, or the text sniff — and must map
+/// to a [`crate::mime::FileType`] containing TEXT; the cross-check tests in
+/// `mime.rs` enforce both.
+///
+/// The `audio/*` and `image/*` entries (playlists, SVG) rely on this
+/// extractor being registered before the audio and image extractors in
+/// [`super::Registry::default_set`] — first match wins, and their text
+/// content is worth more than their tags. `.svgz` also resolves to
+/// `image/svg+xml`; its gzip body fails the binary guard and is recorded as
+/// a failure rather than silently skipped.
+pub(crate) const EXTRA_TEXT_MIMES: &[&str] = &[
+    "application/geo+json",
+    "application/javascript",
+    "application/json",
+    "application/json5",
+    "application/mbox",
+    "application/vnd.dart",
+    "application/x-csh",
+    "application/x-httpd-php",
+    "application/x-perl",
+    "application/x-sh",
+    // `.sql` resolves here rather than to `text/*`, so without it schema
+    // dumps are listed by name but never full-text indexed.
+    "application/x-sql",
+    "application/x-subrip",
+    "application/x-tcl",
+    "application/x-tex",
+    "application/x-texinfo",
+    "application/x-troff",
+    "application/x-troff-man",
+    "application/xhtml+xml",
+    "application/xml",
+    "audio/scpls",
+    "audio/x-mpegurl",
+    "image/svg+xml",
+    "message/rfc822",
+];
+
 /// Decode bytes that are known to be a complete file. Shared by both entry
 /// points so on-disk and already-in-memory extraction cannot drift apart.
 fn decode(bytes: Vec<u8>, path: &Path) -> Result<ExtractedContent, ExtractError> {
-    match String::from_utf8(bytes) {
-        Ok(text) => Ok(ExtractedContent::with_text(text)),
-        Err(e) => Err(format!("plaintext read {}: {}", path.display(), e.utf8_error())),
-    }
+    crate::textenc::decode_text(bytes, path).map(ExtractedContent::with_text)
 }
 
 pub struct PlaintextExtractor;
 
 impl Extractor for PlaintextExtractor {
     fn supports(&self, mime: &str) -> bool {
-        if mime.starts_with("text/") {
-            return true;
-        }
-        matches!(
-            mime,
-            "application/json"
-                | "application/xml"
-                | "application/javascript"
-                | "application/x-shellscript"
-                | "application/x-python"
-                | "application/toml"
-                | "application/yaml"
-                | "application/x-yaml"
-                // `.sql` resolves here rather than to `text/*`, so without it
-                // schema dumps are listed by name but never full-text indexed.
-                | "application/x-sql"
-        )
+        mime.starts_with("text/") || EXTRA_TEXT_MIMES.contains(&mime)
     }
 
     /// Read the whole file, sized from the handle we just opened.
@@ -135,15 +158,41 @@ mod tests {
     }
 
     #[test]
-    fn both_paths_reject_invalid_utf8_and_name_the_file() {
-        let p = tmp("badutf8", &[0x68, 0x69, 0xff, 0xfe]);
+    fn both_paths_reject_binary_and_name_the_file() {
+        // A NUL keeps this undecodable now that legacy charsets decode.
+        let body = [0x68, 0x69, 0x00, 0xff];
+        let p = tmp("binary", &body);
         let disk_err = PlaintextExtractor.extract(&p).unwrap_err();
         let head_err = PlaintextExtractor
-            .extract_from_head(&p, &[0x68, 0x69, 0xff, 0xfe])
+            .extract_from_head(&p, &body)
             .unwrap()
             .unwrap_err();
         assert_eq!(disk_err, head_err, "one decode path, one message");
-        assert!(disk_err.contains("badutf8"), "the failure names the file: {}", disk_err);
+        assert!(disk_err.contains("binary"), "the failure names the file: {}", disk_err);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn latin1_decodes_via_both_paths() {
+        let body = b"une journ\xe9e agr\xe9able pr\xe8s de la rivi\xe8re";
+        let p = tmp("latin1", body);
+        let from_disk = PlaintextExtractor.extract(&p).unwrap();
+        let from_head = PlaintextExtractor.extract_from_head(&p, body).unwrap().unwrap();
+        assert_eq!(from_disk.text, from_head.text);
+        assert_eq!(from_disk.text, "une journée agréable près de la rivière");
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn utf16le_bom_decodes_via_both_paths() {
+        let src = "Windows Registry Editor Version 5.00\r\n[HKEY_CURRENT_USER\\Software]\r\n";
+        let mut body = vec![0xFF, 0xFE];
+        body.extend(src.encode_utf16().flat_map(|u| u.to_le_bytes()));
+        let p = tmp("utf16", &body);
+        let from_disk = PlaintextExtractor.extract(&p).unwrap();
+        let from_head = PlaintextExtractor.extract_from_head(&p, &body).unwrap().unwrap();
+        assert_eq!(from_disk.text, from_head.text);
+        assert_eq!(from_disk.text, src, "stored text is the UTF-8 decode, BOM stripped");
         std::fs::remove_file(&p).ok();
     }
 
@@ -215,6 +264,14 @@ mod tests {
         assert!(e.supports("text/plain"));
         assert!(e.supports("text/x-rust"));
         assert!(e.supports("application/json"));
+        assert!(e.supports("application/x-sh"));
+        assert!(e.supports("image/svg+xml"));
+        assert!(e.supports("audio/x-mpegurl"));
+        assert!(e.supports("message/rfc822"));
+        // Never emitted by any MIME source; removed as dead.
+        assert!(!e.supports("application/x-shellscript"));
+        // RTF belongs to the RTF extractor, which registers first.
+        assert!(!e.supports("application/rtf"));
         assert!(!e.supports("application/pdf"));
         assert!(!e.supports("image/png"));
     }

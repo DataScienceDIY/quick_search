@@ -46,6 +46,11 @@ include_hidden = false
 # Empty = extract text from every supported format. Non-empty = content
 # indexing only for these extensions; other files are still listed for
 # filename search. Entries are case-insensitive, leading dot optional.
+# The reserved entry "(none)" whitelists files that have no extension at
+# all (Makefile, README, .bashrc); a non-empty list without it skips them.
+# Inside an entry, "#" starts a comment that runs to its end, so entries may
+# be annotated or commented out:
+#   content_extensions = ["txt", "md # docs", "# pdf — too slow", "(none)"]
 content_extensions = []
 # Excluded from the index entirely. A pattern without a separator matches
 # any single path component (so ".git" prunes whole subtrees); patterns
@@ -74,7 +79,10 @@ ignore_patterns = [".git", "node_modules", "*.tmp", ".venv", "venv"]
 # Bytes read from the start of each file for its content hash, which is
 # `sha256(size || first hash_length bytes)` and backs duplicate detection.
 # Only the head is read: seeking to the end for a second block costs an
-# extra round trip per file on network shares.
+# extra round trip per file on network shares. The same bytes are also the
+# detection window that decides what a file is: magic-byte matching, and
+# the text sniff that lets extensionless or unknown-extension files be
+# indexed as text — so shrinking this judges files on less evidence.
 #
 # Known limitation: files of identical size whose heads match will be
 # reported as duplicates. In practice that means pre-allocated VM disk

@@ -1629,31 +1629,34 @@ mod count_and_extract_tests {
         let registry = Registry::default_set();
 
         // Real files, because `decide_content` runs the extractor for anything
-        // it claims and its answer must be a genuine one.
-        let cases = [
-            "notes.txt",
-            "data.json",
-            "schema.sql",
-            "song.mp3",
-            "photo.jpg",
-            "movie.mp4",
-            "archive.zip",
-            "blob.bin",
-            "noextension",
+        // it claims and its answer must be a genuine one. A text body sniffs
+        // as text for the extension-less names; the NUL body keeps the
+        // unclaimed side of the invariant exercised too.
+        let cases: [(&str, &[u8]); 10] = [
+            ("notes.txt", b"plain bytes with no magic"),
+            ("data.json", b"plain bytes with no magic"),
+            ("schema.sql", b"plain bytes with no magic"),
+            ("song.mp3", b"plain bytes with no magic"),
+            ("photo.jpg", b"plain bytes with no magic"),
+            ("movie.mp4", b"plain bytes with no magic"),
+            ("archive.zip", b"plain bytes with no magic"),
+            ("blob.bin", b"plain bytes with no magic"),
+            ("noextension", b"plain bytes with no magic"),
+            ("real.bin", b"\x00\x01\x02\x03"),
         ];
-        for name in cases {
+        for (name, body) in cases {
             let p = root.join(name);
-            std::fs::write(&p, b"plain bytes with no magic").unwrap();
+            std::fs::write(&p, body).unwrap();
         }
 
         // Once with the filter off (the default: everything the registry
         // claims), once with it narrowed to `.txt`.
         for filter in [Vec::new(), vec!["txt".to_string()]] {
             cfg.indexing.content_extensions = filter.clone();
-            for name in cases {
+            for (name, body) in cases {
                 let p = root.join(name);
                 let path = p.to_str().unwrap();
-                let mime = guess_mime_from_head(&p, b"plain bytes with no magic");
+                let mime = guess_mime_from_head(&p, body);
                 let claimed = content_extractable(&p, mime.as_deref(), &cfg, &registry);
                 let outcome = decide_content(path, mime.as_deref(), &registry, &cfg);
                 assert_eq!(
@@ -1685,17 +1688,20 @@ mod count_and_extract_tests {
                 .needs_content
         };
 
-        for name in ["notes.txt", "song.mp3", "movie.mp4", "blob.bin"] {
+        for name in ["notes.txt", "song.mp3", "movie.mp4", "README"] {
             std::fs::write(root.join(name), b"body").unwrap();
         }
+        // NUL bytes: the text sniff must not rescue a genuinely binary blob.
+        std::fs::write(root.join("blob.bin"), b"\x00\x01\x02\x03").unwrap();
         let big = root.join("huge.txt");
         std::fs::write(&big, vec![b'x'; 4096]).unwrap();
 
         let cfg = Config::default();
         assert!(needs(&cfg, "notes.txt"), "plaintext is claimed");
         assert!(needs(&cfg, "song.mp3"), "audio tags are content too");
+        assert!(needs(&cfg, "README"), "an extensionless text head sniffs as text/plain");
         assert!(!needs(&cfg, "movie.mp4"), "no extractor claims video");
-        assert!(!needs(&cfg, "blob.bin"), "unsniffable: no MIME, no extractor");
+        assert!(!needs(&cfg, "blob.bin"), "binary content: no MIME, no extractor");
 
         // Over `maximum_text_file_size`, so the content pass would never read
         // it even though plaintext claims the MIME.
@@ -1722,12 +1728,18 @@ mod count_and_extract_tests {
         let mut db = root.clone();
         db.set_extension("sqlite");
 
-        // 3 files an extractor claims, 5 it never will. Big enough that the
-        // old behaviour (every row pending) can't coincide with the new one.
-        let claimed = ["a.txt", "b.json", "c.mp3"];
+        // 4 files an extractor claims (README via the extensionless text
+        // sniff), 5 it never will — the unclaimed set gets NUL bodies so
+        // neither the extension tables nor the sniff have anything to say.
+        // Big enough that the old behaviour (every row pending) can't
+        // coincide with the new one.
+        let claimed = ["a.txt", "b.json", "c.mp3", "README"];
         let unclaimed = ["d.mp4", "e.zip", "f.bin", "g.exe", "h"];
-        for name in claimed.iter().chain(unclaimed.iter()) {
+        for name in claimed.iter() {
             std::fs::write(root.join(name), b"body bytes, no magic").unwrap();
+        }
+        for name in unclaimed.iter() {
+            std::fs::write(root.join(name), b"\x00\x01body\x00").unwrap();
         }
 
         let config = Config::default();
@@ -1752,13 +1764,13 @@ mod count_and_extract_tests {
         let cursor = ExtractCursor::for_root(root.to_str().unwrap());
         let scope = extract_scope_prepare(&conn_mutex, &cursor, &config).unwrap();
 
-        // `extract_total` in the GUI. The two small text-ish files were
+        // `extract_total` in the GUI. The three small text-ish files were
         // finished inline by the walk so they land in `already_done`; the mp3
         // needs the disk pass. Either way the denominator is the claimed set —
-        // before this was decided at walk time it read 8, every indexed file.
+        // before this was decided at walk time it read 9, every indexed file.
         assert_eq!(
             (scope.pending, scope.already_done),
-            (1, 2),
+            (1, 3),
             "denominator must be the files needing text, not every indexed file"
         );
         assert_eq!(scope.pending + scope.already_done, claimed.len());

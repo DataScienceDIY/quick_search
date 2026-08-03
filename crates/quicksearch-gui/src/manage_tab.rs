@@ -308,12 +308,21 @@ impl ManageTab {
                 ui.heading(egui::RichText::new("Content filters").strong());
                 ui.columns(2, |cols| {
                     cols[0].label("Full-text extensions whitelist (empty = all supported):");
-                    cols[0].add(
-                        egui::TextEdit::multiline(&mut self.ext_filter_text)
-                            .desired_rows(4)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("txt\nmd\npdf"),
-                    );
+                    cols[0]
+                        .add(
+                            egui::TextEdit::multiline(&mut self.ext_filter_text)
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("txt\nmd\npdf  # comments allowed\n(none)"),
+                        )
+                        .on_hover_text(
+                            "One extension per line, leading dot optional. A non-empty \
+                             list also excludes files that have no extension at all \
+                             (Makefile, README, .bashrc) — add the line \"(none)\" to \
+                             keep extracting text from those.\n\n\
+                             \"#\" starts a comment, either on its own line or after an \
+                             entry, so a type can be commented out without losing it.",
+                        );
                     cols[1].label("Ignore patterns (excluded entirely):");
                     let mut remove_pat: Option<usize> = None;
                     // The list grows and shrinks — including from outside

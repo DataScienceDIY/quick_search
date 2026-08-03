@@ -16,5 +16,6 @@ pub mod search;
 pub mod security;
 pub mod shutdown;
 pub mod snippet;
+pub mod textenc;
 pub mod walk;
 pub mod watcher;
