@@ -20,6 +20,25 @@ pub fn bordered_button(
     egui::Button::new(text).stroke(egui::Stroke::new(1.5, color))
 }
 
+/// Render a section whose widget count changes from frame to frame inside
+/// its own child `Ui`.
+///
+/// egui derives a widget's id from how many widgets precede it in the same
+/// `Ui`. A section that emits, say, one label while idle and four rows plus
+/// a progress line while working therefore *renames* every widget below it
+/// the moment its content changes — and a `DragValue` or `TextEdit` whose
+/// id changes loses keyboard focus and whatever the user was typing. A
+/// child `Ui` costs the parent exactly one id no matter what goes inside
+/// it, so everything below keeps its identity.
+///
+/// Wrapping does not help the section's *own* widgets: a child `Ui` mixes
+/// the parent's counter into its id, so an unstable section cannot be made
+/// stable from the inside. Live text and progress belong in a wrapped
+/// section; editable fields belong outside one.
+pub fn stable_section<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.vertical(contents).inner
+}
+
 /// Whether `pattern` is usable as an ignore pattern. `IgnoreSet::compile`
 /// silently *skips* patterns that trim to nothing, so emptiness is checked
 /// here with the same trimming rules compile applies.

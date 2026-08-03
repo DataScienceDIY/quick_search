@@ -77,8 +77,17 @@ fn main() {
     // verified key means no prompt at all. Anything else starts locked —
     // the unlock screen owns password entry, bad-salt reporting, and the
     // forgot-password escape hatch. No index is touched until unlocked.
-    let start_unlocked =
-        !config.security.password_protected || unlock::try_keychain_unlock(&config);
+    //
+    // `None` means "start locked". The two unlocked cases stay distinct
+    // rather than collapsing to a bool, because anything the app later says
+    // *about* the key has to know whether the user typed one.
+    let key_source = if !config.security.password_protected {
+        Some(unlock::KeySource::Unprotected)
+    } else if unlock::try_keychain_unlock(&config) {
+        Some(unlock::KeySource::Keychain)
+    } else {
+        None
+    };
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -94,11 +103,12 @@ fn main() {
         "QuickSearch",
         native_options,
         Box::new(move |cc| {
-            let gate = if start_unlocked {
-                unlock::Gate::running(&cc.egui_ctx, config, config_error, initial_query)
-                    .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?
-            } else {
-                unlock::Gate::locked(config, config_error, initial_query)
+            let gate = match key_source {
+                Some(source) => {
+                    unlock::Gate::running(&cc.egui_ctx, config, config_error, initial_query, source)
+                        .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?
+                }
+                None => unlock::Gate::locked(config, config_error, initial_query),
             };
             Ok(Box::new(gate) as Box<dyn eframe::App>)
         }),

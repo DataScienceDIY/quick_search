@@ -3179,7 +3179,7 @@ dependencies = [
 
 [[package]]
 name = "quicksearch-core"
-version = "0.8.5"
+version = "0.8.8"
 dependencies = [
  "argon2",
  "ctrlc",
@@ -3187,6 +3187,7 @@ dependencies = [
  "globset",
  "infer",
  "kamadak-exif",
+ "libc",
  "lofty",
  "lopdf 0.32.0",
  "mime_guess",
@@ -3207,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "quicksearch-gui"
-version = "0.8.5"
+version = "0.8.8"
 dependencies = [
  "chrono",
  "eframe",

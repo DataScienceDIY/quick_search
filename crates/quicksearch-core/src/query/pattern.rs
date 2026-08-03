@@ -236,6 +236,38 @@ impl TermPattern {
         }
     }
 
+    /// Case-insensitive [`find_first`] against an already-folded haystack.
+    ///
+    /// The literal path would otherwise fold the haystack itself, and the
+    /// cascade's full-text passes need the same fold for counting, searching
+    /// and snippet extraction — three copies of a document that can run to
+    /// `maximum_text_size`. Folding is byte-length preserving, so the returned
+    /// range is valid in the unfolded original too.
+    pub fn find_first_folded(&self, folded: &str) -> Option<Range<usize>> {
+        match self {
+            TermPattern::Empty => None,
+            TermPattern::Literal(l) => {
+                let pos = folded.find(&l.folded)?;
+                Some(pos..pos + l.text.len())
+            }
+            // The regex engine folds as it matches, so it needs no help and
+            // allocates nothing either way.
+            TermPattern::Wildcard(w) => w.search_ci.find(folded).map(|m| m.range()),
+        }
+    }
+
+    /// Case-insensitive [`count`] against an already-folded haystack. See
+    /// [`TermPattern::find_first_folded`].
+    pub fn count_folded(&self, folded: &str) -> usize {
+        match self {
+            TermPattern::Empty => 0,
+            // Both sides are already folded, so an exact scan *is* the
+            // case-insensitive one — and it allocates nothing.
+            TermPattern::Literal(l) => snippet::count_occurrences(folded, &l.folded, true),
+            TermPattern::Wildcard(w) => w.search_ci.find_iter(folded).take(COUNT_CAP).count(),
+        }
+    }
+
     /// Non-overlapping occurrence count, capped at 1000 (the cascade's
     /// `count_frac` saturates there anyway).
     pub fn count(&self, text: &str, case_insensitive: bool) -> usize {

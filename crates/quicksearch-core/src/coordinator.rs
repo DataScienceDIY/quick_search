@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
@@ -142,6 +142,8 @@ impl IndexCoordinator {
             watcher_rx: None,
             watcher_gen: 0,
             pending: HashMap::new(),
+            last_event_at: None,
+            pending_since: None,
             needs_full_run: false,
             saw_running: false,
             write_conn: None,
@@ -259,6 +261,50 @@ fn enqueue(pending: &mut HashMap<PathBuf, FsEvent>, event: FsEvent) {
     }
 }
 
+/// Whether a queued event is a removal. The queue only ever holds
+/// Create/Modify/Remove — [`enqueue`] splits renames into their halves.
+fn is_removal(event: &FsEvent) -> bool {
+    matches!(event, FsEvent::Remove(_))
+}
+
+/// Drop queued removals that a queued removal of one of their ancestors
+/// already covers, in place.
+///
+/// `rm -rf dir/` reports `dir` and every path beneath it; applying `dir` sweeps
+/// the whole range, so the descendants are duplicate work. Collapsing here —
+/// rather than at application time — is what keeps a mass deletion from
+/// tripping [`PENDING_OVERFLOW`] and forcing a redundant full run.
+///
+/// Only removals collapse against removals. A `Create` under a removed
+/// directory is a re-creation and must survive: removals are applied first, so
+/// it lands afterwards and the row is correct either way.
+fn collapse_pending_removals(pending: &mut HashMap<PathBuf, FsEvent>) {
+    if pending.values().filter(|e| is_removal(e)).take(2).count() < 2 {
+        return;
+    }
+    let removed: std::collections::HashSet<PathBuf> = pending
+        .iter()
+        .filter(|(_, ev)| is_removal(ev))
+        .map(|(p, _)| p.clone())
+        .collect();
+    // `Path::ancestors` walks whole components, so `/a/bc` is never treated as
+    // living under `/a/b` — the rule `remove_tree` and `UnreadableDirs::covers`
+    // also use.
+    pending.retain(|path, ev| {
+        !is_removal(ev) || !path.ancestors().skip(1).any(|a| removed.contains(a))
+    });
+}
+
+/// How long [`Inner::apply_pending`] may hold the command loop before handing
+/// the rest of the queue to the next tick.
+///
+/// A long run over a busy tree can accumulate tens of thousands of events, and
+/// draining them all inline would block Stop and Apply behind the backlog. A
+/// deadline bounds that latency without throttling throughput the way a fixed
+/// event budget would; `queued_events` already reports the remainder, so a
+/// multi-tick drain is visible rather than silent.
+const APPLY_BUDGET: Duration = Duration::from_millis(250);
+
 struct Inner {
     config: Config,
     indexing: Arc<IndexingService>,
@@ -271,6 +317,12 @@ struct Inner {
     watcher_rx: Option<mpsc::Receiver<(u64, Result<Watcher, WatchError>)>>,
     watcher_gen: u64,
     pending: HashMap<PathBuf, FsEvent>,
+    /// When the most recent event arrived; the burst is over once this is
+    /// `pending_settle` old.
+    last_event_at: Option<Instant>,
+    /// When the oldest un-applied event arrived, so a steady trickle cannot
+    /// defer application past `pending_max_defer`.
+    pending_since: Option<Instant>,
     needs_full_run: bool,
     /// A start was requested; set false once the service reports running,
     /// so idle-after-running transitions are detectable.
@@ -363,9 +415,13 @@ impl Inner {
 
         let status = self.indexing.get_status();
         match status {
-            IndexingStatus::Running { .. } | IndexingStatus::Stopping => {
+            IndexingStatus::Running { .. }
+            | IndexingStatus::Stopping
+            | IndexingStatus::Optimizing => {
                 // Single-writer rule: never touch the DB while a full run
-                // is active; the queue drains on a later tick.
+                // is active; the queue drains on a later tick. Optimizing
+                // counts — it holds a write transaction over the whole file
+                // for as long as the rewrite takes.
                 self.saw_running = true;
                 return;
             }
@@ -384,12 +440,12 @@ impl Inner {
 
         if self.mode != IndexMode::Auto {
             if self.mode == IndexMode::ManualStopped {
-                self.pending.clear();
+                self.clear_pending();
             }
             return;
         }
 
-        if !self.pending.is_empty() && !self.needs_full_run {
+        if !self.pending.is_empty() && !self.needs_full_run && self.pending_settled() {
             self.apply_pending();
         }
 
@@ -399,19 +455,58 @@ impl Inner {
     }
 
     fn drain_events(&mut self) {
+        let mut received = false;
         while let Ok(ev) = self.event_rx.try_recv() {
             enqueue(&mut self.pending, ev);
+            received = true;
+        }
+        if received {
+            let now = Instant::now();
+            self.last_event_at = Some(now);
+            self.pending_since.get_or_insert(now);
+            // Before the overflow test, not after: an `rm -rf` of half a
+            // million files collapses to a handful of directory roots, and
+            // measuring the queue by its raw event count would throw all of
+            // them away and schedule a full run instead.
+            collapse_pending_removals(&mut self.pending);
         }
         if self.pending.len() > PENDING_OVERFLOW {
             // Replaying a storm one file at a time is slower than one
             // incremental full run (unchanged files skip on mtime).
-            self.pending.clear();
+            self.clear_pending();
             self.needs_full_run = true;
         }
     }
 
+    /// Drop the queue and the timers that describe it, so a stale
+    /// `pending_since` cannot force an immediate apply of the next event.
+    fn clear_pending(&mut self) {
+        self.pending.clear();
+        self.last_event_at = None;
+        self.pending_since = None;
+    }
+
+    /// Whether the queue has gone quiet long enough to be worth applying, or
+    /// has waited long enough that it must be applied regardless.
+    fn pending_settled(&self) -> bool {
+        let quiet = self
+            .last_event_at
+            .is_none_or(|t| t.elapsed() >= self.watcher_config.pending_settle);
+        let overdue = self
+            .pending_since
+            .is_some_and(|t| t.elapsed() >= self.watcher_config.pending_max_defer);
+        quiet || overdue
+    }
+
+    /// Apply as much of the queue as fits in [`APPLY_BUDGET`], removals first.
+    ///
+    /// Removals lead deliberately. The queue is an unordered map, so the old
+    /// arbitrary application order could delete a row a `Create` in the same
+    /// batch had just written. With removals first both interleavings converge
+    /// on the truth: a delete-then-recreate ends with the file present, and a
+    /// create-then-delete ends with it absent, because the upsert half consults
+    /// the filesystem and finds nothing there.
     fn apply_pending(&mut self) {
-        let events: Vec<FsEvent> = self.pending.drain().map(|(_, ev)| ev).collect();
         let conn = match self.ensure_write_conn() {
             Ok(conn) => conn,
             Err(e) => {
@@ -423,13 +518,57 @@ impl Inner {
         };
         // Borrow dance: pull the connection out while applying.
         let mut conn = conn;
-        for ev in &events {
-            if let Err(e) = apply_fs_event(&mut conn, ev, &self.config, &self.ignore, &self.registry)
-            {
-                crate::log_warn!("coordinator: apply {:?}: {}", ev, e);
+        let deadline = Instant::now() + APPLY_BUDGET;
+        let chunk = self.config.processing.batch_size.max(1);
+
+        let removals: Vec<PathBuf> = self
+            .pending
+            .iter()
+            .filter(|(_, ev)| is_removal(ev))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for batch in removals.chunks(chunk) {
+            if let Err(e) = crate::incremental::remove_paths(&mut conn, batch, chunk) {
+                crate::log_warn!("coordinator: remove: {}", e);
+            }
+            for path in batch {
+                self.pending.remove(path);
+            }
+            if Instant::now() >= deadline {
+                break;
             }
         }
+
+        if Instant::now() < deadline {
+            let upserts: Vec<PathBuf> = self
+                .pending
+                .iter()
+                .filter(|(_, ev)| !is_removal(ev))
+                .map(|(p, _)| p.clone())
+                .collect();
+            for path in upserts {
+                let Some(ev) = self.pending.remove(&path) else {
+                    continue;
+                };
+                if let Err(e) =
+                    apply_fs_event(&mut conn, &ev, &self.config, &self.ignore, &self.registry)
+                {
+                    crate::log_warn!("coordinator: apply {:?}: {}", ev, e);
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+
         self.write_conn = Some(conn);
+        // Whatever is left goes to the next tick, and goes immediately: the
+        // pause was ours, not the filesystem's, so it must not re-arm the
+        // settle window.
+        self.last_event_at = None;
+        if self.pending.is_empty() {
+            self.pending_since = None;
+        }
     }
 
     fn ensure_write_conn(&mut self) -> Result<Connection, String> {
@@ -478,7 +617,18 @@ impl Inner {
         // The full run owns the DB (and may wipe/rebuild the file).
         self.write_conn = None;
         self.needs_full_run = false;
-        self.pending.clear();
+        // Queued creates and modifies are dropped — the walk about to start
+        // rediscovers every one of them. Removals are kept, because it cannot:
+        // a deletion under a directory the walk fails to read is deliberately
+        // left alone by `unreadable.covers`, and one of a symlink target whose
+        // real parent lies outside every root is exempted by `aliased_paths`.
+        // Those rows would otherwise leak until a rebuild. Re-applying a
+        // removal the walk did happen to catch is a harmless no-op.
+        self.pending.retain(|_, ev| is_removal(ev));
+        if self.pending.is_empty() {
+            self.last_event_at = None;
+            self.pending_since = None;
+        }
         if let Err(e) = self
             .indexing
             .start_indexing(roots, self.db_path(), self.config.clone())
@@ -486,18 +636,10 @@ impl Inner {
             crate::log_warn!("coordinator: start indexing: {}", e);
             return;
         }
-        // Give the service's command thread a moment to flip the status;
-        // small trees can finish between two coordinator ticks, and the
-        // finished-run bookkeeping keys off `saw_running`.
-        for _ in 0..200 {
-            if !matches!(
-                self.indexing.get_status(),
-                IndexingStatus::Idle | IndexingStatus::Error(_)
-            ) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // `start_indexing` claims the Running status before it returns, so
+        // `get_status()` is already authoritative — no poll, and no window in
+        // which this thread could believe the service idle and start writing
+        // to a database the run is about to reopen.
         self.saw_running = true;
     }
 
@@ -516,7 +658,7 @@ impl Inner {
         self.mode = IndexMode::ManualStopped;
         self.config.indexing.auto_index = false;
         self.stop_watcher();
-        self.pending.clear();
+        self.clear_pending();
         let status = self.indexing.get_status();
         if !matches!(status, IndexingStatus::Idle | IndexingStatus::Error(_)) {
             // Signal only — waiting up to 5 s here would stall every
@@ -775,11 +917,13 @@ mod tests {
     }
 
     /// Short debounce windows so trailing-edge events flush within test
-    /// timeouts (production default is a 30 s window).
+    /// timeouts (production defaults are 30 s / 2 s).
     fn fast_watcher() -> WatcherConfig {
         WatcherConfig {
             throttle_window: Duration::from_millis(300),
             tick_interval: Duration::from_millis(100),
+            pending_settle: Duration::from_millis(200),
+            pending_max_defer: Duration::from_secs(3),
             ..WatcherConfig::default()
         }
     }
@@ -981,6 +1125,114 @@ mod tests {
         });
         coord.shutdown();
         std::fs::remove_dir_all(&extra_root).ok();
+    }
+
+    /// A `rm -rf` reports the directory *and* everything under it. Only the
+    /// directory needs applying — its range sweep covers the rest — and
+    /// collapsing before the overflow test is what stops a large deletion from
+    /// discarding the queue and forcing a full run.
+    #[test]
+    fn collapsing_reduces_a_tree_deletion_to_its_root() {
+        let mut pending = HashMap::new();
+        let dir = PathBuf::from("/x/tree");
+        enqueue(&mut pending, FsEvent::Remove(dir.clone()));
+        for i in 0..500 {
+            enqueue(
+                &mut pending,
+                FsEvent::Remove(dir.join(format!("sub{}/f{}.txt", i % 5, i))),
+            );
+            enqueue(&mut pending, FsEvent::Remove(dir.join(format!("sub{}", i % 5))));
+        }
+        // Not under the removed tree, and not a removal: both must survive.
+        enqueue(&mut pending, FsEvent::Remove(PathBuf::from("/x/treehouse")));
+        enqueue(&mut pending, FsEvent::Create(dir.join("reborn.txt")));
+
+        collapse_pending_removals(&mut pending);
+
+        let mut left: Vec<String> = pending
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "/x/tree".to_string(),
+                "/x/tree/reborn.txt".to_string(),
+                "/x/treehouse".to_string(),
+            ],
+            "only the removal root, the re-creation, and the prefix sibling remain"
+        );
+    }
+
+    #[test]
+    fn collapsing_a_queue_without_removals_is_a_no_op() {
+        let mut pending = HashMap::new();
+        enqueue(&mut pending, FsEvent::Create(PathBuf::from("/x/a")));
+        enqueue(&mut pending, FsEvent::Modify(PathBuf::from("/x/a/b")));
+        collapse_pending_removals(&mut pending);
+        assert_eq!(pending.len(), 2);
+    }
+
+    /// Deleting a populated directory must land as one queued removal, not one
+    /// per file, and the rows must actually go.
+    #[test]
+    fn a_deleted_directory_is_applied_as_a_single_collapsed_removal() {
+        let f = Fixture::new(true);
+        let tree = f.dir.join("tree");
+        for i in 0..40 {
+            let p = tree.join(format!("sub{}/f{:03}.txt", i % 4, i));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, format!("body {}", i)).unwrap();
+        }
+        std::fs::write(f.dir.join("keep.txt"), "survivor").unwrap();
+
+        let coord =
+            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        wait_for("initial index", Duration::from_secs(30), || {
+            f.file_count() == 41
+        });
+
+        std::fs::remove_dir_all(&tree).unwrap();
+        wait_for("subtree removed from the index", Duration::from_secs(30), || {
+            f.file_count() == 1
+        });
+
+        coord.shutdown();
+    }
+
+    /// The queue must not be applied while a full run owns the database, and
+    /// the events must survive to be applied once it finishes.
+    #[test]
+    fn a_deletion_during_a_full_run_is_queued_then_applied() {
+        let f = Fixture::new(false); // manual: runs happen only when asked
+        for i in 0..300 {
+            let p = f.dir.join(format!("d{}/f{:03}.txt", i % 6, i));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, format!("body {}", i)).unwrap();
+        }
+
+        let coord =
+            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        coord.reindex_now();
+        wait_for("first run", Duration::from_secs(30), || {
+            coord.state().last_full_index.is_some() && f.file_count() == 300
+        });
+
+        // Auto mode so the watcher is live, then delete while a run is going.
+        coord.set_mode(IndexMode::Auto);
+        wait_for("watcher active", Duration::from_secs(30), || {
+            matches!(coord.state().watcher, WatcherStatus::Active { .. })
+        });
+        coord.reindex_now();
+        std::fs::remove_dir_all(f.dir.join("d0")).unwrap();
+
+        // 300 files, 50 of them under d0.
+        wait_for("deletion applied after the run", Duration::from_secs(60), || {
+            f.file_count() == 250
+        });
+
+        coord.shutdown();
     }
 
     #[test]

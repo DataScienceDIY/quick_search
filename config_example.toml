@@ -21,16 +21,23 @@ indexing_paths = ["~"]
 database_path = "~/.local/share/quicksearch/index.sqlite"
 
 [indexing]
-# The indexing mode. true = automatic: filesystem watchers apply changes as
-# they happen and a full reindex runs every reindex_interval_minutes (the
-# watcher catches changes as they happen, so that interval only needs to be
+# The indexing mode. true = automatic: filesystem watchers apply changes a
+# couple of seconds after they happen — the queue waits for a burst to settle
+# so that deleting a folder costs one operation instead of one per file — and
+# a full reindex runs every reindex_interval_minutes (the watcher catches
+# changes as they happen, so that interval only needs to be
 # often enough to cover whatever the watcher missed). false = manual:
 # nothing is indexed until you ask for it. The Stop and Return to Automatic
 # buttons on the Manage Index tab write this value, so the mode you left the
 # app in is the mode it starts in.
 auto_index = true
 reindex_interval_minutes = 1440
-# Follow symbolic links during directory walks.
+# Follow symbolic links during directory walks. Applies to links pointing at
+# files as well as at directories: with this off a symlink is not resolved at
+# all, so its target is never indexed — which matters because a target can
+# live outside every folder listed above. A resolved target is stored under
+# its own real path, not the link's. Changing this changes what is in the
+# index, so it prompts for a rebuild.
 follow_symlinks = false
 # Index hidden files and directories. That means dot-files everywhere, and
 # additionally anything carrying the Hidden or System attribute on Windows
@@ -80,9 +87,17 @@ maximum_text_size = 262144
 # Files larger than this skip text extraction entirely (bytes).
 maximum_text_file_size = 2097152
 # Files per batch during walks / inserts / extraction.
-batch_size = 200
+batch_size = 500
 # Files per transaction for incremental FTS updates.
 fts_update_batch_size = 1000
+# How large the write-ahead log (index.sqlite-wal) may grow during an
+# indexing run before the indexer forces a checkpoint (bytes). SQLite copies
+# the log into the index on its own but can only reset it when no reader is
+# mid-query, and a run keeps one reader per root busy throughout — so
+# unattended the log grows for the whole run and can end up larger than the
+# index. Set to 0 to disable forced checkpoints; any other value below
+# 16777216 is raised to it.
+maximum_wal_size = 536870912
 # FTS5 tokenizer: 'trigram' (substring matching, the default; gets
 # remove_diacritics 1 appended), 'unicode61', 'porter', or a full FTS5
 # option string. See https://www.sqlite.org/fts5.html#tokenizers

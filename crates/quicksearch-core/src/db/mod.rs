@@ -15,6 +15,6 @@ pub mod schema;
 
 pub use key::{process_key_hex, set_process_key};
 pub use open::{
-    open_existing, open_or_recreate, verify_process_key, CURRENT_SCHEMA_VERSION,
-    KEY_MISMATCH_PREFIX,
+    index_needs_rebuild, open_existing, open_or_recreate, verify_process_key,
+    CURRENT_SCHEMA_VERSION, KEY_MISMATCH_PREFIX,
 };

@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Arc};
 use std::fs::File;
 use std::io::Read;
@@ -532,16 +532,16 @@ fn get_file_hash(
     Ok((hasher.finalize().to_vec(), head))
 }
 
-/// Nudge FTS5 to merge its index segments. Best-effort optimization; any
-/// error is logged but not fatal.
-pub fn fts_finalize_after_text_indexing(conn: &Connection) -> Result<(), String> {
+/// Nudge FTS5 to merge its index segments. Best-effort: the only failure
+/// possible is logged and swallowed, so there is nothing for a caller to
+/// handle — hence no `Result`.
+pub fn fts_finalize_after_text_indexing(conn: &Connection) {
     if let Err(e) = conn.execute(
         "INSERT INTO searchabletext(searchabletext, rank) VALUES('automerge', 8)",
         [],
     ) {
         crate::log_warn!("FTS automerge failed (non-fatal): {}", e);
     }
-    Ok(())
 }
 
 /// An owned, fully-derived file record: everything needed to insert or
@@ -566,6 +566,11 @@ pub struct OwnedNewFile {
     /// one, and the walk's channel is bounded at `CHANNEL_CAP`, so this adds
     /// at most `CHANNEL_CAP * hash_length` of in-flight memory.
     pub inline_text: Option<String>,
+    /// Whether the content pass has anything to do for this file — see
+    /// [`content_extractable`], plus the `maximum_text_file_size` gate. `false`
+    /// means the row is born `STATE_NA`, so "pending" counts only real work and
+    /// the pass never queues a file just to write it off.
+    pub needs_content: bool,
 }
 
 impl OwnedNewFile {
@@ -581,6 +586,7 @@ impl OwnedNewFile {
             mime: self.mime.as_deref(),
             ftype: self.ftype,
             hash: Some(&self.hash),
+            needs_content: self.needs_content,
         }
     }
 }
@@ -636,27 +642,27 @@ pub fn prepare_file_record(
     let mime = guess_mime_from_head(Path::new(path), &head);
     let ftype = mime.as_deref().map(mime_to_type).unwrap_or(FileType::EMPTY);
 
+    // Decided once, here, where the sniffed MIME, the size, the config and the
+    // registry are all in hand — and stored as the row's `content_state`, so
+    // "pending" downstream means a file that really needs reading rather than
+    // one the content pass would only mark not-applicable.
+    let needs_content = size <= config.processing.maximum_text_file_size
+        && content_extractable(Path::new(path), mime.as_deref(), config, registry);
+
     // When the head is the whole file, an extractor that works from bytes can
     // finish the job now and spare the content pass an open/read/close. Any
     // condition that does not hold simply leaves this `None`, and the file
     // stays pending exactly as before — including invalid UTF-8, which the
     // content pass records as a failure with a reason.
-    let inline_text = mime.as_deref().and_then(|m| {
-        // The head is the whole file only up to `hash_length`. The
-        // `maximum_text_file_size` gate is the content pass's own (see
-        // `extract_scope_prepare`), repeated so both paths agree even when a
-        // config sets it below `hash_length`.
+    let inline_text = mime.as_deref().filter(|_| needs_content).and_then(|m| {
+        // The head is the whole file only up to `hash_length`.
         //
         // Size 0 is excluded rather than treated as "trivially complete":
         // procfs, sysfs and some FUSE mounts report it for files that do have
         // content, and inlining would store empty text for them. The content
         // pass reads those correctly, and an actually-empty file costs the
         // same there as it ever did.
-        if size == 0
-            || size > config.processing.hash_length as u64
-            || size > config.processing.maximum_text_file_size
-            || !crate::config::content_allowed(Path::new(path), config)
-        {
+        if size == 0 || size > config.processing.hash_length as u64 {
             return None;
         }
         match registry.extract_complete_head(Path::new(path), m, &head) {
@@ -686,6 +692,7 @@ pub fn prepare_file_record(
         ftype,
         hash,
         inline_text,
+        needs_content,
     })
 }
 
@@ -729,10 +736,71 @@ pub fn extract_and_store(
     registry: &Registry,
     config: &Config,
 ) -> Result<(), String> {
+    let outcome = decide_content(path, mime, registry, config);
+    store_content_outcome(tx, file_id, name, &outcome, config)
+}
+
+/// What should be written for one file's content, decided without touching
+/// the database.
+///
+/// Split from the write so the deciding — which opens the file, reads it and
+/// runs an extractor over it — can happen on a worker thread while the single
+/// writer holds nothing. See [`crate::content`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentOutcome {
+    /// Text (already truncated to `maximum_text_size`) and sorted properties.
+    Done {
+        text: String,
+        properties: Vec<(String, String)>,
+    },
+    /// No extractor claims the MIME, or `content_extensions` excludes it.
+    NotApplicable,
+    /// The extractor ran and failed; the reason goes on the row.
+    Failed(String),
+}
+
+/// Whether extraction will produce anything for this file: the
+/// `content_extensions` filter allows it, and some extractor claims its MIME.
+///
+/// The single predicate behind both the `content_state` a row is born with
+/// (see [`prepare_file_record`]) and [`decide_content`]'s not-applicable
+/// early-out, so the two can never drift. That matters more than it looks: if
+/// they disagreed, a file the walk wrote off as NA would silently never be
+/// full-text indexed.
+///
+/// Deliberately size-free. The content pass's workers never see a size — the
+/// `maximum_text_file_size` gate lives in the feeder's query
+/// ([`crate::db::repo::pending_content_page`]) and in [`extract_scope_prepare`]
+/// — so folding it in here would be a gate only one of the two callers could
+/// honour.
+pub fn content_extractable(
+    path: &Path,
+    mime: Option<&str>,
+    config: &Config,
+    registry: &Registry,
+) -> bool {
+    crate::config::content_allowed(path, config)
+        && mime.is_some_and(|m| registry.supports(m))
+}
+
+/// Read `path` and decide what its content row should say. No database access,
+/// no locks held — this is the expensive half.
+///
+/// `mime` is authoritative, including when it is `None`: see
+/// [`extract_and_store`].
+pub fn decide_content(
+    path: &str,
+    mime: Option<&str>,
+    registry: &Registry,
+    config: &Config,
+) -> ContentOutcome {
     let p = Path::new(path);
-    if !crate::config::content_allowed(p, config) {
-        return repo::set_content_na(tx, file_id);
+    if !content_extractable(p, mime, config, registry) {
+        return ContentOutcome::NotApplicable;
     }
+    // `content_extractable` just established that some extractor claims this
+    // MIME, so the `Ok(None)` arm below is unreachable; it stays as the honest
+    // answer should that ever stop holding.
     let result = match mime {
         Some(m) => registry.extract(p, m),
         None => Ok(None),
@@ -740,20 +808,39 @@ pub fn extract_and_store(
     match result {
         Ok(Some(mut content)) => {
             if content.text.len() > config.processing.maximum_text_size {
-                content.text = safe_truncate_string(&content.text, config.processing.maximum_text_size);
+                content.text =
+                    safe_truncate_string(&content.text, config.processing.maximum_text_size);
             }
-            let props = content.properties_sorted();
-            repo::set_content_done(
-                tx,
-                file_id,
-                name,
-                &content.text,
-                &props,
-                config.processing.store_text_for_snippets,
-            )
+            ContentOutcome::Done {
+                properties: content.properties_sorted(),
+                text: content.text,
+            }
         }
-        Ok(None) => repo::set_content_na(tx, file_id),
-        Err(reason) => repo::set_content_failed(tx, file_id, &reason),
+        Ok(None) => ContentOutcome::NotApplicable,
+        Err(reason) => ContentOutcome::Failed(reason),
+    }
+}
+
+/// Apply a decision from [`decide_content`]. The cheap half: pure database
+/// writes, so this is all that runs with the connection held.
+pub fn store_content_outcome(
+    tx: &rusqlite::Transaction<'_>,
+    file_id: i64,
+    name: &str,
+    outcome: &ContentOutcome,
+    config: &Config,
+) -> Result<(), String> {
+    match outcome {
+        ContentOutcome::Done { text, properties } => repo::set_content_done(
+            tx,
+            file_id,
+            name,
+            text,
+            properties,
+            config.processing.store_text_for_snippets,
+        ),
+        ContentOutcome::NotApplicable => repo::set_content_na(tx, file_id),
+        ContentOutcome::Failed(reason) => repo::set_content_failed(tx, file_id, reason),
     }
 }
 
@@ -769,7 +856,7 @@ pub fn extract_and_store(
 pub fn process_batch_updates(
     conn_mutex: &Arc<Mutex<Connection>>,
     files_to_update: &[OwnedNewFile],
-    stop_flag: &Arc<Mutex<bool>>,
+    stop_flag: &Arc<AtomicBool>,
     config: &Config,
 ) -> Result<(), String> {
     if files_to_update.is_empty() {
@@ -779,7 +866,7 @@ pub fn process_batch_updates(
     let fts_batch = config.processing.fts_update_batch_size.max(1);
 
     for batch in files_to_update.chunks(fts_batch) {
-        if *stop_flag.lock().unwrap() {
+        if stop_flag.load(Ordering::Relaxed) {
             return Ok(());
         }
 
@@ -789,22 +876,13 @@ pub fn process_batch_updates(
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
         for rec in batch.iter() {
-            if *stop_flag.lock().unwrap() {
+            if stop_flag.load(Ordering::Relaxed) {
                 drop(tx);
                 drop(conn);
                 return Ok(());
             }
 
-            let updated = repo::update_file_basic(
-                &tx,
-                &rec.path,
-                rec.size,
-                rec.mtime,
-                Some(rec.hash.as_slice()),
-                rec.mime.as_deref(),
-                rec.ftype,
-            )
-            .map_err(|e| {
+            let updated = repo::update_file_basic(&tx, &rec.as_new_file()).map_err(|e| {
                 format!(
                     "Failed to update file record + clear stale content for {}: {}",
                     rec.path, e
@@ -867,7 +945,7 @@ pub(crate) fn store_inline_text(
 pub fn process_batch_inserts(
     conn_mutex: &Arc<Mutex<Connection>>,
     files_to_insert: &[OwnedNewFile],
-    stop_flag: &Arc<Mutex<bool>>,
+    stop_flag: &Arc<AtomicBool>,
     config: &Config,
 ) -> Result<(), String> {
     if files_to_insert.is_empty() {
@@ -875,7 +953,7 @@ pub fn process_batch_inserts(
     }
 
     for batch in files_to_insert.chunks(config.processing.batch_size) {
-        if *stop_flag.lock().unwrap() {
+        if stop_flag.load(Ordering::Relaxed) {
             return Ok(());
         }
 
@@ -885,7 +963,7 @@ pub fn process_batch_inserts(
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
         for rec in batch.iter() {
-            if *stop_flag.lock().unwrap() {
+            if stop_flag.load(Ordering::Relaxed) {
                 drop(tx);
                 drop(conn);
                 return Ok(());
@@ -904,52 +982,76 @@ pub fn process_batch_inserts(
     Ok(())
 }
 
+/// Delete the rows a completed run found no file behind, in chunked
+/// transactions. Returns how many went.
+///
+/// The chunking is not just about transaction size: the connection is shared
+/// with every search and status query, and `should_abort` *blocks* while the
+/// indexer is suspended. Checking it inside the transaction — as this used to —
+/// pinned the connection for the whole suspension and froze the GUI behind it.
+/// So the stop flag, which never blocks, is what guards the inner loop, and
+/// suspension is only ever observed between chunks with nothing held.
 pub fn cleanup_stale_index_entries(
     conn_mutex: &Arc<Mutex<Connection>>,
     stale_paths: &[String],
-    stop_flag: &Arc<Mutex<bool>>,
+    stop_flag: &Arc<AtomicBool>,
     suspend_flag: &Arc<AtomicBool>,
+    config: &Config,
 ) -> Result<usize, String> {
     if stale_paths.is_empty() {
         return Ok(0);
     }
-
-    let conn = conn_mutex.lock().unwrap();
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| format!("Failed to begin stale cleanup transaction: {}", e))?;
-
+    let chunk = config.processing.batch_size.max(1);
     let mut deleted_count = 0usize;
-    for path in stale_paths {
+
+    for batch in stale_paths.chunks(chunk) {
+        // Outside the lock, so a suspend parks here rather than mid-transaction.
         if should_abort(stop_flag, suspend_flag) {
-            let _ = tx.commit();
-            drop(conn);
             return Ok(deleted_count);
         }
-
-        if repo::delete_file_by_path(&tx, path).map_err(|e| {
-            format!(
-                "Failed to remove stale index entry for {}: {}",
-                path, e
-            )
-        })? {
-            deleted_count += 1;
+        let conn = conn_mutex.lock().unwrap();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin stale cleanup transaction: {}", e))?;
+        for path in batch {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            if repo::delete_file_by_path(&tx, path)
+                .map_err(|e| format!("Failed to remove stale index entry for {}: {}", path, e))?
+            {
+                deleted_count += 1;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("Failed to commit stale cleanup transaction: {}", e))?;
+        if stop_flag.load(Ordering::Relaxed) {
+            return Ok(deleted_count);
         }
     }
 
-    tx.commit()
-        .map_err(|e| format!("Failed to commit stale cleanup transaction: {}", e))?;
-
     if deleted_count > 0 && !should_abort(stop_flag, suspend_flag) {
-        fts_finalize_after_text_indexing(&conn)?;
+        let conn = conn_mutex.lock().unwrap();
+        fts_finalize_after_text_indexing(&conn);
     }
 
     Ok(deleted_count)
 }
 
-/// Keyset cursor for per-root content extraction. `lo`/`hi` bound the
-/// root's path range: `[root + "/", root + "0")` — `'0'` is `'/' + 1`, so
-/// the pair is a pure index range on `UNIQUE(files.path)`.
+/// Keyset cursor bounding everything stored beneath one directory.
+///
+/// `lo`/`hi` are the half-open path range `[dir + SEP, dir + (SEP + 1))`, so
+/// the pair is a pure index range on `UNIQUE(files.path)` — `SEARCH … (path>?
+/// AND path<?)` rather than a scan. Used by content extraction, by the
+/// vanished-directory sweep, and by the watcher's subtree deletion, all of
+/// which need the same answer to "which rows live under this directory".
+///
+/// The separator is load-bearing and must be the platform's own. `files.path`
+/// stores native separators (see [`path_to_db_string`]), and the successor of
+/// `/` (`0x2F`) is `'0'` while the successor of `\` (`0x5C`) is `']'` — using
+/// the Unix pair on Windows yields `hi = "C:\Users\me0"`, which every stored
+/// path sorts *above*. The range would be empty, silently disabling content
+/// extraction and the vanished-directory sweep on that platform.
 #[derive(Debug, Clone)]
 pub struct ExtractCursor {
     pub last_id: i64,
@@ -960,11 +1062,16 @@ pub struct ExtractCursor {
 impl ExtractCursor {
     /// Cursor covering everything under `root`.
     pub fn for_root(root: &str) -> ExtractCursor {
-        let base = root.trim_end_matches('/');
+        const SEP: char = std::path::MAIN_SEPARATOR;
+        // Both separators are trimmed, not just the platform's: a config or a
+        // watcher event may spell a directory either way, and a trailing one
+        // would otherwise be doubled into the bounds.
+        let base = root.trim_end_matches(['/', '\\']);
+        let next = char::from_u32(SEP as u32 + 1).expect("separator successor is a valid char");
         ExtractCursor {
             last_id: 0,
-            lo: format!("{}/", base),
-            hi: format!("{}0", base),
+            lo: format!("{}{}", base, SEP),
+            hi: format!("{}{}", base, next),
         }
     }
 }
@@ -973,6 +1080,11 @@ impl ExtractCursor {
 /// and rows whose text is already searchable from earlier runs. Progress
 /// displays show their sum so an unchanged root reads as fully extracted
 /// rather than "extracted 0".
+///
+/// Both halves count only files an extractor claims: rows nothing will extract
+/// are written `NA` at walk time (see [`content_extractable`]) and so appear in
+/// neither. That is what makes the sum a denominator for the *work*, rather
+/// than for every file under the root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtractScope {
     pub pending: usize,
@@ -980,8 +1092,15 @@ pub struct ExtractScope {
 }
 
 /// Prepare a root's extraction scope: flip oversize pending rows to NA
-/// (idempotent; also handles a `maximum_text_file_size` lowered between
-/// runs) and count what is pending vs. already extracted in the range.
+/// (idempotent) and count what is pending vs. already extracted in the range.
+///
+/// [`prepare_file_record`] already applies `maximum_text_file_size` when it
+/// writes a row, so the sweep finds nothing on a database this build filled.
+/// It stays for the two cases that decision cannot cover: a
+/// `maximum_text_file_size` *lowered* between runs (which, unlike
+/// `content_extensions`, does not force a rebuild — see
+/// [`crate::config::diff_actions`]), and rows left pending by an older build
+/// that marked every file pending regardless.
 pub fn extract_scope_prepare(
     conn_mutex: &Arc<Mutex<Connection>>,
     cursor: &ExtractCursor,
@@ -1017,87 +1136,47 @@ pub fn extract_scope_prepare(
     })
 }
 
-/// Run ONE bounded batch of content extraction within the cursor's range.
-/// Returns rows processed; 0 means the range is drained (or the run is
-/// stopping). `on_file` receives each file's name for progress display.
-/// Designed to be pumped by the per-root writer loop, so one root's
-/// extraction interleaves with other roots' walks and extractions.
-pub fn extract_one_batch(
+/// Write a batch of already-extracted rows.
+///
+/// The cheap half of the content pass: [`crate::content`] does the reading and
+/// the extracting on its own worker threads, and this is all that runs with the
+/// connection held. Chunked so each transaction — and so each hold of the
+/// connection lock — stays short, exactly as [`process_batch_inserts`] does.
+///
+/// Returns how many rows were written. A row whose write fails is logged and
+/// skipped rather than failing the run: its `content_state` stays pending, so
+/// the next run retries it.
+pub fn store_extracted(
     conn_mutex: &Arc<Mutex<Connection>>,
-    cursor: &mut ExtractCursor,
-    registry: &Registry,
+    rows: &[crate::content::ExtractedRow],
+    stop_flag: &Arc<AtomicBool>,
     config: &Config,
-    stop_flag: &Arc<Mutex<bool>>,
-    suspend_flag: &Arc<AtomicBool>,
-    on_file: &mut dyn FnMut(&str),
 ) -> Result<usize, String> {
-    if should_abort(stop_flag, suspend_flag) {
+    if rows.is_empty() {
         return Ok(0);
     }
-    let max_size = i64::try_from(config.processing.maximum_text_file_size).unwrap_or(i64::MAX);
-    let batch_limit = config.processing.batch_size.max(1) as i64;
-
-    let batch: Vec<(i64, String, String, Option<String>)> = {
+    let mut written = 0usize;
+    for batch in rows.chunks(config.processing.batch_size.max(1)) {
+        if stop_flag.load(Ordering::Relaxed) {
+            return Ok(written);
+        }
         let conn = conn_mutex.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, name, path, mime FROM files
-                  WHERE content_state = 0 AND size <= ?1 AND id > ?2
-                    AND path >= ?3 AND path < ?4
-                  ORDER BY id
-                  LIMIT ?5",
-            )
-            .map_err(|e| format!("Failed to prepare text indexing query: {}", e))?;
-        let rows = stmt
-            .query_map(
-                rusqlite::params![max_size, cursor.last_id, cursor.lo, cursor.hi, batch_limit],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
-                },
-            )
-            .map_err(|e| format!("Failed to query files for text indexing: {}", e))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to read file row: {}", e))?
-    };
-
-    if batch.is_empty() {
-        return Ok(0);
-    }
-
-    let mut processed = 0usize;
-    let conn = conn_mutex.lock().unwrap();
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(|e| format!("Failed to begin transaction: {}", e))?;
-    for (file_id, fname, fpath, fmime) in batch.iter() {
-        if *stop_flag.lock().unwrap() {
-            break;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+        for row in batch {
+            if let Err(e) =
+                store_content_outcome(&tx, row.file_id, &row.name, &row.outcome, config)
+            {
+                crate::log_warn!("content indexing for {}: {}", row.name, e);
+                continue;
+            }
+            written += 1;
         }
-        on_file(fname);
-        if let Err(e) = extract_and_store(
-            &tx,
-            *file_id,
-            fname,
-            fpath,
-            fmime.as_deref(),
-            registry,
-            config,
-        ) {
-            crate::log_warn!("content indexing for {}: {}", fpath, e);
-        }
-        // Advance only past what was actually processed, so a stop
-        // mid-batch never skips rows (they stay pending for the next run).
-        cursor.last_id = *file_id;
-        processed += 1;
+        tx.commit()
+            .map_err(|e| format!("Failed to commit transaction: {}", e))?;
     }
-    tx.commit()
-        .map_err(|e| format!("Failed to commit transaction: {}", e))?;
-    Ok(processed)
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -1310,6 +1389,54 @@ mod tests {
         );
     }
 
+    /// The range must bracket paths spelled with the *platform's* separator.
+    ///
+    /// The bug this pins: `hi` was hard-coded as `'/' + 1` = `'0'`, so on
+    /// Windows every stored `C:\Users\me\…` path sorted above it and the range
+    /// was empty — content extraction and the vanished-directory sweep both
+    /// silently did nothing.
+    #[test]
+    fn extract_cursor_brackets_paths_under_its_root() {
+        use std::path::MAIN_SEPARATOR as SEP;
+
+        let root = format!("{}Users{}me", root_prefix(), SEP);
+        let c = ExtractCursor::for_root(&root);
+        let inside = format!("{}{}docs{}a.txt", root, SEP, SEP);
+        assert!(
+            inside.as_str() >= c.lo.as_str() && inside.as_str() < c.hi.as_str(),
+            "{:?} must fall inside [{:?}, {:?})",
+            inside,
+            c.lo,
+            c.hi
+        );
+
+        // The directory itself is *not* in the range (the range is what lives
+        // beneath it), and a prefix sibling is outside it.
+        assert!(root.as_str() < c.lo.as_str());
+        let sibling = format!("{}Users{}mexico{}a.txt", root_prefix(), SEP, SEP);
+        assert!(
+            !(sibling.as_str() >= c.lo.as_str() && sibling.as_str() < c.hi.as_str()),
+            "{:?} is a sibling of {:?}, not a child",
+            sibling,
+            root
+        );
+
+        // A trailing separator of either flavour must not double up.
+        for spelled in [format!("{}/", root), format!("{}\\", root)] {
+            let c2 = ExtractCursor::for_root(&spelled);
+            assert_eq!((&c2.lo, &c2.hi), (&c.lo, &c.hi), "spelled {:?}", spelled);
+        }
+    }
+
+    /// An absolute-path prefix for the running platform.
+    fn root_prefix() -> String {
+        if cfg!(windows) {
+            r"C:\".to_string()
+        } else {
+            "/".to_string()
+        }
+    }
+
     /// A Remove event names a path that is already gone, so the key for it has
     /// to be built from the deepest ancestor that still resolves.
     #[test]
@@ -1437,9 +1564,6 @@ mod tests {
 #[cfg(test)]
 mod count_and_extract_tests {
     use super::*;
-    use crate::db::open_or_recreate;
-    use crate::db::repo::{insert_file, NewFile};
-    use crate::mime::FileType;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn tmp(tag: &str) -> std::path::PathBuf {
@@ -1492,102 +1616,161 @@ mod count_and_extract_tests {
         assert!(cancel.load(Ordering::Relaxed));
     }
 
+    /// The invariant the whole "decide at walk time" design rests on. If these
+    /// two ever disagree, a file the walk wrote off as NA would silently never
+    /// be full-text indexed — a far worse bug than the inflated denominator
+    /// this replaced. Fails the moment someone edits one predicate and not the
+    /// other.
     #[test]
-    fn extract_one_batch_is_scoped_to_its_root_range() {
-        let tree = tmp("extract-tree");
-        std::fs::create_dir_all(tree.join("r1")).unwrap();
-        std::fs::create_dir_all(tree.join("r2")).unwrap();
-        let f1 = tree.join("r1/inside.txt");
-        let f2 = tree.join("r2/outside.txt");
-        std::fs::write(&f1, "sphinx of black quartz").unwrap();
-        std::fs::write(&f2, "judge my vow").unwrap();
-
-        let db = tmp("extract-db");
-        let mut conn = open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
-        {
-            let tx = conn.transaction().unwrap();
-            for f in [&f1, &f2] {
-                insert_file(
-                    &tx,
-                    &NewFile {
-                        name: f.file_name().unwrap().to_str().unwrap(),
-                        path: f.to_str().unwrap(),
-                        parent: f.parent().unwrap().to_str().unwrap(),
-                        size: std::fs::metadata(f).unwrap().len(),
-                        mtime: 1,
-                        inode: None,
-                        device_id: None,
-                        mime: Some("text/plain"),
-                        ftype: FileType::TEXT,
-                        hash: None,
-                    },
-                )
-                .unwrap()
-                .expect("unique");
-            }
-            tx.commit().unwrap();
-        }
-        let conn_mutex = Arc::new(Mutex::new(conn));
-
+    fn content_extractable_is_decide_contents_not_applicable() {
+        let root = tmp("extractable");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut cfg = Config::default();
         let registry = Registry::default_set();
-        let config = Config::default();
-        let stop = Arc::new(Mutex::new(false));
-        let suspend = Arc::new(AtomicBool::new(false));
 
-        let mut cursor = ExtractCursor::for_root(tree.join("r1").to_str().unwrap());
-        let scope = extract_scope_prepare(&conn_mutex, &cursor, &config).unwrap();
-        assert_eq!(scope.pending, 1, "only r1's file is in range");
-        assert_eq!(scope.already_done, 0, "nothing extracted yet");
+        // Real files, because `decide_content` runs the extractor for anything
+        // it claims and its answer must be a genuine one.
+        let cases = [
+            "notes.txt",
+            "data.json",
+            "schema.sql",
+            "song.mp3",
+            "photo.jpg",
+            "movie.mp4",
+            "archive.zip",
+            "blob.bin",
+            "noextension",
+        ];
+        for name in cases {
+            let p = root.join(name);
+            std::fs::write(&p, b"plain bytes with no magic").unwrap();
+        }
 
-        let mut seen_names = Vec::new();
-        loop {
-            let n = extract_one_batch(
-                &conn_mutex,
-                &mut cursor,
-                &registry,
-                &config,
-                &stop,
-                &suspend,
-                &mut |name| seen_names.push(name.to_string()),
-            )
-            .unwrap();
-            if n == 0 {
-                break;
+        // Once with the filter off (the default: everything the registry
+        // claims), once with it narrowed to `.txt`.
+        for filter in [Vec::new(), vec!["txt".to_string()]] {
+            cfg.indexing.content_extensions = filter.clone();
+            for name in cases {
+                let p = root.join(name);
+                let path = p.to_str().unwrap();
+                let mime = guess_mime_from_head(&p, b"plain bytes with no magic");
+                let claimed = content_extractable(&p, mime.as_deref(), &cfg, &registry);
+                let outcome = decide_content(path, mime.as_deref(), &registry, &cfg);
+                assert_eq!(
+                    claimed,
+                    outcome != ContentOutcome::NotApplicable,
+                    "{} (mime {:?}, filter {:?}): predicate says {}, decide_content says {:?}",
+                    name,
+                    mime,
+                    filter,
+                    claimed,
+                    outcome
+                );
             }
         }
-        assert_eq!(seen_names, vec!["inside.txt".to_string()]);
 
-        let conn = conn_mutex.lock().unwrap();
-        let state = |path: &std::path::Path| -> i64 {
-            conn.query_row(
-                "SELECT content_state FROM files WHERE path = ?1",
-                rusqlite::params![path.to_str().unwrap()],
-                |r| r.get(0),
-            )
-            .unwrap()
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn prepare_file_record_marks_only_claimable_files() {
+        let root = tmp("claimable");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = Registry::default_set();
+        let needs = |cfg: &Config, name: &str| -> bool {
+            let p = root.join(name);
+            let meta = std::fs::metadata(&p).unwrap();
+            prepare_file_record(p.to_str().unwrap(), &meta, cfg, &registry)
+                .expect("regular file")
+                .needs_content
         };
-        assert_eq!(state(&f1), repo::STATE_DONE, "in-range row extracted");
-        assert_eq!(state(&f2), repo::STATE_PENDING, "out-of-range row untouched");
-        drop(conn);
 
-        // A second run over the unchanged root must report the file as
-        // already extracted, so progress reads "1 of 1", never "0 of 0".
-        let cursor2 = ExtractCursor::for_root(tree.join("r1").to_str().unwrap());
-        let scope2 = extract_scope_prepare(&conn_mutex, &cursor2, &config).unwrap();
-        assert_eq!(scope2.pending, 0);
-        assert_eq!(scope2.already_done, 1);
-        let conn = conn_mutex.lock().unwrap();
-        let hits: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH '\"sphinx\"'",
-                [],
-                |r| r.get(0),
-            )
+        for name in ["notes.txt", "song.mp3", "movie.mp4", "blob.bin"] {
+            std::fs::write(root.join(name), b"body").unwrap();
+        }
+        let big = root.join("huge.txt");
+        std::fs::write(&big, vec![b'x'; 4096]).unwrap();
+
+        let cfg = Config::default();
+        assert!(needs(&cfg, "notes.txt"), "plaintext is claimed");
+        assert!(needs(&cfg, "song.mp3"), "audio tags are content too");
+        assert!(!needs(&cfg, "movie.mp4"), "no extractor claims video");
+        assert!(!needs(&cfg, "blob.bin"), "unsniffable: no MIME, no extractor");
+
+        // Over `maximum_text_file_size`, so the content pass would never read
+        // it even though plaintext claims the MIME.
+        let mut small_cap = Config::default();
+        small_cap.processing.maximum_text_file_size = 1024;
+        assert!(!needs(&small_cap, "huge.txt"));
+        assert!(needs(&cfg, "huge.txt"), "and claimed under the default cap");
+
+        // The `content_extensions` allowlist excludes it.
+        let mut only_md = Config::default();
+        only_md.indexing.content_extensions = vec!["md".to_string()];
+        assert!(!needs(&only_md, "notes.txt"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The headline regression test: the number the manage-index tab shows as
+    /// the extraction denominator, measured where `indexing.rs` measures it —
+    /// after the walk's inserts, before any content pass runs.
+    #[test]
+    fn extract_scope_counts_only_files_an_extractor_claims() {
+        let root = tmp("denominator");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut db = root.clone();
+        db.set_extension("sqlite");
+
+        // 3 files an extractor claims, 5 it never will. Big enough that the
+        // old behaviour (every row pending) can't coincide with the new one.
+        let claimed = ["a.txt", "b.json", "c.mp3"];
+        let unclaimed = ["d.mp4", "e.zip", "f.bin", "g.exe", "h"];
+        for name in claimed.iter().chain(unclaimed.iter()) {
+            std::fs::write(root.join(name), b"body bytes, no magic").unwrap();
+        }
+
+        let config = Config::default();
+        let registry = Registry::default_set();
+        let records: Vec<OwnedNewFile> = claimed
+            .iter()
+            .chain(unclaimed.iter())
+            .map(|name| {
+                let p = root.join(name);
+                let meta = std::fs::metadata(&p).unwrap();
+                prepare_file_record(p.to_str().unwrap(), &meta, &config, &registry)
+                    .expect("regular file")
+            })
+            .collect();
+
+        let conn_mutex = Arc::new(Mutex::new(
+            crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap(),
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        process_batch_inserts(&conn_mutex, &records, &stop, &config).unwrap();
+
+        let cursor = ExtractCursor::for_root(root.to_str().unwrap());
+        let scope = extract_scope_prepare(&conn_mutex, &cursor, &config).unwrap();
+
+        // `extract_total` in the GUI. The two small text-ish files were
+        // finished inline by the walk so they land in `already_done`; the mp3
+        // needs the disk pass. Either way the denominator is the claimed set —
+        // before this was decided at walk time it read 8, every indexed file.
+        assert_eq!(
+            (scope.pending, scope.already_done),
+            (1, 2),
+            "denominator must be the files needing text, not every indexed file"
+        );
+        assert_eq!(scope.pending + scope.already_done, claimed.len());
+
+        let total: i64 = conn_mutex
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(hits, 1);
+        assert_eq!(total as usize, claimed.len() + unclaimed.len());
 
-        drop(conn);
-        std::fs::remove_dir_all(&tree).ok();
+        std::fs::remove_dir_all(&root).ok();
         std::fs::remove_file(&db).ok();
     }
 }

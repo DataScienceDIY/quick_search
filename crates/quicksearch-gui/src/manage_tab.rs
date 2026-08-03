@@ -1,11 +1,14 @@
 //! The Manage Index tab: detailed status, mode controls, indexed roots,
 //! and the content/ignore filter editors.
 
+use std::path::Path;
+use std::time::{Duration, Instant};
+
 use quicksearch_core::config::Config;
 use quicksearch_core::coordinator::{IndexMode, IndexerState, WatcherStatus};
 use quicksearch_core::indexing::{IndexingStatus, RootPhase, RootProgress};
 
-use crate::format::{fmt_interval, fmt_rate, group_thousands, middle_truncate};
+use crate::format::{fmt_interval, fmt_rate, group_thousands, human_size, middle_truncate};
 use crate::tracker::SpeedTracker;
 
 /// What the tab asks the app to do after this frame.
@@ -35,6 +38,8 @@ pub struct ManageTab {
     baseline: Option<Config>,
     /// Draft of the roots/filters edited in-place.
     draft: Option<Config>,
+    /// Cached on-disk footprint of the index, restatted on a timer.
+    db_size: DbSizeProbe,
 }
 
 impl ManageTab {
@@ -47,6 +52,7 @@ impl ManageTab {
             root_error: None,
             baseline: None,
             draft: None,
+            db_size: DbSizeProbe::default(),
         }
     }
 
@@ -59,7 +65,9 @@ impl ManageTab {
                 let total: usize = roots.iter().map(|r| r.walked + r.extracted).sum();
                 self.speed.record(total);
             }
-            IndexingStatus::Idle | IndexingStatus::Error(_) => self.speed.reset(),
+            IndexingStatus::Idle | IndexingStatus::Error(_) | IndexingStatus::Optimizing => {
+                self.speed.reset()
+            }
             _ => {}
         }
     }
@@ -121,7 +129,14 @@ impl ManageTab {
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 // --- Status ---------------------------------------------------
-                ui.heading(egui::RichText::new("Status").strong());
+                ui.horizontal(|ui| {
+                    ui.heading(egui::RichText::new("Status").strong());
+                    // Right-aligned, clear of the progress text below it —
+                    // that text changes width every frame during a run.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        db_size_label(ui, self.db_size.size(config, Instant::now()));
+                    });
+                });
                 status_panel(ui, state, &self.speed);
                 watch_panel(ui, state, config);
                 ui.add_space(8.0);
@@ -232,6 +247,8 @@ impl ManageTab {
                                  storage, 16 on network mounts. Takes effect on \
                                  the next indexing run.",
                                 );
+                            #[cfg(test)]
+                            tests::record_widget("workers", &response);
                             if response.changed() {
                                 if workers == 0 {
                                     draft.indexing.root_workers.remove(root);
@@ -280,9 +297,11 @@ impl ManageTab {
                         }
                     }
                 });
-                if let Some(err) = &self.root_error {
-                    ui.colored_label(ui.visuals().error_fg_color, err);
-                }
+                crate::ui_util::stable_section(ui, |ui| {
+                    if let Some(err) = &self.root_error {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                    }
+                });
                 ui.separator();
 
                 // --- Filters ---------------------------------------------------
@@ -297,27 +316,32 @@ impl ManageTab {
                     );
                     cols[1].label("Ignore patterns (excluded entirely):");
                     let mut remove_pat: Option<usize> = None;
-                    for (i, pat) in draft.indexing.ignore_patterns.iter().enumerate() {
-                        cols[1].horizontal(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("Remove").clicked() {
-                                        remove_pat = Some(i);
-                                    }
-                                    ui.with_layout(
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            ui.monospace(pat);
-                                        },
-                                    );
-                                },
-                            );
-                        });
-                    }
-                    if draft.indexing.ignore_patterns.is_empty() {
-                        cols[1].label(egui::RichText::new("No ignore patterns.").small().weak());
-                    }
+                    // The list grows and shrinks — including from outside
+                    // this tab — so it is kept off the id of the editor
+                    // below it (see `ui_util::stable_section`).
+                    crate::ui_util::stable_section(&mut cols[1], |ui| {
+                        for (i, pat) in draft.indexing.ignore_patterns.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("Remove").clicked() {
+                                            remove_pat = Some(i);
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.monospace(pat);
+                                            },
+                                        );
+                                    },
+                                );
+                            });
+                        }
+                        if draft.indexing.ignore_patterns.is_empty() {
+                            ui.label(egui::RichText::new("No ignore patterns.").small().weak());
+                        }
+                    });
                     if let Some(i) = remove_pat {
                         draft.indexing.ignore_patterns.remove(i);
                     }
@@ -363,13 +387,13 @@ impl ManageTab {
                 );
                 ui.add_space(8.0);
 
-                if ui
-                    .add(crate::ui_util::bordered_button(
-                        "Apply & Save",
-                        crate::ui_util::BLUE,
-                    ))
-                    .clicked()
-                {
+                let apply = ui.add(crate::ui_util::bordered_button(
+                    "Apply & Save",
+                    crate::ui_util::BLUE,
+                ));
+                #[cfg(test)]
+                tests::record_widget("apply", &apply);
+                if apply.clicked() {
                     let mut new_config = draft.clone();
                     new_config.indexing.content_extensions = parse_lines(&self.ext_filter_text);
                     let roots = new_config.paths.indexing_paths.clone();
@@ -383,8 +407,109 @@ impl ManageTab {
             });
         crate::ui_util::more_below_hint(ui, &scroll);
 
+        // Nothing else asks for repaints while the app sits idle, so without
+        // this the size would freeze at whatever it read when the pointer
+        // last moved. One frame per interval, and only while this tab is the
+        // one on screen.
+        ui.ctx().request_repaint_after(DB_SIZE_REFRESH);
+
         actions
     }
+}
+
+/// How often the index files are re-statted. The number moves slowly even
+/// during a run, so this is deliberately lazy: it costs three stats and one
+/// repaint, and asking any more often would buy nothing.
+const DB_SIZE_REFRESH: Duration = Duration::from_secs(10);
+
+/// Total on-disk footprint of the index: the database plus its `-wal` and
+/// `-shm` sidecars. The `-wal` file is why the database alone will not do —
+/// mid-run it can hold hundreds of megabytes the database does not show yet.
+///
+/// A file that is not there counts as zero: there is no database at all
+/// before the first run, and the sidecars exist only while a connection is
+/// open.
+fn measure_db_size(db: &Path) -> u64 {
+    // Only regular files: a misconfigured path pointing at a directory
+    // would otherwise report that directory's own inode size as an index.
+    let len = |path: &Path| {
+        std::fs::metadata(path)
+            .map(|m| if m.is_file() { m.len() } else { 0 })
+            .unwrap_or(0)
+    };
+    let name = db.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    // No `-journal`: the index runs in WAL mode, so a rollback journal is
+    // not part of a live database.
+    len(db)
+        + ["-wal", "-shm"]
+            .iter()
+            .map(|suffix| len(&db.with_file_name(format!("{}{}", name, suffix))))
+            .sum::<u64>()
+}
+
+/// Caches the last measurement so the tab can ask for it every frame.
+#[derive(Default)]
+struct DbSizeProbe {
+    /// Configured (unresolved) path the cached size belongs to.
+    path: String,
+    bytes: u64,
+    measured_at: Option<Instant>,
+}
+
+impl DbSizeProbe {
+    /// The cached size, restatted when it has gone stale or the configured
+    /// database path changed under it. `now` is a parameter so the refresh
+    /// cadence can be tested without sleeping.
+    fn size(&mut self, config: &Config, now: Instant) -> u64 {
+        let expired = self
+            .measured_at
+            .is_none_or(|at| now.duration_since(at) >= DB_SIZE_REFRESH);
+        if expired || self.path != config.paths.database_path {
+            // Resolving the path is only worth doing on a real refresh.
+            self.bytes = measure_db_size(&config.resolved_database_path());
+            self.path = config.paths.database_path.clone();
+            self.measured_at = Some(now);
+        }
+        self.bytes
+    }
+}
+
+/// The index's footprint, with the levers for shrinking it on hover: a user
+/// who finds the number too large looks here first, and every lever named
+/// is either on this tab or in Options.
+fn db_size_label(ui: &mut egui::Ui, bytes: u64) {
+    let response = ui.label(format!("Index size: {}", human_size(bytes)));
+    #[cfg(test)]
+    tests::record_widget("db-size", &response);
+    response.on_hover_ui(db_size_tooltip);
+}
+
+fn db_size_tooltip(ui: &mut egui::Ui) {
+    ui.set_max_width(440.0);
+    ui.strong("To reduce the index size");
+    for lever in [
+        "Add ignore filters for files and folders you never search — the ignore \
+         pattern list further down this tab.",
+        "Remove indexed folders you do not need, in Indexed folders above.",
+        "Narrow the full-text extension whitelist, so text is only extracted \
+         from the file types you actually search.",
+        "Turn off \"Store text for snippets\" in Options: full-text search keeps \
+         working, but without previews, occurrence ranking or fuzzy matching \
+         inside file contents.",
+        "Lower \"Max text file size\" and \"Max stored text\" in Options.",
+    ] {
+        ui.label(format!("•  {}", lever));
+    }
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(
+            "The file does not shrink on its own: freed space is reused by the \
+             index rather than returned to the disk. To hand it back after \
+             narrowing the filters, use Clear index… and reindex.",
+        )
+        .small()
+        .weak(),
+    );
 }
 
 /// Append a root to the draft unless it would duplicate or nest with an
@@ -419,7 +544,14 @@ fn parse_lines(text: &str) -> Vec<String> {
 /// Live-update health. Permanent counterpart to the one-time modal: the
 /// modal is dismissed and remembered per root, but "live updates are off"
 /// stays true and must remain discoverable.
+///
+/// Wrapped for the same reason as [`status_panel`]: this panel is empty in
+/// manual mode and a line long otherwise.
 fn watch_panel(ui: &mut egui::Ui, state: &IndexerState, config: &Config) {
+    crate::ui_util::stable_section(ui, |ui| watch_contents(ui, state, config));
+}
+
+fn watch_contents(ui: &mut egui::Ui, state: &IndexerState, config: &Config) {
     match &state.watcher {
         // Manual mode already says "stopped" in the controls row; repeating
         // it here would be noise.
@@ -454,7 +586,15 @@ fn watch_panel(ui: &mut egui::Ui, state: &IndexerState, config: &Config) {
     }
 }
 
+/// Live progress. Its widget count tracks the run (roots come and go, the
+/// rate line and the current file appear and vanish), so it renders inside
+/// a [`crate::ui_util::stable_section`]: without one, every id below it —
+/// including the per-root worker fields — would move mid-run.
 fn status_panel(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker) {
+    crate::ui_util::stable_section(ui, |ui| status_contents(ui, state, speed));
+}
+
+fn status_contents(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker) {
     match &state.activity {
         IndexingStatus::Idle => {
             // Relative wording makes even a milliseconds-fast run visibly
@@ -470,6 +610,11 @@ fn status_panel(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker) {
         }
         IndexingStatus::Stopping => {
             ui.label("Stopping…");
+        }
+        IndexingStatus::Optimizing => {
+            // No per-file progress exists to show: this is one bulk rewrite
+            // of the whole file, and on a large index it runs for minutes.
+            ui.label("Optimizing index; reclaiming unused space…");
         }
         IndexingStatus::Running { roots, .. } => {
             for root in roots {
@@ -500,7 +645,7 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
                 ui.label("indexing");
                 divider(ui);
                 let workers = format!("{}/{} workers", r.active_workers, r.total_workers);
-                match r.walk_total {
+                match r.walk_denominator() {
                     Some(total) if total > 0 => {
                         let frac = (r.walked as f32 / total as f32).clamp(0.0, 1.0);
                         ui.label(format!(
@@ -535,10 +680,12 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
                     1.0
                 };
                 ui.label(format!(
-                    "{} / {} ({:.0}%)",
+                    "{} / {} ({:.0}%) · {}/{} workers",
                     group_thousands(r.extracted as u64),
                     group_thousands(r.extract_total as u64),
-                    frac * 100.0
+                    frac * 100.0,
+                    r.active_workers,
+                    r.total_workers
                 ));
                 ui.add(egui::ProgressBar::new(frac).desired_width(160.0));
             }
@@ -566,6 +713,542 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::RefCell;
+
+    // Driving the real tab through a headless egui context is the only way
+    // to test widget identity, and identity is exactly what these tests are
+    // about — so the widgets under test report themselves here.
+    thread_local! {
+        static WIDGETS: RefCell<Vec<(&'static str, egui::Id, egui::Rect)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record_widget(tag: &'static str, response: &egui::Response) {
+        WIDGETS.with(|w| w.borrow_mut().push((tag, response.id, response.rect)));
+    }
+
+    fn widget(tag: &str) -> (egui::Id, egui::Rect) {
+        WIDGETS.with(|w| {
+            w.borrow()
+                .iter()
+                .find(|(t, _, _)| *t == tag)
+                .map(|(_, id, rect)| (*id, *rect))
+                .unwrap_or_else(|| panic!("{} widget was not drawn", tag))
+        })
+    }
+
+    fn idle_state() -> IndexerState {
+        IndexerState {
+            mode: IndexMode::Auto,
+            activity: IndexingStatus::Idle,
+            last_full_index: Some(0),
+            queued_events: 0,
+            watcher: WatcherStatus::Active { dirs: 10 },
+        }
+    }
+
+    /// A run in progress. `current_file` and the number of roots are the
+    /// parts that come and go from frame to frame in a real run.
+    fn running_state(roots: &[&str], current_file: Option<&str>) -> IndexerState {
+        state_with(
+            roots
+                .iter()
+                .map(|root| RootProgress {
+                    root: (*root).to_string(),
+                    phase: RootPhase::Walking,
+                    walked: 100,
+                    walk_total: Some(1000),
+                    extracted: 0,
+                    extract_total: 0,
+                    current_file: current_file.map(str::to_string),
+                    active_workers: 4,
+                    total_workers: 4,
+                })
+                .collect(),
+        )
+    }
+
+    /// A run whose roots are described one by one, for the rows whose
+    /// contents — not just their widget ids — are under test.
+    fn state_with(roots: Vec<RootProgress>) -> IndexerState {
+        IndexerState {
+            mode: IndexMode::Auto,
+            activity: IndexingStatus::Running {
+                start_time: std::time::Instant::now(),
+                roots,
+            },
+            last_full_index: Some(0),
+            queued_events: 0,
+            watcher: WatcherStatus::Active { dirs: 10 },
+        }
+    }
+
+    fn raw_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// One frame of the real tab, with `events` delivered to it.
+    fn frame(
+        ctx: &egui::Context,
+        tab: &mut ManageTab,
+        cfg: &Config,
+        state: &IndexerState,
+        events: Vec<egui::Event>,
+    ) -> ManageActions {
+        WIDGETS.with(|w| w.borrow_mut().clear());
+        let mut actions = ManageActions::default();
+        let _ = ctx.run(raw_input(events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                actions = tab.ui(ui, state, cfg);
+            });
+        });
+        actions
+    }
+
+    /// Every string the tab actually painted this frame. Labels carry no
+    /// widget id worth recording, so the rendered text is read back off the
+    /// shapes — the only place a number the user sees can be checked.
+    fn frame_text(ctx: &egui::Context, tab: &mut ManageTab, state: &IndexerState) -> Vec<String> {
+        frame_text_with(ctx, tab, &cfg_with_root(), state)
+    }
+
+    fn frame_text_with(
+        ctx: &egui::Context,
+        tab: &mut ManageTab,
+        cfg: &Config,
+        state: &IndexerState,
+    ) -> Vec<String> {
+        WIDGETS.with(|w| w.borrow_mut().clear());
+        let out = ctx.run(raw_input(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                tab.ui(ui, state, cfg);
+            });
+        });
+        let mut text = Vec::new();
+        for clipped in &out.shapes {
+            collect_text(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    fn collect_text(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
+            egui::epaint::Shape::Vec(shapes) => {
+                for s in shapes {
+                    collect_text(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            pointer(pos, true),
+            pointer(pos, false),
+        ]
+    }
+
+    fn cfg_with_root() -> Config {
+        let mut cfg = Config::default();
+        cfg.paths.indexing_paths = vec!["/data".into()];
+        cfg
+    }
+
+    fn staged_workers(tab: &ManageTab) -> Option<usize> {
+        tab.draft
+            .as_ref()
+            .unwrap()
+            .indexing
+            .root_workers
+            .get("/data")
+            .copied()
+    }
+
+    /// The per-root worker field must keep the same widget id however the
+    /// status above it changes: egui hangs focus and in-progress text off
+    /// that id, so a field that is renamed mid-run silently drops the edit.
+    #[test]
+    fn the_worker_field_keeps_its_identity_as_the_status_changes() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let cfg = cfg_with_root();
+
+        frame(&ctx, &mut tab, &cfg, &running_state(&["/data"], None), vec![]);
+        let (baseline, _) = widget("workers");
+
+        for state in [
+            running_state(&["/data"], Some("/data/file")),
+            running_state(&["/data", "/other"], None),
+            idle_state(),
+            IndexerState {
+                watcher: WatcherStatus::Off,
+                ..idle_state()
+            },
+            IndexerState {
+                activity: IndexingStatus::Error("boom".into()),
+                ..idle_state()
+            },
+        ] {
+            frame(&ctx, &mut tab, &cfg, &state, vec![]);
+            assert_eq!(
+                widget("workers").0,
+                baseline,
+                "status change moved the worker field"
+            );
+        }
+    }
+
+    /// Click the field, type a count, click Apply & Save — while a run is
+    /// reporting progress the whole time.
+    #[test]
+    fn a_typed_worker_count_reaches_the_applied_config() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let cfg = cfg_with_root();
+
+        frame(&ctx, &mut tab, &cfg, &running_state(&["/data"], None), vec![]);
+        let field = widget("workers").1.center();
+        frame(
+            &ctx,
+            &mut tab,
+            &cfg,
+            &running_state(&["/data"], None),
+            click_at(field),
+        );
+        // The run starts reporting a file: one more label above the field.
+        let busy = running_state(&["/data"], Some("/data/file"));
+        frame(&ctx, &mut tab, &cfg, &busy, vec![]);
+        frame(
+            &ctx,
+            &mut tab,
+            &cfg,
+            &busy,
+            vec![egui::Event::Text("8".into())],
+        );
+        assert_eq!(staged_workers(&tab), Some(8), "typed count was not staged");
+
+        let apply = widget("apply").1.center();
+        let mut actions = frame(&ctx, &mut tab, &cfg, &busy, click_at(apply));
+        if actions.apply_config.is_none() {
+            // egui fires a click on release; give it the follow-up frame.
+            actions = frame(&ctx, &mut tab, &cfg, &busy, vec![]);
+        }
+        let applied = actions.apply_config.expect("Apply & Save produced a config");
+        assert_eq!(applied.indexing.root_workers.get("/data"), Some(&8));
+    }
+
+    /// The other way to set the field: drag it.
+    #[test]
+    fn a_dragged_worker_count_is_staged() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let cfg = cfg_with_root();
+        let busy = running_state(&["/data"], None);
+
+        frame(&ctx, &mut tab, &cfg, &busy, vec![]);
+        let field = widget("workers").1.center();
+        frame(
+            &ctx,
+            &mut tab,
+            &cfg,
+            &busy,
+            vec![egui::Event::PointerMoved(field), pointer(field, true)],
+        );
+        // Drag right across frames, with the status changing underneath.
+        let mut pos = field;
+        for state in [
+            running_state(&["/data"], Some("/data/a")),
+            running_state(&["/data"], None),
+            running_state(&["/data"], Some("/data/b")),
+        ] {
+            pos.x += 4.0;
+            frame(
+                &ctx,
+                &mut tab,
+                &cfg,
+                &state,
+                vec![egui::Event::PointerMoved(pos)],
+            );
+        }
+        frame(&ctx, &mut tab, &cfg, &busy, vec![pointer(pos, false)]);
+        assert!(
+            staged_workers(&tab).is_some_and(|w| w > 0),
+            "dragging staged nothing: {:?}",
+            staged_workers(&tab)
+        );
+    }
+
+    fn root_progress(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> RootProgress {
+        RootProgress {
+            root: "/data".to_string(),
+            phase,
+            walked,
+            walk_total,
+            extracted: 0,
+            extract_total: 0,
+            current_file: None,
+            active_workers: 4,
+            total_workers: 4,
+        }
+    }
+
+    /// The `find` count is an estimate of *tree entries*, so it runs far
+    /// ahead of the files a walk actually emits. Once the walk ends the exact
+    /// number is in hand, and the row must show that instead — the estimate
+    /// is what kept the bar short of full for the rest of the run.
+    #[test]
+    fn a_finished_root_reports_its_exact_count_not_the_estimate() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let mut done = root_progress(RootPhase::Done, 261_088, Some(6_677_062));
+        done.extracted = 238_929;
+        done.active_workers = 0;
+        done.total_workers = 0;
+
+        let text = frame_text(&ctx, &mut tab, &state_with(vec![done])).join(" | ");
+        assert!(
+            text.contains("indexed 261,088, extracted 238,929"),
+            "finished row: {}",
+            text
+        );
+        assert!(
+            !text.contains("6,677,062"),
+            "the stale estimate is still on screen: {}",
+            text
+        );
+    }
+
+    /// While the walk runs the estimate is all there is, so it is shown —
+    /// but never below what has already been walked, or the row would sit at
+    /// 100% with the walk still going and read as a hang.
+    #[test]
+    fn a_walking_root_shows_the_estimate_raised_to_what_it_has_walked() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+
+        let honest = frame_text(
+            &ctx,
+            &mut tab,
+            &state_with(vec![root_progress(RootPhase::Walking, 100, Some(1000))]),
+        )
+        .join(" | ");
+        assert!(honest.contains("100 / 1,000 (10%)"), "{}", honest);
+
+        let overtaken = frame_text(
+            &ctx,
+            &mut tab,
+            &state_with(vec![root_progress(RootPhase::Walking, 1500, Some(1000))]),
+        )
+        .join(" | ");
+        assert!(
+            overtaken.contains("1,500 / 1,500 (100%)"),
+            "an overtaken estimate must be raised, not shown: {}",
+            overtaken
+        );
+    }
+
+    /// No count has landed yet: an indeterminate row, not a fabricated one.
+    #[test]
+    fn a_walking_root_without_a_count_shows_no_denominator() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let text = frame_text(
+            &ctx,
+            &mut tab,
+            &state_with(vec![root_progress(RootPhase::Walking, 100, None)]),
+        )
+        .join(" | ");
+        assert!(text.contains("100 files"), "{}", text);
+        assert!(!text.contains(" / "), "invented a denominator: {}", text);
+    }
+
+    /// A scratch directory of its own for each size test, so two of them
+    /// running in parallel cannot see each other's files.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("qs-dbsize-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn write_bytes(path: &Path, len: usize) {
+        std::fs::write(path, vec![b'x'; len]).expect("write");
+    }
+
+    /// A config whose database is `path`, for the probe and the rendered row.
+    fn cfg_with_db(path: &Path) -> Config {
+        let mut cfg = cfg_with_root();
+        cfg.paths.database_path = path.to_string_lossy().into_owned();
+        cfg
+    }
+
+    /// Each of the three files SQLite keeps for one database is added, and
+    /// nothing else that happens to sit beside them is.
+    #[test]
+    fn db_size_counts_the_database_and_both_sidecars() {
+        let dir = scratch_dir("parts");
+        let db = dir.join("index.sqlite");
+        write_bytes(&db, 4096);
+        assert_eq!(measure_db_size(&db), 4096, "the database itself");
+        write_bytes(&dir.join("index.sqlite-wal"), 1024);
+        assert_eq!(measure_db_size(&db), 5120, "-wal was not added");
+        write_bytes(&dir.join("index.sqlite-shm"), 32);
+        assert_eq!(measure_db_size(&db), 5152, "-shm was not added");
+
+        // Decoys: a rollback journal (never present in WAL mode) and an
+        // unrelated neighbour.
+        write_bytes(&dir.join("index.sqlite-journal"), 999);
+        write_bytes(&dir.join("index.sqlite.bak"), 777);
+        assert_eq!(measure_db_size(&db), 5152, "a decoy was counted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Before the first indexing run there is no database at all, and a
+    /// closed database has no sidecars — neither is an error.
+    #[test]
+    fn a_missing_database_measures_zero() {
+        let dir = scratch_dir("missing");
+        let db = dir.join("index.sqlite");
+        assert_eq!(measure_db_size(&db), 0);
+        assert_eq!(measure_db_size(&dir), 0, "a directory");
+
+        write_bytes(&db, 100);
+        assert_eq!(measure_db_size(&db), 100, "sidecars are optional");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe answers from cache until the interval is up: `ui()` asks it
+    /// every frame, and three stats per frame is churn nobody needs.
+    #[test]
+    fn the_probe_caches_until_the_refresh_interval_is_up() {
+        let dir = scratch_dir("cache");
+        let db = dir.join("index.sqlite");
+        write_bytes(&db, 100);
+        let cfg = cfg_with_db(&db);
+        let mut probe = DbSizeProbe::default();
+        let t0 = Instant::now();
+
+        assert_eq!(probe.size(&cfg, t0), 100);
+        write_bytes(&db, 5000);
+        assert_eq!(
+            probe.size(&cfg, t0 + DB_SIZE_REFRESH / 2),
+            100,
+            "restatted before the interval was up"
+        );
+        assert_eq!(
+            probe.size(&cfg, t0 + DB_SIZE_REFRESH),
+            5000,
+            "the refresh never happened"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database path edited in Options must not keep showing the old
+    /// database's size for the rest of the interval.
+    #[test]
+    fn the_probe_follows_a_changed_database_path() {
+        let dir = scratch_dir("moved");
+        let first = dir.join("index.sqlite");
+        let second = dir.join("other.sqlite");
+        write_bytes(&first, 100);
+        write_bytes(&second, 7000);
+        let mut probe = DbSizeProbe::default();
+        let t0 = Instant::now();
+
+        assert_eq!(probe.size(&cfg_with_db(&first), t0), 100);
+        assert_eq!(
+            probe.size(&cfg_with_db(&second), t0),
+            7000,
+            "a new path must restat at once, not wait out the interval"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The number reaches the screen, and it is the total of all three files
+    /// rather than the database on its own.
+    #[test]
+    fn the_status_row_shows_the_total_index_size() {
+        let dir = scratch_dir("render");
+        let db = dir.join("index.sqlite");
+        write_bytes(&db, 3_000_000);
+        write_bytes(&dir.join("index.sqlite-wal"), 200_000);
+        write_bytes(&dir.join("index.sqlite-shm"), 32_768);
+
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let text = frame_text_with(&ctx, &mut tab, &cfg_with_db(&db), &idle_state()).join(" | ");
+        assert!(
+            text.contains("Index size: 3.2 MB"),
+            "the size is not on screen: {}",
+            text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hovering is the whole point of the readout: the number tells the user
+    /// the index is big, the tooltip tells them what to do about it. Each
+    /// lever named here has to keep matching a control that exists.
+    #[test]
+    fn hovering_the_size_explains_how_to_shrink_the_index() {
+        let dir = scratch_dir("hover");
+        let db = dir.join("index.sqlite");
+        write_bytes(&db, 2048);
+
+        let ctx = egui::Context::default();
+        // egui holds tooltips back for a third of a second, and frames here
+        // are only 1/60 s of simulated time apart.
+        ctx.style_mut(|s| s.interaction.tooltip_delay = 0.0);
+        let mut tab = ManageTab::new();
+        let cfg = cfg_with_db(&db);
+
+        frame_text_with(&ctx, &mut tab, &cfg, &idle_state());
+        let at = widget("db-size").1.center();
+        frame(
+            &ctx,
+            &mut tab,
+            &cfg,
+            &idle_state(),
+            vec![egui::Event::PointerMoved(at)],
+        );
+        // The tooltip is painted in the frame after the pointer lands.
+        let text = frame_text_with(&ctx, &mut tab, &cfg, &idle_state()).join(" | ");
+
+        assert!(
+            text.contains("To reduce the index size"),
+            "no tooltip: {}",
+            text
+        );
+        for lever in [
+            "ignore filters",
+            "Indexed folders",
+            "whitelist",
+            "Store text for snippets",
+            "Options",
+        ] {
+            assert!(text.contains(lever), "tooltip never mentions {}", lever);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn synced_tab(config: &Config) -> ManageTab {
         let mut tab = ManageTab::new();

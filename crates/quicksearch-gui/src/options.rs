@@ -308,6 +308,18 @@ pub fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section
                 ui.add(egui::DragValue::new(&mut config.processing.batch_size).range(10..=100_000));
                 ui.end_row();
 
+                ui.label("Max WAL size (bytes)");
+                ui.add(
+                    egui::DragValue::new(&mut config.processing.maximum_wal_size)
+                        .range(0u64..=8_589_934_592u64),
+                )
+                .on_hover_text(
+                    "How large index.sqlite-wal may grow during a run before the \
+                     indexer forces a checkpoint. 0 disables forced checkpoints; \
+                     anything below 16 MiB is raised to it.",
+                );
+                ui.end_row();
+
                 ui.label("Store text for snippets");
                 ui.checkbox(&mut config.processing.store_text_for_snippets, "")
                     .on_hover_text(
@@ -365,9 +377,14 @@ pub fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section
                     );
                 ui.end_row();
             });
-            if let Some(warning) = config.search.fuzzy_edits_warning() {
-                ui.colored_label(ui.visuals().warn_fg_color, warning);
-            }
+            // A warning that comes and goes as the value is edited would
+            // otherwise move every widget below it in the window; see
+            // `ui_util::stable_section`.
+            crate::ui_util::stable_section(ui, |ui| {
+                if let Some(warning) = config.search.fuzzy_edits_warning() {
+                    ui.colored_label(ui.visuals().warn_fg_color, warning);
+                }
+            });
         }
     }
 }

@@ -227,6 +227,41 @@ pub const WATCH_ROOTS_RECURSIVELY: bool = cfg!(windows);
 /// on both sides, consistently.
 pub const PATH_COLLATION: &str = if cfg!(windows) { "NOCASE" } else { "BINARY" };
 
+/// Drop the **calling thread** to background scheduling priority.
+///
+/// Per-thread, not per-process. The GUI shares this process, so lowering the
+/// process would slow the very window the user is watching progress in — the
+/// point is to yield to the foreground, not to throttle ourselves. Called by
+/// the threads that do indexing work and by nobody else; the search worker,
+/// the coordinator and the watcher exist to answer promptly and keep normal
+/// priority.
+///
+/// Best-effort and idempotent: a refusal is not worth reporting, since the
+/// only consequence is that indexing competes on equal terms.
+pub fn set_background_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        // Linux schedules per task, so `nice` moves this thread alone.
+        // Deliberately not `setpriority(PRIO_PROCESS, 0, …)`, which is
+        // process-wide on the BSDs and would take the GUI with it.
+        unsafe { libc::nice(10) };
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+        };
+        // Background *mode*, not merely a lower priority number: it drops I/O
+        // priority as well, which is what actually keeps a walk from starving
+        // the foreground on a spinning disk.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
+    }
+    // Elsewhere (macOS, BSD): deliberately nothing. `nice` there applies to the
+    // whole process, so it would hit the GUI. The right call is
+    // `pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0)`, which is worth
+    // adding on its own terms rather than approximating here.
+}
+
 /// How long to keep retrying a delete that fails because something else holds
 /// the file open.
 #[cfg(windows)]
@@ -349,6 +384,16 @@ mod tests {
         assert!(!is_unc_string(r"C:\Users\me"));
         assert!(!is_unc_string("/home/me"));
         assert!(!is_unc_string(""));
+    }
+
+    /// Not observable cross-platform beyond "it did not blow up", which is
+    /// still worth pinning: the call is `unsafe` on both real targets, and it
+    /// runs at the top of every walker thread, so it must also be safe to
+    /// repeat.
+    #[test]
+    fn background_priority_is_best_effort_and_repeatable() {
+        set_background_priority();
+        set_background_priority();
     }
 
     #[test]

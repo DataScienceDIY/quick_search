@@ -21,6 +21,21 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::app::QuickSearchApp;
 use crate::keychain;
 
+/// Where this session's index key came from.
+///
+/// The app needs it for anything that *refers* to the key: telling someone
+/// "the password you just entered" is wrong when they never typed one, because
+/// the keychain answered before the window opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// The index is not password-protected.
+    Unprotected,
+    /// Typed at the unlock prompt during this session.
+    Prompt,
+    /// Supplied by the OS keychain, with no prompt shown.
+    Keychain,
+}
+
 /// The application shell handed to eframe: locked (unlock screen) or
 /// running (the real app).
 pub enum Gate {
@@ -36,8 +51,9 @@ impl Gate {
         cfg: Config,
         config_error: Option<String>,
         initial_query: Option<String>,
+        key_source: KeySource,
     ) -> Result<Gate, String> {
-        QuickSearchApp::new(ctx, cfg, config_error, initial_query)
+        QuickSearchApp::new(ctx, cfg, config_error, initial_query, key_source)
             .map(|app| Gate::Running(Box::new(app)))
     }
 
@@ -99,8 +115,13 @@ pub fn try_keychain_unlock(cfg: &Config) -> bool {
 enum Mode {
     /// An index exists: the password must open it.
     Unlock,
-    /// Protection is on but no index file exists yet — the typed password
-    /// (with confirmation) becomes the one the new index is built under.
+    /// Protection is on but no index file exists yet, so the typed password
+    /// becomes the one the new index is built under.
+    ///
+    /// Still not a *new* password: this mode is only reachable with a salt
+    /// already in the config, so one was chosen previously and this is the
+    /// user re-entering it. Choosing a genuinely new password happens in the
+    /// Options window, which does its own confirmation.
     Create,
     /// `password_protected = true` but the salt is missing or corrupt; no
     /// password can help. Only the reset escape hatch applies.
@@ -113,9 +134,14 @@ pub struct UnlockScreen {
     initial_query: Option<String>,
     mode: Mode,
     password: String,
-    confirm: String,
     remember: bool,
     error: Option<String>,
+    /// Put the caret in the password field on the next frame. Set once at
+    /// startup and again after a failed attempt, so the user can retype
+    /// straight away — but *not* every frame: re-focusing unconditionally
+    /// traps the caret, and nothing else on the screen can be tabbed to or
+    /// clicked into.
+    focus_password: bool,
     /// In-flight Argon2 derivation (+ verification) on a worker thread.
     job: Option<mpsc::Receiver<Result<IndexKey, String>>>,
     forgot_confirm: bool,
@@ -140,9 +166,9 @@ impl UnlockScreen {
             initial_query,
             mode,
             password: String::new(),
-            confirm: String::new(),
             remember,
             error: None,
+            focus_password: true,
             job: None,
             forgot_confirm: false,
         }
@@ -159,6 +185,9 @@ impl UnlockScreen {
                     } else {
                         e
                     });
+                    // The field was cleared on submit, so put the caret back
+                    // in it rather than making the user click before retrying.
+                    self.focus_password = true;
                 }
             }
         }
@@ -206,15 +235,6 @@ impl UnlockScreen {
                             .hint_text("Password")
                             .desired_width(240.0),
                     );
-                    if matches!(self.mode, Mode::Create) {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.confirm)
-                                .id(confirm_field_id())
-                                .password(true)
-                                .hint_text("Confirm password")
-                                .desired_width(240.0),
-                        );
-                    }
                     ui.add_space(4.0);
                     ui.checkbox(&mut self.remember, "Remember on this device")
                         .on_hover_text(
@@ -231,8 +251,9 @@ impl UnlockScreen {
                     let entered = field.lost_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     submitted = clicked || entered;
-                    if !busy && !field.has_focus() && !submitted {
+                    if self.focus_password && !busy {
                         field.request_focus();
+                        self.focus_password = false;
                     }
                 });
                 if busy {
@@ -292,19 +313,12 @@ impl UnlockScreen {
                 self.error = Some("The password may not be empty.".to_string());
                 return;
             }
-            if self.password != self.confirm {
-                self.error = Some("Passwords do not match.".to_string());
-                return;
-            }
         }
         let Ok(salt) = self.cfg.security.salt_bytes() else {
             return; // BrokenSalt mode never reaches submit
         };
         let password = Zeroizing::new(std::mem::take(&mut self.password));
-        self.confirm.zeroize();
-        self.confirm.clear();
         purge_text_state(ctx, pw_field_id());
-        purge_text_state(ctx, confirm_field_id());
 
         let verify_against = match self.mode {
             Mode::Unlock => Some(self.cfg.resolved_database_path()),
@@ -352,11 +366,20 @@ impl UnlockScreen {
 
     /// Construct the real app; on failure stay locked and show why.
     fn launch(&mut self, ctx: &egui::Context) -> Option<QuickSearchApp> {
+        // Reaching here means either the password was just typed, or the
+        // "forgot password" path disabled protection on the way. The config
+        // says which, and no caller has to remember to pass it.
+        let key_source = if self.cfg.security.password_protected {
+            KeySource::Prompt
+        } else {
+            KeySource::Unprotected
+        };
         match QuickSearchApp::new(
             ctx,
             self.cfg.clone(),
             self.config_error.take(),
             self.initial_query.take(),
+            key_source,
         ) {
             Ok(app) => Some(app),
             Err(e) => {
@@ -420,16 +443,11 @@ impl UnlockScreen {
 impl Drop for UnlockScreen {
     fn drop(&mut self) {
         self.password.zeroize();
-        self.confirm.zeroize();
     }
 }
 
 fn pw_field_id() -> egui::Id {
     egui::Id::new("unlock-password")
-}
-
-fn confirm_field_id() -> egui::Id {
-    egui::Id::new("unlock-confirm")
 }
 
 /// Drop egui's retained state for a password field — its text buffer and
@@ -455,4 +473,84 @@ fn delete_index_files(db_path: &std::path::Path) -> Result<(), String> {
         let _ = quicksearch_core::platform::remove_file_retrying(&db_path.with_file_name(name));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A protected config whose salt parses, so the screen lands in a real
+    /// password mode rather than `BrokenSalt`.
+    fn locked_config() -> Config {
+        let mut cfg = Config::default();
+        cfg.security.password_protected = true;
+        cfg.security.salt = Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string());
+        cfg.paths.database_path = std::env::temp_dir()
+            .join(format!("qs-unlock-test-{}.sqlite", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        cfg
+    }
+
+    fn frame(ctx: &egui::Context, screen: &mut UnlockScreen) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            // `update` only builds the app on a successful unlock, which needs
+            // a derived key — so with nothing submitted this stays on screen.
+            assert!(screen.update(ctx).is_none());
+        });
+    }
+
+    /// The caret starts in the password field, and — the regression — can then
+    /// leave it.
+    ///
+    /// The screen used to call `request_focus()` on every frame the field did
+    /// not have focus, which yanked the caret back the instant anything else
+    /// took it. Nothing else on the screen could be tabbed to or clicked into.
+    #[test]
+    fn the_password_field_takes_focus_once_and_then_releases_it() {
+        let ctx = egui::Context::default();
+        let mut screen = UnlockScreen::new(locked_config(), None, None);
+
+        frame(&ctx, &mut screen);
+        assert!(
+            ctx.memory(|m| m.has_focus(pw_field_id())),
+            "the caret should start in the password field"
+        );
+
+        // Whatever the user clicks or tabs to next takes focus away.
+        ctx.memory_mut(|m| m.surrender_focus(pw_field_id()));
+        frame(&ctx, &mut screen);
+        assert!(
+            !ctx.memory(|m| m.has_focus(pw_field_id())),
+            "focus was stolen back; the caret is trapped in the password field"
+        );
+
+        // And it stays released across further frames.
+        frame(&ctx, &mut screen);
+        assert!(!ctx.memory(|m| m.has_focus(pw_field_id())));
+    }
+
+    /// A failed attempt is the one case that *should* re-focus: the field was
+    /// cleared on submit, so the user would otherwise have to click before
+    /// retyping.
+    #[test]
+    fn a_failed_attempt_puts_the_caret_back() {
+        let ctx = egui::Context::default();
+        let mut screen = UnlockScreen::new(locked_config(), None, None);
+        frame(&ctx, &mut screen);
+        ctx.memory_mut(|m| m.surrender_focus(pw_field_id()));
+        frame(&ctx, &mut screen);
+        assert!(!ctx.memory(|m| m.has_focus(pw_field_id())));
+
+        screen.focus_password = true; // what the error path sets
+        frame(&ctx, &mut screen);
+        assert!(ctx.memory(|m| m.has_focus(pw_field_id())));
+    }
 }

@@ -11,13 +11,36 @@
 /// writers exist (full index runs and the coordinator's incremental
 /// updates) and they're serialized by design; `busy_timeout` is a backstop,
 /// not a coordination mechanism. A clean shutdown truncates the log via
-/// [`super::repo::checkpoint_and_close`].
+/// [`super::repo::checkpoint_and_close`], and a long run truncates it
+/// periodically as it goes (see `maximum_wal_size`) — SQLite's own
+/// autocheckpoint backfills but cannot reset a log that readers are touching.
 pub const PRAGMAS_FAST: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 5000;
     PRAGMA cache_size = 10000;
     PRAGMA temp_store = MEMORY;
+    PRAGMA foreign_keys = ON;
+";
+
+/// Pragmas for the connection that compacts the index after a run.
+///
+/// [`PRAGMAS_FAST`] but for `temp_store`, and that one difference is the whole
+/// reason this profile exists. VACUUM builds the replacement database in the
+/// temp store; SQLCipher is compiled `-DSQLITE_TEMP_STORE=2`, under which
+/// anything but an explicit `FILE` puts that database in memory. Vacuuming a
+/// multi-gigabyte index on the indexer's connection would try to hold the
+/// entire rebuilt index in RAM. See [`super::repo::maintain`], which also
+/// points the temp directory at the index's own volume.
+///
+/// The smaller page cache is because this connection does one bulk copy and
+/// then closes; the 40 MiB the indexer keeps hot buys it nothing.
+pub const PRAGMAS_MAINTENANCE: &str = "
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA cache_size = 2000;
+    PRAGMA temp_store = FILE;
     PRAGMA foreign_keys = ON;
 ";
 
@@ -84,7 +107,15 @@ CREATE TABLE files (
     hash          BLOB
 );
 
-CREATE INDEX idx_files_parent ON files(parent);
+-- Covering, not just `(parent)`. The walk's row prefetcher issues
+-- `SELECT name, mtime FROM files WHERE parent = ?` once per directory — the
+-- hottest read in a full run — and with the bare index that is an index probe
+-- plus a table-row fetch per entry. Those fetches are cold by design: the walk
+-- reader deliberately runs on a 1 MiB page cache (see `PRAGMAS_WALK_READER`).
+-- Carrying `name` and `mtime` in the index makes it an index-only scan.
+-- `parent` stays leading, so `SELECT DISTINCT parent` range scans and
+-- `paths_in_dir` are unaffected.
+CREATE INDEX idx_files_parent ON files(parent, name, mtime);
 CREATE INDEX idx_files_mtime  ON files(mtime);
 CREATE INDEX idx_files_type   ON files(type);
 CREATE INDEX idx_files_mime   ON files(mime);

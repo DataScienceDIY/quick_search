@@ -8,18 +8,20 @@
 //! computable), and measures against `now` so the estimate decays during
 //! stalls instead of freezing at the last burst.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 const HISTORY: Duration = Duration::from_secs(60);
 
 pub struct SpeedTracker {
-    /// (when, counter value) — appended only on counter change.
-    points: Vec<(Instant, usize)>,
+    /// (when, counter value) — appended only on counter change. A deque
+    /// because pruning drops from the front, which is O(n) on a `Vec`.
+    points: VecDeque<(Instant, usize)>,
 }
 
 impl SpeedTracker {
     pub fn new() -> SpeedTracker {
-        SpeedTracker { points: Vec::new() }
+        SpeedTracker { points: VecDeque::new() }
     }
 
     /// Reset between phases (each phase restarts its counter).
@@ -32,18 +34,18 @@ impl SpeedTracker {
     }
 
     fn record_at(&mut self, now: Instant, files_processed: usize) {
-        match self.points.last() {
+        match self.points.back() {
             Some(&(_, last)) if last == files_processed => return,
             // Counter went backwards — a new phase started without an
             // explicit reset.
             Some(&(_, last)) if files_processed < last => self.points.clear(),
             _ => {}
         }
-        self.points.push((now, files_processed));
+        self.points.push_back((now, files_processed));
         // Prune old points, but always keep at least two so a slow but
         // steady rate never becomes unmeasurable.
         while self.points.len() > 2 && now.duration_since(self.points[0].0) > HISTORY {
-            self.points.remove(0);
+            self.points.pop_front();
         }
     }
 
@@ -54,8 +56,8 @@ impl SpeedTracker {
     }
 
     fn files_per_sec_at(&self, now: Instant) -> Option<f64> {
-        let (t0, c0) = *self.points.first()?;
-        let (_, c1) = *self.points.last()?;
+        let (t0, c0) = *self.points.front()?;
+        let (_, c1) = *self.points.back()?;
         if self.points.len() < 2 {
             return None;
         }

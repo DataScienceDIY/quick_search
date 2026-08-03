@@ -115,6 +115,9 @@ mod tests {
                     mime: None,
                     ftype: FileType::TEXT,
                     hash,
+                    // No MIME, so nothing claims it — and duplicate detection
+                    // never looks at content anyway.
+                    needs_content: false,
                 },
             )
             .unwrap()

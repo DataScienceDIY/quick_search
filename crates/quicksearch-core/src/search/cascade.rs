@@ -1,7 +1,6 @@
 //! The ranked search cascade.
 //!
-//! One term, four table scans, eleven ranks. Rank base = stage number, so
-//! later stages only ever append to a rank-sorted result list:
+//! One term, four table scans, eleven ranks. Rank base = stage number:
 //!
 //! | rank | meaning                          | scan |
 //! |-----:|----------------------------------|------|
@@ -45,9 +44,23 @@
 //! Every scan appends the caller's structured-filter SQL (anonymous
 //! placeholders over alias `f`) and checks the generation counter as it
 //! streams; a bumped generation aborts mid-statement.
+//!
+//! # Batches are ordered within themselves, not against each other
+//!
+//! A pass hands hits over *while it scans* (see [`FLUSH_INTERVAL`]) rather than
+//! at the end. On a large index a single pass runs for seconds, and holding its
+//! results back means the UI shows nothing for that whole time even though a
+//! rank-1 filename match may have turned up in the first few milliseconds.
+//!
+//! The cost is that a scan finds hits in table order, not rank order: batch two
+//! can contain something better than anything in batch one. Each batch is
+//! sorted before it goes, but the consumer owns the ordering *across* batches —
+//! the GUI keeps its table sorted by whichever column is keyed and places each
+//! arrival where that sort requires. Do not assume arrival order is rank order.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
@@ -206,6 +219,19 @@ struct Deferred {
     overflowed: bool,
 }
 
+/// Longest a pass may sit on hits before handing them over.
+///
+/// A pass is a whole-table scan, and on a large index that runs for seconds.
+/// Waiting for it to finish means the GUI shows nothing for that whole time,
+/// even when a rank-1 filename match turned up in the first few milliseconds.
+/// Draining on a clock rather than only on a full buffer is what makes a
+/// *sparse* query responsive too — six matches out of seven million still
+/// paint as the scan reaches them.
+///
+/// Short enough to land two or three batches inside the GUI's 250 ms result
+/// fade, so the fade reveals a filling list rather than an empty one.
+const FLUSH_INTERVAL: Duration = Duration::from_millis(80);
+
 struct Cx<'a> {
     conn: &'a Connection,
     query: &'a CascadeQuery,
@@ -221,6 +247,39 @@ struct Cx<'a> {
     total: usize,
     limited: bool,
     sink: &'a mut dyn FnMut(Vec<SearchHit>),
+}
+
+/// Drives [`Cx::flush_if_due`]: when this pass last handed hits over, and
+/// whether it has handed over anything at all.
+struct FlushClock {
+    last: Instant,
+    sent_anything: bool,
+}
+
+impl FlushClock {
+    fn new() -> FlushClock {
+        FlushClock {
+            last: Instant::now(),
+            sent_anything: false,
+        }
+    }
+
+    /// Whether a buffer of `len` hits should go now.
+    ///
+    /// The first batch of a pass goes the moment there is anything to send, so
+    /// a single early hit paints immediately instead of waiting out an
+    /// interval it has no reason to.
+    fn due(&self, len: usize, batch: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        !self.sent_anything || len >= batch || self.last.elapsed() >= FLUSH_INTERVAL
+    }
+
+    fn mark_sent(&mut self) {
+        self.last = Instant::now();
+        self.sent_anything = true;
+    }
 }
 
 impl<'a> Cx<'a> {
@@ -286,6 +345,24 @@ impl<'a> Cx<'a> {
             return Ok(false);
         };
         Ok(re.is_match(&String::from_utf8_lossy(&raw)))
+    }
+
+    /// Hand `buf` over mid-scan if it is due, leaving it empty when it goes.
+    ///
+    /// Partial and final flushes are the same operation — [`flush_pass`] sorts
+    /// what it is given and emits it — so a pass streams simply by calling this
+    /// each time round its row loop. Ordering *between* batches is the caller's
+    /// problem: the GUI keeps its table sorted by whichever column is keyed, so
+    /// a better-ranked hit found later lands above the ones already shown.
+    fn flush_if_due(&mut self, buf: &mut Vec<SearchHit>, clock: &mut FlushClock) {
+        if !clock.due(buf.len(), self.options.batch.max(1)) {
+            return;
+        }
+        let batch = std::mem::take(buf);
+        // `overflowed` belongs to the pass as a whole, not to one batch; the
+        // final flush reports it.
+        self.flush_pass(batch, false);
+        clock.mark_sent();
     }
 
     /// Sort a finished pass buffer, truncate to what's left of the display
@@ -387,6 +464,7 @@ impl<'a> Cx<'a> {
         let mut overflowed = false;
         let mut path_overflowed = false;
         let mut scanned = 0usize;
+        let mut clock = FlushClock::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             scanned += 1;
             if scanned % CANCEL_CHECK_ROWS == 0 && self.cancelled() {
@@ -451,6 +529,7 @@ impl<'a> Cx<'a> {
             } else {
                 buf.push(hit);
                 overflowed |= self.enforce_cap(&mut buf);
+                self.flush_if_due(&mut buf, &mut clock);
             }
         }
         drop(rows);
@@ -529,6 +608,7 @@ impl<'a> Cx<'a> {
         let snippet_opts = snippet::Options { approx_chars: SNIPPET_WINDOW_CHARS };
         let mut buf: Vec<SearchHit> = Vec::new();
         let mut overflowed = false;
+        let mut clock = FlushClock::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             // Decompression dominates: check every row.
             if self.cancelled() {
@@ -546,14 +626,22 @@ impl<'a> Cx<'a> {
 
             let (rank, stage, snip) = match &text {
                 Some(text) => {
-                    let (count, stage, ci) = {
+                    // Fold once. The case-insensitive count, the first-match
+                    // search and the snippet extraction all need it, and each
+                    // used to make its own copy of a document that can run to
+                    // `maximum_text_size`. The trigram tokenizer is
+                    // case-insensitive, so nearly every candidate takes this
+                    // path — it is a per-row cost, not a per-hit one.
+                    let mut folded: Option<String> = None;
+                    let (count, stage) = {
                         let count_cs = pattern.count(text, false);
                         if count_cs > 0 {
-                            (count_cs, 5, false)
+                            (count_cs, 5)
                         } else {
-                            let count_ci = pattern.count(text, true);
+                            let lower = folded.insert(text.to_ascii_lowercase());
+                            let count_ci = pattern.count_folded(lower);
                             if count_ci > 0 {
-                                (count_ci, 6, true)
+                                (count_ci, 6)
                             } else {
                                 // Folded/unordered FTS candidate: the
                                 // pattern never occurs — drop it.
@@ -563,9 +651,15 @@ impl<'a> Cx<'a> {
                     };
                     // Literal terms keep the richer multi-occurrence
                     // extract; a wildcard match marks its own first range.
+                    let lower = folded.unwrap_or_else(|| text.to_ascii_lowercase());
                     let snip = match pattern.literal() {
-                        Some(term) => Some(snippet::extract(text, &[term], &snippet_opts)),
-                        None => pattern.find_first(text, ci).map(|r| {
+                        Some(term) => Some(snippet::extract_folded(
+                            text,
+                            &lower,
+                            &[term],
+                            &snippet_opts,
+                        )),
+                        None => pattern.find_first_folded(&lower).map(|r| {
                             let r = clamp_match_range(text, r, SNIPPET_WINDOW_CHARS);
                             snippet::window_around(text, (r.start, r.end), &snippet_opts)
                         }),
@@ -601,6 +695,7 @@ impl<'a> Cx<'a> {
                 snippet: snip,
             });
             overflowed |= self.enforce_cap(&mut buf);
+            self.flush_if_due(&mut buf, &mut clock);
         }
         drop(rows);
         if self.cancelled() {
@@ -644,6 +739,7 @@ impl<'a> Cx<'a> {
         let mut overflowed = false;
         let mut path_overflowed = false;
         let mut scanned = 0usize;
+        let mut clock = FlushClock::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             scanned += 1;
             if scanned % 1024 == 0 && self.cancelled() {
@@ -656,14 +752,18 @@ impl<'a> Cx<'a> {
                 continue;
             }
             // The name is the better match when both fire, so it wins and
-            // only a name miss falls through to the path tier.
+            // only a name miss falls through to the path tier. Distance and
+            // match range come from one sweep — taking them separately meant a
+            // second full scan of the same buffer for every hit.
             let folded_name = name.to_ascii_lowercase();
-            let (rank, field, folded_field) = match bitap.best_distance(folded_name.as_bytes()) {
-                Some(distance) => (7.0 + 0.1 * distance as f64, &name, folded_name),
+            let (rank, field, range) = match bitap.best_distance_and_first(folded_name.as_bytes()) {
+                Some((distance, range)) => (7.0 + 0.1 * distance as f64, &name, range),
                 None if with_paths => {
                     let folded_path = path.to_ascii_lowercase();
-                    match bitap.best_distance(folded_path.as_bytes()) {
-                        Some(distance) => (11.0 + 0.1 * distance as f64, &path, folded_path),
+                    match bitap.best_distance_and_first(folded_path.as_bytes()) {
+                        Some((distance, range)) => {
+                            (11.0 + 0.1 * distance as f64, &path, range)
+                        }
                         None => continue,
                     }
                 }
@@ -675,15 +775,13 @@ impl<'a> Cx<'a> {
             // Mark the approximate matched span in the matched field for
             // the GUI's [matched field] rendering. window_around clamps
             // and aligns.
-            let snip = bitap.count_and_first(folded_field.as_bytes()).1.map(|range| {
-                snippet::window_around(
-                    field,
-                    range,
-                    &snippet::Options {
-                        approx_chars: field.len().saturating_mul(2).max(8),
-                    },
-                )
-            });
+            let snip = Some(snippet::window_around(
+                field,
+                range,
+                &snippet::Options {
+                    approx_chars: field.len().saturating_mul(2).max(8),
+                },
+            ));
             let is_path_tier = rank >= 11.0;
             let hit = SearchHit {
                 file_id,
@@ -701,6 +799,7 @@ impl<'a> Cx<'a> {
             } else {
                 buf.push(hit);
                 overflowed |= self.enforce_cap(&mut buf);
+                self.flush_if_due(&mut buf, &mut clock);
             }
         }
         drop(rows);
@@ -746,6 +845,7 @@ impl<'a> Cx<'a> {
         let snippet_opts = snippet::Options { approx_chars: SNIPPET_WINDOW_CHARS };
         let mut buf: Vec<SearchHit> = Vec::new();
         let mut overflowed = false;
+        let mut clock = FlushClock::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             if self.cancelled() {
                 return Ok(false);
@@ -785,6 +885,7 @@ impl<'a> Cx<'a> {
                 snippet: snip,
             });
             overflowed |= self.enforce_cap(&mut buf);
+            self.flush_if_due(&mut buf, &mut clock);
         }
         drop(rows);
         if self.cancelled() {
@@ -816,6 +917,7 @@ impl<'a> Cx<'a> {
         let mut overflowed = false;
         let mut path_overflowed = false;
         let mut scanned = 0usize;
+        let mut clock = FlushClock::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             scanned += 1;
             if scanned % 1024 == 0 && self.cancelled() {
@@ -858,6 +960,7 @@ impl<'a> Cx<'a> {
             } else {
                 buf.push(hit);
                 overflowed |= self.enforce_cap(&mut buf);
+                self.flush_if_due(&mut buf, &mut clock);
             }
         }
         drop(rows);
@@ -890,6 +993,7 @@ impl<'a> Cx<'a> {
         let snippet_opts = snippet::Options { approx_chars: SNIPPET_WINDOW_CHARS };
         let mut buf: Vec<SearchHit> = Vec::new();
         let mut overflowed = false;
+        let mut clock = FlushClock::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             // Decompression dominates: check every row.
             if self.cancelled() {
@@ -926,6 +1030,7 @@ impl<'a> Cx<'a> {
                 snippet: snip,
             });
             overflowed |= self.enforce_cap(&mut buf);
+            self.flush_if_due(&mut buf, &mut clock);
         }
         drop(rows);
         if self.cancelled() {

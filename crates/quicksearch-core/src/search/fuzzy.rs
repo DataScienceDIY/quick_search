@@ -11,6 +11,15 @@
 //! convention). Patterns are limited to 64 bytes by the machine word; the
 //! cascade skips fuzzy stages for longer terms.
 
+/// Registers the automaton needs: one per error count `0..=k`.
+///
+/// `k` is bounded by [`edit_budget`]'s one-edit-per-three-characters ladder
+/// against a pattern the machine word caps at 64 bytes, so it never exceeds 21
+/// however hostile `fuzzy_max_edits` is (pinned by
+/// `edit_budget_stays_within_the_bitap_word_size`). [`Bitap::new`] rejects
+/// anything larger, so the array is always big enough.
+const MAX_REGISTERS: usize = 22;
+
 pub struct Bitap {
     /// `masks[c]` has bit `i` set iff `pattern[i] == c`.
     masks: [u64; 256],
@@ -22,9 +31,10 @@ pub struct Bitap {
 
 impl Bitap {
     /// `None` when the pattern is empty, longer than 64 bytes, or the edit
-    /// budget reaches the word size (`initial_registers` shifts by `k`).
+    /// budget does not fit the registers (`reset` shifts by `k`, and the
+    /// register array holds [`MAX_REGISTERS`]).
     pub fn new(pattern: &[u8], k: usize) -> Option<Bitap> {
-        if pattern.is_empty() || pattern.len() > 64 || k >= 64 {
+        if pattern.is_empty() || pattern.len() > 64 || k >= MAX_REGISTERS {
             return None;
         }
         let mut masks = [0u64; 256];
@@ -38,14 +48,19 @@ impl Bitap {
         })
     }
 
-    /// Fresh per-distance state registers. Bit `i` of `r[d]` set means "a
+    /// Reset the per-distance state registers. Bit `i` of `r[d]` set means "a
     /// match of pattern[..=i] with ≤ d errors ends at the current text
     /// position". With d errors the first d pattern bytes can be deleted
     /// before any text is read, hence the pre-set low bits.
-    fn initial_registers(&self) -> Vec<u64> {
-        (0..=self.k)
-            .map(|d| if d == 0 { 0 } else { (1u64 << d) - 1 })
-            .collect()
+    ///
+    /// Writes into a caller-owned array rather than returning a `Vec`: the
+    /// fuzzy passes call this once per scanned row — millions of them on a
+    /// whole-table sweep — and a heap allocation per row is pure overhead for
+    /// at most [`MAX_REGISTERS`] words.
+    fn reset(&self, r: &mut [u64; MAX_REGISTERS]) {
+        for (d, reg) in r.iter_mut().enumerate().take(self.k + 1) {
+            *reg = if d == 0 { 0 } else { (1u64 << d) - 1 };
+        }
     }
 
     /// Advance all registers by one haystack byte. Returns the smallest
@@ -78,15 +93,30 @@ impl Bitap {
     /// Minimum edit distance (≤ k) of any occurrence of the pattern in
     /// `hay`, or `None` if nothing matches within k edits.
     pub fn best_distance(&self, hay: &[u8]) -> Option<usize> {
-        let mut r = self.initial_registers();
-        let mut best: Option<usize> = None;
-        for &b in hay {
+        self.best_distance_and_first(hay).map(|(d, _)| d)
+    }
+
+    /// [`best_distance`](Self::best_distance) plus the first match's
+    /// approximate byte range, from one sweep.
+    ///
+    /// The filename pass needs both — the distance to rank by, the range to
+    /// mark in the snippet — and taking them separately meant a second full
+    /// scan of the same buffer for every hit. The range carries the same
+    /// caveat as [`count_and_first`](Self::count_and_first): it assumes a
+    /// pattern-length match, so edits can shift the true start by up to `k`.
+    pub fn best_distance_and_first(&self, hay: &[u8]) -> Option<(usize, (usize, usize))> {
+        let mut r = [0u64; MAX_REGISTERS];
+        self.reset(&mut r);
+        let mut best: Option<(usize, (usize, usize))> = None;
+        for (i, &b) in hay.iter().enumerate() {
             if let Some(d) = self.step(&mut r, b) {
+                let end = i + 1;
+                let range = (end.saturating_sub(self.len), end);
                 if d == 0 {
-                    return Some(0);
+                    return Some((0, range));
                 }
-                if best.map_or(true, |cur| d < cur) {
-                    best = Some(d);
+                if best.is_none_or(|(cur, _)| d < cur) {
+                    best = Some((d, range));
                 }
             }
         }
@@ -100,7 +130,8 @@ impl Bitap {
     /// The reported range assumes pattern-length matches — edits can shift
     /// the true start by up to k bytes, which is fine for snippet windows.
     pub fn count_and_first(&self, hay: &[u8]) -> (usize, Option<(usize, usize)>) {
-        let mut r = self.initial_registers();
+        let mut r = [0u64; MAX_REGISTERS];
+        self.reset(&mut r);
         let mut count = 0usize;
         let mut first: Option<(usize, usize)> = None;
         for (i, &b) in hay.iter().enumerate() {
@@ -110,9 +141,7 @@ impl Bitap {
                     let end = i + 1;
                     first = Some((end.saturating_sub(self.len), end));
                 }
-                for (d, reg) in r.iter_mut().enumerate() {
-                    *reg = if d == 0 { 0 } else { (1u64 << d) - 1 };
-                }
+                self.reset(&mut r);
             }
         }
         (count, first)
@@ -183,10 +212,12 @@ mod tests {
 
     #[test]
     fn oversized_k_is_rejected_not_shifted() {
-        // `initial_registers` shifts by k; k >= 64 would overflow u64.
+        // `reset` shifts by k and writes k+1 registers, so both the u64 shift
+        // and the fixed array have to be respected.
+        assert!(Bitap::new(b"abc", MAX_REGISTERS).is_none());
         assert!(Bitap::new(b"abc", 64).is_none());
         assert!(Bitap::new(b"abc", usize::MAX).is_none());
-        assert!(Bitap::new(b"abc", 63).is_some());
+        assert!(Bitap::new(b"abc", MAX_REGISTERS - 1).is_some());
     }
 
     #[test]
