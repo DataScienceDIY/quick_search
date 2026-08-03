@@ -203,7 +203,12 @@ impl SearchService {
 /// Map SQLite-level errors to the tagged strings frontends key off.
 /// `DATABASE_CORRUPTED:` drives the GUI's recovery dialog.
 pub fn classify_sql_err(error_msg: &str) -> String {
-    if error_msg.contains("malformed")
+    if error_msg.starts_with(db::KEY_MISMATCH_PREFIX) {
+        // Wrong or missing encryption key. Already user-legible, and it
+        // must never fall into the corruption bucket — the recovery dialog
+        // would offer to delete an index that is perfectly intact.
+        error_msg.to_string()
+    } else if error_msg.contains("malformed")
         || error_msg.contains("corrupt")
         || error_msg.contains("database disk image is malformed")
     {
@@ -303,5 +308,36 @@ impl Worker {
                 message: classify_sql_err(&e),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_mismatch_is_never_classified_as_corruption() {
+        let msg = format!(
+            "{}index at /tmp/x.sqlite: wrong password (or the file is not a QuickSearch index)",
+            db::KEY_MISMATCH_PREFIX
+        );
+        let classified = classify_sql_err(&msg);
+        assert_eq!(classified, msg, "must pass through verbatim");
+        assert!(!classified.starts_with("DATABASE_CORRUPTED:"));
+
+        // The raw SQLite wording for an undecryptable page must not land in
+        // the corruption bucket either — the GUI recovery dialog offers to
+        // delete the file, which is exactly wrong for an intact encrypted
+        // index. (It doesn't match the corruption needles; pin that.)
+        let raw = "Failed to read database at /tmp/x.sqlite: file is not a database";
+        assert!(!classify_sql_err(raw).starts_with("DATABASE_CORRUPTED:"));
+    }
+
+    #[test]
+    fn corruption_and_syntax_classification_still_work() {
+        assert!(classify_sql_err("database disk image is malformed")
+            .starts_with("DATABASE_CORRUPTED:"));
+        assert!(classify_sql_err("fts5: syntax error near \"NEAR\"").starts_with("Search syntax"));
+        assert!(classify_sql_err("no such table: files").starts_with("Search failed:"));
     }
 }

@@ -11,6 +11,27 @@ pub enum Section {
     Search,
 }
 
+/// A click in the Security block. Unlike the rest of the Options window
+/// these are not draft edits: passwords are not config fields, and every
+/// action here runs its own explicit flow (with a rebuild warning where
+/// one is required) in the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecurityAction {
+    Enable,
+    Disable,
+    ChangePassword,
+    SetKeychain(bool),
+}
+
+/// What one frame of the Options window produced.
+#[derive(Default)]
+pub struct OptionsOutput {
+    /// "Apply & Save" was clicked with this draft.
+    pub applied: Option<Config>,
+    /// A Security block action was clicked.
+    pub security: Option<SecurityAction>,
+}
+
 pub struct OptionsWindow {
     pub open: bool,
     draft: Option<Config>,
@@ -29,16 +50,16 @@ impl OptionsWindow {
         self.draft = Some(current.clone());
     }
 
-    /// Render; returns a new config when the user applied changes.
-    pub fn ui(&mut self, ctx: &egui::Context, current: &Config) -> Option<Config> {
+    /// Render; reports an applied draft config and/or a security action.
+    pub fn ui(&mut self, ctx: &egui::Context, current: &Config) -> OptionsOutput {
         if !self.open {
             self.draft = None;
-            return None;
+            return OptionsOutput::default();
         }
         if self.draft.is_none() {
             self.draft = Some(current.clone());
         }
-        let mut applied = None;
+        let mut out = OptionsOutput::default();
         let mut open = self.open;
         let draft = self.draft.as_mut().unwrap();
 
@@ -93,12 +114,20 @@ impl OptionsWindow {
                         );
                         ui.end_row();
                     });
+                    ui.separator();
+
+                    // Security acts on the live config, not the draft: each
+                    // action opens its own confirmation flow immediately.
+                    // The KDF salt is deliberately never shown here (or
+                    // anywhere else in the GUI).
+                    ui.heading("Security");
+                    out.security = security_ui(ui, current);
                 });
 
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Apply & Save").clicked() {
-                        applied = Some(draft.clone());
+                        out.applied = Some(draft.clone());
                     }
                     ui.label(
                         egui::RichText::new(
@@ -115,8 +144,49 @@ impl OptionsWindow {
         if !self.open {
             self.draft = None;
         }
-        applied
+        out
     }
+}
+
+/// The Security block: status plus action buttons. Never renders the salt.
+fn security_ui(ui: &mut egui::Ui, current: &Config) -> Option<SecurityAction> {
+    let mut action = None;
+    if current.security.password_protected {
+        ui.label("The index is encrypted; a password is asked for at startup.");
+        ui.horizontal(|ui| {
+            if ui.button("Change password…").clicked() {
+                action = Some(SecurityAction::ChangePassword);
+            }
+            if ui.button("Disable protection…").clicked() {
+                action = Some(SecurityAction::Disable);
+            }
+        });
+        let mut remember = current.security.use_keychain;
+        if ui
+            .checkbox(&mut remember, "Remember on this device")
+            .on_hover_text(
+                "Stores the derived key (not the password) in the OS keychain \
+                 and skips the startup prompt on this machine.",
+            )
+            .changed()
+        {
+            action = Some(SecurityAction::SetKeychain(remember));
+        }
+    } else {
+        ui.label("The index is not encrypted.");
+        if ui.button("Enable password protection…").clicked() {
+            action = Some(SecurityAction::Enable);
+        }
+        ui.label(
+            egui::RichText::new(
+                "The index stores the names and text of your files. A password \
+                 encrypts it on disk; enabling one rebuilds the index.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+    action
 }
 
 /// One implementation of the per-section config controls, shared by the
@@ -164,6 +234,13 @@ pub fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section
                     });
                 ui.end_row();
 
+                ui.label("");
+                ui.hyperlink_to(
+                    "Tokenizer documentation",
+                    "https://www.sqlite.org/fts5.html#tokenizers",
+                );
+                ui.end_row();
+
                 ui.label("Hash sample size (bytes)");
                 ui.add(egui::DragValue::new(&mut config.processing.hash_length).range(512..=1_048_576));
                 ui.end_row();
@@ -197,7 +274,7 @@ pub fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section
         }
         Section::Search => {
             egui::Grid::new("cfg-search").num_columns(2).show(ui, |ui| {
-                ui.label("Fuzzy stages on by default");
+                ui.label("Fuzzy search ON by default");
                 ui.checkbox(&mut config.search.fuzzy_default, "");
                 ui.end_row();
 
@@ -214,7 +291,7 @@ pub fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section
                         ui.label(
                             egui::RichText::new(warning)
                                 .small()
-                                .color(egui::Color32::from_rgb(220, 150, 40)),
+                                .color(crate::ui_util::ORANGE),
                         );
                     }
                 });

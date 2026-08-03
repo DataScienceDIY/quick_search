@@ -181,6 +181,11 @@ depends="$depends, hicolor-icon-theme"
 # the dbus-send used by "reveal in folder"; xdg-utils provides the xdg-open
 # fallback; xdg-desktop-portal backs the native folder picker. None are needed
 # to search, so none are hard dependencies.
+#
+# The index-password "remember on this device" feature talks Secret Service
+# over the session bus with a statically linked libdbus (keyring's `vendored`
+# feature), so it adds no library dependency; without a Secret Service
+# provider (gnome-keyring, kwalletd) it simply falls back to prompting.
 recommends="desktop-file-utils, xdg-utils, dbus-bin, xdg-desktop-portal"
 
 install -dm755 "$stage/DEBIAN"

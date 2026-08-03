@@ -14,6 +14,8 @@ mod backend;
 mod cli;
 mod duplicates_tab;
 mod format;
+mod help_tab;
+mod keychain;
 mod logs_tab;
 mod manage_tab;
 mod options;
@@ -21,6 +23,8 @@ mod platform;
 mod query_highlight;
 mod search_tab;
 mod tracker;
+mod unlock;
+mod ui_util;
 
 use quicksearch_core::config::Config;
 
@@ -69,6 +73,13 @@ fn main() {
     };
     let initial_query = seed_query();
 
+    // With protection on, try the keychain before the window opens; a
+    // verified key means no prompt at all. Anything else starts locked —
+    // the unlock screen owns password entry, bad-salt reporting, and the
+    // forgot-password escape hatch. No index is touched until unlocked.
+    let start_unlocked =
+        !config.security.password_protected || unlock::try_keychain_unlock(&config);
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("QuickSearch")
@@ -83,9 +94,13 @@ fn main() {
         "QuickSearch",
         native_options,
         Box::new(move |cc| {
-            app::QuickSearchApp::new(cc, config, config_error, initial_query)
-                .map(|app| Box::new(app) as Box<dyn eframe::App>)
-                .map_err(|e| e.into())
+            let gate = if start_unlocked {
+                unlock::Gate::running(&cc.egui_ctx, config, config_error, initial_query)
+                    .map_err(Box::<dyn std::error::Error + Send + Sync>::from)?
+            } else {
+                unlock::Gate::locked(config, config_error, initial_query)
+            };
+            Ok(Box::new(gate) as Box<dyn eframe::App>)
         }),
     );
     if let Err(e) = result {

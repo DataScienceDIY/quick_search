@@ -1,21 +1,26 @@
 //! Application shell: tab strip, per-frame event drains, debounce,
 //! status bar, and config-change routing.
 
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use quicksearch_core::cli::{index_counts, IndexCounts};
-use quicksearch_core::config::{diff_actions, nested_roots, Config};
+use quicksearch_core::config::{diff_actions, nested_roots, Config, SecurityConfig};
 use quicksearch_core::coordinator::{IndexMode, IndexerState, WatcherStatus};
+use quicksearch_core::db;
 use quicksearch_core::indexing::{ConfigChange, IndexingStatus, RootPhase};
 use quicksearch_core::search::SearchOptions;
+use quicksearch_core::security::{derive_key, generate_salt, salt_to_hex, IndexKey};
 use quicksearch_core::watcher::WatchError;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::backend::Backend;
 use crate::duplicates_tab::{DupState, DuplicatesTab};
 use crate::format::{fmt_interval, group_thousands};
+use crate::keychain;
 use crate::logs_tab::LogsTab;
 use crate::manage_tab::ManageTab;
-use crate::options::OptionsWindow;
+use crate::options::{OptionsWindow, SecurityAction};
 use crate::search_tab::SearchTab;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +29,7 @@ enum Tab {
     Manage,
     Duplicates,
     Logs,
+    Help,
 }
 
 pub struct QuickSearchApp {
@@ -47,7 +53,38 @@ pub struct QuickSearchApp {
     /// Set when the watcher gave up on the directory budget and live
     /// updates are off; see [`QuickSearchApp::check_watch_cap_warning`].
     watch_cap_prompt: Option<WatchError>,
+    /// In-flight security flow (enable/disable/change password), driven by
+    /// the Options window's Security block.
+    security_prompt: Option<SecurityPrompt>,
     config_error: Option<String>,
+}
+
+/// The two-step security flow: collect a password (enable/change), derive
+/// its key off the UI thread, then confirm the mandatory index rebuild.
+/// Disabling skips straight to the confirmation.
+enum SecurityPrompt {
+    SetPassword {
+        pw1: String,
+        pw2: String,
+        remember: bool,
+        change: bool,
+    },
+    Deriving {
+        rx: mpsc::Receiver<(SecurityConfig, IndexKey)>,
+    },
+    ConfirmRebuild {
+        new_security: SecurityConfig,
+        new_key: Option<IndexKey>,
+    },
+}
+
+impl Drop for SecurityPrompt {
+    fn drop(&mut self) {
+        if let SecurityPrompt::SetPassword { pw1, pw2, .. } = self {
+            pw1.zeroize();
+            pw2.zeroize();
+        }
+    }
 }
 
 impl QuickSearchApp {
@@ -55,20 +92,23 @@ impl QuickSearchApp {
     /// first frame. It carries the positional arguments the binary was given,
     /// which on Windows is the only thing the GUI can do with them — terminal
     /// output belongs to `quicksearch-cli` there.
+    /// Takes a plain [`egui::Context`] rather than eframe's
+    /// `CreationContext` because construction can happen mid-session: the
+    /// unlock gate builds the app only after the password verifies.
     pub fn new(
-        cc: &eframe::CreationContext<'_>,
+        ctx: &egui::Context,
         cfg: Config,
         config_error: Option<String>,
         initial_query: Option<String>,
     ) -> Result<QuickSearchApp, String> {
         // Compact styling: results density is the whole point.
-        cc.egui_ctx.style_mut(|style| {
+        ctx.style_mut(|style| {
             style.spacing.item_spacing = egui::vec2(6.0, 3.0);
             style.spacing.button_padding = egui::vec2(6.0, 2.0);
         });
-        cc.egui_ctx.set_zoom_factor(clamp_scale(cfg.ui.scale));
+        ctx.set_zoom_factor(clamp_scale(cfg.ui.scale));
 
-        let backend = Backend::start(&cfg, cc.egui_ctx.clone())?;
+        let backend = Backend::start(&cfg, ctx.clone())?;
         let fuzzy = cfg.search.fuzzy_default;
         // Startup validation: a hand-edited config can nest roots, which
         // per-root pipelines can't accept. Redirect straight to the folder
@@ -98,6 +138,7 @@ impl QuickSearchApp {
             clear_prompt: false,
             nested_prompt,
             watch_cap_prompt: None,
+            security_prompt: None,
             config_error,
         })
     }
@@ -128,6 +169,11 @@ impl QuickSearchApp {
 
     /// Save + route an edited config to the running services.
     fn apply_new_config(&mut self, ctx: &egui::Context, mut new: Config) {
+        // The security section is never edited through config drafts — it
+        // changes only via the explicit flows in `handle_security_action`.
+        // Pinning it here keeps a stale draft (taken before a security
+        // change) from silently reverting protection or the salt.
+        new.security = self.cfg.security.clone();
         if let Some((child, parent)) = nested_roots(&new.paths.indexing_paths).first() {
             self.config_error = Some(format!(
                 "Not applied: indexed folder {} is nested under {}",
@@ -184,7 +230,6 @@ impl QuickSearchApp {
             }
         }
         self.cfg = new;
-        self.manage.invalidate_editors();
     }
 
     fn drain_events(&mut self) {
@@ -444,6 +489,247 @@ impl QuickSearchApp {
             self.rebuild_prompt = None;
         }
     }
+
+    /// Route a click in the Options window's Security block. Keychain
+    /// toggles act immediately; everything else opens the two-step flow.
+    fn handle_security_action(&mut self, action: SecurityAction) {
+        match action {
+            SecurityAction::Enable | SecurityAction::ChangePassword => {
+                self.security_prompt = Some(SecurityPrompt::SetPassword {
+                    pw1: String::new(),
+                    pw2: String::new(),
+                    remember: self.cfg.security.use_keychain,
+                    change: matches!(action, SecurityAction::ChangePassword),
+                });
+            }
+            SecurityAction::Disable => {
+                self.security_prompt = Some(SecurityPrompt::ConfirmRebuild {
+                    new_security: SecurityConfig::default(),
+                    new_key: None,
+                });
+            }
+            SecurityAction::SetKeychain(remember) => {
+                let db_path = self.cfg.resolved_database_path();
+                if remember {
+                    match db::process_key_hex() {
+                        Some(hex) => {
+                            if let Err(e) = keychain::store_key(&db_path.to_string_lossy(), &hex)
+                            {
+                                self.config_error = Some(e);
+                                return; // preference not saved either
+                            }
+                        }
+                        None => {
+                            // Unreachable while protected — the gate always
+                            // installs a key before the app starts.
+                            self.config_error =
+                                Some("no key to remember; restart and unlock first".to_string());
+                            return;
+                        }
+                    }
+                } else {
+                    keychain::delete_key(&db_path.to_string_lossy());
+                }
+                self.cfg.security.use_keychain = remember;
+                if let Err(e) = self.cfg.save() {
+                    self.config_error = Some(e);
+                }
+            }
+        }
+    }
+
+    /// Render the active security flow (drawn with the other modals).
+    fn security_prompt_ui(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = &mut self.security_prompt else {
+            return;
+        };
+        match prompt {
+            SecurityPrompt::SetPassword {
+                pw1,
+                pw2,
+                remember,
+                change,
+            } => {
+                let title = if *change {
+                    "Change password"
+                } else {
+                    "Enable password protection"
+                };
+                let mut submit = false;
+                let mut cancel = false;
+                egui::Window::new(title)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.set_max_width(360.0);
+                        ui.add(
+                            egui::TextEdit::singleline(pw1)
+                                .id(egui::Id::new("security-pw1"))
+                                .password(true)
+                                .hint_text("Password")
+                                .desired_width(240.0),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(pw2)
+                                .id(egui::Id::new("security-pw2"))
+                                .password(true)
+                                .hint_text("Confirm password")
+                                .desired_width(240.0),
+                        );
+                        ui.checkbox(remember, "Remember on this device").on_hover_text(
+                            "Stores the derived key (not the password) in the OS \
+                             keychain and skips the startup prompt.",
+                        );
+                        if !pw1.is_empty() && !pw2.is_empty() && pw1 != pw2 {
+                            ui.colored_label(ui.visuals().error_fg_color, "Passwords do not match.");
+                        }
+                        ui.horizontal(|ui| {
+                            let ok = !pw1.is_empty() && pw1 == pw2;
+                            if ui.add_enabled(ok, egui::Button::new("Continue")).clicked() {
+                                submit = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if cancel {
+                    self.security_prompt = None; // Drop impl zeroizes
+                    purge_security_field_state(ctx);
+                } else if submit {
+                    let password = Zeroizing::new(std::mem::take(pw1));
+                    pw2.zeroize();
+                    let remember = *remember;
+                    purge_security_field_state(ctx);
+                    let (tx, rx) = mpsc::channel();
+                    let repaint = ctx.clone();
+                    std::thread::spawn(move || {
+                        let salt = generate_salt();
+                        let key = derive_key(&password, &salt);
+                        drop(password);
+                        let new_security = SecurityConfig {
+                            password_protected: true,
+                            salt: Some(salt_to_hex(&salt)),
+                            use_keychain: remember,
+                        };
+                        let _ = tx.send((new_security, key));
+                        repaint.request_repaint();
+                    });
+                    self.security_prompt = Some(SecurityPrompt::Deriving { rx });
+                }
+            }
+            SecurityPrompt::Deriving { rx } => {
+                match rx.try_recv() {
+                    Ok((new_security, key)) => {
+                        self.security_prompt = Some(SecurityPrompt::ConfirmRebuild {
+                            new_security,
+                            new_key: Some(key),
+                        });
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        egui::Window::new("Deriving key")
+                            .collapsible(false)
+                            .resizable(false)
+                            .title_bar(false)
+                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Deriving key…");
+                                });
+                            });
+                        ctx.request_repaint_after(Duration::from_millis(100));
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.config_error = Some("key derivation thread died".to_string());
+                        self.security_prompt = None;
+                    }
+                }
+            }
+            SecurityPrompt::ConfirmRebuild {
+                new_security,
+                new_key,
+            } => {
+                let title = match (new_key.is_some(), self.cfg.security.password_protected) {
+                    (false, _) => "Disable password protection?",
+                    (true, false) => "Enable password protection?",
+                    (true, true) => "Change password?",
+                };
+                let mut confirm = false;
+                let mut cancel = false;
+                egui::Window::new(title)
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.set_max_width(420.0);
+                        ui.label(
+                            "Changing index encryption deletes the index and \
+                             re-indexes everything. Searches return incomplete \
+                             results until the rebuild finishes. Your files are \
+                             not touched.",
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(
+                                    egui::RichText::new("Delete & rebuild index")
+                                        .color(ui.visuals().error_fg_color),
+                                )
+                                .clicked()
+                            {
+                                confirm = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+                if cancel {
+                    self.security_prompt = None;
+                } else if confirm {
+                    let new_security = new_security.clone();
+                    let new_key = new_key.clone();
+                    self.security_prompt = None;
+                    self.apply_security_change(new_security, new_key);
+                }
+            }
+        }
+    }
+
+    /// Commit a confirmed security change: config, keychain, process key —
+    /// in that order, before the rebuild so the fresh index is created
+    /// under the new key (or none).
+    fn apply_security_change(&mut self, new_security: SecurityConfig, new_key: Option<IndexKey>) {
+        let db_path = self.cfg.resolved_database_path().to_string_lossy().into_owned();
+        self.cfg.security = new_security;
+        if let Err(e) = self.cfg.save() {
+            self.config_error = Some(e);
+        }
+        match (&new_key, self.cfg.security.use_keychain) {
+            (Some(key), true) => {
+                if let Err(e) = keychain::store_key(&db_path, &key.to_hex()) {
+                    self.config_error = Some(e);
+                }
+            }
+            // Disabling protection, or "remember" off: no stored key may
+            // survive pointing at the previous encryption state.
+            _ => keychain::delete_key(&db_path),
+        }
+        db::set_process_key(new_key);
+        self.backend.coordinator.rebuild_index();
+        self.counts = None;
+        self.dups.state = DupState::NotLoaded;
+    }
+}
+
+/// Drop egui's retained text-field state (buffer + undo history) for the
+/// password dialog fields.
+fn purge_security_field_state(ctx: &egui::Context) {
+    ctx.data_mut(|d| {
+        d.remove::<egui::text_edit::TextEditState>(egui::Id::new("security-pw1"));
+        d.remove::<egui::text_edit::TextEditState>(egui::Id::new("security-pw2"));
+    });
 }
 
 impl QuickSearchApp {
@@ -621,6 +907,7 @@ impl eframe::App for QuickSearchApp {
                 ui.selectable_value(&mut self.tab, Tab::Manage, "Manage Index");
                 ui.selectable_value(&mut self.tab, Tab::Duplicates, "Duplicates");
                 ui.selectable_value(&mut self.tab, Tab::Logs, "Logs");
+                ui.selectable_value(&mut self.tab, Tab::Help, "Help");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⚙").on_hover_text("Options").clicked() {
                         if self.options.open {
@@ -704,12 +991,18 @@ impl eframe::App for QuickSearchApp {
                 }
             }
             Tab::Logs => self.logs.ui(ui),
+            Tab::Help => crate::help_tab::ui(ui),
         });
 
-        if let Some(new_cfg) = self.options.ui(ctx, &self.cfg) {
+        let options_out = self.options.ui(ctx, &self.cfg);
+        if let Some(new_cfg) = options_out.applied {
             self.apply_new_config(ctx, new_cfg);
         }
+        if let Some(action) = options_out.security {
+            self.handle_security_action(action);
+        }
         self.rebuild_prompt_ui(ctx);
+        self.security_prompt_ui(ctx);
         self.clear_prompt_ui(ctx);
         self.nested_prompt_ui(ctx);
         self.watch_cap_prompt_ui(ctx);

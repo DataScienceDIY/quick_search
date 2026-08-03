@@ -12,6 +12,7 @@ pub mod mime;
 pub mod platform;
 pub mod query;
 pub mod search;
+pub mod security;
 pub mod shutdown;
 pub mod snippet;
 pub mod walk;

@@ -21,9 +21,11 @@ pub enum SortKey {
 }
 
 pub struct IgnoreDialog {
-    pub source_name: String,
     pub source_path: String,
-    pub pattern: String,
+    /// `*.{ext}`, when the file has an extension.
+    pub ext_pattern: Option<String>,
+    pub name_pattern: String,
+    pub dir_pattern: String,
     pub persist: bool,
 }
 
@@ -69,6 +71,11 @@ pub struct SearchTab {
     pub ignore_dialog: Option<IgnoreDialog>,
     pub help_open: bool,
     has_snippets: bool,
+    /// Display-row index hovered last frame; drives the row hover fill.
+    /// egui_extras' own tracking needs `row.response().hovered()`, which is
+    /// false whenever a selectable label wins the hit-test, so we track it
+    /// ourselves via `contains_pointer()`.
+    hovered_row: Option<usize>,
     focus_query: bool,
     /// Query syntax-highlight segments, cached per text.
     highlight: crate::query_highlight::HighlightCache,
@@ -98,6 +105,7 @@ impl SearchTab {
             ignore_dialog: None,
             help_open: false,
             has_snippets: false,
+            hovered_row: None,
             focus_query: true,
             highlight: Default::default(),
         }
@@ -416,8 +424,9 @@ impl SearchTab {
 
         let text_height = egui::TextStyle::Body.resolve(ui.style()).size + 4.0;
         let mut open_ignore_dialog: Option<usize> = None;
+        let mut hovered_now: Option<usize> = None;
 
-        ui.push_id("results", |ui| {
+        let table_scroll = ui.push_id("results", |ui| {
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
@@ -457,15 +466,23 @@ impl SearchTab {
                 .body(|body| {
                     let order = self.order.clone();
                     body.rows(text_height, order.len(), |mut row| {
-                        let result_ix = order[row.index()] as usize;
+                        let display_ix = row.index();
+                        let result_ix = order[display_ix] as usize;
                         let hit = &self.results[result_ix];
                         row.set_selected(self.selected == Some(result_ix as u32));
+                        row.set_hovered(self.hovered_row == Some(display_ix));
+
+                        // Labels stay selectable for copy-paste, which makes
+                        // them win egui's hit-test over the row. Collect their
+                        // responses and union them into the row's below so
+                        // clicks land even when the pointer is over glyphs.
+                        let mut cell_responses: Vec<egui::Response> = Vec::new();
 
                         row.col(|ui| {
-                            ui.label(&hit.name);
+                            cell_responses.push(ui.label(&hit.name));
                         });
                         row.col(|ui| {
-                            ui.label(egui::RichText::new(&hit.path).weak());
+                            cell_responses.push(ui.label(egui::RichText::new(&hit.path).weak()));
                         });
                         if self.has_snippets {
                             let snippet = hit.snippet.clone();
@@ -477,7 +494,7 @@ impl SearchTab {
                                 if let Some(snip) = &snippet {
                                     let width = ui.available_width();
                                     let job = centered_match_job(ui, snip, width, whole_field);
-                                    let response = ui
+                                    let mut response = ui
                                         .with_layout(
                                             egui::Layout::centered_and_justified(
                                                 egui::Direction::LeftToRight,
@@ -487,40 +504,41 @@ impl SearchTab {
                                         .inner;
                                     if !snip.ranges.is_empty() {
                                         let hover = snip.clone();
-                                        response.on_hover_ui(|ui| {
+                                        response = response.on_hover_ui(|ui| {
                                             ui.set_max_width(520.0);
                                             let job = snippet_job(ui, &hover, 10);
                                             ui.label(job);
                                         });
                                     }
+                                    cell_responses.push(response);
                                 }
                             });
                         }
                         row.col(|ui| {
-                            ui.with_layout(
+                            let response = ui.with_layout(
                                 egui::Layout::centered_and_justified(
                                     egui::Direction::LeftToRight,
                                 ),
-                                |ui| {
-                                    ui.label(human_size(hit.size));
-                                },
+                                |ui| ui.label(human_size(hit.size)),
                             );
+                            cell_responses.push(response.inner);
                         });
                         row.col(|ui| {
                             let color = recency_color(ui, hit.mtime);
-                            ui.with_layout(
+                            let response = ui.with_layout(
                                 egui::Layout::centered_and_justified(
                                     egui::Direction::LeftToRight,
                                 ),
                                 |ui| {
                                     ui.label(
                                         egui::RichText::new(fmt_mtime(hit.mtime)).color(color),
-                                    );
+                                    )
                                 },
                             );
+                            cell_responses.push(response.inner);
                         });
                         row.col(|ui| {
-                            ui.with_layout(
+                            let response = ui.with_layout(
                                 egui::Layout::centered_and_justified(
                                     egui::Direction::LeftToRight,
                                 ),
@@ -529,13 +547,20 @@ impl SearchTab {
                                         egui::RichText::new(format!(" {:.2} ", hit.rank))
                                             .background_color(rank_tier_color(hit.stage))
                                             .color(egui::Color32::from_rgb(32, 32, 32)),
-                                    );
+                                    )
                                 },
                             );
+                            cell_responses.push(response.inner);
                         });
 
-                        let response = row.response();
-                        if response.clicked() {
+                        let mut response = row.response();
+                        for r in cell_responses {
+                            response = response | r;
+                        }
+                        if response.contains_pointer() {
+                            hovered_now = Some(display_ix);
+                        }
+                        if response.clicked() || response.secondary_clicked() {
                             self.selected = Some(result_ix as u32);
                         }
                         if response.double_clicked() {
@@ -543,12 +568,16 @@ impl SearchTab {
                         }
                         response.context_menu(|ui| {
                             let path = self.results[result_ix].path.clone();
+                            if ui.button("Open containing folder").clicked() {
+                                platform::reveal_in_folder(&path);
+                                ui.close();
+                            }
                             if ui.button("Open").clicked() {
                                 platform::open_file(&path);
                                 ui.close();
                             }
-                            if ui.button("Open containing folder").clicked() {
-                                platform::reveal_in_folder(&path);
+                            if ui.button("Copy path").clicked() {
+                                ui.ctx().copy_text(path.clone());
                                 ui.close();
                             }
                             ui.separator();
@@ -558,15 +587,26 @@ impl SearchTab {
                             }
                         });
                     });
-                });
-        });
+                })
+        })
+        .inner;
+        crate::ui_util::more_below_hint(ui, &table_scroll);
+        self.hovered_row = hovered_now;
 
         if let Some(ix) = open_ignore_dialog {
             let hit = &self.results[ix];
             self.ignore_dialog = Some(IgnoreDialog {
-                source_name: hit.name.clone(),
                 source_path: hit.path.clone(),
-                pattern: hit.name.clone(),
+                ext_pattern: std::path::Path::new(&hit.name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| format!("*.{}", e)),
+                name_pattern: hit.name.clone(),
+                dir_pattern: std::path::Path::new(&hit.path)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .map(|p| format!("{}/*", p))
+                    .unwrap_or_default(),
                 persist: false,
             });
         }
@@ -584,45 +624,85 @@ impl SearchTab {
     }
 
     fn ignore_dialog_ui(&mut self, ctx: &egui::Context, actions: &mut SearchActions) {
+        use crate::ui_util::{bordered_button, pattern_edit, BLUE, ORANGE};
         let Some(dialog) = &mut self.ignore_dialog else {
             return;
         };
-        let mut apply = false;
+        // The chosen pattern; each "Ignore this …" button applies exactly
+        // that filter and closes the dialog.
+        let mut chosen: Option<String> = None;
         let mut cancel = false;
         egui::Window::new("Ignore filter")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
+                ui.set_min_width(430.0);
                 ui.label(format!("From: {}", dialog.source_path));
-                ui.add_space(4.0);
+                ui.separator();
+
+                // --- Extension ---------------------------------------------
                 ui.horizontal(|ui| {
-                    if ui.button("This name").clicked() {
-                        dialog.pattern = dialog.source_name.clone();
-                    }
-                    if let Some(ext) = std::path::Path::new(&dialog.source_name)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                    {
-                        if ui.button(format!("*.{}", ext)).clicked() {
-                            dialog.pattern = format!("*.{}", ext);
+                    match &dialog.ext_pattern {
+                        Some(ext) => {
+                            ui.monospace(ext);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(bordered_button("Ignore this extension", ORANGE))
+                                        .clicked()
+                                    {
+                                        chosen = Some(ext.clone());
+                                    }
+                                },
+                            );
                         }
-                    }
-                    if let Some(parent) = std::path::Path::new(&dialog.source_path)
-                        .parent()
-                        .and_then(|p| p.to_str())
-                    {
-                        if ui.button("This directory").clicked() {
-                            dialog.pattern = format!("{}/*", parent);
+                        None => {
+                            ui.label(egui::RichText::new("(no file extension)").weak());
                         }
                     }
                 });
-                ui.add(
-                    egui::TextEdit::singleline(&mut dialog.pattern)
-                        .desired_width(360.0)
-                        .hint_text("glob pattern"),
-                );
-                ui.checkbox(&mut dialog.persist, "Persist to config");
+                ui.separator();
+
+                // --- Filename ----------------------------------------------
+                ui.horizontal(|ui| {
+                    let (_, valid) =
+                        pattern_edit(ui, &mut dialog.name_pattern, 240.0, "filename or glob");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(valid, bordered_button("Ignore this filename", ORANGE))
+                            .clicked()
+                        {
+                            chosen = Some(dialog.name_pattern.trim().to_string());
+                        }
+                    });
+                });
+                ui.separator();
+
+                // --- Directory ---------------------------------------------
+                ui.horizontal(|ui| {
+                    let (_, valid) =
+                        pattern_edit(ui, &mut dialog.dir_pattern, 240.0, "directory glob");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled(valid, bordered_button("Ignore this directory", ORANGE))
+                            .clicked()
+                        {
+                            chosen = Some(dialog.dir_pattern.trim().to_string());
+                        }
+                    });
+                });
+                ui.separator();
+
+                // --- Persist + close ---------------------------------------
+                egui::Frame::new()
+                    .stroke(egui::Stroke::new(1.0, BLUE))
+                    .corner_radius(4)
+                    .inner_margin(egui::Margin::symmetric(6, 3))
+                    .show(ui, |ui| {
+                        ui.checkbox(&mut dialog.persist, "Persist to config");
+                    });
                 ui.label(
                     egui::RichText::new(
                         "Session filters hide results immediately. Persisted filters also \
@@ -631,27 +711,19 @@ impl SearchTab {
                     .small()
                     .weak(),
                 );
-                ui.horizontal(|ui| {
-                    if ui.button("Apply").clicked() {
-                        apply = true;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
             });
-        if apply {
+        if let Some(pattern) = chosen {
             let dialog = self.ignore_dialog.take().unwrap();
-            let pattern = dialog.pattern.trim().to_string();
-            if !pattern.is_empty() {
-                if !self.session_ignores.contains(&pattern) {
-                    self.session_ignores.push(pattern.clone());
-                }
-                if dialog.persist {
-                    actions.persist_ignore = Some(pattern);
-                }
-                actions.rerun = true;
+            if !self.session_ignores.contains(&pattern) {
+                self.session_ignores.push(pattern.clone());
             }
+            if dialog.persist {
+                actions.persist_ignore = Some(pattern);
+            }
+            actions.rerun = true;
         } else if cancel {
             self.ignore_dialog = None;
         }
@@ -944,4 +1016,97 @@ fn recency_color(ui: &egui::Ui, mtime: i64) -> egui::Color32 {
         lerp(fresh.g(), old.g()),
         lerp(fresh.b(), old.b()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tab_with_results(n: usize) -> SearchTab {
+        let mut tab = SearchTab::new(false);
+        tab.query = "alpha".into();
+        tab.focus_query = false;
+        tab.results = (0..n)
+            .map(|i| SearchHit {
+                file_id: i as i64,
+                name: format!("alpha_widget_{i}.txt"),
+                path: format!("/qs-test/alpha_widget_{i}.txt"),
+                size: 116,
+                mtime: 1_700_000_000,
+                rank: 3.0,
+                stage: 1,
+                snippet: None,
+            })
+            .collect();
+        tab.order = (0..n as u32).collect();
+        tab
+    }
+
+    fn run_frame(
+        ctx: &egui::Context,
+        tab: &mut SearchTab,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                tab.ui(ui);
+            });
+        })
+    }
+
+    /// Walk the pointer down the name column until it sits on `row`'s label
+    /// glyphs. The text cursor proves a selectable label won the hit-test —
+    /// exactly the case where row hover, clicks, and the context menu used
+    /// to go dead — while `hovered_row` proves the row still tracks hover.
+    fn hover_row_text(ctx: &egui::Context, tab: &mut SearchTab, row: usize) -> egui::Pos2 {
+        for y in 40..250 {
+            let pos = egui::pos2(60.0, y as f32);
+            let out = run_frame(ctx, tab, vec![egui::Event::PointerMoved(pos)]);
+            let over_text = out.platform_output.cursor_icon == egui::CursorIcon::Text;
+            if over_text && tab.hovered_row == Some(row) {
+                return pos;
+            }
+        }
+        panic!("never landed on row {row}'s label text");
+    }
+
+    fn click(pos: egui::Pos2, button: egui::PointerButton) -> Vec<egui::Event> {
+        [true, false]
+            .into_iter()
+            .map(|pressed| egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rows_respond_over_selectable_label_text() {
+        let ctx = egui::Context::default();
+        let mut tab = tab_with_results(3);
+        run_frame(&ctx, &mut tab, Vec::new());
+
+        // Hovering glyphs still marks the row hovered (drives the hover fill).
+        let pos = hover_row_text(&ctx, &mut tab, 0);
+
+        // Left click on glyphs selects the row.
+        run_frame(&ctx, &mut tab, click(pos, egui::PointerButton::Primary));
+        assert_eq!(tab.selected, Some(0));
+
+        // Right click on glyphs selects the row and opens the context menu.
+        let pos = hover_row_text(&ctx, &mut tab, 1);
+        run_frame(&ctx, &mut tab, click(pos, egui::PointerButton::Secondary));
+        assert_eq!(tab.selected, Some(1));
+        assert!(egui::Popup::is_any_open(&ctx));
+    }
 }

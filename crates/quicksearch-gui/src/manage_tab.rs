@@ -23,15 +23,18 @@ pub struct ManageActions {
 
 pub struct ManageTab {
     pub speed: SpeedTracker,
-    /// Multiline editors, one entry per line; synced from config on tab
-    /// entry and parsed back on Apply.
+    /// Multiline editor, one extension per line; synced from config and
+    /// parsed back on Apply.
     ext_filter_text: String,
-    ignore_filter_text: String,
     new_root: String,
+    /// Text of the inline "add ignore pattern" box.
+    new_ignore: String,
     /// Inline error from a rejected root add (nested/duplicate).
     root_error: Option<String>,
-    editors_synced: bool,
-    /// Draft of the indexing/processing knobs edited in-place.
+    /// The config the draft was last synced from. `None` forces a full
+    /// resync (first frame, and right after our own Apply).
+    baseline: Option<Config>,
+    /// Draft of the roots/filters/indexing knobs edited in-place.
     draft: Option<Config>,
 }
 
@@ -40,10 +43,10 @@ impl ManageTab {
         ManageTab {
             speed: SpeedTracker::new(),
             ext_filter_text: String::new(),
-            ignore_filter_text: String::new(),
             new_root: String::new(),
+            new_ignore: String::new(),
             root_error: None,
-            editors_synced: false,
+            baseline: None,
             draft: None,
         }
     }
@@ -62,18 +65,48 @@ impl ManageTab {
         }
     }
 
+    /// Reconcile the draft with the live config, every frame. This is what
+    /// keeps the ignore-pattern list realtime: a filter persisted from the
+    /// Search tab shows up here on the next frame, staged edits or not.
     fn sync_editors(&mut self, config: &Config) {
-        if !self.editors_synced {
-            self.ext_filter_text = config.indexing.content_extensions.join("\n");
-            self.ignore_filter_text = config.indexing.ignore_patterns.join("\n");
-            self.draft = Some(config.clone());
-            self.editors_synced = true;
+        let Some(baseline) = &self.baseline else {
+            // First frame, or right after our own Apply.
+            return self.resync(config);
+        };
+        if baseline == config {
+            return;
         }
+        // The config changed elsewhere (Options apply, a filter persisted
+        // from the Search tab, the fuzzy toggle's direct save…).
+        let dirty = self.draft.as_ref() != Some(baseline)
+            || self.ext_filter_text != baseline.indexing.content_extensions.join("\n");
+        if !dirty {
+            // Nothing staged, nothing to lose.
+            return self.resync(config);
+        }
+        // Staged edits exist: keep the sections this tab edits, adopt
+        // everything else so a later Apply cannot revert changes made
+        // elsewhere, and fold in ignore patterns added externally.
+        let draft = self.draft.take().expect("synced");
+        let mut merged = config.clone();
+        merged.paths.indexing_paths = draft.paths.indexing_paths;
+        merged.indexing = draft.indexing;
+        merged.processing = draft.processing;
+        for pat in &config.indexing.ignore_patterns {
+            if !baseline.indexing.ignore_patterns.contains(pat)
+                && !merged.indexing.ignore_patterns.contains(pat)
+            {
+                merged.indexing.ignore_patterns.push(pat.clone());
+            }
+        }
+        self.draft = Some(merged);
+        self.baseline = Some(config.clone());
     }
 
-    /// Force a re-sync next frame (config changed elsewhere).
-    pub fn invalidate_editors(&mut self) {
-        self.editors_synced = false;
+    fn resync(&mut self, config: &Config) {
+        self.ext_filter_text = config.indexing.content_extensions.join("\n");
+        self.draft = Some(config.clone());
+        self.baseline = Some(config.clone());
     }
 
     pub fn ui(
@@ -85,7 +118,7 @@ impl ManageTab {
         let mut actions = ManageActions::default();
         self.sync_editors(config);
 
-        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        let scroll = egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
             // --- Status ---------------------------------------------------
             ui.heading("Status");
             status_panel(ui, state, &self.speed);
@@ -240,11 +273,57 @@ impl ManageTab {
                         .hint_text("txt\nmd\npdf"),
                 );
                 cols[1].label("Ignore patterns (excluded entirely):");
-                cols[1].add(
-                    egui::TextEdit::multiline(&mut self.ignore_filter_text)
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY)
-                        .hint_text(".git\nnode_modules\n*.tmp"),
+                let mut remove_pat: Option<usize> = None;
+                for (i, pat) in draft.indexing.ignore_patterns.iter().enumerate() {
+                    cols[1].horizontal(|ui| {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("Remove").clicked() {
+                                    remove_pat = Some(i);
+                                }
+                                ui.with_layout(
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.monospace(pat);
+                                    },
+                                );
+                            },
+                        );
+                    });
+                }
+                if draft.indexing.ignore_patterns.is_empty() {
+                    cols[1].label(egui::RichText::new("No ignore patterns.").small().weak());
+                }
+                if let Some(i) = remove_pat {
+                    draft.indexing.ignore_patterns.remove(i);
+                }
+                cols[1].horizontal(|ui| {
+                    let (response, valid) = crate::ui_util::pattern_edit(
+                        ui,
+                        &mut self.new_ignore,
+                        180.0,
+                        "*.tmp or node_modules",
+                    );
+                    let submitted =
+                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.add_enabled(valid, egui::Button::new("Add")).clicked()
+                        || (submitted && valid)
+                    {
+                        let pat = self.new_ignore.trim().to_string();
+                        if !draft.indexing.ignore_patterns.contains(&pat) {
+                            draft.indexing.ignore_patterns.push(pat);
+                        }
+                        self.new_ignore.clear();
+                    }
+                });
+                cols[1].label(
+                    egui::RichText::new(
+                        "Changes apply on Apply & Save (may trigger a rebuild). \
+                         Session-only filters are shown and removed on the Search tab.",
+                    )
+                    .small()
+                    .weak(),
                 );
             });
             ui.separator();
@@ -256,19 +335,25 @@ impl ManageTab {
             config_editor_ui(ui, draft, Section::Processing);
             ui.add_space(8.0);
 
-            if ui.button("Apply & Save").clicked() {
+            if ui
+                .add(crate::ui_util::bordered_button(
+                    "Apply & Save",
+                    crate::ui_util::BLUE,
+                ))
+                .clicked()
+            {
                 let mut new_config = draft.clone();
                 new_config.indexing.content_extensions = parse_lines(&self.ext_filter_text);
-                new_config.indexing.ignore_patterns = parse_lines(&self.ignore_filter_text);
                 let roots = new_config.paths.indexing_paths.clone();
                 new_config
                     .indexing
                     .root_workers
                     .retain(|root, _| roots.contains(root));
                 actions.apply_config = Some(new_config);
-                self.editors_synced = false;
+                self.baseline = None;
             }
         });
+        crate::ui_util::more_below_hint(ui, &scroll);
 
         actions
     }
@@ -443,5 +528,100 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
     });
     if let Some(f) = &r.current_file {
         ui.label(egui::RichText::new(middle_truncate(f, 90)).small().weak());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synced_tab(config: &Config) -> ManageTab {
+        let mut tab = ManageTab::new();
+        tab.sync_editors(config);
+        tab
+    }
+
+    #[test]
+    fn identical_config_leaves_draft_untouched() {
+        let cfg = Config::default();
+        let mut tab = synced_tab(&cfg);
+        // Stage an edit, then sync against the unchanged config.
+        tab.draft.as_mut().unwrap().indexing.ignore_patterns.push("*.log".into());
+        tab.sync_editors(&cfg);
+        assert!(tab
+            .draft
+            .as_ref()
+            .unwrap()
+            .indexing
+            .ignore_patterns
+            .contains(&"*.log".to_string()));
+    }
+
+    #[test]
+    fn clean_draft_adopts_external_changes_wholesale() {
+        let cfg = Config::default();
+        let mut tab = synced_tab(&cfg);
+        let mut external = cfg.clone();
+        external.indexing.ignore_patterns.push("*.log".into());
+        external.search.fuzzy_default = !external.search.fuzzy_default;
+        tab.sync_editors(&external);
+        assert_eq!(tab.draft.as_ref().unwrap(), &external);
+        assert_eq!(tab.baseline.as_ref().unwrap(), &external);
+    }
+
+    #[test]
+    fn staged_edits_survive_an_external_persist() {
+        let cfg = Config::default();
+        let mut tab = synced_tab(&cfg);
+        // Stage a removal of the first default pattern.
+        let removed = tab
+            .draft
+            .as_mut()
+            .unwrap()
+            .indexing
+            .ignore_patterns
+            .remove(0);
+        // Meanwhile the Search tab persists a new filter.
+        let mut external = cfg.clone();
+        external.indexing.ignore_patterns.push("*.log".into());
+        tab.sync_editors(&external);
+        let draft = tab.draft.as_ref().unwrap();
+        assert!(!draft.indexing.ignore_patterns.contains(&removed));
+        assert!(draft.indexing.ignore_patterns.contains(&"*.log".to_string()));
+        assert_eq!(tab.baseline.as_ref().unwrap(), &external);
+    }
+
+    #[test]
+    fn dirty_draft_adopts_sections_owned_elsewhere() {
+        let cfg = Config::default();
+        let mut tab = synced_tab(&cfg);
+        tab.draft.as_mut().unwrap().indexing.ignore_patterns.push("*.bak".into());
+        // The fuzzy toggle saves the config directly, outside this tab.
+        let mut external = cfg.clone();
+        external.search.fuzzy_default = !cfg.search.fuzzy_default;
+        tab.sync_editors(&external);
+        let draft = tab.draft.as_ref().unwrap();
+        assert_eq!(draft.search.fuzzy_default, external.search.fuzzy_default);
+        assert!(draft.indexing.ignore_patterns.contains(&"*.bak".to_string()));
+    }
+
+    #[test]
+    fn external_pattern_is_not_duplicated_into_a_draft_that_has_it() {
+        let cfg = Config::default();
+        let mut tab = synced_tab(&cfg);
+        tab.draft.as_mut().unwrap().indexing.ignore_patterns.push("*.log".into());
+        let mut external = cfg.clone();
+        external.indexing.ignore_patterns.push("*.log".into());
+        tab.sync_editors(&external);
+        let count = tab
+            .draft
+            .as_ref()
+            .unwrap()
+            .indexing
+            .ignore_patterns
+            .iter()
+            .filter(|p| p.as_str() == "*.log")
+            .count();
+        assert_eq!(count, 1);
     }
 }
