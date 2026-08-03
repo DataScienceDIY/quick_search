@@ -18,8 +18,8 @@ use std::path::Path;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use super::schema::{
-    effective_tokenizer, fts_create_sql, PRAGMAS_FAST, PRAGMAS_READONLY, PRAGMAS_WALK_READER,
-    SCHEMA_CURRENT,
+    effective_tokenizer, fts_create_sql, PRAGMAS_FAST, PRAGMAS_MAINTENANCE, PRAGMAS_READONLY,
+    PRAGMAS_WALK_READER, SCHEMA_CURRENT,
 };
 use crate::security::IndexKey;
 
@@ -33,7 +33,7 @@ pub const KEY_MISMATCH_PREFIX: &str = "KEY_MISMATCH: ";
 /// a way that makes an old DB unreadable by new code. Any such bump
 /// causes existing indexes to be wiped on next open — there's no
 /// migration path by design.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Open `db_path`, applying fast-path pragmas, and ensure the on-disk
 /// schema matches what this build expects. If it doesn't, delete the
@@ -114,6 +114,17 @@ pub fn open_walk_reader(db_path: &str) -> Result<Connection, String> {
     )
 }
 
+/// A writable connection for post-run compaction, and the only one that may
+/// VACUUM. See [`PRAGMAS_MAINTENANCE`] for why it cannot be the indexer's.
+pub fn open_maintenance(db_path: &str) -> Result<Connection, String> {
+    open_keyed_with_pragmas(
+        db_path,
+        true,
+        super::key::process_key().as_ref(),
+        PRAGMAS_MAINTENANCE,
+    )
+}
+
 pub(crate) fn open_existing_keyed(
     db_path: &str,
     write: bool,
@@ -155,8 +166,63 @@ fn open_keyed_with_pragmas(
 /// index. Used by the GUI unlock screen and the CLI prompt loop before any
 /// service starts; the error carries [`KEY_MISMATCH_PREFIX`] on a wrong
 /// password.
+///
+/// Answers **only** the key question. It deliberately does not go through
+/// [`open_existing`], which additionally demands a current schema — a
+/// different question, with a different owner. Whether the stored schema is
+/// current is the *indexer's* business, and its answer is to wipe and rebuild
+/// ([`open_or_recreate`]); an unlock screen has nothing useful to do with it.
+///
+/// Conflating the two made every schema bump present itself to anyone using
+/// password protection as an unlock failure, with no way past the gate even
+/// with the correct password:
+///
+/// ```text
+/// index at …/index.sqlite is not a compatible QuickSearch index
+/// (schema v4 expected); refusing to modify it. Re-index to rebuild.
+/// ```
+///
+/// An unprotected install in the same state starts fine and rebuilds on its
+/// first run; this keeps the protected one behaving the same way.
 pub fn verify_process_key(db_path: &str) -> Result<(), String> {
-    open_existing(db_path, false).map(|_| ())
+    verify_key(db_path, super::key::process_key().as_ref())
+}
+
+/// Whether an existing index will be discarded and rebuilt by the next
+/// indexing run because it was written under a different schema version.
+///
+/// The GUI asks this at startup so it can *say so*. The wipe is otherwise
+/// silent: `open_or_recreate` replaces the file, every search fails in the
+/// meantime, and the only visible explanation is a schema-version error
+/// string — which reads like data loss rather than a version upgrade.
+///
+/// `false` for anything this cannot positively establish: no file yet, a file
+/// the process key does not open, or a database that cannot be queried at all.
+/// Announcing a reset that is not happening would be worse than saying nothing.
+pub fn index_needs_rebuild(db_path: &str) -> bool {
+    let Ok(conn) = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return false;
+    };
+    if key_and_probe(&conn, db_path, super::key::process_key().as_ref()).is_err() {
+        return false;
+    }
+    // Only `Ok(false)` — a version we read and it differed, or a layout with no
+    // `schema_info` at all. An `Err` means we could not tell.
+    matches!(schema_version_current(&conn), Ok(false))
+}
+
+pub(crate) fn verify_key(db_path: &str, key: Option<&IndexKey>) -> Result<(), String> {
+    // Read-only and no CREATE: verifying a key must never bring a database
+    // into existence, and must never modify one.
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|e| format!("Failed to open database at {}: {}", db_path, e))?;
+    key_and_probe(&conn, db_path, key)
 }
 
 /// Apply the SQLCipher key (if any) and force the first page off disk.
@@ -624,6 +690,84 @@ mod tests {
             .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
         drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// The one difference that makes the maintenance profile exist.
+    ///
+    /// SQLCipher is compiled `-DSQLITE_TEMP_STORE=2`, under which SQLite puts
+    /// temporary databases in memory for any `temp_store` but an explicit
+    /// `FILE` (1). VACUUM builds the whole replacement index in that temporary
+    /// database, so on the indexer's connection — which sets `MEMORY` — it
+    /// would try to hold a rebuilt multi-gigabyte index in RAM.
+    #[test]
+    fn maintenance_opens_keep_temporaries_on_disk() {
+        let p = tmp_db_path();
+        {
+            let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+            let indexer: i64 = conn.query_row("PRAGMA temp_store", [], |r| r.get(0)).unwrap();
+            assert_eq!(indexer, 2, "the indexer's own profile is MEMORY");
+        }
+
+        let conn = open_maintenance(p.to_str().unwrap()).unwrap();
+        let store: i64 = conn.query_row("PRAGMA temp_store", [], |r| r.get(0)).unwrap();
+        assert_eq!(store, 1, "maintenance must build its temporaries on disk");
+
+        // And the directory those temporaries land in is steerable, which is
+        // what keeps them off a RAM-backed /tmp. Deprecated but present.
+        let dir = p.parent().unwrap().to_string_lossy().into_owned();
+        conn.execute_batch(&format!("PRAGMA temp_store_directory = '{}';", dir))
+            .unwrap();
+        let set: String = conn
+            .query_row("PRAGMA temp_store_directory", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(set, dir);
+        conn.execute_batch("PRAGMA temp_store_directory = '';").unwrap();
+
+        drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Drives the GUI's "your index is being reset" modal, so a false positive
+    /// announces a wipe that is not happening and a false negative lets one
+    /// happen in silence.
+    #[test]
+    fn index_needs_rebuild_only_when_the_schema_really_differs() {
+        let p = tmp_db_path();
+        assert!(
+            !index_needs_rebuild(p.to_str().unwrap()),
+            "no file yet is a fresh install, not a reset"
+        );
+
+        {
+            let _ = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        }
+        assert!(
+            !index_needs_rebuild(p.to_str().unwrap()),
+            "a current index is not going to be rebuilt"
+        );
+
+        // Age it, exactly as a version bump does.
+        {
+            let conn = open_existing(p.to_str().unwrap(), true).unwrap();
+            conn.execute("UPDATE schema_info SET value = '1' WHERE key = 'version'", [])
+                .unwrap();
+        }
+        assert!(index_needs_rebuild(p.to_str().unwrap()));
+
+        // A pre-`schema_info` layout counts too.
+        std::fs::remove_file(&p).ok();
+        {
+            let conn = Connection::open(&p).unwrap();
+            conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT)", [])
+                .unwrap();
+        }
+        assert!(index_needs_rebuild(p.to_str().unwrap()));
+
+        // Not a database at all: we cannot tell, so we say nothing.
+        std::fs::write(&p, [0x5a; 4096]).unwrap();
+        assert!(!index_needs_rebuild(p.to_str().unwrap()));
+
         std::fs::remove_file(&p).ok();
     }
 

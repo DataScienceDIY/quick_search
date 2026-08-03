@@ -4,11 +4,11 @@
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use quicksearch_core::cli::{index_counts, IndexCounts};
+use quicksearch_core::cli::IndexCounts;
 use quicksearch_core::config::{diff_actions, nested_roots, Config, SecurityConfig};
 use quicksearch_core::coordinator::{IndexMode, IndexerState, WatcherStatus};
 use quicksearch_core::db;
-use quicksearch_core::indexing::{ConfigChange, IndexingStatus, RootPhase};
+use quicksearch_core::indexing::{overall_progress, ConfigChange, IndexingStatus, RootPhase};
 use quicksearch_core::search::SearchOptions;
 use quicksearch_core::security::{derive_key, generate_salt, salt_to_hex, IndexKey};
 use quicksearch_core::watcher::WatchError;
@@ -22,6 +22,7 @@ use crate::logs_tab::LogsTab;
 use crate::manage_tab::ManageTab;
 use crate::options::{OptionsWindow, SecurityAction};
 use crate::search_tab::SearchTab;
+use crate::unlock::KeySource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -50,6 +51,12 @@ pub struct QuickSearchApp {
     /// Nested roots found in the loaded config (startup validation); shown
     /// as a modal over the Manage tab until dismissed.
     nested_prompt: Option<Vec<(String, String)>>,
+    /// How this session's key was obtained, for wording that refers to it.
+    key_source: KeySource,
+    /// Set when the index on disk was written by a different schema version
+    /// and the next run will replace it; see
+    /// [`QuickSearchApp::stale_index_prompt_ui`].
+    stale_index_prompt: bool,
     /// Set when the watcher gave up on the directory budget and live
     /// updates are off; see [`QuickSearchApp::check_watch_cap_warning`].
     watch_cap_prompt: Option<WatchError>,
@@ -100,6 +107,7 @@ impl QuickSearchApp {
         cfg: Config,
         config_error: Option<String>,
         initial_query: Option<String>,
+        key_source: KeySource,
     ) -> Result<QuickSearchApp, String> {
         // Compact styling: results density is the whole point.
         ctx.style_mut(|style| {
@@ -107,6 +115,13 @@ impl QuickSearchApp {
             style.spacing.button_padding = egui::vec2(6.0, 2.0);
         });
         ctx.set_zoom_factor(clamp_scale(cfg.ui.scale));
+
+        // Probed *before* the backend exists. The coordinator can begin a full
+        // run — and with it the wipe — the moment it starts, and afterwards
+        // there is nothing left on disk to tell an upgrade apart from a fresh
+        // install.
+        let stale_index_prompt =
+            db::index_needs_rebuild(&cfg.resolved_database_path().to_string_lossy());
 
         let backend = Backend::start(&cfg, ctx.clone())?;
         let fuzzy = cfg.search.fuzzy_default;
@@ -137,6 +152,8 @@ impl QuickSearchApp {
             rebuild_prompt: None,
             clear_prompt: false,
             nested_prompt,
+            key_source,
+            stale_index_prompt,
             watch_cap_prompt: None,
             security_prompt: None,
             config_error,
@@ -259,6 +276,28 @@ impl QuickSearchApp {
                 Err(_) => break,
             }
         }
+        // Status-bar counts worker.
+        if let Some(rx) = &self.backend.counts_job {
+            match rx.try_recv() {
+                Ok(counts) => {
+                    self.counts = Some((Instant::now(), counts));
+                    self.backend.counts_job = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                // The worker gave up (missing or unreadable index). Keep the
+                // last known figures but restamp them, so the next attempt
+                // waits its turn instead of respawning a thread every frame.
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let last = self.counts.map(|(_, c)| c).unwrap_or(IndexCounts {
+                        files: 0,
+                        content_done: 0,
+                        content_pending: 0,
+                    });
+                    self.counts = Some((Instant::now(), last));
+                    self.backend.counts_job = None;
+                }
+            }
+        }
         // Duplicates worker.
         if let Some(rx) = &self.backend.dup_job {
             match rx.try_recv() {
@@ -349,14 +388,10 @@ impl QuickSearchApp {
                             .map(|(at, _)| at.elapsed() > Duration::from_secs(5))
                             .unwrap_or(true);
                         if stale {
-                            let db = self.cfg.resolved_database_path();
-                            let counts =
-                                index_counts(&db.to_string_lossy()).unwrap_or(IndexCounts {
-                                    files: 0,
-                                    content_done: 0,
-                                    content_pending: 0,
-                                });
-                            self.counts = Some((Instant::now(), counts));
+                            // Kicked off, not awaited: the result lands through
+                            // `drain_events` on a later frame.
+                            let cfg = self.cfg.clone();
+                            self.backend.start_index_counts(&cfg, ctx.clone());
                         }
                         let files = self.counts.map(|(_, c)| c.files).unwrap_or(0);
                         ui.label(
@@ -377,25 +412,25 @@ impl QuickSearchApp {
                     IndexingStatus::Stopping => {
                         ui.label(egui::RichText::new("Stopping indexing…").small());
                     }
+                    IndexingStatus::Optimizing => {
+                        ui.label(egui::RichText::new("Optimizing index…").small());
+                    }
                     IndexingStatus::Running { roots, .. } => {
                         let done = roots.iter().filter(|r| r.phase == RootPhase::Done).count();
-                        let processed: usize = roots.iter().map(|r| r.walked + r.extracted).sum();
-                        let totals_known = roots.iter().all(|r| r.walk_total.is_some());
-                        let denominator: usize = roots
-                            .iter()
-                            .map(|r| r.walk_total.unwrap_or(0) + r.extract_total)
-                            .sum();
+                        let progress = overall_progress(roots);
+                        let frac = progress.fraction();
 
-                        let mut text = if totals_known && denominator > 0 {
-                            let frac = (processed as f64 / denominator as f64).min(1.0);
-                            format!(
+                        let mut text = match (progress.total, frac) {
+                            (Some(total), Some(frac)) => format!(
                                 "Indexing {} / {} ({:.0}%)",
-                                group_thousands(processed as u64),
-                                group_thousands(denominator as u64),
+                                group_thousands(progress.processed as u64),
+                                group_thousands(total as u64),
                                 frac * 100.0
-                            )
-                        } else {
-                            format!("Indexing · {} files", group_thousands(processed as u64))
+                            ),
+                            _ => format!(
+                                "Indexing · {} files",
+                                group_thousands(progress.processed as u64)
+                            ),
                         };
                         if roots.len() > 1 {
                             text.push_str(&format!(" · {}/{} roots done", done, roots.len()));
@@ -409,11 +444,13 @@ impl QuickSearchApp {
                             text.push_str(&format!(" · {}/{} workers", active, total_workers));
                         }
                         ui.label(egui::RichText::new(text).small());
-                        if totals_known && denominator > 0 {
-                            let frac = (processed as f32 / denominator as f32).clamp(0.0, 1.0);
-                            ui.add(egui::ProgressBar::new(frac).desired_width(120.0));
-                        } else {
-                            ui.add(egui::Spinner::new().size(12.0));
+                        match frac {
+                            Some(frac) => {
+                                ui.add(egui::ProgressBar::new(frac as f32).desired_width(120.0));
+                            }
+                            None => {
+                                ui.add(egui::Spinner::new().size(12.0));
+                            }
                         }
                     }
                 }
@@ -781,6 +818,26 @@ impl QuickSearchApp {
         }
     }
 
+    /// Tell the user their index is being replaced because it belongs to an
+    /// older version — rather than letting them discover it as a run of failed
+    /// searches.
+    ///
+    /// This is the one modal that is not a question. The old index genuinely
+    /// cannot be read by this build, so there is no "keep it" branch to offer;
+    /// the button starts the rebuild rather than merely dismissing, which is
+    /// what makes the promise true in manual mode as well as automatic.
+    fn stale_index_prompt_ui(&mut self, ctx: &egui::Context) {
+        if !self.stale_index_prompt {
+            return;
+        }
+        if stale_index_window(ctx, self.key_source) {
+            self.stale_index_prompt = false;
+            self.backend.coordinator.rebuild_index();
+            self.counts = None;
+            self.dups.state = DupState::NotLoaded;
+        }
+    }
+
     fn watch_cap_prompt_ui(&mut self, ctx: &egui::Context) {
         let Some(reason) = &self.watch_cap_prompt else {
             return;
@@ -902,6 +959,60 @@ impl QuickSearchApp {
 fn pin_live_fields(new: &mut Config, live: &Config) {
     new.security = live.security.clone();
     new.indexing.auto_index = live.indexing.auto_index;
+}
+
+/// The stale-index window's body. Returns whether the user asked for the
+/// rebuild.
+///
+/// Split out from the method so it can be rendered, and its button clicked, in
+/// a headless egui context — building a whole [`QuickSearchApp`] would start a
+/// coordinator and a watcher.
+fn stale_index_window(ctx: &egui::Context, key_source: KeySource) -> bool {
+    let mut rebuild = false;
+    egui::Window::new("Index reset for this version")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_max_width(440.0);
+            ui.label(
+                "Your search index was created by an older version of QuickSearch, \
+                 which this version cannot read. It is being reset and rebuilt from \
+                 scratch. Don't worry, this is very Quick!",
+            );
+            // Only says "you just entered" when that actually happened: with
+            // the key remembered on this device there was no prompt to type
+            // into, and naming one the user never saw would just confuse.
+            let reassurance = match key_source {
+                KeySource::Unprotected => None,
+                KeySource::Prompt => Some(
+                    "The rebuilt index is encrypted with the password you just \
+                     entered, so it stays password protected.",
+                ),
+                KeySource::Keychain => Some(
+                    "The rebuilt index is encrypted with the key remembered on \
+                     this device, so it stays password protected.",
+                ),
+            };
+            if let Some(text) = reassurance {
+                ui.add_space(4.0);
+                ui.label(text);
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Your files are not touched. Searches return incomplete results \
+                     until the rebuild finishes; progress is on the Manage Index tab.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.add_space(4.0);
+            if ui.button("Rebuild now").clicked() {
+                rebuild = true;
+            }
+        });
+    rebuild
 }
 
 /// A stored/current config value for the rebuild prompt; list values are
@@ -1034,6 +1145,10 @@ impl eframe::App for QuickSearchApp {
         self.security_prompt_ui(ctx);
         self.clear_prompt_ui(ctx);
         self.nested_prompt_ui(ctx);
+        // Ahead of the watch-cap warning: on a fresh upgrade both can be true,
+        // and "your index is being rebuilt" is the one that explains what the
+        // user is actually looking at.
+        self.stale_index_prompt_ui(ctx);
         self.watch_cap_prompt_ui(ctx);
     }
 
@@ -1045,6 +1160,68 @@ impl eframe::App for QuickSearchApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(ctx: &egui::Context, source: KeySource, events: Vec<egui::Event>) -> bool {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut clicked = false;
+        let _ = ctx.run(input, |ctx| clicked = stale_index_window(ctx, source));
+        clicked
+    }
+
+    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
+        [true, false]
+            .into_iter()
+            .map(|pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            })
+            .collect()
+    }
+
+    /// The modal the user sees after unlocking onto an index from an older
+    /// version. It must render under every key source — each produces a
+    /// different height — and its one button must actually report the click,
+    /// since that click is what starts the rebuild. A dead button would leave
+    /// the promise ("it is being rebuilt") unkept in manual mode.
+    #[test]
+    fn the_stale_index_modal_renders_and_its_button_fires() {
+        for source in [
+            KeySource::Unprotected,
+            KeySource::Prompt,
+            KeySource::Keychain,
+        ] {
+            let ctx = egui::Context::default();
+            assert!(
+                !frame(&ctx, source, Vec::new()),
+                "an untouched frame must not request a rebuild"
+            );
+
+            // Sweep the window for the button rather than hard-coding its
+            // position: it is left-aligned at the bottom of a centre-anchored
+            // window whose height depends on which sentence is shown, and
+            // pinning coordinates would make this a layout test.
+            let mut fired = None;
+            'sweep: for y in (230..480).step_by(3) {
+                for x in (250..760).step_by(6) {
+                    let pos = egui::pos2(x as f32, y as f32);
+                    if frame(&ctx, source, click_at(pos)) {
+                        fired = Some(pos);
+                        break 'sweep;
+                    }
+                }
+            }
+            assert!(fired.is_some(), "no clickable Rebuild button for {source:?}");
+        }
+    }
 
     #[test]
     fn a_stale_draft_cannot_revert_the_indexing_mode_or_security() {

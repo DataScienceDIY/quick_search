@@ -7,10 +7,12 @@
 //! stale — and only appears on the second run.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use quicksearch_core::config::Config;
-use quicksearch_core::indexing::{IndexingService, IndexingStatus};
+use quicksearch_core::file_handling::{extract_scope_prepare, ExtractCursor};
+use quicksearch_core::indexing::{IndexingService, IndexingStatus, RootPhase};
 
 fn tmp_dir(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -271,6 +273,137 @@ fn stopping_mid_run_deletes_nothing() {
 }
 
 #[test]
+fn a_stamped_run_has_finished_its_stale_cleanup() {
+    // `last_full_index` is what the coordinator schedules the next periodic
+    // reindex from. Stamping it for a run that was cut short suppresses
+    // reindexing for the whole interval (24 h by default) — and the damage is
+    // concrete: stale cleanup is skipped when the run is stopped, so rows for
+    // files that no longer exist stay in the index and keep turning up in
+    // search results until something else forces a rebuild.
+    //
+    // The hole this guards: the writer loop set `aborted` only at the *top* of
+    // an iteration, while the "every root is Done" exit sits at the bottom and
+    // breaks directly. A stop landing inside the pass — or inside stale cleanup
+    // itself, which returns early and leaves rows behind — reached that bottom
+    // break with `aborted` still false and stamped the run as complete.
+    //
+    // The assertion is one-sided on purpose, so timing can never make it fail
+    // spuriously: a stamp *always* has to mean cleanup finished, whether the
+    // stop landed inside the window or never landed at all.
+    let root = tmp_dir("stop-stamp");
+    let db_dir = tmp_dir("stop-stamp-db");
+    let db = db_dir.join("index.sqlite");
+    let mut config = test_config();
+    // Nothing to extract, so a root goes Walking → Done in one pass and the
+    // run's whole tail is the stale cleanup this test wants to interrupt.
+    config.processing.maximum_text_file_size = 0;
+
+    const FILES: usize = 8000;
+    for i in 0..FILES {
+        touch(&root.join(format!("d{}/f{:05}.txt", i % 25, i)), b"body");
+    }
+    index_once(&root, &db, &config);
+    assert_eq!(rows(&db).len(), FILES);
+
+    // Every file vanishes, so the next run has FILES stale rows to delete —
+    // a tail long enough for a stop to land inside it.
+    for i in 0..FILES {
+        std::fs::remove_file(root.join(format!("d{}/f{:05}.txt", i % 25, i))).unwrap();
+    }
+
+    let marker = |db: &Path| -> Option<u64> {
+        let conn = rusqlite::Connection::open(db).ok()?;
+        quicksearch_core::db::repo::get_last_full_index(&conn)
+    };
+
+    for delay_ms in [2u64, 5, 10, 20, 35, 60, 100, 200] {
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
+                .unwrap();
+        }
+        assert_eq!(marker(&db), None, "stamp cleared before the run");
+
+        let service = IndexingService::new();
+        service
+            .start_indexing(
+                vec![root.to_string_lossy().into_owned()],
+                db.to_string_lossy().into_owned(),
+                config.clone(),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        service.stop_indexing().unwrap();
+        drop(service);
+        std::thread::sleep(Duration::from_millis(300));
+
+        if marker(&db).is_some() {
+            assert_eq!(
+                rows(&db).len(),
+                0,
+                "delay {}ms: the run stamped itself complete but left stale rows behind",
+                delay_ms
+            );
+            // Cleanup finished, so there is nothing left for later delays to
+            // interrupt; the rest of the sweep would be vacuous.
+            break;
+        }
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+#[test]
+fn starting_a_run_claims_the_status_before_it_returns() {
+    // The coordinator enforces the single-writer rule by polling
+    // `get_status()`. That is only sound if the Running transition has already
+    // happened when `start_indexing` returns — it used to be performed by the
+    // service's command thread, *after* it joined the previous run's handle,
+    // so a caller could see Idle and start writing to the database this run is
+    // about to reopen (and possibly wipe).
+    let root = tmp_dir("start-claims");
+    let db_dir = tmp_dir("start-claims-db");
+    let db = db_dir.join("index.sqlite");
+    let config = test_config();
+    touch(&root.join("a.txt"), b"body");
+
+    let service = IndexingService::new();
+    service
+        .start_indexing(
+            vec![root.to_string_lossy().into_owned()],
+            db.to_string_lossy().into_owned(),
+            config.clone(),
+        )
+        .unwrap();
+
+    // No sleep, no poll: the very next observation must already be Running.
+    assert!(
+        matches!(service.get_status(), IndexingStatus::Running { .. }),
+        "status must be claimed synchronously, got {:?}",
+        service.get_status()
+    );
+
+    // And a second start is a reportable error rather than a silently
+    // dropped command.
+    let err = service
+        .start_indexing(
+            vec![root.to_string_lossy().into_owned()],
+            db.to_string_lossy().into_owned(),
+            config.clone(),
+        )
+        .unwrap_err();
+    assert!(err.contains("already running"), "got: {}", err);
+
+    service.stop_indexing().unwrap();
+    drop(service);
+    std::thread::sleep(Duration::from_millis(250));
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+#[test]
 fn a_wide_tree_indexes_every_file_exactly_once() {
     // Exercises the parallel walk's chunking and termination against a real
     // database, where a duplicate path would be a UNIQUE violation and a
@@ -444,7 +577,10 @@ fn a_symlink_target_in_an_unwalked_directory_survives_reindexing() {
     let outside = tmp_dir("alias-outside");
     let db_dir = tmp_dir("alias-db");
     let db = db_dir.join("index.sqlite");
-    let config = test_config();
+    // Aliases only exist when links are followed; with the default (off) a
+    // symlink is not resolved at all, which the tail of this test checks.
+    let mut config = test_config();
+    config.indexing.follow_symlinks = true;
 
     touch(&root.join("normal.txt"), b"inside the root");
 
@@ -471,6 +607,16 @@ fn a_symlink_target_in_an_unwalked_directory_survives_reindexing() {
     index_once(&root, &db, &config);
     assert_eq!(rows(&db), first, "an aliased row must survive a re-index");
 
+    // And the other half of the setting: with links off, neither target is
+    // indexed — including the one outside the root, which the user never asked
+    // us to look at. This is also what keeps the full run in agreement with
+    // `filtered_walk`, which the watcher uses and which follows neither kind.
+    let db2 = db_dir.join("links-off.sqlite");
+    index_once(&root, &db2, &test_config());
+    let off: Vec<String> = rows(&db2).into_iter().map(|(p, _, _)| p).collect();
+    assert_eq!(off.len(), 1, "only the ordinary file: {:?}", off);
+    assert!(off[0].ends_with("normal.txt"));
+
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&outside).ok();
     std::fs::remove_dir_all(&db_dir).ok();
@@ -486,7 +632,8 @@ fn a_modified_symlink_target_is_updated_not_silently_ignored() {
     let outside = tmp_dir("alias-mod-outside");
     let db_dir = tmp_dir("alias-mod-db");
     let db = db_dir.join("index.sqlite");
-    let config = test_config();
+    let mut config = test_config();
+    config.indexing.follow_symlinks = true;
 
     let target = outside.join("target.txt");
     touch(&target, b"first body");
@@ -735,6 +882,69 @@ fn undecodable_small_files_are_reported_as_failures_not_silently_skipped() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
+/// End-to-end version of the fix: the extraction denominator the manage-index
+/// tab renders is `extract_total`, and it must count files that need text —
+/// not every indexed file. Asserted through a real `IndexingService` run so it
+/// covers the walk, the batch writers and `extract_scope_prepare` together.
+#[test]
+fn the_extraction_denominator_counts_only_files_that_need_text() {
+    let root = tmp_dir("denominator");
+    let db_dir = tmp_dir("denominator-db");
+    let db = db_dir.join("index.sqlite");
+
+    // Three files an extractor claims, seven it never will. `big.txt` is the
+    // interesting one: larger than `hash_length`, so the walk cannot finish it
+    // inline and it is the only row the content pass actually opens.
+    for name in ["a.txt", "b.json"] {
+        touch(&root.join(name), b"body bytes with no magic");
+    }
+    touch(&root.join("big.txt"), &vec![b'z'; 32 * 1024]);
+    for name in ["d.mp4", "e.zip", "f.bin", "g.exe", "h.iso", "i.so", "j"] {
+        touch(&root.join(name), b"body bytes with no magic");
+    }
+
+    let config = Config::default();
+    index_once(&root, &db, &config);
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count = |state: i64| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE content_state = ?1",
+            [state],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(count(0), 0, "a finished run leaves nothing pending");
+    assert_eq!(count(1), 3, "the claimed files have text");
+    assert_eq!(count(3), 7, "the rest are NA, and were NA from the walk on");
+    drop(conn);
+
+    // The exact call `indexing.rs` makes to fill `RootProgress::extract_total`,
+    // run against the index the full pass just produced. Asserted here rather
+    // than by sampling the live status, which cannot be observed reliably: a
+    // ten-file tree finishes between two polls.
+    let conn = Arc::new(Mutex::new(
+        // Writable: the scope call's first act is the idempotent oversize sweep.
+        quicksearch_core::db::open_existing(db.to_str().unwrap(), true).unwrap(),
+    ));
+    let cursor = ExtractCursor::for_root(root.to_str().unwrap());
+    let scope = extract_scope_prepare(&conn, &cursor, &config).unwrap();
+    assert_eq!(
+        (scope.pending, scope.already_done),
+        (0, 3),
+        "extract_total is the searchable set, not the file count"
+    );
+    // Which is what the row renders: "3 / 3" on an unchanged re-run. Before
+    // this was decided at walk time it read "10 / 10", seven of them files
+    // with nothing to extract.
+    assert_eq!(scope.pending + scope.already_done, 3);
+    drop(conn);
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
 #[test]
 fn an_empty_file_is_done_with_no_snippet_sidecar() {
     let root = tmp_dir("inline-empty");
@@ -818,6 +1028,261 @@ fn contentless_mode_still_indexes_inlined_files_without_storing_bodies() {
         )
         .unwrap();
     assert_eq!(hits, 1, "an inlined file is still searchable in contentless mode");
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// A slow root must not stall the others.
+///
+/// This is the complaint stated directly: one root doing heavy extraction used
+/// to occupy the single writer thread — and the database connection — for a
+/// whole batch of files at a time, during which no other root's walk was
+/// drained at all. Their walker threads filled their channels and blocked.
+///
+/// So the assertion is about *stalls*, not throughput. Throughput would be the
+/// wrong measure: writing is serial by construction (one SQLite connection),
+/// so on a local disk the writer, not extraction, is the bottleneck and a
+/// wall-clock comparison would mostly measure the machine.
+#[test]
+fn a_heavy_root_does_not_stall_a_light_one() {
+    // HEAVY: few files, each big enough that reading it is real work, with a
+    // small `maximum_text_size` so the cost lands in extraction rather than in
+    // the writer's tokenising.
+    let heavy = tmp_dir("stall-heavy");
+    let body: Vec<u8> = "sphinx of black quartz judge my vow ".repeat(40_000).into_bytes();
+    for i in 0..200 {
+        touch(&heavy.join(format!("d{}/big{:04}.txt", i % 8, i)), &body);
+    }
+    // LIGHT: a wide tree of tiny files, so its walk runs long enough to sample
+    // and its progress counter moves finely.
+    let light = tmp_dir("stall-light");
+    for i in 0..6000 {
+        touch(&light.join(format!("d{}/f{:05}.txt", i % 60, i)), b"x");
+    }
+
+    let db_dir = tmp_dir("stall-db");
+    let db = db_dir.join("index.sqlite");
+    let mut config = test_config();
+    config.processing.maximum_text_size = 1024;
+    config.processing.maximum_text_file_size = 8 * 1024 * 1024;
+
+    let service = IndexingService::new();
+    service
+        .start_indexing(
+            vec![
+                heavy.to_string_lossy().into_owned(),
+                light.to_string_lossy().into_owned(),
+            ],
+            db.to_string_lossy().into_owned(),
+            config.clone(),
+        )
+        .unwrap();
+
+    // Sample the light root's progress while the heavy one is extracting, and
+    // keep the longest interval over which it did not move.
+    let mut worst = Duration::ZERO;
+    let mut last_change = Instant::now();
+    let mut last_seen = 0usize;
+    let mut sampled_together = false;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        match service.get_status() {
+            IndexingStatus::Running { roots, .. } => {
+                let heavy_p = roots.iter().find(|r| r.root.contains("stall-heavy"));
+                let light_p = roots.iter().find(|r| r.root.contains("stall-light"));
+                if let (Some(h), Some(l)) = (heavy_p, light_p) {
+                    let light_busy = l.phase != RootPhase::Done;
+                    if h.phase == RootPhase::Extracting && light_busy {
+                        sampled_together = true;
+                        let now = l.walked + l.extracted;
+                        if now != last_seen {
+                            last_seen = now;
+                            last_change = Instant::now();
+                        } else {
+                            worst = worst.max(last_change.elapsed());
+                        }
+                    }
+                }
+            }
+            IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
+            _ => break,
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    service.stop_indexing().unwrap();
+    drop(service);
+
+    assert!(
+        sampled_together,
+        "never observed the two roots overlapping; the fixture is not exercising the case"
+    );
+    // Measured on this fixture: ~20 ms with the extraction pools, ~130 ms when
+    // the file reading is forced back onto the writer thread (and unbounded in
+    // the real failure, where the heavy root is on a network share). The bound
+    // sits between, with several times the observed headroom.
+    //
+    // The fixed design's stall does not grow with the heavy root's cost — it is
+    // one round-robin pass plus one commit — so making that root heavier only
+    // widens the margin.
+    eprintln!("longest light-root stall while heavy extracted: {:?}", worst);
+    assert!(
+        worst < Duration::from_millis(100),
+        "the light root stalled for {:?} while the heavy root extracted",
+        worst
+    );
+
+    std::fs::remove_dir_all(&heavy).ok();
+    std::fs::remove_dir_all(&light).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// The write-ahead log must not grow for the length of a run.
+///
+/// SQLite's autocheckpoint copies committed frames into the index but can only
+/// *reset* the log at an instant no reader holds a read mark — a lock it tries
+/// once, without retrying. A run keeps a reader per root querying continuously,
+/// so that instant does not come and the log appends until the run ends: the
+/// case that prompted this was a 12.5 GiB index carrying a 21.6 GiB log.
+///
+/// So the assertion is about the *peak while running*. It has to be sampled
+/// in flight — `stop_indexing` and the post-run maintenance both truncate the
+/// log on the way out, so a reading taken afterwards proves nothing about what
+/// happened during.
+#[test]
+fn the_wal_stays_bounded_during_a_run() {
+    let root = tmp_dir("wal-bound");
+    // Wide and text-heavy: every file lands in the FTS index, which is what
+    // actually fills the log.
+    let body: Vec<u8> = "sphinx of black quartz judge my vow ".repeat(200).into_bytes();
+    for i in 0..4000 {
+        touch(&root.join(format!("d{}/f{:05}.txt", i % 40, i)), &body);
+    }
+
+    let db_dir = tmp_dir("wal-bound-db");
+    let db = db_dir.join("index.sqlite");
+    let wal = db_dir.join("index.sqlite-wal");
+    let mut config = test_config();
+    // The floor `MINIMUM_WAL_SIZE` clamps to, so the cap is exercised many
+    // times over a fixture this size rather than once at the very end.
+    config.processing.maximum_wal_size = 16 * 1024 * 1024;
+
+    let service = IndexingService::new();
+    service
+        .start_indexing(
+            vec![root.to_string_lossy().into_owned()],
+            db.to_string_lossy().into_owned(),
+            config.clone(),
+        )
+        .unwrap();
+
+    let mut peak = 0u64;
+    let mut checkpointed = false;
+    let mut last = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        let len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        peak = peak.max(len);
+        // A drop in length is a checkpoint that ran mid-run; without one the
+        // bound below could be met simply by the fixture being too small.
+        if len + 1024 * 1024 < last {
+            checkpointed = true;
+        }
+        last = len;
+        match service.get_status() {
+            IndexingStatus::Running { .. } => {}
+            IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
+            _ => break,
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // Let the maintenance pass finish before tearing the service down.
+    let idle_by = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < idle_by && !matches!(service.get_status(), IndexingStatus::Idle) {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    drop(service);
+
+    eprintln!("peak WAL during the run: {} bytes", peak);
+    assert!(
+        checkpointed,
+        "the log never shrank mid-run; the fixture is not exercising the cap"
+    );
+    // Generously above the 16 MiB cap: the check runs between round-robin
+    // rounds, so a round's worth of commits can land on top of it, and a
+    // checkpoint that loses a lock race defers to the next cap of growth.
+    assert!(
+        peak < 96 * 1024 * 1024,
+        "the log peaked at {} bytes against a 16 MiB cap",
+        peak
+    );
+    assert_eq!(after, 0, "the optimize pass leaves an empty log behind");
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// Stopping a run does not skip the optimize pass.
+///
+/// A run cut short is exactly when the log is at its largest and nothing else
+/// will come along to land it: the writer connection closes, and the next run
+/// may be hours away. So Stop ends the *indexing*, and the pass that follows
+/// runs either way — visible as `Optimizing` until it is done.
+#[test]
+fn a_stopped_run_is_still_optimized() {
+    let root = tmp_dir("stop-optimize");
+    let body: Vec<u8> = "sphinx of black quartz judge my vow ".repeat(200).into_bytes();
+    for i in 0..4000 {
+        touch(&root.join(format!("d{}/f{:05}.txt", i % 40, i)), &body);
+    }
+
+    let db_dir = tmp_dir("stop-optimize-db");
+    let db = db_dir.join("index.sqlite");
+    let wal = db_dir.join("index.sqlite-wal");
+
+    let service = IndexingService::new();
+    service
+        .start_indexing(
+            vec![root.to_string_lossy().into_owned()],
+            db.to_string_lossy().into_owned(),
+            test_config(),
+        )
+        .unwrap();
+
+    // Let it get far enough in to have written something worth landing.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        if std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 512 * 1024 {
+            break;
+        }
+        if let IndexingStatus::Error(e) = service.get_status() {
+            panic!("indexing failed: {}", e);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    service.request_stop();
+
+    let mut saw_optimizing = false;
+    let idle_by = Instant::now() + Duration::from_secs(120);
+    loop {
+        match service.get_status() {
+            IndexingStatus::Optimizing => saw_optimizing = true,
+            IndexingStatus::Idle => break,
+            IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
+            _ => {}
+        }
+        assert!(Instant::now() < idle_by, "the stopped run never reached Idle");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert!(saw_optimizing, "a stopped run must still publish Optimizing");
+    assert_eq!(
+        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
+        0,
+        "the optimize pass must land the stopped run's log"
+    );
+    drop(service);
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&db_dir).ok();

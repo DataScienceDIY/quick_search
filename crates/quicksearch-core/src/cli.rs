@@ -173,10 +173,11 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
     })
 }
 
-/// Count files with `content_state = 0` (pending). Distinct from
-/// `files_row_count − searchabletext_row_count`, which over-counts because
-/// files whose content doesn't apply (binary formats, too-large files) sit
-/// with `content_state = 3` (NA) forever and never become FTS rows.
+/// Count files with `content_state = 0` (pending) — files an extractor claims
+/// whose text has not been read yet. Files nothing extracts (binary formats,
+/// too-large files) are written `content_state = 3` (NA) when the walk records
+/// them and are never counted here, so this is outstanding work rather than
+/// `files_row_count − searchabletext_row_count`, which counts those forever.
 ///
 /// Used by the Baloo compat daemon to report the "Files waiting for content
 /// indexing" figure both to balooctl and to the LMDB mirror.
@@ -263,6 +264,7 @@ mod tests {
                     mime: Some("text/plain"),
                     ftype: FileType::TEXT,
                     hash: None,
+                    needs_content: true,
                 },
             )
             .unwrap()
@@ -281,6 +283,7 @@ mod tests {
                     mime: None,
                     ftype: FileType::EMPTY,
                     hash: None,
+                    needs_content: false,
                 },
             )
             .unwrap()
@@ -366,6 +369,7 @@ mod tests {
                     mime: Some("text/plain"),
                     ftype: FileType::TEXT,
                     hash: None,
+                    needs_content: true,
                 },
             )
             .unwrap()
@@ -424,6 +428,7 @@ mod tests {
                         mime: Some("text/plain"),
                         ftype: FileType::TEXT,
                         hash: None,
+                        needs_content: true,
                     },
                 )
                 .unwrap()

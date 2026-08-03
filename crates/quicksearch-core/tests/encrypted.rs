@@ -107,9 +107,50 @@ fn encrypted_index_lifecycle() {
         "plaintext content leaked into the encrypted file"
     );
 
+    // --- Optimizing a keyed index: VACUUM keeps it encrypted. ---
+    //
+    // VACUUM rewrites the whole file through a temporary database that
+    // SQLCipher has to key from the main one. If it did not, the rewrite would
+    // hand back a plaintext index — silently, and only for protected users.
+    //
+    // The slack is manufactured: this tree is two files, and `maintain` only
+    // rewrites a file with something to reclaim.
+    {
+        let conn = db::open_existing(&db_path.to_string_lossy(), true).unwrap();
+        conn.execute_batch(
+            "INSERT INTO files (name, path, parent, size, mtime, type, basic_state, content_state)
+             WITH RECURSIVE n(i) AS (
+                 SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000
+             )
+             SELECT 'p' || i, '/pad/' || i, '/pad', 0, 0, 0, 1, 3 FROM n;
+             DELETE FROM files WHERE parent = '/pad';",
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = db::open::open_maintenance(&db_path.to_string_lossy()).unwrap();
+        let dir = data.to_string_lossy().into_owned();
+        assert!(
+            quicksearch_core::db::repo::maintain(&conn, &dir).unwrap(),
+            "that much slack should have been reclaimed"
+        );
+        drop(conn);
+
+        assert_ne!(
+            &header(&db_path),
+            b"SQLite format 3\0",
+            "the vacuum's replacement file must still be encrypted"
+        );
+        assert_eq!(
+            match_count(&db_path, "zebrapayload"),
+            1,
+            "and still searchable under the same key"
+        );
+    }
+
     // --- Wrong password / no password: tagged error, file intact. ---
     let before = std::fs::read(&db_path).unwrap();
-    db::set_process_key(Some(wrong_key));
+    db::set_process_key(Some(wrong_key.clone()));
     let err = db::verify_process_key(&db_path.to_string_lossy()).unwrap_err();
     assert!(err.starts_with(db::KEY_MISMATCH_PREFIX), "got: {err}");
     db::set_process_key(None);
@@ -120,6 +161,56 @@ fn encrypted_index_lifecycle() {
         std::fs::read(&db_path).unwrap(),
         "failed unlocks must never modify the index"
     );
+
+    // --- A stale schema must not read as a locked index. ---
+    //
+    // The reported failure: after a schema bump, a password-protected install
+    // could not start at all — the correct password was rejected with
+    // "not a compatible QuickSearch index (schema v4 expected)", because the
+    // unlock gate verified the key by opening the index the way a *consumer*
+    // does, which also insists the schema be current. An unprotected install
+    // in the same state starts and rebuilds on its first run; the protected
+    // one had no way past the gate.
+    //
+    // Whether the schema is current belongs to the indexer, which answers it
+    // by wiping and rebuilding. Unlocking only has to answer "does this key
+    // open the file?".
+    {
+        db::set_process_key(Some(key.clone()));
+        // Age the stored schema, exactly as a version bump would.
+        let conn = db::open_existing(&db_path.to_string_lossy(), true).unwrap();
+        conn.execute(
+            "UPDATE schema_info SET value = '1' WHERE key = 'version'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // The right password still unlocks...
+        db::verify_process_key(&db_path.to_string_lossy()).expect(
+            "a stale schema must not make the correct password look wrong",
+        );
+        // ...and the wrong one is still refused, with the same tagged error —
+        // the relaxation must not have turned the check into a rubber stamp.
+        db::set_process_key(Some(wrong_key.clone()));
+        let err = db::verify_process_key(&db_path.to_string_lossy()).unwrap_err();
+        assert!(err.starts_with(db::KEY_MISMATCH_PREFIX), "got: {err}");
+
+        // Consumers still refuse a stale index, which is what sends the
+        // indexer down its rebuild path.
+        db::set_process_key(Some(key.clone()));
+        let err = db::open_existing(&db_path.to_string_lossy(), false).unwrap_err();
+        assert!(err.contains("not a compatible QuickSearch index"), "got: {err}");
+
+        // And the rebuild comes back encrypted and searchable under the same
+        // key, so the whole path a real user walks is covered.
+        index_once(&root, &db_path, &config);
+        assert_ne!(&header(&db_path), b"SQLite format 3\0");
+        assert_eq!(match_count(&db_path, "zebrapayload"), 1);
+
+        // Hand the next section the unkeyed state it expects.
+        db::set_process_key(None);
+    }
 
     // --- Disable: delete + rebuild produces a plaintext index. ---
     let service = IndexingService::new();

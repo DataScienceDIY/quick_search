@@ -61,7 +61,8 @@ pub struct IndexingConfig {
     /// supports. Non-empty = only files with these extensions get content
     /// extraction/FTS; everything else is still listed for filename search
     /// (`content_state = NA`). Entries are case-insensitive, with or
-    /// without a leading dot.
+    /// without a leading dot. Applied at walk time, when the row is written —
+    /// which is why changing this forces a rebuild (see [`diff_actions`]).
     pub content_extensions: Vec<String>,
     /// Excluded from the index entirely — never even listed. A pattern
     /// without `/` matches any single path component (so `.git` prunes
@@ -69,9 +70,11 @@ pub struct IndexingConfig {
     /// matched against the full path. Glob syntax (`*`, `?`, `[..]`).
     pub ignore_patterns: Vec<String>,
     /// Per-root walker thread override, keyed by the root string exactly
-    /// as it appears in `indexing_paths`. Absent or 0 = auto-detect
-    /// (4 for local storage, 16 for network mounts). Read at run start;
-    /// a change applies to the next run.
+    /// as it appears in `indexing_paths` — the indexer resolves both sides
+    /// to the same canonical path before matching, so a key that spells its
+    /// root as `~/docs`, `/docs/` or a symlink still applies. Absent or
+    /// 0 = auto-detect (4 for local storage, 16 for network mounts). Read
+    /// at run start; a change applies to the next run.
     pub root_workers: std::collections::HashMap<String, usize>,
 }
 
@@ -95,6 +98,18 @@ pub struct ProcessingConfig {
     pub maximum_text_file_size: u64,
     pub batch_size: usize,
     pub fts_update_batch_size: usize,
+    /// How large the write-ahead log may grow during a run before the indexer
+    /// forces a checkpoint, in bytes. `0` disables forced checkpoints;
+    /// anything else is raised to [`MINIMUM_WAL_SIZE`] at the use site.
+    ///
+    /// SQLite's own autocheckpoint copies the log into the index continuously
+    /// but can only *reset* it when no reader is mid-query, and a run keeps a
+    /// reader per root busy from start to finish — so left alone the log grows
+    /// for the whole run and can end up larger than the index itself. This is
+    /// a stall-frequency knob, not a throughput one: by the time a forced
+    /// checkpoint fires there is almost nothing left to copy, so it costs lock
+    /// acquisition and little else.
+    pub maximum_wal_size: u64,
     pub tokenize: String,
     /// When `true` (default), extracted text is stored zstd-compressed in
     /// `documents_text` so search results can render snippet/highlight
@@ -106,6 +121,12 @@ pub struct ProcessingConfig {
     /// footprint to roughly what stock Baloo uses.
     pub store_text_for_snippets: bool,
 }
+
+/// Floor on a non-zero [`ProcessingConfig::maximum_wal_size`]. A checkpoint
+/// costs a lock acquisition that can wait on a running search, so a cap set
+/// low enough to fire every round would trade a large log for a stalled
+/// writer. Zero still means "never force one".
+pub const MINIMUM_WAL_SIZE: u64 = 1024 * 1024 * 16;
 
 /// Fuzzy edit distances above this are allowed but warned about: matches
 /// become dominated by coincidence and every fuzzy pass slows down.
@@ -177,8 +198,9 @@ impl Default for ProcessingConfig {
             hash_length: 1024 * 8,
             maximum_text_size: 1024 * 256,
             maximum_text_file_size: 1024 * 1024 * 2,
-            batch_size: 200,
+            batch_size: 500,
             fts_update_batch_size: 1000,
+            maximum_wal_size: 1024 * 1024 * 512,
             tokenize: "trigram".to_string(),
             store_text_for_snippets: true,
         }
@@ -650,6 +672,11 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
     let requires_rebuild = old.processing.hash_length != new.processing.hash_length
         || old.processing.tokenize != new.processing.tokenize
         || old.indexing.include_hidden != new.indexing.include_hidden
+        // Not merely a walk-behaviour knob: with links off, a symlink's target
+        // is not indexed at all, so turning it off leaves rows for files that
+        // are no longer in scope — including ones whose real parent lies
+        // outside every root, which no sweep will ever reach.
+        || old.indexing.follow_symlinks != new.indexing.follow_symlinks
         || old.indexing.ignore_patterns != new.indexing.ignore_patterns
         || old.indexing.content_extensions != new.indexing.content_extensions
         || old.security.password_protected != new.security.password_protected
@@ -657,9 +684,7 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
         || roots_changed;
     ConfigActions {
         requires_rebuild,
-        restart_watcher: requires_rebuild
-            || roots_changed
-            || old.indexing.follow_symlinks != new.indexing.follow_symlinks,
+        restart_watcher: requires_rebuild || roots_changed,
         search_db_changed: old.paths.database_path != new.paths.database_path,
     }
 }
@@ -727,7 +752,7 @@ mod tests {
         fs::write(&path, "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n").unwrap();
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.paths.indexing_paths, vec!["/x".to_string()]);
-        assert_eq!(cfg.processing.batch_size, 200, "missing sections default");
+        assert_eq!(cfg.processing.batch_size, 500, "missing sections default");
         assert_eq!(cfg.search.debounce_ms, 150);
         assert!((cfg.ui.scale - 1.1).abs() < f32::EPSILON);
         fs::remove_dir_all(&dir).ok();
@@ -975,10 +1000,12 @@ mod tests {
         let a = diff_actions(&base, &c);
         assert!(a.requires_rebuild && a.restart_watcher);
 
+        // `follow_symlinks` decides what is in the index, not just how the walk
+        // moves, so it rebuilds as well as restarting the watcher.
         let mut c = base.clone();
         c.indexing.follow_symlinks = true;
         let a = diff_actions(&base, &c);
-        assert!(!a.requires_rebuild && a.restart_watcher);
+        assert!(a.requires_rebuild && a.restart_watcher);
 
         let mut c = base.clone();
         c.paths.database_path = "/elsewhere.sqlite".into();
@@ -988,6 +1015,7 @@ mod tests {
         let mut c = base.clone();
         c.search.display_limit = 5000;
         c.processing.batch_size = 999;
+        c.processing.maximum_wal_size = 0;
         c.indexing.auto_index = false;
         c.indexing.reindex_interval_minutes = 5;
         let a = diff_actions(&base, &c);

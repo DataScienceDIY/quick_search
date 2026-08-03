@@ -63,6 +63,18 @@ impl Snippet {
 /// `terms` (ASCII-case-insensitive). With no terms or no matches, returns
 /// the head of the text as the window with no ranges.
 pub fn extract(text: &str, terms: &[&str], opts: &Options) -> Snippet {
+    extract_folded(text, &text.to_ascii_lowercase(), terms, opts)
+}
+
+/// [`extract`] against a haystack the caller has already ASCII-folded.
+///
+/// The search cascade folds each document once per row and then counts,
+/// searches and extracts from that one buffer; folding again here would copy
+/// up to `maximum_text_size` a second time for every hit. `folded` must be
+/// `text.to_ascii_lowercase()` — the fold is byte-length preserving, which is
+/// what lets offsets found in it slice the original.
+pub fn extract_folded(text: &str, folded: &str, terms: &[&str], opts: &Options) -> Snippet {
+    debug_assert_eq!(folded.len(), text.len(), "ASCII folding preserves length");
     if text.is_empty() {
         return Snippet::empty();
     }
@@ -75,10 +87,9 @@ pub fn extract(text: &str, terms: &[&str], opts: &Options) -> Snippet {
         return head_window(text, opts.approx_chars);
     }
 
-    // Case-fold once; we do all positioning on the folded buffer and slice
-    // from the original. Both buffers have identical byte layout because
-    // `to_ascii_lowercase` only touches ASCII letters.
-    let folded = text.to_ascii_lowercase();
+    // All positioning happens on the folded buffer; slices come from the
+    // original. Both have identical byte layout because `to_ascii_lowercase`
+    // only touches ASCII letters.
     let folded_bytes = folded.as_bytes();
 
     let mut matches: Vec<(usize, usize)> = Vec::new();

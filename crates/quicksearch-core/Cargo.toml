@@ -43,6 +43,13 @@ zstd = "0.13"
 globset = "0.4"
 regex = "1"
 
+# `nice()`, for dropping indexing threads to background scheduling priority.
+# Linux schedules per task, so it affects only the calling thread. Already in
+# the lockfile transitively (rusqlite, getrandom), so naming it directly
+# compiles nothing new.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # `GetDriveTypeW` (a mapped drive letter is the only way to spot an SMB share
 # that isn't written as UNC) plus the FILE_ATTRIBUTE_* constants for hidden
 # detection. Pinned to 0.52 deliberately: walkdir → winapi-util already
@@ -50,8 +57,12 @@ regex = "1"
 [target.'cfg(windows)'.dependencies]
 # GetDriveTypeW and the FILE_ATTRIBUTE_* constants live in
 # Win32_Storage_FileSystem; DRIVE_REMOTE, oddly, is filed under
-# Win32_System_WindowsProgramming.
+# Win32_System_WindowsProgramming. Win32_System_Threading carries
+# SetThreadPriority and THREAD_MODE_BACKGROUND_BEGIN, and both it and
+# GetCurrentThread need Win32_Foundation for HANDLE/BOOL.
 windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }

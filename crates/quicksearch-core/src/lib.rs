@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod content;
 pub mod coordinator;
 pub mod db;
 pub mod document_extraction;

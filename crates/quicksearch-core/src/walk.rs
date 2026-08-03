@@ -178,12 +178,12 @@ struct Shared {
     /// observational, for progress display: two relaxed atomic ops per
     /// *job* (a directory read plus up to [`FILES_PER_JOB`] files), so it
     /// costs nothing the queue mutex didn't already.
-    busy: AtomicUsize,
+    stats: WorkerStats,
 }
 
 /// Decrements the busy count however the worker leaves its job — including
 /// early returns on stop and panics.
-struct BusyGuard<'a>(&'a AtomicUsize);
+pub(crate) struct BusyGuard<'a>(&'a AtomicUsize);
 
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
@@ -191,17 +191,32 @@ impl Drop for BusyGuard<'_> {
     }
 }
 
-/// Lock-free view of walker activity for progress displays.
+/// Lock-free view of a worker pool's activity for progress displays.
+///
+/// Shared by the walk and by [`crate::content`]: a root runs one pool and then
+/// the other, and the progress line has to report whichever is live — a pool
+/// whose threads have exited reads as busy 0, which is only the truth while
+/// that pool is the one running.
 #[derive(Clone)]
 pub struct WorkerStats {
-    shared: Arc<Shared>,
+    busy: Arc<AtomicUsize>,
     total: usize,
 }
 
 impl WorkerStats {
+    pub(crate) fn new(total: usize) -> Self {
+        WorkerStats { busy: Arc::new(AtomicUsize::new(0)), total }
+    }
+
+    /// Count the calling thread as busy until the returned guard drops.
+    pub(crate) fn enter(&self) -> BusyGuard<'_> {
+        self.busy.fetch_add(1, Ordering::Relaxed);
+        BusyGuard(&self.busy)
+    }
+
     /// Workers doing work right now (the rest are parked).
     pub fn active(&self) -> usize {
-        self.shared.busy.load(Ordering::Relaxed).min(self.total)
+        self.busy.load(Ordering::Relaxed).min(self.total)
     }
 
     pub fn total(&self) -> usize {
@@ -378,7 +393,7 @@ struct Ctx {
     /// from bytes saves the content pass an open/read/close per file.
     registry: Arc<Registry>,
     unreadable: UnreadableDirs,
-    stop_flag: Arc<Mutex<bool>>,
+    stop_flag: Arc<AtomicBool>,
     suspend_flag: Arc<AtomicBool>,
 }
 
@@ -458,16 +473,28 @@ fn read_directory(
             // directory now *should* lose its row.
             Ok(ft) if ft.is_dir() => found.push(Found::Dir(path)),
             Ok(ft) if ft.is_symlink() => {
+                // With links off there is nothing here to index — targets
+                // included. Returning before `canonicalize` also drops a
+                // readlink chain and a stat per symlink, so honouring the
+                // setting costs fewer syscalls than ignoring it, not more.
+                //
+                // Both kinds have to be gated together, or the two walkers
+                // disagree: `filtered_walk` (which the watcher and the
+                // incremental path use) passes `follow_links` straight to
+                // walkdir and follows neither. A file target followed here but
+                // not there is indexed by every full run and never updated
+                // between them — and, if it resolves outside every configured
+                // root, indexed despite living somewhere the user never asked
+                // us to look.
+                if !ctx.follow_symlinks {
+                    continue;
+                }
                 // Resolve aliases where they are found. The target's canonical
                 // path is what the index stores, and pushing only canonical
                 // directories is what keeps `seen_dirs` able to break cycles.
                 if let Ok(target) = path.canonicalize() {
                     match fs::metadata(&target) {
-                        Ok(m) if m.is_dir() => {
-                            if ctx.follow_symlinks {
-                                found.push(Found::Dir(target));
-                            }
-                        }
+                        Ok(m) if m.is_dir() => found.push(Found::Dir(target)),
                         // The row for a resolved target belongs to the
                         // target's own directory, not this one, so it is not
                         // marked present here and cannot be classified
@@ -589,8 +616,7 @@ fn prepare(path: PathBuf, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
 
 fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
     while let Some((job, slot)) = shared.take() {
-        shared.busy.fetch_add(1, Ordering::Relaxed);
-        let _busy = BusyGuard(&shared.busy);
+        let _busy = shared.stats.enter();
         if should_abort(&ctx.stop_flag, &ctx.suspend_flag) {
             shared.shutdown();
             return;
@@ -728,11 +754,11 @@ impl ParallelWalk {
 
     /// A cheap, cloneable handle for reading worker activity while the
     /// walk's iterator is mutably borrowed by a `for` loop.
+    ///
+    /// Meaningful only while the walk is running: once the workers exit, the
+    /// pool size stays but the busy count is permanently zero.
     pub fn worker_stats(&self) -> WorkerStats {
-        WorkerStats {
-            shared: self.shared.clone(),
-            total: self.handles.len(),
-        }
+        self.shared.stats.clone()
     }
 
     /// Join the workers and report whether every one of them finished
@@ -766,27 +792,37 @@ impl ParallelWalk {
     }
 }
 
-/// Result of a non-blocking pull from a walk.
-pub enum TryNext {
-    Item(WalkEvent),
-    /// Nothing ready right now; the walk is still running.
+/// Result of a non-blocking pull from a producer pool.
+///
+/// Shared by every pass the writer loop multiplexes — the walk here and the
+/// content pass in [`crate::content`] — so that draining one root's work reads
+/// identically whichever pass it came from.
+pub enum TryNext<T> {
+    Item(T),
+    /// Nothing ready right now; the pass is still running.
     Empty,
-    /// The walk has ended (all workers exited, for any reason).
+    /// The pass has ended (all workers exited, for any reason).
     Finished,
+}
+
+/// Translate a non-blocking channel pull into [`TryNext`]. `None` is a
+/// receiver the owner already dropped, which reads as finished.
+pub(crate) fn try_recv_next<T>(rx: Option<&mpsc::Receiver<T>>) -> TryNext<T> {
+    match rx {
+        None => TryNext::Finished,
+        Some(rx) => match rx.try_recv() {
+            Ok(item) => TryNext::Item(item),
+            Err(mpsc::TryRecvError::Empty) => TryNext::Empty,
+            Err(mpsc::TryRecvError::Disconnected) => TryNext::Finished,
+        },
+    }
 }
 
 impl ParallelWalk {
     /// Non-blocking variant of `next`, for callers multiplexing several
     /// walks (the per-root writer loop).
-    pub fn try_next(&mut self) -> TryNext {
-        match &self.rx {
-            None => TryNext::Finished,
-            Some(rx) => match rx.try_recv() {
-                Ok(file) => TryNext::Item(file),
-                Err(mpsc::TryRecvError::Empty) => TryNext::Empty,
-                Err(mpsc::TryRecvError::Disconnected) => TryNext::Finished,
-            },
-        }
+    pub fn try_next(&mut self) -> TryNext<WalkEvent> {
+        try_recv_next(self.rx.as_ref())
     }
 }
 
@@ -823,7 +859,7 @@ pub fn walk_indexable_files(
     db_path: &str,
     config: Config,
     registry: Arc<Registry>,
-    stop_flag: Arc<Mutex<bool>>,
+    stop_flag: Arc<AtomicBool>,
     suspend_flag: Arc<AtomicBool>,
     workers: usize,
 ) -> ParallelWalk {
@@ -862,7 +898,7 @@ pub fn walk_indexable_files(
     let shared = Arc::new(Shared {
         queue: Mutex::new(queue),
         idle: Condvar::new(),
-        busy: AtomicUsize::new(0),
+        stats: WorkerStats::new(threads),
     });
     let ctx = Arc::new(Ctx {
         follow_symlinks,
@@ -883,7 +919,12 @@ pub fn walk_indexable_files(
     let handles = (0..threads)
         .map(|_| {
             let (shared, ctx, tx) = (shared.clone(), ctx.clone(), tx.clone());
-            thread::spawn(move || worker(&shared, &ctx, &tx))
+            thread::spawn(move || {
+                // Walker threads are the bulk of a run's CPU and I/O; the
+                // foreground must stay ahead of them.
+                crate::platform::set_background_priority();
+                worker(&shared, &ctx, &tx)
+            })
         })
         .collect();
     // The workers must hold the only senders, or `recv` never reports the end
@@ -893,7 +934,10 @@ pub fn walk_indexable_files(
 
     let prefetch = {
         let (shared, db_path) = (shared.clone(), db_path.to_string());
-        thread::spawn(move || prefetcher(&shared, &db_path))
+        thread::spawn(move || {
+            crate::platform::set_background_priority();
+            prefetcher(&shared, &db_path)
+        })
     };
 
     ParallelWalk { rx: Some(rx), handles, prefetch: Some(prefetch), shared, ctx }
@@ -999,7 +1043,7 @@ mod tests {
             db.to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
-            Arc::new(Mutex::new(false)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
         ))
@@ -1181,7 +1225,7 @@ mod tests {
                 empty_db("unreadable-dir").to_str().unwrap(),
                 Config::default(),
                 Arc::new(Registry::default_set()),
-                Arc::new(Mutex::new(false)),
+                Arc::new(AtomicBool::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 4,
             );
@@ -1240,13 +1284,50 @@ mod tests {
         )
         .unwrap();
 
-        let files = walk(&root, &empty_db("symlink-file"));
+        let files = walk_with(&root, &empty_db("symlink-file"), true, false);
         let paths: HashSet<&String> = files.iter().map(|f| &f.path).collect();
         assert_eq!(paths.len(), 1, "both routes report one canonical path");
 
         let canonical = path_to_db_string(&root.join("real/target.txt").canonicalize().unwrap());
         assert_eq!(*paths.into_iter().next().unwrap(), canonical, "the target, not the alias");
+
+        // The alias itself is still reported, so its row is never mistaken for
+        // deleted — it is reported under the *target's* path.
+        assert_eq!(files.len(), 2, "seen twice, spelled once");
+        assert!(files.iter().any(|f| f.aliased), "the link route is marked");
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// The counterpart, and the reason both symlink kinds are gated together:
+    /// `filtered_walk` — which the watcher and the incremental path use —
+    /// passes `follow_links` to walkdir and follows neither kind. A file link
+    /// followed only here would be re-indexed by every full run and never
+    /// updated between them, and its target may sit outside every root.
+    #[test]
+    #[cfg(unix)]
+    fn a_file_symlink_is_not_followed_when_links_are_off() {
+        let root = tmp_tree("symlink-off");
+        touch(&root.join("real/target.txt"));
+        fs::create_dir_all(root.join("links")).unwrap();
+        std::os::unix::fs::symlink(root.join("real/target.txt"), root.join("links/alias.txt"))
+            .unwrap();
+        // A target outside the walked tree: with links off it must not be
+        // reachable at all.
+        let outside = tmp_tree("symlink-off-outside");
+        touch(&outside.join("elsewhere.txt"));
+        std::os::unix::fs::symlink(outside.join("elsewhere.txt"), root.join("links/out.txt"))
+            .unwrap();
+
+        let files = walk_with(&root, &empty_db("symlink-off"), false, false);
+        assert_eq!(
+            names(&files),
+            vec!["target.txt"],
+            "only the real file, reached directly"
+        );
+        assert!(!files.iter().any(|f| f.aliased), "nothing was resolved");
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&outside).ok();
     }
 
     #[test]
@@ -1272,7 +1353,7 @@ mod tests {
             empty_db("prune").to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
-            Arc::new(Mutex::new(false)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
         ));
@@ -1311,7 +1392,7 @@ mod tests {
             db.to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
-            Arc::new(Mutex::new(false)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
         ));
@@ -1348,7 +1429,7 @@ mod tests {
             db.to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
-            Arc::new(Mutex::new(false)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
         ));
@@ -1377,7 +1458,7 @@ mod tests {
             touch(&root.join(format!("f{:04}.txt", i)));
         }
 
-        let stop = Arc::new(Mutex::new(true));
+        let stop = Arc::new(AtomicBool::new(true));
         let files: Vec<WalkedFile> = files_only(walk_indexable_files(
             &[root.to_string_lossy().into_owned()],
             false,
@@ -1412,7 +1493,7 @@ mod tests {
             empty_db("early-drop").to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
-            Arc::new(Mutex::new(false)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
         );
@@ -1438,7 +1519,7 @@ mod tests {
             empty_db("overlap").to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
-            Arc::new(Mutex::new(false)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
         ));
@@ -1486,7 +1567,7 @@ mod tests {
             empty_db("finish").to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
-            Arc::new(Mutex::new(false)),
+            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
         );

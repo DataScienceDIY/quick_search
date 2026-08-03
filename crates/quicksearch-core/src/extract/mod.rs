@@ -121,6 +121,27 @@ impl Registry {
         self
     }
 
+    /// The extractor that claims `mime`, if any. The one place dispatch
+    /// happens, so every question about a MIME — "who handles it", "does
+    /// anyone handle it", "handle it from these bytes" — gets the same answer.
+    fn find(&self, mime: &str) -> Option<&dyn Extractor> {
+        let lower = mime.to_ascii_lowercase();
+        self.extractors
+            .iter()
+            .find(|e| e.supports(&lower))
+            .map(|e| &**e)
+    }
+
+    /// Whether any extractor claims `mime` — the same question
+    /// [`Registry::extract`] answers by returning `Ok(None)`, asked without
+    /// touching the file. This is what lets the walk decide a row's
+    /// `content_state` up front instead of queueing it for a worker that will
+    /// only mark it not-applicable (see
+    /// [`crate::file_handling::content_extractable`]).
+    pub fn supports(&self, mime: &str) -> bool {
+        self.find(mime).is_some()
+    }
+
     /// Look up a handler for `mime` and run it against `path`. Returns
     /// `Ok(None)` if no extractor claims the MIME — the caller should then
     /// decide whether the file is "not applicable" (text state NA).
@@ -129,13 +150,7 @@ impl Registry {
         path: &Path,
         mime: &str,
     ) -> Result<Option<ExtractedContent>, ExtractError> {
-        let lower = mime.to_ascii_lowercase();
-        for e in &self.extractors {
-            if e.supports(&lower) {
-                return e.extract(path).map(Some);
-            }
-        }
-        Ok(None)
+        self.find(mime).map(|e| e.extract(path)).transpose()
     }
 
     /// [`Registry::extract`] for a file whose complete contents the caller
@@ -151,13 +166,7 @@ impl Registry {
         mime: &str,
         head: &[u8],
     ) -> Option<Result<ExtractedContent, ExtractError>> {
-        let lower = mime.to_ascii_lowercase();
-        for e in &self.extractors {
-            if e.supports(&lower) {
-                return e.extract_from_head(path, head);
-            }
-        }
-        None
+        self.find(mime).and_then(|e| e.extract_from_head(path, head))
     }
 
     /// The default set wired up for Set A: plaintext, office docs, PDF,
@@ -219,6 +228,43 @@ mod tests {
             assert!(
                 r.extract_complete_head(p, mime, b"x").is_some(),
                 "{} should extract from a head", mime
+            );
+        }
+    }
+
+    #[test]
+    fn supports_agrees_with_extract_dispatch() {
+        // `supports` is the cheap form of the question `extract` answers with
+        // `Ok(None)`. They must agree for every MIME, or the walk would write
+        // a content state the content pass then contradicts. The path does not
+        // exist, so a claimed MIME surfaces as `Err`, not `Ok(None)` — which is
+        // exactly the distinction under test.
+        let r = Registry::default_set();
+        let missing = Path::new("/nonexistent/quicksearch-supports-probe");
+        for mime in [
+            "text/plain",
+            "TEXT/PLAIN",
+            "text/x-rust",
+            "application/json",
+            "APPLICATION/PDF",
+            "application/pdf",
+            "audio/mpeg",
+            "Image/JPEG",
+            "application/msword",
+            "application/vnd.oasis.opendocument.text",
+            // Real MIMEs with no extractor: the population the fix is about.
+            "video/mp4",
+            "application/zip",
+            "application/x-executable",
+            "application/octet-stream",
+            "",
+        ] {
+            let claimed = !matches!(r.extract(missing, mime), Ok(None));
+            assert_eq!(
+                r.supports(mime),
+                claimed,
+                "supports and extract disagree about {:?}",
+                mime
             );
         }
     }

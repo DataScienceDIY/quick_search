@@ -120,7 +120,10 @@ the package is installed.
   indexed folder list, full-text extension filters, ignore patterns, and
   the indexing options. Stopping switches to manual mode and saves that
   (`indexing.auto_index`), so a stopped index stays stopped across
-  restarts until you return to automatic.
+  restarts until you return to automatic. The index size beside the
+  status heading totals the database and its `-wal`/`-shm` sidecars,
+  refreshed every ten seconds; hovering it lists the ways to make it
+  smaller.
 - **Duplicates**: files sharing a content hash, grouped.
 - **Logs**: the lines the app would have printed to a terminal — warnings
   from indexing, folder watching and opening files, newest last, with a
@@ -264,7 +267,11 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
 
 - **Storage** (`db/`): SQLite via rusqlite (bundled SQLCipher build —
   identical to stock SQLite until a key is applied), WAL mode so the
-  single writer never blocks streaming read-only searches. `files` holds
+  single writer never blocks streaming read-only searches. A run forces a
+  `wal_checkpoint(TRUNCATE)` every `processing.maximum_wal_size` bytes of
+  log, because SQLite's own autocheckpoint can only reset the log at an
+  instant no reader holds it — and a run keeps a reader per root querying
+  throughout, so left alone the log grows for the whole run. `files` holds
   metadata (name, path, size, mtime, hash, MIME/type bitmask, per-row
   index state); `searchabletext` is a *contentless* FTS5 table (postings
   only, configurable tokenizer, trigram by default); canonical extracted
@@ -284,8 +291,11 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   tags, EXIF; see `extract/`) for FTS. Files no larger than
   `processing.hash_length` skip that second pass entirely: the head the walk
   reads to hash them is already their whole content, so a plaintext body is
-  extracted in the same `read` and stored complete. Progress streams through
-  a polled `IndexingStatus`.
+  extracted in the same `read` and stored complete. Every run ends — whether
+  it completed or was stopped — with an optimize pass on its own connection:
+  checkpoint, VACUUM if the file has at least 10% slack to reclaim, `PRAGMA
+  optimize`, checkpoint again. Progress streams through a polled
+  `IndexingStatus`, which reads `Optimizing` for the duration of that pass.
 - **Coordinator** (`coordinator.rs`): the object binaries construct.
   Owns the `IndexingService`, the debouncing filesystem watcher
   (`watcher.rs`), and the mode state machine (Auto / Manual, persisted as

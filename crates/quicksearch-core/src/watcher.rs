@@ -157,8 +157,25 @@ fn fmt_cap(cap: usize) -> String {
     }
 }
 
+/// Tuning for the whole filesystem-event pipeline: the watcher's own
+/// per-directory debounce, and the coordinator's queue on the far side of it.
+/// Both halves are debounce knobs on one path, so they live together and
+/// tests that want a fast pipeline shorten them in one place.
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
+    /// How long the coordinator's queue must go quiet before it is applied.
+    ///
+    /// An `rm -rf` arrives as a burst; applying it in waves as it lands means
+    /// no wave sees the whole set to collapse against, and each pays its own
+    /// costs. Waiting for quiet trades a little latency for one pass over the
+    /// complete picture. Creates and modifies benefit too — the queue is
+    /// last-event-wins per path, so a build that rewrites the same files
+    /// repeatedly collapses for free.
+    pub pending_settle: Duration,
+    /// Ceiling on how long [`WatcherConfig::pending_settle`] may hold the
+    /// queue back. A steady trickle of changes never goes quiet, and must not
+    /// starve.
+    pub pending_max_defer: Duration,
     /// Per-directory debounce window. Bursts of events in the same directory
     /// collapse to one flush after this interval of quiet.
     pub throttle_window: Duration,
@@ -177,6 +194,8 @@ pub struct WatcherConfig {
 impl Default for WatcherConfig {
     fn default() -> Self {
         Self {
+            pending_settle: Duration::from_secs(2),
+            pending_max_defer: Duration::from_secs(30),
             throttle_window: Duration::from_secs(30),
             tick_interval: Duration::from_millis(500),
             max_dirs_per_tick: 64,
@@ -244,6 +263,17 @@ impl WatchRegistry {
     /// directories on its own; unwatching anyway keeps notify's internal
     /// descriptor map from growing across a long session of directory churn.
     fn remove_tree(&mut self, dir: &Path) -> usize {
+        // The scan below is O(watched dirs), and the event loop calls this for
+        // every Remove — files included. Deleting a directory of 10k files
+        // would otherwise cost 10k passes over a set capped at 128k entries.
+        //
+        // Exact, not a heuristic: registration always walks top-down (see
+        // `register_tree` and startup), so a watched directory beneath `dir`
+        // implies `dir` itself is watched. An unwatched `dir` therefore has no
+        // watched descendants and there is nothing to find.
+        if !self.dirs.contains(dir) {
+            return 0;
+        }
         let doomed: Vec<PathBuf> = self
             .dirs
             .iter()
@@ -464,13 +494,8 @@ struct LoopCtx {
     degraded: Degraded,
 }
 
-/// A queued event, deduplicated per path within a window.
-#[derive(Debug, Clone)]
-struct QueuedEvent {
-    op: QueuedOp,
-}
-
-#[derive(Debug, Clone, Copy)]
+/// A queued operation, deduplicated per path within a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueuedOp {
     Create,
     Modify,
@@ -484,7 +509,7 @@ struct DirThrottleEntry {
     record_time: Instant,
     /// Per-path pending op. Same path seen twice in a window keeps only the
     /// latest op — coalescing a rename-as-create+modify spam into one event.
-    queue: HashMap<PathBuf, QueuedEvent>,
+    queue: HashMap<PathBuf, QueuedOp>,
     /// If true, the next tick flushes regardless of window age. Set for the
     /// first event in a previously-idle directory so it reacts fast.
     immediate: bool,
@@ -694,14 +719,12 @@ fn enqueue(
             immediate: true,
         });
     // Coalesce: Remove after Create → drop both. Modify after Modify → one Modify.
-    match (op, entry.queue.get(&path).map(|q| q.op)) {
+    match (op, entry.queue.get(&path).copied()) {
         (QueuedOp::Remove, Some(QueuedOp::Create)) => {
             entry.queue.remove(&path);
         }
         _ => {
-            entry
-                .queue
-                .insert(path, QueuedEvent { op });
+            entry.queue.insert(path, op);
         }
     }
 }
@@ -726,11 +749,7 @@ fn flush_ready(
     }
     for dir in ready {
         if let Some(entry) = throttle.get_mut(&dir) {
-            let drained: Vec<(PathBuf, QueuedOp)> = entry
-                .queue
-                .drain()
-                .map(|(p, q)| (p, q.op))
-                .collect();
+            let drained: Vec<(PathBuf, QueuedOp)> = entry.queue.drain().collect();
             entry.immediate = false;
             entry.record_time = now;
             for (path, op) in drained {
@@ -801,6 +820,42 @@ mod tests {
         dir
     }
 
+    /// A registry with `dirs` seeded directly, so the pure set logic can be
+    /// tested without registering real kernel watches.
+    fn registry_with(dirs: &[&str]) -> WatchRegistry {
+        let raw = RecommendedWatcher::new(|_res| {}, NotifyConfig::default()).unwrap();
+        WatchRegistry {
+            raw,
+            dirs: dirs.iter().map(PathBuf::from).collect(),
+            cap: 64,
+        }
+    }
+
+    /// Most `Remove` events name *files*, which are never watched. Returning
+    /// before the O(watched) scan is what keeps deleting a 10k-file directory
+    /// off 10k passes over a set capped at 128k entries.
+    #[test]
+    fn remove_tree_skips_the_scan_for_a_path_that_is_not_watched() {
+        let mut reg = registry_with(&["/a/b", "/a/b/c", "/a/bc"]);
+
+        // A file inside a watched directory: not watched itself, and nothing
+        // can live beneath it.
+        assert_eq!(reg.remove_tree(Path::new("/a/b/file.txt")), 0);
+        assert_eq!(reg.dirs.len(), 3, "the watch set is untouched");
+
+        // An entirely unrelated path is likewise a no-op.
+        assert_eq!(reg.remove_tree(Path::new("/elsewhere")), 0);
+        assert_eq!(reg.dirs.len(), 3);
+
+        // The watched directory itself still takes its descendants with it —
+        // and only its descendants: /a/bc is a sibling, not a child.
+        assert_eq!(reg.remove_tree(Path::new("/a/b")), 2);
+        assert_eq!(
+            reg.dirs.iter().collect::<Vec<_>>(),
+            vec![&PathBuf::from("/a/bc")]
+        );
+    }
+
     #[test]
     fn enqueue_create_then_remove_cancels() {
         let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
@@ -866,10 +921,7 @@ mod tests {
     fn prune_stale_keeps_active_entries() {
         let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
         let mut queue = HashMap::new();
-        queue.insert(
-            PathBuf::from("/tmp/a"),
-            QueuedEvent { op: QueuedOp::Modify },
-        );
+        queue.insert(PathBuf::from("/tmp/a"), QueuedOp::Modify);
         map.insert(
             PathBuf::from("/tmp"),
             DirThrottleEntry {

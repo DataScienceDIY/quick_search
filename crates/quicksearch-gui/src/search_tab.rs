@@ -41,6 +41,35 @@ pub struct SearchActions {
     pub save_fuzzy_default: Option<bool>,
 }
 
+/// Add `incoming` to `set`, keeping at most `limit` of them — the best by
+/// **rank**, whatever column the table is currently sorted by.
+///
+/// Retention and display are separate questions. What to keep is about
+/// relevance; what order to show it in is the user's choice. That distinction
+/// only started to matter once the cascade began streaming: hits now arrive in
+/// table order, so a cap that simply stopped accepting at `limit` would fill
+/// the table with whatever the scan happened to reach first and never show the
+/// good ones. Dropping the worst-ranked instead means a rank-1 hit found late
+/// in a scan still displaces a rank-10 one found early.
+fn admit(
+    set: &mut Vec<SearchHit>,
+    incoming: Vec<SearchHit>,
+    limit: usize,
+    limited: &mut bool,
+) {
+    set.extend(incoming);
+    if set.len() > limit {
+        set.sort_by(|a, b| {
+            a.rank
+                .partial_cmp(&b.rank)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        set.truncate(limit);
+        *limited = true;
+    }
+}
+
 pub struct SearchTab {
     pub query: String,
     pub fuzzy: bool,
@@ -142,31 +171,31 @@ impl SearchTab {
             SearchUpdate::Hits { hits, .. } => {
                 if self.swap_pending {
                     // Old results are still fading out; hold the new ones.
-                    for hit in hits {
-                        if self.staging.len() >= display_limit {
-                            self.limited = true;
-                            break;
-                        }
-                        self.staging_has_snippets |= hit.snippet.is_some();
-                        self.staging.push(hit);
-                    }
+                    // Nothing of this generation is displayed yet, so there is
+                    // no selection to keep.
+                    self.staging_has_snippets |= hits.iter().any(|h| h.snippet.is_some());
+                    admit(&mut self.staging, hits, display_limit, &mut self.limited);
                 } else {
-                    // Post-swap stream: later cascade passes append live.
-                    for hit in hits {
-                        if self.results.len() >= display_limit {
-                            self.limited = true;
-                            break;
-                        }
-                        self.has_snippets |= hit.snippet.is_some();
-                        self.results.push(hit);
-                    }
-                    // Arrival order *is* rank order, so the default sort
-                    // needs no work; anything else re-sorts on the set.
-                    if self.sort != (SortKey::Rank, true) {
-                        self.sort_dirty = true;
-                    } else {
-                        self.order = (0..self.results.len() as u32).collect();
-                    }
+                    self.has_snippets |= hits.iter().any(|h| h.snippet.is_some());
+                    // A row can be selected while batches are still arriving,
+                    // and admitting them may reorder or drop rows out from
+                    // under its index, so carry the selection by file id.
+                    let selected_id = self
+                        .selected
+                        .and_then(|i| self.results.get(i as usize))
+                        .map(|h| h.file_id);
+                    admit(&mut self.results, hits, display_limit, &mut self.limited);
+                    self.selected = selected_id.and_then(|id| {
+                        self.results
+                            .iter()
+                            .position(|h| h.file_id == id)
+                            .map(|i| i as u32)
+                    });
+                    // Arrival order is *scan* order — the cascade streams each
+                    // pass as it runs, so a better-ranked hit can turn up after
+                    // a worse one. Re-establish the table's own order on every
+                    // batch, under whichever column is keyed.
+                    self.sort_dirty = true;
                 }
             }
             SearchUpdate::Completed { limited, .. } => {
@@ -213,11 +242,14 @@ impl SearchTab {
                 SortKey::Size => a.size.cmp(&b.size),
                 SortKey::Modified => a.mtime.cmp(&b.mtime),
             };
-            if ascending {
-                ord
-            } else {
-                ord.reverse()
-            }
+            let ord = if ascending { ord } else { ord.reverse() };
+            // Break ties on the path, which is unique, so the order is total.
+            // Without it a stable sort falls back to insertion order — and
+            // that is now the order batches happened to stream in, so equal
+            // keys would shuffle under the pointer on every arrival. The
+            // tiebreak stays ascending regardless of the key's direction; it
+            // is there for stability, not as a second sort the user asked for.
+            ord.then_with(|| a.path.cmp(&b.path))
         });
         // Selection follows the file, not the visual slot.
         self.selected = selected_id.and_then(|id| {
@@ -395,11 +427,9 @@ impl SearchTab {
             self.has_snippets = self.staging_has_snippets;
             self.selected = None;
             self.swap_pending = false;
-            if self.sort == (SortKey::Rank, true) {
-                self.order = (0..self.results.len() as u32).collect();
-            } else {
-                self.sort_dirty = true;
-            }
+            // Staged hits arrived in scan order too, so the table has to be
+            // ordered here as well — including under the default key.
+            self.sort_dirty = true;
         }
 
         if self.sort_dirty {
@@ -425,6 +455,10 @@ impl SearchTab {
         let text_height = egui::TextStyle::Body.resolve(ui.style()).size + 4.0;
         let mut open_ignore_dialog: Option<usize> = None;
         let mut hovered_now: Option<usize> = None;
+        // Moved out of `self` rather than cloned. The row closure needs `&mut
+        // self` for selection and hover, so a field read would conflict — but
+        // a plain local does not, and this runs every frame.
+        let order = std::mem::take(&mut self.order);
 
         let table_scroll = ui
             .push_id("results", |ui| {
@@ -465,7 +499,6 @@ impl SearchTab {
                         header.col(|ui| self.sort_header(ui, SortKey::Rank, "Rank"));
                     })
                     .body(|body| {
-                        let order = self.order.clone();
                         body.rows(text_height, order.len(), |mut row| {
                             let display_ix = row.index();
                             let result_ix = order[display_ix] as usize;
@@ -487,13 +520,17 @@ impl SearchTab {
                                     .push(ui.label(egui::RichText::new(&hit.path).weak()));
                             });
                             if self.has_snippets {
-                                let snippet = hit.snippet.clone();
+                                // Borrowed, not cloned: a snippet window runs
+                                // to 600 characters and this is per visible row
+                                // per frame. The hover job is built inside the
+                                // closure, so an un-hovered row builds nothing.
+                                let snippet = hit.snippet.as_ref();
                                 // Name and path matches show a whole field, so
                                 // they render bracketed: [matched field].
                                 let whole_field =
                                     hit.stage <= 4 || hit.stage == 7 || hit.stage >= 9;
                                 row.col(|ui| {
-                                    if let Some(snip) = &snippet {
+                                    if let Some(snip) = snippet {
                                         let width = ui.available_width();
                                         let job = centered_match_job(ui, snip, width, whole_field);
                                         let mut response = ui
@@ -505,10 +542,9 @@ impl SearchTab {
                                             )
                                             .inner;
                                         if !snip.ranges.is_empty() {
-                                            let hover = snip.clone();
                                             response = response.on_hover_ui(|ui| {
                                                 ui.set_max_width(520.0);
-                                                let job = snippet_job(ui, &hover, 10);
+                                                let job = snippet_job(ui, snip, 10);
                                                 ui.label(job);
                                             });
                                         }
@@ -592,6 +628,8 @@ impl SearchTab {
                     })
             })
             .inner;
+        // Put the permutation back for the next frame.
+        self.order = order;
         crate::ui_util::more_below_hint(ui, &table_scroll);
         self.hovered_row = hovered_now;
 
@@ -900,8 +938,14 @@ fn centered_match_job(
     // centered single-line cell. Flatten them to spaces — a byte-for-byte
     // ASCII replacement, so the match ranges stay valid. The mouseover
     // renders the original window untouched.
-    let flattened = snip.window.replace(['\n', '\r', '\t'], " ");
-    let window = flattened.as_str();
+    //
+    // Only copied when there is something to flatten: name and path snippets
+    // never contain these, and this runs per visible row per frame.
+    let flattened: Option<String> = snip
+        .window
+        .contains(['\n', '\r', '\t'])
+        .then(|| snip.window.replace(['\n', '\r', '\t'], " "));
+    let window = flattened.as_deref().unwrap_or(&snip.window);
     let (start, end) = match snip.ranges.first().copied() {
         Some((a, b)) => {
             let match_chars = window[a..b].chars().count();
@@ -1084,6 +1128,208 @@ mod tests {
                 modifiers: egui::Modifiers::default(),
             })
             .collect()
+    }
+
+    fn hit(id: i64, name: &str, rank: f64, size: u64) -> SearchHit {
+        SearchHit {
+            file_id: id,
+            name: name.to_string(),
+            path: format!("/d/{name}"),
+            size,
+            mtime: 1_700_000_000,
+            rank,
+            stage: rank as u8,
+            snippet: None,
+        }
+    }
+
+    fn batch(tab: &mut SearchTab, hits: Vec<SearchHit>) {
+        tab.apply_update(
+            SearchUpdate::Hits {
+                generation: tab.generation,
+                hits,
+            },
+            1000,
+        );
+        if tab.sort_dirty {
+            tab.resort();
+        }
+    }
+
+    /// A tab already past the fade, so batches land straight in `results`.
+    fn streaming_tab() -> SearchTab {
+        let mut tab = SearchTab::new(false);
+        tab.focus_query = false;
+        tab.query = "zebra".into();
+        tab.swap_pending = false;
+        tab
+    }
+
+    fn displayed(tab: &SearchTab) -> Vec<&str> {
+        tab.order
+            .iter()
+            .map(|&i| tab.results[i as usize].name.as_str())
+            .collect()
+    }
+
+    /// The cascade streams each pass as it scans, so a better-ranked hit can
+    /// arrive after a worse one. The table has to stay ordered by its keyed
+    /// column as batches land, not merely append them.
+    #[test]
+    fn later_batches_land_in_the_tables_sort_order() {
+        let mut tab = streaming_tab();
+        batch(&mut tab, vec![hit(1, "middling.txt", 4.0, 50)]);
+        assert_eq!(displayed(&tab), vec!["middling.txt"]);
+
+        // A rank-1 hit found later in the scan belongs on top.
+        batch(&mut tab, vec![hit(2, "best.txt", 1.0, 10)]);
+        assert_eq!(displayed(&tab), vec!["best.txt", "middling.txt"]);
+
+        // And a rank-10 one belongs at the bottom, not wherever it arrived.
+        batch(&mut tab, vec![hit(3, "worst.txt", 10.0, 90)]);
+        assert_eq!(
+            displayed(&tab),
+            vec!["best.txt", "middling.txt", "worst.txt"]
+        );
+    }
+
+    /// Rank is only the default. Under any other key, arrivals slot into that
+    /// key's order.
+    #[test]
+    fn batches_respect_a_non_rank_sort_key() {
+        let mut tab = streaming_tab();
+        tab.sort = (SortKey::Name, true);
+        batch(&mut tab, vec![hit(1, "mango.txt", 1.0, 50)]);
+        batch(&mut tab, vec![hit(2, "apple.txt", 9.0, 10)]);
+        batch(&mut tab, vec![hit(3, "zucchini.txt", 2.0, 90)]);
+        assert_eq!(
+            displayed(&tab),
+            vec!["apple.txt", "mango.txt", "zucchini.txt"],
+            "name order, not arrival or rank order"
+        );
+
+        tab.sort = (SortKey::Size, false);
+        tab.sort_dirty = true;
+        tab.resort();
+        assert_eq!(displayed(&tab), vec!["zucchini.txt", "mango.txt", "apple.txt"]);
+    }
+
+    /// The user may re-key the sort at any time, including while results are
+    /// still arriving: rows already shown must re-order, and later batches
+    /// must land under the new key.
+    #[test]
+    fn re_keying_the_sort_mid_stream_reorders_everything() {
+        let mut tab = streaming_tab();
+        batch(&mut tab, vec![hit(1, "delta.txt", 1.0, 30)]);
+        batch(&mut tab, vec![hit(2, "alpha.txt", 5.0, 10)]);
+        assert_eq!(displayed(&tab), vec!["delta.txt", "alpha.txt"], "rank order");
+
+        // Header click, mid-search.
+        tab.sort = (SortKey::Name, true);
+        tab.sort_dirty = true;
+        tab.resort();
+        assert_eq!(
+            displayed(&tab),
+            vec!["alpha.txt", "delta.txt"],
+            "rows that already arrived re-order under the new key"
+        );
+
+        batch(&mut tab, vec![hit(3, "bravo.txt", 2.0, 20)]);
+        assert_eq!(
+            displayed(&tab),
+            vec!["alpha.txt", "bravo.txt", "delta.txt"],
+            "and the next batch lands under it too"
+        );
+    }
+
+    /// At the display cap, retention stays keyed on rank even when the table
+    /// is shown in another order — otherwise a broad query fills up with
+    /// whatever the scan reached first and never shows the good hits.
+    #[test]
+    fn a_late_better_hit_displaces_the_worst_at_the_cap() {
+        let mut tab = streaming_tab();
+        tab.sort = (SortKey::Name, true);
+        let limit = 3;
+
+        let send = |tab: &mut SearchTab, hits: Vec<SearchHit>| {
+            tab.apply_update(
+                SearchUpdate::Hits {
+                    generation: tab.generation,
+                    hits,
+                },
+                limit,
+            );
+            if tab.sort_dirty {
+                tab.resort();
+            }
+        };
+
+        send(
+            &mut tab,
+            vec![
+                hit(1, "aaa.txt", 9.0, 10),
+                hit(2, "bbb.txt", 8.0, 20),
+                hit(3, "ccc.txt", 7.0, 30),
+            ],
+        );
+        assert_eq!(displayed(&tab), vec!["aaa.txt", "bbb.txt", "ccc.txt"]);
+        assert!(!tab.limited);
+
+        // Full. A rank-1 arrival must still get in, evicting rank 9.
+        send(&mut tab, vec![hit(4, "zzz.txt", 1.0, 40)]);
+        assert!(tab.limited, "the cap was hit");
+        assert_eq!(tab.results.len(), limit);
+        assert_eq!(
+            displayed(&tab),
+            vec!["bbb.txt", "ccc.txt", "zzz.txt"],
+            "worst rank dropped, display still in name order"
+        );
+    }
+
+    /// Batches arriving during the fade get the same treatment; the ordering
+    /// problem must not simply move inside the 250 ms window.
+    #[test]
+    fn staged_batches_are_ordered_once_the_fade_swaps() {
+        let mut tab = SearchTab::new(false);
+        tab.focus_query = false;
+        tab.query = "zebra".into();
+        tab.on_search_started(1);
+        assert!(tab.swap_pending);
+
+        for h in [hit(1, "worst.txt", 9.0, 10), hit(2, "best.txt", 1.0, 20)] {
+            tab.apply_update(
+                SearchUpdate::Hits {
+                    generation: 1,
+                    hits: vec![h],
+                },
+                1000,
+            );
+        }
+        assert!(tab.results.is_empty(), "still staged behind the fade");
+
+        // What the fade does when it reaches zero.
+        tab.results = std::mem::take(&mut tab.staging);
+        tab.swap_pending = false;
+        tab.sort_dirty = true;
+        tab.resort();
+        assert_eq!(displayed(&tab), vec!["best.txt", "worst.txt"]);
+    }
+
+    /// A selected row is identified by file id, so it survives both the
+    /// re-ordering and the eviction that a new batch can cause.
+    #[test]
+    fn the_selection_follows_its_file_across_batches() {
+        let mut tab = streaming_tab();
+        batch(&mut tab, vec![hit(1, "chosen.txt", 5.0, 10)]);
+        tab.selected = Some(0);
+
+        batch(&mut tab, vec![hit(2, "better.txt", 1.0, 20)]);
+        let sel = tab.selected.expect("still selected");
+        assert_eq!(
+            tab.results[sel as usize].file_id,
+            1,
+            "selection follows the file, not the slot"
+        );
     }
 
     #[test]

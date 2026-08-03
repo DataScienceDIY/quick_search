@@ -31,7 +31,7 @@
 //! cache (or, on a share, the client's attribute cache), so the second is the
 //! one to compare.
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
 use quicksearch_core::config::{Config, IgnoreSet};
@@ -118,7 +118,7 @@ fn parallel(root: &str, config: &Config, db_path: &str) -> (usize, usize) {
         db_path,
         config.clone(),
         Arc::new(Registry::default_set()),
-        Arc::new(Mutex::new(false)),
+        Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
         4,
     ) {

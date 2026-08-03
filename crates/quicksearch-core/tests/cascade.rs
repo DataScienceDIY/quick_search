@@ -55,6 +55,7 @@ impl Seeder {
                 mime: Some("text/plain"),
                 ftype: FileType::TEXT,
                 hash: None,
+                needs_content: true,
             },
         )
         .unwrap()
@@ -73,20 +74,47 @@ impl Seeder {
 
 /// Run the cascade synchronously, collecting every batch. Returns
 /// (flattened hits in emission order, outcome).
+/// Run a search and return its hits in rank order.
+///
+/// The cascade streams batches *while* each pass scans, so arrival order is
+/// table order, not rank order — batch two can hold something better than
+/// anything in batch one. Ordering across batches belongs to the consumer, and
+/// this mirrors what the GUI does with the default sort key, so the ranking
+/// assertions below stay about ranking rather than about scan order.
+///
+/// Use [`run_collect_batches`] to assert on the stream itself.
 fn run_collect(
     conn: &rusqlite::Connection,
     input: &str,
     options: &SearchOptions,
 ) -> (Vec<SearchHit>, cascade::Outcome) {
+    let (batches, outcome) = run_collect_batches(conn, input, options);
+    let mut hits: Vec<SearchHit> = batches.into_iter().flatten().collect();
+    hits.sort_by(|a, b| {
+        a.rank
+            .partial_cmp(&b.rank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    (hits, outcome)
+}
+
+/// The raw batch stream, one `Vec` per sink call.
+fn run_collect_batches(
+    conn: &rusqlite::Connection,
+    input: &str,
+    options: &SearchOptions,
+) -> (Vec<Vec<SearchHit>>, cascade::Outcome) {
     let split = split_for_cascade(input).expect("split");
     let latest = AtomicU64::new(7);
-    let mut hits = Vec::new();
+    let mut batches = Vec::new();
     let outcome = cascade::run(conn, &split, options, 7, &latest, &mut |batch| {
-        hits.extend(batch)
+        batches.push(batch)
     })
     .expect("cascade run")
     .expect("not cancelled");
-    (hits, outcome)
+    (batches, outcome)
 }
 
 fn fuzzy_options() -> SearchOptions {
@@ -1012,4 +1040,116 @@ fn service_reports_missing_db_as_error() {
     }
     assert!(got_error, "missing index must surface as a search error");
     service.shutdown();
+}
+
+/// The point of the whole change: a pass hands hits over *while* it scans, so
+/// the UI has something to show long before the scan ends.
+///
+/// Proven by ordering rather than by batch count — `flush_pass` has always
+/// chunked its output, so counting sink calls proves nothing. Pass A scans in
+/// `files.path` order, so seeding a *worse* match at an early path and a
+/// *better* one at a late path separates the two designs: emitting at the end
+/// sorts them and leads with rank 1, while streaming hands over the rank-3 hit
+/// before the scan has even reached the rank-1 one.
+///
+/// That is the trade being made deliberately: arrival order is scan order, and
+/// ordering across batches belongs to the consumer.
+#[test]
+fn a_pass_hands_hits_over_before_the_scan_reaches_the_end() {
+    let p = tmp_db("stream");
+    let mut s = Seeder::new(&p, true);
+    let early_worse = s.add("my_zebra_file.txt", "/aaa", 1, None); // rank 3
+    for i in 0..400 {
+        s.add(&format!("filler{:04}.txt", i), "/mmm", i as u64 + 2, None);
+    }
+    let late_better = s.add("zebra", "/zzz", 999, None); // rank 1
+    let conn = s.done();
+
+    let options = SearchOptions {
+        batch: 100,
+        ..SearchOptions::default()
+    };
+    let (batches, outcome) = run_collect_batches(&conn, "zebra", &options);
+
+    assert_eq!(outcome.total, 2, "both matches still reach the sink");
+    assert_eq!(
+        batches.first().map(|b| b.as_slice()).and_then(|b| b.first()).map(|h| h.file_id),
+        Some(early_worse),
+        "the early hit should have gone out before the scan found the better one; \
+         batch sizes: {:?}",
+        batches.iter().map(|b| b.len()).collect::<Vec<_>>()
+    );
+
+    // ...and sorting the stream the way the GUI does still puts rank 1 on top.
+    let (hits, _) = run_collect(&conn, "zebra", &options);
+    assert_eq!(
+        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        vec![late_better, early_worse],
+        "the consumer's sort restores rank order"
+    );
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// The time bound, which a size-only rule would miss: a query matching a
+/// handful of rows out of many still paints them as the scan reaches them
+/// rather than at the end.
+#[test]
+fn a_sparse_match_still_streams_before_the_scan_ends() {
+    let p = tmp_db("sparse");
+    let mut s = Seeder::new(&p, true);
+    // Three needles, spread through a haystack far larger than one batch.
+    for i in 0..3000 {
+        let name = if i % 1000 == 500 {
+            format!("needle{:04}.txt", i)
+        } else {
+            format!("hay{:04}.txt", i)
+        };
+        s.add(&name, "/d", i as u64 + 1, Some("body"));
+    }
+    let conn = s.done();
+
+    let options = SearchOptions {
+        batch: 100,
+        ..SearchOptions::default()
+    };
+    let (batches, outcome) = run_collect_batches(&conn, "needle", &options);
+
+    assert_eq!(outcome.total, 3, "all three needles found");
+    assert_eq!(batches.iter().map(|b| b.len()).sum::<usize>(), 3);
+    assert!(
+        !batches.is_empty() && batches[0].len() < 3,
+        "the first needle should not have waited for the other two; batches: {:?}",
+        batches.iter().map(|b| b.len()).collect::<Vec<_>>()
+    );
+}
+
+/// Streaming must not change *what* a search returns, only when. The rank
+/// ordering assertions elsewhere in this file are the detailed version; this
+/// pins the set and the count against a mixed-tier query.
+#[test]
+fn streaming_does_not_change_the_result_set() {
+    let p = tmp_db("stream-set");
+    let mut s = Seeder::new(&p, true);
+    let exact = s.add("zebra", "/d", 1, Some("nothing here"));
+    let sub = s.add("my_zebra_file.txt", "/d", 2, Some("nothing here"));
+    let content = s.add("unrelated.txt", "/d", 3, Some("a zebra in the text"));
+    let conn = s.done();
+
+    for batch in [1usize, 2, 100] {
+        let options = SearchOptions {
+            batch,
+            ..SearchOptions::default()
+        };
+        let (hits, outcome) = run_collect(&conn, "zebra", &options);
+        let ids: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
+        assert_eq!(
+            ids,
+            vec![exact, sub, content],
+            "batch size {} must not change ranking",
+            batch
+        );
+        assert_eq!(outcome.total, 3, "batch size {}", batch);
+    }
 }

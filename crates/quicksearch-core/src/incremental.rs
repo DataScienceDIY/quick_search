@@ -17,15 +17,14 @@ use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::config::{content_allowed, Config, IgnoreSet};
+use crate::config::{Config, IgnoreSet};
 use crate::db::repo;
 use crate::extract::Registry;
 use crate::file_handling::{
-    db_key_for_missing_path, extract_and_store, filtered_walk, UnreadableDirs,
+    db_key_for_missing_path, extract_and_store, filtered_walk, ExtractCursor, UnreadableDirs,
     prepare_file_record_from_path, store_inline_text,
 };
 use crate::platform::path_has_hidden_component_under;
-use crate::query::translator::like_subtree_pattern;
 use crate::watcher::FsEvent;
 
 /// Apply one filesystem event to the index. Missing files are treated as
@@ -120,15 +119,7 @@ fn upsert_file(
     let file_id = match existing {
         Some((_, mtime)) if mtime.max(0) as u64 == rec.mtime => return Ok(()),
         Some((id, _)) => {
-            repo::update_file_basic(
-                &tx,
-                &rec.path,
-                rec.size,
-                rec.mtime,
-                Some(&rec.hash),
-                rec.mime.as_deref(),
-                rec.ftype,
-            )?;
+            repo::update_file_basic(&tx, &rec.as_new_file())?;
             id
         }
         None => match repo::insert_file(&tx, &rec.as_new_file())? {
@@ -139,9 +130,13 @@ fn upsert_file(
         },
     };
 
-    if rec.size > config.processing.maximum_text_file_size
-        || !content_allowed(Path::new(&rec.path), config)
-    {
+    // The insert/update above already wrote NA; re-asserting it costs one
+    // indexed UPDATE on a path that handles one file per event, and keeps this
+    // correct on its own terms rather than on `insert_file`'s. It is also the
+    // only size gate on this path — `decide_content` has none, so falling
+    // through would hand a multi-gigabyte `.txt` to the plaintext extractor,
+    // which reads the whole file into memory.
+    if !rec.needs_content {
         repo::set_content_na(&tx, file_id)?;
     } else if let Some(text) = rec.inline_text.as_deref() {
         // Small enough that `prepare_file_record_from_path` already read the
@@ -163,34 +158,68 @@ fn upsert_file(
 }
 
 fn remove_path(conn: &mut Connection, path: &Path) -> Result<(), String> {
-    // The insert side stores a canonicalized path, so the raw event spelling
-    // is not a usable key — but the file is already gone, so `canonicalize`
-    // cannot be called on it directly either.
-    let path_str = db_key_for_missing_path(path);
-    let tx = conn
-        .transaction()
-        .map_err(|e| format!("begin incremental tx: {}", e))?;
+    remove_paths(conn, std::slice::from_ref(&path.to_path_buf()), 1)
+}
 
-    repo::delete_file_by_path(&tx, &path_str)?;
-
-    // Directory removals surface as one event for the directory itself —
-    // sweep everything indexed beneath it.
-    let subtree: Vec<String> = {
-        let mut stmt = tx
-            .prepare("SELECT path FROM files WHERE path LIKE ?1 ESCAPE '\\'")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params![like_subtree_pattern(&path_str)], |r| {
-                r.get::<_, String>(0)
-            })
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
-    };
-    for p in &subtree {
-        repo::delete_file_by_path(&tx, p)?;
+/// Drop removals that a removal of one of their ancestors already covers.
+///
+/// `rm -rf dir/` reports `dir` *and* every file beneath it. Since removing
+/// `dir` sweeps its whole path range, each descendant event is duplicate work —
+/// 10 000 of them for a 10 000-file tree.
+///
+/// Ancestor membership is tested against a set rather than by sorting, which
+/// keeps this obviously correct: no ordering argument to get wrong, and
+/// `Path::ancestors` walks whole components, so `/a/bc` is never treated as
+/// living under `/a/b` — the same rule `remove_tree` and
+/// `UnreadableDirs::covers` use. Paths are shallow, so the cost is linear.
+pub fn collapse_removal_roots(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
+    if paths.len() < 2 {
+        return paths;
     }
+    let all: std::collections::HashSet<&Path> = paths.iter().map(|p| p.as_path()).collect();
+    paths
+        .iter()
+        .filter(|p| !p.ancestors().skip(1).any(|a| all.contains(a)))
+        .cloned()
+        .collect()
+}
 
-    tx.commit().map_err(|e| format!("commit incremental tx: {}", e))
+/// Delete `paths` and everything indexed beneath them, in transactions of at
+/// most `chunk` paths.
+///
+/// A mass deletion is the case this exists for. Callers hand over the *roots*
+/// of the removal set (see [`collapse_removal_roots`]), so `rm -rf dir/` is one
+/// path here rather than one per file, and each one costs a fixed handful of
+/// range-driven statements ([`repo::delete_subtree`]) instead of a full table
+/// scan plus five statements per file.
+///
+/// Chunking bounds how long any single transaction holds the connection, the
+/// same way `process_batch_inserts` bounds the indexer's writes.
+pub fn remove_paths(
+    conn: &mut Connection,
+    paths: &[std::path::PathBuf],
+    chunk: usize,
+) -> Result<(), String> {
+    for batch in paths.chunks(chunk.max(1)) {
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("begin incremental tx: {}", e))?;
+        for path in batch {
+            // The insert side stores a canonicalized path, so the raw event
+            // spelling is not a usable key — but the file is already gone, so
+            // `canonicalize` cannot be called on it directly either.
+            let path_str = db_key_for_missing_path(path);
+            // The path itself, whether it was a file or a directory...
+            repo::delete_file_by_path(&tx, &path_str)?;
+            // ...then everything beneath it, for a directory removal, which
+            // surfaces as a single event for the directory.
+            let range = ExtractCursor::for_root(&path_str);
+            repo::delete_subtree(&tx, &range.lo, &range.hi)?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit incremental tx: {}", e))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -295,6 +324,81 @@ mod tests {
             std::fs::remove_dir_all(&self.dir).ok();
             std::fs::remove_file(&self.db).ok();
         }
+    }
+
+    fn collapse(paths: &[&str]) -> Vec<String> {
+        let mut out: Vec<String> =
+            collapse_removal_roots(paths.iter().map(std::path::PathBuf::from).collect())
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn removal_roots_collapse_to_the_shallowest_ancestor() {
+        // `rm -rf dir/` reports the directory and every file beneath it;
+        // removing the directory already sweeps its whole range.
+        assert_eq!(
+            collapse(&["/dir", "/dir/a.txt", "/dir/b/c.txt", "/dir/b"]),
+            vec!["/dir"]
+        );
+
+        // Component-wise, so a name-prefix sibling is not swallowed.
+        assert_eq!(
+            collapse(&["/a/b", "/a/bc"]),
+            vec!["/a/b", "/a/bc"],
+            "/a/bc does not live under /a/b"
+        );
+        assert_eq!(
+            collapse(&["/a/b", "/a/b.txt"]),
+            vec!["/a/b", "/a/b.txt"],
+            "a sibling file sorting between a dir and its children survives"
+        );
+
+        // Unrelated removals all survive; order of input does not matter.
+        assert_eq!(
+            collapse(&["/x/deep/f", "/y", "/x"]),
+            vec!["/x", "/y"],
+            "/x/deep/f is covered by /x, /y is independent"
+        );
+
+        // Degenerate inputs.
+        assert!(collapse(&[]).is_empty());
+        assert_eq!(collapse(&["/only"]), vec!["/only"]);
+    }
+
+    /// The collapse must not change what ends up deleted — only how much work
+    /// it takes to get there.
+    #[test]
+    fn collapsed_removal_deletes_the_same_rows_as_the_full_set() {
+        let mut f = Fixture::new();
+        f.write("tree/a.txt", "alpha");
+        f.write("tree/deep/b.txt", "beta");
+        f.write("tree2/keep.txt", "survivor");
+        let tree = f.dir.join("tree");
+        f.apply(&FsEvent::Create(tree.clone()));
+        f.apply(&FsEvent::Create(f.dir.join("tree2")));
+        assert_eq!(f.counts().0, 3);
+
+        let canonical_tree = f.canonical(&tree);
+        std::fs::remove_dir_all(&tree).unwrap();
+
+        // What a real `rm -rf` produces: the directory plus every path under it.
+        let reported: Vec<std::path::PathBuf> = vec![
+            canonical_tree.clone().into(),
+            format!("{}/deep", canonical_tree).into(),
+            format!("{}/a.txt", canonical_tree).into(),
+            format!("{}/deep/b.txt", canonical_tree).into(),
+        ];
+        let roots = collapse_removal_roots(reported);
+        assert_eq!(roots.len(), 1, "one range covers the whole tree");
+
+        remove_paths(&mut f.conn, &roots, 200).unwrap();
+        assert_eq!(f.counts(), (1, 1, 1), "only tree2 survives");
+        let survivor = f.canonical(&f.dir.join("tree2").join("keep.txt"));
+        assert!(f.row(&survivor).is_some());
     }
 
     #[test]
@@ -410,6 +514,27 @@ mod tests {
             content_state,
             repo::STATE_NA,
             "filename indexed, content skipped"
+        );
+        assert_eq!(f.counts(), (1, 0, 0));
+    }
+
+    /// The third way a file can end up NA — no extractor claims its MIME —
+    /// which the filter and oversize tests either side of this one don't
+    /// cover. A row left pending here would be re-fed to the content pass on
+    /// every subsequent run and counted in the extraction denominator forever.
+    #[test]
+    fn an_unclaimed_mime_is_na_in_the_watcher_path() {
+        let mut f = Fixture::new();
+        // `.mp4` sniffs as video/mp4 by extension; nothing extracts video.
+        let vid = f.write("clip.mp4", "not really an mp4, and it needn't be");
+        f.apply(&FsEvent::Create(vid.clone()));
+
+        let canonical = f.canonical(&vid);
+        let (_, _, content_state) = f.row(&canonical).expect("row listed");
+        assert_eq!(
+            content_state,
+            repo::STATE_NA,
+            "filename indexed, nothing to extract"
         );
         assert_eq!(f.counts(), (1, 0, 0));
     }
