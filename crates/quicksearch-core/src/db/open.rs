@@ -30,10 +30,14 @@ use crate::security::IndexKey;
 pub const KEY_MISMATCH_PREFIX: &str = "KEY_MISMATCH: ";
 
 /// Bump this whenever [`SCHEMA_CURRENT`] or [`fts_create_sql`] changes in
-/// a way that makes an old DB unreadable by new code. Any such bump
-/// causes existing indexes to be wiped on next open — there's no
-/// migration path by design.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+/// a way that makes an old DB unreadable by new code — or when stored,
+/// classifier-derived values go stale: `files.mime`, `files.type` and
+/// `content_state` are computed at walk time and never re-derived for
+/// unchanged files, so a classification change (v5: text sniffing, charset
+/// decoding, RTF) needs the wipe to apply everywhere. Any such bump causes
+/// existing indexes to be wiped on next open — there's no migration path
+/// by design.
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// Open `db_path`, applying fast-path pragmas, and ensure the on-disk
 /// schema matches what this build expects. If it doesn't, delete the

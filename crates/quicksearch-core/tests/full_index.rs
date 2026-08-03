@@ -777,10 +777,13 @@ fn seed_mixed_tree(root: &Path) {
     touch(&root.join("small.txt"), b"a small plaintext body with xylophone in it");
     touch(&root.join("large.txt"), big.as_bytes());
     touch(&root.join("empty.txt"), b"");
-    // Invalid UTF-8 with a .txt extension: claimed by the plaintext extractor,
-    // but not decodable, so it must be reported as a failure either way.
+    // Binary bytes with a .txt extension: claimed by the plaintext
+    // extractor, but the NUL fails the binary guard (and the FF FE pair is
+    // not at offset 0, so it is no BOM), so it must be reported as a
+    // failure either way.
     touch(&root.join("bad.txt"), &[0x68, 0x69, 0xff, 0xfe, 0x00, 0x41]);
-    // No extension `infer` or `mime_guess` recognises: no extractor claims it.
+    // No extension table, magic, or text sniff has an answer for NUL soup:
+    // no MIME, no extractor.
     touch(&root.join("blob.bin"), &[0x00, 0x01, 0x02, 0xfd, 0xfe, 0xff]);
     touch(&root.join("nested/deep/note.md"), b"# heading\n\nquagmire body text\n");
 }
@@ -859,7 +862,9 @@ fn undecodable_small_files_are_reported_as_failures_not_silently_skipped() {
     let db_dir = tmp_dir("inline-badutf8-db");
     let db = db_dir.join("index.sqlite");
 
-    touch(&root.join("bad.txt"), &[0x68, 0x69, 0xff, 0xfe]);
+    // The NUL keeps this undecodable: without it these bytes would now
+    // decode as windows-1252 and the test would assert nothing.
+    touch(&root.join("bad.txt"), &[0x68, 0x00, 0x69, 0xff]);
     index_once(&root, &db, &Config::default());
 
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -882,6 +887,114 @@ fn undecodable_small_files_are_reported_as_failures_not_silently_skipped() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
+/// The text sniff end-to-end: extensionless text files (README, Makefile,
+/// go.sum) are content-indexed off their head bytes, while an extensionless
+/// binary blob stays NA.
+#[test]
+fn extensionless_text_files_are_indexed() {
+    let root = tmp_dir("extless");
+    let db_dir = tmp_dir("extless-db");
+    let db = db_dir.join("index.sqlite");
+
+    touch(&root.join("README"), b"QuickSearch indexes zanzibar contents.\n");
+    touch(&root.join("Makefile"), b"all:\n\tcargo build --release\n");
+    touch(&root.join("go.sum"), b"example.com/x v1.0.0 h1:abcdef=\n");
+    touch(&root.join("blob"), &[0x00, 0x01, 0xfe, 0xff]);
+    index_once(&root, &db, &Config::default());
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let state_of = |name: &str| -> i64 {
+        conn.query_row(
+            "SELECT content_state FROM files WHERE path LIKE '%' || ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    for name in ["README", "Makefile", "go.sum"] {
+        assert_eq!(state_of(name), 1, "{} should be content-indexed", name);
+    }
+    assert_eq!(state_of("blob"), 3, "binary blob stays not-applicable");
+    drop(conn);
+
+    assert_eq!(
+        stored_text(&db, "README").as_deref(),
+        Some("QuickSearch indexes zanzibar contents.\n"),
+        "the stored body round-trips"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// Charset decoding end-to-end: UTF-16LE files (the shape of a Windows
+/// registry export) and legacy single-byte text are stored as UTF-8 —
+/// `stored_text` decodes the zstd sidecar with `String::from_utf8`, so a
+/// `Some` result *is* the storage-is-UTF-8 assertion.
+#[test]
+fn utf16_files_are_stored_as_utf8() {
+    let root = tmp_dir("charset");
+    let db_dir = tmp_dir("charset-db");
+    let db = db_dir.join("index.sqlite");
+
+    let reg_src = "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\Xylograph]\r\n";
+    let mut reg_body = vec![0xFF, 0xFE];
+    reg_body.extend(reg_src.encode_utf16().flat_map(|u| u.to_le_bytes()));
+    touch(&root.join("export.reg"), &reg_body);
+
+    // The same encoding behind no extension at all: BOM first, sniff after.
+    let mut extless = vec![0xFF, 0xFE];
+    extless.extend("utf16 notes about quokkas".encode_utf16().flat_map(|u| u.to_le_bytes()));
+    touch(&root.join("NOTES16"), &extless);
+
+    touch(&root.join("legacy.txt"), b"un caf\xe9 tr\xe8s agr\xe9able pr\xe8s du mus\xe9e");
+    index_once(&root, &db, &Config::default());
+
+    assert_eq!(stored_text(&db, "export.reg").as_deref(), Some(reg_src));
+    assert_eq!(
+        stored_text(&db, "NOTES16").as_deref(),
+        Some("utf16 notes about quokkas")
+    );
+    assert_eq!(
+        stored_text(&db, "legacy.txt").as_deref(),
+        Some("un café très agréable près du musée")
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// RTF end-to-end through both extraction paths: a small file the walk
+/// finishes inline, and one past `hash_length` that the content pass opens.
+/// Stored text is the parsed prose, not RTF control words.
+#[test]
+fn rtf_files_are_extracted() {
+    let root = tmp_dir("rtf");
+    let db_dir = tmp_dir("rtf-db");
+    let db = db_dir.join("index.sqlite");
+
+    touch(
+        &root.join("small.rtf"),
+        br"{\rtf1\ansi Meeting notes about the pangolin budget.}",
+    );
+    let big_body = format!(
+        r"{{\rtf1\ansi {}}}",
+        r"paragraphs about the pangolin budget \par ".repeat(400)
+    );
+    assert!(big_body.len() > 8192, "must exceed the default head");
+    touch(&root.join("big.rtf"), big_body.as_bytes());
+    index_once(&root, &db, &Config::default());
+
+    for name in ["small.rtf", "big.rtf"] {
+        let text = stored_text(&db, name).unwrap_or_else(|| panic!("{} has no stored text", name));
+        assert!(text.contains("pangolin budget"), "{}: {:?}", name, &text[..text.len().min(80)]);
+        assert!(!text.contains(r"\rtf"), "{} stored control words", name);
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
 /// End-to-end version of the fix: the extraction denominator the manage-index
 /// tab renders is `extract_total`, and it must count files that need text —
 /// not every indexed file. Asserted through a real `IndexingService` run so it
@@ -894,13 +1007,15 @@ fn the_extraction_denominator_counts_only_files_that_need_text() {
 
     // Three files an extractor claims, seven it never will. `big.txt` is the
     // interesting one: larger than `hash_length`, so the walk cannot finish it
-    // inline and it is the only row the content pass actually opens.
+    // inline and it is the only row the content pass actually opens. The
+    // unclaimed seven get NUL-bearing bodies so neither the extension tables
+    // nor the text sniff have anything to say about them.
     for name in ["a.txt", "b.json"] {
         touch(&root.join(name), b"body bytes with no magic");
     }
     touch(&root.join("big.txt"), &vec![b'z'; 32 * 1024]);
     for name in ["d.mp4", "e.zip", "f.bin", "g.exe", "h.iso", "i.so", "j"] {
-        touch(&root.join(name), b"body bytes with no magic");
+        touch(&root.join(name), b"\x00\x01body bytes\x00");
     }
 
     let config = Config::default();

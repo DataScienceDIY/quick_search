@@ -61,8 +61,12 @@ pub struct IndexingConfig {
     /// supports. Non-empty = only files with these extensions get content
     /// extraction/FTS; everything else is still listed for filename search
     /// (`content_state = NA`). Entries are case-insensitive, with or
-    /// without a leading dot. Applied at walk time, when the row is written —
-    /// which is why changing this forces a rebuild (see [`diff_actions`]).
+    /// without a leading dot. The reserved entry [`EXTENSIONLESS`] whitelists
+    /// files that have no extension at all (`Makefile`, `README`, `.bashrc`),
+    /// which are otherwise excluded by any non-empty filter. `#` starts a
+    /// comment — whole-entry or trailing — see [`content_filter_entries`].
+    /// Applied at walk time, when the row is written — which is why changing
+    /// what it matches forces a rebuild (see [`diff_actions`]).
     pub content_extensions: Vec<String>,
     /// Excluded from the index entirely — never even listed. A pattern
     /// without `/` matches any single path component (so `.git` prunes
@@ -82,14 +86,17 @@ pub struct IndexingConfig {
 #[serde(default)]
 pub struct ProcessingConfig {
     /// Bytes read from the head of each new or changed file. Those bytes do
-    /// three jobs, so this one number sets more than the hash:
+    /// four jobs, so this one number sets more than the hash:
     ///
     /// 1. with the size, they identify the file (see `get_file_hash`);
     /// 2. they are the magic-byte window for MIME detection — `infer` reads
     ///    8 KiB from a path and its longest matcher needs 262 bytes, so the
     ///    default is exactly as good as opening the file, and a value under
     ///    262 makes some formats undetectable except by extension;
-    /// 3. any plaintext file no larger than this is extracted during the
+    /// 3. they are the text-sniff window (`textenc::looks_like_text`) that
+    ///    decides whether an unknown-extension or extensionless file is
+    ///    text — small values judge files on less evidence;
+    /// 4. any plaintext file no larger than this is extracted during the
     ///    walk, sparing the content pass an open/read/close.
     ///
     /// Changing it invalidates stored hashes and forces a rebuild.
@@ -504,21 +511,43 @@ impl Config {
     }
 }
 
+/// Reserved `content_extensions` entry standing for "files with no
+/// extension". Matched case-insensitively, and it cannot collide with a real
+/// extension because the parentheses are not part of one.
+pub const EXTENSIONLESS: &str = "(none)";
+
+/// The `content_extensions` entries that actually filter: `#` starts a
+/// comment and runs to the end of the entry, so a whole-line comment drops
+/// out entirely and `md  # notes` filters on `md`. Surrounding space is
+/// trimmed; what is left of a `#` never is.
+pub fn content_filter_entries(list: &[String]) -> impl Iterator<Item = &str> {
+    list.iter().filter_map(|raw| {
+        let entry = raw.split('#').next().unwrap_or_default().trim();
+        (!entry.is_empty()).then_some(entry)
+    })
+}
+
 /// Whether a file's content (text extraction + FTS) should be indexed under
 /// the `content_extensions` filter. Files that fail this are still listed
-/// for filename search. Empty filter = everything allowed.
+/// for filename search. No entries (empty, or nothing but comments) =
+/// everything allowed.
 pub fn content_allowed(path: &Path, cfg: &Config) -> bool {
-    if cfg.indexing.content_extensions.is_empty() {
+    let list = &cfg.indexing.content_extensions;
+    if content_filter_entries(list).next().is_none() {
         return true;
     }
-    let ext = match path.extension().and_then(|e| e.to_str()) {
-        Some(e) => e.to_ascii_lowercase(),
-        None => return false,
-    };
-    cfg.indexing
-        .content_extensions
-        .iter()
-        .any(|allowed| allowed.trim_start_matches('.').eq_ignore_ascii_case(&ext))
+    // `Path::extension` is None for `Makefile` and for dot-only names like
+    // `.bashrc`, so without the sentinel a non-empty filter always skips them.
+    match path.extension().and_then(|e| e.to_str()) {
+        // The sentinel is reserved: it never doubles as an extension, so a
+        // file named `x.(none)` is not whitelisted by it.
+        Some(ext) => content_filter_entries(list)
+            .filter(|allowed| !allowed.eq_ignore_ascii_case(EXTENSIONLESS))
+            .any(|allowed| allowed.trim_start_matches('.').eq_ignore_ascii_case(ext)),
+        None => {
+            content_filter_entries(list).any(|allowed| allowed.eq_ignore_ascii_case(EXTENSIONLESS))
+        }
+    }
 }
 
 /// Compiled ignore patterns, split by matching scope: patterns without a
@@ -678,7 +707,10 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
         // outside every root, which no sweep will ever reach.
         || old.indexing.follow_symlinks != new.indexing.follow_symlinks
         || old.indexing.ignore_patterns != new.indexing.ignore_patterns
-        || old.indexing.content_extensions != new.indexing.content_extensions
+        // Comments are not part of the filter, so annotating the list is not
+        // a reason to rebuild — only a change to what it actually matches is.
+        || !content_filter_entries(&old.indexing.content_extensions)
+            .eq(content_filter_entries(&new.indexing.content_extensions))
         || old.security.password_protected != new.security.password_protected
         || old.security.salt != new.security.salt
         || roots_changed;
@@ -815,6 +847,81 @@ mod tests {
         assert!(content_allowed(Path::new("/a/readme.md"), &cfg), "leading dot + case in filter");
         assert!(!content_allowed(Path::new("/a/b.pdf"), &cfg));
         assert!(!content_allowed(Path::new("/a/noext"), &cfg));
+        assert!(!content_allowed(Path::new("/a/.bashrc"), &cfg), "dot-only name has no ext");
+    }
+
+    #[test]
+    fn content_allowed_extensionless_sentinel() {
+        let mut cfg = Config::default();
+        cfg.indexing.content_extensions = vec!["txt".into(), "  (NonE)  ".into()];
+        assert!(content_allowed(Path::new("/a/Makefile"), &cfg));
+        assert!(content_allowed(Path::new("/a/.bashrc"), &cfg), "dot-only name");
+        assert!(content_allowed(Path::new("/a/b.txt"), &cfg), "real extensions still work");
+        assert!(!content_allowed(Path::new("/a/b.pdf"), &cfg), "sentinel is not a wildcard");
+        // The sentinel is not itself an extension: a file literally named
+        // `x.none` is not whitelisted by it.
+        assert!(!content_allowed(Path::new("/a/x.none"), &cfg));
+        assert!(!content_allowed(Path::new("/a/x.(none)"), &cfg));
+
+        // Every capitalisation of the word means the same thing.
+        for spelling in ["(none)", "(NONE)", "(NonE)", "(nOnE)"] {
+            let mut c = Config::default();
+            c.indexing.content_extensions = vec![spelling.to_string()];
+            assert!(content_allowed(Path::new("/a/README"), &c), "{spelling}");
+        }
+
+        // A leading dot is stripped for extensions but must not turn some
+        // other entry into the sentinel.
+        let mut only_txt = Config::default();
+        only_txt.indexing.content_extensions = vec!["txt".into()];
+        assert!(!content_allowed(Path::new("/a/Makefile"), &only_txt));
+    }
+
+    #[test]
+    fn content_allowed_comments() {
+        let mut cfg = Config::default();
+        cfg.indexing.content_extensions = vec![
+            "# source files only".into(),
+            "rs # rust".into(),
+            "  .MD\t# docs  ".into(),
+            "   # indented whole-line comment".into(),
+            "(none) # Makefile, LICENSE, ...".into(),
+        ];
+        assert!(content_allowed(Path::new("/a/b.rs"), &cfg));
+        assert!(content_allowed(Path::new("/a/b.md"), &cfg), "dot + trailing comment");
+        assert!(content_allowed(Path::new("/a/Makefile"), &cfg), "sentinel + comment");
+        assert!(!content_allowed(Path::new("/a/b.pdf"), &cfg));
+        // Comment text is not itself a filter entry.
+        assert!(!content_allowed(Path::new("/a/b.rust"), &cfg));
+        assert!(!content_allowed(Path::new("/a/b.only"), &cfg));
+        assert!(!content_allowed(Path::new("/a/b.docs"), &cfg));
+
+        // Nothing but comments filters nothing — same as an empty list.
+        let mut all_comments = Config::default();
+        all_comments.indexing.content_extensions =
+            vec!["# nothing enabled yet".into(), "  ".into(), "#".into()];
+        assert!(content_allowed(Path::new("/a/b.pdf"), &all_comments));
+        assert!(content_allowed(Path::new("/a/Makefile"), &all_comments));
+    }
+
+    #[test]
+    fn comment_only_edit_does_not_force_rebuild() {
+        let mut old = Config::default();
+        old.indexing.content_extensions = vec!["txt".into(), "md".into()];
+        let mut new = old.clone();
+        new.indexing.content_extensions =
+            vec!["# my notes".into(), "txt".into(), "md  # markdown".into()];
+        assert!(!diff_actions(&old, &new).requires_rebuild);
+
+        // Changing what the list matches still does.
+        let mut changed = old.clone();
+        changed.indexing.content_extensions = vec!["txt".into(), "md".into(), "(none)".into()];
+        assert!(diff_actions(&old, &changed).requires_rebuild);
+
+        // ... including commenting an entry out.
+        let mut disabled = old.clone();
+        disabled.indexing.content_extensions = vec!["txt".into(), "# md".into()];
+        assert!(diff_actions(&old, &disabled).requires_rebuild);
     }
 
     #[test]

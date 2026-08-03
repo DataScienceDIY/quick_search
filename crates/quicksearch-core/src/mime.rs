@@ -1,16 +1,23 @@
 //! MIME type guessing and `FileType` bitmask classification.
 //!
-//! Two stages:
-//! 1. [`guess_mime_from_head`] infers a MIME type — extension first via
-//!    `mime_guess`, falling back to magic-byte sniffing via `infer` for files
-//!    whose extension is missing or ambiguous.
-//! 2. [`mime_to_type`] maps a MIME string to a [`FileType`] bitmask so a single
-//!    file can belong to multiple categories (e.g. a `.docx` is Document|Text).
+//! [`guess_mime_from_head`] infers a MIME type in three stages: extension
+//! first (an override table, then `mime_guess`), magic-byte sniffing via
+//! `infer` next, and finally a text sniff ([`crate::textenc`]) that answers
+//! `text/plain` for anything whose head reads as text — which is how
+//! extensionless files (README, Makefile) and source extensions no MIME
+//! table knows (`.go`, `.zig`) get their contents indexed. Extensions in
+//! [`AMBIGUOUS_EXTENSIONS`] invert the order: content decides, and the
+//! extension's MIME is only a fallback.
 //!
-//! The magic bytes are always ones the caller already holds. Indexing reads
+//! [`mime_to_type`] then maps a MIME string to a [`FileType`] bitmask so a
+//! single file can belong to multiple categories (e.g. a `.docx` is
+//! Document|Text).
+//!
+//! The head bytes are always ones the caller already holds. Indexing reads
 //! the head of every new or changed file to hash it, and those are the same
-//! bytes `infer` wants, so there is no path-based variant that goes back to
-//! disk for them — that was a second open/read/close per undetectable file.
+//! bytes `infer` and the text sniff want, so there is no path-based variant
+//! that goes back to disk for them — that was a second open/read/close per
+//! undetectable file.
 
 use std::path::Path;
 
@@ -70,22 +77,21 @@ impl std::ops::BitOrAssign for FileType {
     }
 }
 
-/// Extensions `mime_guess` gets wrong or does not know, and what they really
-/// are.
+/// Extensions whose MIME is pinned regardless of what `mime_guess` or the
+/// file's bytes say.
 ///
-/// Consulted *before* `mime_guess`, because for these the table is not a
-/// fallback but a correction. Everything here is plain text that would
-/// otherwise get no content indexing at all:
+/// Consulted *before* everything else, because for these the table is not a
+/// fallback but a correction or a guarantee:
 ///
-/// - `.ps1`/`.psm1`/`.psd1` and `.url` are simply absent from `mime_guess`,
-///   and `infer` only knows binary magic, so they end up with no MIME — and
-///   [`crate::extract::Registry`] has no extractor to offer, so the file is
-///   marked "not applicable". PowerShell is the most common script type on a
-///   Windows machine.
-/// - `.bat` maps to `application/x-msdownload`, i.e. an executable. It is a
-///   text file, and the plaintext extractor rightly refuses the executable
-///   type. (`.cmd` already resolves to `text/plain`; it is listed so the pair
+/// - `.bat` maps in `mime_guess` to `application/x-msdownload`, i.e. an
+///   executable, and a non-empty `mime_guess` answer would preempt the text
+///   sniff — so without this entry batch files are never content-indexed.
+///   (`.cmd` already resolves to `text/plain`; it is listed so the pair
 ///   cannot drift.)
+/// - `.ps1`/`.psm1`/`.psd1`, `.inf` and `.url` are absent from `mime_guess`.
+///   The text sniff would usually catch them, but pinning them costs
+///   nothing and classifies them deterministically, whatever their head
+///   bytes happen to look like.
 ///
 /// Platform-neutral on purpose: a `.ps1` copied to a Linux box should classify
 /// the same way.
@@ -98,6 +104,27 @@ const EXTENSION_OVERRIDES: &[(&str, &str)] = &[
     ("psm1", "text/plain"),
     ("url", "text/plain"),
 ];
+
+/// Extensions `mime_guess` maps to a binary format that is, on a modern
+/// disk, at least as often a text file: `.ts`/`.mts` TypeScript vs MPEG
+/// transport stream, `.mod` go.mod vs `video/mpeg`, `.org` Org-mode vs
+/// Lotus Organizer, `.scm` Scheme vs Lotus ScreenCam, `.pot` gettext
+/// template vs PowerPoint template, `.vhd` VHDL source vs VirtualBox disk
+/// image.
+///
+/// For these the content decides: magic bytes first, then the text sniff,
+/// and only if both decline does `mime_guess`'s extension answer stand — so
+/// a real MPEG-TS recording still classifies as video.
+const AMBIGUOUS_EXTENSIONS: &[&str] = &["mod", "mts", "org", "pot", "scm", "ts", "vhd"];
+
+/// Whether `path`'s extension is in [`AMBIGUOUS_EXTENSIONS`].
+/// ASCII-case-insensitive, like [`extension_override`].
+fn extension_is_ambiguous(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| AMBIGUOUS_EXTENSIONS.contains(&e.as_str()))
+}
 
 /// Look up [`EXTENSION_OVERRIDES`] for `path`. Extension comparison is
 /// ASCII-case-insensitive, which matters more on Windows where `REPORT.BAT` is
@@ -112,15 +139,21 @@ fn extension_override(path: &Path) -> Option<&'static str> {
 
 /// Infer a MIME type from a path plus the file's leading bytes.
 ///
-/// Extension first — an override table, then `mime_guess` — and magic bytes
-/// only when those come up empty or say `application/octet-stream`.
+/// Extension first — an override table, then `mime_guess` — then magic
+/// bytes when those come up empty or say `application/octet-stream`, and
+/// finally a text sniff that answers `text/plain` for any head that reads
+/// as text ([`crate::textenc::looks_like_text`]). For
+/// [`AMBIGUOUS_EXTENSIONS`] the `mime_guess` answer is demoted to a last
+/// resort behind both content checks.
 ///
 /// `head` is whatever the caller already read; indexing passes the same buffer
 /// it hashes. It bounds magic-byte detection, so a caller that supplies fewer
 /// than 262 bytes (`infer`'s longest signature) can get `None` where a longer
 /// head would have matched. The indexer's `hash_length` defaults to 8 KiB —
 /// exactly what `infer` itself reads from a path — so at default config this
-/// is as good as opening the file, and strictly cheaper.
+/// is as good as opening the file, and strictly cheaper. The same buffer
+/// bounds the text sniff, which tolerates a multibyte character cut off at
+/// the buffer's end.
 ///
 /// A `None` result is a real answer, not a "don't know": the content pass
 /// stores it and does not re-derive it (see
@@ -129,13 +162,29 @@ pub fn guess_mime_from_head(path: &Path, head: &[u8]) -> Option<String> {
     if let Some(m) = extension_override(path) {
         return Some(m.to_string());
     }
-    if let Some(g) = mime_guess::from_path(path).first() {
+    let by_extension = mime_guess::from_path(path).first().and_then(|g| {
         let s = g.essence_str();
-        if !s.is_empty() && s != "application/octet-stream" {
-            return Some(s.to_string());
-        }
+        (!s.is_empty() && s != "application/octet-stream").then(|| s.to_string())
+    });
+    if !extension_is_ambiguous(path) && by_extension.is_some() {
+        return by_extension;
     }
-    infer::get(head).map(|t| t.mime_type().to_string())
+    if let Some(t) = infer::get(head) {
+        let magic = t.mime_type();
+        // For an ambiguous extension, `infer`'s generic OLE-container answer
+        // is less specific than the extension's: a real PowerPoint `.pot`
+        // template must resolve to vnd.ms-powerpoint (which the office
+        // extractor claims), not to a container MIME nothing claims.
+        if magic == "application/x-ole-storage" && by_extension.is_some() {
+            return by_extension;
+        }
+        return Some(magic.to_string());
+    }
+    if crate::textenc::looks_like_text(head) {
+        return Some("text/plain".to_string());
+    }
+    // Only an ambiguous extension still has an answer left to fall back on.
+    by_extension
 }
 
 /// Map a MIME string to a [`FileType`] bitmask. Ported from Baloo's
@@ -153,8 +202,9 @@ pub fn mime_to_type(mime: &str) -> FileType {
         "video" => t |= FileType::VIDEO,
         "text" => {
             t |= FileType::TEXT;
-            // HTML counts as a document too in Baloo.
-            if sub == "html" || sub == "xhtml+xml" {
+            // HTML counts as a document too in Baloo. (xhtml+xml is handled
+            // in the subtype match below, whatever its top level.)
+            if sub == "html" {
                 t |= FileType::DOCUMENT;
             }
         }
@@ -204,8 +254,19 @@ pub fn mime_to_type(mime: &str) -> FileType {
         | "x-msi" => {
             t |= FileType::ARCHIVE;
         }
-        // application/xml is structured text
-        "xml" | "json" | "javascript" | "x-shellscript" | "x-python" => {
+        // XHTML is text and, like HTML above, a document in Baloo's model —
+        // whichever top level it arrives under.
+        "xhtml+xml" => {
+            t |= FileType::TEXT | FileType::DOCUMENT;
+        }
+        // Structured text: everything the plaintext extractor claims beyond
+        // `text/*` (see `extract::plaintext::EXTRA_TEXT_MIMES` and the
+        // cross-check test below). Keyed on the subtype alone, so playlists
+        // stay AUDIO|TEXT and SVG stays IMAGE|TEXT.
+        "xml" | "json" | "json5" | "geo+json" | "javascript" | "mbox" | "rfc822"
+        | "vnd.dart" | "x-csh" | "x-httpd-php" | "x-perl" | "x-sh" | "x-sql"
+        | "x-subrip" | "x-tcl" | "x-tex" | "x-texinfo" | "x-troff" | "x-troff-man"
+        | "x-mpegurl" | "scpls" | "svg+xml" => {
             t |= FileType::TEXT;
         }
         _ => {}
@@ -396,15 +457,19 @@ mod tests {
     }
 
     /// The other side of that bound: starve the head below `infer`'s longest
-    /// signature and detection legitimately degrades. Documented behaviour of
-    /// a non-default `hash_length`, not a bug — but it must stay a `None`
-    /// rather than a wrong guess.
+    /// signature and magic detection legitimately degrades. Documented
+    /// behaviour of a non-default `hash_length`, not a bug — but a binary
+    /// head must stay a `None` rather than become a wrong guess. (A head
+    /// that *reads as text* is a different case: the text sniff answers for
+    /// it, however short.)
     #[test]
     fn a_head_shorter_than_the_signature_declines_rather_than_guessing() {
         use std::path::PathBuf;
         let path = PathBuf::from("/tmp/qs-sniff-truncated");
         assert_eq!(guess_mime_from_head(&path, b"").as_deref(), None);
-        assert_eq!(guess_mime_from_head(&path, &[0x89]).as_deref(), None);
+        // A PNG magic truncated to two bytes: not a magic match, and the
+        // NUL fails the binary guard, so no text guess either.
+        assert_eq!(guess_mime_from_head(&path, &[0x89, 0x00]).as_deref(), None);
         // Enough bytes, and it resolves.
         assert_eq!(
             guess_mime_from_head(&path, &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
@@ -419,5 +484,156 @@ mod tests {
         assert!(mime_to_type("application/x-msi").contains(FileType::ARCHIVE));
         assert!(mime_to_type("application/vnd.ms-outlook").contains(FileType::DOCUMENT));
         assert!(mime_to_type("application/vnd.ms-htmlhelp").contains(FileType::DOCUMENT));
+    }
+
+    /// Every extension fixed by this round of coverage work must reach the
+    /// plaintext extractor through real dispatch — `extract_complete_head`
+    /// rather than `supports` — so the svg/m3u/pls cases prove the
+    /// plaintext-first registration *order*, not just the MIME claim.
+    #[test]
+    fn newly_claimed_extensions_reach_the_plaintext_extractor() {
+        use crate::extract::Registry;
+        use std::path::PathBuf;
+
+        let registry = Registry::default_set();
+        let samples: &[(&str, &[u8])] = &[
+            ("deploy.sh", b"echo hi"),
+            ("env.csh", b"setenv X 1"),
+            ("script.pl", b"print 1;"),
+            ("Module.pm", b"package M;"),
+            ("index.php", b"<?php echo 1;"),
+            ("paper.tex", b"\\documentclass{article}"),
+            ("page.xhtml", b"<html/>"),
+            ("notes.json5", b"{a: 1}"),
+            ("map.geojson", b"{}"),
+            ("subs.srt", b"1\n00:00:01 --> 00:00:02\nhi\n"),
+            ("run.tcl", b"puts hi"),
+            ("main.dart", b"void main() {}"),
+            ("page.man", b".TH TEST 1"),
+            ("test.t", b"use Test::More;"),
+            ("doc.texi", b"@node Top"),
+            ("mail.eml", b"Subject: hi\n\nbody"),
+            ("inbox.mbox", b"From a@b\n\nbody"),
+            ("icon.svg", b"<svg xmlns='x'/>"),
+            ("list.m3u", b"#EXTM3U\ntrack.mp3"),
+            ("radio.pls", b"[playlist]"),
+        ];
+        for (name, head) in samples {
+            let path = PathBuf::from(name);
+            let mime = guess_mime_from_head(&path, head)
+                .unwrap_or_else(|| panic!("{} has no MIME", name));
+            let extracted = registry
+                .extract_complete_head(&path, &mime, head)
+                .unwrap_or_else(|| panic!("{} -> {} not claimed by a head-capable extractor", name, mime))
+                .unwrap_or_else(|e| panic!("{} -> {} failed to extract: {}", name, mime, e));
+            assert!(
+                !extracted.text.is_empty(),
+                "{} -> {} extracted no text",
+                name,
+                mime
+            );
+        }
+    }
+
+    /// Extensionless files are decided by their bytes: text heads index,
+    /// binary heads stay unclassified.
+    #[test]
+    fn extensionless_files_sniff_by_content() {
+        use std::path::PathBuf;
+        let readme = PathBuf::from("README");
+        assert_eq!(
+            guess_mime_from_head(&readme, b"QuickSearch indexes your files.\n").as_deref(),
+            Some("text/plain")
+        );
+        let makefile = PathBuf::from("Makefile");
+        assert_eq!(
+            guess_mime_from_head(&makefile, b"all:\n\tcargo build\n").as_deref(),
+            Some("text/plain")
+        );
+        let blob = PathBuf::from("blob");
+        assert_eq!(guess_mime_from_head(&blob, &[0x00, 0x01, 0x02, 0xFF]).as_deref(), None);
+    }
+
+    /// Ambiguous extensions resolve by content in both directions: source
+    /// code beats the extension table, real binary keeps the extension's
+    /// MIME as the fallback.
+    #[test]
+    fn ambiguous_extensions_resolve_by_content_both_ways() {
+        use std::path::PathBuf;
+
+        let ts_source = b"export function hi(): string { return 'hi'; }\n";
+        assert_eq!(
+            guess_mime_from_head(&PathBuf::from("app.ts"), ts_source).as_deref(),
+            Some("text/plain")
+        );
+        // Uppercase, as Windows likes it.
+        assert_eq!(
+            guess_mime_from_head(&PathBuf::from("APP.TS"), ts_source).as_deref(),
+            Some("text/plain")
+        );
+        // An MPEG transport stream: 0x47 sync bytes with NUL-heavy payloads.
+        // No magic matcher, fails the text sniff, so the extension answers.
+        let mut ts_video = vec![0u8; 376];
+        ts_video[0] = 0x47;
+        ts_video[188] = 0x47;
+        assert_eq!(
+            guess_mime_from_head(&PathBuf::from("clip.ts"), &ts_video).as_deref(),
+            Some("video/vnd.dlna.mpeg-tts")
+        );
+
+        assert_eq!(
+            guess_mime_from_head(&PathBuf::from("go.mod"), b"module example.com/x\n\ngo 1.22\n")
+                .as_deref(),
+            Some("text/plain")
+        );
+
+        // gettext template vs PowerPoint template: text decides one way,
+        // binary bytes fall back to the extension's office MIME (whether
+        // infer's OLE matcher fires or the guard rejects, the answer agrees).
+        assert_eq!(
+            guess_mime_from_head(&PathBuf::from("app.pot"), b"msgid \"hello\"\nmsgstr \"\"\n")
+                .as_deref(),
+            Some("text/plain")
+        );
+        let ole = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0x00, 0x00];
+        assert_eq!(
+            guess_mime_from_head(&PathBuf::from("slides.pot"), &ole).as_deref(),
+            Some("application/vnd.ms-powerpoint")
+        );
+
+        assert_eq!(
+            guess_mime_from_head(&PathBuf::from("cpu.vhd"), b"entity cpu is\nend cpu;\n")
+                .as_deref(),
+            Some("text/plain")
+        );
+        assert_eq!(
+            guess_mime_from_head(&PathBuf::from("disk.vhd"), &[0x00, 0x01, 0x02, 0x03])
+                .as_deref(),
+            Some("application/x-virtualbox-vhd")
+        );
+    }
+
+    /// Everything the plaintext extractor claims must carry the TEXT bit,
+    /// or `type:Text` silently misses content-indexed files (the pre-fix
+    /// state of `.sql`). Iterates the actual claim list so the two can
+    /// never drift apart.
+    #[test]
+    fn every_plaintext_claim_carries_the_text_bit() {
+        for mime in crate::extract::plaintext::EXTRA_TEXT_MIMES {
+            assert!(
+                mime_to_type(mime).contains(FileType::TEXT),
+                "{} is extractable as text but lacks FileType::TEXT",
+                mime
+            );
+        }
+        // The multi-category cases keep their native category too.
+        let svg = mime_to_type("image/svg+xml");
+        assert!(svg.contains(FileType::IMAGE) && svg.contains(FileType::TEXT));
+        let m3u = mime_to_type("audio/x-mpegurl");
+        assert!(m3u.contains(FileType::AUDIO) && m3u.contains(FileType::TEXT));
+        let xhtml = mime_to_type("application/xhtml+xml");
+        assert!(xhtml.contains(FileType::TEXT) && xhtml.contains(FileType::DOCUMENT));
+        // And the `text/` prefix arm still covers the rest.
+        assert!(mime_to_type("text/x-toml").contains(FileType::TEXT));
     }
 }

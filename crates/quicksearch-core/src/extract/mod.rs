@@ -20,6 +20,7 @@ pub mod image;
 pub mod office;
 pub mod pdf;
 pub mod plaintext;
+pub mod rtf;
 
 /// Result of a successful extraction. `text` feeds the FTS5 `text` column;
 /// `properties` feeds both the `properties` FTS5 column (as `key:value`
@@ -169,10 +170,18 @@ impl Registry {
         self.find(mime).and_then(|e| e.extract_from_head(path, head))
     }
 
-    /// The default set wired up for Set A: plaintext, office docs, PDF,
-    /// audio tags, image EXIF.
+    /// The default set: RTF, plaintext, office docs, PDF, audio tags,
+    /// image EXIF.
+    ///
+    /// Order matters — the first extractor whose `supports` accepts a MIME
+    /// wins. RTF precedes plaintext because plaintext claims every `text/*`
+    /// and would swallow `text/rtf` as raw control words. Plaintext
+    /// precedes audio and image because it deliberately claims playlist
+    /// (`audio/x-mpegurl`, `audio/scpls`) and SVG MIMEs whose text is worth
+    /// more than their tags.
     pub fn default_set() -> Self {
         Self::new()
+            .with(rtf::RtfExtractor)
             .with(plaintext::PlaintextExtractor)
             .with(office::OfficeExtractor)
             .with(pdf::PdfExtractor)
@@ -230,6 +239,26 @@ mod tests {
                 "{} should extract from a head", mime
             );
         }
+        for mime in ["application/rtf", "text/rtf"] {
+            assert!(
+                r.extract_complete_head(p, mime, br"{\rtf1 x}").is_some(),
+                "{} should extract from a head", mime
+            );
+        }
+    }
+
+    /// `text/rtf` must dispatch to the RTF extractor, not to plaintext's
+    /// `text/*` claim — i.e. the registration order does its job. The RTF
+    /// parser strips control words; plaintext would keep them.
+    #[test]
+    fn text_rtf_reaches_the_rtf_extractor_not_plaintext() {
+        let r = Registry::default_set();
+        let p = Path::new("/tmp/whatever.rtf");
+        let out = r
+            .extract_complete_head(p, "text/rtf", br"{\rtf1\ansi Hello {\b World}}")
+            .expect("claimed")
+            .expect("parsed");
+        assert_eq!(out.text, "Hello World");
     }
 
     #[test]
