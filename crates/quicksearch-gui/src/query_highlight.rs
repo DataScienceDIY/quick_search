@@ -81,9 +81,7 @@ pub fn classify(text: &str) -> Vec<Seg> {
                             let valid = if is_regex {
                                 let first = !regex_seen;
                                 regex_seen = true;
-                                first
-                                    && op == Op::Contains
-                                    && RegexQuery::new(&value).is_ok()
+                                first && op == Op::Contains && RegexQuery::new(&value).is_ok()
                             } else {
                                 build_filter(word, op, &value, value_is_word).is_ok()
                             };
@@ -406,7 +404,11 @@ mod tests {
         let segs = classify(text);
         let mut cursor = 0usize;
         for s in &segs {
-            assert_eq!(s.range.start, cursor, "gap or overlap in {:?}: {:?}", text, segs);
+            assert_eq!(
+                s.range.start, cursor,
+                "gap or overlap in {:?}: {:?}",
+                text, segs
+            );
             assert!(s.range.end > s.range.start, "empty seg in {:?}", text);
             cursor = s.range.end;
         }
@@ -416,7 +418,9 @@ mod tests {
     use Class::*;
 
     fn owned(v: Vec<(&str, Class, bool)>) -> Vec<(String, Class, bool)> {
-        v.into_iter().map(|(s, c, b)| (s.to_string(), c, b)).collect()
+        v.into_iter()
+            .map(|(s, c, b)| (s.to_string(), c, b))
+            .collect()
     }
 
     #[test]
@@ -460,7 +464,9 @@ mod tests {
             assert_eq!(all[0].1, Keyword, "{:?}", input);
             assert_eq!(all[1].1, Operator, "{:?}", input);
             assert!(
-                all[2..].iter().all(|(_, c, _)| *c == Argument || *c == Operator),
+                all[2..]
+                    .iter()
+                    .all(|(_, c, _)| *c == Argument || *c == Operator),
                 "{:?}: {:?}",
                 input,
                 all
@@ -514,10 +520,7 @@ mod tests {
                 (r"C:\Users\me", Argument, true),
             ])
         );
-        assert_eq!(
-            segs(r"C:\data"),
-            owned(vec![(r"C:\data", Plain, false)])
-        );
+        assert_eq!(segs(r"C:\data"), owned(vec![(r"C:\data", Plain, false)]));
     }
 
     #[test]
@@ -540,8 +543,9 @@ mod tests {
             ])
         );
         // Quoted stars are literal — content stays plain.
-        assert!(segs("\"a*b\"").iter().all(|(s, c, _)| s == "\""
-            || *c == Plain));
+        assert!(segs("\"a*b\"")
+            .iter()
+            .all(|(s, c, _)| s == "\"" || *c == Plain));
     }
 
     #[test]
@@ -640,7 +644,12 @@ mod tests {
     fn invalid_arguments_go_error_uniformly() {
         // (`regex:(` is not here: `(` lexes as a paren, so that input is an
         // *incomplete* filter — bare-key optimism applies, not an error.)
-        for input in ["type:NotAThing", "modified:>=tomorrow", "regex:[", "type:Doc*"] {
+        for input in [
+            "type:NotAThing",
+            "modified:>=tomorrow",
+            "regex:[",
+            "type:Doc*",
+        ] {
             let all = segs(input);
             assert_eq!(all[0].1, Keyword, "{:?}", input);
             let last = all.last().unwrap();
@@ -703,11 +712,9 @@ mod tests {
 
     #[test]
     fn demoted_operators_stay_plain() {
-        assert!(
-            segs("(alpha AND beta) OR gamma")
-                .iter()
-                .all(|(_, c, chip)| *c == Plain && !chip)
-        );
+        assert!(segs("(alpha AND beta) OR gamma")
+            .iter()
+            .all(|(_, c, chip)| *c == Plain && !chip));
         // Dangling comparators are literal text.
         assert!(segs("a > b").iter().all(|(_, c, _)| *c == Plain));
         // Leading operator, nothing else.

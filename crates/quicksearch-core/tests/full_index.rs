@@ -388,6 +388,194 @@ fn two_roots_walk_extract_and_clean_independently() {
 }
 
 // ---------------------------------------------------------------------------
+// Reconciliation without a global path set.
+//
+// Classification and stale detection are per-directory: a worker diffs one
+// directory's listing against that directory's index rows. These cover the
+// cases that arrangement cannot see from inside a single directory read.
+// ---------------------------------------------------------------------------
+
+/// A directory deleted wholesale is never read, so per-directory
+/// reconciliation never runs for it. Only the sweep over stored parents finds
+/// the rows underneath.
+#[test]
+fn a_deleted_directory_takes_its_whole_subtree_out_of_the_index() {
+    let root = tmp_dir("gone-dir");
+    let db_dir = tmp_dir("gone-dir-db");
+    let db = db_dir.join("index.sqlite");
+    let config = test_config();
+
+    touch(&root.join("keep.txt"), b"stays");
+    touch(&root.join("doomed/a.txt"), b"goes");
+    touch(&root.join("doomed/b.txt"), b"goes");
+    // Nested, so the sweep has to reach a parent two levels below the root.
+    touch(&root.join("doomed/deeper/c.txt"), b"goes too");
+
+    index_once(&root, &db, &config);
+    assert_eq!(rows(&db).len(), 4, "all four indexed");
+
+    std::fs::remove_dir_all(root.join("doomed")).unwrap();
+    index_once(&root, &db, &config);
+
+    let names: Vec<String> = rows(&db)
+        .into_iter()
+        .map(|(p, _, _)| Path::new(&p).file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["keep.txt"], "the whole subtree is swept");
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// A symlink target whose own directory the walk never enters.
+///
+/// Two flavours, and only one of them exercises the alias exemption:
+///
+/// - A target *outside* every root is already safe, because the sweep only
+///   scans parents within a root's path range.
+/// - A target inside the root but under a *pruned* directory — hidden here —
+///   has a parent that is in range and legitimately absent from `seen_dirs`.
+///   Nothing but the record that the file itself was seen distinguishes it
+///   from a row whose directory was deleted.
+#[test]
+#[cfg(unix)]
+fn a_symlink_target_in_an_unwalked_directory_survives_reindexing() {
+    let root = tmp_dir("alias-root");
+    let outside = tmp_dir("alias-outside");
+    let db_dir = tmp_dir("alias-db");
+    let db = db_dir.join("index.sqlite");
+    let config = test_config();
+
+    touch(&root.join("normal.txt"), b"inside the root");
+
+    // In range, but under a hidden directory the walk prunes.
+    let hidden_target = root.join(".pruned/inner.txt");
+    touch(&hidden_target, b"only reachable through the link");
+    std::os::unix::fs::symlink(&hidden_target, root.join("hidden_link.txt")).unwrap();
+
+    // Out of range entirely.
+    let outer_target = outside.join("target.txt");
+    touch(&outer_target, b"outside the root entirely");
+    std::os::unix::fs::symlink(&outer_target, root.join("outside_link.txt")).unwrap();
+
+    index_once(&root, &db, &config);
+    let first = rows(&db);
+    assert_eq!(first.len(), 3, "both targets indexed under their own paths");
+    assert!(
+        first.iter().any(|(p, _, _)| p.ends_with(".pruned/inner.txt")),
+        "the pruned-directory target is stored under its canonical path"
+    );
+
+    // The second run is where a sweep keyed only on "was this parent
+    // visited?" deletes the pruned-directory row.
+    index_once(&root, &db, &config);
+    assert_eq!(rows(&db), first, "an aliased row must survive a re-index");
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&outside).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// A file reached only through a symlink must still be *updated* when it
+/// changes. Classifying it against the linking directory's rows would miss,
+/// read as Insert, and `INSERT OR IGNORE` would then silently do nothing.
+#[test]
+#[cfg(unix)]
+fn a_modified_symlink_target_is_updated_not_silently_ignored() {
+    let root = tmp_dir("alias-mod-root");
+    let outside = tmp_dir("alias-mod-outside");
+    let db_dir = tmp_dir("alias-mod-db");
+    let db = db_dir.join("index.sqlite");
+    let config = test_config();
+
+    let target = outside.join("target.txt");
+    touch(&target, b"first body");
+    std::os::unix::fs::symlink(&target, root.join("link.txt")).unwrap();
+
+    index_once(&root, &db, &config);
+    let before = rows(&db);
+    assert_eq!(before.len(), 1);
+
+    std::fs::write(&target, b"second body, quite different").unwrap();
+    filetime_set(&target, SystemTime::now() + Duration::from_secs(120));
+
+    index_once(&root, &db, &config);
+    let after = rows(&db);
+    assert_eq!(after.len(), 1, "still exactly one row");
+    assert_eq!(after[0].0, before[0].0, "same path");
+    assert_ne!(after[0].1, before[0].1, "mtime was refreshed, so it was re-read");
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&outside).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// Overlapping roots reach the same files twice. The writer's digest set is
+/// the only thing left that collapses those visits.
+#[test]
+fn overlapping_roots_index_each_file_exactly_once() {
+    let outer = tmp_dir("overlap-outer");
+    let db_dir = tmp_dir("overlap-db");
+    let db = db_dir.join("index.sqlite");
+    let config = test_config();
+
+    let inner = outer.join("inner");
+    touch(&outer.join("top.txt"), b"in the outer root only");
+    touch(&inner.join("shared.txt"), b"reachable from both roots");
+    touch(&inner.join("also.txt"), b"likewise");
+
+    index_roots_once(&[&outer, &inner], &db, &config);
+
+    let all = rows(&db);
+    assert_eq!(all.len(), 3, "three files, however many roots reach them");
+    let shared: Vec<&(String, i64, i64)> = all
+        .iter()
+        .filter(|(p, _, _)| p.ends_with("shared.txt"))
+        .collect();
+    assert_eq!(shared.len(), 1, "the doubly-reachable file has exactly one row");
+
+    // And the overlap must not make anything look stale on a second pass.
+    index_roots_once(&[&outer, &inner], &db, &config);
+    assert_eq!(rows(&db), all, "a second overlapping run changes nothing");
+
+    std::fs::remove_dir_all(&outer).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// A directory that becomes unreadable between runs must not read as empty.
+/// Per-directory reconciliation returns before diffing when the read fails,
+/// and the sweep skips parents beneath it.
+#[test]
+#[cfg(unix)]
+fn a_directory_that_becomes_unreadable_deletes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tmp_dir("locked-later");
+    let db_dir = tmp_dir("locked-later-db");
+    let db = db_dir.join("index.sqlite");
+    let config = test_config();
+
+    touch(&root.join("open.txt"), b"always readable");
+    let vault = root.join("vault");
+    touch(&vault.join("secret.txt"), b"readable for now");
+    touch(&vault.join("deeper/also.txt"), b"and this one");
+
+    index_once(&root, &db, &config);
+    let before = rows(&db);
+    assert_eq!(before.len(), 3, "all three indexed while readable");
+
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
+    index_once(&root, &db, &config);
+    let after = rows(&db);
+    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).ok();
+
+    assert_eq!(after, before, "an unreadable directory is not an empty one");
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
 // Inline extraction: the walk finishes files whose head is the whole file.
 //
 // `hash_length` is what decides how much of a file the walk reads, so setting

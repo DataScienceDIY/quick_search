@@ -24,7 +24,7 @@
 //! Deliberately std-only (`std::thread` + `std::sync::mpsc`), matching the
 //! house style set out in [`crate::watcher`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -32,12 +32,13 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::UNIX_EPOCH;
 
+use sha2::{Digest, Sha256};
+
 use crate::config::{Config, IgnoreSet};
 use crate::extract::Registry;
 use crate::file_handling::{
-    classify_for_indexing, path_to_db_string, prepare_file_record, warn_if_unrepresentable,
-    ExistingFileEntry,
-    FileIndexAction, OwnedNewFile, UnreadableDirs,
+    classify_by_mtime, classify_for_indexing, path_to_db_string, prepare_file_record,
+    warn_if_unrepresentable, DirRows, FileIndexAction, OwnedNewFile, UnreadableDirs,
 };
 use crate::indexing::should_abort;
 
@@ -65,26 +66,62 @@ const NETWORK_THREADS: usize = 16;
 #[derive(Debug)]
 pub struct WalkedFile {
     /// Canonical path, and the `files.path` key.
-    ///
-    /// Present for *every* file the walk saw, including unchanged ones and
-    /// ones that could not be read. The caller's "seen" set drives stale-row
-    /// deletion, so a path missing from this stream is a path whose index row
-    /// gets deleted.
     pub path: String,
     pub action: FileIndexAction,
     /// `None` when there is nothing to write: the file was unchanged, or its
     /// record could not be built. Never a reason to drop [`WalkedFile::path`].
     pub record: Option<OwnedNewFile>,
+    /// 128-bit truncated SHA-256 of [`WalkedFile::path`], for the writer's
+    /// duplicate-visit set. Computed here so the cost lands on the walk pool
+    /// rather than on the single writer thread.
+    pub digest: u128,
+    /// True when this file was reached by resolving a symlink, so the
+    /// directory it was found in is *not* the directory its row belongs to.
+    ///
+    /// Such a row is invisible to the reconciliation of its real parent —
+    /// which may be a directory no walk ever visits — so the caller must
+    /// exempt it from the vanished-directory sweep.
+    pub aliased: bool,
+}
+
+impl WalkedFile {
+    /// Seen, but with nothing to write. Distinct from not being emitted at
+    /// all: the row stays.
+    fn skipped(path: String, digest: u128, aliased: bool) -> Self {
+        WalkedFile { path, action: FileIndexAction::Skip, record: None, digest, aliased }
+    }
+}
+
+/// What the walk emits. Files as they are classified, plus the per-directory
+/// verdict on which index rows no longer have a file behind them.
+#[derive(Debug)]
+pub enum WalkEvent {
+    File(WalkedFile),
+    /// Paths whose row should be deleted: present in one directory's index
+    /// rows, absent from that directory's listing. Emitted once per directory
+    /// read, and only for directories that were read successfully.
+    Stale(Vec<String>),
 }
 
 /// Work waiting for a thread.
 enum Job {
-    /// Read this directory and process its files.
-    Dir(PathBuf),
+    /// Read this directory and process its files. Carries the directory's
+    /// index rows, fetched by the prefetcher before the job became runnable.
+    Dir(PathBuf, Arc<DirRows>),
     /// Process this slice of one directory's files, split off because the
     /// directory was too wide for one worker to be worth serialising on.
-    Files(Vec<PathBuf>),
+    /// Shares its directory's rows.
+    Files(Vec<PathBuf>, Arc<DirRows>),
+    /// A resolved symlink target, with the stored mtime for its own path.
+    /// Classified against that rather than against any directory's rows.
+    Alias(PathBuf, Option<u64>),
 }
+
+/// Directories fetched but not yet taken by a worker. Each holds its rows
+/// live, so without a cap the prefetcher would run ahead of the pool and
+/// materialise rows for thousands of directories at once — reintroducing in
+/// one structure the memory this design exists to remove.
+const PREFETCH_AHEAD: usize = 64;
 
 #[derive(Default)]
 struct Queue {
@@ -93,14 +130,45 @@ struct Queue {
     /// keeps the live frontier depth-first-ish instead of holding an entire
     /// breadth-first level in memory.
     jobs: Vec<Job>,
+    /// Directories discovered but not yet given their rows, and symlink
+    /// targets awaiting an mtime lookup. The prefetcher drains both.
+    needs_rows: Vec<PathBuf>,
+    needs_alias: Vec<PathBuf>,
+    /// Set while the prefetcher is mid-query, holding work that is in neither
+    /// list. Part of the end-of-walk proof: see [`Shared::take`].
+    prefetching: bool,
+    /// Fetched directories sitting in `jobs`, i.e. the ones actually holding
+    /// rows. What [`PREFETCH_AHEAD`] bounds.
+    ///
+    /// Counted rather than derived from `jobs.len()`: that also holds
+    /// `Job::Files` chunks, which carry no rows of their own, and a wide
+    /// directory pushes many of them. Bounding on the total would let file
+    /// chunks starve directory prefetching and leave the pool waiting on
+    /// rows that were never fetched.
+    dirs_ready: usize,
     /// Workers currently holding a job — that is, workers that may still push
     /// more. The walk is over when this is zero and `jobs` is empty.
     active: usize,
     /// Canonical directories already queued. Collapses overlapping roots and
     /// makes symlink cycles impossible: a cycle must revisit a canonical path,
     /// and every directory pushed here is canonical.
+    ///
+    /// Also the record of which directories the walk reached, which the
+    /// caller's vanished-directory sweep reads once the walk has finished.
     seen_dirs: HashSet<PathBuf>,
     done: bool,
+}
+
+impl Queue {
+    /// Whether any stage still holds work. The prefetch stage is invisible to
+    /// a `jobs`/`active` test, so it has to be named here explicitly.
+    fn idle(&self) -> bool {
+        self.jobs.is_empty()
+            && self.needs_rows.is_empty()
+            && self.needs_alias.is_empty()
+            && !self.prefetching
+            && self.active == 0
+    }
 }
 
 struct Shared {
@@ -155,9 +223,18 @@ impl Shared {
             }
             if let Some(job) = q.jobs.pop() {
                 q.active += 1;
+                if matches!(job, Job::Dir(..)) {
+                    q.dirs_ready -= 1;
+                }
+                // The prefetcher may have been parked behind PREFETCH_AHEAD.
+                self.idle.notify_all();
                 return Some((job, ActiveJob { shared: self, finished: false }));
             }
-            if q.active == 0 {
+            // Nothing runnable. Only "nobody anywhere holds work" proves the
+            // walk is over — a directory sitting in the prefetch stage still
+            // becomes a job, and declaring the walk finished with one parked
+            // there would hand reconciliation a partial file set.
+            if q.idle() {
                 q.done = true;
                 self.idle.notify_all();
                 return None;
@@ -166,20 +243,96 @@ impl Shared {
         }
     }
 
-    /// Push discovered work and give the job slot back, under a single lock
-    /// acquisition. Doing both together is what makes the `active == 0` test
-    /// in [`Shared::take`] an end-of-walk proof rather than a race: a worker
-    /// that has popped the last job but not yet published its children must
-    /// never look idle.
-    fn publish(&self, found: Vec<Job>) {
+    /// Claim one unit of prefetch work, or `None` once the walk is over.
+    ///
+    /// Parks while the runnable queue is already `PREFETCH_AHEAD` deep, so
+    /// fetched-but-unclaimed rows stay bounded.
+    fn take_prefetch(&self) -> Option<PrefetchWork> {
         let mut q = self.queue.lock().unwrap();
-        for job in found {
-            if let Job::Dir(ref dir) = job {
-                if !q.seen_dirs.insert(dir.clone()) {
-                    continue;
+        loop {
+            if q.done {
+                return None;
+            }
+            // Aliases are never throttled: they carry a single mtime, not a
+            // directory's rows, so they cost nothing to hold.
+            if let Some(path) = q.needs_alias.pop() {
+                q.prefetching = true;
+                return Some(PrefetchWork::Alias(path));
+            }
+            if q.dirs_ready < PREFETCH_AHEAD {
+                if let Some(dir) = q.needs_rows.pop() {
+                    q.prefetching = true;
+                    return Some(PrefetchWork::Dir(dir));
                 }
             }
-            q.jobs.push(job);
+            if q.idle() {
+                q.done = true;
+                self.idle.notify_all();
+                return None;
+            }
+            q = self.idle.wait(q).unwrap();
+        }
+    }
+
+    /// Publish a prefetched job and clear the in-flight flag together, under
+    /// one lock — the same indivisibility `publish` relies on, for the same
+    /// reason.
+    fn finish_prefetch(&self, job: Job) {
+        let mut q = self.queue.lock().unwrap();
+        if matches!(job, Job::Dir(..)) {
+            q.dirs_ready += 1;
+        }
+        q.jobs.push(job);
+        q.prefetching = false;
+        self.idle.notify_all();
+    }
+
+    /// Give the prefetch slot back without producing a job (the query failed).
+    fn abandon_prefetch(&self) {
+        let mut q = self.queue.lock().unwrap();
+        q.prefetching = false;
+        self.idle.notify_all();
+    }
+}
+
+/// One unit of work for the prefetcher.
+enum PrefetchWork {
+    Dir(PathBuf),
+    Alias(PathBuf),
+}
+
+/// What a worker discovered while reading a directory.
+///
+/// Distinct from [`Job`] because most of it is not yet runnable: a newly
+/// discovered directory has no rows, and a symlink target has no stored
+/// mtime, until the prefetcher supplies them.
+enum Found {
+    /// A subdirectory. Needs its rows before a worker can classify inside it.
+    Dir(PathBuf),
+    /// A resolved symlink target. Needs an exact-path mtime lookup.
+    Alias(PathBuf),
+    /// Overflow files from the directory just read, which already has rows.
+    Files(Vec<PathBuf>, Arc<DirRows>),
+}
+
+impl Shared {
+    /// Push discovered work and give the job slot back, under a single lock
+    /// acquisition. Doing both together is what makes the idle test in
+    /// [`Shared::take`] an end-of-walk proof rather than a race: a worker
+    /// that has popped the last job but not yet published its children must
+    /// never look idle.
+    fn publish(&self, found: Vec<Found>) {
+        let mut q = self.queue.lock().unwrap();
+        for item in found {
+            match item {
+                Found::Dir(dir) => {
+                    if q.seen_dirs.insert(dir.clone()) {
+                        q.needs_rows.push(dir);
+                    }
+                }
+                Found::Alias(path) => q.needs_alias.push(path),
+                Found::Files(files, rows) => q.jobs.push(Job::Files(files, rows)),
+            }
         }
         q.active -= 1;
         self.idle.notify_all();
@@ -201,7 +354,7 @@ struct ActiveJob<'a> {
 }
 
 impl ActiveJob<'_> {
-    fn finish(mut self, found: Vec<Job>) {
+    fn finish(mut self, found: Vec<Found>) {
         self.shared.publish(found);
         self.finished = true;
     }
@@ -219,7 +372,6 @@ struct Ctx {
     follow_symlinks: bool,
     include_hidden: bool,
     ignore: IgnoreSet,
-    existing_files: Arc<HashMap<String, ExistingFileEntry>>,
     config: Config,
     /// Lets a worker finish small text files outright: the head it reads to
     /// hash them is already their entire contents, so an extractor that works
@@ -233,7 +385,23 @@ struct Ctx {
 /// Read one directory, apply the hidden/ignore rules, and split the result:
 /// subdirectories and overflow file chunks go to `found` for the pool, the
 /// remaining files come back for this worker to handle immediately.
-fn read_directory(dir: &Path, ctx: &Ctx, found: &mut Vec<Job>) -> Vec<PathBuf> {
+///
+/// Also reconciles the directory against its index rows. This is the right
+/// place for it and the only cheap one: the *complete* filtered listing
+/// exists here, before the directory is split across workers, so the diff
+/// needs no per-directory completion count. `stale` receives the paths whose
+/// row has no file behind it any more.
+///
+/// A directory that cannot be read returns before reconciling, so nothing
+/// under it is ever deleted — an unreadable directory must not read as an
+/// empty one.
+fn read_directory(
+    dir: &Path,
+    rows: &Arc<DirRows>,
+    ctx: &Ctx,
+    found: &mut Vec<Found>,
+    stale: &mut Vec<String>,
+) -> Vec<PathBuf> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -243,6 +411,11 @@ fn read_directory(dir: &Path, ctx: &Ctx, found: &mut Vec<Job>) -> Vec<PathBuf> {
             return Vec::new();
         }
     };
+    // Names surviving the filters, for the diff below. Only meaningful
+    // because every `continue` in the loop is a genuine "not indexable",
+    // matching what would have been absent from the old global seen set.
+    let mut present: HashSet<String> = HashSet::new();
+    let mut unreadable_entry = false;
 
     let mut files = Vec::new();
     for entry in entries {
@@ -251,6 +424,10 @@ fn read_directory(dir: &Path, ctx: &Ctx, found: &mut Vec<Job>) -> Vec<PathBuf> {
             Err(e) => {
                 crate::log_warn!("cannot read an entry of {}: {}", dir.display(), e);
                 ctx.unreadable.record(dir.to_path_buf());
+                // The listing is now incomplete, so it cannot be used to
+                // decide what is missing: an entry we failed to read would
+                // look identical to one that was deleted.
+                unreadable_entry = true;
                 continue;
             }
         };
@@ -276,7 +453,10 @@ fn read_directory(dir: &Path, ctx: &Ctx, found: &mut Vec<Job>) -> Vec<PathBuf> {
         // `file_type` is the cached `d_type` from the directory read, so
         // splitting directories from files here is free.
         match entry.file_type() {
-            Ok(ft) if ft.is_dir() => found.push(Job::Dir(path)),
+            // Directories hold no `files` row, so they are deliberately not
+            // marked present: a name that was a file last run and is a
+            // directory now *should* lose its row.
+            Ok(ft) if ft.is_dir() => found.push(Found::Dir(path)),
             Ok(ft) if ft.is_symlink() => {
                 // Resolve aliases where they are found. The target's canonical
                 // path is what the index stores, and pushing only canonical
@@ -285,45 +465,94 @@ fn read_directory(dir: &Path, ctx: &Ctx, found: &mut Vec<Job>) -> Vec<PathBuf> {
                     match fs::metadata(&target) {
                         Ok(m) if m.is_dir() => {
                             if ctx.follow_symlinks {
-                                found.push(Job::Dir(target));
+                                found.push(Found::Dir(target));
                             }
                         }
-                        Ok(_) => files.push(target),
+                        // The row for a resolved target belongs to the
+                        // target's own directory, not this one, so it is not
+                        // marked present here and cannot be classified
+                        // against these rows.
+                        Ok(_) => found.push(Found::Alias(target)),
                         Err(_) => {}
                     }
                 }
             }
-            Ok(_) => files.push(path),
-            Err(_) => {}
+            Ok(_) => {
+                present.insert(name.into_owned());
+                files.push(path);
+            }
+            // Type unknown: the entry exists but we could not classify it.
+            // Mark it present so an existing row survives — seen, not deleted.
+            Err(_) => {
+                present.insert(name.into_owned());
+            }
+        }
+    }
+
+    if !unreadable_entry {
+        for name in rows.keys() {
+            if !present.contains(name.as_str()) {
+                // Rebuild the stored path the way `prepare` does, by joining
+                // onto the canonical directory, so separators and roots match
+                // the `files.path` spelling exactly.
+                stale.push(path_to_db_string(&dir.join(name)));
+            }
         }
     }
 
     // Spread a wide directory across the pool, keeping the tail for
-    // ourselves so the entries the read just warmed are handled now.
+    // ourselves so the entries the read just warmed are handled now. Each
+    // chunk shares this directory's rows: they are the same directory, and
+    // classifying them against anything else would read every file as new.
     while files.len() > FILES_PER_JOB {
         let chunk = files.split_off(files.len() - FILES_PER_JOB);
-        found.push(Job::Files(chunk));
+        found.push(Found::Files(chunk, rows.clone()));
     }
     files
 }
 
+/// How a file's stored mtime is to be found.
+enum Known<'a> {
+    /// By name within the directory being walked — the ordinary case.
+    InDir(&'a DirRows),
+    /// Already resolved by exact path, for a symlink target whose row lives
+    /// under a different parent.
+    Exact(Option<u64>),
+}
+
+/// 128-bit truncated SHA-256 of a path, for the writer's duplicate-visit set.
+///
+/// Truncated rather than full: 16 bytes is ~4e-26 collision probability at
+/// 7M paths, where 8 bytes would be ~1e-6 — and a collision here silently
+/// drops a real file from the index. Cryptographic rather than fast because
+/// filenames on a shared volume are attacker-supplied, so a cheap hash would
+/// let a chosen pair hide one of the two files.
+pub fn path_digest(path: &str) -> u128 {
+    let digest = Sha256::digest(path.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    u128::from_be_bytes(bytes)
+}
+
 /// One `stat`, then classify; only files that are actually going to be
 /// written get opened, and small text files are finished outright.
-fn prepare(path: PathBuf, ctx: &Ctx) -> WalkedFile {
+fn prepare(path: PathBuf, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
     let db_path = path_to_db_string(&path);
+    let digest = path_digest(&db_path);
+    let aliased = matches!(known, Known::Exact(_));
 
     // A name that is not valid UTF-8 cannot be stored in `files.path` and read
     // back as the same file, so there is nothing to hash or text-index. `Skip`
     // rather than an early return with no entry: the caller reads a missing
     // path as "deleted", and this file was seen, not removed.
     if warn_if_unrepresentable(&path) {
-        return WalkedFile { path: db_path, action: FileIndexAction::Skip, record: None };
+        return WalkedFile::skipped(db_path, digest, aliased);
     }
 
     let Ok(meta) = fs::metadata(&path) else {
         // Seen but unreadable. Emitting it anyway keeps its index row alive:
         // a transient stat failure must not read as "deleted".
-        return WalkedFile { path: db_path, action: FileIndexAction::Skip, record: None };
+        return WalkedFile::skipped(db_path, digest, aliased);
     };
     let Some(mtime) = meta
         .modified()
@@ -331,10 +560,21 @@ fn prepare(path: PathBuf, ctx: &Ctx) -> WalkedFile {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
     else {
-        return WalkedFile { path: db_path, action: FileIndexAction::Skip, record: None };
+        return WalkedFile::skipped(db_path, digest, aliased);
     };
 
-    let action = classify_for_indexing(&db_path, mtime, &ctx.existing_files);
+    let action = match known {
+        Known::InDir(rows) => {
+            // The name is what these rows are keyed by; it is the last
+            // component of the same path `db_path` was built from.
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            classify_for_indexing(&name, mtime, rows)
+        }
+        Known::Exact(stored) => classify_by_mtime(stored, mtime),
+    };
     let record = match action {
         // Unchanged: never opened, never hashed. This is nearly every file on
         // a re-index, and it is the case that has to stay at one syscall.
@@ -344,10 +584,10 @@ fn prepare(path: PathBuf, ctx: &Ctx) -> WalkedFile {
         _ => prepare_file_record(&db_path, &meta, &ctx.config, &ctx.registry),
     };
 
-    WalkedFile { path: db_path, action, record }
+    WalkedFile { path: db_path, action, record, digest, aliased }
 }
 
-fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkedFile>) {
+fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
     while let Some((job, slot)) = shared.take() {
         shared.busy.fetch_add(1, Ordering::Relaxed);
         let _busy = BusyGuard(&shared.busy);
@@ -357,9 +597,24 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkedFile>) {
         }
 
         let mut found = Vec::new();
-        let files = match job {
-            Job::Dir(dir) => read_directory(&dir, ctx, &mut found),
-            Job::Files(files) => files,
+        let mut stale = Vec::new();
+        // An alias is a single file with its mtime already resolved; the
+        // other two variants are a directory's worth classified against
+        // that directory's rows.
+        let (files, rows) = match job {
+            Job::Dir(dir, rows) => {
+                let files = read_directory(&dir, &rows, ctx, &mut found, &mut stale);
+                (files, rows)
+            }
+            Job::Files(files, rows) => (files, rows),
+            Job::Alias(path, stored) => {
+                slot.finish(found);
+                if tx.send(WalkEvent::File(prepare(path, Known::Exact(stored), ctx))).is_err() {
+                    shared.shutdown();
+                    return;
+                }
+                continue;
+            }
         };
 
         // Hand the subdirectories over before doing our own per-file work, so
@@ -367,12 +622,17 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkedFile>) {
         // also confines the job slot to `read_directory`.
         slot.finish(found);
 
+        if !stale.is_empty() && tx.send(WalkEvent::Stale(stale)).is_err() {
+            shared.shutdown();
+            return;
+        }
+
         for path in files {
             if should_abort(&ctx.stop_flag, &ctx.suspend_flag) {
                 shared.shutdown();
                 return;
             }
-            if tx.send(prepare(path, ctx)).is_err() {
+            if tx.send(WalkEvent::File(prepare(path, Known::InDir(&rows), ctx))).is_err() {
                 // Receiver gone: the run was stopped or failed. Not an error.
                 shared.shutdown();
                 return;
@@ -381,11 +641,62 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkedFile>) {
     }
 }
 
+/// Serves the pool's directory-row and symlink-mtime lookups from one
+/// read-only connection.
+///
+/// One per walk. The alternative — a connection per worker — would multiply
+/// SQLite's page cache by the pool size; see [`PRAGMAS_WALK_READER`]. Every
+/// query here is a single index lookup, so one thread stays far ahead of a
+/// pool bound by `stat` latency.
+///
+/// A failed query is not fatal: the job is abandoned rather than retried, and
+/// the directory it was for simply goes unwalked, which reconciliation reads
+/// as "not seen" and therefore deletes nothing.
+fn prefetcher(shared: &Shared, db_path: &str) {
+    let conn = match crate::db::open::open_walk_reader(db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            // Without rows nothing can be classified, so stopping the walk is
+            // the honest outcome: continuing would treat every file as new
+            // and every row as stale.
+            crate::log_warn!("walk reader: {}", e);
+            shared.shutdown();
+            return;
+        }
+    };
+
+    while let Some(work) = shared.take_prefetch() {
+        match work {
+            PrefetchWork::Dir(dir) => {
+                match crate::db::repo::dir_rows(&conn, &path_to_db_string(&dir)) {
+                    Ok(rows) => shared.finish_prefetch(Job::Dir(dir, Arc::new(rows))),
+                    Err(e) => {
+                        crate::log_warn!("{}", e);
+                        shared.abandon_prefetch();
+                    }
+                }
+            }
+            PrefetchWork::Alias(path) => {
+                match crate::db::repo::mtime_for_path(&conn, &path_to_db_string(&path)) {
+                    Ok(stored) => shared.finish_prefetch(Job::Alias(path, stored)),
+                    Err(e) => {
+                        crate::log_warn!("{}", e);
+                        shared.abandon_prefetch();
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A running parallel walk. Iterating it drains finished files; dropping it
 /// stops the workers and joins them.
 pub struct ParallelWalk {
-    rx: Option<mpsc::Receiver<WalkedFile>>,
+    rx: Option<mpsc::Receiver<WalkEvent>>,
     handles: Vec<JoinHandle<()>>,
+    /// Joined by [`ParallelWalk::finish`] alongside the workers. Held
+    /// separately only so a failure to open its connection is attributable.
+    prefetch: Option<JoinHandle<()>>,
     shared: Arc<Shared>,
     ctx: Arc<Ctx>,
 }
@@ -395,6 +706,24 @@ impl ParallelWalk {
     /// ended, because the channel closes when the last worker exits.
     pub fn unreadable(&self) -> &UnreadableDirs {
         &self.ctx.unreadable
+    }
+
+    /// Every canonical directory the walk queued, in `files.parent` spelling.
+    ///
+    /// The caller's vanished-directory sweep needs this: a directory deleted
+    /// wholesale is never read, so nothing reconciles the rows beneath it,
+    /// and "was this parent reached at all" is the only way to find them.
+    ///
+    /// Only meaningful once the walk has finished.
+    pub fn seen_dirs(&self) -> HashSet<String> {
+        self.shared
+            .queue
+            .lock()
+            .unwrap()
+            .seen_dirs
+            .iter()
+            .map(|d| path_to_db_string(d))
+            .collect()
     }
 
     /// A cheap, cloneable handle for reading worker activity while the
@@ -423,13 +752,23 @@ impl ParallelWalk {
                 clean = false;
             }
         }
+        // After the workers, so a prefetcher parked waiting for the pool to
+        // drain below PREFETCH_AHEAD is already free to observe `done`.
+        if let Some(handle) = self.prefetch.take() {
+            // `shutdown` is what releases it; without that this would block
+            // until the queue emptied on its own.
+            self.shared.shutdown();
+            if handle.join().is_err() {
+                clean = false;
+            }
+        }
         clean
     }
 }
 
 /// Result of a non-blocking pull from a walk.
 pub enum TryNext {
-    Item(WalkedFile),
+    Item(WalkEvent),
     /// Nothing ready right now; the walk is still running.
     Empty,
     /// The walk has ended (all workers exited, for any reason).
@@ -452,9 +791,9 @@ impl ParallelWalk {
 }
 
 impl Iterator for ParallelWalk {
-    type Item = WalkedFile;
+    type Item = WalkEvent;
 
-    fn next(&mut self) -> Option<WalkedFile> {
+    fn next(&mut self) -> Option<WalkEvent> {
         self.rx.as_ref()?.recv().ok()
     }
 }
@@ -473,13 +812,15 @@ impl Drop for ParallelWalk {
 /// `workers` is explicit so callers can honour per-root overrides; use
 /// [`thread_count_for`] for the storage-appropriate default. Clamped to
 /// 1..=64.
+/// `db_path` is opened read-only by this walk's row prefetcher; the walk
+/// itself never writes.
 #[allow(clippy::too_many_arguments)]
 pub fn walk_indexable_files(
     roots: &[String],
     follow_symlinks: bool,
     include_hidden: bool,
     ignore: IgnoreSet,
-    existing_files: Arc<HashMap<String, ExistingFileEntry>>,
+    db_path: &str,
     config: Config,
     registry: Arc<Registry>,
     stop_flag: Arc<Mutex<bool>>,
@@ -501,7 +842,10 @@ pub fn walk_indexable_files(
             Ok(dir) => {
                 let dir = PathBuf::from(path_to_db_string(&dir));
                 if queue.seen_dirs.insert(dir.clone()) {
-                    queue.jobs.push(Job::Dir(dir));
+                    // Through the prefetcher like any other directory: a root
+                    // needs its rows before anything inside it can be
+                    // classified.
+                    queue.needs_rows.push(dir);
                 }
             }
             Err(e) => {
@@ -524,7 +868,6 @@ pub fn walk_indexable_files(
         follow_symlinks,
         include_hidden,
         ignore,
-        existing_files,
         config,
         registry,
         unreadable: UnreadableDirs::default(),
@@ -544,10 +887,16 @@ pub fn walk_indexable_files(
         })
         .collect();
     // The workers must hold the only senders, or `recv` never reports the end
-    // of the walk and phase 1 hangs forever.
+    // of the walk and phase 1 hangs forever. The prefetcher deliberately holds
+    // none: it produces jobs, not files.
     drop(tx);
 
-    ParallelWalk { rx: Some(rx), handles, shared, ctx }
+    let prefetch = {
+        let (shared, db_path) = (shared.clone(), db_path.to_string());
+        thread::spawn(move || prefetcher(&shared, &db_path))
+    };
+
+    ParallelWalk { rx: Some(rx), handles, prefetch: Some(prefetch), shared, ctx }
 }
 
 /// Pick a worker count for these roots.
@@ -593,28 +942,86 @@ mod tests {
         fs::write(p, b"x").unwrap();
     }
 
-    fn walk(root: &Path, existing: HashMap<String, ExistingFileEntry>) -> Vec<WalkedFile> {
-        walk_with(root, existing, false, false)
+    /// A database seeded with `rows` as already-indexed files.
+    ///
+    /// Classification data now comes from SQLite rather than from a map the
+    /// caller passes in, so these tests build the state they are testing
+    /// against the same way the indexer does.
+    fn db_with(tag: &str, rows: &[(String, u64)]) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "quicksearch-pwalk-db-{}-{}-{}.sqlite",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let conn = crate::db::open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        for (path, mtime) in rows {
+            let as_path = Path::new(path);
+            conn.execute(
+                "INSERT INTO files (name, path, parent, size, mtime, type, \
+                                    basic_state, content_state)
+                 VALUES (?1, ?2, ?3, 0, ?4, 0, 1, 3)",
+                rusqlite::params![
+                    as_path.file_name().unwrap().to_string_lossy(),
+                    path,
+                    as_path.parent().unwrap().to_string_lossy(),
+                    *mtime as i64,
+                ],
+            )
+            .unwrap();
+        }
+        p
+    }
+
+    fn empty_db(tag: &str) -> PathBuf {
+        db_with(tag, &[])
+    }
+
+    fn walk(root: &Path, db: &Path) -> Vec<WalkedFile> {
+        walk_with(root, db, false, false)
     }
 
     fn walk_with(
         root: &Path,
-        existing: HashMap<String, ExistingFileEntry>,
+        db: &Path,
         follow_symlinks: bool,
         include_hidden: bool,
     ) -> Vec<WalkedFile> {
-        walk_indexable_files(
+        files_only(walk_indexable_files(
             &[root.to_string_lossy().into_owned()],
             follow_symlinks,
             include_hidden,
             IgnoreSet::compile(&[]).unwrap(),
-            Arc::new(existing),
+            db.to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
             Arc::new(Mutex::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
-        )
+        ))
+    }
+
+    /// Drop the reconciliation events; most tests are about which files the
+    /// walk reports.
+    fn files_only(walk: ParallelWalk) -> Vec<WalkedFile> {
+        walk.filter_map(|e| match e {
+            WalkEvent::File(f) => Some(f),
+            WalkEvent::Stale(_) => None,
+        })
+        .collect()
+    }
+
+    /// Paths the walk decided no longer have a file behind them.
+    fn stale_only(walk: ParallelWalk) -> Vec<String> {
+        walk.filter_map(|e| match e {
+            WalkEvent::Stale(paths) => Some(paths),
+            WalkEvent::File(_) => None,
+        })
+        .flatten()
         .collect()
     }
 
@@ -635,7 +1042,7 @@ mod tests {
         touch(&root.join("sub/deep/c.txt"));
         touch(&root.join("other/d.txt"));
 
-        let files = walk(&root, HashMap::new());
+        let files = walk(&root, &empty_db("nested"));
         assert_eq!(names(&files), vec!["a.txt", "b.txt", "c.txt", "d.txt"]);
 
         let unique: HashSet<&String> = files.iter().map(|f| &f.path).collect();
@@ -661,7 +1068,7 @@ mod tests {
         touch(&bad);
         assert!(bad.symlink_metadata().is_ok(), "the file really is on disk");
 
-        let files = walk(&root, HashMap::new());
+        let files = walk(&root, &empty_db("nonutf8"));
 
         // Both are yielded, so neither reads as deleted...
         assert_eq!(files.len(), 2, "the bad name is still reported as seen");
@@ -688,7 +1095,7 @@ mod tests {
             touch(&root.join(format!("f{:05}.txt", i)));
         }
 
-        let files = walk(&root, HashMap::new());
+        let files = walk(&root, &empty_db("wide"));
         assert_eq!(files.len(), count, "every file is yielded exactly once");
         let unique: HashSet<&String> = files.iter().map(|f| &f.path).collect();
         assert_eq!(unique.len(), count, "and none is yielded twice");
@@ -700,7 +1107,7 @@ mod tests {
         // The "queue empty at t=0" corner: every worker must observe the walk
         // as finished rather than waiting for work that will never arrive.
         let root = tmp_tree("empty");
-        assert!(walk(&root, HashMap::new()).is_empty());
+        assert!(walk(&root, &empty_db("empty")).is_empty());
         fs::remove_dir_all(&root).ok();
     }
 
@@ -712,18 +1119,16 @@ mod tests {
         touch(&root.join("a.txt"));
         touch(&root.join("sub/b.txt"));
 
-        let first = walk(&root, HashMap::new());
+        let first = walk(&root, &empty_db("skip-first"));
         assert_eq!(first.len(), 2);
         assert!(first.iter().all(|f| f.action == FileIndexAction::Insert));
 
-        let existing: HashMap<String, ExistingFileEntry> = first
+        let indexed: Vec<(String, u64)> = first
             .iter()
-            .map(|f| {
-                (f.path.clone(), ExistingFileEntry { mtime: f.record.as_ref().unwrap().mtime })
-            })
+            .map(|f| (f.path.clone(), f.record.as_ref().unwrap().mtime))
             .collect();
 
-        let second = walk(&root, existing);
+        let second = walk(&root, &db_with("skip-second", &indexed));
         assert_eq!(second.len(), 2, "unchanged files are still reported as seen");
         for f in &second {
             assert_eq!(f.action, FileIndexAction::Skip);
@@ -746,7 +1151,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
 
-            let files = walk(&root, HashMap::new());
+            let files = walk(&root, &empty_db("unreadable-file"));
             fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).ok();
 
             assert_eq!(names(&files), vec!["bad.txt", "fine.txt"]);
@@ -773,14 +1178,20 @@ mod tests {
                 false,
                 false,
                 IgnoreSet::compile(&[]).unwrap(),
-                Arc::new(HashMap::new()),
+                empty_db("unreadable-dir").to_str().unwrap(),
                 Config::default(),
                 Arc::new(Registry::default_set()),
                 Arc::new(Mutex::new(false)),
                 Arc::new(AtomicBool::new(false)),
                 4,
             );
-            let files: Vec<WalkedFile> = w.by_ref().collect();
+            let files: Vec<WalkedFile> = w
+                .by_ref()
+                .filter_map(|e| match e {
+                    WalkEvent::File(f) => Some(f),
+                    WalkEvent::Stale(_) => None,
+                })
+                .collect();
             let recorded = !w.unreadable().is_empty();
             let covers = w.unreadable().covers(locked.join("inside.txt").to_str().unwrap());
 
@@ -802,7 +1213,7 @@ mod tests {
         touch(&root.join("real.txt"));
         std::os::unix::fs::symlink(&root, root.join("self_link")).unwrap();
 
-        let files = walk_with(&root, HashMap::new(), true, false);
+        let files = walk_with(&root, &empty_db("loop"), true, false);
         assert_eq!(names(&files), vec!["real.txt"], "the cycle is visited once");
         fs::remove_dir_all(&root).ok();
     }
@@ -829,7 +1240,7 @@ mod tests {
         )
         .unwrap();
 
-        let files = walk(&root, HashMap::new());
+        let files = walk(&root, &empty_db("symlink-file"));
         let paths: HashSet<&String> = files.iter().map(|f| &f.path).collect();
         assert_eq!(paths.len(), 1, "both routes report one canonical path");
 
@@ -853,27 +1264,97 @@ mod tests {
             "node_modules".to_string(),
         ])
         .unwrap();
-        let files: Vec<WalkedFile> = walk_indexable_files(
+        let files: Vec<WalkedFile> = files_only(walk_indexable_files(
             &[root.to_string_lossy().into_owned()],
             false,
             false,
             ignore,
-            Arc::new(HashMap::new()),
+            empty_db("prune").to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
             Arc::new(Mutex::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
-        )
-        .collect();
+        ));
         assert_eq!(names(&files), vec!["keep.txt", "keep2.txt"]);
 
-        let files = walk_with(&root, HashMap::new(), false, true);
+        let files = walk_with(&root, &empty_db("prune-hidden"), false, true);
         assert_eq!(
             names(&files),
             vec![".dotfile", "index.js", "inside.txt", "keep.txt", "keep2.txt", "skip.tmp"],
             "include_hidden with no ignore patterns keeps everything"
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_directory_reports_rows_with_no_file_behind_them() {
+        // The per-directory diff, at the level it is computed: one listing
+        // against one directory's rows, before any splitting.
+        let root = tmp_tree("reconcile");
+        touch(&root.join("kept.txt"));
+        touch(&root.join("sub/nested.txt"));
+
+        let gone = path_to_db_string(&root.join("removed.txt"));
+        let gone_nested = path_to_db_string(&root.join("sub/vanished.txt"));
+        let kept = path_to_db_string(&root.join("kept.txt"));
+        let db = db_with(
+            "reconcile",
+            &[(gone.clone(), 1), (gone_nested.clone(), 1), (kept.clone(), 1)],
+        );
+
+        let mut stale = stale_only(walk_indexable_files(
+            &[root.to_string_lossy().into_owned()],
+            false,
+            false,
+            IgnoreSet::compile(&[]).unwrap(),
+            db.to_str().unwrap(),
+            Config::default(),
+            Arc::new(Registry::default_set()),
+            Arc::new(Mutex::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            4,
+        ));
+        stale.sort();
+
+        let mut want = vec![gone, gone_nested];
+        want.sort();
+        assert_eq!(stale, want, "exactly the rows with no file, from both directories");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_directory_reports_nothing_stale() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A failed read leaves an empty listing, which must never be diffed:
+        // every row under it would look deleted.
+        let root = tmp_tree("reconcile-locked");
+        let locked = root.join("locked");
+        touch(&locked.join("inside.txt"));
+
+        let db = db_with(
+            "reconcile-locked",
+            &[(path_to_db_string(&locked.join("inside.txt")), 1)],
+        );
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let stale = stale_only(walk_indexable_files(
+            &[root.to_string_lossy().into_owned()],
+            false,
+            false,
+            IgnoreSet::compile(&[]).unwrap(),
+            db.to_str().unwrap(),
+            Config::default(),
+            Arc::new(Registry::default_set()),
+            Arc::new(Mutex::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            4,
+        ));
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).ok();
+
+        assert!(stale.is_empty(), "an unreadable directory is not an empty one");
         fs::remove_dir_all(&root).ok();
     }
 
@@ -884,7 +1365,7 @@ mod tests {
         let root = base.join(".config");
         touch(&root.join("app.conf"));
 
-        let files = walk(&root, HashMap::new());
+        let files = walk(&root, &empty_db("hidden-root"));
         assert_eq!(names(&files), vec!["app.conf"]);
         fs::remove_dir_all(&base).ok();
     }
@@ -897,19 +1378,18 @@ mod tests {
         }
 
         let stop = Arc::new(Mutex::new(true));
-        let files: Vec<WalkedFile> = walk_indexable_files(
+        let files: Vec<WalkedFile> = files_only(walk_indexable_files(
             &[root.to_string_lossy().into_owned()],
             false,
             false,
             IgnoreSet::compile(&[]).unwrap(),
-            Arc::new(HashMap::new()),
+            empty_db("stop").to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
             stop,
             Arc::new(AtomicBool::new(false)),
             4,
-        )
-        .collect();
+        ));
 
         assert!(files.len() < 500, "an already-stopped walk does not run to completion");
         fs::remove_dir_all(&root).ok();
@@ -929,7 +1409,7 @@ mod tests {
             false,
             false,
             IgnoreSet::compile(&[]).unwrap(),
-            Arc::new(HashMap::new()),
+            empty_db("early-drop").to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
             Arc::new(Mutex::new(false)),
@@ -947,7 +1427,7 @@ mod tests {
         let root = tmp_tree("overlap");
         touch(&root.join("sub/a.txt"));
 
-        let files: Vec<WalkedFile> = walk_indexable_files(
+        let files: Vec<WalkedFile> = files_only(walk_indexable_files(
             &[
                 root.to_string_lossy().into_owned(),
                 root.join("sub").to_string_lossy().into_owned(),
@@ -955,14 +1435,13 @@ mod tests {
             false,
             false,
             IgnoreSet::compile(&[]).unwrap(),
-            Arc::new(HashMap::new()),
+            empty_db("overlap").to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
             Arc::new(Mutex::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
-        )
-        .collect();
+        ));
 
         assert_eq!(files.len(), 1, "the nested root must not double-index");
         fs::remove_dir_all(&root).ok();
@@ -976,11 +1455,16 @@ mod tests {
         for i in 0..40 {
             touch(&root.join(format!("d{}/f{}.txt", i % 7, i)));
         }
-        let expected = names(&walk(&root, HashMap::new()));
+        let expected = names(&walk(&root, &empty_db("determinism-base")));
         assert_eq!(expected.len(), 40);
 
         for run in 0..30 {
-            assert_eq!(names(&walk(&root, HashMap::new())), expected, "run {}", run);
+            assert_eq!(
+                names(&walk(&root, &empty_db(&format!("determinism-{}", run)))),
+                expected,
+                "run {}",
+                run
+            );
         }
         fs::remove_dir_all(&root).ok();
     }
@@ -999,14 +1483,20 @@ mod tests {
             false,
             false,
             IgnoreSet::compile(&[]).unwrap(),
-            Arc::new(HashMap::new()),
+            empty_db("finish").to_str().unwrap(),
             Config::default(),
             Arc::new(Registry::default_set()),
             Arc::new(Mutex::new(false)),
             Arc::new(AtomicBool::new(false)),
             4,
         );
-        let files: Vec<WalkedFile> = w.by_ref().collect();
+        let files: Vec<WalkedFile> = w
+            .by_ref()
+            .filter_map(|e| match e {
+                WalkEvent::File(f) => Some(f),
+                WalkEvent::Stale(_) => None,
+            })
+            .collect();
         assert_eq!(files.len(), 2);
         assert!(w.finish(), "no worker panicked");
         // Drop calls it again; joining an already-drained handle list must be

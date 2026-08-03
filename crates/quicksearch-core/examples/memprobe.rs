@@ -14,9 +14,14 @@
 //! ```
 //!
 //! The optional trailing number is the sampling interval in milliseconds
-//! (default 100). Drop it to single digits to name the file a spike happened
-//! on: at 100 ms the extractor has moved on by the time RSS is read, so the
-//! file the timeline shows beside a spike is only approximately the cause.
+//! (default 100). Finer sampling resolves the *shape* of a spike, not its
+//! cause: the file column is only as good as `RootProgress::current_file`,
+//! which [`crate::indexing`] publishes once per extraction batch, holding the
+//! last file of the batch that just finished. During a batch it therefore
+//! names a file that is already done, and no sampling rate fixes that. To
+//! attribute a spike to a file, narrow the root instead — index a directory
+//! holding only the candidates, which is what identified `pdf-extract` as the
+//! largest single consumer on this tree.
 //!
 //! `cold` deletes the database first: every file is new, so the walk hashes
 //! and extracts all of them and `existing_files` starts empty. `warm` re-runs
@@ -33,11 +38,13 @@
 //!   peak to the walk or to extraction; a sampled peak far under VmHWM means
 //!   the real spike was shorter than the sampling interval.
 //!
-//! RSS counts the page cache backing the mmap'd database, so the figure is a
-//! ceiling on what the process needs, not a floor on what it must have: those
-//! pages are evictable under pressure. `/usr/bin/time -v` on this binary
-//! reports the same VmHWM, as a cross-check that nothing here is fooling
-//! itself.
+//! Nothing here is evictable page cache. The connection sets no `mmap_size`,
+//! so SQLite reads the index through its own `malloc`'d page cache (`PRAGMA
+//! cache_size`, 10000 pages ≈ 40 MiB) rather than mapping the file, and the
+//! `by mapping` breakdown confirms it: the index never appears as a
+//! file-backed mapping. Every megabyte reported is memory the process
+//! actually holds. `/usr/bin/time -v` on this binary reports the same VmHWM,
+//! as a cross-check that nothing here is fooling itself.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

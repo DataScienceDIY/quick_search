@@ -23,8 +23,8 @@ mod platform;
 mod query_highlight;
 mod search_tab;
 mod tracker;
-mod unlock;
 mod ui_util;
+mod unlock;
 
 use quicksearch_core::config::Config;
 

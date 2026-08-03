@@ -118,7 +118,9 @@ the package is installed.
   copied in place. Matches in file contents show highlighted snippets.
 - **Manage Index**: full indexing status, Start/Stop/Automatic controls,
   indexed folder list, full-text extension filters, ignore patterns, and
-  the indexing options.
+  the indexing options. Stopping switches to manual mode and saves that
+  (`indexing.auto_index`), so a stopped index stays stopped across
+  restarts until you return to automatic.
 - **Duplicates**: files sharing a content hash, grouped.
 - **Logs**: the lines the app would have printed to a terminal — warnings
   from indexing, folder watching and opening files, newest last, with a
@@ -286,7 +288,9 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   a polled `IndexingStatus`.
 - **Coordinator** (`coordinator.rs`): the object binaries construct.
   Owns the `IndexingService`, the debouncing filesystem watcher
-  (`watcher.rs`), and the mode state machine (Auto / Manual). Watcher
+  (`watcher.rs`), and the mode state machine (Auto / Manual, persisted as
+  `indexing.auto_index` — the mode the app is left in is the mode it
+  starts in, and a config carrying a different value switches it). Watcher
   events become single-file transactions (`incremental.rs`) that keep
   `files`, FTS, and the text sidecar consistent per commit; a full
   reindex runs on a configurable interval. Incremental writes defer while

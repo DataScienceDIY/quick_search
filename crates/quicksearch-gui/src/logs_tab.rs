@@ -155,11 +155,7 @@ impl LogsTab {
                 for &i in &shown[range] {
                     let line = &self.lines[i];
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(fmt_clock(line.at))
-                                .monospace()
-                                .weak(),
-                        );
+                        ui.label(egui::RichText::new(fmt_clock(line.at)).monospace().weak());
                         let text = egui::RichText::new(&line.text).monospace();
                         match line.level {
                             Level::Warn => {

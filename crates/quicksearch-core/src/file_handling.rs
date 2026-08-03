@@ -19,32 +19,13 @@ use crate::extract::Registry;
 use crate::indexing::should_abort;
 use crate::mime::{guess_mime_from_head, mime_to_type, FileType};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExistingFileEntry {
-    pub mtime: u64,
-}
-
-/// Load path and mtime per row for incremental classification (hash/size loaded only when updating a file).
-pub fn load_existing_files(conn: &Connection) -> Result<HashMap<String, ExistingFileEntry>, rusqlite::Error> {
-    let mut existing_files = HashMap::new();
-    let mut stmt = conn.prepare("SELECT path, mtime FROM files")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            ExistingFileEntry {
-                // SQLite stores i64; mtimes are non-negative in practice.
-                mtime: row.get::<_, i64>(1)?.max(0) as u64,
-            },
-        ))
-    })?;
-
-    for row in rows {
-        let (path, entry) = row?;
-        existing_files.insert(path, entry);
-    }
-
-    Ok(existing_files)
-}
+/// One directory's indexed files, as `name -> mtime`.
+///
+/// The unit classification works in. Names, not full paths: the parent is
+/// implied by which directory is being walked, and at millions of files the
+/// repeated directory prefix is the whole cost. Produced by
+/// [`crate::db::repo::dir_rows`].
+pub type DirRows = HashMap<String, u64>;
 
 /// Derive (inode, device_id) from a `std::fs::Metadata` on platforms that
 /// expose them. Returns `(None, None)` on Windows and other non-Unix targets.
@@ -471,19 +452,32 @@ pub enum FileIndexAction {
     Insert,
 }
 
-/// Decide what Phase 1 should do with a file, given the path spelling used
-/// as the `files.path` key and the file's mtime.
+/// Decide what Phase 1 should do with a file, given its name within the
+/// directory being walked and the file's mtime.
 ///
-/// Pure: the caller supplies the `stat` result rather than this function
-/// going to disk for it, so the same `stat` serves classification and the
-/// record build, and this runs on any worker thread against a shared map.
-pub fn classify_for_indexing(
-    path: &str,
-    mtime: u64,
-    existing_files: &HashMap<String, ExistingFileEntry>,
-) -> FileIndexAction {
-    match existing_files.get(path) {
-        Some(existing) if existing.mtime == mtime => FileIndexAction::Skip,
+/// Pure: the caller supplies both the `stat` result and the directory's rows
+/// rather than this function going to disk or to SQLite for them, so the same
+/// `stat` serves classification and the record build, and this runs on any
+/// worker thread against data the prefetcher already fetched.
+///
+/// Keyed by name against one directory rather than by full path against the
+/// whole index: see [`DirRows`]. A file the walk reaches under a spelling
+/// whose parent is *not* this directory — a resolved symlink target — must
+/// not be classified here; it would miss and read as [`FileIndexAction::Insert`],
+/// and `insert_file`'s `INSERT OR IGNORE` would then silently not update it.
+/// Use [`classify_by_mtime`] for those.
+pub fn classify_for_indexing(name: &str, mtime: u64, rows: &DirRows) -> FileIndexAction {
+    classify_by_mtime(rows.get(name).copied(), mtime)
+}
+
+/// The same decision from an already-resolved stored mtime.
+///
+/// The path [`classify_for_indexing`] funnels into, and the one the walk uses
+/// directly for resolved symlink targets, whose stored row is found by exact
+/// path instead of by name within a directory.
+pub fn classify_by_mtime(stored: Option<u64>, mtime: u64) -> FileIndexAction {
+    match stored {
+        Some(known) if known == mtime => FileIndexAction::Skip,
         Some(_) => FileIndexAction::Update,
         None => FileIndexAction::Insert,
     }
@@ -1268,24 +1262,33 @@ mod tests {
 
     #[test]
     fn classify_uses_mtime_against_the_existing_index() {
-        let mut existing = HashMap::new();
-        existing.insert("/a/known.txt".to_string(), ExistingFileEntry { mtime: 100 });
+        let mut rows = DirRows::new();
+        rows.insert("known.txt".to_string(), 100);
 
         assert_eq!(
-            classify_for_indexing("/a/new.txt", 100, &existing),
+            classify_for_indexing("new.txt", 100, &rows),
             FileIndexAction::Insert,
-            "a path absent from the index is new"
+            "a name absent from the directory's rows is new"
         );
         assert_eq!(
-            classify_for_indexing("/a/known.txt", 100, &existing),
+            classify_for_indexing("known.txt", 100, &rows),
             FileIndexAction::Skip,
             "same mtime means nothing to do"
         );
         assert_eq!(
-            classify_for_indexing("/a/known.txt", 101, &existing),
+            classify_for_indexing("known.txt", 101, &rows),
             FileIndexAction::Update,
             "a changed mtime means re-read"
         );
+    }
+
+    #[test]
+    fn classify_by_mtime_matches_the_name_keyed_path() {
+        // Resolved symlink targets take this route because their row is
+        // found by exact path, not by name within the directory walked.
+        assert_eq!(classify_by_mtime(None, 100), FileIndexAction::Insert);
+        assert_eq!(classify_by_mtime(Some(100), 100), FileIndexAction::Skip);
+        assert_eq!(classify_by_mtime(Some(99), 100), FileIndexAction::Update);
     }
 
     #[test]
