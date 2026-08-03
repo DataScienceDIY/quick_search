@@ -242,6 +242,87 @@ pub fn delete_file_by_path(tx: &Transaction<'_>, path: &str) -> Result<bool, Str
     Ok(true)
 }
 
+/// Every indexed file directly inside `parent`, as `name -> mtime`.
+///
+/// The walk's unit of classification. Keyed by name rather than full path
+/// because the parent is implied — at millions of files, not storing the
+/// directory prefix once per entry is the difference this whole path exists
+/// to make. Served by `idx_files_parent`, so this is one index range lookup.
+pub fn dir_rows(
+    conn: &Connection,
+    parent: &str,
+) -> Result<std::collections::HashMap<String, u64>, String> {
+    let mut stmt = conn
+        .prepare_cached("SELECT name, mtime FROM files WHERE parent = ?1")
+        .map_err(|e| format!("prepare dir rows for {}: {}", parent, e))?;
+    let rows = stmt
+        .query_map(params![parent], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+        })
+        .map_err(|e| format!("query dir rows for {}: {}", parent, e))?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (name, mtime) = row.map_err(|e| format!("read dir row under {}: {}", parent, e))?;
+        out.insert(name, mtime);
+    }
+    Ok(out)
+}
+
+/// The stored mtime for one exact path, or `None` if it isn't indexed.
+///
+/// For files the walk reaches by a spelling whose parent isn't the directory
+/// being read — a resolved symlink target — where [`dir_rows`] would not
+/// have them.
+pub fn mtime_for_path(conn: &Connection, path: &str) -> Result<Option<u64>, String> {
+    let mut stmt = conn
+        .prepare_cached("SELECT mtime FROM files WHERE path = ?1")
+        .map_err(|e| format!("prepare mtime lookup for {}: {}", path, e))?;
+    stmt.query_row(params![path], |r| r.get::<_, i64>(0))
+        .optional()
+        .map(|o| o.map(|m| m.max(0) as u64))
+        .map_err(|e| format!("mtime lookup for {}: {}", path, e))
+}
+
+/// Distinct `parent` values within the half-open path range `[lo, hi)`,
+/// streamed to `f` rather than collected.
+///
+/// Callers use this to find directories the walk never visited, so it must
+/// not itself materialize a list proportional to the tree — the whole point
+/// of the change that introduced it. `idx_files_parent` makes this an
+/// index-only scan.
+pub fn for_each_parent_in_range<F: FnMut(String)>(
+    conn: &Connection,
+    lo: &str,
+    hi: &str,
+    mut f: F,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT parent FROM files WHERE parent >= ?1 AND parent < ?2")
+        .map_err(|e| format!("prepare parent scan: {}", e))?;
+    let rows = stmt
+        .query_map(params![lo, hi], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("parent scan: {}", e))?;
+    for row in rows {
+        f(row.map_err(|e| format!("read parent row: {}", e))?);
+    }
+    Ok(())
+}
+
+/// Paths of every file directly inside `parent`.
+///
+/// The companion to [`for_each_parent_in_range`]: once a parent is known to
+/// be unvisited, this is what its rows are.
+pub fn paths_in_dir(conn: &Connection, parent: &str) -> Result<Vec<String>, String> {
+    let mut stmt = conn
+        .prepare_cached("SELECT path FROM files WHERE parent = ?1")
+        .map_err(|e| format!("prepare paths in {}: {}", parent, e))?;
+    let rows = stmt
+        .query_map(params![parent], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("query paths in {}: {}", parent, e))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read path under {}: {}", parent, e))
+}
+
 /// Remove the FTS row, compressed text blob, and any `properties` rows for
 /// a given file id. Does not touch the `files` row itself. Idempotent — a
 /// missing row is fine.

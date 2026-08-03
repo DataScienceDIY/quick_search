@@ -77,15 +77,13 @@ pub fn maybe_run_cli() -> Option<i32> {
                     return Some(2);
                 }
             },
-            other if other.starts_with("--limit=") => {
-                match other["--limit=".len()..].parse() {
-                    Ok(n) => limit = Some(n),
-                    Err(_) => {
-                        eprintln!("--limit requires a number\n\n{}", USAGE);
-                        return Some(2);
-                    }
+            other if other.starts_with("--limit=") => match other["--limit=".len()..].parse() {
+                Ok(n) => limit = Some(n),
+                Err(_) => {
+                    eprintln!("--limit requires a number\n\n{}", USAGE);
+                    return Some(2);
                 }
-            }
+            },
             other if other.starts_with('-') && terms.is_empty() => {
                 // Unknown flags without a query fall through to the GUI
                 // (they may be eframe/winit flags).
@@ -128,13 +126,15 @@ pub(crate) fn resolve_key(
 
     if let Some(hex) = keychain_hex {
         match IndexKey::from_hex(&hex).map_err(|e| format!("keychain entry: {}", e)) {
-            Ok(key) => match try_key(key) {
-                Ok(()) => return Ok(()),
-                Err(e) if e.starts_with(db::KEY_MISMATCH_PREFIX) => {
-                    eprintln!("warning: the key remembered in the OS keychain no longer opens this index");
+            Ok(key) => {
+                match try_key(key) {
+                    Ok(()) => return Ok(()),
+                    Err(e) if e.starts_with(db::KEY_MISMATCH_PREFIX) => {
+                        eprintln!("warning: the key remembered in the OS keychain no longer opens this index");
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
-            },
+            }
             Err(e) => eprintln!("warning: {}", e),
         }
     }
@@ -474,8 +474,7 @@ mod tests {
     #[test]
     fn no_tty_no_sources_is_instructive() {
         let sec = protected();
-        let err = resolve_key(&sec, false, None, None, || None, |_| Ok(()))
-            .unwrap_err();
+        let err = resolve_key(&sec, false, None, None, || None, |_| Ok(())).unwrap_err();
         assert!(err.contains(PASSWORD_ENV));
         assert!(err.contains("Remember on this device"));
     }

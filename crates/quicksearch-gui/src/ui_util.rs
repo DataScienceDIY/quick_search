@@ -28,9 +28,23 @@ pub fn ignore_pattern_valid(pattern: &str) -> bool {
     !trimmed.is_empty() && IgnoreSet::compile(&[pattern.to_string()]).is_ok()
 }
 
+/// Border color for a pattern editor holding `text`, or `None` to keep the
+/// theme's own border. A blank box is not wrong yet, just unfilled, so it
+/// stays neutral; only text the user actually typed is judged.
+fn pattern_border(text: &str) -> Option<egui::Color32> {
+    if text.trim().is_empty() {
+        None
+    } else if ignore_pattern_valid(text) {
+        Some(VALID_GREEN)
+    } else {
+        Some(INVALID_RED)
+    }
+}
+
 /// Single-line ignore-pattern editor with a green border while the text is
-/// a valid pattern and a red one otherwise. Returns the response and the
-/// validity of the text as it stands after this frame's edits.
+/// a valid pattern, a red one while it is not, and the theme's neutral
+/// border while it is empty. Returns the response and the validity of the
+/// text as it stands after this frame's edits.
 pub fn pattern_edit(
     ui: &mut egui::Ui,
     text: &mut String,
@@ -38,16 +52,19 @@ pub fn pattern_edit(
     hint: &str,
 ) -> (egui::Response, bool) {
     let mut valid = ignore_pattern_valid(text);
-    let stroke = egui::Stroke::new(1.0, if valid { VALID_GREEN } else { INVALID_RED });
+    let border = pattern_border(text);
     let response = ui
         .scope(|ui| {
             // TextEdit frames with widgets.*.bg_stroke when unfocused and
             // selection.stroke when focused; recolor all of them.
-            let v = ui.visuals_mut();
-            v.widgets.inactive.bg_stroke = stroke;
-            v.widgets.hovered.bg_stroke = stroke;
-            v.widgets.active.bg_stroke = stroke;
-            v.selection.stroke = stroke;
+            if let Some(color) = border {
+                let stroke = egui::Stroke::new(1.0, color);
+                let v = ui.visuals_mut();
+                v.widgets.inactive.bg_stroke = stroke;
+                v.widgets.hovered.bg_stroke = stroke;
+                v.widgets.active.bg_stroke = stroke;
+                v.selection.stroke = stroke;
+            }
             ui.add(
                 egui::TextEdit::singleline(text)
                     .desired_width(desired_width)
@@ -63,18 +80,20 @@ pub fn pattern_edit(
 }
 
 /// Paint a semitransparent down-arrow near the bottom edge of a scroll
-/// area while more content lies below the fold. Painter-only on the
-/// foreground layer, so it can never swallow clicks. (The bundled fonts
-/// have no ▼ glyph — this is a shape, like the sort-header triangles.)
+/// area while more content lies below the fold. Painter-only, so it can
+/// never swallow clicks. (The bundled fonts have no ▼ glyph — this is a
+/// shape, like the sort-header triangles.)
+///
+/// The hint is painted on the caller's own layer, unclipped: last in that
+/// layer, so it sits above the scrolled content, but still below anything
+/// stacked over it — a tab's hint stays under the Options window rather
+/// than punching through it.
 pub fn more_below_hint<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutput<R>) {
     let more_below = out.state.offset.y + out.inner_rect.height() < out.content_size.y - 1.0;
     if !more_below {
         return;
     }
-    let painter = ui.ctx().layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::new("qs-more-below-hint"),
-    ));
+    let painter = ui.ctx().layer_painter(ui.layer_id());
     let cx = out.inner_rect.center().x;
     let tip = out.inner_rect.bottom() - 5.0;
     let (half_width, height) = (7.0, 6.0);
@@ -99,7 +118,7 @@ pub fn more_below_hint<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutp
 
 #[cfg(test)]
 mod tests {
-    use super::ignore_pattern_valid;
+    use super::{ignore_pattern_valid, pattern_border, INVALID_RED, VALID_GREEN};
 
     #[test]
     fn blank_patterns_are_invalid() {
@@ -125,5 +144,23 @@ mod tests {
         assert!(ignore_pattern_valid("/home/x/docs/*")); // directory
         assert!(ignore_pattern_valid("C:\\Windows\\Temp\\*"));
         assert!(ignore_pattern_valid("cache-??")); // wildcards
+    }
+
+    #[test]
+    fn empty_editor_keeps_the_theme_border() {
+        // Nothing typed yet is not an error to flag.
+        assert_eq!(pattern_border(""), None);
+        assert_eq!(pattern_border("   "), None);
+        assert_eq!(pattern_border("\t\n"), None);
+    }
+
+    #[test]
+    fn typed_text_is_judged() {
+        assert_eq!(pattern_border("*.tmp"), Some(VALID_GREEN));
+        assert_eq!(pattern_border("  node_modules  "), Some(VALID_GREEN));
+        assert_eq!(pattern_border("foo["), Some(INVALID_RED));
+        // Typed, but trims away to nothing under the pattern rules — still
+        // worth flagging, unlike a box the user simply has not filled in.
+        assert_eq!(pattern_border("/"), Some(INVALID_RED));
     }
 }

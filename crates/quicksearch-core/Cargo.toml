@@ -23,7 +23,11 @@ zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"
 sha2 = "0.10.8"
 walkdir = "2.5.0"
-zip = "0.6"
+# Default features pull in zstd 0.11, which cannot unify with our zstd 0.13 below
+# and so builds a second copy of the wrapper crates. We only read OOXML/ODF
+# containers (docx/xlsx/pptx/odt/ods/odp), whose entries are always deflate or
+# stored, so zstd/bzip2/aes-crypto are all dead weight here.
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
 quick-xml = "0.31"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"

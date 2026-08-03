@@ -204,7 +204,10 @@ impl SearchTab {
         self.order.sort_by(|&a, &b| {
             let (a, b) = (&results[a as usize], &results[b as usize]);
             let ord = match key {
-                SortKey::Rank => a.rank.partial_cmp(&b.rank).unwrap_or(std::cmp::Ordering::Equal),
+                SortKey::Rank => a
+                    .rank
+                    .partial_cmp(&b.rank)
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 SortKey::Name => a.name.cmp(&b.name),
                 SortKey::Path => a.path.cmp(&b.path),
                 SortKey::Size => a.size.cmp(&b.size),
@@ -233,8 +236,7 @@ impl SearchTab {
     fn sort_header(&mut self, ui: &mut egui::Ui, key: SortKey, label: &str) {
         let (cur, asc) = self.sort;
         let selected = cur == key;
-        let (rect, response) =
-            ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
+        let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
         if ui.is_rect_visible(rect) {
             if response.hovered() {
                 ui.painter()
@@ -344,7 +346,7 @@ impl SearchTab {
                 let mut remove: Option<usize> = None;
                 for (i, pattern) in self.session_ignores.iter().enumerate() {
                     if ui
-                        .small_button(format!("{} ✕", pattern))
+                        .small_button(format!("{} 🗙", pattern))
                         .on_hover_text("Remove this session filter")
                         .clicked()
                     {
@@ -385,11 +387,9 @@ impl SearchTab {
         // `animate_value_with_time` keeps requesting repaints until the
         // value settles.
         let fade_target = if self.swap_pending { 0.0 } else { 1.0 };
-        let fade = ui.ctx().animate_value_with_time(
-            egui::Id::new("qs-results-fade"),
-            fade_target,
-            0.25,
-        );
+        let fade =
+            ui.ctx()
+                .animate_value_with_time(egui::Id::new("qs-results-fade"), fade_target, 0.25);
         if self.swap_pending && fade <= 0.01 {
             self.results = std::mem::take(&mut self.staging);
             self.has_snippets = self.staging_has_snippets;
@@ -426,170 +426,172 @@ impl SearchTab {
         let mut open_ignore_dialog: Option<usize> = None;
         let mut hovered_now: Option<usize> = None;
 
-        let table_scroll = ui.push_id("results", |ui| {
-            let mut table = TableBuilder::new(ui)
-                .striped(true)
-                .resizable(true)
-                .sense(egui::Sense::click())
-                .max_scroll_height(table_height)
-                .min_scrolled_height(60.0)
-                .column(Column::initial(220.0).at_least(80.0).clip(true)) // name
-                .column(Column::remainder().at_least(120.0).clip(true)); // path
-            if self.has_snippets {
-                table = table.column(Column::remainder().at_least(120.0).clip(true));
-            }
-            table = table
-                .column(Column::exact(72.0)) // size
-                .column(Column::exact(110.0)) // modified
-                .column(Column::exact(52.0)); // rank
+        let table_scroll = ui
+            .push_id("results", |ui| {
+                let mut table = TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .sense(egui::Sense::click())
+                    .max_scroll_height(table_height)
+                    .min_scrolled_height(60.0)
+                    .column(Column::initial(220.0).at_least(80.0).clip(true)) // name
+                    .column(Column::remainder().at_least(120.0).clip(true)); // path
+                if self.has_snippets {
+                    table = table.column(Column::remainder().at_least(120.0).clip(true));
+                }
+                table = table
+                    .column(Column::exact(72.0)) // size
+                    .column(Column::exact(110.0)) // modified
+                    .column(Column::exact(52.0)); // rank
 
-            table
-                .header(text_height + 4.0, |mut header| {
-                    header.col(|ui| self.sort_header(ui, SortKey::Name, "Name"));
-                    header.col(|ui| self.sort_header(ui, SortKey::Path, "Path"));
-                    if self.has_snippets {
-                        header.col(|ui| {
-                            ui.with_layout(
-                                egui::Layout::centered_and_justified(
-                                    egui::Direction::LeftToRight,
-                                ),
-                                |ui| {
-                                    ui.label(egui::RichText::new("Match").strong());
-                                },
-                            );
-                        });
-                    }
-                    header.col(|ui| self.sort_header(ui, SortKey::Size, "Size"));
-                    header.col(|ui| self.sort_header(ui, SortKey::Modified, "Modified"));
-                    header.col(|ui| self.sort_header(ui, SortKey::Rank, "Rank"));
-                })
-                .body(|body| {
-                    let order = self.order.clone();
-                    body.rows(text_height, order.len(), |mut row| {
-                        let display_ix = row.index();
-                        let result_ix = order[display_ix] as usize;
-                        let hit = &self.results[result_ix];
-                        row.set_selected(self.selected == Some(result_ix as u32));
-                        row.set_hovered(self.hovered_row == Some(display_ix));
-
-                        // Labels stay selectable for copy-paste, which makes
-                        // them win egui's hit-test over the row. Collect their
-                        // responses and union them into the row's below so
-                        // clicks land even when the pointer is over glyphs.
-                        let mut cell_responses: Vec<egui::Response> = Vec::new();
-
-                        row.col(|ui| {
-                            cell_responses.push(ui.label(&hit.name));
-                        });
-                        row.col(|ui| {
-                            cell_responses.push(ui.label(egui::RichText::new(&hit.path).weak()));
-                        });
+                table
+                    .header(text_height + 4.0, |mut header| {
+                        header.col(|ui| self.sort_header(ui, SortKey::Name, "Name"));
+                        header.col(|ui| self.sort_header(ui, SortKey::Path, "Path"));
                         if self.has_snippets {
-                            let snippet = hit.snippet.clone();
-                            // Name and path matches show a whole field, so
-                            // they render bracketed: [matched field].
-                            let whole_field =
-                                hit.stage <= 4 || hit.stage == 7 || hit.stage >= 9;
-                            row.col(|ui| {
-                                if let Some(snip) = &snippet {
-                                    let width = ui.available_width();
-                                    let job = centered_match_job(ui, snip, width, whole_field);
-                                    let mut response = ui
-                                        .with_layout(
-                                            egui::Layout::centered_and_justified(
-                                                egui::Direction::LeftToRight,
-                                            ),
-                                            |ui| ui.label(job),
-                                        )
-                                        .inner;
-                                    if !snip.ranges.is_empty() {
-                                        let hover = snip.clone();
-                                        response = response.on_hover_ui(|ui| {
-                                            ui.set_max_width(520.0);
-                                            let job = snippet_job(ui, &hover, 10);
-                                            ui.label(job);
-                                        });
-                                    }
-                                    cell_responses.push(response);
-                                }
+                            header.col(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::centered_and_justified(
+                                        egui::Direction::LeftToRight,
+                                    ),
+                                    |ui| {
+                                        ui.label(egui::RichText::new("Match").strong());
+                                    },
+                                );
                             });
                         }
-                        row.col(|ui| {
-                            let response = ui.with_layout(
-                                egui::Layout::centered_and_justified(
-                                    egui::Direction::LeftToRight,
-                                ),
-                                |ui| ui.label(human_size(hit.size)),
-                            );
-                            cell_responses.push(response.inner);
-                        });
-                        row.col(|ui| {
-                            let color = recency_color(ui, hit.mtime);
-                            let response = ui.with_layout(
-                                egui::Layout::centered_and_justified(
-                                    egui::Direction::LeftToRight,
-                                ),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(fmt_mtime(hit.mtime)).color(color),
-                                    )
-                                },
-                            );
-                            cell_responses.push(response.inner);
-                        });
-                        row.col(|ui| {
-                            let response = ui.with_layout(
-                                egui::Layout::centered_and_justified(
-                                    egui::Direction::LeftToRight,
-                                ),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(" {:.2} ", hit.rank))
-                                            .background_color(rank_tier_color(hit.stage))
-                                            .color(egui::Color32::from_rgb(32, 32, 32)),
-                                    )
-                                },
-                            );
-                            cell_responses.push(response.inner);
-                        });
+                        header.col(|ui| self.sort_header(ui, SortKey::Size, "Size"));
+                        header.col(|ui| self.sort_header(ui, SortKey::Modified, "Modified"));
+                        header.col(|ui| self.sort_header(ui, SortKey::Rank, "Rank"));
+                    })
+                    .body(|body| {
+                        let order = self.order.clone();
+                        body.rows(text_height, order.len(), |mut row| {
+                            let display_ix = row.index();
+                            let result_ix = order[display_ix] as usize;
+                            let hit = &self.results[result_ix];
+                            row.set_selected(self.selected == Some(result_ix as u32));
+                            row.set_hovered(self.hovered_row == Some(display_ix));
 
-                        let mut response = row.response();
-                        for r in cell_responses {
-                            response = response | r;
-                        }
-                        if response.contains_pointer() {
-                            hovered_now = Some(display_ix);
-                        }
-                        if response.clicked() || response.secondary_clicked() {
-                            self.selected = Some(result_ix as u32);
-                        }
-                        if response.double_clicked() {
-                            platform::open_file(&self.results[result_ix].path);
-                        }
-                        response.context_menu(|ui| {
-                            let path = self.results[result_ix].path.clone();
-                            if ui.button("Open containing folder").clicked() {
-                                platform::reveal_in_folder(&path);
-                                ui.close();
+                            // Labels stay selectable for copy-paste, which makes
+                            // them win egui's hit-test over the row. Collect their
+                            // responses and union them into the row's below so
+                            // clicks land even when the pointer is over glyphs.
+                            let mut cell_responses: Vec<egui::Response> = Vec::new();
+
+                            row.col(|ui| {
+                                cell_responses.push(ui.label(&hit.name));
+                            });
+                            row.col(|ui| {
+                                cell_responses
+                                    .push(ui.label(egui::RichText::new(&hit.path).weak()));
+                            });
+                            if self.has_snippets {
+                                let snippet = hit.snippet.clone();
+                                // Name and path matches show a whole field, so
+                                // they render bracketed: [matched field].
+                                let whole_field =
+                                    hit.stage <= 4 || hit.stage == 7 || hit.stage >= 9;
+                                row.col(|ui| {
+                                    if let Some(snip) = &snippet {
+                                        let width = ui.available_width();
+                                        let job = centered_match_job(ui, snip, width, whole_field);
+                                        let mut response = ui
+                                            .with_layout(
+                                                egui::Layout::centered_and_justified(
+                                                    egui::Direction::LeftToRight,
+                                                ),
+                                                |ui| ui.label(job),
+                                            )
+                                            .inner;
+                                        if !snip.ranges.is_empty() {
+                                            let hover = snip.clone();
+                                            response = response.on_hover_ui(|ui| {
+                                                ui.set_max_width(520.0);
+                                                let job = snippet_job(ui, &hover, 10);
+                                                ui.label(job);
+                                            });
+                                        }
+                                        cell_responses.push(response);
+                                    }
+                                });
                             }
-                            if ui.button("Open").clicked() {
-                                platform::open_file(&path);
-                                ui.close();
+                            row.col(|ui| {
+                                let response = ui.with_layout(
+                                    egui::Layout::centered_and_justified(
+                                        egui::Direction::LeftToRight,
+                                    ),
+                                    |ui| ui.label(human_size(hit.size)),
+                                );
+                                cell_responses.push(response.inner);
+                            });
+                            row.col(|ui| {
+                                let color = recency_color(ui, hit.mtime);
+                                let response = ui.with_layout(
+                                    egui::Layout::centered_and_justified(
+                                        egui::Direction::LeftToRight,
+                                    ),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(fmt_mtime(hit.mtime)).color(color),
+                                        )
+                                    },
+                                );
+                                cell_responses.push(response.inner);
+                            });
+                            row.col(|ui| {
+                                let response = ui.with_layout(
+                                    egui::Layout::centered_and_justified(
+                                        egui::Direction::LeftToRight,
+                                    ),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(" {:.2} ", hit.rank))
+                                                .background_color(rank_tier_color(hit.stage))
+                                                .color(egui::Color32::from_rgb(32, 32, 32)),
+                                        )
+                                    },
+                                );
+                                cell_responses.push(response.inner);
+                            });
+
+                            let mut response = row.response();
+                            for r in cell_responses {
+                                response = response | r;
                             }
-                            if ui.button("Copy path").clicked() {
-                                ui.ctx().copy_text(path.clone());
-                                ui.close();
+                            if response.contains_pointer() {
+                                hovered_now = Some(display_ix);
                             }
-                            ui.separator();
-                            if ui.button("Build ignore filter…").clicked() {
-                                open_ignore_dialog = Some(result_ix);
-                                ui.close();
+                            if response.clicked() || response.secondary_clicked() {
+                                self.selected = Some(result_ix as u32);
                             }
+                            if response.double_clicked() {
+                                platform::open_file(&self.results[result_ix].path);
+                            }
+                            response.context_menu(|ui| {
+                                let path = self.results[result_ix].path.clone();
+                                if ui.button("Open containing folder").clicked() {
+                                    platform::reveal_in_folder(&path);
+                                    ui.close();
+                                }
+                                if ui.button("Open").clicked() {
+                                    platform::open_file(&path);
+                                    ui.close();
+                                }
+                                if ui.button("Copy path").clicked() {
+                                    ui.ctx().copy_text(path.clone());
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("Build ignore filter…").clicked() {
+                                    open_ignore_dialog = Some(result_ix);
+                                    ui.close();
+                                }
+                            });
                         });
-                    });
-                })
-        })
-        .inner;
+                    })
+            })
+            .inner;
         crate::ui_util::more_below_hint(ui, &table_scroll);
         self.hovered_row = hovered_now;
 
@@ -642,25 +644,20 @@ impl SearchTab {
                 ui.separator();
 
                 // --- Extension ---------------------------------------------
-                ui.horizontal(|ui| {
-                    match &dialog.ext_pattern {
-                        Some(ext) => {
-                            ui.monospace(ext);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add(bordered_button("Ignore this extension", ORANGE))
-                                        .clicked()
-                                    {
-                                        chosen = Some(ext.clone());
-                                    }
-                                },
-                            );
-                        }
-                        None => {
-                            ui.label(egui::RichText::new("(no file extension)").weak());
-                        }
+                ui.horizontal(|ui| match &dialog.ext_pattern {
+                    Some(ext) => {
+                        ui.monospace(ext);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(bordered_button("Ignore this extension", ORANGE))
+                                .clicked()
+                            {
+                                chosen = Some(ext.clone());
+                            }
+                        });
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("(no file extension)").weak());
                     }
                 });
                 ui.separator();
@@ -771,8 +768,7 @@ impl SearchTab {
                             ui,
                             "regex:\"(foo|bar)\\d+\"",
                             "regular expression, matched against names, contents, \
-                             and paths; case-insensitive — use (?-i:…) to override; \
-                             quote patterns containing spaces",
+                             and paths",
                         );
                         row(
                             ui,
@@ -984,17 +980,17 @@ fn centered_match_job(
 /// tiers. Dark text on these pastels stays readable in both themes.
 fn rank_tier_color(stage: u8) -> egui::Color32 {
     match stage {
-        1 => egui::Color32::from_rgb(255, 127, 127), // S
-        2 => egui::Color32::from_rgb(255, 191, 127), // A
-        3 => egui::Color32::from_rgb(255, 223, 127), // B
-        4 => egui::Color32::from_rgb(255, 255, 127), // C
-        5 => egui::Color32::from_rgb(191, 255, 127), // D
-        6 => egui::Color32::from_rgb(127, 255, 127), // E
-        7 => egui::Color32::from_rgb(127, 191, 255), // F
-        8 => egui::Color32::from_rgb(191, 127, 255), // G
-        9 => egui::Color32::from_rgb(223, 159, 255), // H — path, exact case
+        1 => egui::Color32::from_rgb(255, 127, 127),  // S
+        2 => egui::Color32::from_rgb(255, 191, 127),  // A
+        3 => egui::Color32::from_rgb(255, 223, 127),  // B
+        4 => egui::Color32::from_rgb(255, 255, 127),  // C
+        5 => egui::Color32::from_rgb(191, 255, 127),  // D
+        6 => egui::Color32::from_rgb(127, 255, 127),  // E
+        7 => egui::Color32::from_rgb(127, 191, 255),  // F
+        8 => egui::Color32::from_rgb(191, 127, 255),  // G
+        9 => egui::Color32::from_rgb(223, 159, 255),  // H — path, exact case
         10 => egui::Color32::from_rgb(239, 191, 239), // I — path, any case
-        _ => egui::Color32::from_rgb(199, 199, 199), // J — fuzzy path
+        _ => egui::Color32::from_rgb(199, 199, 199),  // J — fuzzy path
     }
 }
 

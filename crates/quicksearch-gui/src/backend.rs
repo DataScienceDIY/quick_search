@@ -49,11 +49,8 @@ impl Backend {
         let (tx, rx) = mpsc::channel();
         let db = config.resolved_database_path();
         std::thread::spawn(move || {
-            let result = quicksearch_core::search::find_duplicate_groups(
-                &db.to_string_lossy(),
-                500,
-                0,
-            );
+            let result =
+                quicksearch_core::search::find_duplicate_groups(&db.to_string_lossy(), 500, 0);
             let _ = tx.send(result);
             ctx.request_repaint();
         });

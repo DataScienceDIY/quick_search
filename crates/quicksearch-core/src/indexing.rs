@@ -12,7 +12,6 @@ use crate::file_handling::{
     extract_one_batch,
     extract_scope_prepare,
     fts_finalize_after_text_indexing,
-    load_existing_files,
     process_batch_inserts,
     process_batch_updates,
     path_to_db_string,
@@ -21,8 +20,11 @@ use crate::file_handling::{
     OwnedNewFile,
 };
 use crate::config::Config;
-use crate::walk::{thread_count_for, walk_indexable_files, ParallelWalk, TryNext, WorkerStats};
+use crate::walk::{
+    thread_count_for, walk_indexable_files, ParallelWalk, TryNext, WalkEvent, WorkerStats,
+};
 use crate::db;
+use crate::db::repo;
 
 /// Where one root's pipeline is in its life cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +91,54 @@ pub enum IndexingCommand {
         config: Config,
     },
     Stop,
+}
+
+/// Collect rows whose parent directory the walk never reached.
+///
+/// Per-directory reconciliation can only speak for directories it read, so a
+/// directory deleted wholesale — or newly excluded by an ignore pattern —
+/// leaves its rows unaccounted for. This finds them by scanning the distinct
+/// parents stored under `root` and keeping the ones absent from `seen_dirs`.
+///
+/// Two kinds of absence are *not* deletions and are filtered out:
+///
+/// - A parent under a directory the walk could not read. Its children were
+///   never discovered, so their absence proves nothing.
+/// - A path reached by resolving a symlink. Its row's parent may lie outside
+///   every root and so is never visited by construction; `aliased` is the
+///   record that the file itself was seen.
+///
+/// The parent scan streams (see [`repo::for_each_parent_in_range`]) so this
+/// costs memory proportional to the *unvisited* directories, not to the tree.
+fn sweep_unvisited_parents(
+    conn_mutex: &Arc<Mutex<Connection>>,
+    root: &str,
+    seen_dirs: &HashSet<String>,
+    unreadable: &crate::file_handling::UnreadableDirs,
+    aliased: &HashSet<String>,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    // Same keyset range the extraction cursor uses: `[root + "/", root + "0")`.
+    let range = ExtractCursor::for_root(root);
+    let conn = conn_mutex.lock().unwrap();
+
+    // Collected rather than streamed into the second query: both borrow the
+    // same connection, and the outer statement is still live while iterating.
+    let mut unvisited: Vec<String> = Vec::new();
+    repo::for_each_parent_in_range(&conn, &range.lo, &range.hi, |parent| {
+        if !seen_dirs.contains(&parent) && !unreadable.covers(&parent) {
+            unvisited.push(parent);
+        }
+    })?;
+
+    for parent in unvisited {
+        for path in repo::paths_in_dir(&conn, &parent)? {
+            if !aliased.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -456,13 +506,10 @@ impl IndexingService {
         // the legacy single path did.
         Self::update_config(&conn, config, &roots.join("\n"))?;
 
-        // Load existing files from database for incremental indexing
-        // Shared read-only with the walk threads, which classify against it.
-        let existing_files = Arc::new({
-            let conn_ref = &conn;
-            load_existing_files(conn_ref)
-                .map_err(|e| format!("Failed to load existing files: {}", e))?
-        });
+        // No up-front load of the whole `files` table: each walk's prefetcher
+        // fetches one directory's rows at a time, so classification data is
+        // never all resident at once and the walk starts immediately instead
+        // of after a full table scan.
 
         let conn_mutex = Arc::new(Mutex::new(conn));
         
@@ -504,7 +551,7 @@ impl IndexingService {
                 config.indexing.follow_symlinks,
                 config.indexing.include_hidden,
                 ignore,
-                existing_files.clone(),
+                db_path,
                 config.clone(),
                 registry.clone(),
                 stop_flag.clone(),
@@ -583,7 +630,17 @@ impl IndexingService {
         // active roots get even quanta; read-bottlenecked, roots with
         // empty channels are skipped and the firehose roots get the
         // writer's full attention.
-        let mut seen_paths: HashSet<String> = HashSet::new();
+        // 128-bit path digests, not paths. Its only job is to drop a repeat
+        // visit, and at millions of files owning every path string again —
+        // on top of the rows SQLite already holds — was the single largest
+        // allocation in a run. See `walk::path_digest`.
+        let mut seen_paths: HashSet<u128> = HashSet::new();
+        // Rows the per-directory reconciliation found no file behind, plus
+        // whatever the vanished-directory sweep adds once the walks end.
+        let mut stale_candidates: Vec<String> = Vec::new();
+        // Paths reached by resolving a symlink, whose row lives under a
+        // parent that may be outside every root.
+        let mut aliased_paths: HashSet<String> = HashSet::new();
         let mut aborted = false;
         let mut stale_cleanup_ok = true;
         let mut cleanup_done = false;
@@ -604,17 +661,33 @@ impl IndexingService {
                         let mut took = 0usize;
                         while took < quantum {
                             match p.walk.try_next() {
-                                TryNext::Item(file) => {
+                                TryNext::Item(WalkEvent::Stale(paths)) => {
+                                    took += 1;
+                                    // Applied at the end of the run, not here:
+                                    // deleting mid-walk would break the "a
+                                    // stopped run deletes nothing" guarantee,
+                                    // and an aliased sighting that exempts a
+                                    // path may still be ahead of us.
+                                    stale_candidates.extend(paths);
+                                }
+                                TryNext::Item(WalkEvent::File(file)) => {
                                     took += 1;
                                     p.walked += 1;
                                     if p.walked % 64 == 0 {
                                         p.current_file = Some(file.path.clone());
                                     }
-                                    // Membership decides what survives stale
-                                    // cleanup: "the walk saw this", never
-                                    // "processed successfully". Also dedupes
-                                    // symlinked spellings across roots.
-                                    if !seen_paths.insert(file.path.clone()) {
+                                    if file.aliased {
+                                        // Its row's parent is a directory this
+                                        // walk may never visit, so the
+                                        // vanished-directory sweep must not
+                                        // treat that parent's absence as proof
+                                        // the file is gone.
+                                        aliased_paths.insert(file.path.clone());
+                                    }
+                                    // Dedupes a canonical file reachable
+                                    // through several spellings, or from more
+                                    // than one root.
+                                    if !seen_paths.insert(file.digest) {
                                         continue;
                                     }
                                     let Some(rec) = file.record else { continue };
@@ -734,14 +807,27 @@ impl IndexingService {
                 cleanup_done = true;
                 let stopped = *stop_flag.lock().unwrap();
                 if stale_cleanup_ok && !stopped {
-                    let stale_paths: Vec<String> = existing_files
-                        .keys()
-                        .filter(|path| !seen_paths.contains(*path))
-                        .filter(|path| {
-                            !pipelines.iter().any(|p| p.walk.unreadable().covers(path))
-                        })
-                        .cloned()
-                        .collect();
+                    // Directories that vanished entirely are never read, so
+                    // per-directory reconciliation never sees them; only a
+                    // scan of stored parents against the ones the walk
+                    // reached can find the rows beneath them.
+                    for p in &pipelines {
+                        sweep_unvisited_parents(
+                            &conn_mutex,
+                            &p.root,
+                            &p.walk.seen_dirs(),
+                            p.walk.unreadable(),
+                            &aliased_paths,
+                            &mut stale_candidates,
+                        )?;
+                    }
+                    // No unreadable-directory filter here: neither source of
+                    // candidates can produce one. `read_directory` returns
+                    // before reconciling a directory it could not read, and
+                    // the sweep skips parents beneath one. Re-checking here
+                    // as well would put the same rule in two places, free to
+                    // drift, and the tests could not tell which one held.
+                    let stale_paths: Vec<String> = stale_candidates.drain(..).collect();
                     let unreadable_count: usize = pipelines
                         .iter()
                         .map(|p| p.walk.unreadable().paths().len())

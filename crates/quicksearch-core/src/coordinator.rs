@@ -12,6 +12,11 @@
 //! - **ManualRunning** — one user-forced full run; returns to
 //!   `ManualStopped` when it finishes. (A forced run in Auto stays Auto.)
 //!
+//! `indexing.auto_index` is the persisted form of that mode: it picks the
+//! starting mode here, and every mode change keeps the coordinator's copy
+//! of the config in step with it. Writing the file back is the caller's
+//! job — the coordinator's config is a copy, not the source of truth.
+//!
 //! Single-writer guarantee: incremental writes are deferred while a full
 //! run is active — the coordinator's tick simply does nothing until the
 //! `IndexingService` reports idle, then drains its queue. Overflowing the
@@ -307,15 +312,22 @@ impl Inner {
                 }
             }
             CoordCmd::ConfigChanged(new) => {
+                let want_auto = new.indexing.auto_index;
                 self.config = new;
                 if let Err(e) = self.reload_filters() {
                     crate::log_warn!("coordinator: {}", e);
                 }
                 // The write connection may point at an old database_path.
                 self.write_conn = None;
-                // Watched roots / symlink behavior may have changed; a
-                // restart is cheap and unconditional beats a diff here.
-                if self.mode == IndexMode::Auto {
+                if want_auto && self.mode != IndexMode::Auto {
+                    // The mode lives in `auto_index`, so a config that
+                    // disagrees with the running mode *is* a mode change.
+                    self.enter_auto();
+                } else if !want_auto && self.mode == IndexMode::Auto {
+                    self.enter_manual_stopped();
+                } else if self.mode == IndexMode::Auto {
+                    // Watched roots / symlink behavior may have changed; a
+                    // restart is cheap and unconditional beats a diff here.
                     self.start_watcher();
                 }
             }
@@ -491,6 +503,9 @@ impl Inner {
 
     fn enter_auto(&mut self) {
         self.mode = IndexMode::Auto;
+        // Keep the config copy honest: `auto_index` is this mode written
+        // down, and the caller persists it from its own copy.
+        self.config.indexing.auto_index = true;
         self.start_watcher();
         if self.shared.lock().unwrap().last_full_index.is_none() {
             self.needs_full_run = true;
@@ -499,6 +514,7 @@ impl Inner {
 
     fn enter_manual_stopped(&mut self) {
         self.mode = IndexMode::ManualStopped;
+        self.config.indexing.auto_index = false;
         self.stop_watcher();
         self.pending.clear();
         let status = self.indexing.get_status();
@@ -895,6 +911,38 @@ mod tests {
         std::thread::sleep(Duration::from_secs(3));
         assert_eq!(f.file_count(), 1, "stopped mode must not index new files");
         assert_eq!(coord.state().queued_events, 0);
+
+        coord.shutdown();
+    }
+
+    /// `auto_index` is the mode written down, so a config whose value
+    /// disagrees with the running mode switches it. That is what lets the
+    /// GUI persist a Stop click, and what makes a hand-edited config take
+    /// effect without a restart.
+    #[test]
+    fn applying_a_config_switches_the_mode_to_match_auto_index() {
+        let f = Fixture::new(true);
+        let coord =
+            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        wait_for("watcher active", Duration::from_secs(20), || {
+            matches!(coord.state().watcher, WatcherStatus::Active { .. })
+        });
+
+        let mut manual = f.config.clone();
+        manual.indexing.auto_index = false;
+        coord.apply_config(manual.clone());
+        wait_for("manual mode", Duration::from_secs(10), || {
+            let s = coord.state();
+            s.mode == IndexMode::ManualStopped && s.watcher == WatcherStatus::Off
+        });
+
+        let mut auto = manual.clone();
+        auto.indexing.auto_index = true;
+        coord.apply_config(auto);
+        wait_for("automatic mode", Duration::from_secs(20), || {
+            let s = coord.state();
+            s.mode == IndexMode::Auto && matches!(s.watcher, WatcherStatus::Active { .. })
+        });
 
         coord.shutdown();
     }

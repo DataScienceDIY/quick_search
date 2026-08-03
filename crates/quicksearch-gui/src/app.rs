@@ -169,11 +169,7 @@ impl QuickSearchApp {
 
     /// Save + route an edited config to the running services.
     fn apply_new_config(&mut self, ctx: &egui::Context, mut new: Config) {
-        // The security section is never edited through config drafts — it
-        // changes only via the explicit flows in `handle_security_action`.
-        // Pinning it here keeps a stale draft (taken before a security
-        // change) from silently reverting protection or the salt.
-        new.security = self.cfg.security.clone();
+        pin_live_fields(&mut new, &self.cfg);
         if let Some((child, parent)) = nested_roots(&new.paths.indexing_paths).first() {
             self.config_error = Some(format!(
                 "Not applied: indexed folder {} is nested under {}",
@@ -230,6 +226,27 @@ impl QuickSearchApp {
             }
         }
         self.cfg = new;
+    }
+
+    /// Switch the indexing mode and write it to the config immediately.
+    ///
+    /// The mode is a persisted setting (`indexing.auto_index`), not a
+    /// per-session one: a manual stop must still be manual after a
+    /// restart, or the next launch quietly resumes the indexing the user
+    /// just stopped.
+    fn set_index_mode(&mut self, auto: bool) {
+        self.backend.coordinator.set_mode(if auto {
+            IndexMode::Auto
+        } else {
+            IndexMode::ManualStopped
+        });
+        if self.cfg.indexing.auto_index == auto {
+            return;
+        }
+        self.cfg.indexing.auto_index = auto;
+        if let Err(e) = self.cfg.save() {
+            self.config_error = Some(e);
+        }
     }
 
     fn drain_events(&mut self) {
@@ -333,13 +350,12 @@ impl QuickSearchApp {
                             .unwrap_or(true);
                         if stale {
                             let db = self.cfg.resolved_database_path();
-                            let counts = index_counts(&db.to_string_lossy()).unwrap_or(
-                                IndexCounts {
+                            let counts =
+                                index_counts(&db.to_string_lossy()).unwrap_or(IndexCounts {
                                     files: 0,
                                     content_done: 0,
                                     content_pending: 0,
-                                },
-                            );
+                                });
                             self.counts = Some((Instant::now(), counts));
                         }
                         let files = self.counts.map(|(_, c)| c.files).unwrap_or(0);
@@ -362,12 +378,8 @@ impl QuickSearchApp {
                         ui.label(egui::RichText::new("Stopping indexing…").small());
                     }
                     IndexingStatus::Running { roots, .. } => {
-                        let done = roots
-                            .iter()
-                            .filter(|r| r.phase == RootPhase::Done)
-                            .count();
-                        let processed: usize =
-                            roots.iter().map(|r| r.walked + r.extracted).sum();
+                        let done = roots.iter().filter(|r| r.phase == RootPhase::Done).count();
+                        let processed: usize = roots.iter().map(|r| r.walked + r.extracted).sum();
                         let totals_known = roots.iter().all(|r| r.walk_total.is_some());
                         let denominator: usize = roots
                             .iter()
@@ -375,8 +387,7 @@ impl QuickSearchApp {
                             .sum();
 
                         let mut text = if totals_known && denominator > 0 {
-                            let frac =
-                                (processed as f64 / denominator as f64).min(1.0);
+                            let frac = (processed as f64 / denominator as f64).min(1.0);
                             format!(
                                 "Indexing {} / {} ({:.0}%)",
                                 group_thousands(processed as u64),
@@ -384,10 +395,7 @@ impl QuickSearchApp {
                                 frac * 100.0
                             )
                         } else {
-                            format!(
-                                "Indexing · {} files",
-                                group_thousands(processed as u64)
-                            )
+                            format!("Indexing · {} files", group_thousands(processed as u64))
                         };
                         if roots.len() > 1 {
                             text.push_str(&format!(" · {}/{} roots done", done, roots.len()));
@@ -396,15 +404,13 @@ impl QuickSearchApp {
                             text.push_str(&format!(" · {}", crate::format::fmt_rate(rate)));
                         }
                         let active: usize = roots.iter().map(|r| r.active_workers).sum();
-                        let total_workers: usize =
-                            roots.iter().map(|r| r.total_workers).sum();
+                        let total_workers: usize = roots.iter().map(|r| r.total_workers).sum();
                         if total_workers > 0 {
                             text.push_str(&format!(" · {}/{} workers", active, total_workers));
                         }
                         ui.label(egui::RichText::new(text).small());
                         if totals_known && denominator > 0 {
-                            let frac =
-                                (processed as f32 / denominator as f32).clamp(0.0, 1.0);
+                            let frac = (processed as f32 / denominator as f32).clamp(0.0, 1.0);
                             ui.add(egui::ProgressBar::new(frac).desired_width(120.0));
                         } else {
                             ui.add(egui::Spinner::new().size(12.0));
@@ -424,7 +430,10 @@ impl QuickSearchApp {
         });
 
         // Keep painting while anything is moving.
-        if !matches!(state.activity, IndexingStatus::Idle | IndexingStatus::Error(_)) {
+        if !matches!(
+            state.activity,
+            IndexingStatus::Idle | IndexingStatus::Error(_)
+        ) {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         // Watcher registration walks every root, so its verdict can land
@@ -458,9 +467,7 @@ impl QuickSearchApp {
                     // newline-joined — side-by-side columns keep before and
                     // after readable instead of one run-on arrow line.
                     ui.columns(2, |cols| {
-                        cols[0].label(
-                            egui::RichText::new("index was built with").small().weak(),
-                        );
+                        cols[0].label(egui::RichText::new("index was built with").small().weak());
                         cols[0].monospace(display_value(&change.stored));
                         cols[1].label(egui::RichText::new("config now says").small().weak());
                         cols[1].monospace(display_value(&change.current));
@@ -513,8 +520,7 @@ impl QuickSearchApp {
                 if remember {
                     match db::process_key_hex() {
                         Some(hex) => {
-                            if let Err(e) = keychain::store_key(&db_path.to_string_lossy(), &hex)
-                            {
+                            if let Err(e) = keychain::store_key(&db_path.to_string_lossy(), &hex) {
                                 self.config_error = Some(e);
                                 return; // preference not saved either
                             }
@@ -577,12 +583,16 @@ impl QuickSearchApp {
                                 .hint_text("Confirm password")
                                 .desired_width(240.0),
                         );
-                        ui.checkbox(remember, "Remember on this device").on_hover_text(
-                            "Stores the derived key (not the password) in the OS \
+                        ui.checkbox(remember, "Remember on this device")
+                            .on_hover_text(
+                                "Stores the derived key (not the password) in the OS \
                              keychain and skips the startup prompt.",
-                        );
+                            );
                         if !pw1.is_empty() && !pw2.is_empty() && pw1 != pw2 {
-                            ui.colored_label(ui.visuals().error_fg_color, "Passwords do not match.");
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                "Passwords do not match.",
+                            );
                         }
                         ui.horizontal(|ui| {
                             let ok = !pw1.is_empty() && pw1 == pw2;
@@ -619,34 +629,32 @@ impl QuickSearchApp {
                     self.security_prompt = Some(SecurityPrompt::Deriving { rx });
                 }
             }
-            SecurityPrompt::Deriving { rx } => {
-                match rx.try_recv() {
-                    Ok((new_security, key)) => {
-                        self.security_prompt = Some(SecurityPrompt::ConfirmRebuild {
-                            new_security,
-                            new_key: Some(key),
-                        });
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        egui::Window::new("Deriving key")
-                            .collapsible(false)
-                            .resizable(false)
-                            .title_bar(false)
-                            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                            .show(ctx, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("Deriving key…");
-                                });
-                            });
-                        ctx.request_repaint_after(Duration::from_millis(100));
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        self.config_error = Some("key derivation thread died".to_string());
-                        self.security_prompt = None;
-                    }
+            SecurityPrompt::Deriving { rx } => match rx.try_recv() {
+                Ok((new_security, key)) => {
+                    self.security_prompt = Some(SecurityPrompt::ConfirmRebuild {
+                        new_security,
+                        new_key: Some(key),
+                    });
                 }
-            }
+                Err(mpsc::TryRecvError::Empty) => {
+                    egui::Window::new("Deriving key")
+                        .collapsible(false)
+                        .resizable(false)
+                        .title_bar(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ctx, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Deriving key…");
+                            });
+                        });
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.config_error = Some("key derivation thread died".to_string());
+                    self.security_prompt = None;
+                }
+            },
             SecurityPrompt::ConfirmRebuild {
                 new_security,
                 new_key,
@@ -701,7 +709,11 @@ impl QuickSearchApp {
     /// in that order, before the rebuild so the fresh index is created
     /// under the new key (or none).
     fn apply_security_change(&mut self, new_security: SecurityConfig, new_key: Option<IndexKey>) {
-        let db_path = self.cfg.resolved_database_path().to_string_lossy().into_owned();
+        let db_path = self
+            .cfg
+            .resolved_database_path()
+            .to_string_lossy()
+            .into_owned();
         self.cfg.security = new_security;
         if let Err(e) = self.cfg.save() {
             self.config_error = Some(e);
@@ -858,6 +870,11 @@ impl QuickSearchApp {
                         )
                         .clicked()
                     {
+                        // Manual first, and persisted: clearing drops the
+                        // coordinator to manual so automatic mode cannot
+                        // resurrect what was just deleted, and the next
+                        // launch must not undo that either.
+                        self.set_index_mode(false);
                         self.backend.coordinator.clear_index();
                         self.counts = None;
                         self.dups.state = DupState::NotLoaded;
@@ -874,6 +891,18 @@ impl QuickSearchApp {
     }
 }
 
+/// Overwrite the fields a config draft must never carry back.
+///
+/// Both are live state the GUI changes through their own controls — the
+/// security flows in `handle_security_action`, the mode buttons in
+/// [`QuickSearchApp::set_index_mode`] — and both are saved the moment they
+/// change. A draft taken before one of those clicks still holds the old
+/// value, so applying it would silently revert protection, the salt, or
+/// the indexing mode.
+fn pin_live_fields(new: &mut Config, live: &Config) {
+    new.security = live.security.clone();
+    new.indexing.auto_index = live.indexing.auto_index;
+}
 
 /// A stored/current config value for the rebuild prompt; list values are
 /// already newline-joined and render as-is, empty means unset.
@@ -966,10 +995,10 @@ impl eframe::App for QuickSearchApp {
                     self.backend.coordinator.reindex_now();
                 }
                 if actions.stop {
-                    self.backend.coordinator.set_mode(IndexMode::ManualStopped);
+                    self.set_index_mode(false);
                 }
                 if actions.auto {
-                    self.backend.coordinator.set_mode(IndexMode::Auto);
+                    self.set_index_mode(true);
                 }
                 if actions.clear_index {
                     self.clear_prompt = true;
@@ -1010,5 +1039,39 @@ impl eframe::App for QuickSearchApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.backend.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_draft_cannot_revert_the_indexing_mode_or_security() {
+        // The draft as it was when the editor last synced: automatic
+        // indexing, no password — plus one real edit the user staged.
+        let mut draft = Config::default();
+        draft.indexing.auto_index = true;
+        draft.indexing.reindex_interval_minutes = 60;
+
+        // Since then: Stop was clicked and protection was enabled.
+        let mut live = Config::default();
+        live.indexing.auto_index = false;
+        live.security = SecurityConfig {
+            password_protected: true,
+            salt: Some("ab".repeat(16)),
+            use_keychain: true,
+        };
+
+        pin_live_fields(&mut draft, &live);
+        assert!(
+            !draft.indexing.auto_index,
+            "applying the draft must not restart automatic indexing"
+        );
+        assert_eq!(draft.security, live.security);
+        assert_eq!(
+            draft.indexing.reindex_interval_minutes, 60,
+            "the staged edit itself still applies"
+        );
     }
 }

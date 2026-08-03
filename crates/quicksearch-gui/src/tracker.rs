@@ -42,9 +42,7 @@ impl SpeedTracker {
         self.points.push((now, files_processed));
         // Prune old points, but always keep at least two so a slow but
         // steady rate never becomes unmeasurable.
-        while self.points.len() > 2
-            && now.duration_since(self.points[0].0) > HISTORY
-        {
+        while self.points.len() > 2 && now.duration_since(self.points[0].0) > HISTORY {
             self.points.remove(0);
         }
     }
@@ -90,7 +88,9 @@ mod tests {
         for i in 0..4 {
             t.record_at(base + Duration::from_millis(2500 * i), 10 + i as usize);
         }
-        let rate = t.files_per_sec_at(base + Duration::from_millis(7500)).unwrap();
+        let rate = t
+            .files_per_sec_at(base + Duration::from_millis(7500))
+            .unwrap();
         assert!((rate - 0.4).abs() < 0.01, "expected ~0.4/s, got {}", rate);
     }
 
@@ -113,7 +113,11 @@ mod tests {
         let just_after = t.files_per_sec_at(base + Duration::from_secs(1)).unwrap();
         let stalled = t.files_per_sec_at(base + Duration::from_secs(20)).unwrap();
         assert!(just_after > 90.0);
-        assert!(stalled < 6.0, "estimate must decay during a stall: {}", stalled);
+        assert!(
+            stalled < 6.0,
+            "estimate must decay during a stall: {}",
+            stalled
+        );
     }
 
     #[test]

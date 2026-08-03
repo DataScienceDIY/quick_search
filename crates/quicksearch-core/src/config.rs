@@ -48,8 +48,11 @@ pub struct PathConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct IndexingConfig {
-    /// Start in automatic mode: filesystem watchers apply changes as they
-    /// happen and a full reindex runs every `reindex_interval_minutes`.
+    /// The indexing mode, written down: `true` is automatic — filesystem
+    /// watchers apply changes as they happen and a full reindex runs every
+    /// `reindex_interval_minutes` — and `false` is manual, where nothing
+    /// runs until the user asks. The GUI's Stop / Return to Automatic
+    /// controls save it as they switch, so the mode survives a restart.
     pub auto_index: bool,
     pub reindex_interval_minutes: u64,
     pub follow_symlinks: bool,
@@ -292,7 +295,7 @@ impl Default for Config {
 /// to catch it would also catch a user folder named `Windows`.
 /// `config_example.toml` documents it for people who add a drive root.
 fn default_ignore_patterns() -> Vec<String> {
-    let mut patterns = vec![".git", "node_modules", "*.tmp", ".venv", "venv", "*.pdf"];
+    let mut patterns = vec![".git", "node_modules", "*.tmp", ".venv", "venv"];
     if cfg!(windows) {
         patterns.extend([
             "$RECYCLE.BIN",

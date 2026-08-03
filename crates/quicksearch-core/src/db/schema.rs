@@ -32,6 +32,25 @@ pub const PRAGMAS_READONLY: &str = "
     PRAGMA foreign_keys = ON;
 ";
 
+/// Pragmas for a walk's row-prefetch connection.
+///
+/// Identical to [`PRAGMAS_READONLY`] but for `cache_size`, and that one
+/// difference is the point. One of these connections exists per indexing
+/// root, so the 10000-page (~40 MiB) cache the other profiles take would
+/// cost ~200 MiB across five roots — more than the per-directory
+/// classification this connection exists to serve was meant to save.
+///
+/// 256 pages (~1 MiB) is enough to hold the upper levels of
+/// `idx_files_parent` hot, which is all these queries touch: each one is a
+/// single index range lookup, and the pages under it are read once and not
+/// revisited.
+pub const PRAGMAS_WALK_READER: &str = "
+    PRAGMA busy_timeout = 5000;
+    PRAGMA cache_size = 256;
+    PRAGMA temp_store = MEMORY;
+    PRAGMA foreign_keys = ON;
+";
+
 /// The full current schema. Applied by [`super::open::open_or_recreate`]
 /// when the DB is fresh or has just been wiped because it drifted from
 /// [`super::open::CURRENT_SCHEMA_VERSION`].

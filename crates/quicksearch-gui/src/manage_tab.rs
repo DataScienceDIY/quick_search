@@ -6,7 +6,6 @@ use quicksearch_core::coordinator::{IndexMode, IndexerState, WatcherStatus};
 use quicksearch_core::indexing::{IndexingStatus, RootPhase, RootProgress};
 
 use crate::format::{fmt_interval, fmt_rate, group_thousands, middle_truncate};
-use crate::options::{config_editor_ui, Section};
 use crate::tracker::SpeedTracker;
 
 /// What the tab asks the app to do after this frame.
@@ -17,7 +16,7 @@ pub struct ManageActions {
     pub auto: bool,
     /// Ask the app to confirm and delete the index.
     pub clear_index: bool,
-    /// A full edited config to apply (roots / filters / indexing knobs).
+    /// A full edited config to apply (roots / filters).
     pub apply_config: Option<Config>,
 }
 
@@ -34,7 +33,7 @@ pub struct ManageTab {
     /// The config the draft was last synced from. `None` forces a full
     /// resync (first frame, and right after our own Apply).
     baseline: Option<Config>,
-    /// Draft of the roots/filters/indexing knobs edited in-place.
+    /// Draft of the roots/filters edited in-place.
     draft: Option<Config>,
 }
 
@@ -118,241 +117,270 @@ impl ManageTab {
         let mut actions = ManageActions::default();
         self.sync_editors(config);
 
-        let scroll = egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            // --- Status ---------------------------------------------------
-            ui.heading("Status");
-            status_panel(ui, state, &self.speed);
-            watch_panel(ui, state, config);
-            ui.add_space(8.0);
+        let scroll = egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                // --- Status ---------------------------------------------------
+                ui.heading(egui::RichText::new("Status").strong());
+                status_panel(ui, state, &self.speed);
+                watch_panel(ui, state, config);
+                ui.add_space(8.0);
 
-            // --- Controls -------------------------------------------------
-            ui.horizontal(|ui| {
-                let running = !matches!(
-                    state.activity,
-                    IndexingStatus::Idle | IndexingStatus::Error(_)
-                );
-                if ui.add_enabled(!running, egui::Button::new("Start indexing now")).clicked() {
-                    actions.start_now = true;
-                }
-                if ui.add_enabled(running || state.mode == IndexMode::Auto, egui::Button::new("Stop")).clicked() {
-                    actions.stop = true;
-                }
-                if ui
-                    .add_enabled(state.mode != IndexMode::Auto, egui::Button::new("Return to Automatic"))
-                    .clicked()
-                {
-                    actions.auto = true;
-                }
-                let mode = match state.mode {
-                    IndexMode::Auto => "Automatic",
-                    IndexMode::ManualStopped => "Manual (stopped)",
-                    IndexMode::ManualRunning => "Manual (running)",
-                };
-                ui.label(egui::RichText::new(format!("Mode: {}", mode)).weak());
-                ui.separator();
-                if ui
-                    .button(egui::RichText::new("Clear index…").color(ui.visuals().error_fg_color))
-                    .on_hover_text("Delete the index database (asks for confirmation)")
-                    .clicked()
-                {
-                    actions.clear_index = true;
-                }
-                if state.queued_events > 0 {
-                    ui.label(
-                        egui::RichText::new(format!("{} changes queued", state.queued_events))
-                            .small()
-                            .weak(),
-                    );
-                }
-            });
-            ui.separator();
-
-            // --- Indexed roots ---------------------------------------------
-            ui.heading("Indexed folders");
-            let draft = self.draft.as_mut().expect("synced");
-            let mut remove: Option<usize> = None;
-            for (i, root) in draft.paths.indexing_paths.clone().iter().enumerate() {
+                // --- Controls -------------------------------------------------
                 ui.horizontal(|ui| {
-                    // Controls claim the right edge first so a long path can
-                    // never push them out of view; the path truncates into
-                    // whatever width remains (full path on hover).
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Remove").clicked() {
-                            remove = Some(i);
-                        }
-                        // Per-root walker override; 0 = auto (4 local / 16
-                        // network, detected per root). Applies on the next run.
-                        let mut workers =
-                            draft.indexing.root_workers.get(root).copied().unwrap_or(0);
-                        let response = ui
-                            .add(
-                                egui::DragValue::new(&mut workers)
-                                    .range(0..=64)
-                                    .custom_formatter(|n, _| {
-                                        if n == 0.0 {
-                                            "auto".to_string()
-                                        } else {
-                                            format!("{:.0}", n)
-                                        }
-                                    })
-                                    .custom_parser(|s| {
-                                        let s = s.trim();
-                                        if s.is_empty() || s.eq_ignore_ascii_case("auto") {
-                                            Some(0.0)
-                                        } else {
-                                            s.parse().ok()
-                                        }
-                                    }),
-                            )
-                            .on_hover_text(
-                                "Walker threads for this folder. auto = 4 on local \
+                    let running = !matches!(
+                        state.activity,
+                        IndexingStatus::Idle | IndexingStatus::Error(_)
+                    );
+                    if ui
+                        .add_enabled(!running, egui::Button::new("Start indexing now"))
+                        .clicked()
+                    {
+                        actions.start_now = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            running || state.mode == IndexMode::Auto,
+                            egui::Button::new("Stop"),
+                        )
+                        .on_hover_text(
+                            "Stop indexing and switch to manual. Saved right away: it \
+                         stays manual on the next launch too.",
+                        )
+                        .clicked()
+                    {
+                        actions.stop = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            state.mode != IndexMode::Auto,
+                            egui::Button::new("Return to Automatic"),
+                        )
+                        .on_hover_text(
+                            "Watch for changes and reindex periodically again. Also \
+                         saved, so this is how the app starts from now on.",
+                        )
+                        .clicked()
+                    {
+                        actions.auto = true;
+                    }
+                    let mode = match state.mode {
+                        IndexMode::Auto => "Automatic",
+                        IndexMode::ManualStopped => "Manual (stopped)",
+                        IndexMode::ManualRunning => "Manual (running)",
+                    };
+                    ui.label(egui::RichText::new(format!("Mode: {}", mode)).weak());
+                    ui.separator();
+                    if ui
+                        .button(
+                            egui::RichText::new("Clear index…").color(ui.visuals().error_fg_color),
+                        )
+                        .on_hover_text("Delete the index database (asks for confirmation)")
+                        .clicked()
+                    {
+                        actions.clear_index = true;
+                    }
+                    if state.queued_events > 0 {
+                        ui.label(
+                            egui::RichText::new(format!("{} changes queued", state.queued_events))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                });
+                ui.separator();
+
+                // --- Indexed roots ---------------------------------------------
+                ui.heading(egui::RichText::new("Indexed folders").strong());
+                let draft = self.draft.as_mut().expect("synced");
+                let mut remove: Option<usize> = None;
+                for (i, root) in draft.paths.indexing_paths.clone().iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        // Controls claim the right edge first so a long path can
+                        // never push them out of view; the path truncates into
+                        // whatever width remains (full path on hover).
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Remove").clicked() {
+                                remove = Some(i);
+                            }
+                            // Per-root walker override; 0 = auto (4 local / 16
+                            // network, detected per root). Applies on the next run.
+                            let mut workers =
+                                draft.indexing.root_workers.get(root).copied().unwrap_or(0);
+                            let response = ui
+                                .add(
+                                    egui::DragValue::new(&mut workers)
+                                        .range(0..=64)
+                                        .custom_formatter(|n, _| {
+                                            if n == 0.0 {
+                                                "auto".to_string()
+                                            } else {
+                                                format!("{:.0}", n)
+                                            }
+                                        })
+                                        .custom_parser(|s| {
+                                            let s = s.trim();
+                                            if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+                                                Some(0.0)
+                                            } else {
+                                                s.parse().ok()
+                                            }
+                                        }),
+                                )
+                                .on_hover_text(
+                                    "Walker threads for this folder. auto = 4 on local \
                                  storage, 16 on network mounts. Takes effect on \
                                  the next indexing run.",
-                            );
-                        if response.changed() {
-                            if workers == 0 {
-                                draft.indexing.root_workers.remove(root);
-                            } else {
-                                draft.indexing.root_workers.insert(root.clone(), workers);
-                            }
-                        }
-                        ui.label(egui::RichText::new("workers:").small().weak());
-
-                        // Path label takes the leftover width, middle-truncated.
-                        ui.with_layout(
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-                                let char_width =
-                                    ui.fonts(|f| f.glyph_width(&font_id, '0')).max(1.0);
-                                let budget =
-                                    ((ui.available_width() / char_width) as usize).max(16);
-                                ui.monospace(middle_truncate(root, budget))
-                                    .on_hover_text(root);
-                            },
-                        );
-                    });
-                });
-            }
-            if let Some(i) = remove {
-                let removed = draft.paths.indexing_paths.remove(i);
-                draft.indexing.root_workers.remove(&removed);
-            }
-            ui.horizontal(|ui| {
-                if ui.button("Add folder…").clicked() {
-                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                        let path = dir.to_string_lossy().into_owned();
-                        try_add_root(draft, path, &mut self.root_error);
-                    }
-                }
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_root)
-                        .desired_width(240.0)
-                        .hint_text("or type a path"),
-                );
-                if ui.button("Add").clicked() && !self.new_root.trim().is_empty() {
-                    let path = self.new_root.trim().to_string();
-                    if try_add_root(draft, path, &mut self.root_error) {
-                        self.new_root.clear();
-                    }
-                }
-            });
-            if let Some(err) = &self.root_error {
-                ui.colored_label(ui.visuals().error_fg_color, err);
-            }
-            ui.separator();
-
-            // --- Filters ---------------------------------------------------
-            ui.heading("Content filters");
-            ui.columns(2, |cols| {
-                cols[0].label("Full-text extensions (empty = all supported):");
-                cols[0].add(
-                    egui::TextEdit::multiline(&mut self.ext_filter_text)
-                        .desired_rows(4)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("txt\nmd\npdf"),
-                );
-                cols[1].label("Ignore patterns (excluded entirely):");
-                let mut remove_pat: Option<usize> = None;
-                for (i, pat) in draft.indexing.ignore_patterns.iter().enumerate() {
-                    cols[1].horizontal(|ui| {
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if ui.small_button("Remove").clicked() {
-                                    remove_pat = Some(i);
-                                }
-                                ui.with_layout(
-                                    egui::Layout::left_to_right(egui::Align::Center),
-                                    |ui| {
-                                        ui.monospace(pat);
-                                    },
                                 );
-                            },
-                        );
+                            if response.changed() {
+                                if workers == 0 {
+                                    draft.indexing.root_workers.remove(root);
+                                } else {
+                                    draft.indexing.root_workers.insert(root.clone(), workers);
+                                }
+                            }
+                            ui.label(egui::RichText::new("workers:").small().weak());
+
+                            // Path label takes the leftover width, middle-truncated.
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let font_id = egui::TextStyle::Monospace.resolve(ui.style());
+                                    let char_width =
+                                        ui.fonts(|f| f.glyph_width(&font_id, '0')).max(1.0);
+                                    let budget =
+                                        ((ui.available_width() / char_width) as usize).max(16);
+                                    ui.monospace(middle_truncate(root, budget))
+                                        .on_hover_text(root);
+                                },
+                            );
+                        });
                     });
                 }
-                if draft.indexing.ignore_patterns.is_empty() {
-                    cols[1].label(egui::RichText::new("No ignore patterns.").small().weak());
+                if let Some(i) = remove {
+                    let removed = draft.paths.indexing_paths.remove(i);
+                    draft.indexing.root_workers.remove(&removed);
                 }
-                if let Some(i) = remove_pat {
-                    draft.indexing.ignore_patterns.remove(i);
-                }
-                cols[1].horizontal(|ui| {
-                    let (response, valid) = crate::ui_util::pattern_edit(
-                        ui,
-                        &mut self.new_ignore,
-                        180.0,
-                        "*.tmp or node_modules",
-                    );
-                    let submitted =
-                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if ui.add_enabled(valid, egui::Button::new("Add")).clicked()
-                        || (submitted && valid)
-                    {
-                        let pat = self.new_ignore.trim().to_string();
-                        if !draft.indexing.ignore_patterns.contains(&pat) {
-                            draft.indexing.ignore_patterns.push(pat);
+                ui.horizontal(|ui| {
+                    if ui.button("Add folder…").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                            let path = dir.to_string_lossy().into_owned();
+                            try_add_root(draft, path, &mut self.root_error);
                         }
-                        self.new_ignore.clear();
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_root)
+                            .desired_width(240.0)
+                            .hint_text("or type a path"),
+                    );
+                    if ui.button("Add").clicked() && !self.new_root.trim().is_empty() {
+                        let path = self.new_root.trim().to_string();
+                        if try_add_root(draft, path, &mut self.root_error) {
+                            self.new_root.clear();
+                        }
                     }
                 });
-                cols[1].label(
+                if let Some(err) = &self.root_error {
+                    ui.colored_label(ui.visuals().error_fg_color, err);
+                }
+                ui.separator();
+
+                // --- Filters ---------------------------------------------------
+                ui.heading(egui::RichText::new("Content filters").strong());
+                ui.columns(2, |cols| {
+                    cols[0].label("Full-text extensions whitelist (empty = all supported):");
+                    cols[0].add(
+                        egui::TextEdit::multiline(&mut self.ext_filter_text)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("txt\nmd\npdf"),
+                    );
+                    cols[1].label("Ignore patterns (excluded entirely):");
+                    let mut remove_pat: Option<usize> = None;
+                    for (i, pat) in draft.indexing.ignore_patterns.iter().enumerate() {
+                        cols[1].horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Remove").clicked() {
+                                        remove_pat = Some(i);
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.monospace(pat);
+                                        },
+                                    );
+                                },
+                            );
+                        });
+                    }
+                    if draft.indexing.ignore_patterns.is_empty() {
+                        cols[1].label(egui::RichText::new("No ignore patterns.").small().weak());
+                    }
+                    if let Some(i) = remove_pat {
+                        draft.indexing.ignore_patterns.remove(i);
+                    }
+                    cols[1].horizontal(|ui| {
+                        let (response, valid) = crate::ui_util::pattern_edit(
+                            ui,
+                            &mut self.new_ignore,
+                            180.0,
+                            "*.tmp or node_modules",
+                        );
+                        let submitted =
+                            response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if ui.add_enabled(valid, egui::Button::new("Add")).clicked()
+                            || (submitted && valid)
+                        {
+                            let pat = self.new_ignore.trim().to_string();
+                            if !draft.indexing.ignore_patterns.contains(&pat) {
+                                draft.indexing.ignore_patterns.push(pat);
+                            }
+                            self.new_ignore.clear();
+                        }
+                    });
+                    cols[1].label(
+                        egui::RichText::new(
+                            "Changes apply on Apply & Save (may trigger index rebuild).",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                });
+                ui.separator();
+
+                // The indexing/processing knobs themselves live only in the
+                // Options window; this points at them so the tab does not look
+                // like the whole story.
+                ui.label(
                     egui::RichText::new(
-                        "Changes apply on Apply & Save (may trigger a rebuild). \
-                         Session-only filters are shown and removed on the Search tab.",
+                        "Reindex interval, symlinks, hidden files, tokenizer, and size \
+                     limits are in Options (⚙ in the toolbar).",
                     )
                     .small()
                     .weak(),
                 );
+                ui.add_space(8.0);
+
+                if ui
+                    .add(crate::ui_util::bordered_button(
+                        "Apply & Save",
+                        crate::ui_util::BLUE,
+                    ))
+                    .clicked()
+                {
+                    let mut new_config = draft.clone();
+                    new_config.indexing.content_extensions = parse_lines(&self.ext_filter_text);
+                    let roots = new_config.paths.indexing_paths.clone();
+                    new_config
+                        .indexing
+                        .root_workers
+                        .retain(|root, _| roots.contains(root));
+                    actions.apply_config = Some(new_config);
+                    self.baseline = None;
+                }
             });
-            ui.separator();
-
-            // --- Indexing options -------------------------------------------
-            ui.heading("Indexing options");
-            config_editor_ui(ui, draft, Section::Indexing);
-            ui.add_space(4.0);
-            config_editor_ui(ui, draft, Section::Processing);
-            ui.add_space(8.0);
-
-            if ui
-                .add(crate::ui_util::bordered_button(
-                    "Apply & Save",
-                    crate::ui_util::BLUE,
-                ))
-                .clicked()
-            {
-                let mut new_config = draft.clone();
-                new_config.indexing.content_extensions = parse_lines(&self.ext_filter_text);
-                let roots = new_config.paths.indexing_paths.clone();
-                new_config
-                    .indexing
-                    .root_workers
-                    .retain(|root, _| roots.contains(root));
-                actions.apply_config = Some(new_config);
-                self.baseline = None;
-            }
-        });
         crate::ui_util::more_below_hint(ui, &scroll);
 
         actions
@@ -490,7 +518,11 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
                             group_thousands(r.walked as u64),
                             workers
                         ));
-                        ui.add(egui::ProgressBar::new(0.0).animate(true).desired_width(160.0));
+                        ui.add(
+                            egui::ProgressBar::new(0.0)
+                                .animate(true)
+                                .desired_width(160.0),
+                        );
                     }
                 }
             }
@@ -546,7 +578,12 @@ mod tests {
         let cfg = Config::default();
         let mut tab = synced_tab(&cfg);
         // Stage an edit, then sync against the unchanged config.
-        tab.draft.as_mut().unwrap().indexing.ignore_patterns.push("*.log".into());
+        tab.draft
+            .as_mut()
+            .unwrap()
+            .indexing
+            .ignore_patterns
+            .push("*.log".into());
         tab.sync_editors(&cfg);
         assert!(tab
             .draft
@@ -587,7 +624,10 @@ mod tests {
         tab.sync_editors(&external);
         let draft = tab.draft.as_ref().unwrap();
         assert!(!draft.indexing.ignore_patterns.contains(&removed));
-        assert!(draft.indexing.ignore_patterns.contains(&"*.log".to_string()));
+        assert!(draft
+            .indexing
+            .ignore_patterns
+            .contains(&"*.log".to_string()));
         assert_eq!(tab.baseline.as_ref().unwrap(), &external);
     }
 
@@ -595,21 +635,34 @@ mod tests {
     fn dirty_draft_adopts_sections_owned_elsewhere() {
         let cfg = Config::default();
         let mut tab = synced_tab(&cfg);
-        tab.draft.as_mut().unwrap().indexing.ignore_patterns.push("*.bak".into());
+        tab.draft
+            .as_mut()
+            .unwrap()
+            .indexing
+            .ignore_patterns
+            .push("*.bak".into());
         // The fuzzy toggle saves the config directly, outside this tab.
         let mut external = cfg.clone();
         external.search.fuzzy_default = !cfg.search.fuzzy_default;
         tab.sync_editors(&external);
         let draft = tab.draft.as_ref().unwrap();
         assert_eq!(draft.search.fuzzy_default, external.search.fuzzy_default);
-        assert!(draft.indexing.ignore_patterns.contains(&"*.bak".to_string()));
+        assert!(draft
+            .indexing
+            .ignore_patterns
+            .contains(&"*.bak".to_string()));
     }
 
     #[test]
     fn external_pattern_is_not_duplicated_into_a_draft_that_has_it() {
         let cfg = Config::default();
         let mut tab = synced_tab(&cfg);
-        tab.draft.as_mut().unwrap().indexing.ignore_patterns.push("*.log".into());
+        tab.draft
+            .as_mut()
+            .unwrap()
+            .indexing
+            .ignore_patterns
+            .push("*.log".into());
         let mut external = cfg.clone();
         external.indexing.ignore_patterns.push("*.log".into());
         tab.sync_editors(&external);

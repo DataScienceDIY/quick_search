@@ -21,10 +21,13 @@ indexing_paths = ["~"]
 database_path = "~/.local/share/quicksearch/index.sqlite"
 
 [indexing]
-# Automatic mode: filesystem watchers apply changes as they happen and a
-# full reindex runs every reindex_interval_minutes. The watcher catches
-# changes as they happen, so this only needs to be often enough to cover
-# whatever the watcher missed.
+# The indexing mode. true = automatic: filesystem watchers apply changes as
+# they happen and a full reindex runs every reindex_interval_minutes (the
+# watcher catches changes as they happen, so that interval only needs to be
+# often enough to cover whatever the watcher missed). false = manual:
+# nothing is indexed until you ask for it. The Stop and Return to Automatic
+# buttons on the Manage Index tab write this value, so the mode you left the
+# app in is the mode it starts in.
 auto_index = true
 reindex_interval_minutes = 1440
 # Follow symbolic links during directory walks.

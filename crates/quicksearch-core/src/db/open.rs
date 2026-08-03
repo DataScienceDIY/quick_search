@@ -18,7 +18,8 @@ use std::path::Path;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use super::schema::{
-    effective_tokenizer, fts_create_sql, PRAGMAS_FAST, PRAGMAS_READONLY, SCHEMA_CURRENT,
+    effective_tokenizer, fts_create_sql, PRAGMAS_FAST, PRAGMAS_READONLY, PRAGMAS_WALK_READER,
+    SCHEMA_CURRENT,
 };
 use crate::security::IndexKey;
 
@@ -99,10 +100,34 @@ pub fn open_existing(db_path: &str, write: bool) -> Result<Connection, String> {
     open_existing_keyed(db_path, write, super::key::process_key().as_ref())
 }
 
+/// A read-only connection for one walk's row prefetcher.
+///
+/// Identical to `open_existing(_, false)` except for the pragma profile: see
+/// [`PRAGMAS_WALK_READER`] for why these connections must not take the
+/// 40 MiB page cache the other profiles use.
+pub fn open_walk_reader(db_path: &str) -> Result<Connection, String> {
+    open_keyed_with_pragmas(
+        db_path,
+        false,
+        super::key::process_key().as_ref(),
+        PRAGMAS_WALK_READER,
+    )
+}
+
 pub(crate) fn open_existing_keyed(
     db_path: &str,
     write: bool,
     key: Option<&IndexKey>,
+) -> Result<Connection, String> {
+    let pragmas = if write { PRAGMAS_FAST } else { PRAGMAS_READONLY };
+    open_keyed_with_pragmas(db_path, write, key, pragmas)
+}
+
+fn open_keyed_with_pragmas(
+    db_path: &str,
+    write: bool,
+    key: Option<&IndexKey>,
+    pragmas: &str,
 ) -> Result<Connection, String> {
     let flags = OpenFlags::SQLITE_OPEN_NO_MUTEX
         | if write {
@@ -113,7 +138,6 @@ pub(crate) fn open_existing_keyed(
     let conn = Connection::open_with_flags(db_path, flags)
         .map_err(|e| format!("Failed to open database at {}: {}", db_path, e))?;
     key_and_probe(&conn, db_path, key)?;
-    let pragmas = if write { PRAGMAS_FAST } else { PRAGMAS_READONLY };
     conn.execute_batch(pragmas)
         .map_err(|e| format!("Failed to apply pragmas: {}", e))?;
 

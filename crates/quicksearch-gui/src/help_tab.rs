@@ -12,7 +12,7 @@ pub fn ui(ui: &mut egui::Ui) {
             // would otherwise stretch every paragraph into one long line.
             ui.set_max_width(620.0);
 
-            ui.heading("Welcome to QuickSearch");
+            ui.heading(egui::RichText::new("Welcome to QuickSearch").strong());
             ui.add_space(4.0);
             ui.label(
                 "QuickSearch keeps an index of the folders you choose and finds \
@@ -20,7 +20,7 @@ pub fn ui(ui: &mut egui::Ui) {
             );
 
             ui.add_space(12.0);
-            ui.heading("Getting started");
+            ui.heading(egui::RichText::new("Getting started").strong());
             ui.add_space(4.0);
             ui.label(
                 "1.  The first time QuickSearch runs it starts indexing your home \
@@ -38,7 +38,7 @@ pub fn ui(ui: &mut egui::Ui) {
             );
 
             ui.add_space(12.0);
-            ui.heading("Searching");
+            ui.heading(egui::RichText::new("Searching").strong());
             ui.add_space(4.0);
             ui.label("Plain words match file names, file contents, and paths:");
             ui.monospace("quarterly budget");
@@ -47,9 +47,7 @@ pub fn ui(ui: &mut egui::Ui) {
                  words:",
             );
             ui.monospace("type:Document modified:>=2024-01-01 report");
-            ui.label(
-                "The ? button next to the search box shows the full query syntax.",
-            );
+            ui.label("The ? button next to the search box shows the full query syntax.");
             ui.add_space(6.0);
             ui.label(
                 "•  Tick Fuzzy to also find matches with typos in them, at some \
@@ -69,7 +67,7 @@ pub fn ui(ui: &mut egui::Ui) {
             );
 
             ui.add_space(12.0);
-            ui.heading("The other tabs");
+            ui.heading(egui::RichText::new("The other tabs").strong());
             ui.add_space(4.0);
             egui::Grid::new("help-tabs")
                 .num_columns(2)
@@ -86,7 +84,11 @@ pub fn ui(ui: &mut egui::Ui) {
                         "indexing status and controls, the indexed folder list, \
                          and the filters that decide what is skipped",
                     );
-                    row(ui, "Duplicates", "files whose contents are identical, grouped");
+                    row(
+                        ui,
+                        "Duplicates",
+                        "files whose contents are identical, grouped",
+                    );
                     row(
                         ui,
                         "Logs",
@@ -97,7 +99,7 @@ pub fn ui(ui: &mut egui::Ui) {
                 });
 
             ui.add_space(12.0);
-            ui.heading("Terminal");
+            ui.heading(egui::RichText::new("Terminal").strong());
             ui.add_space(4.0);
             ui.label("QuickSearch also searches straight from a terminal:");
             ui.monospace("quicksearch \"quarterly budget\"");

@@ -30,7 +30,6 @@
 //! Both modes report files/sec. Run each twice: the first pass warms the page
 //! cache (or, on a share, the client's attribute cache), so the second is the
 //! one to compare.
-use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, UNIX_EPOCH};
@@ -38,22 +37,30 @@ use std::time::{Instant, UNIX_EPOCH};
 use quicksearch_core::config::{Config, IgnoreSet};
 use quicksearch_core::extract::Registry;
 use quicksearch_core::file_handling::{
-    classify_for_indexing, filtered_walk, prepare_file_record, ExistingFileEntry, FileIndexAction,
+    classify_for_indexing, filtered_walk, prepare_file_record, DirRows, FileIndexAction,
     UnreadableDirs,
 };
-use quicksearch_core::walk::walk_indexable_files;
+use quicksearch_core::walk::{walk_indexable_files, WalkEvent};
 
 fn main() {
     let root = std::env::args().nth(1).unwrap();
     let mode = std::env::args().nth(2).unwrap_or_else(|| "parallel".into());
     let config = Config::default();
-    let existing: HashMap<String, ExistingFileEntry> = HashMap::new();
+    // Phase 1 in isolation: an empty index, so every file classifies as new.
+    // The parallel walker reads its classification data from a database now,
+    // so it gets a scratch one rather than an empty map.
+    let db = std::env::temp_dir().join(format!("quicksearch-walkprobe-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&db);
+    quicksearch_core::db::open_or_recreate(db.to_str().unwrap(), &config.processing.tokenize)
+        .expect("scratch index");
+    let existing = DirRows::new();
 
     let start = Instant::now();
     let (seen, prepared) = match mode.as_str() {
         "serial" => serial(&root, &config, &existing),
-        _ => parallel(&root, &config, existing),
+        _ => parallel(&root, &config, db.to_str().unwrap()),
     };
+    let _ = std::fs::remove_file(&db);
     let elapsed = start.elapsed();
 
     eprintln!(
@@ -63,11 +70,7 @@ fn main() {
     );
 }
 
-fn serial(
-    root: &str,
-    config: &Config,
-    existing: &HashMap<String, ExistingFileEntry>,
-) -> (usize, usize) {
+fn serial(root: &str, config: &Config, existing: &DirRows) -> (usize, usize) {
     let ignore = IgnoreSet::compile(&[]).unwrap();
     let registry = Registry::default_set();
     let (mut seen, mut prepared) = (0, 0);
@@ -90,7 +93,13 @@ fn serial(
         else {
             continue;
         };
-        if classify_for_indexing(&path, mtime, existing) != FileIndexAction::Skip
+        // Keyed by name within its directory, as the real walk now is; with
+        // an empty index the answer is Insert either way.
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if classify_for_indexing(&name, mtime, existing) != FileIndexAction::Skip
             && prepare_file_record(&path, &meta, config, &registry).is_some()
         {
             prepared += 1;
@@ -99,24 +108,21 @@ fn serial(
     (seen, prepared)
 }
 
-fn parallel(
-    root: &str,
-    config: &Config,
-    existing: HashMap<String, ExistingFileEntry>,
-) -> (usize, usize) {
+fn parallel(root: &str, config: &Config, db_path: &str) -> (usize, usize) {
     let (mut seen, mut prepared) = (0, 0);
-    for file in walk_indexable_files(
+    for event in walk_indexable_files(
         &[root.to_string()],
         false,
         false,
         IgnoreSet::compile(&[]).unwrap(),
-        Arc::new(existing),
+        db_path,
         config.clone(),
         Arc::new(Registry::default_set()),
         Arc::new(Mutex::new(false)),
         Arc::new(AtomicBool::new(false)),
         4,
     ) {
+        let WalkEvent::File(file) = event else { continue };
         seen += 1;
         if file.record.is_some() {
             prepared += 1;

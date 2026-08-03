@@ -2,6 +2,7 @@
 //! window and the Manage Index tab. Edits happen on a draft; Apply
 //! validates, saves, and hands the new config to the app.
 
+use crate::keychain;
 use quicksearch_core::config::Config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +36,10 @@ pub struct OptionsOutput {
 pub struct OptionsWindow {
     pub open: bool,
     draft: Option<Config>,
+    /// Cached answer from [`OptionsWindow::keychain_active`], with the
+    /// `use_keychain` preference it was probed under.
+    keychain_probed_for: Option<bool>,
+    keychain_active: bool,
 }
 
 impl OptionsWindow {
@@ -42,12 +47,31 @@ impl OptionsWindow {
         OptionsWindow {
             open: false,
             draft: None,
+            keychain_probed_for: None,
+            keychain_active: false,
         }
     }
 
     pub fn open_with(&mut self, current: &Config) {
         self.open = true;
         self.draft = Some(current.clone());
+        self.keychain_probed_for = None;
+    }
+
+    /// True when this index's key really is in the OS keychain: the
+    /// preference is on *and* the keychain answers with an entry (a dead
+    /// daemon, a locked keyring or a denied prompt all read as "no", which
+    /// is exactly when the startup prompt still appears). Probed when the
+    /// window opens and whenever the preference changes — a keychain read
+    /// is an IPC round trip, far too costly to repeat every frame.
+    fn keychain_active(&mut self, current: &Config) -> bool {
+        if self.keychain_probed_for != Some(current.security.use_keychain) {
+            let db_path = current.resolved_database_path();
+            self.keychain_active = current.security.use_keychain
+                && matches!(keychain::load_key(&db_path.to_string_lossy()), Ok(Some(_)));
+            self.keychain_probed_for = Some(current.security.use_keychain);
+        }
+        self.keychain_active
     }
 
     /// Render; reports an applied draft config and/or a security action.
@@ -61,6 +85,7 @@ impl OptionsWindow {
         }
         let mut out = OptionsOutput::default();
         let mut open = self.open;
+        let keychain_active = self.keychain_active(current);
         let draft = self.draft.as_mut().unwrap();
 
         egui::Window::new("Options")
@@ -68,8 +93,8 @@ impl OptionsWindow {
             .resizable(false)
             .default_width(420.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
-                    ui.heading("Paths");
+                let scroll = egui::ScrollArea::vertical().max_height(480.0).show(ui, |ui| {
+                    ui.heading(egui::RichText::new("Paths").strong());
                     egui::Grid::new("opt-paths").num_columns(2).show(ui, |ui| {
                         ui.label("Database file");
                         ui.add(
@@ -87,19 +112,27 @@ impl OptionsWindow {
                     );
                     ui.separator();
 
-                    ui.heading("Indexing");
+                    ui.heading(egui::RichText::new("Indexing").strong());
                     config_editor_ui(ui, draft, Section::Indexing);
+                    ui.label(
+                        egui::RichText::new(
+                            "Automatic and manual indexing are switched on the \
+                             Manage Index tab.",
+                        )
+                        .small()
+                        .weak(),
+                    );
                     ui.separator();
 
-                    ui.heading("Processing");
+                    ui.heading(egui::RichText::new("Processing").strong());
                     config_editor_ui(ui, draft, Section::Processing);
                     ui.separator();
 
-                    ui.heading("Search");
+                    ui.heading(egui::RichText::new("Search").strong());
                     config_editor_ui(ui, draft, Section::Search);
                     ui.separator();
 
-                    ui.heading("Interface");
+                    ui.heading(egui::RichText::new("Interface").strong());
                     egui::Grid::new("opt-ui").num_columns(2).show(ui, |ui| {
                         ui.label("UI scale");
                         ui.add(
@@ -120,9 +153,10 @@ impl OptionsWindow {
                     // action opens its own confirmation flow immediately.
                     // The KDF salt is deliberately never shown here (or
                     // anywhere else in the GUI).
-                    ui.heading("Security");
-                    out.security = security_ui(ui, current);
+                    ui.heading(egui::RichText::new("Security").strong());
+                    out.security = security_ui(ui, current, keychain_active);
                 });
+                crate::ui_util::more_below_hint(ui, &scroll);
 
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -149,10 +183,21 @@ impl OptionsWindow {
 }
 
 /// The Security block: status plus action buttons. Never renders the salt.
-fn security_ui(ui: &mut egui::Ui, current: &Config) -> Option<SecurityAction> {
+fn security_ui(
+    ui: &mut egui::Ui,
+    current: &Config,
+    keychain_active: bool,
+) -> Option<SecurityAction> {
     let mut action = None;
     if current.security.password_protected {
-        ui.label("The index is encrypted; a password is asked for at startup.");
+        if keychain_active {
+            ui.label(
+                "The index is encrypted; its password is securely stored by \
+                 your Operating System.",
+            );
+        } else {
+            ui.label("The index is encrypted; a password is required at startup.");
+        }
         ui.horizontal(|ui| {
             if ui.button("Change password…").clicked() {
                 action = Some(SecurityAction::ChangePassword);
@@ -195,10 +240,10 @@ pub fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section
     match section {
         Section::Indexing => {
             egui::Grid::new("cfg-indexing").num_columns(2).show(ui, |ui| {
-                ui.label("Automatic indexing");
-                ui.checkbox(&mut config.indexing.auto_index, "watchers + periodic reindex");
-                ui.end_row();
-
+                // Automatic vs manual is deliberately absent: it is live
+                // state, switched (and saved) by the Stop / Return to
+                // Automatic buttons on the Manage Index tab. A staged copy
+                // of it here would fight those buttons.
                 ui.label("Full reindex every");
                 ui.horizontal(|ui| {
                     ui.add(
