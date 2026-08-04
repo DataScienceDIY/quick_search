@@ -3190,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "quicksearch-core"
-version = "0.8.8"
+version = "0.9.0"
 dependencies = [
  "argon2",
  "chardetng",
@@ -3222,7 +3222,7 @@ dependencies = [
 
 [[package]]
 name = "quicksearch-gui"
-version = "0.8.8"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "eframe",
