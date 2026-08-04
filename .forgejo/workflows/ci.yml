@@ -47,15 +47,10 @@ jobs:
     runs-on: self-hosted
     container:
       image: catthehacker/ubuntu:act-22.04
-      # Jobs run as root, and root ignores permission bits: CAP_DAC_OVERRIDE and
-      # CAP_DAC_READ_SEARCH let uid 0 read a mode-000 file or directory anyway.
-      # Several tests build an unreadable directory with platform::deny_read and
-      # assert the walk reports it rather than reporting an empty directory - the
-      # distinction matters because an empty listing deletes index rows. Under
-      # root those tests see a perfectly readable tree and fail. Dropping the two
-      # DAC capabilities makes root obey the mode bits, which is exactly the
-      # environment the tests assume and get on a developer machine.
-      options: --cap-drop=DAC_OVERRIDE --cap-drop=DAC_READ_SEARCH
+      # A container-level `options: --cap-drop=...` was tried here first and did
+      # not take effect - the runner does not pass it through to the daemon that
+      # creates the job container. The capabilities are dropped inside the Test
+      # step instead, where nothing can ignore them.
     env:
       # crates/quicksearch-core/src/config.rs has a test that expects a home
       # directory and panics without one.
@@ -90,9 +85,11 @@ jobs:
           # winit and glutin dlopen the whole display stack, so there are no X11
           # or Wayland headers here either. The rest is what build-deb.sh checks
           # for before it will run.
+          # libcap2-bin provides capsh, which the Test step uses to drop the two
+          # DAC capabilities so root obeys permission bits.
           apt-get install -y --no-install-recommends \
             build-essential perl pkg-config \
-            binutils dpkg-dev desktop-file-utils gzip
+            binutils dpkg-dev desktop-file-utils gzip libcap2-bin
 
       - name: Trust the workspace
         # checkout writes as root into a directory git then considers dubiously
@@ -138,7 +135,20 @@ jobs:
         # Release mode is not a nicety: tests/encrypted.rs derives an Argon2id key
         # at m=64 MiB, t=3, which takes about half a second in release and minutes
         # in debug. tests/snippet_perf.rs self-skips without QSB_SNIPPET_PERF=1.
-        run: cargo test --release --locked --workspace
+        #
+        # capsh drops CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH from the bounding
+        # set before exec. Without that, uid 0 reads a mode-000 file or directory
+        # regardless of its permissions, and the tests that build one with
+        # platform::deny_read see a perfectly readable tree: they assert an
+        # unreadable directory is *reported* rather than looking empty, because an
+        # empty listing deletes index rows. Dropping from the bounding set is what
+        # makes it stick - a root process re-derives its permitted set from the
+        # bounding set on execve, so the test binaries cannot regain them.
+        run: |
+          echo "capabilities before: $(grep CapEff /proc/self/status | tr -d '\t')"
+          capsh --drop=cap_dac_override,cap_dac_read_search -- -c '
+            echo "capabilities in test shell: $(grep CapEff /proc/self/status | tr -d "\t")"
+            cargo test --release --locked --workspace'
 
       - name: Build the .deb
         # --no-build reuses the binaries from the Build step rather than
