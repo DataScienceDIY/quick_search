@@ -390,8 +390,11 @@ pagination: the table is virtualized, so a single scroll list capped at
   snippet_perf -- --nocapture`: snippet pipeline benchmark.
 - `.forgejo/workflows/ci.yml`: builds both platforms on every push to `master`
   and every pull request. To cut a release, bump `[workspace.package] version`
-  in `Cargo.toml`, run `cargo update -w` so the lockfile agrees (CI builds with
-  `--locked`), and push the commit on a branch named `Release...`. Once both
+  in `Cargo.toml` and push the commit on a branch named `Release...`; CI runs
+  `cargo update -w` first, so a lockfile still pinning the old member versions
+  is not something you have to remember. That only re-resolves the workspace
+  crates, so the `--locked` build after it still fails on a dependency added or
+  bumped without committing `Cargo.lock`. Once both
   build jobs are green, CI tags that commit `v<version>` and publishes a release
   with the `.deb`, a Linux tarball and a Windows zip attached; pushing a `v*`
   tag by hand does the same thing. The version is never taken from the branch

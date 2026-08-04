@@ -121,6 +121,16 @@ jobs:
           key: ${{ github.job }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ${{ github.job }}-cargo-
 
+      - name: Sync the lockfile to the workspace version
+        # Bumping [workspace.package] version leaves Cargo.lock pinning the old
+        # member versions, and --locked then refuses to build. `cargo update -w`
+        # re-resolves only the workspace members and leaves every third-party pin
+        # alone - it reports the others as "unchanged dependencies behind latest"
+        # rather than bumping them. So --locked below still catches the case that
+        # actually matters: a dependency added or bumped without committing the
+        # lockfile, which this cannot and should not paper over.
+        run: cargo update -w
+
       - name: Build
         run: cargo build --release --locked -p quicksearch-gui
 
@@ -230,6 +240,11 @@ jobs:
             target
           key: ${{ github.job }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ${{ github.job }}-cargo-
+
+      - name: Sync the lockfile to the workspace version
+        # Same reasoning as the linux job: workspace members only, third-party
+        # pins untouched, so --locked keeps its teeth.
+        run: cargo update -w
 
       - name: Build
         # rust-toolchain.toml already lists the target, so no `rustup target add`.
