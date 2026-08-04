@@ -63,8 +63,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use notify::{Config as NotifyConfig, ErrorKind as NotifyErrorKind, Event as NotifyEvent, EventKind,
-             RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
+use notify::{
+    Config as NotifyConfig, ErrorKind as NotifyErrorKind, Event as NotifyEvent, EventKind,
+    RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher,
+};
 
 use crate::config::IgnoreSet;
 use crate::file_handling::{filtered_dirs, UnreadableDirs};
@@ -89,7 +91,10 @@ pub enum FsEvent {
     /// Rename where both endpoints arrived in the same notify event. For
     /// split rename halves (From or To only) the watcher emits Remove/Create
     /// instead.
-    Rename { from: PathBuf, to: PathBuf },
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+    },
 }
 
 /// Sink callback. Called on the watcher thread; implementors should keep
@@ -110,11 +115,16 @@ pub struct WatchFilters {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatchError {
     /// The indexed roots hold more directories than the cap allows.
-    TooManyDirectories { dirs: usize, cap: usize },
+    TooManyDirectories {
+        dirs: usize,
+        cap: usize,
+    },
     /// The kernel refused a watch before our own cap was reached —
     /// `fs.inotify.max_user_watches` is lower than the cap, or other
     /// processes have consumed the shared budget.
-    KernelLimit { registered: usize },
+    KernelLimit {
+        registered: usize,
+    },
     Other(String),
 }
 
@@ -640,9 +650,7 @@ fn is_event_interesting(ctx: &LoopCtx, path: &Path) -> bool {
     if ctx.filters.ignore.matches_path(path) {
         return false;
     }
-    if !ctx.filters.include_hidden
-        && path_has_hidden_component_under(path, &ctx.roots)
-    {
+    if !ctx.filters.include_hidden && path_has_hidden_component_under(path, &ctx.roots) {
         return false;
     }
     true
@@ -661,8 +669,7 @@ fn handle_notify_event(
             // file out of an ignored directory into a watched one is a real
             // Create, and the reverse is a real Remove. `apply_fs_event`
             // re-checks each end, so passing the pair through is safe.
-            if !is_event_interesting(ctx, &ev.paths[0])
-                && !is_event_interesting(ctx, &ev.paths[1])
+            if !is_event_interesting(ctx, &ev.paths[0]) && !is_event_interesting(ctx, &ev.paths[1])
             {
                 return;
             }
@@ -705,19 +712,16 @@ fn handle_notify_event(
     }
 }
 
-fn enqueue(
-    throttle: &mut HashMap<PathBuf, DirThrottleEntry>,
-    path: PathBuf,
-    op: QueuedOp,
-) {
-    let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| path.clone());
-    let entry = throttle
-        .entry(dir)
-        .or_insert_with(|| DirThrottleEntry {
-            record_time: Instant::now(),
-            queue: HashMap::new(),
-            immediate: true,
-        });
+fn enqueue(throttle: &mut HashMap<PathBuf, DirThrottleEntry>, path: PathBuf, op: QueuedOp) {
+    let dir = path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| path.clone());
+    let entry = throttle.entry(dir).or_insert_with(|| DirThrottleEntry {
+        record_time: Instant::now(),
+        queue: HashMap::new(),
+        immediate: true,
+    });
     // Coalesce: Remove after Create → drop both. Modify after Modify → one Modify.
     match (op, entry.queue.get(&path).copied()) {
         (QueuedOp::Remove, Some(QueuedOp::Create)) => {
@@ -892,7 +896,11 @@ mod tests {
     fn flush_ready_respects_max_dirs_per_tick() {
         let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
         for i in 0..10 {
-            enqueue(&mut map, PathBuf::from(format!("/dir{}/a", i)), QueuedOp::Create);
+            enqueue(
+                &mut map,
+                PathBuf::from(format!("/dir{}/a", i)),
+                QueuedOp::Create,
+            );
         }
         let (sink, got) = sink_to_vec();
         let mut config = WatcherConfig::default();
@@ -942,8 +950,13 @@ mod tests {
         let dir = tmp_dir("e2e");
         let (sink, got) = sink_to_vec();
 
-        let mut w =
-            Watcher::start(std::iter::once(&dir), default_filters(), fast_config(), sink).unwrap();
+        let mut w = Watcher::start(
+            std::iter::once(&dir),
+            default_filters(),
+            fast_config(),
+            sink,
+        )
+        .unwrap();
 
         let f = dir.join("hello.txt");
         std::fs::write(&f, "hi").unwrap();
@@ -973,21 +986,28 @@ mod tests {
     #[test]
     fn ignored_and_hidden_dirs_are_not_registered() {
         let dir = tmp_dir("filter");
-        for sub in ["keep", "keep/nested", ".git", ".git/objects", "node_modules",
-                    "node_modules/pkg", ".hidden"] {
+        for sub in [
+            "keep",
+            "keep/nested",
+            ".git",
+            ".git/objects",
+            "node_modules",
+            "node_modules/pkg",
+            ".hidden",
+        ] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
 
-        let w =
-            Watcher::start(std::iter::once(&dir), default_filters(), fast_config(), sink_to_vec().0)
-                .unwrap();
+        let w = Watcher::start(
+            std::iter::once(&dir),
+            default_filters(),
+            fast_config(),
+            sink_to_vec().0,
+        )
+        .unwrap();
 
         // root + keep + keep/nested. The 4 ignored/hidden dirs cost nothing.
-        assert_eq!(
-            w.watched_dirs(),
-            3,
-            "expected root, keep, keep/nested only"
-        );
+        assert_eq!(w.watched_dirs(), 3, "expected root, keep, keep/nested only");
         drop(w);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1001,8 +1021,13 @@ mod tests {
             include_hidden: true,
             ..default_filters()
         };
-        let w = Watcher::start(std::iter::once(&dir), filters, fast_config(), sink_to_vec().0)
-            .unwrap();
+        let w = Watcher::start(
+            std::iter::once(&dir),
+            filters,
+            fast_config(),
+            sink_to_vec().0,
+        )
+        .unwrap();
 
         assert_eq!(w.watched_dirs(), 2, "root + .hidden");
         drop(w);
@@ -1022,8 +1047,13 @@ mod tests {
             max_watched_dirs: 2,
             ..fast_config()
         };
-        let err = Watcher::start(std::iter::once(&dir), default_filters(), config, sink_to_vec().0)
-            .unwrap_err();
+        let err = Watcher::start(
+            std::iter::once(&dir),
+            default_filters(),
+            config,
+            sink_to_vec().0,
+        )
+        .unwrap_err();
 
         assert_eq!(
             err,
@@ -1044,8 +1074,12 @@ mod tests {
         std::fs::create_dir_all(&locked).unwrap();
         crate::platform::deny_read(&locked).unwrap();
 
-        let started =
-            Watcher::start(std::iter::once(&dir), default_filters(), fast_config(), sink_to_vec().0);
+        let started = Watcher::start(
+            std::iter::once(&dir),
+            default_filters(),
+            fast_config(),
+            sink_to_vec().0,
+        );
         crate::platform::restore_read(&locked).ok();
         let w = started.expect("an unreadable directory must not fail the watcher");
 
@@ -1074,8 +1108,12 @@ mod tests {
             max_watched_dirs: 2,
             ..fast_config()
         };
-        let started =
-            Watcher::start(std::iter::once(&dir), default_filters(), config, sink_to_vec().0);
+        let started = Watcher::start(
+            std::iter::once(&dir),
+            default_filters(),
+            config,
+            sink_to_vec().0,
+        );
         crate::platform::restore_read(&locked).ok();
 
         // Whichever order the walk visits them in, the cap is what stops us.
@@ -1096,8 +1134,13 @@ mod tests {
             max_watched_dirs: 2,
             ..fast_config()
         };
-        let w = Watcher::start(std::iter::once(&dir), default_filters(), config, sink_to_vec().0)
-            .unwrap();
+        let w = Watcher::start(
+            std::iter::once(&dir),
+            default_filters(),
+            config,
+            sink_to_vec().0,
+        )
+        .unwrap();
         assert_eq!(w.watched_dirs(), 2);
         assert!(!w.is_degraded());
         drop(w);
@@ -1111,8 +1154,13 @@ mod tests {
     fn a_directory_created_after_start_is_watched() {
         let dir = tmp_dir("newdir");
         let (sink, got) = sink_to_vec();
-        let mut w =
-            Watcher::start(std::iter::once(&dir), default_filters(), fast_config(), sink).unwrap();
+        let mut w = Watcher::start(
+            std::iter::once(&dir),
+            default_filters(),
+            fast_config(),
+            sink,
+        )
+        .unwrap();
         assert_eq!(w.watched_dirs(), 1, "only the root to begin with");
 
         let sub = dir.join("later");
@@ -1220,9 +1268,13 @@ mod tests {
             max_watched_dirs: 2,
             ..fast_config()
         };
-        let mut w =
-            Watcher::start(std::iter::once(&dir), default_filters(), config, sink_to_vec().0)
-                .unwrap();
+        let mut w = Watcher::start(
+            std::iter::once(&dir),
+            default_filters(),
+            config,
+            sink_to_vec().0,
+        )
+        .unwrap();
         assert!(!w.is_degraded(), "one directory is under the cap of 2");
 
         // Two more directories: the first fits, the second cannot.

@@ -317,12 +317,7 @@ impl<'a> Cx<'a> {
     /// check covers both; content is fetched (and decompressed) only for
     /// rows whose path missed — bounded by the pass's hit count, not its
     /// scan count. Pass `text` when the pass already has the content.
-    fn regex_accepts(
-        &self,
-        file_id: i64,
-        path: &str,
-        text: Option<&str>,
-    ) -> Result<bool, String> {
+    fn regex_accepts(&self, file_id: i64, path: &str, text: Option<&str>) -> Result<bool, String> {
         let Some(re) = &self.query.regex else {
             return Ok(true);
         };
@@ -449,10 +444,8 @@ impl<'a> Cx<'a> {
             .map(|s| escape_like(s))
             .collect::<Vec<_>>()
             .join("%");
-        let params = self.params_with_filters(vec![rusqlite::types::Value::Text(format!(
-            "%{}%",
-            like
-        ))]);
+        let params =
+            self.params_with_filters(vec![rusqlite::types::Value::Text(format!("%{}%", like))]);
 
         let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
         let mut rows = stmt
@@ -509,7 +502,11 @@ impl<'a> Cx<'a> {
             // the matched span marked — the GUI renders it as [the field].
             let snip = snippet::Snippet {
                 ranges: vec![match_range],
-                window: if is_path_tier { path.clone() } else { name.clone() },
+                window: if is_path_tier {
+                    path.clone()
+                } else {
+                    name.clone()
+                },
                 truncated_start: false,
                 truncated_end: false,
             };
@@ -605,7 +602,9 @@ impl<'a> Cx<'a> {
             .query(rusqlite::params_from_iter(params))
             .map_err(|e| e.to_string())?;
 
-        let snippet_opts = snippet::Options { approx_chars: SNIPPET_WINDOW_CHARS };
+        let snippet_opts = snippet::Options {
+            approx_chars: SNIPPET_WINDOW_CHARS,
+        };
         let mut buf: Vec<SearchHit> = Vec::new();
         let mut overflowed = false;
         let mut clock = FlushClock::new();
@@ -620,9 +619,9 @@ impl<'a> Cx<'a> {
                 continue;
             }
             let blob: Option<Vec<u8>> = row.get(5).map_err(|e| e.to_string())?;
-            let text = blob.and_then(|b| zstd::decode_all(b.as_slice()).ok()).map(
-                |raw| String::from_utf8_lossy(&raw).into_owned(),
-            );
+            let text = blob
+                .and_then(|b| zstd::decode_all(b.as_slice()).ok())
+                .map(|raw| String::from_utf8_lossy(&raw).into_owned());
 
             let (rank, stage, snip) = match &text {
                 Some(text) => {
@@ -761,9 +760,7 @@ impl<'a> Cx<'a> {
                 None if with_paths => {
                     let folded_path = path.to_ascii_lowercase();
                     match bitap.best_distance_and_first(folded_path.as_bytes()) {
-                        Some((distance, range)) => {
-                            (11.0 + 0.1 * distance as f64, &path, range)
-                        }
+                        Some((distance, range)) => (11.0 + 0.1 * distance as f64, &path, range),
                         None => continue,
                     }
                 }
@@ -842,7 +839,9 @@ impl<'a> Cx<'a> {
             .query(rusqlite::params_from_iter(params))
             .map_err(|e| e.to_string())?;
 
-        let snippet_opts = snippet::Options { approx_chars: SNIPPET_WINDOW_CHARS };
+        let snippet_opts = snippet::Options {
+            approx_chars: SNIPPET_WINDOW_CHARS,
+        };
         let mut buf: Vec<SearchHit> = Vec::new();
         let mut overflowed = false;
         let mut clock = FlushClock::new();
@@ -940,7 +939,11 @@ impl<'a> Cx<'a> {
             };
             let snip = snippet::Snippet {
                 ranges: vec![match_range],
-                window: if is_path_tier { path.clone() } else { name.clone() },
+                window: if is_path_tier {
+                    path.clone()
+                } else {
+                    name.clone()
+                },
                 truncated_start: false,
                 truncated_end: false,
             };
@@ -990,7 +993,9 @@ impl<'a> Cx<'a> {
             .query(rusqlite::params_from_iter(params))
             .map_err(|e| e.to_string())?;
 
-        let snippet_opts = snippet::Options { approx_chars: SNIPPET_WINDOW_CHARS };
+        let snippet_opts = snippet::Options {
+            approx_chars: SNIPPET_WINDOW_CHARS,
+        };
         let mut buf: Vec<SearchHit> = Vec::new();
         let mut overflowed = false;
         let mut clock = FlushClock::new();

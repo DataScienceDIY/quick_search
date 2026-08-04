@@ -85,9 +85,7 @@ impl ManageTab {
         }
         // The config changed elsewhere (Options apply, a filter persisted
         // from the Search tab, the fuzzy toggle's direct save…).
-        let dirty = self.draft.as_ref() != Some(baseline)
-            || self.ext_filter_text != baseline.indexing.content_extensions.join("\n");
-        if !dirty {
+        if !self.is_dirty() {
             // Nothing staged, nothing to lose.
             return self.resync(config);
         }
@@ -98,6 +96,10 @@ impl ManageTab {
         let mut merged = config.clone();
         merged.paths.indexing_paths = draft.paths.indexing_paths;
         merged.indexing = draft.indexing;
+        // Live state, not a user edit: the mode buttons write `auto_index`
+        // straight to the config, and a stale copy frozen into the draft
+        // here would read as permanently dirty.
+        merged.indexing.auto_index = config.indexing.auto_index;
         merged.processing = draft.processing;
         for pat in &config.indexing.ignore_patterns {
             if !baseline.indexing.ignore_patterns.contains(pat)
@@ -114,6 +116,57 @@ impl ManageTab {
         self.ext_filter_text = config.indexing.content_extensions.join("\n");
         self.draft = Some(config.clone());
         self.baseline = Some(config.clone());
+    }
+
+    /// Whether the editors hold changes not yet applied.
+    ///
+    /// `security` and `indexing.auto_index` are neutralized before comparing
+    /// — they are live state the app pins on apply (`pin_live_fields`), not
+    /// user edits — and the extension text is compared parsed, so a trailing
+    /// newline never reads as dirty. False before the first sync.
+    pub fn is_dirty(&self) -> bool {
+        let (Some(draft), Some(baseline)) = (&self.draft, &self.baseline) else {
+            return false;
+        };
+        let mut d = draft.clone();
+        crate::app::pin_live_fields(&mut d, baseline);
+        d != *baseline
+            || parse_lines(&self.ext_filter_text)
+                != parse_lines(&baseline.indexing.content_extensions.join("\n"))
+    }
+
+    /// The Apply & Save action, callable from the app's unsaved-changes
+    /// modal as well as the button. Syncs against `live` first — the same
+    /// merge the per-frame sync does — so a config applied elsewhere moments
+    /// ago is not reverted. Does NOT clear `baseline`: the app calls
+    /// [`ManageTab::mark_applied`] only after the apply succeeds, so a
+    /// rejected apply (nested roots) keeps the staged edits.
+    pub fn take_apply_config(&mut self, live: &Config) -> Option<Config> {
+        self.sync_editors(live);
+        let draft = self.draft.as_ref()?;
+        let mut new_config = draft.clone();
+        new_config.indexing.content_extensions = parse_lines(&self.ext_filter_text);
+        let roots = new_config.paths.indexing_paths.clone();
+        new_config
+            .indexing
+            .root_workers
+            .retain(|root, _| roots.contains(root));
+        Some(new_config)
+    }
+
+    /// The last apply landed: resync from the applied config next frame.
+    pub fn mark_applied(&mut self) {
+        self.baseline = None;
+    }
+
+    /// Drop every staged edit and editor box; the next frame resyncs from
+    /// the live config.
+    pub fn discard(&mut self) {
+        self.draft = None;
+        self.baseline = None;
+        self.new_root.clear();
+        self.new_ignore.clear();
+        self.root_error = None;
     }
 
     pub fn ui(
@@ -373,6 +426,7 @@ impl ManageTab {
                             self.new_ignore.clear();
                         }
                     });
+                    crate::ui_util::pattern_hint_label(&mut cols[1], &self.new_ignore);
                     cols[1].label(
                         egui::RichText::new(
                             "Changes apply on Apply & Save (may trigger index rebuild).",
@@ -396,23 +450,33 @@ impl ManageTab {
                 );
                 ui.add_space(8.0);
 
-                let apply = ui.add(crate::ui_util::bordered_button(
-                    "Apply & Save",
-                    crate::ui_util::BLUE,
-                ));
-                #[cfg(test)]
-                tests::record_widget("apply", &apply);
-                if apply.clicked() {
-                    let mut new_config = draft.clone();
-                    new_config.indexing.content_extensions = parse_lines(&self.ext_filter_text);
-                    let roots = new_config.paths.indexing_paths.clone();
-                    new_config
-                        .indexing
-                        .root_workers
-                        .retain(|root, _| roots.contains(root));
-                    actions.apply_config = Some(new_config);
-                    self.baseline = None;
-                }
+                let dirty = self.is_dirty();
+                ui.horizontal(|ui| {
+                    let apply = ui.add(crate::ui_util::bordered_button(
+                        "Apply & Save",
+                        if dirty {
+                            crate::ui_util::ORANGE
+                        } else {
+                            crate::ui_util::BLUE
+                        },
+                    ));
+                    #[cfg(test)]
+                    tests::record_widget("apply", &apply);
+                    // The label comes and goes with the dirty state; keep it
+                    // off the ids of whatever sits after it.
+                    crate::ui_util::stable_section(ui, |ui| {
+                        if dirty {
+                            ui.label(
+                                egui::RichText::new("Unsaved changes")
+                                    .small()
+                                    .color(crate::ui_util::ORANGE),
+                            );
+                        }
+                    });
+                    if apply.clicked() {
+                        actions.apply_config = self.take_apply_config(config);
+                    }
+                });
             });
         crate::ui_util::more_below_hint(ui, &scroll);
 
@@ -902,7 +966,13 @@ mod tests {
         let mut tab = ManageTab::new();
         let cfg = cfg_with_root();
 
-        frame(&ctx, &mut tab, &cfg, &running_state(&["/data"], None), vec![]);
+        frame(
+            &ctx,
+            &mut tab,
+            &cfg,
+            &running_state(&["/data"], None),
+            vec![],
+        );
         let (baseline, _) = widget("workers");
 
         for state in [
@@ -935,7 +1005,13 @@ mod tests {
         let mut tab = ManageTab::new();
         let cfg = cfg_with_root();
 
-        frame(&ctx, &mut tab, &cfg, &running_state(&["/data"], None), vec![]);
+        frame(
+            &ctx,
+            &mut tab,
+            &cfg,
+            &running_state(&["/data"], None),
+            vec![],
+        );
         let field = widget("workers").1.center();
         frame(
             &ctx,
@@ -962,7 +1038,9 @@ mod tests {
             // egui fires a click on release; give it the follow-up frame.
             actions = frame(&ctx, &mut tab, &cfg, &busy, vec![]);
         }
-        let applied = actions.apply_config.expect("Apply & Save produced a config");
+        let applied = actions
+            .apply_config
+            .expect("Apply & Save produced a config");
         assert_eq!(applied.indexing.root_workers.get("/data"), Some(&8));
     }
 
@@ -1368,5 +1446,146 @@ mod tests {
             .filter(|p| p.as_str() == "*.log")
             .count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_fresh_tab_is_not_dirty_before_or_after_its_first_sync() {
+        let mut tab = ManageTab::new();
+        assert!(!tab.is_dirty(), "no draft yet");
+        tab.sync_editors(&cfg_with_root());
+        assert!(!tab.is_dirty(), "a fresh sync stages nothing");
+    }
+
+    #[test]
+    fn a_staged_edit_reads_dirty_and_discard_reverts_it() {
+        let cfg = cfg_with_root();
+        let mut tab = synced_tab(&cfg);
+        tab.draft
+            .as_mut()
+            .unwrap()
+            .indexing
+            .ignore_patterns
+            .push("*.jpg".into());
+        tab.new_ignore = "half-typ".into();
+        tab.root_error = Some("bad".into());
+        assert!(tab.is_dirty());
+
+        tab.discard();
+        assert!(!tab.is_dirty());
+        assert!(tab.new_ignore.is_empty(), "scratch boxes are cleared too");
+        assert!(tab.root_error.is_none());
+        tab.sync_editors(&cfg);
+        assert_eq!(tab.draft.as_ref(), Some(&cfg), "resynced from live");
+        assert!(!tab.is_dirty());
+    }
+
+    /// `parse_lines` drops blank lines and trims entries, so cosmetic
+    /// whitespace in the extension editor must not read as an edit.
+    #[test]
+    fn a_trailing_newline_in_the_extension_editor_is_not_dirty() {
+        let mut cfg = cfg_with_root();
+        cfg.indexing.content_extensions = vec!["txt".into(), "md".into()];
+        let mut tab = synced_tab(&cfg);
+        tab.ext_filter_text.push('\n');
+        assert!(!tab.is_dirty(), "a blank line is not an edit");
+        tab.ext_filter_text.push_str("pdf");
+        assert!(tab.is_dirty(), "a real entry is");
+    }
+
+    /// The mode buttons write `auto_index` straight to the live config. A
+    /// stale copy frozen into a staged draft used to read as permanently
+    /// dirty — and applying it would have reverted the stop.
+    #[test]
+    fn a_live_mode_flip_does_not_read_as_dirty() {
+        let mut cfg = cfg_with_root();
+        cfg.indexing.auto_index = true;
+        let mut tab = synced_tab(&cfg);
+
+        // Stop clicked, nothing staged: the tab resyncs and stays clean.
+        let mut stopped = cfg.clone();
+        stopped.indexing.auto_index = false;
+        tab.sync_editors(&stopped);
+        assert!(!tab.is_dirty());
+
+        // Staged edit, then Return to Automatic: dirty because of the edit
+        // only, and the draft adopts the live mode.
+        tab.draft
+            .as_mut()
+            .unwrap()
+            .indexing
+            .ignore_patterns
+            .push("*.jpg".into());
+        let mut auto_again = stopped.clone();
+        auto_again.indexing.auto_index = true;
+        tab.sync_editors(&auto_again);
+        assert!(tab.is_dirty(), "the staged pattern is still pending");
+        let applied = tab.take_apply_config(&auto_again).expect("a config");
+        assert!(
+            applied.indexing.auto_index,
+            "applying must not revert the live mode"
+        );
+
+        // Un-staging the edit reads clean again — not permanently dirty on
+        // a stale mode copy.
+        tab.draft.as_mut().unwrap().indexing.ignore_patterns.pop();
+        assert!(!tab.is_dirty());
+    }
+
+    /// `take_apply_config` must leave the editors intact: the app reports
+    /// back via `mark_applied` only when the apply landed, so a rejected
+    /// config (nested roots) keeps the user's staged edits on screen.
+    #[test]
+    fn a_rejected_apply_keeps_the_draft() {
+        let cfg = cfg_with_root();
+        let mut tab = synced_tab(&cfg);
+        tab.draft
+            .as_mut()
+            .unwrap()
+            .paths
+            .indexing_paths
+            .push("/data/nested".into());
+
+        let staged = tab.take_apply_config(&cfg).expect("a config to apply");
+        assert!(staged
+            .paths
+            .indexing_paths
+            .contains(&"/data/nested".to_string()));
+        assert!(tab.baseline.is_some(), "baseline survives the attempt");
+        assert!(tab.is_dirty(), "the staged root is still pending");
+
+        tab.mark_applied();
+        assert!(tab.baseline.is_none(), "a landed apply forces a resync");
+        assert!(!tab.is_dirty());
+    }
+
+    /// The dirty label sits after the Apply button inside a stable section:
+    /// its coming and going must never rename the button, which egui hangs
+    /// interaction state off.
+    #[test]
+    fn the_unsaved_label_appears_without_renaming_the_apply_button() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let cfg = cfg_with_root();
+
+        let clean = frame_text_with(&ctx, &mut tab, &cfg, &idle_state());
+        assert!(
+            !clean.iter().any(|t| t.contains("Unsaved changes")),
+            "a clean tab must not claim unsaved changes"
+        );
+        let (clean_id, _) = widget("apply");
+
+        tab.draft
+            .as_mut()
+            .unwrap()
+            .indexing
+            .ignore_patterns
+            .push("*.jpg".into());
+        let dirty = frame_text_with(&ctx, &mut tab, &cfg, &idle_state());
+        assert!(
+            dirty.iter().any(|t| t.contains("Unsaved changes")),
+            "painted: {:?}",
+            dirty
+        );
+        assert_eq!(widget("apply").0, clean_id, "the label renamed the button");
     }
 }

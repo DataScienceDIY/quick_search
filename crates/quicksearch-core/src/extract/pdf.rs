@@ -76,7 +76,9 @@ impl Extractor for PdfExtractor {
                 if let Ok(info_id) = info_ref.as_reference() {
                     if let Ok(info) = doc.get_object(info_id) {
                         if let Ok(dict) = info.as_dict() {
-                            for key in ["Title", "Author", "Subject", "Keywords", "Creator", "Producer"] {
+                            for key in [
+                                "Title", "Author", "Subject", "Keywords", "Creator", "Producer",
+                            ] {
                                 if let Ok(val) = dict.get(key.as_bytes()) {
                                     if let Some(s) = object_to_string(val) {
                                         if !s.is_empty() {

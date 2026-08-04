@@ -58,9 +58,7 @@ pub fn find_duplicate_groups(
     }
 
     let mut member_stmt = conn
-        .prepare(
-            "SELECT id, name, path, size, mtime FROM files WHERE hash = ?1 ORDER BY path",
-        )
+        .prepare("SELECT id, name, path, size, mtime FROM files WHERE hash = ?1 ORDER BY path")
         .map_err(|e| e.to_string())?;
     for group in &mut groups {
         let rows = member_stmt

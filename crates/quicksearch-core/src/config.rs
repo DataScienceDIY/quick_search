@@ -253,9 +253,11 @@ impl SecurityConfig {
     /// around.
     pub fn salt_bytes(&self) -> Result<[u8; crate::security::SALT_LEN], String> {
         match &self.salt {
-            None => Err("password protection is enabled but the config has no salt; \
+            None => Err(
+                "password protection is enabled but the config has no salt; \
                          disable protection or set the password again"
-                .to_string()),
+                    .to_string(),
+            ),
             Some(hex) => crate::security::salt_from_hex(hex)
                 .map_err(|e| format!("invalid salt in config: {}", e)),
         }
@@ -457,10 +459,7 @@ impl Config {
     /// location), creating parent directories as needed. Raw values are
     /// written verbatim — relative paths in a portable config stay relative.
     pub fn save(&self) -> Result<(), String> {
-        let path = self
-            .source
-            .clone()
-            .unwrap_or_else(Self::config_path);
+        let path = self.source.clone().unwrap_or_else(Self::config_path);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)
                 .map_err(|e| format!("Failed to create config dir {}: {}", dir.display(), e))?;
@@ -566,8 +565,25 @@ impl IgnoreSet {
         let mut path = globset::GlobSetBuilder::new();
         for pat in patterns {
             // Trailing separators are how people naturally write directory
-            // patterns ("/tmp/"); paths compare without them, so strip.
-            let pat = pat.trim().trim_end_matches(['/', '\\']);
+            // patterns ("/tmp/"); paths compare without them, so strip —
+            // except a drive root ("D:\" or "D:/"), where the separator is
+            // the whole point: trimmed to "D:" it would become a component
+            // pattern that can never match. Drive roots keep a normalized
+            // "D:/" spelling, which the ancestor walk in
+            // `matches_path_pattern` does reach.
+            let raw = pat.trim();
+            let trimmed = raw.trim_end_matches(['/', '\\']);
+            let is_drive_root = raw.len() > trimmed.len()
+                && trimmed.len() == 2
+                && trimmed.as_bytes()[0].is_ascii_alphabetic()
+                && trimmed.as_bytes()[1] == b':';
+            let drive_root;
+            let pat: &str = if is_drive_root {
+                drive_root = format!("{}/", trimmed);
+                &drive_root
+            } else {
+                trimmed
+            };
             if pat.is_empty() {
                 continue;
             }
@@ -781,7 +797,11 @@ mod tests {
     fn partial_file_gets_section_defaults() {
         let dir = tmp_dir();
         let path = dir.join("config.toml");
-        fs::write(&path, "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n").unwrap();
+        fs::write(
+            &path,
+            "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n",
+        )
+        .unwrap();
         let cfg = Config::load_from(&path).unwrap();
         assert_eq!(cfg.paths.indexing_paths, vec!["/x".to_string()]);
         assert_eq!(cfg.processing.batch_size, 500, "missing sections default");
@@ -844,10 +864,16 @@ mod tests {
         cfg.indexing.content_extensions = vec!["txt".into(), ".MD".into()];
         assert!(content_allowed(Path::new("/a/b.txt"), &cfg));
         assert!(content_allowed(Path::new("/a/B.TXT"), &cfg));
-        assert!(content_allowed(Path::new("/a/readme.md"), &cfg), "leading dot + case in filter");
+        assert!(
+            content_allowed(Path::new("/a/readme.md"), &cfg),
+            "leading dot + case in filter"
+        );
         assert!(!content_allowed(Path::new("/a/b.pdf"), &cfg));
         assert!(!content_allowed(Path::new("/a/noext"), &cfg));
-        assert!(!content_allowed(Path::new("/a/.bashrc"), &cfg), "dot-only name has no ext");
+        assert!(
+            !content_allowed(Path::new("/a/.bashrc"), &cfg),
+            "dot-only name has no ext"
+        );
     }
 
     #[test]
@@ -855,9 +881,18 @@ mod tests {
         let mut cfg = Config::default();
         cfg.indexing.content_extensions = vec!["txt".into(), "  (NonE)  ".into()];
         assert!(content_allowed(Path::new("/a/Makefile"), &cfg));
-        assert!(content_allowed(Path::new("/a/.bashrc"), &cfg), "dot-only name");
-        assert!(content_allowed(Path::new("/a/b.txt"), &cfg), "real extensions still work");
-        assert!(!content_allowed(Path::new("/a/b.pdf"), &cfg), "sentinel is not a wildcard");
+        assert!(
+            content_allowed(Path::new("/a/.bashrc"), &cfg),
+            "dot-only name"
+        );
+        assert!(
+            content_allowed(Path::new("/a/b.txt"), &cfg),
+            "real extensions still work"
+        );
+        assert!(
+            !content_allowed(Path::new("/a/b.pdf"), &cfg),
+            "sentinel is not a wildcard"
+        );
         // The sentinel is not itself an extension: a file literally named
         // `x.none` is not whitelisted by it.
         assert!(!content_allowed(Path::new("/a/x.none"), &cfg));
@@ -888,8 +923,14 @@ mod tests {
             "(none) # Makefile, LICENSE, ...".into(),
         ];
         assert!(content_allowed(Path::new("/a/b.rs"), &cfg));
-        assert!(content_allowed(Path::new("/a/b.md"), &cfg), "dot + trailing comment");
-        assert!(content_allowed(Path::new("/a/Makefile"), &cfg), "sentinel + comment");
+        assert!(
+            content_allowed(Path::new("/a/b.md"), &cfg),
+            "dot + trailing comment"
+        );
+        assert!(
+            content_allowed(Path::new("/a/Makefile"), &cfg),
+            "sentinel + comment"
+        );
         assert!(!content_allowed(Path::new("/a/b.pdf"), &cfg));
         // Comment text is not itself a filter entry.
         assert!(!content_allowed(Path::new("/a/b.rust"), &cfg));
@@ -950,10 +991,10 @@ mod tests {
     #[test]
     fn directory_patterns_with_trailing_slash() {
         let set = IgnoreSet::compile(&[
-            "/tmp/".to_string(),        // absolute dir, natural spelling
-            "cache/".to_string(),       // becomes a component pattern
-            "*/target/".to_string(),    // dir anywhere by suffix
-            "/".to_string(),            // degenerate: trims to nothing, skipped
+            "/tmp/".to_string(),     // absolute dir, natural spelling
+            "cache/".to_string(),    // becomes a component pattern
+            "*/target/".to_string(), // dir anywhere by suffix
+            "/".to_string(),         // degenerate: trims to nothing, skipped
         ])
         .unwrap();
         // The directory itself and everything beneath it.
@@ -966,6 +1007,41 @@ mod tests {
         assert!(set.matches_path(Path::new("/repo/sub/target/debug/app")));
         // A bare "/" must not ignore the universe.
         assert!(!set.matches_path(Path::new("/etc/passwd")));
+    }
+
+    /// A drive-root pattern must survive the trailing-separator trim as a
+    /// path pattern — trimmed to "D:" it would land in the component set,
+    /// where nothing is ever named "D:".
+    #[test]
+    fn drive_root_patterns_are_not_component_patterns() {
+        let set = IgnoreSet::compile(&[r"D:\".to_string(), "E:/".to_string()]).unwrap();
+        assert!(!set.matches_component("D:"));
+        assert!(!set.matches_component(r"D:\"));
+        assert!(!set.matches_component("E:"));
+    }
+
+    /// The full drive-root behavior needs Windows path semantics:
+    /// `Path::parent` only walks up to `D:\` there, and globset only folds
+    /// `\` to `/` where `\` is a separator.
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_pattern_ignores_the_whole_drive() {
+        let set = IgnoreSet::compile(&[r"D:\".to_string()]).unwrap();
+        assert!(set.matches_path(Path::new(r"D:\")));
+        assert!(set.matches_path(Path::new(r"D:\Users\x\file.txt")));
+        assert!(set.matches_path(Path::new(r"d:\case\folded.txt")));
+        assert!(!set.matches_path(Path::new(r"E:\file.txt")));
+    }
+
+    /// A bare "D:" (no separator) compiles but can only match a component
+    /// literally named "D:", which no file ever is. The GUI warns about
+    /// this shape; the compiler intentionally leaves it alone.
+    #[test]
+    fn bare_drive_letter_stays_a_component_pattern() {
+        let set = IgnoreSet::compile(&["D:".to_string()]).unwrap();
+        assert!(set.matches_component("D:"));
+        #[cfg(windows)]
+        assert!(!set.matches_path(Path::new(r"D:\file.txt")));
     }
 
     #[test]
@@ -987,7 +1063,10 @@ mod tests {
     #[test]
     fn ignore_matching_follows_platform_case_rules() {
         let set = IgnoreSet::compile(&["node_modules".to_string()]).unwrap();
-        assert!(set.matches_component("node_modules"), "exact always matches");
+        assert!(
+            set.matches_component("node_modules"),
+            "exact always matches"
+        );
 
         let folded = cfg!(any(windows, target_os = "macos"));
         assert_eq!(
@@ -1080,7 +1159,11 @@ mod tests {
         cfg.save().unwrap();
         let loaded = Config::load_from(&path).unwrap();
         assert_eq!(loaded.indexing.root_workers.get("/share"), Some(&24));
-        assert_eq!(loaded.indexing.root_workers.get("/data"), None, "absent = auto");
+        assert_eq!(
+            loaded.indexing.root_workers.get("/data"),
+            None,
+            "absent = auto"
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1305,11 +1388,17 @@ mod tests {
         let mut cfg = SearchConfig::default();
         for quiet in 0..=FUZZY_EDITS_WARN_ABOVE {
             cfg.fuzzy_max_edits = quiet;
-            assert!(cfg.fuzzy_edits_warning().is_none(), "{} should be quiet", quiet);
+            assert!(
+                cfg.fuzzy_edits_warning().is_none(),
+                "{} should be quiet",
+                quiet
+            );
         }
         for loud in [FUZZY_EDITS_WARN_ABOVE + 1, 8, usize::MAX] {
             cfg.fuzzy_max_edits = loud;
-            let msg = cfg.fuzzy_edits_warning().expect("warns above the threshold");
+            let msg = cfg
+                .fuzzy_edits_warning()
+                .expect("warns above the threshold");
             assert!(msg.contains(&loud.to_string()));
             assert!(msg.contains(&FUZZY_EDITS_WARN_ABOVE.to_string()));
         }

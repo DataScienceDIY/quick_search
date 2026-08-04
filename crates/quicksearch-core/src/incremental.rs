@@ -21,8 +21,8 @@ use crate::config::{Config, IgnoreSet};
 use crate::db::repo;
 use crate::extract::Registry;
 use crate::file_handling::{
-    db_key_for_missing_path, extract_and_store, filtered_walk, ExtractCursor, UnreadableDirs,
-    prepare_file_record_from_path, store_inline_text,
+    db_key_for_missing_path, extract_and_store, filtered_walk, prepare_file_record_from_path,
+    store_inline_text, ExtractCursor, UnreadableDirs,
 };
 use crate::platform::path_has_hidden_component_under;
 use crate::watcher::FsEvent;
@@ -154,7 +154,8 @@ fn upsert_file(
         )?;
     }
 
-    tx.commit().map_err(|e| format!("commit incremental tx: {}", e))
+    tx.commit()
+        .map_err(|e| format!("commit incremental tx: {}", e))
 }
 
 fn remove_path(conn: &mut Connection, path: &Path) -> Result<(), String> {
@@ -263,8 +264,14 @@ mod tests {
         }
 
         fn apply(&mut self, event: &FsEvent) {
-            apply_fs_event(&mut self.conn, event, &self.config, &self.ignore, &self.registry)
-                .unwrap();
+            apply_fs_event(
+                &mut self.conn,
+                event,
+                &self.config,
+                &self.ignore,
+                &self.registry,
+            )
+            .unwrap();
         }
 
         fn write(&self, name: &str, content: &str) -> std::path::PathBuf {

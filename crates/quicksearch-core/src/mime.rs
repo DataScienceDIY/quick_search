@@ -263,10 +263,9 @@ pub fn mime_to_type(mime: &str) -> FileType {
         // `text/*` (see `extract::plaintext::EXTRA_TEXT_MIMES` and the
         // cross-check test below). Keyed on the subtype alone, so playlists
         // stay AUDIO|TEXT and SVG stays IMAGE|TEXT.
-        "xml" | "json" | "json5" | "geo+json" | "javascript" | "mbox" | "rfc822"
-        | "vnd.dart" | "x-csh" | "x-httpd-php" | "x-perl" | "x-sh" | "x-sql"
-        | "x-subrip" | "x-tcl" | "x-tex" | "x-texinfo" | "x-troff" | "x-troff-man"
-        | "x-mpegurl" | "scpls" | "svg+xml" => {
+        "xml" | "json" | "json5" | "geo+json" | "javascript" | "mbox" | "rfc822" | "vnd.dart"
+        | "x-csh" | "x-httpd-php" | "x-perl" | "x-sh" | "x-sql" | "x-subrip" | "x-tcl"
+        | "x-tex" | "x-texinfo" | "x-troff" | "x-troff-man" | "x-mpegurl" | "scpls" | "svg+xml" => {
             t |= FileType::TEXT;
         }
         _ => {}
@@ -292,17 +291,14 @@ mod tests {
 
     #[test]
     fn docx_is_document_and_office() {
-        let t = mime_to_type(
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        );
+        let t =
+            mime_to_type("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
         assert!(t.contains(FileType::DOCUMENT));
     }
 
     #[test]
     fn xlsx_is_spreadsheet_and_document() {
-        let t = mime_to_type(
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        );
+        let t = mime_to_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
         assert!(t.contains(FileType::DOCUMENT));
         assert!(t.contains(FileType::SPREADSHEET));
     }
@@ -341,8 +337,17 @@ mod tests {
 
     #[test]
     fn from_name_round_trip() {
-        for n in ["Audio", "Image", "Video", "Document", "Text", "Archive",
-                  "Spreadsheet", "Presentation", "Folder"] {
+        for n in [
+            "Audio",
+            "Image",
+            "Video",
+            "Document",
+            "Text",
+            "Archive",
+            "Spreadsheet",
+            "Presentation",
+            "Folder",
+        ] {
             assert_ne!(FileType::from_name(n), FileType::EMPTY, "{}", n);
         }
         assert_eq!(FileType::from_name("Weird"), FileType::EMPTY);
@@ -435,7 +440,11 @@ mod tests {
         let head_bytes = crate::config::ProcessingConfig::default().hash_length;
 
         let samples: &[(&str, &[u8], &str)] = &[
-            ("png", &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a], "image/png"),
+            (
+                "png",
+                &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+                "image/png",
+            ),
             ("gif", b"GIF89a", "image/gif"),
             ("pdf", b"%PDF-1.7", "application/pdf"),
             ("zip", &[0x50, 0x4b, 0x03, 0x04], "application/zip"),
@@ -520,11 +529,16 @@ mod tests {
         ];
         for (name, head) in samples {
             let path = PathBuf::from(name);
-            let mime = guess_mime_from_head(&path, head)
-                .unwrap_or_else(|| panic!("{} has no MIME", name));
+            let mime =
+                guess_mime_from_head(&path, head).unwrap_or_else(|| panic!("{} has no MIME", name));
             let extracted = registry
                 .extract_complete_head(&path, &mime, head)
-                .unwrap_or_else(|| panic!("{} -> {} not claimed by a head-capable extractor", name, mime))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{} -> {} not claimed by a head-capable extractor",
+                        name, mime
+                    )
+                })
                 .unwrap_or_else(|e| panic!("{} -> {} failed to extract: {}", name, mime, e));
             assert!(
                 !extracted.text.is_empty(),
@@ -551,7 +565,10 @@ mod tests {
             Some("text/plain")
         );
         let blob = PathBuf::from("blob");
-        assert_eq!(guess_mime_from_head(&blob, &[0x00, 0x01, 0x02, 0xFF]).as_deref(), None);
+        assert_eq!(
+            guess_mime_from_head(&blob, &[0x00, 0x01, 0x02, 0xFF]).as_deref(),
+            None
+        );
     }
 
     /// Ambiguous extensions resolve by content in both directions: source
@@ -582,8 +599,11 @@ mod tests {
         );
 
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("go.mod"), b"module example.com/x\n\ngo 1.22\n")
-                .as_deref(),
+            guess_mime_from_head(
+                &PathBuf::from("go.mod"),
+                b"module example.com/x\n\ngo 1.22\n"
+            )
+            .as_deref(),
             Some("text/plain")
         );
 
@@ -607,8 +627,7 @@ mod tests {
             Some("text/plain")
         );
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("disk.vhd"), &[0x00, 0x01, 0x02, 0x03])
-                .as_deref(),
+            guess_mime_from_head(&PathBuf::from("disk.vhd"), &[0x00, 0x01, 0x02, 0x03]).as_deref(),
             Some("application/x-virtualbox-vhd")
         );
     }

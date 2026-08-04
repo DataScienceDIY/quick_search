@@ -203,8 +203,14 @@ mod tests {
 
     #[test]
     fn plain_trigram_gets_accent_stripping() {
-        assert_eq!(effective_tokenizer("trigram"), "trigram remove_diacritics 1");
-        assert_eq!(effective_tokenizer("  trigram  "), "trigram remove_diacritics 1");
+        assert_eq!(
+            effective_tokenizer("trigram"),
+            "trigram remove_diacritics 1"
+        );
+        assert_eq!(
+            effective_tokenizer("  trigram  "),
+            "trigram remove_diacritics 1"
+        );
     }
 
     #[test]

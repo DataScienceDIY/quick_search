@@ -88,7 +88,13 @@ impl WalkedFile {
     /// Seen, but with nothing to write. Distinct from not being emitted at
     /// all: the row stays.
     fn skipped(path: String, digest: u128, aliased: bool) -> Self {
-        WalkedFile { path, action: FileIndexAction::Skip, record: None, digest, aliased }
+        WalkedFile {
+            path,
+            action: FileIndexAction::Skip,
+            record: None,
+            digest,
+            aliased,
+        }
     }
 }
 
@@ -205,7 +211,10 @@ pub struct WorkerStats {
 
 impl WorkerStats {
     pub(crate) fn new(total: usize) -> Self {
-        WorkerStats { busy: Arc::new(AtomicUsize::new(0)), total }
+        WorkerStats {
+            busy: Arc::new(AtomicUsize::new(0)),
+            total,
+        }
     }
 
     /// Count the calling thread as busy until the returned guard drops.
@@ -243,7 +252,13 @@ impl Shared {
                 }
                 // The prefetcher may have been parked behind PREFETCH_AHEAD.
                 self.idle.notify_all();
-                return Some((job, ActiveJob { shared: self, finished: false }));
+                return Some((
+                    job,
+                    ActiveJob {
+                        shared: self,
+                        finished: false,
+                    },
+                ));
             }
             // Nothing runnable. Only "nobody anywhere holds work" proves the
             // walk is over — a directory sitting in the prefetch stage still
@@ -452,8 +467,7 @@ fn read_directory(
         // `entry.metadata()` is only consulted on Windows, where it is free —
         // the attributes came back with the directory read. On Unix the
         // closure is never called, so this stays at zero extra syscalls.
-        if !ctx.include_hidden
-            && crate::platform::entry_is_hidden(&name, || entry.metadata().ok())
+        if !ctx.include_hidden && crate::platform::entry_is_hidden(&name, || entry.metadata().ok())
         {
             continue;
         }
@@ -492,7 +506,15 @@ fn read_directory(
                 // Resolve aliases where they are found. The target's canonical
                 // path is what the index stores, and pushing only canonical
                 // directories is what keeps `seen_dirs` able to break cycles.
+                //
+                // Normalized like the roots (walk_parallel), or on Windows the
+                // target keeps `canonicalize`'s `\\?\` prefix: every path below
+                // it would be spelled differently from the plainly-spelled
+                // roots, so full-path ignore patterns would never match under a
+                // followed junction and `seen_dirs` could not dedup against an
+                // overlapping root.
                 if let Ok(target) = path.canonicalize() {
+                    let target = PathBuf::from(path_to_db_string(&target));
                     match fs::metadata(&target) {
                         Ok(m) if m.is_dir() => found.push(Found::Dir(target)),
                         // The row for a resolved target belongs to the
@@ -611,7 +633,13 @@ fn prepare(path: PathBuf, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
         _ => prepare_file_record(&db_path, &meta, &ctx.config, &ctx.registry),
     };
 
-    WalkedFile { path: db_path, action, record, digest, aliased }
+    WalkedFile {
+        path: db_path,
+        action,
+        record,
+        digest,
+        aliased,
+    }
 }
 
 fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
@@ -635,7 +663,10 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
             Job::Files(files, rows) => (files, rows),
             Job::Alias(path, stored) => {
                 slot.finish(found);
-                if tx.send(WalkEvent::File(prepare(path, Known::Exact(stored), ctx))).is_err() {
+                if tx
+                    .send(WalkEvent::File(prepare(path, Known::Exact(stored), ctx)))
+                    .is_err()
+                {
                     shared.shutdown();
                     return;
                 }
@@ -658,7 +689,10 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
                 shared.shutdown();
                 return;
             }
-            if tx.send(WalkEvent::File(prepare(path, Known::InDir(&rows), ctx))).is_err() {
+            if tx
+                .send(WalkEvent::File(prepare(path, Known::InDir(&rows), ctx)))
+                .is_err()
+            {
                 // Receiver gone: the run was stopped or failed. Not an error.
                 shared.shutdown();
                 return;
@@ -940,7 +974,13 @@ pub fn walk_indexable_files(
         })
     };
 
-    ParallelWalk { rx: Some(rx), handles, prefetch: Some(prefetch), shared, ctx }
+    ParallelWalk {
+        rx: Some(rx),
+        handles,
+        prefetch: Some(prefetch),
+        shared,
+        ctx,
+    }
 }
 
 /// Pick a worker count for these roots.
@@ -1072,7 +1112,13 @@ mod tests {
     fn names(files: &[WalkedFile]) -> Vec<String> {
         let mut n: Vec<String> = files
             .iter()
-            .map(|f| Path::new(&f.path).file_name().unwrap().to_string_lossy().into_owned())
+            .map(|f| {
+                Path::new(&f.path)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .collect();
         n.sort();
         n
@@ -1124,7 +1170,10 @@ mod tests {
 
         let skipped = files.iter().find(|f| f.record.is_none()).unwrap();
         assert!(matches!(skipped.action, FileIndexAction::Skip));
-        assert!(skipped.path.contains('\u{FFFD}'), "stored spelling is the lossy one");
+        assert!(
+            skipped.path.contains('\u{FFFD}'),
+            "stored spelling is the lossy one"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -1173,7 +1222,11 @@ mod tests {
             .collect();
 
         let second = walk(&root, &db_with("skip-second", &indexed));
-        assert_eq!(second.len(), 2, "unchanged files are still reported as seen");
+        assert_eq!(
+            second.len(),
+            2,
+            "unchanged files are still reported as seen"
+        );
         for f in &second {
             assert_eq!(f.action, FileIndexAction::Skip);
             assert!(f.record.is_none(), "an unchanged file is never hashed");
@@ -1237,7 +1290,9 @@ mod tests {
                 })
                 .collect();
             let recorded = !w.unreadable().is_empty();
-            let covers = w.unreadable().covers(locked.join("inside.txt").to_str().unwrap());
+            let covers = w
+                .unreadable()
+                .covers(locked.join("inside.txt").to_str().unwrap());
 
             fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).ok();
 
@@ -1278,18 +1333,19 @@ mod tests {
         let root = tmp_tree("symlink-file");
         touch(&root.join("real/target.txt"));
         fs::create_dir_all(root.join("links")).unwrap();
-        std::os::unix::fs::symlink(
-            root.join("real/target.txt"),
-            root.join("links/alias.txt"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(root.join("real/target.txt"), root.join("links/alias.txt"))
+            .unwrap();
 
         let files = walk_with(&root, &empty_db("symlink-file"), true, false);
         let paths: HashSet<&String> = files.iter().map(|f| &f.path).collect();
         assert_eq!(paths.len(), 1, "both routes report one canonical path");
 
         let canonical = path_to_db_string(&root.join("real/target.txt").canonicalize().unwrap());
-        assert_eq!(*paths.into_iter().next().unwrap(), canonical, "the target, not the alias");
+        assert_eq!(
+            *paths.into_iter().next().unwrap(),
+            canonical,
+            "the target, not the alias"
+        );
 
         // The alias itself is still reported, so its row is never mistaken for
         // deleted — it is reported under the *target's* path.
@@ -1330,6 +1386,50 @@ mod tests {
         fs::remove_dir_all(&outside).ok();
     }
 
+    /// Windows counterpart of the symlink tests: `canonicalize` spells a
+    /// junction's target `\\?\C:\…`, and the walker must strip that before
+    /// storing — otherwise everything beneath the junction is spelled
+    /// differently from the plainly-spelled roots, full-path ignore patterns
+    /// never match there, and the canonical-directory dedup fails.
+    #[test]
+    #[cfg(windows)]
+    fn a_followed_junction_stores_plain_paths() {
+        let root = tmp_tree("junction");
+        touch(&root.join("real").join("target.txt"));
+        // Junctions need no privileges, unlike symlinks; still, skip cleanly
+        // on filesystems where mklink refuses.
+        let made = std::process::Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                root.join("jlink").to_str().unwrap(),
+                root.join("real").to_str().unwrap(),
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            fs::remove_dir_all(&root).ok();
+            return;
+        }
+
+        let files = walk_with(&root, &empty_db("junction"), true, false);
+        for f in &files {
+            assert!(
+                !f.path.starts_with(r"\\?\"),
+                "stored path leaked a verbatim prefix: {}",
+                f.path
+            );
+        }
+        // The junction resolves to the same canonical directory the walk
+        // reaches directly, so the dedup visits it exactly once. A leaked
+        // prefix would spell it twice and report the file twice.
+        assert_eq!(names(&files), vec!["target.txt"], "visited once");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn hidden_and_ignored_entries_are_pruned() {
         let root = tmp_tree("prune");
@@ -1340,11 +1440,8 @@ mod tests {
         touch(&root.join(".dotfile"));
         touch(&root.join("node_modules/dep/index.js"));
 
-        let ignore = IgnoreSet::compile(&[
-            "*.tmp".to_string(),
-            "node_modules".to_string(),
-        ])
-        .unwrap();
+        let ignore =
+            IgnoreSet::compile(&["*.tmp".to_string(), "node_modules".to_string()]).unwrap();
         let files: Vec<WalkedFile> = files_only(walk_indexable_files(
             &[root.to_string_lossy().into_owned()],
             false,
@@ -1362,7 +1459,14 @@ mod tests {
         let files = walk_with(&root, &empty_db("prune-hidden"), false, true);
         assert_eq!(
             names(&files),
-            vec![".dotfile", "index.js", "inside.txt", "keep.txt", "keep2.txt", "skip.tmp"],
+            vec![
+                ".dotfile",
+                "index.js",
+                "inside.txt",
+                "keep.txt",
+                "keep2.txt",
+                "skip.tmp"
+            ],
             "include_hidden with no ignore patterns keeps everything"
         );
         fs::remove_dir_all(&root).ok();
@@ -1381,7 +1485,11 @@ mod tests {
         let kept = path_to_db_string(&root.join("kept.txt"));
         let db = db_with(
             "reconcile",
-            &[(gone.clone(), 1), (gone_nested.clone(), 1), (kept.clone(), 1)],
+            &[
+                (gone.clone(), 1),
+                (gone_nested.clone(), 1),
+                (kept.clone(), 1),
+            ],
         );
 
         let mut stale = stale_only(walk_indexable_files(
@@ -1400,7 +1508,10 @@ mod tests {
 
         let mut want = vec![gone, gone_nested];
         want.sort();
-        assert_eq!(stale, want, "exactly the rows with no file, from both directories");
+        assert_eq!(
+            stale, want,
+            "exactly the rows with no file, from both directories"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1435,7 +1546,10 @@ mod tests {
         ));
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).ok();
 
-        assert!(stale.is_empty(), "an unreadable directory is not an empty one");
+        assert!(
+            stale.is_empty(),
+            "an unreadable directory is not an empty one"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1472,7 +1586,10 @@ mod tests {
             4,
         ));
 
-        assert!(files.len() < 500, "an already-stopped walk does not run to completion");
+        assert!(
+            files.len() < 500,
+            "an already-stopped walk does not run to completion"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1591,7 +1708,10 @@ mod tests {
     #[test]
     fn local_temp_dir_is_not_detected_as_network() {
         let root = tmp_tree("fstype");
-        assert_eq!(thread_count_for(&[root.to_string_lossy().into_owned()]), LOCAL_THREADS);
+        assert_eq!(
+            thread_count_for(&[root.to_string_lossy().into_owned()]),
+            LOCAL_THREADS
+        );
         fs::remove_dir_all(&root).ok();
     }
 }

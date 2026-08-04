@@ -273,9 +273,7 @@ impl TermPattern {
     pub fn count(&self, text: &str, case_insensitive: bool) -> usize {
         match self {
             TermPattern::Empty => 0,
-            TermPattern::Literal(l) => {
-                snippet::count_occurrences(text, &l.text, !case_insensitive)
-            }
+            TermPattern::Literal(l) => snippet::count_occurrences(text, &l.text, !case_insensitive),
             TermPattern::Wildcard(w) => {
                 let re = if case_insensitive {
                     &w.search_ci

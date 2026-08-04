@@ -14,10 +14,7 @@ pub enum TranslateError {
     UnknownProperty(String),
     BadDate(String),
     BadRegex(String),
-    UnsupportedOp {
-        key: String,
-        op: Op,
-    },
+    UnsupportedOp { key: String, op: Op },
 }
 
 impl std::fmt::Display for TranslateError {
@@ -27,7 +24,11 @@ impl std::fmt::Display for TranslateError {
             TranslateError::BadDate(s) => write!(f, "bad date '{}'", s),
             TranslateError::BadRegex(s) => write!(f, "regex error: {}", s),
             TranslateError::UnsupportedOp { key, op } => {
-                write!(f, "operator {:?} is not supported for property '{}'", op, key)
+                write!(
+                    f,
+                    "operator {:?} is not supported for property '{}'",
+                    op, key
+                )
             }
         }
     }
@@ -66,8 +67,15 @@ pub struct FilterFragment {
 pub fn is_filter_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
-        "type" | "modified" | "mtime" | "path" | "folder" | "includefolder" | "name"
-            | "filename" | "mime"
+        "type"
+            | "modified"
+            | "mtime"
+            | "path"
+            | "folder"
+            | "includefolder"
+            | "name"
+            | "filename"
+            | "mime"
     )
 }
 
@@ -295,7 +303,9 @@ mod tests {
         assert_eq!(f.sql, "(f.type & ?) != 0");
         assert_eq!(
             f.params,
-            vec![rusqlite::types::Value::Integer(FileType::AUDIO.bits() as i64)]
+            vec![rusqlite::types::Value::Integer(
+                FileType::AUDIO.bits() as i64
+            )]
         );
     }
 
@@ -372,8 +382,17 @@ mod tests {
     #[test]
     fn is_filter_key_covers_exactly_the_supported_keys() {
         for key in [
-            "type", "modified", "mtime", "path", "folder", "includefolder", "name", "filename",
-            "mime", "TYPE", "Path",
+            "type",
+            "modified",
+            "mtime",
+            "path",
+            "folder",
+            "includefolder",
+            "name",
+            "filename",
+            "mime",
+            "TYPE",
+            "Path",
         ] {
             assert!(is_filter_key(key), "{} should be a filter key", key);
         }
@@ -395,11 +414,11 @@ mod tests {
 
         let base = format!("{}a{}b", root_prefix(), SEP);
         let rows = [
-            format!("{}{}sub", base, SEP),          // inside
+            format!("{}{}sub", base, SEP),            // inside
             format!("{}{}sub{}deep", base, SEP, SEP), // deeper
-            base.clone(),                            // the folder itself
-            format!("{}a{}bc", root_prefix(), SEP),  // prefix sibling: outside
-            format!("{}a", root_prefix()),           // parent: outside
+            base.clone(),                             // the folder itself
+            format!("{}a{}bc", root_prefix(), SEP),   // prefix sibling: outside
+            format!("{}a", root_prefix()),            // parent: outside
         ];
         for r in &rows {
             conn.execute("INSERT INTO files (parent) VALUES (?1)", [r])
@@ -426,7 +445,7 @@ mod tests {
 
         let base = format!("{}a_b", root_prefix());
         for r in [
-            format!("{}{}inside", base, SEP),         // real child
+            format!("{}{}inside", base, SEP),           // real child
             format!("{}axb{}bait", root_prefix(), SEP), // `_` must not glob to `x`
             format!("{}100%_done{}x", root_prefix(), SEP),
         ] {
@@ -483,5 +502,4 @@ mod tests {
         // 2000-02-29 is valid (leap year)
         assert_eq!(civil_to_unix(2000, 2, 29), 951_782_400);
     }
-
 }

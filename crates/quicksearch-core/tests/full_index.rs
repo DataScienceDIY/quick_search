@@ -20,7 +20,10 @@ fn tmp_dir(tag: &str) -> PathBuf {
         "quicksearch-e2e-{}-{}-{}",
         tag,
         std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -116,7 +119,10 @@ fn reindexing_an_unchanged_tree_changes_nothing() {
     // The whole point: a second run over an unchanged tree must not delete
     // and re-insert anything. A wiped-and-rebuilt row would come back with
     // content_state reset, throwing away extracted text for no reason.
-    assert_eq!(first, second, "an unchanged tree must re-index to an identical set");
+    assert_eq!(
+        first, second,
+        "an unchanged tree must re-index to an identical set"
+    );
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&db_dir).ok();
@@ -140,9 +146,19 @@ fn deleted_files_are_removed_and_new_ones_added() {
 
     let names: Vec<String> = rows(&db)
         .into_iter()
-        .map(|(p, _, _)| Path::new(&p).file_name().unwrap().to_string_lossy().into_owned())
+        .map(|(p, _, _)| {
+            Path::new(&p)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
-    assert_eq!(names, vec!["added.txt", "keep.txt"], "stale cleanup still works");
+    assert_eq!(
+        names,
+        vec!["added.txt", "keep.txt"],
+        "stale cleanup still works"
+    );
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&db_dir).ok();
@@ -439,7 +455,10 @@ fn index_roots_once(roots: &[&Path], db: &Path, config: &Config) {
     let service = IndexingService::new();
     service
         .start_indexing(
-            roots.iter().map(|r| r.to_string_lossy().into_owned()).collect(),
+            roots
+                .iter()
+                .map(|r| r.to_string_lossy().into_owned())
+                .collect(),
             db.to_string_lossy().into_owned(),
             config.clone(),
         )
@@ -475,10 +494,16 @@ fn two_roots_walk_extract_and_clean_independently() {
     // Imbalanced roots so the round-robin writer sees a firehose and a
     // trickle in the same run.
     for i in 0..60 {
-        touch(&root_a.join(format!("a{:03}.txt", i)), b"alpha corpus xylophone");
+        touch(
+            &root_a.join(format!("a{:03}.txt", i)),
+            b"alpha corpus xylophone",
+        );
     }
     for i in 0..5 {
-        touch(&root_b.join(format!("b{:03}.txt", i)), b"bravo corpus quagmire");
+        touch(
+            &root_b.join(format!("b{:03}.txt", i)),
+            b"bravo corpus quagmire",
+        );
     }
 
     index_roots_once(&[&root_a, &root_b], &db, &config);
@@ -489,7 +514,11 @@ fn two_roots_walk_extract_and_clean_independently() {
         .unwrap();
     assert_eq!(total, 65, "both roots fully walked");
     let pending: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files WHERE content_state = 0", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE content_state = 0",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(pending, 0, "per-root extraction drained both roots");
     // Content from EACH root is searchable.
@@ -501,7 +530,11 @@ fn two_roots_walk_extract_and_clean_independently() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(hits > 0, "content from both roots must be indexed ({})", term);
+        assert!(
+            hits > 0,
+            "content from both roots must be indexed ({})",
+            term
+        );
     }
     drop(conn);
 
@@ -552,7 +585,13 @@ fn a_deleted_directory_takes_its_whole_subtree_out_of_the_index() {
 
     let names: Vec<String> = rows(&db)
         .into_iter()
-        .map(|(p, _, _)| Path::new(&p).file_name().unwrap().to_string_lossy().into_owned())
+        .map(|(p, _, _)| {
+            Path::new(&p)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
         .collect();
     assert_eq!(names, vec!["keep.txt"], "the whole subtree is swept");
 
@@ -598,7 +637,9 @@ fn a_symlink_target_in_an_unwalked_directory_survives_reindexing() {
     let first = rows(&db);
     assert_eq!(first.len(), 3, "both targets indexed under their own paths");
     assert!(
-        first.iter().any(|(p, _, _)| p.ends_with(".pruned/inner.txt")),
+        first
+            .iter()
+            .any(|(p, _, _)| p.ends_with(".pruned/inner.txt")),
         "the pruned-directory target is stored under its canonical path"
     );
 
@@ -650,7 +691,10 @@ fn a_modified_symlink_target_is_updated_not_silently_ignored() {
     let after = rows(&db);
     assert_eq!(after.len(), 1, "still exactly one row");
     assert_eq!(after[0].0, before[0].0, "same path");
-    assert_ne!(after[0].1, before[0].1, "mtime was refreshed, so it was re-read");
+    assert_ne!(
+        after[0].1, before[0].1,
+        "mtime was refreshed, so it was re-read"
+    );
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&outside).ok();
@@ -679,7 +723,11 @@ fn overlapping_roots_index_each_file_exactly_once() {
         .iter()
         .filter(|(p, _, _)| p.ends_with("shared.txt"))
         .collect();
-    assert_eq!(shared.len(), 1, "the doubly-reachable file has exactly one row");
+    assert_eq!(
+        shared.len(),
+        1,
+        "the doubly-reachable file has exactly one row"
+    );
 
     // And the overlap must not make anything look stale on a second pass.
     index_roots_once(&[&outer, &inner], &db, &config);
@@ -774,7 +822,10 @@ fn stored_text(db: &Path, suffix: &str) -> Option<String> {
 /// A tree that exercises every branch of the inline decision at once.
 fn seed_mixed_tree(root: &Path) {
     let big = "lorem ipsum dolor sit amet ".repeat(600); // ~16 KiB, past any head
-    touch(&root.join("small.txt"), b"a small plaintext body with xylophone in it");
+    touch(
+        &root.join("small.txt"),
+        b"a small plaintext body with xylophone in it",
+    );
     touch(&root.join("large.txt"), big.as_bytes());
     touch(&root.join("empty.txt"), b"");
     // Binary bytes with a .txt extension: claimed by the plaintext
@@ -784,8 +835,14 @@ fn seed_mixed_tree(root: &Path) {
     touch(&root.join("bad.txt"), &[0x68, 0x69, 0xff, 0xfe, 0x00, 0x41]);
     // No extension table, magic, or text sniff has an answer for NUL soup:
     // no MIME, no extractor.
-    touch(&root.join("blob.bin"), &[0x00, 0x01, 0x02, 0xfd, 0xfe, 0xff]);
-    touch(&root.join("nested/deep/note.md"), b"# heading\n\nquagmire body text\n");
+    touch(
+        &root.join("blob.bin"),
+        &[0x00, 0x01, 0x02, 0xfd, 0xfe, 0xff],
+    );
+    touch(
+        &root.join("nested/deep/note.md"),
+        b"# heading\n\nquagmire body text\n",
+    );
 }
 
 #[test]
@@ -844,7 +901,11 @@ fn the_head_boundary_decides_inlining_without_changing_the_result() {
     // Both are fully extracted; the boundary only decides *which pass* did it.
     let conn = rusqlite::Connection::open(&db).unwrap();
     let pending: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files WHERE content_state != 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE content_state != 1",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(pending, 0, "both sides of the boundary end up extracted");
     drop(conn);
@@ -896,7 +957,10 @@ fn extensionless_text_files_are_indexed() {
     let db_dir = tmp_dir("extless-db");
     let db = db_dir.join("index.sqlite");
 
-    touch(&root.join("README"), b"QuickSearch indexes zanzibar contents.\n");
+    touch(
+        &root.join("README"),
+        b"QuickSearch indexes zanzibar contents.\n",
+    );
     touch(&root.join("Makefile"), b"all:\n\tcargo build --release\n");
     touch(&root.join("go.sum"), b"example.com/x v1.0.0 h1:abcdef=\n");
     touch(&root.join("blob"), &[0x00, 0x01, 0xfe, 0xff]);
@@ -937,17 +1001,25 @@ fn utf16_files_are_stored_as_utf8() {
     let db_dir = tmp_dir("charset-db");
     let db = db_dir.join("index.sqlite");
 
-    let reg_src = "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\Xylograph]\r\n";
+    let reg_src =
+        "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\Xylograph]\r\n";
     let mut reg_body = vec![0xFF, 0xFE];
     reg_body.extend(reg_src.encode_utf16().flat_map(|u| u.to_le_bytes()));
     touch(&root.join("export.reg"), &reg_body);
 
     // The same encoding behind no extension at all: BOM first, sniff after.
     let mut extless = vec![0xFF, 0xFE];
-    extless.extend("utf16 notes about quokkas".encode_utf16().flat_map(|u| u.to_le_bytes()));
+    extless.extend(
+        "utf16 notes about quokkas"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes()),
+    );
     touch(&root.join("NOTES16"), &extless);
 
-    touch(&root.join("legacy.txt"), b"un caf\xe9 tr\xe8s agr\xe9able pr\xe8s du mus\xe9e");
+    touch(
+        &root.join("legacy.txt"),
+        b"un caf\xe9 tr\xe8s agr\xe9able pr\xe8s du mus\xe9e",
+    );
     index_once(&root, &db, &Config::default());
 
     assert_eq!(stored_text(&db, "export.reg").as_deref(), Some(reg_src));
@@ -987,7 +1059,12 @@ fn rtf_files_are_extracted() {
 
     for name in ["small.rtf", "big.rtf"] {
         let text = stored_text(&db, name).unwrap_or_else(|| panic!("{} has no stored text", name));
-        assert!(text.contains("pangolin budget"), "{}: {:?}", name, &text[..text.len().min(80)]);
+        assert!(
+            text.contains("pangolin budget"),
+            "{}: {:?}",
+            name,
+            &text[..text.len().min(80)]
+        );
         assert!(!text.contains(r"\rtf"), "{} stored control words", name);
     }
 
@@ -1113,7 +1190,11 @@ fn the_content_extension_filter_still_excludes_small_text_files() {
         }
     }
     drop(conn);
-    assert_eq!(stored_text(&db, "skipped.txt"), None, "no body stored for a filtered file");
+    assert_eq!(
+        stored_text(&db, "skipped.txt"),
+        None,
+        "no body stored for a filtered file"
+    );
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&db_dir).ok();
@@ -1142,7 +1223,10 @@ fn contentless_mode_still_indexes_inlined_files_without_storing_bodies() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(hits, 1, "an inlined file is still searchable in contentless mode");
+    assert_eq!(
+        hits, 1,
+        "an inlined file is still searchable in contentless mode"
+    );
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&db_dir).ok();
@@ -1165,7 +1249,9 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     // small `maximum_text_size` so the cost lands in extraction rather than in
     // the writer's tokenising.
     let heavy = tmp_dir("stall-heavy");
-    let body: Vec<u8> = "sphinx of black quartz judge my vow ".repeat(40_000).into_bytes();
+    let body: Vec<u8> = "sphinx of black quartz judge my vow "
+        .repeat(40_000)
+        .into_bytes();
     for i in 0..200 {
         touch(&heavy.join(format!("d{}/big{:04}.txt", i % 8, i)), &body);
     }
@@ -1240,7 +1326,10 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     // The fixed design's stall does not grow with the heavy root's cost — it is
     // one round-robin pass plus one commit — so making that root heavier only
     // widens the margin.
-    eprintln!("longest light-root stall while heavy extracted: {:?}", worst);
+    eprintln!(
+        "longest light-root stall while heavy extracted: {:?}",
+        worst
+    );
     assert!(
         worst < Duration::from_millis(100),
         "the light root stalled for {:?} while the heavy root extracted",
@@ -1269,7 +1358,9 @@ fn the_wal_stays_bounded_during_a_run() {
     let root = tmp_dir("wal-bound");
     // Wide and text-heavy: every file lands in the FTS index, which is what
     // actually fills the log.
-    let body: Vec<u8> = "sphinx of black quartz judge my vow ".repeat(200).into_bytes();
+    let body: Vec<u8> = "sphinx of black quartz judge my vow "
+        .repeat(200)
+        .into_bytes();
     for i in 0..4000 {
         touch(&root.join(format!("d{}/f{:05}.txt", i % 40, i)), &body);
     }
@@ -1347,7 +1438,9 @@ fn the_wal_stays_bounded_during_a_run() {
 #[test]
 fn a_stopped_run_is_still_optimized() {
     let root = tmp_dir("stop-optimize");
-    let body: Vec<u8> = "sphinx of black quartz judge my vow ".repeat(200).into_bytes();
+    let body: Vec<u8> = "sphinx of black quartz judge my vow "
+        .repeat(200)
+        .into_bytes();
     for i in 0..4000 {
         touch(&root.join(format!("d{}/f{:05}.txt", i % 40, i)), &body);
     }
@@ -1387,11 +1480,17 @@ fn a_stopped_run_is_still_optimized() {
             IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
             _ => {}
         }
-        assert!(Instant::now() < idle_by, "the stopped run never reached Idle");
+        assert!(
+            Instant::now() < idle_by,
+            "the stopped run never reached Idle"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    assert!(saw_optimizing, "a stopped run must still publish Optimizing");
+    assert!(
+        saw_optimizing,
+        "a stopped run must still publish Optimizing"
+    );
     assert_eq!(
         std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
         0,

@@ -22,9 +22,11 @@ Rust toolchain with rustup; `build.bat` uses winget and rustup. Both take
 `--check` to report dependency status without installing or building,
 `--no-run` to stop after the build, and `--` to pass the rest to the binary.
 
-Building by hand needs a Rust toolchain (edition 2021) plus, on every
-platform, a C toolchain and Perl: SQLCipher, zstd and OpenSSL are compiled
-from bundled C sources, and OpenSSL's `Configure` is a Perl script. The old
+Building by hand needs a Rust toolchain plus, on every platform, a C toolchain
+and Perl: SQLCipher, zstd and OpenSSL are compiled from bundled C sources, and
+OpenSSL's `Configure` is a Perl script. `rust-toolchain.toml` pins the compiler
+version and the cross-compilation targets, so rustup installs the right ones on
+the first `cargo` command and no `rustup target add` is needed. The old
 WebKit/WebView dependencies (`setup.sh`) are gone; the GUI renders with
 OpenGL via egui.
 
@@ -35,9 +37,11 @@ OpenGL via egui.
   run time, so only the runtime libraries matter.
 - Windows: Visual Studio 2022 Build Tools with the "Desktop development
   with C++" workload (MSVC v143 plus a Windows SDK), and Perl (Strawberry
-  Perl); NASM is optional and only enables OpenSSL's assembly paths. For the
-  GNU target instead, `rustup target add x86_64-pc-windows-gnu` and a
-  mingw-w64 toolchain. Note that Windows ships only a software OpenGL 1.1
+  Perl); NASM is optional and only enables OpenSSL's assembly paths. The GNU
+  target needs only a mingw-w64 toolchain, and cross-compiles from Linux —
+  `cargo build --release -p quicksearch-gui --target x86_64-pc-windows-gnu`
+  with `gcc-mingw-w64-x86-64` installed, which is how CI produces the Windows
+  binaries. Note that Windows ships only a software OpenGL 1.1
   driver, so a bare VM or an RDP session without a vendor GPU driver cannot
   create a context and the window will fail to open.
 - macOS: Xcode command line tools (`build.sh` does not auto-install these —
@@ -382,6 +386,14 @@ pagination: the table is virtualized, so a single scroll list capped at
 - `cargo test -p quicksearch-gui`: formatter/tracker/CLI-parsing units.
 - `QSB_SNIPPET_PERF=1 cargo test --release -p quicksearch-core --test
   snippet_perf -- --nocapture`: snippet pipeline benchmark.
+- `.forgejo/workflows/ci.yml`: builds both platforms on every push to `master`
+  and every pull request, and attaches the `.deb`, a Linux tarball and a
+  Windows zip to a release on a `v*` tag. The Linux job runs in an Ubuntu
+  22.04 container on purpose — `packaging/build-deb.sh` reads the package's
+  `libc6` floor from the binary it just built, so the builder's glibc becomes
+  the package's minimum, and 22.04 pins it at 2.35. The Windows job
+  cross-compiles with mingw-w64 and fails if either `.exe` picks up a
+  dependency on a non-system DLL.
 - New extractors: implement `extract::Extractor` and register it in
   `Registry::default_set()` — order matters, the first extractor whose
   `supports` accepts a MIME wins. New cascade behavior: `search/cascade.rs`

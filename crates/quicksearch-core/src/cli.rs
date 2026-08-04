@@ -144,9 +144,7 @@ pub fn list_failed(db_path: &str, limit: Option<u32>) -> Result<Vec<FailedEntry>
 
 /// Return a rough size breakdown of the database on disk and by table.
 pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
-    let file_size_bytes = std::fs::metadata(db_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_size_bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
     let conn = open_existing(db_path, false)?;
     let count = |table: &str| -> Result<i64, String> {
         conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |r| r.get(0))
@@ -384,8 +382,12 @@ mod tests {
         let ratio = r.documents_text_ratio().expect("has rows");
         // Repeating a 44-byte sentence 500x → zstd should hit <20% ratio
         // trivially. Loose bound protects the test from zstd version churn.
-        assert!(ratio < 0.3, "ratio too high: {ratio} raw={} comp={}",
-            r.documents_text_raw_bytes, r.documents_text_compressed_bytes);
+        assert!(
+            ratio < 0.3,
+            "ratio too high: {ratio} raw={} comp={}",
+            r.documents_text_raw_bytes,
+            r.documents_text_compressed_bytes
+        );
 
         std::fs::remove_file(&p).ok();
     }

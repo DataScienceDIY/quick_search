@@ -22,7 +22,10 @@ pub fn set_process_key(key: Option<IndexKey>) {
 
 /// Snapshot of the current key for a single open.
 pub(crate) fn process_key() -> Option<IndexKey> {
-    PROCESS_KEY.read().expect("process key lock poisoned").clone()
+    PROCESS_KEY
+        .read()
+        .expect("process key lock poisoned")
+        .clone()
 }
 
 /// Hex form of the installed key, if any. Exists for exactly one consumer:

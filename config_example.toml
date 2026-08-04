@@ -54,9 +54,11 @@ include_hidden = false
 content_extensions = []
 # Excluded from the index entirely. A pattern without a separator matches
 # any single path component (so ".git" prunes whole subtrees); patterns
-# containing one match full paths. Glob syntax (*, ?, [..]). Matching is
-# case-insensitive on Windows and macOS, case-sensitive elsewhere,
-# following the filesystem.
+# containing one match full paths, including a bare drive root like 'D:\'.
+# Glob syntax (*, ?, [..]). A name pattern must match the whole name:
+# ".jpg" only matches something named exactly ".jpg" — ignoring an
+# extension needs the wildcard, "*.jpg". Matching is case-insensitive on
+# Windows and macOS, case-sensitive elsewhere, following the filesystem.
 #
 # The Windows defaults add: "$RECYCLE.BIN", "System Volume Information",
 # "pagefile.sys", "hiberfil.sys", "swapfile.sys", "Thumbs.db",

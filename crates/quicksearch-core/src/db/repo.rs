@@ -106,10 +106,7 @@ fn initial_content_state(f: &NewFile<'_>) -> i64 {
 /// `failure_msg` — and only those. `name`, `parent`, `inode` and `device_id`
 /// are not refreshed here despite being present on the `NewFile`: the row is
 /// found by path, and the first two are functions of it.
-pub fn update_file_basic(
-    tx: &Transaction<'_>,
-    f: &NewFile<'_>,
-) -> Result<Option<i64>, String> {
+pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option<i64>, String> {
     // One statement, not a lookup then an update: `RETURNING` hands back the
     // id of the row it just wrote, and a miss is simply no row returned.
     let id: Option<i64> = tx
@@ -210,11 +207,7 @@ pub fn set_content_done(
 const ZSTD_LEVEL: i32 = 3;
 
 /// Mark a file's content extraction as failed. Keeps the basic row in place.
-pub fn set_content_failed(
-    tx: &Transaction<'_>,
-    file_id: i64,
-    reason: &str,
-) -> Result<(), String> {
+pub fn set_content_failed(tx: &Transaction<'_>, file_id: i64, reason: &str) -> Result<(), String> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -794,7 +787,9 @@ mod tests {
             row.mtime = 3;
             row.mime = Some("video/mp4");
             row.needs_content = false;
-            update_file_basic(&tx, &row).unwrap().expect("row still there");
+            update_file_basic(&tx, &row)
+                .unwrap()
+                .expect("row still there");
             tx.commit().unwrap();
         }
         assert_eq!(content_state(&conn), STATE_NA);
@@ -910,7 +905,9 @@ mod tests {
         );
 
         let survivors: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT path FROM files ORDER BY path").unwrap();
+            let mut stmt = conn
+                .prepare("SELECT path FROM files ORDER BY path")
+                .unwrap();
             let v = stmt
                 .query_map([], |r| r.get::<_, String>(0))
                 .unwrap()
@@ -1051,8 +1048,15 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-            set_content_done(&tx, id, &name, &"lorem ipsum dolor sit amet ".repeat(64), &[], true)
-                .unwrap();
+            set_content_done(
+                &tx,
+                id,
+                &name,
+                &"lorem ipsum dolor sit amet ".repeat(64),
+                &[],
+                true,
+            )
+            .unwrap();
         }
         tx.commit().unwrap();
     }
@@ -1193,7 +1197,10 @@ mod tests {
         let forced = run(&bounded, 4);
         std::fs::remove_file(&bounded).ok();
 
-        eprintln!("peak WAL: autocheckpoint only {}, forced {}", left_alone, forced);
+        eprintln!(
+            "peak WAL: autocheckpoint only {}, forced {}",
+            left_alone, forced
+        );
         assert!(
             forced * 2 < left_alone,
             "forcing checkpoints did not bound the log: {} vs {}",
@@ -1226,8 +1233,15 @@ mod tests {
         assert!(freelist > 0, "the deletions should have freed pages");
 
         let dir = p.parent().unwrap().to_string_lossy().into_owned();
-        assert!(maintain(&conn, &dir).unwrap(), "that much slack is worth a vacuum");
-        assert_eq!(wal_bytes(&p), 0, "the vacuum's own writes are checkpointed too");
+        assert!(
+            maintain(&conn, &dir).unwrap(),
+            "that much slack is worth a vacuum"
+        );
+        assert_eq!(
+            wal_bytes(&p),
+            0,
+            "the vacuum's own writes are checkpointed too"
+        );
         assert!(
             std::fs::metadata(&p).unwrap().len() < before,
             "the file should have shrunk"

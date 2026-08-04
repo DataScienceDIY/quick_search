@@ -33,6 +33,52 @@ enum Tab {
     Help,
 }
 
+/// A navigation the unsaved-changes guard put on hold. The intent survives
+/// while the guard walks the dirty editors (on Quit there can be two); once
+/// nothing relevant is dirty, [`QuickSearchApp::complete_nav`] performs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavIntent {
+    /// Leave the Manage tab for this one.
+    SwitchTab(Tab),
+    /// Close the Options window.
+    CloseOptions,
+    /// Close the application window.
+    Quit,
+}
+
+/// Which editor the guard is currently asking about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsavedSource {
+    Manage,
+    Options,
+}
+
+/// A button (or Esc/backdrop click) in the unsaved-changes modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum UnsavedChoice {
+    Apply,
+    Discard,
+    Cancel,
+}
+
+/// Which editor the guard must ask about for `intent`, if any. Quit asks
+/// about Options before Manage — sequential prompts, one decision each; a
+/// combined prompt could not Apply both drafts safely, since each is a full
+/// `Config` snapshot and the second apply would revert the first.
+fn guard_source(
+    intent: NavIntent,
+    manage_dirty: bool,
+    options_dirty: bool,
+) -> Option<UnsavedSource> {
+    match intent {
+        NavIntent::SwitchTab(_) => manage_dirty.then_some(UnsavedSource::Manage),
+        NavIntent::CloseOptions => options_dirty.then_some(UnsavedSource::Options),
+        NavIntent::Quit if options_dirty => Some(UnsavedSource::Options),
+        NavIntent::Quit if manage_dirty => Some(UnsavedSource::Manage),
+        NavIntent::Quit => None,
+    }
+}
+
 pub struct QuickSearchApp {
     cfg: Config,
     backend: Backend,
@@ -63,6 +109,10 @@ pub struct QuickSearchApp {
     /// In-flight security flow (enable/disable/change password), driven by
     /// the Options window's Security block.
     security_prompt: Option<SecurityPrompt>,
+    /// A navigation held by the unsaved-changes guard; see [`NavIntent`].
+    pending_nav: Option<NavIntent>,
+    /// The guard resolved a Quit: let the next close request through.
+    quit_confirmed: bool,
     config_error: Option<String>,
 }
 
@@ -156,6 +206,8 @@ impl QuickSearchApp {
             stale_index_prompt,
             watch_cap_prompt: None,
             security_prompt: None,
+            pending_nav: None,
+            quit_confirmed: false,
             config_error,
         })
     }
@@ -184,15 +236,17 @@ impl QuickSearchApp {
         self.backend.start_duplicates(&cfg, ctx.clone());
     }
 
-    /// Save + route an edited config to the running services.
-    fn apply_new_config(&mut self, ctx: &egui::Context, mut new: Config) {
+    /// Save + route an edited config to the running services. Reports
+    /// whether the config was accepted — a `false` means nothing was saved
+    /// and the caller must keep any staged edits alive.
+    fn apply_new_config(&mut self, ctx: &egui::Context, mut new: Config) -> bool {
         pin_live_fields(&mut new, &self.cfg);
         if let Some((child, parent)) = nested_roots(&new.paths.indexing_paths).first() {
             self.config_error = Some(format!(
                 "Not applied: indexed folder {} is nested under {}",
                 child, parent
             ));
-            return;
+            return false;
         }
         // Warned-root memory only means anything for folders still indexed.
         // Pruning here is what makes removing and re-adding a folder warn
@@ -243,6 +297,7 @@ impl QuickSearchApp {
             }
         }
         self.cfg = new;
+        true
     }
 
     /// Switch the indexing mode and write it to the config immediately.
@@ -946,6 +1001,80 @@ impl QuickSearchApp {
             self.clear_prompt = false;
         }
     }
+
+    /// Drive the unsaved-changes guard. Each frame the pending intent picks
+    /// the editor to ask about; Apply and Discard clean one editor and let
+    /// the next frame either move to the second (Quit with both dirty asks
+    /// about Options, then Manage) or fall through to the navigation
+    /// itself. Cancel — button, Esc, or a backdrop click — drops the intent
+    /// and stays put.
+    fn unsaved_prompt_ui(&mut self, ctx: &egui::Context) {
+        let Some(intent) = self.pending_nav else {
+            return;
+        };
+        let dirty = (self.manage.is_dirty(), self.options.is_dirty(&self.cfg));
+        let Some(source) = guard_source(intent, dirty.0, dirty.1) else {
+            return self.complete_nav(ctx, intent);
+        };
+        match unsaved_changes_modal(ctx, source) {
+            None => {}
+            Some(UnsavedChoice::Cancel) => self.pending_nav = None,
+            Some(UnsavedChoice::Discard) => match source {
+                UnsavedSource::Manage => self.manage.discard(),
+                UnsavedSource::Options => self.options.close_discard(),
+            },
+            Some(UnsavedChoice::Apply) => {
+                let ok = match source {
+                    UnsavedSource::Manage => match self.manage.take_apply_config(&self.cfg) {
+                        Some(cfg) => {
+                            let ok = self.apply_new_config(ctx, cfg);
+                            if ok {
+                                self.manage.mark_applied();
+                            }
+                            ok
+                        }
+                        None => true,
+                    },
+                    UnsavedSource::Options => match self.options.draft_config() {
+                        Some(cfg) => {
+                            let ok = self.apply_new_config(ctx, cfg);
+                            if ok {
+                                self.options.close_discard();
+                            }
+                            ok
+                        }
+                        None => true,
+                    },
+                };
+                if !ok {
+                    // Rejected (nested roots): stay put, keep the staged
+                    // edits; the error banner explains what to fix.
+                    self.pending_nav = None;
+                }
+            }
+        }
+    }
+
+    /// Perform a navigation the guard has cleared.
+    fn complete_nav(&mut self, ctx: &egui::Context, intent: NavIntent) {
+        self.pending_nav = None;
+        match intent {
+            NavIntent::SwitchTab(tab) => {
+                let was = self.tab;
+                self.tab = tab;
+                // Same trigger the direct switch in `update` runs; a guarded
+                // switch lands here instead.
+                if tab == Tab::Duplicates && was != Tab::Duplicates {
+                    self.start_duplicates_scan(ctx);
+                }
+            }
+            NavIntent::CloseOptions => self.options.close_discard(),
+            NavIntent::Quit => {
+                self.quit_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
 }
 
 /// Overwrite the fields a config draft must never carry back.
@@ -956,9 +1085,57 @@ impl QuickSearchApp {
 /// change. A draft taken before one of those clicks still holds the old
 /// value, so applying it would silently revert protection, the salt, or
 /// the indexing mode.
-fn pin_live_fields(new: &mut Config, live: &Config) {
+pub(crate) fn pin_live_fields(new: &mut Config, live: &Config) {
     new.security = live.security.clone();
     new.indexing.auto_index = live.indexing.auto_index;
+}
+
+/// Body of the unsaved-changes guard; `Some(choice)` when the user decided
+/// this frame. Esc and a click on the backdrop count as Cancel.
+///
+/// The one `egui::Modal` in the app, deliberately: unlike the centered
+/// `egui::Window` the other prompts use, its backdrop blocks input to
+/// everything behind it — this guard exists to force a decision, and a
+/// click that lands on the tab strip or the Options ✕ behind the prompt
+/// would re-trigger or bypass it.
+///
+/// A free function (not a method) so tests can render it, and click its
+/// buttons, in a headless egui context.
+fn unsaved_changes_modal(ctx: &egui::Context, source: UnsavedSource) -> Option<UnsavedChoice> {
+    let mut choice = None;
+    let modal = egui::Modal::new(egui::Id::new("unsaved-guard")).show(ctx, |ui| {
+        ui.set_max_width(420.0);
+        ui.heading("Unsaved changes");
+        ui.label(match source {
+            UnsavedSource::Manage => "The Manage Index tab has edits that have not been applied.",
+            UnsavedSource::Options => "The Options window has edits that have not been applied.",
+        });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(crate::ui_util::bordered_button(
+                    "Apply & Save",
+                    crate::ui_util::BLUE,
+                ))
+                .clicked()
+            {
+                choice = Some(UnsavedChoice::Apply);
+            }
+            if ui
+                .button(egui::RichText::new("Discard changes").color(ui.visuals().error_fg_color))
+                .clicked()
+            {
+                choice = Some(UnsavedChoice::Discard);
+            }
+            if ui.button("Cancel").clicked() {
+                choice = Some(UnsavedChoice::Cancel);
+            }
+        });
+    });
+    if choice.is_none() && modal.should_close() {
+        choice = Some(UnsavedChoice::Cancel);
+    }
+    choice
 }
 
 /// The stale-index window's body. Returns whether the user asked for the
@@ -1038,27 +1215,54 @@ impl eframe::App for QuickSearchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.tick_debounce(ctx);
+
+        // Quitting with unapplied edits gets the same guard as tab
+        // navigation. The close must be cancelled *this* frame — once the
+        // window is gone there is nothing left to ask — and re-sent from
+        // `complete_nav` if the user chooses to leave.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed {
+            if self.manage.is_dirty() || self.options.is_dirty(&self.cfg) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                // Quitting subsumes any narrower pending navigation.
+                self.pending_nav = Some(NavIntent::Quit);
+            }
+        }
+
         self.status_bar(ctx);
 
         let previous_tab = self.tab;
+        // Tab clicks land on a local first, so leaving a dirty Manage tab
+        // can be held for the unsaved-changes guard instead of committed.
+        let mut requested = self.tab;
         egui::TopBottomPanel::top("tab-strip").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Search, "Search");
-                ui.selectable_value(&mut self.tab, Tab::Manage, "Manage Index");
-                ui.selectable_value(&mut self.tab, Tab::Duplicates, "Duplicates");
-                ui.selectable_value(&mut self.tab, Tab::Logs, "Logs");
-                ui.selectable_value(&mut self.tab, Tab::Help, "Help");
+                ui.selectable_value(&mut requested, Tab::Search, "Search");
+                ui.selectable_value(&mut requested, Tab::Manage, "Manage Index");
+                ui.selectable_value(&mut requested, Tab::Duplicates, "Duplicates");
+                ui.selectable_value(&mut requested, Tab::Logs, "Logs");
+                ui.selectable_value(&mut requested, Tab::Help, "Help");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("⚙").on_hover_text("Options").clicked() {
-                        if self.options.open {
-                            self.options.open = false;
-                        } else {
+                        if !self.options.open {
                             self.options.open_with(&self.cfg);
+                        } else if self.options.is_dirty(&self.cfg) {
+                            if self.pending_nav.is_none() {
+                                self.pending_nav = Some(NavIntent::CloseOptions);
+                            }
+                        } else {
+                            self.options.close_discard();
                         }
                     }
                 });
             });
         });
+        if requested != self.tab {
+            if self.tab == Tab::Manage && self.manage.is_dirty() && self.pending_nav.is_none() {
+                self.pending_nav = Some(NavIntent::SwitchTab(requested));
+            } else {
+                self.tab = requested;
+            }
+        }
         // Entering the Duplicates tab kicks off a fresh scan.
         if self.tab == Tab::Duplicates && previous_tab != Tab::Duplicates {
             self.start_duplicates_scan(ctx);
@@ -1121,7 +1325,9 @@ impl eframe::App for QuickSearchApp {
                     ui.ctx().request_repaint_after(Duration::from_millis(100));
                 }
                 if let Some(new_cfg) = actions.apply_config {
-                    self.apply_new_config(ctx, new_cfg);
+                    if self.apply_new_config(ctx, new_cfg) {
+                        self.manage.mark_applied();
+                    }
                 }
             }
             Tab::Duplicates => {
@@ -1141,6 +1347,9 @@ impl eframe::App for QuickSearchApp {
         if let Some(action) = options_out.security {
             self.handle_security_action(action);
         }
+        if options_out.close_requested && self.pending_nav.is_none() {
+            self.pending_nav = Some(NavIntent::CloseOptions);
+        }
         self.rebuild_prompt_ui(ctx);
         self.security_prompt_ui(ctx);
         self.clear_prompt_ui(ctx);
@@ -1150,6 +1359,8 @@ impl eframe::App for QuickSearchApp {
         // user is actually looking at.
         self.stale_index_prompt_ui(ctx);
         self.watch_cap_prompt_ui(ctx);
+        // Last: the guard must sit above everything else on screen.
+        self.unsaved_prompt_ui(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1219,7 +1430,10 @@ mod tests {
                     }
                 }
             }
-            assert!(fired.is_some(), "no clickable Rebuild button for {source:?}");
+            assert!(
+                fired.is_some(),
+                "no clickable Rebuild button for {source:?}"
+            );
         }
     }
 
@@ -1250,5 +1464,114 @@ mod tests {
             draft.indexing.reindex_interval_minutes, 60,
             "the staged edit itself still applies"
         );
+    }
+
+    /// The whole guard decision table. Quit walks Options before Manage —
+    /// two sequential prompts, because each draft is a full `Config`
+    /// snapshot and applying both in one step would let the second revert
+    /// the first.
+    #[test]
+    fn guard_source_orders_quit_prompts_options_first() {
+        use NavIntent::*;
+        let tab = SwitchTab(Tab::Search);
+
+        assert_eq!(guard_source(tab, true, true), Some(UnsavedSource::Manage));
+        assert_eq!(guard_source(tab, true, false), Some(UnsavedSource::Manage));
+        assert_eq!(
+            guard_source(tab, false, true),
+            None,
+            "options guard its own close"
+        );
+        assert_eq!(guard_source(tab, false, false), None);
+
+        assert_eq!(
+            guard_source(CloseOptions, true, true),
+            Some(UnsavedSource::Options)
+        );
+        assert_eq!(
+            guard_source(CloseOptions, false, true),
+            Some(UnsavedSource::Options)
+        );
+        assert_eq!(
+            guard_source(CloseOptions, true, false),
+            None,
+            "manage guards tab switches"
+        );
+        assert_eq!(guard_source(CloseOptions, false, false), None);
+
+        assert_eq!(guard_source(Quit, true, true), Some(UnsavedSource::Options));
+        assert_eq!(
+            guard_source(Quit, false, true),
+            Some(UnsavedSource::Options)
+        );
+        assert_eq!(guard_source(Quit, true, false), Some(UnsavedSource::Manage));
+        assert_eq!(guard_source(Quit, false, false), None);
+    }
+
+    fn modal_frame(
+        ctx: &egui::Context,
+        source: UnsavedSource,
+        events: Vec<egui::Event>,
+    ) -> Option<UnsavedChoice> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 700.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut choice = None;
+        let _ = ctx.run(input, |ctx| choice = unsaved_changes_modal(ctx, source));
+        choice
+    }
+
+    /// Every way out of the guard reports the right choice: all three
+    /// buttons fire, Esc cancels, and an untouched frame decides nothing.
+    /// A backdrop click also maps to Cancel — that is `should_close`'s
+    /// contract — so the sweep counts button hits by their distinct values.
+    #[test]
+    fn the_unsaved_modal_reports_each_choice() {
+        for source in [UnsavedSource::Manage, UnsavedSource::Options] {
+            let ctx = egui::Context::default();
+            assert_eq!(
+                modal_frame(&ctx, source, Vec::new()),
+                None,
+                "an untouched frame must not decide"
+            );
+
+            let mut seen = std::collections::HashSet::new();
+            for y in (250..450).step_by(3) {
+                for x in (250..760).step_by(6) {
+                    let pos = egui::pos2(x as f32, y as f32);
+                    if let Some(choice) = modal_frame(&ctx, source, click_at(pos)) {
+                        seen.insert(choice);
+                    }
+                }
+            }
+            for expected in [
+                UnsavedChoice::Apply,
+                UnsavedChoice::Discard,
+                UnsavedChoice::Cancel,
+            ] {
+                assert!(
+                    seen.contains(&expected),
+                    "{expected:?} never fired ({source:?})"
+                );
+            }
+
+            let esc = modal_frame(
+                &ctx,
+                source,
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            assert_eq!(esc, Some(UnsavedChoice::Cancel), "Esc must cancel");
+        }
     }
 }

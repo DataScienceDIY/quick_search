@@ -21,7 +21,9 @@ pub struct SpeedTracker {
 
 impl SpeedTracker {
     pub fn new() -> SpeedTracker {
-        SpeedTracker { points: VecDeque::new() }
+        SpeedTracker {
+            points: VecDeque::new(),
+        }
     }
 
     /// Reset between phases (each phase restarts its counter).

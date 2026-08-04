@@ -114,7 +114,9 @@ pub struct Registry {
 
 impl Registry {
     pub fn new() -> Self {
-        Self { extractors: Vec::new() }
+        Self {
+            extractors: Vec::new(),
+        }
     }
 
     pub fn with(mut self, e: impl Extractor + 'static) -> Self {
@@ -167,7 +169,8 @@ impl Registry {
         mime: &str,
         head: &[u8],
     ) -> Option<Result<ExtractedContent, ExtractError>> {
-        self.find(mime).and_then(|e| e.extract_from_head(path, head))
+        self.find(mime)
+            .and_then(|e| e.extract_from_head(path, head))
     }
 
     /// The default set: RTF, plaintext, office docs, PDF, audio tags,
@@ -220,11 +223,17 @@ mod tests {
 
         // A format that seeks or reads a trailer must not be handed a buffer.
         // `None` here is what routes it back to the on-disk extractor.
-        assert!(r.extract_complete_head(p, "application/pdf", b"%PDF-1.4").is_none());
-        assert!(r.extract_complete_head(p, "image/png", b"\x89PNG").is_none());
+        assert!(r
+            .extract_complete_head(p, "application/pdf", b"%PDF-1.4")
+            .is_none());
+        assert!(r
+            .extract_complete_head(p, "image/png", b"\x89PNG")
+            .is_none());
 
         // No extractor claims the MIME at all.
-        assert!(r.extract_complete_head(p, "application/x-nonesuch", b"..").is_none());
+        assert!(r
+            .extract_complete_head(p, "application/x-nonesuch", b"..")
+            .is_none());
     }
 
     #[test]
@@ -233,16 +242,23 @@ mod tests {
         // file's text would depend on which pass happened to handle it.
         let r = Registry::default_set();
         let p = Path::new("/tmp/whatever");
-        for mime in ["text/plain", "TEXT/PLAIN", "application/json", "application/x-sql"] {
+        for mime in [
+            "text/plain",
+            "TEXT/PLAIN",
+            "application/json",
+            "application/x-sql",
+        ] {
             assert!(
                 r.extract_complete_head(p, mime, b"x").is_some(),
-                "{} should extract from a head", mime
+                "{} should extract from a head",
+                mime
             );
         }
         for mime in ["application/rtf", "text/rtf"] {
             assert!(
                 r.extract_complete_head(p, mime, br"{\rtf1 x}").is_some(),
-                "{} should extract from a head", mime
+                "{} should extract from a head",
+                mime
             );
         }
     }
@@ -305,7 +321,10 @@ mod tests {
             .with_property("a", "1");
         assert_eq!(
             c.properties_sorted(),
-            vec![("a".to_string(), "1".to_string()), ("b".to_string(), "2".to_string())]
+            vec![
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string())
+            ]
         );
     }
 }

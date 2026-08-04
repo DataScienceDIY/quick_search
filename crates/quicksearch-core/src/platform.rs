@@ -126,7 +126,14 @@ pub(crate) fn is_unc_string(s: &str) -> bool {
 /// Filesystem types whose operations are network round trips.
 #[cfg(target_os = "linux")]
 const NETWORK_FS_TYPES: [&str; 8] = [
-    "cifs", "smb3", "smbfs", "nfs", "nfs4", "afs", "fuse.sshfs", "9p",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "nfs",
+    "nfs4",
+    "afs",
+    "fuse.sshfs",
+    "9p",
 ];
 
 /// Whether `path` lives on a network filesystem.
@@ -312,7 +319,10 @@ pub fn deny_read(dir: &Path) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        icacls(dir, &["/deny", &format!("{}:(OI)(CI)(RD)", current_user()?)])
+        icacls(
+            dir,
+            &["/deny", &format!("{}:(OI)(CI)(RD)", current_user()?)],
+        )
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -400,7 +410,10 @@ mod tests {
     fn collation_matches_like_case_folding() {
         // LIKE folds ASCII case on every platform; the `=` half of a path
         // filter has to agree with it, which is what this constant is for.
-        assert_eq!(PATH_COLLATION, if cfg!(windows) { "NOCASE" } else { "BINARY" });
+        assert_eq!(
+            PATH_COLLATION,
+            if cfg!(windows) { "NOCASE" } else { "BINARY" }
+        );
     }
 
     #[test]
@@ -427,7 +440,10 @@ mod tests {
         // The root itself is hidden, but it was chosen explicitly — the walk
         // keeps it, so the watcher must too.
         assert!(!path_has_hidden_component_under(&root, &roots));
-        assert!(!path_has_hidden_component_under(&root.join("app.conf"), &roots));
+        assert!(!path_has_hidden_component_under(
+            &root.join("app.conf"),
+            &roots
+        ));
 
         // A dot *below* the root still counts.
         assert!(path_has_hidden_component_under(
