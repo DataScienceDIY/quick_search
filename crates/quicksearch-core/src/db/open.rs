@@ -34,10 +34,11 @@ pub const KEY_MISMATCH_PREFIX: &str = "KEY_MISMATCH: ";
 /// classifier-derived values go stale: `files.mime`, `files.type` and
 /// `content_state` are computed at walk time and never re-derived for
 /// unchanged files, so a classification change (v5: text sniffing, charset
-/// decoding, RTF) needs the wipe to apply everywhere. Any such bump causes
-/// existing indexes to be wiped on next open — there's no migration path
-/// by design.
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+/// decoding, RTF; v6: the text sniff now requires valid UTF-8, so binaries
+/// previously stored as mojibake must be reclassified) needs the wipe to
+/// apply everywhere. Any such bump causes existing indexes to be wiped on
+/// next open — there's no migration path by design.
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// Open `db_path`, applying fast-path pragmas, and ensure the on-disk
 /// schema matches what this build expects. If it doesn't, delete the

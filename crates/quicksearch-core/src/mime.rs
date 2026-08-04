@@ -3,11 +3,17 @@
 //! [`guess_mime_from_head`] infers a MIME type in three stages: extension
 //! first (an override table, then `mime_guess`), magic-byte sniffing via
 //! `infer` next, and finally a text sniff ([`crate::textenc`]) that answers
-//! `text/plain` for anything whose head reads as text — which is how
-//! extensionless files (README, Makefile) and source extensions no MIME
-//! table knows (`.go`, `.zig`) get their contents indexed. Extensions in
-//! [`AMBIGUOUS_EXTENSIONS`] invert the order: content decides, and the
-//! extension's MIME is only a fallback.
+//! `text/plain` for a head that is *provably* text — valid UTF-8 or
+//! BOM-marked — which is how extensionless files (README, Makefile) and
+//! source extensions no MIME table knows (`.go`, `.zig`) get their contents
+//! indexed. Extensions in [`AMBIGUOUS_EXTENSIONS`] invert the order: content
+//! decides, and the extension's MIME is only a fallback.
+//!
+//! That last stage is the only one with no corroborating evidence behind it,
+//! so it demands the most from the bytes. Merely lacking NUL bytes does not
+//! qualify — protobuf and similar `0x80-0xFF` formats clear that bar and
+//! were being stored as mojibake full text. See [`crate::textenc`] for the
+//! measurements.
 //!
 //! [`mime_to_type`] then maps a MIME string to a [`FileType`] bitmask so a
 //! single file can belong to multiple categories (e.g. a `.docx` is
@@ -141,8 +147,8 @@ fn extension_override(path: &Path) -> Option<&'static str> {
 ///
 /// Extension first — an override table, then `mime_guess` — then magic
 /// bytes when those come up empty or say `application/octet-stream`, and
-/// finally a text sniff that answers `text/plain` for any head that reads
-/// as text ([`crate::textenc::looks_like_text`]). For
+/// finally a text sniff that answers `text/plain` for a head that is valid
+/// UTF-8 or BOM-marked ([`crate::textenc::looks_like_text`]). For
 /// [`AMBIGUOUS_EXTENSIONS`] the `mime_guess` answer is demoted to a last
 /// resort behind both content checks.
 ///
@@ -568,6 +574,38 @@ mod tests {
         assert_eq!(
             guess_mime_from_head(&blob, &[0x00, 0x01, 0x02, 0xFF]).as_deref(),
             None
+        );
+    }
+
+    /// The catch-all is the one stage with no corroborating evidence, so it
+    /// demands valid UTF-8. Formats made of high bytes clear the binary
+    /// guard (no NUL, no control bytes) yet are not text, and before this
+    /// they were adopted as `text/plain` and stored as mojibake.
+    #[test]
+    fn high_byte_binary_is_not_sniffed_as_text() {
+        use std::path::PathBuf;
+
+        // Head of a real protobuf-framed GPS log: varint record framing
+        // wrapping ASCII NMEA sentences. `mime_guess` has no `.pb`, `infer`
+        // has no protobuf matcher, so this reaches the sniff.
+        let mut pb = b"\x10\n\x02v1\x10\x01\x18\xe2\xe3\xfc\xd3\x9d\xca\x97\xe4\x189\x08".to_vec();
+        pb.extend_from_slice(b"\x12*$GNGGA,181558.00,,,,,0,00,99.99,,,,,,*78\r\n");
+        assert_eq!(guess_mime_from_head(&PathBuf::from("rtk.pb"), &pb), None);
+
+        // The other half of the contract: an extension the MIME table knows
+        // never reaches the sniff, so legacy-encoded documents still type as
+        // text and still get their charset decoded downstream.
+        let latin1 = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9.";
+        assert_eq!(
+            guess_mime_from_head(&PathBuf::from("notes.txt"), latin1).as_deref(),
+            Some("text/plain")
+        );
+
+        // And an unknown extension is not itself disqualifying — the bytes
+        // decide, so a `.pb` that really is UTF-8 text still indexes.
+        assert_eq!(
+            guess_mime_from_head(&PathBuf::from("notes.pb"), b"just some words\n").as_deref(),
+            Some("text/plain")
         );
     }
 
