@@ -47,6 +47,44 @@ pub fn ignore_pattern_valid(pattern: &str) -> bool {
     !trimmed.is_empty() && IgnoreSet::compile(&[pattern.to_string()]).is_ok()
 }
 
+/// An informational note for a pattern that is valid but likely does not
+/// mean what was typed, or `None`. Never an error: everything it fires on
+/// compiles and matches exactly as described.
+///
+/// The dot-leading case fires for `.git` too — "matches only items named
+/// exactly `.git`" is both true and the intended behavior there, so the
+/// note stays factual rather than guessing intent.
+pub fn pattern_hint(pattern: &str) -> Option<String> {
+    let p = pattern.trim();
+    // ".jpg" is an exact-name pattern, not an extension pattern — the trap
+    // behind "my ignore filters don't work" reports.
+    if p.len() >= 2 && p.starts_with('.') && !p.contains(['*', '?', '[', '/', '\\']) {
+        return Some(format!(
+            "Matches only files or folders named exactly \"{p}\". \
+             To ignore all {p} files, use \"*{p}\"."
+        ));
+    }
+    // "D:" can only match a component literally named "D:", which nothing
+    // ever is; the working spelling keeps the separator.
+    let b = p.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return Some(format!(
+            "\"{p}\" never matches anything — use \"{p}\\\" to ignore the whole drive."
+        ));
+    }
+    None
+}
+
+/// Render [`pattern_hint`] as a small orange label inside a stable section,
+/// so its appearance never shifts the ids of widgets below it.
+pub fn pattern_hint_label(ui: &mut egui::Ui, pattern: &str) {
+    stable_section(ui, |ui| {
+        if let Some(hint) = pattern_hint(pattern) {
+            ui.label(egui::RichText::new(hint).small().color(ORANGE));
+        }
+    });
+}
+
 /// Border color for a pattern editor holding `text`, or `None` to keep the
 /// theme's own border. A blank box is not wrong yet, just unfilled, so it
 /// stays neutral; only text the user actually typed is judged.
@@ -137,7 +175,53 @@ pub fn more_below_hint<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutp
 
 #[cfg(test)]
 mod tests {
-    use super::{ignore_pattern_valid, pattern_border, INVALID_RED, VALID_GREEN};
+    use super::{ignore_pattern_valid, pattern_border, pattern_hint, INVALID_RED, VALID_GREEN};
+
+    /// The trap behind "my ignore filters don't work" reports: ".jpg" is an
+    /// exact-name pattern, and the hint must say so and offer "*.jpg".
+    #[test]
+    fn extension_like_patterns_get_a_hint() {
+        let hint = pattern_hint(".jpg").expect("hint for .jpg");
+        assert!(hint.contains("*.jpg"), "{}", hint);
+        assert!(hint.contains("exactly"), "{}", hint);
+
+        // Fires for genuine exact-name patterns too — the statement it
+        // makes is just as true for .git, so no allowlist.
+        assert!(pattern_hint(".git").is_some());
+        assert!(pattern_hint("  .venv  ").is_some(), "trimmed first");
+
+        let targz = pattern_hint(".tar.gz").expect("hint for .tar.gz");
+        assert!(targz.contains("*.tar.gz"), "{}", targz);
+    }
+
+    #[test]
+    fn working_patterns_get_no_hint() {
+        for p in [
+            "*.jpg",        // the fixed spelling itself
+            "node_modules", // plain name
+            ".hidden*",     // wildcard: the author knows about globs
+            ".[jJ]pg",      // character class counts as a wildcard
+            ".git/",        // separator: a path pattern
+            r".git\",       // …either flavor
+            ".",            // too short to be an extension
+            "",
+            "   ",
+            "D:/",  // working drive-root spelling
+            r"D:\", // …either flavor
+            "cache-??",
+        ] {
+            assert_eq!(pattern_hint(p), None, "hinted on {:?}", p);
+        }
+    }
+
+    #[test]
+    fn bare_drive_letters_get_a_hint() {
+        let hint = pattern_hint("D:").expect("hint for D:");
+        assert!(hint.contains("D:\\"), "{}", hint);
+        assert!(pattern_hint("d:").is_some(), "case does not matter");
+        assert_eq!(pattern_hint("DD:"), None, "not a drive letter");
+        assert_eq!(pattern_hint("4:"), None, "not a drive letter");
+    }
 
     #[test]
     fn blank_patterns_are_invalid() {

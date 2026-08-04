@@ -78,8 +78,8 @@ impl Extractor for PlaintextExtractor {
     /// Neither case was ever atomic — a concurrent writer can tear a file
     /// across any read sequence, including `read_to_string`'s.
     fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError> {
-        let mut f = File::open(path)
-            .map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
+        let mut f =
+            File::open(path).map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
         let size = f
             .metadata()
             .map_err(|e| format!("plaintext read {}: {}", path.display(), e))?
@@ -148,10 +148,16 @@ mod tests {
 
     #[test]
     fn head_extraction_matches_reading_the_file() {
-        let p = tmp("agree", b"shared body with unicode: caf\xc3\xa9 \xe2\x9c\x93");
+        let p = tmp(
+            "agree",
+            b"shared body with unicode: caf\xc3\xa9 \xe2\x9c\x93",
+        );
         let from_disk = PlaintextExtractor.extract(&p).unwrap();
         let bytes = std::fs::read(&p).unwrap();
-        let from_head = PlaintextExtractor.extract_from_head(&p, &bytes).unwrap().unwrap();
+        let from_head = PlaintextExtractor
+            .extract_from_head(&p, &bytes)
+            .unwrap()
+            .unwrap();
         assert_eq!(from_disk.text, from_head.text);
         assert_eq!(from_disk.properties, from_head.properties);
         std::fs::remove_file(&p).ok();
@@ -168,7 +174,11 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(disk_err, head_err, "one decode path, one message");
-        assert!(disk_err.contains("binary"), "the failure names the file: {}", disk_err);
+        assert!(
+            disk_err.contains("binary"),
+            "the failure names the file: {}",
+            disk_err
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -177,7 +187,10 @@ mod tests {
         let body = b"une journ\xe9e agr\xe9able pr\xe8s de la rivi\xe8re";
         let p = tmp("latin1", body);
         let from_disk = PlaintextExtractor.extract(&p).unwrap();
-        let from_head = PlaintextExtractor.extract_from_head(&p, body).unwrap().unwrap();
+        let from_head = PlaintextExtractor
+            .extract_from_head(&p, body)
+            .unwrap()
+            .unwrap();
         assert_eq!(from_disk.text, from_head.text);
         assert_eq!(from_disk.text, "une journée agréable près de la rivière");
         std::fs::remove_file(&p).ok();
@@ -190,9 +203,15 @@ mod tests {
         body.extend(src.encode_utf16().flat_map(|u| u.to_le_bytes()));
         let p = tmp("utf16", &body);
         let from_disk = PlaintextExtractor.extract(&p).unwrap();
-        let from_head = PlaintextExtractor.extract_from_head(&p, &body).unwrap().unwrap();
+        let from_head = PlaintextExtractor
+            .extract_from_head(&p, &body)
+            .unwrap()
+            .unwrap();
         assert_eq!(from_disk.text, from_head.text);
-        assert_eq!(from_disk.text, src, "stored text is the UTF-8 decode, BOM stripped");
+        assert_eq!(
+            from_disk.text, src,
+            "stored text is the UTF-8 decode, BOM stripped"
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -213,7 +232,11 @@ mod tests {
         let p = tmp("empty", b"");
         assert_eq!(PlaintextExtractor.extract(&p).unwrap().text, "");
         assert_eq!(
-            PlaintextExtractor.extract_from_head(&p, &[]).unwrap().unwrap().text,
+            PlaintextExtractor
+                .extract_from_head(&p, &[])
+                .unwrap()
+                .unwrap()
+                .text,
             ""
         );
         std::fs::remove_file(&p).ok();

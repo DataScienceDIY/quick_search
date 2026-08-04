@@ -202,7 +202,9 @@ fn run(mode: &str, root: &str, db: &Path, interval: Duration) {
     assert!(done, "indexing did not finish within {:?}", TIMEOUT);
     service.stop_indexing().expect("stop");
 
-    report(mode, elapsed, baseline, hwm, &samples, db, interval, &at_peak);
+    report(
+        mode, elapsed, baseline, hwm, &samples, db, interval, &at_peak,
+    );
 }
 
 /// Flatten per-root progress into one line's worth of numbers. Roots are
@@ -242,7 +244,10 @@ fn report(
 ) {
     // One line per 5% of the run, so the shape is visible at any duration.
     let step = (samples.len() / 20).max(1);
-    eprintln!("\n  {:>8}  {:>10}  {:>9}  {:>10}  {}", "t", "RSS", "walked", "extracted", "phase");
+    eprintln!(
+        "\n  {:>8}  {:>10}  {:>9}  {:>10}  {}",
+        "t", "RSS", "walked", "extracted", "phase"
+    );
     for s in samples.iter().step_by(step) {
         eprintln!(
             "  {:>7.1}s  {:>10}  {:>9}  {:>10}  {}",
@@ -260,7 +265,12 @@ fn report(
     let files = samples.iter().map(|s| s.walked).max().unwrap_or(0);
     let db_bytes = db_size(db);
 
-    eprintln!("\n{} run: {:.1}s, {} files walked", mode, elapsed.as_secs_f64(), files);
+    eprintln!(
+        "\n{} run: {:.1}s, {} files walked",
+        mode,
+        elapsed.as_secs_f64(),
+        files
+    );
     match hwm {
         Some(h) => eprintln!("  peak RSS (VmHWM)  {}", mib(h)),
         None => eprintln!("  peak RSS (VmHWM)  unavailable"),
@@ -289,7 +299,10 @@ fn report(
             );
         }
     }
-    eprintln!("  database on disk  {} (counts toward RSS as page cache)", mib(db_bytes));
+    eprintln!(
+        "  database on disk  {} (counts toward RSS as page cache)",
+        mib(db_bytes)
+    );
 
     if !at_peak.entries.is_empty() {
         eprintln!("\n  resident bytes at the peak, by mapping:");
@@ -308,7 +321,10 @@ fn report(
         .collect();
     jumps.sort_by_key(|(delta, _)| std::cmp::Reverse(*delta));
     if !jumps.is_empty() {
-        eprintln!("\n  largest RSS rises between samples ({:?} apart):", interval);
+        eprintln!(
+            "\n  largest RSS rises between samples ({:?} apart):",
+            interval
+        );
         for (delta, s) in jumps.iter().take(8) {
             eprintln!(
                 "    +{:>9} to {:>10} at t={:>6.1}s  {}  {}",

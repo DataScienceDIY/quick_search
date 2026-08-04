@@ -49,7 +49,10 @@ fn main() {
     // Phase 1 in isolation: an empty index, so every file classifies as new.
     // The parallel walker reads its classification data from a database now,
     // so it gets a scratch one rather than an empty map.
-    let db = std::env::temp_dir().join(format!("quicksearch-walkprobe-{}.sqlite", std::process::id()));
+    let db = std::env::temp_dir().join(format!(
+        "quicksearch-walkprobe-{}.sqlite",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&db);
     quicksearch_core::db::open_or_recreate(db.to_str().unwrap(), &config.processing.tokenize)
         .expect("scratch index");
@@ -122,7 +125,9 @@ fn parallel(root: &str, config: &Config, db_path: &str) -> (usize, usize) {
         Arc::new(AtomicBool::new(false)),
         4,
     ) {
-        let WalkEvent::File(file) = event else { continue };
+        let WalkEvent::File(file) = event else {
+            continue;
+        };
         seen += 1;
         if file.record.is_some() {
             prepared += 1;

@@ -50,11 +50,42 @@ const LARGE_TEXT: usize = 100;
 const BINARY: usize = 100;
 
 const WORDS: &[&str] = &[
-    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
-    "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "indexer",
-    "rust", "cargo", "sqlite", "baloo", "tokenizer", "trigram", "snippet",
-    "ocean", "forest", "mountain", "river", "valley", "bridge", "tunnel",
-    "morning", "afternoon", "evening", "midnight", "yesterday", "today",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "quick",
+    "brown",
+    "fox",
+    "jumps",
+    "over",
+    "lazy",
+    "dog",
+    "indexer",
+    "rust",
+    "cargo",
+    "sqlite",
+    "baloo",
+    "tokenizer",
+    "trigram",
+    "snippet",
+    "ocean",
+    "forest",
+    "mountain",
+    "river",
+    "valley",
+    "bridge",
+    "tunnel",
+    "morning",
+    "afternoon",
+    "evening",
+    "midnight",
+    "yesterday",
+    "today",
 ];
 
 /// Deterministic so two runs index byte-identical trees and their timings are
@@ -63,7 +94,10 @@ struct Rng(u64);
 
 impl Rng {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 33
     }
 
@@ -74,12 +108,20 @@ impl Rng {
 
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
-    let tree = PathBuf::from(std::env::args().nth(2).expect("usage: indexprobe <gen|cold|warm> <tree> [db]"));
+    let tree = PathBuf::from(
+        std::env::args()
+            .nth(2)
+            .expect("usage: indexprobe <gen|cold|warm> <tree> [db]"),
+    );
 
     match mode.as_str() {
         "gen" => generate(&tree),
         "cold" | "warm" => {
-            let db = PathBuf::from(std::env::args().nth(3).expect("usage: indexprobe <cold|warm> <tree> <db>"));
+            let db = PathBuf::from(
+                std::env::args()
+                    .nth(3)
+                    .expect("usage: indexprobe <cold|warm> <tree> <db>"),
+            );
             if mode == "cold" {
                 for suffix in ["", "-wal", "-shm"] {
                     let _ = std::fs::remove_file(format!("{}{}", db.display(), suffix));

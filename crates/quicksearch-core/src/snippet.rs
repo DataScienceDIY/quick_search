@@ -142,7 +142,12 @@ pub fn extract_folded(text: &str, folded: &str, terms: &[&str], opts: &Options) 
     let ranges = matches
         .iter()
         .filter(|(s, e)| *e > win_start && *s < win_end)
-        .map(|(s, e)| ((*s).max(win_start) - win_start, (*e).min(win_end) - win_start))
+        .map(|(s, e)| {
+            (
+                (*s).max(win_start) - win_start,
+                (*e).min(win_end) - win_start,
+            )
+        })
         .collect();
 
     Snippet {

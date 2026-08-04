@@ -113,8 +113,7 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
                     if let Some(value) = value {
                         // Quoted values keep `*` literal; only a bare word's
                         // stars act as wildcards (`name:` honors this too).
-                        let value_is_word =
-                            matches!(tokens.get(value_idx), Some(Token::Word(_)));
+                        let value_is_word = matches!(tokens.get(value_idx), Some(Token::Word(_)));
                         if word.eq_ignore_ascii_case("regex") {
                             // Not a SQL filter: compiled here, matched in
                             // Rust against name, path and content.
@@ -150,8 +149,7 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
                         while let Some(Token::Op(next_op)) = tokens.get(i) {
                             glued.push_str(op_str(*next_op));
                             i += 1;
-                            if let Some(Token::Word(v)) | Some(Token::Quoted(v)) = tokens.get(i)
-                            {
+                            if let Some(Token::Word(v)) | Some(Token::Quoted(v)) = tokens.get(i) {
                                 glued.push_str(v);
                                 i += 1;
                             }
@@ -295,10 +293,14 @@ mod tests {
     fn a_windows_drive_path_reaches_the_filter_intact() {
         let q = split_for_cascade(r"path:C:\Users\me\docs").unwrap();
         assert_eq!(q.term, "", "the whole input is a filter");
-        assert!(matches!(
-            &q.filter_params[0],
-            Value::Text(t) if t == r"C:\Users\me\docs"
-        ), "{:?}", q.filter_params);
+        assert!(
+            matches!(
+                &q.filter_params[0],
+                Value::Text(t) if t == r"C:\Users\me\docs"
+            ),
+            "{:?}",
+            q.filter_params
+        );
     }
 
     #[test]

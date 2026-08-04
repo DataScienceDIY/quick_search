@@ -110,8 +110,7 @@ pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
         TextClass::Legacy => {
             // ISO-2022-JP detection is safe here: the browser caveat about
             // it concerns script-running web content, not indexed files.
-            let mut det =
-                chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
+            let mut det = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
             det.feed(&bytes, true);
             // Deny UTF-8: strict UTF-8 was already ruled out, so a UTF-8
             // guess could only mean malformed UTF-8.
@@ -119,10 +118,7 @@ pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
             let (text, _, _) = enc.decode(&bytes);
             Ok(text.into_owned())
         }
-        TextClass::Binary => Err(format!(
-            "plaintext read {}: binary content",
-            path.display()
-        )),
+        TextClass::Binary => Err(format!("plaintext read {}: binary content", path.display())),
     }
 }
 
@@ -139,7 +135,10 @@ mod tests {
     fn utf8_decodes_unchanged() {
         let body = "plain ascii and café über 日本語".as_bytes().to_vec();
         assert!(looks_like_text(&body));
-        assert_eq!(decode_text(body, &p()).unwrap(), "plain ascii and café über 日本語");
+        assert_eq!(
+            decode_text(body, &p()).unwrap(),
+            "plain ascii and café über 日本語"
+        );
     }
 
     #[test]
@@ -203,7 +202,10 @@ mod tests {
         assert!(!looks_like_text(&body));
         let err = decode_text(body, &p()).unwrap_err();
         assert!(err.contains("binary content"), "{err}");
-        assert!(err.contains("textenc-test-file"), "error must name the file: {err}");
+        assert!(
+            err.contains("textenc-test-file"),
+            "error must name the file: {err}"
+        );
     }
 
     #[test]
@@ -217,7 +219,8 @@ mod tests {
     #[test]
     fn ansi_log_is_text() {
         // ESC-heavy colored log output stays text.
-        let body = b"\x1b[31mERROR\x1b[0m something failed\n\x1b[33mWARN\x1b[0m retrying\n".to_vec();
+        let body =
+            b"\x1b[31mERROR\x1b[0m something failed\n\x1b[33mWARN\x1b[0m retrying\n".to_vec();
         assert!(looks_like_text(&body));
         assert!(decode_text(body, &p()).is_ok());
     }

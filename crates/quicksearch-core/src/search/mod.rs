@@ -55,10 +55,22 @@ pub struct SearchHit {
 
 #[derive(Debug, Clone)]
 pub enum SearchUpdate {
-    Started { generation: u64 },
-    Hits { generation: u64, hits: Vec<SearchHit> },
-    Completed { generation: u64, total: usize, limited: bool },
-    Error { generation: u64, message: String },
+    Started {
+        generation: u64,
+    },
+    Hits {
+        generation: u64,
+        hits: Vec<SearchHit>,
+    },
+    Completed {
+        generation: u64,
+        total: usize,
+        limited: bool,
+    },
+    Error {
+        generation: u64,
+        message: String,
+    },
 }
 
 impl SearchUpdate {
@@ -335,8 +347,9 @@ mod tests {
 
     #[test]
     fn corruption_and_syntax_classification_still_work() {
-        assert!(classify_sql_err("database disk image is malformed")
-            .starts_with("DATABASE_CORRUPTED:"));
+        assert!(
+            classify_sql_err("database disk image is malformed").starts_with("DATABASE_CORRUPTED:")
+        );
         assert!(classify_sql_err("fts5: syntax error near \"NEAR\"").starts_with("Search syntax"));
         assert!(classify_sql_err("no such table: files").starts_with("Search failed:"));
     }

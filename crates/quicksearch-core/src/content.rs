@@ -223,19 +223,16 @@ fn feeder(shared: &Shared, db_path: &str, mut cursor: ExtractCursor, max_size: i
     };
 
     while shared.take_feed_slot().is_some() {
-        let page = match crate::db::repo::pending_content_page(
-            &conn,
-            &cursor,
-            max_size,
-            FEED_PAGE as i64,
-        ) {
-            Ok(page) => page,
-            Err(e) => {
-                crate::log_warn!("{}", e);
-                shared.shutdown();
-                return;
-            }
-        };
+        let page =
+            match crate::db::repo::pending_content_page(&conn, &cursor, max_size, FEED_PAGE as i64)
+            {
+                Ok(page) => page,
+                Err(e) => {
+                    crate::log_warn!("{}", e);
+                    shared.shutdown();
+                    return;
+                }
+            };
         let last_page = page.len() < FEED_PAGE;
         if let Some((id, _, _, _)) = page.last() {
             cursor.last_id = *id;
@@ -318,7 +315,15 @@ pub fn extract_content(
             let stats = stats.clone();
             thread::spawn(move || {
                 crate::platform::set_background_priority();
-                worker(&shared, &tx, &registry, &config, &stop_flag, &suspend_flag, &stats)
+                worker(
+                    &shared,
+                    &tx,
+                    &registry,
+                    &config,
+                    &stop_flag,
+                    &suspend_flag,
+                    &stats,
+                )
             })
         })
         .collect();

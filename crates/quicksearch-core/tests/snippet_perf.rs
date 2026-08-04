@@ -28,23 +28,85 @@ const PAGE_SIZE: usize = 50;
 /// Word list we draw text from. Has enough variety that trigram posting
 /// lists stay non-trivial (hundreds of terms, not "the" 10000 times).
 const WORDS: &[&str] = &[
-    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
-    "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi", "rho",
-    "sigma", "tau", "upsilon", "phi", "chi", "psi", "omega",
-    "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
-    "rust", "cargo", "sqlite", "baloo", "indexer", "tokenizer", "trigram",
-    "contentless", "posting", "fts5", "snippet", "highlight",
-    "morning", "afternoon", "evening", "midnight", "yesterday", "today",
-    "ocean", "forest", "mountain", "river", "valley", "bridge", "tunnel",
-    "tokyo", "paris", "london", "berlin", "rome", "madrid", "vienna",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "iota",
+    "kappa",
+    "lambda",
+    "mu",
+    "nu",
+    "xi",
+    "omicron",
+    "pi",
+    "rho",
+    "sigma",
+    "tau",
+    "upsilon",
+    "phi",
+    "chi",
+    "psi",
+    "omega",
+    "quick",
+    "brown",
+    "fox",
+    "jumps",
+    "over",
+    "lazy",
+    "dog",
+    "rust",
+    "cargo",
+    "sqlite",
+    "baloo",
+    "indexer",
+    "tokenizer",
+    "trigram",
+    "contentless",
+    "posting",
+    "fts5",
+    "snippet",
+    "highlight",
+    "morning",
+    "afternoon",
+    "evening",
+    "midnight",
+    "yesterday",
+    "today",
+    "ocean",
+    "forest",
+    "mountain",
+    "river",
+    "valley",
+    "bridge",
+    "tunnel",
+    "tokyo",
+    "paris",
+    "london",
+    "berlin",
+    "rome",
+    "madrid",
+    "vienna",
 ];
 
 /// Query terms that appear in the seeded corpus, so every query returns
 /// real hits (not zero rows, which would skew against both paths equally
 /// but wouldn't exercise the snippet renderer at all).
 const QUERIES: &[&str] = &[
-    "quick", "rust", "baloo", "morning", "paris",
-    "tokyo", "forest", "indexer", "contentless", "trigram",
+    "quick",
+    "rust",
+    "baloo",
+    "morning",
+    "paris",
+    "tokyo",
+    "forest",
+    "indexer",
+    "contentless",
+    "trigram",
 ];
 
 fn seed_text(rng: &mut u64, target_words: usize) -> String {
@@ -127,14 +189,10 @@ fn snippet_paths_perf_comparison() {
         let tx = conn.unchecked_transaction().unwrap();
         {
             let mut ins_reg = tx
-                .prepare(
-                    "INSERT INTO st_regular(rowid, name, text) VALUES (?1, ?2, ?3)",
-                )
+                .prepare("INSERT INTO st_regular(rowid, name, text) VALUES (?1, ?2, ?3)")
                 .unwrap();
             let mut ins_con = tx
-                .prepare(
-                    "INSERT INTO st_contentless(rowid, name, text) VALUES (?1, ?2, ?3)",
-                )
+                .prepare("INSERT INTO st_contentless(rowid, name, text) VALUES (?1, ?2, ?3)")
                 .unwrap();
             let mut ins_blob = tx
                 .prepare(
@@ -164,17 +222,19 @@ fn snippet_paths_perf_comparison() {
     // Warm each table's page cache so the first run doesn't skew.
     for q in QUERIES.iter().take(2) {
         let mut s = conn
-            .prepare(
-                "SELECT rowid FROM st_regular WHERE st_regular MATCH ?1 LIMIT 50",
-            )
+            .prepare("SELECT rowid FROM st_regular WHERE st_regular MATCH ?1 LIMIT 50")
             .unwrap();
-        let _ = s.query_map(params![q], |r| r.get::<_, i64>(0)).unwrap().count();
+        let _ = s
+            .query_map(params![q], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .count();
         let mut s = conn
-            .prepare(
-                "SELECT rowid FROM st_contentless WHERE st_contentless MATCH ?1 LIMIT 50",
-            )
+            .prepare("SELECT rowid FROM st_contentless WHERE st_contentless MATCH ?1 LIMIT 50")
             .unwrap();
-        let _ = s.query_map(params![q], |r| r.get::<_, i64>(0)).unwrap().count();
+        let _ = s
+            .query_map(params![q], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .count();
     }
 
     // Path A: SQLite's built-in snippet() on a regular FTS5 table.
@@ -192,7 +252,11 @@ fn snippet_paths_perf_comparison() {
                 .unwrap();
             let rows = stmt
                 .query_map(params![q, PAGE_SIZE as i64], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
                 })
                 .unwrap();
             for r in rows {
@@ -225,10 +289,7 @@ fn snippet_paths_perf_comparison() {
                 .unwrap();
             let rows = stmt
                 .query_map(params![q, PAGE_SIZE as i64], |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, Option<Vec<u8>>>(1)?,
-                    ))
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, Option<Vec<u8>>>(1)?))
                 })
                 .unwrap();
             for row in rows {
@@ -253,8 +314,10 @@ fn snippet_paths_perf_comparison() {
     let a_per_row = dur_a.as_secs_f64() / rows_a_total as f64 * 1_000_000.0;
     let b_per_row = dur_b.as_secs_f64() / rows_b_total as f64 * 1_000_000.0;
     eprintln!();
-    eprintln!("snippet perf (NUM_DOCS={NUM_DOCS}, PAGE_SIZE={PAGE_SIZE}, QUERIES={}, reps={a_reps}):",
-        QUERIES.len());
+    eprintln!(
+        "snippet perf (NUM_DOCS={NUM_DOCS}, PAGE_SIZE={PAGE_SIZE}, QUERIES={}, reps={a_reps}):",
+        QUERIES.len()
+    );
     eprintln!(
         "  A (SQLite snippet(), regular FTS5):       {:.2?} total, {:.2} ms/query, {:.1} µs/row ({} rows)",
         dur_a, a_per_query, a_per_row, rows_a_total

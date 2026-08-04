@@ -184,7 +184,10 @@ fn rank_classification_across_all_stages() {
     }
 
     // Full-text hits carry snippets with valid ranges.
-    for h in hits.iter().filter(|h| h.stage == 5 || h.stage == 6 || h.stage == 8) {
+    for h in hits
+        .iter()
+        .filter(|h| h.stage == 5 || h.stage == 6 || h.stage == 8)
+    {
         let snip = h.snippet.as_ref().expect("full-text hit has a snippet");
         for &(a, b) in &snip.ranges {
             assert!(a < b && b <= snip.window.len());
@@ -206,7 +209,9 @@ fn path_substring_tiers_split_by_case() {
 
     let (hits, _) = run_collect(&conn, "Vacation", &SearchOptions::default());
     assert_eq!(
-        hits.iter().map(|h| (h.file_id, h.stage)).collect::<Vec<_>>(),
+        hits.iter()
+            .map(|h| (h.file_id, h.stage))
+            .collect::<Vec<_>>(),
         vec![(exact, 9), (anycase, 10)],
         "exact-case path matches outrank any-case ones"
     );
@@ -274,7 +279,9 @@ fn path_tiers_respect_the_three_char_floor() {
     // is off here so `ab.txt`, a 1-edit match for `abc`, stays out of it.)
     let (long, _) = run_collect(&conn, "abc", &SearchOptions::default());
     assert_eq!(
-        long.iter().map(|h| (h.file_id, h.stage)).collect::<Vec<_>>(),
+        long.iter()
+            .map(|h| (h.file_id, h.stage))
+            .collect::<Vec<_>>(),
         vec![(dir_only, 9)],
         "3-char term: the directory match surfaces"
     );
@@ -293,7 +300,9 @@ fn term_with_separator_matches_across_the_path() {
 
     let (hits, _) = run_collect(&conn, "docs/report", &SearchOptions::default());
     assert_eq!(
-        hits.iter().map(|h| (h.file_id, h.stage)).collect::<Vec<_>>(),
+        hits.iter()
+            .map(|h| (h.file_id, h.stage))
+            .collect::<Vec<_>>(),
         vec![(nested, 9)],
         "a term spanning a separator can only match the full path"
     );
@@ -383,12 +392,7 @@ fn occurrence_counts_order_within_rank() {
     let mut s = Seeder::new(&p, true);
     let one = s.add("one.txt", "/d", 1, Some("zebra"));
     let three = s.add("three.txt", "/d", 2, Some("zebra zebra zebra"));
-    let thousand = s.add(
-        "thousand.txt",
-        "/d",
-        3,
-        Some(&"zebra ".repeat(1500)),
-    );
+    let thousand = s.add("thousand.txt", "/d", 3, Some(&"zebra ".repeat(1500)));
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "zebra", &SearchOptions::default());
@@ -551,7 +555,10 @@ fn session_ignores_hide_hits_before_the_cap() {
         ..SearchOptions::default()
     };
     let (hits, outcome) = run_collect(&conn, "match", &options);
-    assert_eq!(hits.iter().map(|h| h.file_id).collect::<Vec<_>>(), vec![keep]);
+    assert_eq!(
+        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        vec![keep]
+    );
     assert_eq!(outcome.total, 1, "ignored rows never count toward totals");
 
     drop(conn);
@@ -634,9 +641,17 @@ fn wildcard_name_ranks_through_the_same_tiers() {
 
     let (hits, _) = run_collect(&conn, "report*", &SearchOptions::default());
     assert_eq!(
-        hits.iter().map(|h| (h.file_id, h.stage)).collect::<Vec<_>>(),
+        hits.iter()
+            .map(|h| (h.file_id, h.stage))
+            .collect::<Vec<_>>(),
         // Within rank 3 the tie breaks by name: "2024…" sorts first.
-        vec![(whole_cs, 1), (whole_ci, 2), (suffix, 3), (sub_cs, 3), (sub_ci, 4)],
+        vec![
+            (whole_cs, 1),
+            (whole_ci, 2),
+            (suffix, 3),
+            (sub_cs, 3),
+            (sub_ci, 4)
+        ],
         "wildcard terms rank exactly like literal ones"
     );
 
@@ -697,7 +712,11 @@ fn wildcard_leaves_like_metacharacters_literal() {
     let (hits, _) = run_collect(&conn, "100*", &SearchOptions::default());
     let mut ids: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
     ids.sort();
-    assert_eq!(ids, vec![percent, underscore], "star globs, % and _ stay literal");
+    assert_eq!(
+        ids,
+        vec![percent, underscore],
+        "star globs, % and _ stay literal"
+    );
 
     drop(conn);
     std::fs::remove_file(&p).ok();
@@ -715,11 +734,16 @@ fn wildcard_fulltext_narrows_with_fts_and_verifies_order() {
 
     let (hits, _) = run_collect(&conn, "wond*world", &SearchOptions::default());
     assert_eq!(
-        hits.iter().map(|h| (h.file_id, h.stage)).collect::<Vec<_>>(),
+        hits.iter()
+            .map(|h| (h.file_id, h.stage))
+            .collect::<Vec<_>>(),
         vec![(ordered, 5)],
         "unordered FTS candidates must fail pattern verification"
     );
-    let snip = hits[0].snippet.as_ref().expect("wildcard hit has a snippet");
+    let snip = hits[0]
+        .snippet
+        .as_ref()
+        .expect("wildcard hit has a snippet");
     assert_eq!(snip.ranges.len(), 1);
     let (a, b) = snip.ranges[0];
     assert_eq!(&snip.window[a..b], "wondrous world");
@@ -740,7 +764,9 @@ fn wildcard_with_short_segments_falls_back_to_a_full_scan() {
 
     let (hits, _) = run_collect(&conn, "ab*cd", &SearchOptions::default());
     assert_eq!(
-        hits.iter().map(|h| (h.file_id, h.stage)).collect::<Vec<_>>(),
+        hits.iter()
+            .map(|h| (h.file_id, h.stage))
+            .collect::<Vec<_>>(),
         vec![(hit, 5)]
     );
 
@@ -764,7 +790,10 @@ fn wildcard_path_tier_and_filters() {
 
     // Structured filters gate wildcard scans like any other.
     let (kept, _) = run_collect(&conn, "Vac*tion path:/elsewhere", &SearchOptions::default());
-    assert_eq!(kept.iter().map(|h| h.file_id).collect::<Vec<_>>(), vec![_filtered]);
+    assert_eq!(
+        kept.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        vec![_filtered]
+    );
 
     drop(conn);
     std::fs::remove_file(&p).ok();
@@ -803,7 +832,9 @@ fn contentless_wildcard_degrades_to_unranked_stage6() {
     // text the row can't be pattern-verified and lands at count-unknown 6.
     let (hits, _) = run_collect(&conn, "wal*rus", &SearchOptions::default());
     assert_eq!(
-        hits.iter().map(|h| (h.file_id, h.stage)).collect::<Vec<_>>(),
+        hits.iter()
+            .map(|h| (h.file_id, h.stage))
+            .collect::<Vec<_>>(),
         vec![(doc, 6)]
     );
     assert!(hits[0].snippet.is_none());
@@ -829,7 +860,9 @@ fn regex_only_query_hits_name_content_and_path() {
 
     let (hits, _) = run_collect(&conn, r"regex:qz\d+", &SearchOptions::default());
     assert_eq!(
-        hits.iter().map(|h| (h.file_id, h.stage)).collect::<Vec<_>>(),
+        hits.iter()
+            .map(|h| (h.file_id, h.stage))
+            .collect::<Vec<_>>(),
         vec![(by_name, 4), (by_content, 6), (by_path, 10)],
         "regex-only reuses the name/content/path tiers in cascade order"
     );
@@ -859,7 +892,10 @@ fn regex_is_case_insensitive_by_default_and_respects_filters() {
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, r"regex:qz\d path:/keep", &SearchOptions::default());
-    assert_eq!(hits.iter().map(|h| h.file_id).collect::<Vec<_>>(), vec![keep]);
+    assert_eq!(
+        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        vec![keep]
+    );
 
     // Inline opt-out flips it back to case-sensitive.
     let (cs, _) = run_collect(&conn, r"regex:(?-i:qz)\d", &SearchOptions::default());
@@ -882,7 +918,9 @@ fn regex_alongside_a_term_is_an_accept_predicate() {
 
     let (hits, _) = run_collect(&conn, r"budget regex:acme\d", &SearchOptions::default());
     assert_eq!(
-        hits.iter().map(|h| (h.file_id, h.stage)).collect::<Vec<_>>(),
+        hits.iter()
+            .map(|h| (h.file_id, h.stage))
+            .collect::<Vec<_>>(),
         vec![(kept, 3)],
         "the term drives ranking; the regex gates acceptance"
     );
@@ -926,7 +964,10 @@ fn service_surfaces_invalid_regex_as_an_error() {
     let mut message = None;
     while std::time::Instant::now() < deadline {
         match updates.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(SearchUpdate::Error { generation: g, message: m }) if g == generation => {
+            Ok(SearchUpdate::Error {
+                generation: g,
+                message: m,
+            }) if g == generation => {
                 message = Some(m);
                 break;
             }
@@ -1073,7 +1114,11 @@ fn a_pass_hands_hits_over_before_the_scan_reaches_the_end() {
 
     assert_eq!(outcome.total, 2, "both matches still reach the sink");
     assert_eq!(
-        batches.first().map(|b| b.as_slice()).and_then(|b| b.first()).map(|h| h.file_id),
+        batches
+            .first()
+            .map(|b| b.as_slice())
+            .and_then(|b| b.first())
+            .map(|h| h.file_id),
         Some(early_worse),
         "the early hit should have gone out before the scan found the better one; \
          batch sizes: {:?}",

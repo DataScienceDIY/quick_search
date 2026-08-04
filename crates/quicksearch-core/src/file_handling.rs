@@ -1,17 +1,17 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, Arc};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 // Only the Unix entry-count path shells out; Windows walks the tree directly.
+use std::collections::HashMap;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
-use std::collections::HashMap;
 
-use sha2::{Sha256, Digest};
-use walkdir::{DirEntry, WalkDir};
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+use walkdir::{DirEntry, WalkDir};
 
 use crate::config::{Config, IgnoreSet};
 use crate::db::repo::{self, NewFile};
@@ -57,7 +57,10 @@ pub(crate) fn path_to_db_string(path: &Path) -> String {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{}", rest)
-    } else if let Some(rest) = s.strip_prefix(r"\\?\").filter(|r| starts_with_drive_letter(r)) {
+    } else if let Some(rest) = s
+        .strip_prefix(r"\\?\")
+        .filter(|r| starts_with_drive_letter(r))
+    {
         rest.to_string()
     } else {
         s.into_owned()
@@ -143,7 +146,6 @@ fn parent_str(path: &str) -> String {
         .unwrap_or_default()
 }
 
-
 /// Paths a walk could not read, collected as it runs.
 ///
 /// A full run deletes index rows for everything it did not see, so "I could
@@ -218,6 +220,12 @@ fn walk_filter(e: &DirEntry, include_hidden: bool, ignore: &IgnoreSet) -> bool {
 /// Directories that cannot be read are recorded in `failures` rather than
 /// silently skipped, so the caller can tell an unreadable subtree apart
 /// from a deleted one.
+///
+/// Unlike the parallel walker's symlink resolution, entries here never grow
+/// a Windows `\\?\` prefix: walkdir does not canonicalize — every yielded
+/// path is `root` plus name components — and the callers pass plainly-spelled
+/// roots, so `walk_filter`'s full-path ignore matching sees the same spelling
+/// the patterns use.
 fn walk_entries<'a>(
     root: &str,
     follow_symlinks: bool,
@@ -277,7 +285,6 @@ pub fn filtered_dirs<'a>(
     walk_entries(root, follow_symlinks, include_hidden, ignore, failures)
         .filter(|entry| entry.file_type().is_dir())
 }
-
 
 #[cfg(unix)]
 fn parse_wc_l_stdout(bytes: &[u8]) -> Result<usize, String> {
@@ -425,15 +432,14 @@ pub fn count_tree_entries_fast(
     }
     #[cfg(all(unix, target_os = "linux"))]
     {
-        return count_find_pipe_wc(path, cancel, true)
-            .or_else(|e| {
-                if e.contains("cancelled") {
-                    Err(e)
-                } else {
-                    // Non-GNU find without -printf: plain listing.
-                    count_find_pipe_wc(path, cancel, false)
-                }
-            });
+        return count_find_pipe_wc(path, cancel, true).or_else(|e| {
+            if e.contains("cancelled") {
+                Err(e)
+            } else {
+                // Non-GNU find without -printf: plain listing.
+                count_find_pipe_wc(path, cancel, false)
+            }
+        });
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -488,13 +494,13 @@ fn safe_truncate_string(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    
+
     // Find the last valid UTF-8 character boundary at or before max_bytes
     let mut end = max_bytes;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    
+
     s[..end].to_string()
 }
 
@@ -779,8 +785,7 @@ pub fn content_extractable(
     config: &Config,
     registry: &Registry,
 ) -> bool {
-    crate::config::content_allowed(path, config)
-        && mime.is_some_and(|m| registry.supports(m))
+    crate::config::content_allowed(path, config) && mime.is_some_and(|m| registry.supports(m))
 }
 
 /// Read `path` and decide what its content row should say. No database access,
@@ -1165,8 +1170,7 @@ pub fn store_extracted(
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
         for row in batch {
-            if let Err(e) =
-                store_content_outcome(&tx, row.file_id, &row.name, &row.outcome, config)
+            if let Err(e) = store_content_outcome(&tx, row.file_id, &row.name, &row.outcome, config)
             {
                 crate::log_warn!("content indexing for {}: {}", row.name, e);
                 continue;
@@ -1221,18 +1225,33 @@ mod tests {
         ])
         .unwrap();
 
-        let mut names: Vec<String> = filtered_walk(root.to_str().unwrap(), false, false, &ignore, &UnreadableDirs::default())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+        let mut names: Vec<String> = filtered_walk(
+            root.to_str().unwrap(),
+            false,
+            false,
+            &ignore,
+            &UnreadableDirs::default(),
+        )
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
         names.sort();
         assert_eq!(names, vec!["keep.txt", "keep2.txt"]);
 
         // include_hidden brings back dotfiles but ignores still apply.
-        let mut names: Vec<String> = filtered_walk(root.to_str().unwrap(), false, true, &ignore, &UnreadableDirs::default())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+        let mut names: Vec<String> = filtered_walk(
+            root.to_str().unwrap(),
+            false,
+            true,
+            &ignore,
+            &UnreadableDirs::default(),
+        )
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
         names.sort();
-        assert_eq!(names, vec![".dotfile", "inside.txt", "keep.txt", "keep2.txt"]);
+        assert_eq!(
+            names,
+            vec![".dotfile", "inside.txt", "keep.txt", "keep2.txt"]
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1332,9 +1351,15 @@ mod tests {
         let root = base.join(".config");
         touch(&root.join("app.conf"));
         let ignore = IgnoreSet::compile(&[]).unwrap();
-        let names: Vec<String> = filtered_walk(root.to_str().unwrap(), false, false, &ignore, &UnreadableDirs::default())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+        let names: Vec<String> = filtered_walk(
+            root.to_str().unwrap(),
+            false,
+            false,
+            &ignore,
+            &UnreadableDirs::default(),
+        )
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
         assert_eq!(names, vec!["app.conf"]);
         std::fs::remove_dir_all(&base).ok();
     }
@@ -1372,8 +1397,14 @@ mod tests {
 
     #[test]
     fn db_path_strips_windows_prefixes() {
-        assert_eq!(path_to_db_string(Path::new("/plain/unix/path")), "/plain/unix/path");
-        assert_eq!(path_to_db_string(Path::new(r"\\?\C:\docs\a.txt")), r"C:\docs\a.txt");
+        assert_eq!(
+            path_to_db_string(Path::new("/plain/unix/path")),
+            "/plain/unix/path"
+        );
+        assert_eq!(
+            path_to_db_string(Path::new(r"\\?\C:\docs\a.txt")),
+            r"C:\docs\a.txt"
+        );
         // A share must come back as \\server\share, not UNC\server\share —
         // stripping a fixed four characters produces a path that cannot be
         // opened, and every file beneath it would be misfiled.
@@ -1448,9 +1479,8 @@ mod tests {
         let missing = real.join("gone").join("deeper.txt");
         let key = db_key_for_missing_path(&missing);
 
-        let expected = path_to_db_string(
-            &real.canonicalize().unwrap().join("gone").join("deeper.txt"),
-        );
+        let expected =
+            path_to_db_string(&real.canonicalize().unwrap().join("gone").join("deeper.txt"));
         assert_eq!(key, expected, "existing prefix resolved, missing tail kept");
 
         // A redundant component in the *existing* part is collapsed, which is
@@ -1504,20 +1534,19 @@ mod tests {
 
             let ignore = IgnoreSet::compile(&[]).unwrap();
             let failures = UnreadableDirs::default();
-            let names: Vec<String> = filtered_walk(
-                root.to_str().unwrap(),
-                false,
-                false,
-                &ignore,
-                &failures,
-            )
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+            let names: Vec<String> =
+                filtered_walk(root.to_str().unwrap(), false, false, &ignore, &failures)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
 
             // Restore before asserting so a failure still cleans up.
             std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
 
-            assert_eq!(names, vec!["a.txt"], "the unreadable subtree yields nothing");
+            assert_eq!(
+                names,
+                vec!["a.txt"],
+                "the unreadable subtree yields nothing"
+            );
             assert!(!failures.is_empty(), "and that failure must be recorded");
             assert!(
                 failures.covers(locked.join("hidden-from-us.txt").to_str().unwrap()),
@@ -1542,7 +1571,11 @@ mod tests {
         // Differs within the head window.
         std::fs::write(&c, [b"DIFF".as_slice(), &[0u8; 64], b"AAAA"].concat()).unwrap();
 
-        let h = |p: &Path| get_file_hash(std::fs::metadata(p).unwrap().len(), p, 8).unwrap().0;
+        let h = |p: &Path| {
+            get_file_hash(std::fs::metadata(p).unwrap().len(), p, 8)
+                .unwrap()
+                .0
+        };
         assert_eq!(h(&a), h(&b), "tail differences are invisible by design");
         assert_ne!(h(&a), h(&c), "head differences are caught");
 
@@ -1699,9 +1732,15 @@ mod count_and_extract_tests {
         let cfg = Config::default();
         assert!(needs(&cfg, "notes.txt"), "plaintext is claimed");
         assert!(needs(&cfg, "song.mp3"), "audio tags are content too");
-        assert!(needs(&cfg, "README"), "an extensionless text head sniffs as text/plain");
+        assert!(
+            needs(&cfg, "README"),
+            "an extensionless text head sniffs as text/plain"
+        );
         assert!(!needs(&cfg, "movie.mp4"), "no extractor claims video");
-        assert!(!needs(&cfg, "blob.bin"), "binary content: no MIME, no extractor");
+        assert!(
+            !needs(&cfg, "blob.bin"),
+            "binary content: no MIME, no extractor"
+        );
 
         // Over `maximum_text_file_size`, so the content pass would never read
         // it even though plaintext claims the MIME.

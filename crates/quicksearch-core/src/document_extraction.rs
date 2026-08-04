@@ -1,27 +1,27 @@
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{Read, BufReader};
+use std::io::{BufReader, Read};
 
-use zip::ZipArchive;
-use quick_xml::Reader;
 use quick_xml::events::Event;
+use quick_xml::Reader;
+use zip::ZipArchive;
 
 /// Extract text from DOCX files by parsing the word/document.xml
 pub fn extract_text_from_docx(file_path: &OsString) -> Result<String, Box<dyn std::error::Error>> {
     let file = File::open(file_path)?;
     let mut archive = ZipArchive::new(BufReader::new(file))?;
-    
+
     let mut document_xml = archive.by_name("word/document.xml")?;
     let mut content = String::new();
     document_xml.read_to_string(&mut content)?;
-    
+
     let mut reader = Reader::from_str(&content);
     reader.trim_text(true);
-    
+
     let mut text_content = String::new();
     let mut buf = Vec::new();
     let mut in_text = false;
-    
+
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
@@ -45,7 +45,7 @@ pub fn extract_text_from_docx(file_path: &OsString) -> Result<String, Box<dyn st
         }
         buf.clear();
     }
-    
+
     Ok(text_content)
 }
 
@@ -53,20 +53,20 @@ pub fn extract_text_from_docx(file_path: &OsString) -> Result<String, Box<dyn st
 pub fn extract_text_from_xlsx(file_path: &OsString) -> Result<String, Box<dyn std::error::Error>> {
     let file = File::open(file_path)?;
     let mut archive = ZipArchive::new(BufReader::new(file))?;
-    
+
     let mut text_content = String::new();
-    
+
     // First, read shared strings if they exist
     let mut shared_strings = Vec::new();
     if let Ok(mut shared_strings_xml) = archive.by_name("xl/sharedStrings.xml") {
         let mut content = String::new();
         shared_strings_xml.read_to_string(&mut content)?;
-        
+
         let mut reader = Reader::from_str(&content);
         reader.trim_text(true);
         let mut buf = Vec::new();
         let mut in_text = false;
-        
+
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) => {
@@ -88,7 +88,7 @@ pub fn extract_text_from_xlsx(file_path: &OsString) -> Result<String, Box<dyn st
             buf.clear();
         }
     }
-    
+
     // Read worksheets
     for i in 0..archive.len() {
         let file_name = archive.by_index(i)?.name().to_string();
@@ -96,13 +96,13 @@ pub fn extract_text_from_xlsx(file_path: &OsString) -> Result<String, Box<dyn st
             let mut sheet_xml = archive.by_index(i)?;
             let mut content = String::new();
             sheet_xml.read_to_string(&mut content)?;
-            
+
             let mut reader = Reader::from_str(&content);
             reader.trim_text(true);
             let mut buf = Vec::new();
             let mut in_cell = false;
             let mut cell_type = String::new();
-            
+
             loop {
                 match reader.read_event_into(&mut buf) {
                     Ok(Event::Start(ref e)) => {
@@ -148,7 +148,7 @@ pub fn extract_text_from_xlsx(file_path: &OsString) -> Result<String, Box<dyn st
             }
         }
     }
-    
+
     Ok(text_content)
 }
 
@@ -156,9 +156,9 @@ pub fn extract_text_from_xlsx(file_path: &OsString) -> Result<String, Box<dyn st
 pub fn extract_text_from_pptx(file_path: &OsString) -> Result<String, Box<dyn std::error::Error>> {
     let file = File::open(file_path)?;
     let mut archive = ZipArchive::new(BufReader::new(file))?;
-    
+
     let mut text_content = String::new();
-    
+
     // Read all slide files
     for i in 0..archive.len() {
         let file_name = archive.by_index(i)?.name().to_string();
@@ -166,12 +166,12 @@ pub fn extract_text_from_pptx(file_path: &OsString) -> Result<String, Box<dyn st
             let mut slide_xml = archive.by_index(i)?;
             let mut content = String::new();
             slide_xml.read_to_string(&mut content)?;
-            
+
             let mut reader = Reader::from_str(&content);
             reader.trim_text(true);
             let mut buf = Vec::new();
             let mut in_text = false;
-            
+
             loop {
                 match reader.read_event_into(&mut buf) {
                     Ok(Event::Start(ref e)) => {
@@ -197,7 +197,7 @@ pub fn extract_text_from_pptx(file_path: &OsString) -> Result<String, Box<dyn st
             text_content.push_str("\n--- New Slide ---\n");
         }
     }
-    
+
     Ok(text_content)
 }
 
@@ -205,23 +205,26 @@ pub fn extract_text_from_pptx(file_path: &OsString) -> Result<String, Box<dyn st
 pub fn extract_text_from_odt(file_path: &OsString) -> Result<String, Box<dyn std::error::Error>> {
     let file = File::open(file_path)?;
     let mut archive = ZipArchive::new(BufReader::new(file))?;
-    
+
     let mut content_xml = archive.by_name("content.xml")?;
     let mut content = String::new();
     content_xml.read_to_string(&mut content)?;
-    
+
     let mut reader = Reader::from_str(&content);
     reader.trim_text(true);
-    
+
     let mut text_content = String::new();
     let mut buf = Vec::new();
     let mut in_text = false;
-    
+
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 let name = e.name();
-                if name.as_ref() == b"text:p" || name.as_ref() == b"text:h" || name.as_ref() == b"text:span" {
+                if name.as_ref() == b"text:p"
+                    || name.as_ref() == b"text:h"
+                    || name.as_ref() == b"text:span"
+                {
                     in_text = true;
                 }
             }
@@ -242,7 +245,7 @@ pub fn extract_text_from_odt(file_path: &OsString) -> Result<String, Box<dyn std
         }
         buf.clear();
     }
-    
+
     Ok(text_content)
 }
 
@@ -250,23 +253,26 @@ pub fn extract_text_from_odt(file_path: &OsString) -> Result<String, Box<dyn std
 pub fn extract_text_from_odp(file_path: &OsString) -> Result<String, Box<dyn std::error::Error>> {
     let file = File::open(file_path)?;
     let mut archive = ZipArchive::new(BufReader::new(file))?;
-    
+
     let mut content_xml = archive.by_name("content.xml")?;
     let mut content = String::new();
     content_xml.read_to_string(&mut content)?;
-    
+
     let mut reader = Reader::from_str(&content);
     reader.trim_text(true);
-    
+
     let mut text_content = String::new();
     let mut buf = Vec::new();
     let mut in_text = false;
-    
+
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 let name = e.name();
-                if name.as_ref() == b"text:p" || name.as_ref() == b"text:h" || name.as_ref() == b"text:span" {
+                if name.as_ref() == b"text:p"
+                    || name.as_ref() == b"text:h"
+                    || name.as_ref() == b"text:span"
+                {
                     in_text = true;
                 }
             }
@@ -287,7 +293,7 @@ pub fn extract_text_from_odp(file_path: &OsString) -> Result<String, Box<dyn std
         }
         buf.clear();
     }
-    
+
     Ok(text_content)
 }
 
@@ -295,18 +301,18 @@ pub fn extract_text_from_odp(file_path: &OsString) -> Result<String, Box<dyn std
 pub fn extract_text_from_ods(file_path: &OsString) -> Result<String, Box<dyn std::error::Error>> {
     let file = File::open(file_path)?;
     let mut archive = ZipArchive::new(BufReader::new(file))?;
-    
+
     let mut content_xml = archive.by_name("content.xml")?;
     let mut content = String::new();
     content_xml.read_to_string(&mut content)?;
-    
+
     let mut reader = Reader::from_str(&content);
     reader.trim_text(true);
-    
+
     let mut text_content = String::new();
     let mut buf = Vec::new();
     let mut in_text = false;
-    
+
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
@@ -333,12 +339,15 @@ pub fn extract_text_from_ods(file_path: &OsString) -> Result<String, Box<dyn std
         }
         buf.clear();
     }
-    
+
     Ok(text_content)
 }
 
 /// Extract text from various document formats
-pub fn extract_document_text(file_path: &OsString, extension: &str) -> Result<String, Box<dyn std::error::Error>> {
+pub fn extract_document_text(
+    file_path: &OsString,
+    extension: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
     match extension {
         "docx" => extract_text_from_docx(file_path),
         "doc" => {
@@ -359,6 +368,6 @@ pub fn extract_document_text(file_path: &OsString, extension: &str) -> Result<St
         "odt" => extract_text_from_odt(file_path),
         "odp" => extract_text_from_odp(file_path),
         "ods" => extract_text_from_ods(file_path),
-        _ => Ok(String::new())
+        _ => Ok(String::new()),
     }
 }

@@ -71,7 +71,7 @@ impl Bitap {
         let done = 1u64 << (self.len - 1);
         let mut hit = None;
         let mut prev_old = r[0]; // R_old[d-1] for the d-th iteration
-        // d = 0: exact prefix extension only.
+                                 // d = 0: exact prefix extension only.
         r[0] = ((r[0] << 1) | 1) & mask;
         if r[0] & done != 0 {
             hit = Some(0);
@@ -81,7 +81,7 @@ impl Bitap {
             r[d] = (((old << 1) | 1) & mask)      // extend a ≤d-error state
                 | prev_old                          // insertion in text
                 | (prev_old << 1)                   // substitution
-                | ((r[d - 1] << 1) | 1);            // deletion (pattern byte skipped)
+                | ((r[d - 1] << 1) | 1); // deletion (pattern byte skipped)
             prev_old = old;
             if hit.is_none() && r[d] & done != 0 {
                 hit = Some(d);
@@ -335,7 +335,9 @@ mod tests {
         // Deterministic LCG so the test is reproducible.
         let mut seed: u64 = 0x2545F4914F6CDD1D;
         let mut rng = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as usize
         };
         let alphabet = b"abcx";

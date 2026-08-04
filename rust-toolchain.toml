@@ -1,0 +1,12 @@
+# Pinning the toolchain keeps CI from silently tracking whatever `stable` became
+# overnight, and rustup honours this file automatically, so build.sh, build.bat
+# and a plain `cargo build` all pick it up with no extra arguments.
+#
+# The floor is set by eframe/egui 0.32, which declare rust-version = "1.85".
+#
+# Listing the Windows target here is what lets the cross-compile CI job skip
+# `rustup target add`: rustup installs everything named below on first use.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu"]

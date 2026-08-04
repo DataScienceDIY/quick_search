@@ -134,7 +134,11 @@ pub(crate) fn open_existing_keyed(
     write: bool,
     key: Option<&IndexKey>,
 ) -> Result<Connection, String> {
-    let pragmas = if write { PRAGMAS_FAST } else { PRAGMAS_READONLY };
+    let pragmas = if write {
+        PRAGMAS_FAST
+    } else {
+        PRAGMAS_READONLY
+    };
     open_keyed_with_pragmas(db_path, write, key, pragmas)
 }
 
@@ -295,8 +299,10 @@ fn key_mismatch_message(db_path: &str, had_key: bool) -> String {
         })
         .unwrap_or(false);
     let detail = match (had_key, plaintext) {
-        (true, true) => "password protection is enabled but the index is not encrypted; \
-                         rebuild the index to encrypt it",
+        (true, true) => {
+            "password protection is enabled but the index is not encrypted; \
+                         rebuild the index to encrypt it"
+        }
         (true, false) => "wrong password (or the file is not a QuickSearch index)",
         (false, _) => "the index is password-protected; a password is required",
     };
@@ -709,12 +715,16 @@ mod tests {
         let p = tmp_db_path();
         {
             let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-            let indexer: i64 = conn.query_row("PRAGMA temp_store", [], |r| r.get(0)).unwrap();
+            let indexer: i64 = conn
+                .query_row("PRAGMA temp_store", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(indexer, 2, "the indexer's own profile is MEMORY");
         }
 
         let conn = open_maintenance(p.to_str().unwrap()).unwrap();
-        let store: i64 = conn.query_row("PRAGMA temp_store", [], |r| r.get(0)).unwrap();
+        let store: i64 = conn
+            .query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(store, 1, "maintenance must build its temporaries on disk");
 
         // And the directory those temporaries land in is steerable, which is
@@ -726,7 +736,8 @@ mod tests {
             .query_row("PRAGMA temp_store_directory", [], |r| r.get(0))
             .unwrap();
         assert_eq!(set, dir);
-        conn.execute_batch("PRAGMA temp_store_directory = '';").unwrap();
+        conn.execute_batch("PRAGMA temp_store_directory = '';")
+            .unwrap();
 
         drop(conn);
         std::fs::remove_file(&p).ok();
@@ -754,8 +765,11 @@ mod tests {
         // Age it, exactly as a version bump does.
         {
             let conn = open_existing(p.to_str().unwrap(), true).unwrap();
-            conn.execute("UPDATE schema_info SET value = '1' WHERE key = 'version'", [])
-                .unwrap();
+            conn.execute(
+                "UPDATE schema_info SET value = '1' WHERE key = 'version'",
+                [],
+            )
+            .unwrap();
         }
         assert!(index_needs_rebuild(p.to_str().unwrap()));
 
@@ -836,7 +850,7 @@ mod tests {
             conn.execute(
                 "INSERT INTO files (name, path, parent, size, mtime) \
                  VALUES ('secret', '/secret.txt', '/', 0, 0)",
-            [],
+                [],
             )
             .unwrap();
         }
@@ -877,8 +891,8 @@ mod tests {
         }
         let before = file_bytes(&p);
         for write in [false, true] {
-            let err = open_existing_keyed(p.to_str().unwrap(), write, Some(&test_key(0xb2)))
-                .unwrap_err();
+            let err =
+                open_existing_keyed(p.to_str().unwrap(), write, Some(&test_key(0xb2))).unwrap_err();
             assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
         }
         // The owner path must error too — a wrong key is never a "schema

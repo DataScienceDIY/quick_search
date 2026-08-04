@@ -29,6 +29,14 @@ pub struct IgnoreDialog {
     pub persist: bool,
 }
 
+/// Glob ignoring everything under `dir`, spelled with the platform
+/// separator. `Path::join` inserts a separator only where one is needed, so
+/// a drive root yields `C:\*` rather than the never-matching `C:\/*` a
+/// `format!("{}/*")` would produce.
+fn dir_ignore_pattern(dir: &std::path::Path) -> String {
+    dir.join("*").to_string_lossy().into_owned()
+}
+
 /// What the tab asks the app to do after this frame.
 #[derive(Default)]
 pub struct SearchActions {
@@ -51,12 +59,7 @@ pub struct SearchActions {
 /// the table with whatever the scan happened to reach first and never show the
 /// good ones. Dropping the worst-ranked instead means a rank-1 hit found late
 /// in a scan still displaces a rank-10 one found early.
-fn admit(
-    set: &mut Vec<SearchHit>,
-    incoming: Vec<SearchHit>,
-    limit: usize,
-    limited: &mut bool,
-) {
+fn admit(set: &mut Vec<SearchHit>, incoming: Vec<SearchHit>, limit: usize, limited: &mut bool) {
     set.extend(incoming);
     if set.len() > limit {
         set.sort_by(|a, b| {
@@ -644,8 +647,7 @@ impl SearchTab {
                 name_pattern: hit.name.clone(),
                 dir_pattern: std::path::Path::new(&hit.path)
                     .parent()
-                    .and_then(|p| p.to_str())
-                    .map(|p| format!("{}/*", p))
+                    .map(dir_ignore_pattern)
                     .unwrap_or_default(),
                 persist: false,
             });
@@ -713,6 +715,9 @@ impl SearchTab {
                         }
                     });
                 });
+                // Inside a stable section, or the hint's appearance would
+                // rename the directory editor below and drop its focus.
+                crate::ui_util::pattern_hint_label(ui, &dialog.name_pattern);
                 ui.separator();
 
                 // --- Directory ---------------------------------------------
@@ -1211,7 +1216,10 @@ mod tests {
         tab.sort = (SortKey::Size, false);
         tab.sort_dirty = true;
         tab.resort();
-        assert_eq!(displayed(&tab), vec!["zucchini.txt", "mango.txt", "apple.txt"]);
+        assert_eq!(
+            displayed(&tab),
+            vec!["zucchini.txt", "mango.txt", "apple.txt"]
+        );
     }
 
     /// The user may re-key the sort at any time, including while results are
@@ -1222,7 +1230,11 @@ mod tests {
         let mut tab = streaming_tab();
         batch(&mut tab, vec![hit(1, "delta.txt", 1.0, 30)]);
         batch(&mut tab, vec![hit(2, "alpha.txt", 5.0, 10)]);
-        assert_eq!(displayed(&tab), vec!["delta.txt", "alpha.txt"], "rank order");
+        assert_eq!(
+            displayed(&tab),
+            vec!["delta.txt", "alpha.txt"],
+            "rank order"
+        );
 
         // Header click, mid-search.
         tab.sort = (SortKey::Name, true);
@@ -1326,8 +1338,7 @@ mod tests {
         batch(&mut tab, vec![hit(2, "better.txt", 1.0, 20)]);
         let sel = tab.selected.expect("still selected");
         assert_eq!(
-            tab.results[sel as usize].file_id,
-            1,
+            tab.results[sel as usize].file_id, 1,
             "selection follows the file, not the slot"
         );
     }
@@ -1350,5 +1361,26 @@ mod tests {
         run_frame(&ctx, &mut tab, click(pos, egui::PointerButton::Secondary));
         assert_eq!(tab.selected, Some(1));
         assert!(egui::Popup::is_any_open(&ctx));
+    }
+
+    /// `Path::join` adds a separator only where one is needed, so the
+    /// pattern is spelled natively and a drive root does not become the
+    /// never-matching `C:\/*`.
+    #[test]
+    fn dir_ignore_patterns_use_the_platform_separator() {
+        use std::path::Path;
+        #[cfg(unix)]
+        {
+            assert_eq!(dir_ignore_pattern(Path::new("/home/x")), "/home/x/*");
+            assert_eq!(dir_ignore_pattern(Path::new("/")), "/*");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                dir_ignore_pattern(Path::new(r"C:\Users\x")),
+                r"C:\Users\x\*"
+            );
+            assert_eq!(dir_ignore_pattern(Path::new(r"C:\")), r"C:\*");
+        }
     }
 }

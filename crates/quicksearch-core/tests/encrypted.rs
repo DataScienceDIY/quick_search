@@ -103,7 +103,8 @@ fn encrypted_index_lifecycle() {
     // Raw bytes must not leak the indexed content anywhere in the file.
     let raw = std::fs::read(&db_path).unwrap();
     assert!(
-        !raw.windows(b"zebrapayload".len()).any(|w| w == b"zebrapayload"),
+        !raw.windows(b"zebrapayload".len())
+            .any(|w| w == b"zebrapayload"),
         "plaintext content leaked into the encrypted file"
     );
 
@@ -187,9 +188,8 @@ fn encrypted_index_lifecycle() {
         drop(conn);
 
         // The right password still unlocks...
-        db::verify_process_key(&db_path.to_string_lossy()).expect(
-            "a stale schema must not make the correct password look wrong",
-        );
+        db::verify_process_key(&db_path.to_string_lossy())
+            .expect("a stale schema must not make the correct password look wrong");
         // ...and the wrong one is still refused, with the same tagged error —
         // the relaxation must not have turned the check into a rubber stamp.
         db::set_process_key(Some(wrong_key.clone()));
@@ -200,7 +200,10 @@ fn encrypted_index_lifecycle() {
         // indexer down its rebuild path.
         db::set_process_key(Some(key.clone()));
         let err = db::open_existing(&db_path.to_string_lossy(), false).unwrap_err();
-        assert!(err.contains("not a compatible QuickSearch index"), "got: {err}");
+        assert!(
+            err.contains("not a compatible QuickSearch index"),
+            "got: {err}"
+        );
 
         // And the rebuild comes back encrypted and searchable under the same
         // key, so the whole path a real user walks is covered.

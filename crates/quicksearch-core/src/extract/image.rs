@@ -18,8 +18,7 @@ impl Extractor for ImageExtractor {
     }
 
     fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError> {
-        let file = File::open(path)
-            .map_err(|e| format!("image open {}: {}", path.display(), e))?;
+        let file = File::open(path).map_err(|e| format!("image open {}: {}", path.display(), e))?;
         let mut bufreader = BufReader::new(&file);
         let mut out = ExtractedContent::default();
 

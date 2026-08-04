@@ -1,0 +1,293 @@
+name: CI
+
+# Forgejo reads .forgejo/workflows before .github/workflows. Actions referenced
+# bare (actions/checkout, actions/cache, ...) resolve through the instance's
+# DEFAULT_ACTIONS_URL, which points at data.forgejo.org, so nothing here reaches
+# out to github.com.
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are never reused between CI runs and would bloat the
+  # cached target/ tree for nothing.
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  # ---------------------------------------------------------------- linux ----
+  #
+  # The container base is load-bearing: packaging/build-deb.sh derives the
+  # package's libc6 floor with objdump from the binary it just built, so the
+  # .deb inherits the *builder's* glibc. Ubuntu 22.04 fixes that floor at 2.35,
+  # which covers 22.04 LTS and newer plus Debian 12 and newer. Packages built by
+  # hand on a dev machine declared libc6 (>= 2.43) and installed on almost
+  # nothing.
+  #
+  # catthehacker/ubuntu is the act-compatible image family. A bare ubuntu:22.04
+  # will not work: JS actions need Node already present in the image, and no
+  # step can install it before actions/checkout runs.
+  linux:
+    runs-on: forgejo-runner
+    container:
+      image: catthehacker/ubuntu:act-22.04
+    env:
+      # crates/quicksearch-core/src/config.rs has a test that expects a home
+      # directory and panics without one.
+      HOME: /root
+      # The highest libc6 version the .deb is allowed to require.
+      MAX_GLIBC: '2.35'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          # rusqlite's bundled-sqlcipher-vendored-openssl and keyring's vendored
+          # feature compile SQLCipher, OpenSSL and libdbus from source, so a C
+          # toolchain plus perl covers them and no -dev packages are needed.
+          # winit and glutin dlopen the whole display stack, so there are no X11
+          # or Wayland headers here either. The rest is what build-deb.sh checks
+          # for before it will run.
+          apt-get install -y --no-install-recommends \
+            build-essential perl pkg-config \
+            binutils dpkg-dev desktop-file-utils gzip
+
+      - name: Trust the workspace
+        # checkout writes as root into a directory git then considers dubiously
+        # owned; build-deb.sh and the version scrape both shell out to git.
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install Rust
+        run: |
+          # --default-toolchain none defers to rust-toolchain.toml, so the pinned
+          # channel and its targets are downloaded exactly once.
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # Materialise the pinned toolchain here rather than partway through the
+          # build, so a toolchain problem shows up as its own failed step.
+          "$HOME/.cargo/bin/rustup" show
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # Keyed per job so this tree never collides with the cross-compiled one.
+          key: ${{ github.job }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ github.job }}-cargo-
+
+      - name: Build
+        run: cargo build --release --locked -p quicksearch-gui
+
+      - name: Test
+        # Release mode is not a nicety: tests/encrypted.rs derives an Argon2id key
+        # at m=64 MiB, t=3, which takes about half a second in release and minutes
+        # in debug. tests/snippet_perf.rs self-skips without QSB_SNIPPET_PERF=1.
+        run: cargo test --release --locked --workspace
+
+      - name: Build the .deb
+        # --no-build reuses the binaries from the Build step rather than
+        # recompiling. SOURCE_DATE_EPOCH pins the generated changelog date so
+        # repeat builds of the same commit are byte-identical.
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)" \
+            ./packaging/build-deb.sh --no-build
+
+      - name: Check the glibc floor
+        # The whole point of pinning the container. If someone bumps the image,
+        # this fails loudly instead of quietly shipping an uninstallable package.
+        run: |
+          deb=$(ls dist/*.deb)
+          depends=$(dpkg-deb -f "$deb" Depends)
+          echo "$depends"
+          floor=$(printf '%s' "$depends" | sed -n 's/.*libc6 (>= \([0-9][0-9.]*\)).*/\1/p')
+          [ -n "$floor" ] || { echo "could not read the libc6 floor from $deb" >&2; exit 1; }
+          # dpkg's own comparator, so 2.9 does not sort above 2.35.
+          if ! dpkg --compare-versions "$floor" le "$MAX_GLIBC"; then
+              echo "ERROR: the .deb requires glibc $floor, above the $MAX_GLIBC target." >&2
+              echo "The build container base has probably changed." >&2
+              exit 1
+          fi
+          echo "OK: glibc floor $floor <= $MAX_GLIBC"
+
+      - name: Package the binaries
+        # A tarball for anyone not installing the .deb, stripped to match what
+        # build-deb.sh ships.
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
+          [ -n "$version" ] || { echo "could not read the version from Cargo.toml" >&2; exit 1; }
+          stage="quicksearch-$version-linux-x86_64"
+          mkdir -p "dist/$stage"
+          for bin in quicksearch quicksearch-cli; do
+              install -m755 "target/release/$bin" "dist/$stage/$bin"
+              strip --strip-unneeded "dist/$stage/$bin"
+          done
+          install -m644 README.md config_example.toml LICENSE "dist/$stage/"
+          tar -czf "dist/$stage.tar.gz" -C dist "$stage"
+          rm -rf "dist/$stage"
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # -------------------------------------------------------- windows-cross ----
+  #
+  # Deliberately a newer base than the linux job. This job emits a PE binary
+  # linked against msvcrt.dll, so the container's glibc cannot affect what the
+  # .exe runs on; pinning it to 22.04 would buy nothing while forcing the build
+  # through mingw-w64 10.3 instead of 13.2.
+  windows-cross:
+    runs-on: forgejo-runner
+    container:
+      image: catthehacker/ubuntu:act-24.04
+    env:
+      HOME: /root
+      TARGET: x86_64-pc-windows-gnu
+      # rusqlite, zstd-sys and openssl-src all shell out to a C compiler, which
+      # has to be the cross one rather than the host's cc.
+      CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+      CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+      AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            build-essential perl make pkg-config \
+            gcc-mingw-w64-x86-64 zip
+
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # Materialise the pinned toolchain here rather than partway through the
+          # build, so a toolchain problem shows up as its own failed step.
+          "$HOME/.cargo/bin/rustup" show
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ github.job }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ github.job }}-cargo-
+
+      - name: Build
+        # rust-toolchain.toml already lists the target, so no `rustup target add`.
+        run: cargo build --release --locked -p quicksearch-gui --target "$TARGET"
+
+      - name: Check for non-system DLL dependencies
+        # Debian's default mingw alternative uses posix threads, which can pull
+        # in libwinpthread-1.dll or libgcc_s_seh-1.dll and produce an .exe that
+        # refuses to start on a clean Windows machine. The binaries are currently
+        # clean - every import is a system DLL - and this keeps them that way.
+        run: |
+          for exe in "target/$TARGET"/release/quicksearch.exe "target/$TARGET"/release/quicksearch-cli.exe; do
+              dlls=$(x86_64-w64-mingw32-objdump -p "$exe" | sed -n 's/^[[:space:]]*DLL Name: //p' | sort -fu)
+              printf '%s:\n%s\n\n' "$exe" "$dlls"
+              if printf '%s\n' "$dlls" | grep -qiE '^(libgcc|libwinpthread|libstdc\+\+|libssp)'; then
+                  echo "ERROR: $exe imports a non-system DLL and will not run on a clean Windows install." >&2
+                  exit 1
+              fi
+          done
+
+      - name: Package the binaries
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
+          [ -n "$version" ] || { echo "could not read the version from Cargo.toml" >&2; exit 1; }
+          stage="quicksearch-$version-windows-x86_64"
+          mkdir -p "dist/$stage"
+          for exe in quicksearch.exe quicksearch-cli.exe; do
+              install -m755 "target/$TARGET/release/$exe" "dist/$stage/$exe"
+              x86_64-w64-mingw32-strip --strip-unneeded "dist/$stage/$exe"
+          done
+          install -m644 README.md config_example.toml LICENSE "dist/$stage/"
+          (cd dist && zip -qr "$stage.zip" "$stage")
+          rm -rf "dist/$stage"
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  # -------------------------------------------------------------- release ----
+  release:
+    needs: [linux, windows-cross]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: forgejo-runner
+    container:
+      image: catthehacker/ubuntu:act-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish the release
+        # Forgejo populates GITHUB_API_URL, GITHUB_REPOSITORY and the token by
+        # itself, so this needs no configuration. Talking to the API directly
+        # keeps the release step off any third-party action's release cadence.
+        env:
+          RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          api="${GITHUB_API_URL:-$GITHUB_SERVER_URL/api/v1}"
+          tag="${GITHUB_REF#refs/tags/}"
+          auth="Authorization: token $RELEASE_TOKEN"
+
+          mkdir -p dist
+          find artifacts -type f -exec mv -t dist -- {} +
+          ls -l dist/
+
+          # Reuse the release when it already exists, so re-running a tag build
+          # replaces assets instead of failing.
+          id=$(curl -sS -H "$auth" "$api/repos/$GITHUB_REPOSITORY/releases/tags/$tag" | jq -r '.id // empty')
+          if [ -z "$id" ]; then
+              id=$(curl -fsS -X POST "$api/repos/$GITHUB_REPOSITORY/releases" \
+                     -H "$auth" -H 'Content-Type: application/json' \
+                     -d "$(jq -n --arg t "$tag" '{tag_name: $t, name: $t, draft: false, prerelease: false}')" \
+                   | jq -r '.id // empty')
+          fi
+          [ -n "$id" ] || { echo "could not create or find a release for $tag" >&2; exit 1; }
+
+          for f in dist/*; do
+              name=$(basename "$f")
+              echo "uploading $name"
+              # Replace an asset of the same name left by an earlier run.
+              old=$(curl -sS -H "$auth" "$api/repos/$GITHUB_REPOSITORY/releases/$id/assets" \
+                    | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
+              [ -z "$old" ] || curl -fsS -X DELETE -H "$auth" \
+                  "$api/repos/$GITHUB_REPOSITORY/releases/$id/assets/$old"
+              curl -fsS -X POST "$api/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$name" \
+                -H "$auth" -F "attachment=@$f" -o /dev/null
+          done
+          echo "published $tag"

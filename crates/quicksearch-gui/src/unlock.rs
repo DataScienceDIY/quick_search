@@ -57,7 +57,11 @@ impl Gate {
             .map(|app| Gate::Running(Box::new(app)))
     }
 
-    pub fn locked(cfg: Config, config_error: Option<String>, initial_query: Option<String>) -> Gate {
+    pub fn locked(
+        cfg: Config,
+        config_error: Option<String>,
+        initial_query: Option<String>,
+    ) -> Gate {
         Gate::Locked(UnlockScreen::new(cfg, config_error, initial_query))
     }
 }
@@ -148,7 +152,11 @@ pub struct UnlockScreen {
 }
 
 impl UnlockScreen {
-    fn new(cfg: Config, config_error: Option<String>, initial_query: Option<String>) -> UnlockScreen {
+    fn new(
+        cfg: Config,
+        config_error: Option<String>,
+        initial_query: Option<String>,
+    ) -> UnlockScreen {
         let mode = match cfg.security.salt_bytes() {
             Err(e) => Mode::BrokenSalt(e),
             Ok(_) => {
@@ -248,8 +256,8 @@ impl UnlockScreen {
                         _ => "Create index",
                     };
                     let clicked = ui.button(label).clicked();
-                    let entered = field.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let entered =
+                        field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     submitted = clicked || entered;
                     if self.focus_password && !busy {
                         field.request_focus();
@@ -331,9 +339,7 @@ impl UnlockScreen {
             drop(password);
             db::set_process_key(Some(key.clone()));
             let result = match &verify_against {
-                Some(db_path) => {
-                    db::verify_process_key(&db_path.to_string_lossy()).map(|()| key)
-                }
+                Some(db_path) => db::verify_process_key(&db_path.to_string_lossy()).map(|()| key),
                 None => Ok(key),
             };
             let _ = tx.send(result);

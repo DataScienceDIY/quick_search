@@ -1,28 +1,20 @@
+use rusqlite::{params, Connection, InterruptHandle, OptionalExtension};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use std::collections::{HashMap, HashSet};
-use rusqlite::{params, Connection, InterruptHandle, OptionalExtension};
 
-use crate::extract::Registry;
-use crate::file_handling::{
-    cleanup_stale_index_entries,
-    count_tree_entries_fast,
-    extract_scope_prepare,
-    store_extracted,
-    fts_finalize_after_text_indexing,
-    process_batch_inserts,
-    process_batch_updates,
-    path_to_db_string,
-    ExtractCursor,
-    FileIndexAction,
-    OwnedNewFile,
-};
 use crate::config::Config;
-use crate::walk::{thread_count_for, walk_indexable_files, ParallelWalk, TryNext, WalkEvent};
 use crate::db;
 use crate::db::repo;
+use crate::extract::Registry;
+use crate::file_handling::{
+    cleanup_stale_index_entries, count_tree_entries_fast, extract_scope_prepare,
+    fts_finalize_after_text_indexing, path_to_db_string, process_batch_inserts,
+    process_batch_updates, store_extracted, ExtractCursor, FileIndexAction, OwnedNewFile,
+};
+use crate::walk::{thread_count_for, walk_indexable_files, ParallelWalk, TryNext, WalkEvent};
 
 /// Where one root's pipeline is in its life cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,10 +283,7 @@ fn wal_len(path: &str) -> u64 {
 /// caller should abort the operation. While the suspend flag is set and stop
 /// is not, this parks the thread by sleeping in short increments so a later
 /// `resume()` unblocks it. Cheap to call in tight loops.
-pub(crate) fn should_abort(
-    stop: &Arc<AtomicBool>,
-    suspend: &Arc<AtomicBool>,
-) -> bool {
+pub(crate) fn should_abort(stop: &Arc<AtomicBool>, suspend: &Arc<AtomicBool>) -> bool {
     loop {
         if stop.load(Ordering::Relaxed) {
             return true;
@@ -454,7 +443,11 @@ impl IndexingService {
             };
         }
         self.command_tx
-            .send(IndexingCommand::Start { paths, db_path, config })
+            .send(IndexingCommand::Start {
+                paths,
+                db_path,
+                config,
+            })
             .map_err(|e| {
                 // The service is gone; leave the status honest rather than
                 // stuck on a run that will never happen.
@@ -478,7 +471,8 @@ impl IndexingService {
 
         // Wait for indexing to transition to stopping state
         let mut attempts = 0;
-        while attempts < 50 { // Wait up to 5 seconds
+        while attempts < 50 {
+            // Wait up to 5 seconds
             match self.get_status() {
                 IndexingStatus::Stopping => break,
                 IndexingStatus::Idle => return Ok(()), // Already stopped
@@ -520,7 +514,12 @@ impl IndexingService {
     /// confirmed the rebuild dialog). A missing or incompatible DB means
     /// there is nothing to validate — the indexer will (re)build under its
     /// own policy anyway.
-    pub fn check_config_validation(&self, db_path: &str, config: &Config, indexing_path: &str) -> Result<Option<Vec<ConfigChange>>, String> {
+    pub fn check_config_validation(
+        &self,
+        db_path: &str,
+        config: &Config,
+        indexing_path: &str,
+    ) -> Result<Option<Vec<ConfigChange>>, String> {
         match db::open_existing(db_path, false) {
             Ok(conn) => Self::validate_config(&conn, config, indexing_path),
             Err(_) => Ok(None),
@@ -539,7 +538,8 @@ impl IndexingService {
 
         // Wait for indexing to actually stop
         let mut attempts = 0;
-        while attempts < 50 { // Wait up to 5 seconds
+        while attempts < 50 {
+            // Wait up to 5 seconds
             match self.get_status() {
                 IndexingStatus::Idle => break,
                 // Optimizing holds the file about to be deleted, so it is
@@ -576,10 +576,14 @@ impl IndexingService {
     ) {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let mut indexing_handle: Option<thread::JoinHandle<()>> = None;
-        
+
         while let Ok(command) = command_rx.recv() {
             match command {
-                IndexingCommand::Start { paths, db_path, config } => {
+                IndexingCommand::Start {
+                    paths,
+                    db_path,
+                    config,
+                } => {
                     // `start_indexing` already claimed the status and rejected
                     // a concurrent start, so there is nothing to re-check here.
 
@@ -606,7 +610,15 @@ impl IndexingService {
                         // The writer thread: every DB write and every text
                         // extraction a run performs happens here.
                         crate::platform::set_background_priority();
-                        let result = Self::run_indexing(&status_clone, &paths_owned, &db_path_owned, &stop_flag_clone, &suspend_clone, &config_owned, &db_connection_clone);
+                        let result = Self::run_indexing(
+                            &status_clone,
+                            &paths_owned,
+                            &db_path_owned,
+                            &stop_flag_clone,
+                            &suspend_clone,
+                            &config_owned,
+                            &db_connection_clone,
+                        );
 
                         // Released before maintenance, not after: VACUUM needs
                         // its own connection (see `db::open::open_maintenance`)
@@ -641,7 +653,7 @@ impl IndexingService {
                 }
             }
         }
-        
+
         // Clean up any remaining indexing thread
         if let Some(handle) = indexing_handle {
             let _ = handle.join();
@@ -735,7 +747,7 @@ impl IndexingService {
         // of after a full table scan.
 
         let conn_mutex = Arc::new(Mutex::new(conn));
-        
+
         // Store the database connection for proper cleanup on stop
         if let Ok(mut db_opt) = db_connection.lock() {
             *db_opt = Some(conn_mutex.clone());
@@ -785,20 +797,22 @@ impl IndexingService {
                 let root = root.clone();
                 let cancel = count_cancel.clone();
                 let total = count_total.clone();
-                let _ = thread::Builder::new().name("qs-count".into()).spawn(move || {
-                    crate::platform::set_background_priority();
-                    match count_tree_entries_fast(&root, &cancel) {
-                        // A genuinely empty root stores 1 so "known" stays
-                        // distinguishable from the 0 = unknown sentinel; an
-                        // empty root's walk finishes instantly anyway.
-                        Ok(n) => total.store(n.max(1), Ordering::Relaxed),
-                        Err(e) => {
-                            if !e.contains("cancelled") {
-                                crate::log_warn!("count for {}: {}", root, e);
+                let _ = thread::Builder::new()
+                    .name("qs-count".into())
+                    .spawn(move || {
+                        crate::platform::set_background_priority();
+                        match count_tree_entries_fast(&root, &cancel) {
+                            // A genuinely empty root stores 1 so "known" stays
+                            // distinguishable from the 0 = unknown sentinel; an
+                            // empty root's walk finishes instantly anyway.
+                            Ok(n) => total.store(n.max(1), Ordering::Relaxed),
+                            Err(e) => {
+                                if !e.contains("cancelled") {
+                                    crate::log_warn!("count for {}: {}", root, e);
+                                }
                             }
                         }
-                    }
-                });
+                    });
             }
 
             pipelines.push(RootPipeline {
@@ -843,7 +857,10 @@ impl IndexingService {
                 .collect();
             if let Ok(mut g) = status.lock() {
                 if !matches!(*g, IndexingStatus::Stopping) {
-                    *g = IndexingStatus::Running { start_time: run_start, roots };
+                    *g = IndexingStatus::Running {
+                        start_time: run_start,
+                        roots,
+                    };
                 }
             }
         };
@@ -1117,8 +1134,7 @@ impl IndexingService {
                     }
                     if !stale_paths.is_empty() {
                         if let Some(first) = pipelines.first_mut() {
-                            first.current_file =
-                                Some("Removing stale index entries…".to_string());
+                            first.current_file = Some("Removing stale index entries…".to_string());
                         }
                         stale_deleted = cleanup_stale_index_entries(
                             &conn_mutex,
@@ -1224,7 +1240,10 @@ impl IndexingService {
     /// The config keys whose change invalidates the stored index, paired
     /// with their current values. One list drives both [`validate_config`]
     /// and [`update_config`] so the two can never drift apart.
-    fn config_validation_entries(config: &Config, indexing_path: &str) -> Vec<(&'static str, String)> {
+    fn config_validation_entries(
+        config: &Config,
+        indexing_path: &str,
+    ) -> Vec<(&'static str, String)> {
         let sorted_joined = |v: &[String]| {
             let mut v: Vec<String> = v.to_vec();
             v.sort();
@@ -1288,11 +1307,19 @@ impl IndexingService {
                 }
             }
         }
-        Ok(if changes.is_empty() { None } else { Some(changes) })
+        Ok(if changes.is_empty() {
+            None
+        } else {
+            Some(changes)
+        })
     }
 
     /// Stamp the index with the settings it's being built under.
-    fn update_config(conn: &Connection, config: &Config, indexing_path: &str) -> Result<(), String> {
+    fn update_config(
+        conn: &Connection,
+        config: &Config,
+        indexing_path: &str,
+    ) -> Result<(), String> {
         for (key, current) in Self::config_validation_entries(config, indexing_path) {
             conn.execute(
                 "INSERT OR REPLACE INTO config_validation (key, value) VALUES (?1, ?2)",
@@ -1332,7 +1359,6 @@ impl Default for IndexingService {
         Self::new()
     }
 }
-
 
 #[cfg(test)]
 mod tests {

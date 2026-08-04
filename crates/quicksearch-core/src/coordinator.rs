@@ -209,7 +209,10 @@ impl IndexCoordinator {
     }
 
     /// Compare `config` against what the index was built with. Read-only.
-    pub fn check_config_validation(&self, config: &Config) -> Result<Option<Vec<ConfigChange>>, String> {
+    pub fn check_config_validation(
+        &self,
+        config: &Config,
+    ) -> Result<Option<Vec<ConfigChange>>, String> {
         let db = config.resolved_database_path();
         let roots = joined_roots(config);
         self.indexing
@@ -511,7 +514,10 @@ impl Inner {
             Ok(conn) => conn,
             Err(e) => {
                 // Missing or stale DB: incremental can't help, rebuild.
-                crate::log_warn!("coordinator: incremental unavailable ({}); scheduling full run", e);
+                crate::log_warn!(
+                    "coordinator: incremental unavailable ({}); scheduling full run",
+                    e
+                );
                 self.needs_full_run = true;
                 return;
             }
@@ -609,7 +615,8 @@ impl Inner {
             for (child, parent) in &nested {
                 crate::log_warn!(
                     "coordinator: refusing to index: root {} is nested under {}",
-                    child, parent
+                    child,
+                    parent
                 );
             }
             return;
@@ -1012,9 +1019,11 @@ mod tests {
         // Periodic reindex is the fallback and must still run: mode stays
         // Auto, only the watcher is off.
         assert_eq!(coord.state().mode, IndexMode::Auto);
-        wait_for("full run despite no watcher", Duration::from_secs(20), || {
-            coord.state().last_full_index.is_some() && f.file_count() == 1
-        });
+        wait_for(
+            "full run despite no watcher",
+            Duration::from_secs(20),
+            || coord.state().last_full_index.is_some() && f.file_count() == 1,
+        );
         coord.shutdown();
     }
 
@@ -1111,10 +1120,11 @@ mod tests {
             f.file_count() == 1
         });
 
-        let extra_root = f.dir.parent().unwrap().join(format!(
-            "qs-coord-extra-{}",
-            std::process::id()
-        ));
+        let extra_root = f
+            .dir
+            .parent()
+            .unwrap()
+            .join(format!("qs-coord-extra-{}", std::process::id()));
         std::fs::create_dir_all(&extra_root).unwrap();
         std::fs::write(extra_root.join("second.txt"), "two").unwrap();
 
@@ -1147,7 +1157,10 @@ mod tests {
                 &mut pending,
                 FsEvent::Remove(dir.join(format!("sub{}/f{}.txt", i % 5, i))),
             );
-            enqueue(&mut pending, FsEvent::Remove(dir.join(format!("sub{}", i % 5))));
+            enqueue(
+                &mut pending,
+                FsEvent::Remove(dir.join(format!("sub{}", i % 5))),
+            );
         }
         // Not under the removed tree, and not a removal: both must survive.
         enqueue(&mut pending, FsEvent::Remove(PathBuf::from("/x/treehouse")));
@@ -1200,9 +1213,11 @@ mod tests {
         });
 
         std::fs::remove_dir_all(&tree).unwrap();
-        wait_for("subtree removed from the index", Duration::from_secs(30), || {
-            f.file_count() == 1
-        });
+        wait_for(
+            "subtree removed from the index",
+            Duration::from_secs(30),
+            || f.file_count() == 1,
+        );
 
         coord.shutdown();
     }
@@ -1234,9 +1249,11 @@ mod tests {
         std::fs::remove_dir_all(f.dir.join("d0")).unwrap();
 
         // 300 files, 50 of them under d0.
-        wait_for("deletion applied after the run", Duration::from_secs(60), || {
-            f.file_count() == 250
-        });
+        wait_for(
+            "deletion applied after the run",
+            Duration::from_secs(60),
+            || f.file_count() == 250,
+        );
 
         coord.shutdown();
     }
