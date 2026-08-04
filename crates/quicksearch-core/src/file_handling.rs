@@ -1665,7 +1665,14 @@ mod count_and_extract_tests {
         // it claims and its answer must be a genuine one. A text body sniffs
         // as text for the extension-less names; the NUL body keeps the
         // unclaimed side of the invariant exercised too.
-        let cases: [(&str, &[u8]); 10] = [
+        //
+        // The last two are the high-byte pair: identical non-UTF-8 bytes,
+        // once behind an extension the MIME table knows (claimed, decoded as
+        // legacy) and once behind one it doesn't (unclaimed, since the sniff
+        // takes only provable text). Both sides must agree with the
+        // predicate, whichever way they land.
+        let legacy = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9.";
+        let cases: [(&str, &[u8]); 12] = [
             ("notes.txt", b"plain bytes with no magic"),
             ("data.json", b"plain bytes with no magic"),
             ("schema.sql", b"plain bytes with no magic"),
@@ -1676,6 +1683,8 @@ mod count_and_extract_tests {
             ("blob.bin", b"plain bytes with no magic"),
             ("noextension", b"plain bytes with no magic"),
             ("real.bin", b"\x00\x01\x02\x03"),
+            ("legacy.txt", legacy),
+            ("legacy.unknownext", legacy),
         ];
         for (name, body) in cases {
             let p = root.join(name);

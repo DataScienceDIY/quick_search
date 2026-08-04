@@ -47,6 +47,15 @@ jobs:
     runs-on: self-hosted
     container:
       image: catthehacker/ubuntu:act-22.04
+      # Jobs run as root, and root ignores permission bits: CAP_DAC_OVERRIDE and
+      # CAP_DAC_READ_SEARCH let uid 0 read a mode-000 file or directory anyway.
+      # Several tests build an unreadable directory with platform::deny_read and
+      # assert the walk reports it rather than reporting an empty directory - the
+      # distinction matters because an empty listing deletes index rows. Under
+      # root those tests see a perfectly readable tree and fail. Dropping the two
+      # DAC capabilities makes root obey the mode bits, which is exactly the
+      # environment the tests assume and get on a developer machine.
+      options: --cap-drop=DAC_OVERRIDE --cap-drop=DAC_READ_SEARCH
     env:
       # crates/quicksearch-core/src/config.rs has a test that expects a home
       # directory and panics without one.

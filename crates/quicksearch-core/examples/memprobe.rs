@@ -11,10 +11,14 @@
 //! ./target/release/examples/memprobe cold /media/shared /var/tmp/qs-mem/index.db
 //! ./target/release/examples/memprobe warm /media/shared /var/tmp/qs-mem/index.db
 //! ./target/release/examples/memprobe cold /media/shared /var/tmp/qs-mem/index.db 10
+//! ./target/release/examples/memprobe cold ~ /var/tmp/qs-mem/index.db 250 probe.toml
 //! ```
 //!
 //! The optional trailing number is the sampling interval in milliseconds
-//! (default 100). Finer sampling resolves the *shape* of a spike, not its
+//! (default 100), and the one after it a config file to load instead of the
+//! defaults — the only way to probe a tree that the shipped `include_hidden =
+//! false` would walk past, such as a home directory that is nearly all dotdirs.
+//! Finer sampling resolves the *shape* of a spike, not its
 //! cause: the file column is only as good as `RootProgress::current_file`,
 //! which [`crate::indexing`] publishes once per extraction batch, holding the
 //! last file of the batch that just finished. During a batch it therefore
@@ -24,10 +28,20 @@
 //! largest single consumer on this tree.
 //!
 //! `cold` deletes the database first: every file is new, so the walk hashes
-//! and extracts all of them and `existing_files` starts empty. `warm` re-runs
-//! against the finished database, which is the case that loads one
-//! `existing_files` entry per indexed path up front — the allocation that
-//! scales with tree size rather than with in-flight work.
+//! and extracts all of them. `warm` re-runs against the finished database,
+//! where most files classify as unchanged and the run is dominated by
+//! reconciliation rather than extraction. Warm peaks *below* cold on the same
+//! tree — the walk reads one directory's rows at a time (`repo::dir_rows`,
+//! held in an `Arc` only while that directory is in flight), so there is no
+//! up-front load that scales with tree size.
+//!
+//! **`growth per file` is a ratio, not a per-file cost.** It divides a peak
+//! that is essentially constant by the file count, so it *falls* as the tree
+//! grows: measured 2052 B/file over 99,477 files and 644 B/file over 279,936,
+//! with the larger tree peaking *lower* in absolute terms. Read the peak, not
+//! the quotient. What actually scales with tree size is `seen_paths`
+//! (`indexing.rs`), a `HashSet<u128>` of path digests — ~17 bytes per file
+//! including hashbrown's control bytes and load factor.
 //!
 //! Two peaks are reported and they measure different things:
 //!
@@ -94,11 +108,11 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_default();
     let (Some(root), Some(db)) = (args.next(), args.next()) else {
-        eprintln!("usage: memprobe <cold|warm> <root> <db> [sample_ms]");
+        eprintln!("usage: memprobe <cold|warm> <root> <db> [sample_ms] [config.toml]");
         std::process::exit(2);
     };
     if mode != "cold" && mode != "warm" {
-        eprintln!("usage: memprobe <cold|warm> <root> <db> [sample_ms]");
+        eprintln!("usage: memprobe <cold|warm> <root> <db> [sample_ms] [config.toml]");
         std::process::exit(2);
     }
     let interval = Duration::from_millis(
@@ -107,6 +121,7 @@ fn main() {
             .unwrap_or(DEFAULT_SAMPLE_MS)
             .max(1),
     );
+    let config_path = args.next().map(PathBuf::from);
     let db = PathBuf::from(db);
 
     if let Some(parent) = db.parent() {
@@ -118,11 +133,18 @@ fn main() {
         }
     }
 
-    run(&mode, &root, &db, interval);
+    run(&mode, &root, &db, interval, config_path.as_deref());
 }
 
-fn run(mode: &str, root: &str, db: &Path, interval: Duration) {
-    let config = Config::default();
+fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Option<&Path>) {
+    // The root and database always come from argv; a config file only supplies
+    // the knobs that change *what* indexing does — `include_hidden`,
+    // `ignore_patterns`, `maximum_text_size` and so on. Without one the probe
+    // measures the shipped defaults, which is what makes two runs comparable.
+    let config = match config_path {
+        Some(p) => Config::load_from(p).expect("load probe config"),
+        None => Config::default(),
+    };
 
     // Cleared for the same reason indexprobe clears it: the marker is the
     // only unambiguous completion signal, and a stale one from the previous

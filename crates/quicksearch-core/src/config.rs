@@ -95,7 +95,9 @@ pub struct ProcessingConfig {
     ///    262 makes some formats undetectable except by extension;
     /// 3. they are the text-sniff window (`textenc::looks_like_text`) that
     ///    decides whether an unknown-extension or extensionless file is
-    ///    text — small values judge files on less evidence;
+    ///    valid UTF-8 and so worth extracting — small values judge files on
+    ///    less evidence, and a binary whose first bytes happen to be valid
+    ///    UTF-8 is likelier to slip through a short window than a long one;
     /// 4. any plaintext file no larger than this is extracted during the
     ///    walk, sparing the content pass an open/read/close.
     ///

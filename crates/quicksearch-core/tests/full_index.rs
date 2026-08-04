@@ -1501,3 +1501,75 @@ fn a_stopped_run_is_still_optimized() {
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&db_dir).ok();
 }
+
+/// High-byte binaries are listed but never full-text extracted.
+///
+/// The whole reason the text sniff demands valid UTF-8. Protobuf and friends
+/// carry no NUL and no control bytes, so the binary guard passes them; before
+/// the guard was tightened they were adopted as `text/plain`, read in full,
+/// run through chardetng's never-failing windows-1252 floor and stored as
+/// mojibake. On a real 99k-file tree that was 93% of every byte of extracted
+/// text.
+///
+/// End-to-end because the interesting part is the *combination*: the row must
+/// survive in `files` (the file is still findable by name) while acquiring no
+/// `documents_text` sidecar and no `failed_files` entry — it is not a failure,
+/// it is a file with no text in it. The `.txt` alongside it holds the same
+/// bytes and must still extract, which is what proves the fix cost nothing for
+/// files an extension already identified.
+#[test]
+fn high_byte_binaries_are_listed_but_not_text_extracted() {
+    let root = tmp_dir("sniff-binary");
+    let db_dir = tmp_dir("sniff-binary-db");
+    let db = db_dir.join("index.sqlite");
+
+    // Head of a real protobuf-framed GPS log: varint framing around ASCII
+    // NMEA sentences. No NUL, no control-byte density — it clears the binary
+    // guard on its own.
+    let mut pb = b"\x10\n\x02v1\x10\x01\x18\xe2\xe3\xfc\xd3\x9d\xca\x97\xe4\x189\x08".to_vec();
+    pb.extend_from_slice(b"\x12*$GNGGA,181558.00,,,,,0,00,99.99,,,,,,*78\r\n");
+    assert!(!pb.contains(&0u8), "fixture must not trip the NUL guard");
+
+    let legacy = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9.";
+
+    touch(&root.join("rtk.pb"), &pb);
+    touch(&root.join("legacy.txt"), legacy);
+    touch(&root.join("notes.md"), b"ordinary utf-8 prose");
+    index_once(&root, &db, &Config::default());
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let probe = |suffix: &str| -> (i64, i64, i64) {
+        conn.query_row(
+            "SELECT f.content_state,
+                    (SELECT COUNT(*) FROM documents_text d WHERE d.file_id = f.id),
+                    (SELECT COUNT(*) FROM failed_files x WHERE x.file_id = f.id)
+               FROM files f WHERE f.path LIKE '%' || ?1",
+            [suffix],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap_or_else(|e| panic!("{suffix} must be indexed: {e}"))
+    };
+
+    // 3 = not applicable. Present in `files`, so filename search still finds
+    // it; no sidecar, so none of its bytes reached the index.
+    assert_eq!(
+        probe("rtk.pb"),
+        (3, 0, 0),
+        "a high-byte binary must be listed, not extracted, and not a failure"
+    );
+
+    // Same bytes, known extension: typed by mime_guess, never sniffed, still
+    // decoded through chardetng and stored.
+    let (state, sidecars, failures) = probe("legacy.txt");
+    assert_eq!(
+        (state, failures),
+        (1, 0),
+        "a legacy-charset .txt must still extract"
+    );
+    assert_eq!(sidecars, 1, "and must still store its text");
+
+    assert_eq!(probe("notes.md"), (1, 1, 0), "ordinary UTF-8 is unaffected");
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}

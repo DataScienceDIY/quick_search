@@ -294,11 +294,13 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   sweep stale rows, then extract content (plaintext, RTF, Office, PDF,
   audio tags, EXIF; see `extract/`) for FTS. Files whose extension no MIME
   table knows — including extensionless ones like `README` or `Makefile` —
-  are sniffed from their head bytes and indexed as text when they read as
-  text (`mime.rs`, `textenc.rs`); non-UTF-8 text (UTF-16 with BOM, legacy
-  charsets via chardetng) is decoded and stored as UTF-8. More claimed
-  files means a bigger index — `indexing.content_extensions` remains the
-  throttle. Files no larger than `processing.hash_length` skip that second
+  are sniffed from their head bytes and indexed as text only when that head
+  is provably text: valid UTF-8, or BOM-marked (`mime.rs`, `textenc.rs`).
+  Legacy charsets are decoded via chardetng and stored as UTF-8, but only
+  for files something *else* typed as text, normally their extension —
+  chardetng's windows-1252 floor never fails, so accepting it on a bare
+  sniff would adopt any binary lacking NUL bytes. More claimed files means a
+  bigger index — `indexing.content_extensions` remains the throttle. Files no larger than `processing.hash_length` skip that second
   pass entirely: the head the walk reads to hash them is already their
   whole content, so a plaintext body is extracted in the same `read` and
   stored complete. Every run ends — whether
