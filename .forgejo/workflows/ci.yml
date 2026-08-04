@@ -198,7 +198,14 @@ jobs:
           rm -rf "dist/$stage"
           ls -l dist/
 
-      - uses: actions/upload-artifact@v4
+      # Not v4, and not plain v3 either. @actions/artifact v2+ (which backs
+      # upload/download-artifact v4) inspects the API host, decides anything that
+      # is not github.com is GitHub Enterprise Server, and refuses outright with
+      # GHESNotSupportedError - it never reaches the server, so whether Forgejo
+      # implements the v4 artifact API is beside the point. Plain v3 runs on
+      # node16, which current Forgejo runner images no longer ship; the
+      # -node20 tags are Forgejo's builds for precisely this combination.
+      - uses: actions/upload-artifact@v3-node20
         with:
           name: linux-x86_64
           path: |
@@ -296,7 +303,14 @@ jobs:
           rm -rf "dist/$stage"
           ls -l dist/
 
-      - uses: actions/upload-artifact@v4
+      # Not v4, and not plain v3 either. @actions/artifact v2+ (which backs
+      # upload/download-artifact v4) inspects the API host, decides anything that
+      # is not github.com is GitHub Enterprise Server, and refuses outright with
+      # GHESNotSupportedError - it never reaches the server, so whether Forgejo
+      # implements the v4 artifact API is beside the point. Plain v3 runs on
+      # node16, which current Forgejo runner images no longer ship; the
+      # -node20 tags are Forgejo's builds for precisely this combination.
+      - uses: actions/upload-artifact@v3-node20
         with:
           name: windows-x86_64
           path: dist/*.zip
@@ -329,7 +343,8 @@ jobs:
       # Only needed to read the workspace version on a Release* branch push.
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      # Must match the uploader's major version - see the note on the upload steps.
+      - uses: actions/download-artifact@v3-node20
         with:
           path: artifacts
 
