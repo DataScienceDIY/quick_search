@@ -7,7 +7,13 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # Pushing a branch whose name starts with Release cuts a release: the version
+    # comes from Cargo.toml and the release job creates the tag itself. Pushing a
+    # v* tag by hand still works and takes the same path. The lowercase pattern is
+    # there because branch names are case-sensitive and a silent no-op would be a
+    # miserable thing to debug, as is the fact that * does not match / in these
+    # filters - Release/0.9.1 needs the ** form to be seen at all.
+    branches: [master, 'Release*', 'Release/**', 'release*', 'release/**']
     tags: ['v*']
   pull_request:
     branches: [master]
@@ -49,6 +55,22 @@ jobs:
       MAX_GLIBC: '2.35'
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check the tag matches the workspace version
+        # Asset names come from [workspace.package] version, not from the tag, so
+        # tagging v0.9.0 against version 0.8.8 would publish a release called
+        # v0.9.0 full of 0.8.8 files. Fails in seconds, before anything is built.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
+          tag="${GITHUB_REF#refs/tags/}"
+          if [ "v$version" != "$tag" ]; then
+              echo "ERROR: tag $tag does not match the workspace version $version." >&2
+              echo "Bump [workspace.package] version in Cargo.toml, refresh Cargo.lock," >&2
+              echo "commit, delete the tag and re-tag." >&2
+              exit 1
+          fi
+          echo "OK: $tag matches the workspace version"
 
       - name: Install build dependencies
         run: |
@@ -242,13 +264,31 @@ jobs:
           retention-days: 14
 
   # -------------------------------------------------------------- release ----
+  #
+  # Two ways in, one path out:
+  #   push a Release* branch  -> the tag is derived from the workspace version
+  #   push a v* tag by hand   -> that tag is used as-is
+  #
+  # Either way this runs only after linux and windows-cross are green, so a
+  # failing test cannot produce a release.
+  #
+  # The tag is created by the same API call that creates the release. Creating it
+  # in an earlier step would not work: a tag pushed with CI's own token does not
+  # re-trigger workflows, so a design that tagged first and waited for the tag
+  # event would stall with no release and no error.
   release:
     needs: [linux, windows-cross]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      startsWith(github.ref, 'refs/tags/v')
+      || startsWith(github.ref, 'refs/heads/Release')
+      || startsWith(github.ref, 'refs/heads/release')
     runs-on: forgejo-runner
     container:
       image: catthehacker/ubuntu:act-24.04
     steps:
+      # Only needed to read the workspace version on a Release* branch push.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -261,20 +301,47 @@ jobs:
           RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           api="${GITHUB_API_URL:-$GITHUB_SERVER_URL/api/v1}"
-          tag="${GITHUB_REF#refs/tags/}"
           auth="Authorization: token $RELEASE_TOKEN"
+          repo="$GITHUB_REPOSITORY"
+
+          # One source of truth for the version: the same [workspace.package]
+          # field build-deb.sh reads and the artifact names already carry. The
+          # branch name only signals intent - nothing is parsed out of it.
+          case "$GITHUB_REF" in
+              refs/tags/*)
+                  tag="${GITHUB_REF#refs/tags/}" ;;
+              *)
+                  version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
+                  [ -n "$version" ] || { echo "could not read the version from Cargo.toml" >&2; exit 1; }
+                  tag="v$version" ;;
+          esac
+          echo "release tag: $tag   commit: $GITHUB_SHA"
+
+          # A published version is immutable. If the tag already exists at some
+          # other commit, stop rather than ship two different builds under one
+          # version - the usual cause is forgetting to bump Cargo.toml.
+          at=$(curl -sS -H "$auth" "$api/repos/$repo/tags/$tag" | jq -r '.commit.sha // empty')
+          if [ -n "$at" ] && [ "$at" != "$GITHUB_SHA" ]; then
+              echo "ERROR: tag $tag already exists at $at, not $GITHUB_SHA." >&2
+              echo "Bump [workspace.package] version in Cargo.toml, refresh Cargo.lock" >&2
+              echo "with 'cargo update -w', commit and push again." >&2
+              exit 1
+          fi
 
           mkdir -p dist
           find artifacts -type f -exec mv -t dist -- {} +
           ls -l dist/
 
-          # Reuse the release when it already exists, so re-running a tag build
-          # replaces assets instead of failing.
-          id=$(curl -sS -H "$auth" "$api/repos/$GITHUB_REPOSITORY/releases/tags/$tag" | jq -r '.id // empty')
+          # Creating a release whose tag_name does not exist yet makes Forgejo
+          # create the tag at target_commitish, so this one call both tags and
+          # publishes. Reuse an existing release so a re-run replaces assets
+          # instead of failing.
+          id=$(curl -sS -H "$auth" "$api/repos/$repo/releases/tags/$tag" | jq -r '.id // empty')
           if [ -z "$id" ]; then
-              id=$(curl -fsS -X POST "$api/repos/$GITHUB_REPOSITORY/releases" \
+              id=$(curl -fsS -X POST "$api/repos/$repo/releases" \
                      -H "$auth" -H 'Content-Type: application/json' \
-                     -d "$(jq -n --arg t "$tag" '{tag_name: $t, name: $t, draft: false, prerelease: false}')" \
+                     -d "$(jq -n --arg t "$tag" --arg c "$GITHUB_SHA" \
+                           '{tag_name: $t, target_commitish: $c, name: $t, draft: false, prerelease: false}')" \
                    | jq -r '.id // empty')
           fi
           [ -n "$id" ] || { echo "could not create or find a release for $tag" >&2; exit 1; }
@@ -283,11 +350,11 @@ jobs:
               name=$(basename "$f")
               echo "uploading $name"
               # Replace an asset of the same name left by an earlier run.
-              old=$(curl -sS -H "$auth" "$api/repos/$GITHUB_REPOSITORY/releases/$id/assets" \
+              old=$(curl -sS -H "$auth" "$api/repos/$repo/releases/$id/assets" \
                     | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')
               [ -z "$old" ] || curl -fsS -X DELETE -H "$auth" \
-                  "$api/repos/$GITHUB_REPOSITORY/releases/$id/assets/$old"
-              curl -fsS -X POST "$api/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$name" \
+                  "$api/repos/$repo/releases/$id/assets/$old"
+              curl -fsS -X POST "$api/repos/$repo/releases/$id/assets?name=$name" \
                 -H "$auth" -F "attachment=@$f" -o /dev/null
           done
           echo "published $tag"

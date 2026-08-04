@@ -387,8 +387,14 @@ pagination: the table is virtualized, so a single scroll list capped at
 - `QSB_SNIPPET_PERF=1 cargo test --release -p quicksearch-core --test
   snippet_perf -- --nocapture`: snippet pipeline benchmark.
 - `.forgejo/workflows/ci.yml`: builds both platforms on every push to `master`
-  and every pull request, and attaches the `.deb`, a Linux tarball and a
-  Windows zip to a release on a `v*` tag. The Linux job runs in an Ubuntu
+  and every pull request. To cut a release, bump `[workspace.package] version`
+  in `Cargo.toml`, run `cargo update -w` so the lockfile agrees (CI builds with
+  `--locked`), and push the commit on a branch named `Release...`. Once both
+  build jobs are green, CI tags that commit `v<version>` and publishes a release
+  with the `.deb`, a Linux tarball and a Windows zip attached; pushing a `v*`
+  tag by hand does the same thing. The version is never taken from the branch
+  name, and a tag that already exists at a different commit aborts the release
+  rather than shipping two builds under one version. The Linux job runs in an Ubuntu
   22.04 container on purpose — `packaging/build-deb.sh` reads the package's
   `libc6` floor from the binary it just built, so the builder's glibc becomes
   the package's minimum, and 22.04 pins it at 2.35. The Windows job
