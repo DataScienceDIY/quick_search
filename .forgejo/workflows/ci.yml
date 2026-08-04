@@ -44,7 +44,7 @@ jobs:
   # will not work: JS actions need Node already present in the image, and no
   # step can install it before actions/checkout runs.
   linux:
-    runs-on: forgejo-runner
+    runs-on: self-hosted
     container:
       image: catthehacker/ubuntu:act-22.04
     env:
@@ -179,7 +179,7 @@ jobs:
   # .exe runs on; pinning it to 22.04 would buy nothing while forcing the build
   # through mingw-w64 10.3 instead of 13.2.
   windows-cross:
-    runs-on: forgejo-runner
+    runs-on: self-hosted
     container:
       image: catthehacker/ubuntu:act-24.04
     env:
@@ -282,7 +282,7 @@ jobs:
       startsWith(github.ref, 'refs/tags/v')
       || startsWith(github.ref, 'refs/heads/Release')
       || startsWith(github.ref, 'refs/heads/release')
-    runs-on: forgejo-runner
+    runs-on: self-hosted
     container:
       image: catthehacker/ubuntu:act-24.04
     steps:
