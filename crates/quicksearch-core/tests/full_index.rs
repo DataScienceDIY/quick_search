@@ -1326,14 +1326,28 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     // The fixed design's stall does not grow with the heavy root's cost — it is
     // one round-robin pass plus one commit — so making that root heavier only
     // widens the margin.
+    // The figures above are wall-clock, so they scale with the host: a small CI
+    // VM running the other tests in this binary alongside this one measures
+    // several times the developer-machine number without the design having
+    // changed at all. QSB_STALL_BUDGET_MS lets that environment say so out loud
+    // instead of the bound being quietly loosened for everyone. Keep any override
+    // well under the broken design's figure scaled by the same factor, or the
+    // test stops discriminating between the two.
+    let budget = Duration::from_millis(
+        std::env::var("QSB_STALL_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100),
+    );
     eprintln!(
-        "longest light-root stall while heavy extracted: {:?}",
-        worst
+        "longest light-root stall while heavy extracted: {:?} (budget {:?})",
+        worst, budget
     );
     assert!(
-        worst < Duration::from_millis(100),
-        "the light root stalled for {:?} while the heavy root extracted",
-        worst
+        worst < budget,
+        "the light root stalled for {:?} while the heavy root extracted (budget {:?})",
+        worst,
+        budget
     );
 
     std::fs::remove_dir_all(&heavy).ok();
