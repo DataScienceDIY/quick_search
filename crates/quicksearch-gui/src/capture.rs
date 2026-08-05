@@ -46,6 +46,9 @@ use crate::app::{QuickSearchApp, Tab};
 /// clear_query | focus_search
 /// window INT INT                   # resize to width x height, in the same
 ///                                  # logical points as the startup size
+/// hover_match INT                  # pin the pointer over the Nth visible
+///                                  # Match cell (0-based) until hover_off
+/// hover_off                        # release the pinned pointer
 /// tab (search|manage|duplicates|logs|help)
 /// wait_index_running [max INT]     # caps in ms; a capped wait cannot fail
 /// wait_index_idle    [max INT]
@@ -62,6 +65,8 @@ pub(crate) enum Cmd {
     ClearQuery,
     FocusSearch,
     Window { w: f32, h: f32 },
+    HoverMatch(usize),
+    HoverOff,
     Tab(Tab),
     WaitIndexRunning { max_ms: Option<u64> },
     WaitIndexIdle { max_ms: Option<u64> },
@@ -198,6 +203,10 @@ fn parse_line(tokens: &[Token], line_no: usize) -> Result<Option<Cmd>, ParseErro
                 h: h as f32,
             }
         }
+        "hover_match" => Cmd::HoverMatch(
+            parse_int("row", next_word(rest, line_no, "row index")?, line_no)? as usize,
+        ),
+        "hover_off" => Cmd::HoverOff,
         "tab" => Cmd::Tab(match next_word(rest, line_no, "tab name")? {
             "search" => Tab::Search,
             "manage" => Tab::Manage,
@@ -343,6 +352,17 @@ pub(crate) struct CaptureDriver {
     /// Screenshot in flight: requested, PNG not yet written.
     shot: Option<PathBuf>,
     rec: Option<Recorder>,
+    /// Match-cell row the pointer is pinned to (`hover_match`), and the
+    /// on-screen position it resolved to on the last rendered frame.
+    hover: Option<usize>,
+    hover_pos: Option<egui::Pos2>,
+    /// The position last injected. Kept separate from `hover_pos` because
+    /// injection must be edge-triggered: egui resets its pointer-stillness
+    /// clock on *every* `PointerMoved` event, moved or not, and tooltips
+    /// only appear once that clock outlives the tooltip delay.
+    hover_injected: Option<egui::Pos2>,
+    /// One-shot `Event::PointerGone` injection, armed by `hover_off`.
+    pointer_gone_pending: bool,
     out_dir: PathBuf,
     /// Set by `quit`; the app drops the driver once it is.
     pub(crate) finished: bool,
@@ -391,6 +411,10 @@ impl CaptureDriver {
             typing: None,
             shot: None,
             rec: None,
+            hover: None,
+            hover_pos: None,
+            hover_injected: None,
+            pointer_gone_pending: false,
             out_dir,
             finished: false,
         }))
@@ -418,6 +442,13 @@ impl CaptureDriver {
                 )));
                 rec.next_request = now + rec.interval;
             }
+        }
+
+        // Resolve the pinned hover against what the last frame rendered:
+        // rows can move while results stream, and the tooltip should track
+        // the cell, not a stale point.
+        if let Some(n) = self.hover {
+            self.hover_pos = app.capture_match_cell(n).map(|r| r.center());
         }
 
         let Some(cmd) = self.cmds.get(self.pc).cloned() else {
@@ -473,6 +504,16 @@ impl CaptureDriver {
             }
             Cmd::ClearQuery => app.capture_clear_query(),
             Cmd::FocusSearch => app.capture_focus_search(),
+            Cmd::HoverMatch(n) => {
+                self.hover = Some(*n);
+                self.hover_pos = None; // resolved from the next rendered frame
+            }
+            Cmd::HoverOff => {
+                self.hover = None;
+                self.hover_pos = None;
+                self.hover_injected = None;
+                self.pointer_gone_pending = true;
+            }
             Cmd::Window { w, h } => {
                 // Scenario sizes use the same logical points as the startup
                 // size in main.rs, so `window 1000 700` restores it exactly.
@@ -517,8 +558,11 @@ impl CaptureDriver {
         match cmd {
             Cmd::WaitMs(ms) => elapsed >= Duration::from_millis(*ms),
             Cmd::Type { .. } => self.typing.is_none(),
+            // Done once the cell exists on screen and the pointer is on it.
+            Cmd::HoverMatch(_) => self.hover_pos.is_some(),
             Cmd::ClearQuery
             | Cmd::FocusSearch
+            | Cmd::HoverOff
             | Cmd::Window { .. }
             | Cmd::Tab(_)
             | Cmd::RecordStart(_)
@@ -573,6 +617,31 @@ impl CaptureDriver {
         }
         if drained {
             self.typing = None;
+        }
+
+        if self.pointer_gone_pending {
+            self.pointer_gone_pending = false;
+            raw.events.push(egui::Event::PointerGone);
+        }
+        if let Some(pos) = self.hover_pos {
+            // Edge-triggered on purpose: egui resets its pointer-stillness
+            // clock on every `PointerMoved` event even at an unchanged
+            // position, and the tooltip appears only after that clock
+            // outlives the tooltip delay. Inject when the pin moves — or
+            // after a real OS pointer event, which would otherwise unpin us
+            // (appending after it means the pin wins the frame).
+            let foreign_pointer = raw.events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::PointerMoved(_)
+                        | egui::Event::PointerGone
+                        | egui::Event::PointerButton { .. }
+                )
+            });
+            if foreign_pointer || self.hover_injected != Some(pos) {
+                raw.events.push(egui::Event::PointerMoved(pos));
+                self.hover_injected = Some(pos);
+            }
         }
 
         // One pass over the incoming events harvests both kinds of
@@ -740,11 +809,14 @@ fn hard_timeout_ms(cmd: &Cmd) -> u64 {
         Cmd::Type { text, cps } => (text.chars().count() as f32 / cps * 1000.0) as u64 + 30_000,
         Cmd::ClearQuery
         | Cmd::FocusSearch
+        | Cmd::HoverOff
         | Cmd::Window { .. }
         | Cmd::Tab(_)
         | Cmd::RecordStart(_)
         | Cmd::RecordStop
         | Cmd::Quit => 10_000,
+        // Fails when the scenario asks for a row that never rendered.
+        Cmd::HoverMatch(_) => 10_000,
         Cmd::Screenshot(_) => 10_000,
         Cmd::WaitIndexRunning { .. } => 120_000,
         Cmd::WaitIndexIdle { .. } => 1_800_000,
@@ -815,6 +887,8 @@ mod tests {
             clear_query
             focus_search
             window 500 350
+            hover_match 2
+            hover_off
             tab search
             tab manage
             tab duplicates
@@ -846,6 +920,8 @@ mod tests {
                 Cmd::ClearQuery,
                 Cmd::FocusSearch,
                 Cmd::Window { w: 500.0, h: 350.0 },
+                Cmd::HoverMatch(2),
+                Cmd::HoverOff,
                 Cmd::Tab(Tab::Search),
                 Cmd::Tab(Tab::Manage),
                 Cmd::Tab(Tab::Duplicates),
@@ -943,6 +1019,7 @@ mod tests {
         assert!(parse_err("screenshot").msg.contains("missing"));
         assert!(parse_err("window").msg.contains("missing"));
         assert!(parse_err("window 500").msg.contains("missing"));
+        assert!(parse_err("hover_match").msg.contains("missing"));
     }
 
     #[test]
