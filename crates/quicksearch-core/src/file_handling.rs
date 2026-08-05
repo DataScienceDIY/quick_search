@@ -1,10 +1,10 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 // Only the Unix entry-count path shells out; Windows walks the tree directly.
-use std::collections::HashMap;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
@@ -67,15 +67,12 @@ pub(crate) fn path_to_db_string(path: &Path) -> String {
     }
 }
 
-/// Canonicalize a root string for storage/comparison, stripping the Windows
-/// UNC prefix. Multi-root strings (newline-joined) fail canonicalize and
-/// pass through verbatim, which still compares consistently.
-///
-/// The UNC strip is [`path_to_db_string`]'s, not a hand-rolled one: chopping
-/// four characters would turn `\\?\UNC\server\share` into
-/// `UNC\server\share`, which is not a path — and no longer looks like a
-/// share, so the root would walk with the local thread count instead of the
-/// network one.
+/// Canonicalize a root string for storage/comparison, via
+/// [`path_to_db_string`] rather than a hand-rolled prefix strip — the extra
+/// consequence here being that a mis-stripped share stops looking like one, so
+/// the root would walk with the local thread count instead of the network one.
+/// Multi-root strings (newline-joined) fail canonicalize and pass through
+/// verbatim, which still compares consistently.
 ///
 /// This is the spelling `files.path` rows are prefixed with, so it is also the
 /// form roots must be compared in: `~/docs` and `/home/me/docs` name one root
@@ -196,8 +193,19 @@ impl UnreadableDirs {
     /// Whether `path` lies under a directory the walk failed to read, and so
     /// must not be treated as deleted.
     ///
-    /// Compares by path component, not by string prefix: `/a/bc` does not
-    /// live under `/a/b`.
+    /// # Containment is by path component, never by string prefix
+    ///
+    /// `Path::starts_with` and `Path::ancestors` both compare whole
+    /// components, so `/a/bc` does not live under `/a/b` and `/a/b.txt` is not
+    /// swallowed by `/a/b`. A `str::starts_with` would say otherwise, and
+    /// every use of this rule in the codebase decides whether rows get
+    /// deleted, whether a watch is dropped, or whether a subtree is in scope —
+    /// so a sibling matched by accident is a neighbouring folder's index
+    /// disappearing. This is the reference statement of the rule;
+    /// [`crate::incremental::collapse_removal_roots`],
+    /// `coordinator::collapse_pending_removals`, `watcher::WatchRegistry::remove_tree`,
+    /// [`crate::scope::Scope::owning_root`] and
+    /// [`crate::config::nested_roots`] apply the same one.
     pub fn covers(&self, path: &str) -> bool {
         let dirs = self.dirs.lock().unwrap();
         if dirs.is_empty() {
@@ -217,7 +225,12 @@ impl UnreadableDirs {
 ///
 /// Used as a `walkdir` `filter_entry` predicate, so returning `false` for a
 /// directory prunes the whole subtree instead of merely skipping the entry.
-fn walk_filter(e: &DirEntry, include_hidden: bool, ignore: &IgnoreSet) -> bool {
+fn walk_filter(
+    e: &DirEntry,
+    follow_symlinks: bool,
+    include_hidden: bool,
+    ignore: &IgnoreSet,
+) -> bool {
     // Depth 0 is the root itself — a `false` here would silence the
     // entire walk, and users explicitly chose their roots.
     if e.depth() == 0 {
@@ -227,7 +240,21 @@ fn walk_filter(e: &DirEntry, include_hidden: bool, ignore: &IgnoreSet) -> bool {
     // Free on Windows (walkdir hands back the attributes `FindNextFileW`
     // already returned) and never called on Unix, so the "no extra lstat"
     // property below still holds.
-    if !include_hidden && crate::platform::entry_is_hidden(&name, || e.metadata().ok()) {
+    //
+    // The exception is a followed symlink: `DirEntry::metadata` switches to
+    // `fs::metadata` there and would report the *target's* attributes, where
+    // the parallel walker reports the link's own. `entry_hidden_reason`
+    // requires the entry itself, so ask for it explicitly — walkdir was
+    // already making a real call in that case, so this costs nothing extra.
+    if !include_hidden
+        && crate::platform::entry_is_hidden(&name, || {
+            if follow_symlinks && e.path_is_symlink() {
+                std::fs::symlink_metadata(e.path()).ok()
+            } else {
+                e.metadata().ok()
+            }
+        })
+    {
         return false;
     }
     !ignore.matches_component(&name) && !ignore.matches_path_pattern(e.path())
@@ -256,7 +283,7 @@ fn walk_entries<'a>(
     WalkDir::new(root)
         .follow_links(follow_symlinks)
         .into_iter()
-        .filter_entry(move |e| walk_filter(e, include_hidden, ignore))
+        .filter_entry(move |e| walk_filter(e, follow_symlinks, include_hidden, ignore))
         .filter_map(move |res| match res {
             Ok(e) => Some(e),
             Err(err) => {
@@ -310,7 +337,6 @@ pub fn filtered_dirs<'a>(
 fn parse_wc_l_stdout(bytes: &[u8]) -> Result<usize, String> {
     let s = String::from_utf8_lossy(bytes);
     let token = s
-        .trim()
         .split_whitespace()
         .next()
         .ok_or_else(|| "wc: empty output".to_string())?;
@@ -405,15 +431,11 @@ fn count_find_pipe_wc(
 
 /// Count tree entries with a plain directory walk.
 ///
-/// Windows has no `find`, and the obvious substitute — `powershell.exe -Command
-/// "(Get-ChildItem -Recurse | Measure-Object).Count"` — is a poor trade: 300+
-/// ms of interpreter startup before any work, `Get-ChildItem -Recurse` is far
-/// slower than a `FindNextFileW` loop, it pops a console window on a windowed
-/// process, and the path has to be escaped into a script string. Walking
-/// directly is faster, quieter, and cancels immediately instead of at the
-/// 50 ms subprocess-poll granularity.
+/// Kept as the oracle [`count_tree_entries_win32`] is tested against: the fast
+/// path replaces it precisely because it must produce the same number, and an
+/// independent implementation is the only way to assert that.
 #[cfg(windows)]
-fn count_tree_entries_native(
+fn count_tree_entries_walkdir(
     path: &str,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<usize, String> {
@@ -436,10 +458,151 @@ fn count_tree_entries_native(
     Ok(n)
 }
 
+/// Count tree entries by reading directories in bulk through
+/// `GetFileInformationByHandleEx`.
+///
+/// Windows has no `find`, so the Unix pipeline has nothing to call. The
+/// obvious substitute — `powershell.exe -Command "(Get-ChildItem -Recurse |
+/// Measure-Object).Count"` — is a poor trade: 300+ ms of interpreter startup
+/// before any work, `Get-ChildItem -Recurse` is far slower than a directory
+/// read, it pops a console window on a windowed process, and the path has to
+/// be escaped into a script string.
+///
+/// The reason this exists rather than [`count_tree_entries_walkdir`] is the
+/// per-entry cost. `std::fs::read_dir` — which walkdir sits on — issues one
+/// `FindNextFileW` per entry and allocates a `PathBuf` for each, so counting a
+/// million-entry tree means a million syscalls and a million allocations to
+/// produce a single integer. `FileIdBothDirectoryInfo` fills a caller-supplied
+/// buffer with as many chained records as fit, which turns the syscall count
+/// into roughly one per 64 KiB of directory data and the allocations into one
+/// per directory. This is the documented Win32 form of what fast indexers use;
+/// it needs no new crate, no elevated rights, and no ntdll.
+///
+/// Recursion is explicit and iterative — a stack of directories still to read
+/// — because a deep tree must not be able to exhaust the thread's stack.
+#[cfg(windows)]
+fn count_tree_entries_win32(
+    path: &str,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<usize, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandleEx, FileIdBothDirectoryInfo, FILE_ID_BOTH_DIR_INFO,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    /// One call returns as many entries as fit here. 64 KiB holds several
+    /// hundred typical names, so a directory of any ordinary size is one or
+    /// two syscalls rather than one per file.
+    const BUFFER_BYTES: usize = 64 * 1024;
+
+    /// `FILE_ATTRIBUTE_DIRECTORY`, spelled out for the reason
+    /// [`crate::platform`] spells out its own attribute constants, and
+    /// const-asserted against the real header below.
+    const ATTR_DIRECTORY: u32 = 0x10;
+    const _: () = assert!(
+        ATTR_DIRECTORY == windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+    );
+
+    fn wide(path: &std::path::Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    let mut pending = vec![std::path::PathBuf::from(path)];
+    let mut count = 0usize;
+    // One allocation for the whole walk, reused for every directory.
+    let mut buffer = vec![0u8; BUFFER_BYTES];
+
+    while let Some(dir) = pending.pop() {
+        // Checked per directory *and* per entry below: cancellation has to be
+        // immediate on a tree large enough to be worth counting.
+        if cancel.load(Ordering::Relaxed) {
+            return Err("count cancelled".to_string());
+        }
+
+        // FILE_FLAG_BACKUP_SEMANTICS is what makes CreateFileW open a
+        // directory rather than fail; the share flags let the tree keep being
+        // used while we count it.
+        let handle = unsafe {
+            CreateFileW(
+                wide(&dir).as_ptr(),
+                FILE_LIST_DIRECTORY,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                // hTemplateFile: a HANDLE, which windows-sys spells `isize`.
+                0,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            // An unreadable directory costs its own entries, not the tree's.
+            continue;
+        }
+
+        loop {
+            // Returns zero both on error and at the end of the listing; either
+            // way this directory is done.
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    handle,
+                    FileIdBothDirectoryInfo,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len() as u32,
+                )
+            };
+            if ok == 0 {
+                break;
+            }
+
+            let mut offset = 0usize;
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    unsafe { CloseHandle(handle) };
+                    return Err("count cancelled".to_string());
+                }
+                // SAFETY: the API filled `buffer` with a chain of these
+                // records, each at the offset the previous one gave.
+                let info =
+                    unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
+
+                // FileNameLength is in bytes; FileName is UTF-16 and is *not*
+                // NUL-terminated, so the length is the only thing that says
+                // where it ends.
+                let name_units = (info.FileNameLength as usize) / 2;
+                let name = unsafe {
+                    std::slice::from_raw_parts(info.FileName.as_ptr(), name_units)
+                };
+                let name = OsString::from_wide(name);
+
+                // "." and ".." are entries of the listing, not of the tree.
+                let is_dot = name == "." || name == "..";
+                if !is_dot {
+                    count += 1;
+                    if info.FileAttributes & ATTR_DIRECTORY != 0 {
+                        pending.push(dir.join(&name));
+                    }
+                }
+
+                match info.NextEntryOffset {
+                    0 => break,
+                    next => offset += next as usize,
+                }
+            }
+        }
+        unsafe { CloseHandle(handle) };
+    }
+    Ok(count)
+}
+
 /// Rough tree entry count for progress totals. Setting `cancel` stops it
 /// rather than letting it scan an entire root after the run stopped: on Unix
 /// that kills the `find`/`wc` subprocesses at ~50 ms granularity, on Windows
-/// the native walk notices almost immediately. Runs concurrently with
+/// the bulk directory read notices almost immediately. Runs concurrently with
 /// indexing — its scope is not identical to the walker's classified file
 /// count.
 pub fn count_tree_entries_fast(
@@ -448,18 +611,18 @@ pub fn count_tree_entries_fast(
 ) -> Result<usize, String> {
     #[cfg(windows)]
     {
-        return count_tree_entries_native(path, cancel);
+        return count_tree_entries_win32(path, cancel);
     }
     #[cfg(all(unix, target_os = "linux"))]
     {
-        return count_find_pipe_wc(path, cancel, true).or_else(|e| {
+        count_find_pipe_wc(path, cancel, true).or_else(|e| {
             if e.contains("cancelled") {
                 Err(e)
             } else {
                 // Non-GNU find without -printf: plain listing.
                 count_find_pipe_wc(path, cancel, false)
             }
-        });
+        })
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -509,13 +672,13 @@ pub fn classify_by_mtime(stored: Option<u64>, mtime: u64) -> FileIndexAction {
     }
 }
 
-/// Safely truncate a string to at most max_bytes bytes while respecting UTF-8 character boundaries
+/// Truncate to at most `max_bytes` bytes, backing up to a UTF-8 character
+/// boundary. Cuts short of the budget rather than over it.
 fn safe_truncate_string(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
 
-    // Find the last valid UTF-8 character boundary at or before max_bytes
     let mut end = max_bytes;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
@@ -553,7 +716,7 @@ fn get_file_hash(
     f.read_exact(&mut head)?;
 
     let mut hasher = Sha256::new();
-    hasher.update(&size.to_le_bytes());
+    hasher.update(size.to_le_bytes());
     hasher.update(&head);
     Ok((hasher.finalize().to_vec(), head))
 }
@@ -583,7 +746,11 @@ pub struct OwnedNewFile {
     pub device_id: Option<u64>,
     pub mime: Option<String>,
     pub ftype: FileType,
-    pub hash: Vec<u8>,
+    /// `None` only for a file whose contents could not be read without paying
+    /// for them — a dehydrated cloud placeholder. Stored as SQL NULL, which is
+    /// what keeps such files out of duplicate detection: an empty or zero hash
+    /// would make every one of them look identical to every other.
+    pub hash: Option<Vec<u8>>,
     /// Text extracted from the head bytes during the walk, for files small
     /// enough that the head *was* the whole file. `Some` means the content
     /// pass never has to open this file; `None` leaves it pending as before.
@@ -611,10 +778,26 @@ impl OwnedNewFile {
             device_id: self.device_id,
             mime: self.mime.as_deref(),
             ftype: self.ftype,
-            hash: Some(&self.hash),
+            hash: self.hash.as_deref(),
             needs_content: self.needs_content,
         }
     }
+}
+
+/// Individual "cannot hash" warnings allowed per run before only the count is
+/// kept. See [`crate::log::Throttle`]; [`reset_run_warnings`] arms it.
+static HASH_FAILURES: crate::log::Throttle = crate::log::Throttle::new(20);
+
+/// Arm the per-run warning throttles. Called once at the start of an indexing
+/// run, so the counts a run reports describe that run and not the process.
+pub fn reset_run_warnings() {
+    HASH_FAILURES.reset();
+}
+
+/// How many files could not be hashed this run, and how many of those went
+/// unlogged. `(0, 0)` when nothing failed.
+pub fn hash_failure_counts() -> (u64, u64) {
+    (HASH_FAILURES.seen(), HASH_FAILURES.suppressed())
 }
 
 /// Build the `files` row for one on-disk file from a `stat` the caller
@@ -651,11 +834,29 @@ pub fn prepare_file_record(
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())?;
 
-    let (hash, head) = match get_file_hash(size, Path::new(path), config.processing.hash_length) {
-        Ok(v) => v,
-        Err(e) => {
-            crate::log_warn!("Skipping file (cannot hash) {}: {}", path, e);
-            return None;
+    // A dehydrated cloud file is indexed from its metadata alone. Reading even
+    // the first byte would block on downloading the whole thing, so the head is
+    // never fetched: no hash, no MIME sniff, no inline extraction, and the row
+    // is born with nothing pending. The file is still fully searchable by name,
+    // size and date — only its *contents* wait, and they wait until the user
+    // hydrates the file themselves. Hydration does not change the mtime, so what
+    // picks it up is this same test on a later run, once the attribute clears.
+    let dehydrated = crate::platform::is_cloud_placeholder(meta);
+
+    let (hash, head) = if dehydrated {
+        (None, Vec::new())
+    } else {
+        match get_file_hash(size, Path::new(path), config.processing.hash_length) {
+            Ok((hash, head)) => (Some(hash), head),
+            Err(e) => {
+                // Throttled: on Windows a file another process holds open fails
+                // here as a matter of course, and a large tree can produce
+                // thousands. `run_indexing` reports the total.
+                if HASH_FAILURES.allow() {
+                    crate::log_warn!("Skipping file (cannot hash) {}: {}", path, e);
+                }
+                return None;
+            }
         }
     };
 
@@ -664,7 +865,9 @@ pub fn prepare_file_record(
         .map(|n| n.to_string_lossy().into_owned())?;
     let parent = parent_str(path);
     let (inode, device_id) = inode_and_device(meta);
-    // Sniff from the bytes hashing already read rather than reopening.
+    // Sniff from the bytes hashing already read rather than reopening. With no
+    // head to sniff, the extension is all there is — which is what
+    // `guess_mime_from_head` already falls back to for an empty slice.
     let mime = guess_mime_from_head(Path::new(path), &head);
     let ftype = mime.as_deref().map(mime_to_type).unwrap_or(FileType::EMPTY);
 
@@ -672,7 +875,8 @@ pub fn prepare_file_record(
     // registry are all in hand — and stored as the row's `content_state`, so
     // "pending" downstream means a file that really needs reading rather than
     // one the content pass would only mark not-applicable.
-    let needs_content = size <= config.processing.maximum_text_file_size
+    let needs_content = !dehydrated
+        && size <= config.processing.maximum_text_file_size
         && content_extractable(Path::new(path), mime.as_deref(), config, registry);
 
     // When the head is the whole file, an extractor that works from bytes can
@@ -1209,17 +1413,7 @@ mod tests {
     use std::path::MAIN_SEPARATOR;
 
     fn tmp_tree() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "quicksearch-walk-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+        crate::testutil::scratch_dir("walk")
     }
 
     fn touch(p: &Path) {
@@ -1619,18 +1813,9 @@ mod count_and_extract_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// A path that does not exist yet — these tests build the tree themselves.
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "qs-ce-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+        crate::testutil::scratch_dir(tag).join("tree")
     }
 
     #[test]
@@ -1642,8 +1827,59 @@ mod count_and_extract_tests {
         }
         let cancel = AtomicBool::new(false);
         let n = count_tree_entries_fast(root.to_str().unwrap(), &cancel).unwrap();
-        // find lists the root, the subdir, and the three files.
-        assert_eq!(n, 5);
+        // The subdir plus the three files. Unix counts through `find`, which
+        // also lists the root it was given; the Windows directory read only
+        // ever sees entries *inside* a directory and so never counts the root.
+        // Both are correct for a progress denominator — this is an estimate
+        // running concurrently with the walk, not a total to reconcile against.
+        assert_eq!(n, if cfg!(windows) { 4 } else { 5 });
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The load-bearing property of the Windows fast path: it exists only to
+    /// be quicker than a plain walk, so it has to agree with one exactly.
+    ///
+    /// The tree is deliberately wider than one buffer's worth of directory
+    /// data, so `GetFileInformationByHandleEx` is called repeatedly for the
+    /// same directory and the resumption between calls is exercised — the part
+    /// a single-buffer test would never reach.
+    #[cfg(windows)]
+    #[test]
+    fn the_bulk_directory_read_agrees_with_a_plain_walk() {
+        let root = tmp("count-oracle");
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
+        // Long names so the chained records fill more than one 64 KiB buffer.
+        for i in 0..600 {
+            let name = format!("{}-{:04}.txt", "padding".repeat(12), i);
+            std::fs::write(root.join(&name), b"x").unwrap();
+            std::fs::write(root.join("a/b/c").join(&name), b"x").unwrap();
+        }
+
+        let cancel = AtomicBool::new(false);
+        let path = root.to_str().unwrap();
+        let fast = count_tree_entries_win32(path, &cancel).unwrap();
+        let plain = count_tree_entries_walkdir(path, &cancel).unwrap();
+        assert_eq!(fast, plain, "the fast count must match a plain walk");
+        // 1200 files + `empty` + `a` + `a/b` + `a/b/c`.
+        assert_eq!(fast, 1204);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Cancellation is checked per entry, not per directory, so a huge single
+    /// directory stops as promptly as a deep tree.
+    #[cfg(windows)]
+    #[test]
+    fn the_bulk_directory_read_stops_when_cancelled() {
+        let root = tmp("count-cancel");
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..200 {
+            std::fs::write(root.join(format!("f{:03}.txt", i)), b"x").unwrap();
+        }
+        let cancel = AtomicBool::new(true);
+        let err = count_tree_entries_win32(root.to_str().unwrap(), &cancel).unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
         std::fs::remove_dir_all(&root).ok();
     }
 

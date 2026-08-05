@@ -66,7 +66,7 @@ and exit codes behave normally. On Unix `quicksearch` also does both, and
 
 ```sh
 ./packaging/build-deb.sh
-sudo apt install ./dist/quicksearch_0.1.0_amd64.deb
+sudo apt install ./dist/quicksearch_1.0.2_amd64.deb
 ```
 
 The script builds the release binary, strips it, and assembles a `.deb` with
@@ -172,7 +172,7 @@ installer, so it takes `/S` for a silent install and `/D=` for the directory
 (last argument, unquoted):
 
 ```bat
-quicksearch-0.9.1-windows-x86_64-setup.exe /S /D=C:\Tools\QuickSearch
+quicksearch-1.0.2-windows-x86_64-setup.exe /S /D=C:\Tools\QuickSearch
 ```
 
 The `.zip` on the release page is the alternative to all of this: the same two
@@ -211,7 +211,17 @@ inside that folder.
   what each tab does — pointing here for everything technical.
 
 The bottom status bar always shows what the indexer is doing (phase,
-percent, files/sec) or the total indexed file count when idle.
+percent, files/sec) or the total indexed file count when idle. Applying a
+settings change to the index counts as something the indexer is doing: it
+reports its progress there and in the Manage Index tab, and says what it
+removed for a few seconds after it finishes, so a change that takes a
+millisecond is as visible as one that takes minutes.
+
+Quitting while a settings change is still being applied asks first. Leaving
+is never refused — the work stops promptly and the index stays consistent —
+but it stops part-way, so entries you excluded can still turn up in search
+results until indexing runs again. The next launch says so, with a button to
+start that run; in automatic mode the periodic reindex does it for you.
 
 ### Terminal
 
@@ -317,10 +327,12 @@ default index goes to `~/.local/share/quicksearch/index.sqlite`
 
 Defaults follow the platform. The first indexing root is your home
 directory or `%USERPROFILE%`; `include_hidden = false` skips dot-files
-everywhere and additionally anything marked Hidden or System on Windows,
-which is what keeps `AppData`, `$RECYCLE.BIN` and `System Volume
-Information` out of the index; and ignore patterns are matched
-case-insensitively on Windows and macOS, matching the filesystem.
+everywhere and additionally anything marked Hidden on Windows, which is
+what keeps `AppData`, `$RECYCLE.BIN` and `System Volume Information` out
+of the index — the System attribute alone is not enough, because cloud
+sync roots carry it purely to get a branded folder icon; and ignore
+patterns are matched case-insensitively on Windows and macOS, matching
+the filesystem.
 
 **Portable mode**: a `config.toml` sitting next to the `quicksearch`
 binary overrides the user config entirely, and relative paths inside any
@@ -381,8 +393,10 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
 - **Indexing** (`indexing.rs`, `file_handling.rs`): full runs walk each
   root (`filtered_walk` prunes hidden/ignored subtrees before descending),
   classify files by mtime into insert/update/skip, batch-write metadata,
-  sweep stale rows, then extract content (plaintext, RTF, Office, PDF,
-  audio tags, EXIF; see `extract/`) for FTS. Files whose extension no MIME
+  sweep stale rows, then extract content (plaintext, RTF, Office — both the
+  OOXML/ODF zip formats and the pre-2007 binary `.doc`/`.xls`/`.ppt`, whose
+  OLE2 streams are read in `extract/ole.rs` — PDF, audio tags, EXIF; see
+  `extract/`) for FTS. Files whose extension no MIME
   table knows — including extensionless ones like `README` or `Makefile` —
   are sniffed from their head bytes and indexed as text only when that head
   is provably text: valid UTF-8, or BOM-marked (`mime.rs`, `textenc.rs`).
@@ -397,7 +411,12 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   it completed or was stopped — with an optimize pass on its own connection:
   checkpoint, VACUUM if the file has at least 10% slack to reclaim, `PRAGMA
   optimize`, checkpoint again. Progress streams through a polled
-  `IndexingStatus`, which reads `Optimizing` for the duration of that pass.
+  `IndexingStatus`, which reads `Optimizing` for the duration of that pass —
+  and `Preparing` for everything a run does before its first file is walked:
+  waiting on the previous run's thread, opening the index (a WAL recovery
+  lands here), and reconciling a changed configuration. Each carries the run's
+  start time, so a prologue that outlasts the walk on a large index reads as
+  slow work rather than a hang.
 - **Scope reconciliation** (`scope.rs`): the index is a cache of what a walk
   under the configured roots would produce, so a configuration change is a
   difference between the two rather than a reason to start over.
@@ -412,6 +431,20 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   closed behave like one edited live. The scan is per-root, by `[lo, hi)`
   range: a symlink target stored outside every root has no owning root and
   therefore no rules that could be applied to it, so it is never visited.
+  Whichever of the two applies it, a pass that *finishes* records what it
+  reconciled against — everything but the three rebuild-only keys, which no
+  scan can satisfy. That record is the whole convergence condition: an
+  abandoned pass leaves it alone and the next run picks the work back up,
+  while a completed one stops every later run from re-deriving the same plan
+  and rescanning every row to redo work already done. Both report a live
+  `ReconcileProgress` while they scan, since on a large index this is minutes
+  of work with no files moving to show for it. Both can also be abandoned:
+  `advance` reads a cancel flag before every statement, and the statement
+  already running — one `DELETE` can cover a whole root — is ended by
+  `sqlite3_interrupt`, since a flag alone cannot reach inside SQLite. That is
+  what makes closing the window during a prune immediate instead of a wait
+  the desktop offers to kill. `scope::outstanding_work` asks the record what
+  is still owed, which is how the GUI knows to remind you at the next launch.
 - **Coordinator** (`coordinator.rs`): the object binaries construct.
   Owns the `IndexingService`, the debouncing filesystem watcher
   (`watcher.rs`), and the mode state machine (Auto / Manual, persisted as
@@ -444,10 +477,12 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   flush last, so weaker matches only ever append. All SQL is
   parameterized; structured filters from the query language (`query/`)
   are ANDed onto every pass.
-- **Baloo compatibility** (`cli.rs`, `mime.rs`): read-only endpoints
-  (`status_for_path`, `list_failed`, `index_size_breakdown`, …) and a
-  Baloo-shaped type model, groundwork for a future `balooctl`-compatible
-  layer.
+- **Baloo compatibility** (`cli.rs`, `mime.rs`): the read API this repo's
+  parent consumes — `status_for_path`, `list_failed`,
+  `index_size_breakdown`, `pending_content_count`, `clear_path` — plus a
+  Baloo-shaped type model. Only `index_counts` has a caller inside this
+  repository; the rest are a compatibility surface for the parent's
+  `balooctl` layer and are not dead code.
 - **Logging** (`log.rs`): background reporting goes through `log_info!` /
   `log_warn!` rather than `println!`/`eprintln!`. Each writes its line to
   stderr *and* appends it to a bounded in-memory ring (newest 5000 lines,
@@ -456,7 +491,8 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   search hits, usage, the error a command exits with — stays on stdio.
 - **Platform differences** (`platform.rs`): the single home for `#[cfg]`.
   Home directory lookup, what counts as a hidden entry (dot-prefix, plus
-  the Hidden/System attributes on Windows), network-filesystem detection
+  the Hidden attribute on Windows — System deliberately excluded, since
+  cloud sync roots set it to get a folder icon), network-filesystem detection
   (`/proc/mounts` against `GetDriveTypeW`), path collation, and the
   watch-registration strategy all live here, so the rest of the crate can
   ask a question rather than test a target. Anything decidable from a
@@ -490,7 +526,11 @@ pagination: the table is virtualized, so a single scroll list capped at
 - `cargo test -p quicksearch-core`: unit + integration suites (cascade
   ranking, cancellation, incremental indexing, coordinator modes, config
   resolution, fuzzy matcher vs. brute-force oracle).
-- `cargo test -p quicksearch-gui`: formatter/tracker/CLI-parsing units.
+- `cargo test -p quicksearch-gui`: formatter/tracker/CLI-parsing units plus
+  headless egui tests that drive the real widgets — building an input frame,
+  synthesizing clicks and reading back the painted text (`test_ui.rs`) — over
+  the search and manage tabs, the options editor, the unlock gate, the logs
+  and duplicates tabs, and query highlighting.
 - `QSB_SNIPPET_PERF=1 cargo test --release -p quicksearch-core --test
   snippet_perf -- --nocapture`: snippet pipeline benchmark.
 - `.forgejo/workflows/ci.yml`: builds both platforms on every push to `master`

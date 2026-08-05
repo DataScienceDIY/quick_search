@@ -7,11 +7,11 @@
 //! migrations.
 //!
 //! The tradeoff: users pay a re-index cost every time the shipped schema
-//! changes. Our indexing is fast (see `bench/`) and schema changes are
-//! rare in practice, so the code-complexity cost of maintaining real
-//! migration paths wasn't worth it. A single `open_or_recreate` replaces
-//! what used to be version detection + tokenizer-drift FTS rebuild +
-//! legacy-layout recovery, all of which ultimately wiped anyway.
+//! changes. Indexing is fast and schema changes are rare in practice, so the
+//! code-complexity cost of maintaining real migration paths wasn't worth it.
+//! A single `open_or_recreate` replaces what used to be version detection +
+//! tokenizer-drift FTS rebuild + legacy-layout recovery, all of which
+//! ultimately wiped anyway.
 
 use std::path::Path;
 
@@ -414,10 +414,7 @@ fn apply_current_schema(conn: &Connection, tokenizer: &str) -> Result<(), String
     conn.execute_batch(&fts)
         .map_err(|e| format!("Failed to create searchabletext: {}", e))?;
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = crate::log::now_unix();
     let effective = effective_tokenizer(tokenizer);
     conn.execute(
         "INSERT INTO schema_info(key, value) VALUES ('version', ?1), ('created_at', ?2), ('tokenize', ?3)",
@@ -437,16 +434,7 @@ mod tests {
     use super::*;
 
     fn tmp_db_path() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "quicksearch-test-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+        crate::testutil::scratch_dir("open").join("index.sqlite")
     }
 
     #[test]
@@ -548,7 +536,7 @@ mod tests {
         assert_eq!(count, 0);
         // New columns should exist (just prepare the SELECT — an
         // unknown column name would parse-error here).
-        let _ = conn
+        conn
             .query_row(
                 "SELECT basic_state, content_state, type, mime FROM files LIMIT 0",
                 [],
@@ -667,15 +655,7 @@ mod tests {
     fn open_or_recreate_creates_missing_parent_dirs() {
         // Fresh installs point at ~/.local/share/quicksearch/… which
         // doesn't exist yet; the owner open must create it.
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "qs-mkdir-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::testutil::scratch_dir("mkdir");
         let db = dir.join("nested/deeper/index.sqlite");
         let conn = open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
         drop(conn);

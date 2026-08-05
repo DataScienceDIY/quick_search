@@ -18,6 +18,7 @@ use std::path::Path;
 pub mod audio;
 pub mod image;
 pub mod office;
+pub mod ole;
 pub mod pdf;
 pub mod plaintext;
 pub mod rtf;

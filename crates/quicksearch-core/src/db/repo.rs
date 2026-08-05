@@ -23,6 +23,57 @@ pub const STATE_DONE: i64 = 1;
 pub const STATE_FAILED: i64 = 2;
 pub const STATE_NA: i64 = 3;
 
+/// `prepare_cached` + `execute`, returning the affected row count.
+///
+/// `what` is a closure rather than a string so the message is built only on
+/// the error path — several callers run this per property or per file, where
+/// formatting a description that is then discarded is the dominant cost.
+///
+/// Takes `&Connection`; a `Transaction` derefs to one, so the same call works
+/// inside and outside a transaction.
+fn exec(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    what: impl FnOnce() -> String,
+) -> Result<usize, String> {
+    conn.prepare_cached(sql)
+        .and_then(|mut stmt| stmt.execute(params))
+        .map_err(|e| format!("{}: {}", what(), e))
+}
+
+/// Move a file to a content state that means "nothing is currently wrong with
+/// this row", clearing any failure record along with it.
+///
+/// The pair is one operation, not two that happen to be adjacent: a row that
+/// succeeded, that nothing can extract, or that has been queued for another
+/// attempt must not keep a `failed_files` entry explaining a failure that no
+/// longer applies. `list-failed` reads that table directly, so a stale entry
+/// is a file the user is told is broken after it stopped being broken.
+///
+/// [`set_content_failed`] is deliberately not routed through here — it is the
+/// one transition that *writes* a failure record.
+fn set_state_clearing_failure(
+    tx: &Transaction<'_>,
+    file_id: i64,
+    state: i64,
+    transition: &'static str,
+) -> Result<(), String> {
+    exec(
+        tx,
+        "UPDATE files SET content_state = ?1, failure_msg = NULL WHERE id = ?2",
+        params![state, file_id],
+        || format!("{} content_state {}", transition, file_id),
+    )?;
+    exec(
+        tx,
+        "DELETE FROM failed_files WHERE file_id = ?1",
+        params![file_id],
+        || format!("clear failed_files {}", file_id),
+    )?;
+    Ok(())
+}
+
 /// Everything needed to insert a fresh file row.
 #[derive(Debug, Clone)]
 pub struct NewFile<'a> {
@@ -162,18 +213,22 @@ pub fn set_content_done(
     remove_content_for_id(tx, file_id)?;
 
     for (k, v) in properties {
-        tx.prepare_cached("INSERT INTO properties(file_id, key, value) VALUES (?1, ?2, ?3)")
-            .and_then(|mut stmt| stmt.execute(params![file_id, k, v]))
-            .map_err(|e| format!("insert property {}={}: {}", k, v, e))?;
+        exec(
+            tx,
+            "INSERT INTO properties(file_id, key, value) VALUES (?1, ?2, ?3)",
+            params![file_id, k, v],
+            || format!("insert property {}={}", k, v),
+        )?;
     }
     let props_blob = encode_properties_for_fts(properties);
     // Contentless FTS5 still accepts values on INSERT — the tokenizer needs
     // them — it simply doesn't persist the raw column values.
-    tx.prepare_cached(
+    exec(
+        tx,
         "INSERT INTO searchabletext(rowid, name, text, properties) VALUES (?1, ?2, ?3, ?4)",
-    )
-    .and_then(|mut stmt| stmt.execute(params![file_id, name, text, props_blob]))
-    .map_err(|e| format!("insert FTS row {}: {}", file_id, e))?;
+        params![file_id, name, text, props_blob],
+        || format!("insert FTS row {}", file_id),
+    )?;
 
     // Skip the compressed sidecar when: the config disables snippet storage
     // outright, or there's no body text (e.g. an image whose extractor
@@ -182,21 +237,15 @@ pub fn set_content_done(
     if store_text && !text.is_empty() {
         let compressed = zstd::encode_all(text.as_bytes(), ZSTD_LEVEL)
             .map_err(|e| format!("zstd encode for file {}: {}", file_id, e))?;
-        tx.prepare_cached(
+        exec(
+            tx,
             "INSERT INTO documents_text(file_id, text_zstd, text_len) VALUES (?1, ?2, ?3)",
-        )
-        .and_then(|mut stmt| stmt.execute(params![file_id, compressed, text.len() as i64]))
-        .map_err(|e| format!("insert documents_text {}: {}", file_id, e))?;
+            params![file_id, compressed, text.len() as i64],
+            || format!("insert documents_text {}", file_id),
+        )?;
     }
 
-    tx.prepare_cached("UPDATE files SET content_state = ?1, failure_msg = NULL WHERE id = ?2")
-        .and_then(|mut stmt| stmt.execute(params![STATE_DONE, file_id]))
-        .map_err(|e| format!("update content_state DONE {}: {}", file_id, e))?;
-    // Clear any prior failed-file record.
-    tx.prepare_cached("DELETE FROM failed_files WHERE file_id = ?1")
-        .and_then(|mut stmt| stmt.execute(params![file_id]))
-        .map_err(|e| format!("clear failed_files {}: {}", file_id, e))?;
-    Ok(())
+    set_state_clearing_failure(tx, file_id, STATE_DONE, "update DONE")
 }
 
 /// zstd level tuned for extracted-text prose. Level 3 hits ~3-5× on English
@@ -208,31 +257,26 @@ const ZSTD_LEVEL: i32 = 3;
 
 /// Mark a file's content extraction as failed. Keeps the basic row in place.
 pub fn set_content_failed(tx: &Transaction<'_>, file_id: i64, reason: &str) -> Result<(), String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
-    tx.prepare_cached("UPDATE files SET content_state = ?1, failure_msg = ?2 WHERE id = ?3")
-        .and_then(|mut stmt| stmt.execute(params![STATE_FAILED, reason, file_id]))
-        .map_err(|e| format!("update content_state FAILED {}: {}", file_id, e))?;
-    tx.prepare_cached(
+    let now = crate::log::now_unix() as i64;
+    exec(
+        tx,
+        "UPDATE files SET content_state = ?1, failure_msg = ?2 WHERE id = ?3",
+        params![STATE_FAILED, reason, file_id],
+        || format!("update content_state FAILED {}", file_id),
+    )?;
+    exec(
+        tx,
         "INSERT OR REPLACE INTO failed_files(file_id, reason, ts) VALUES (?1, ?2, ?3)",
-    )
-    .and_then(|mut stmt| stmt.execute(params![file_id, reason, now]))
-    .map_err(|e| format!("insert failed_files {}: {}", file_id, e))?;
+        params![file_id, reason, now],
+        || format!("insert failed_files {}", file_id),
+    )?;
     Ok(())
 }
 
 /// Mark content extraction as not applicable (e.g. binary format we don't
 /// support). The file row still contributes to filename search.
 pub fn set_content_na(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
-    tx.prepare_cached("UPDATE files SET content_state = ?1, failure_msg = NULL WHERE id = ?2")
-        .and_then(|mut stmt| stmt.execute(params![STATE_NA, file_id]))
-        .map_err(|e| format!("update content_state NA {}: {}", file_id, e))?;
-    tx.prepare_cached("DELETE FROM failed_files WHERE file_id = ?1")
-        .and_then(|mut stmt| stmt.execute(params![file_id]))
-        .map_err(|e| format!("clear failed_files {}: {}", file_id, e))?;
-    Ok(())
+    set_state_clearing_failure(tx, file_id, STATE_NA, "update NA")
 }
 
 /// Delete a file row by path, keeping FTS in sync. Returns whether a row was
@@ -276,15 +320,16 @@ pub fn delete_subtree(tx: &Transaction<'_>, lo: &str, hi: &str) -> Result<usize,
              (SELECT id FROM files WHERE path >= ?1 AND path < ?2)",
             table, key
         );
-        tx.prepare_cached(&sql)
-            .and_then(|mut stmt| stmt.execute(params![lo, hi]))
-            .map_err(|e| format!("delete {} under {}: {}", table, lo, e))?;
+        exec(tx, &sql, params![lo, hi], || {
+            format!("delete {} under {}", table, lo)
+        })?;
     }
-    let removed = tx
-        .prepare_cached("DELETE FROM files WHERE path >= ?1 AND path < ?2")
-        .and_then(|mut stmt| stmt.execute(params![lo, hi]))
-        .map_err(|e| format!("delete files under {}: {}", lo, e))?;
-    Ok(removed)
+    exec(
+        tx,
+        "DELETE FROM files WHERE path >= ?1 AND path < ?2",
+        params![lo, hi],
+        || format!("delete files under {}", lo),
+    )
 }
 
 /// Delete every row whose path falls in *none* of `ranges`, keeping the four
@@ -326,14 +371,14 @@ pub fn delete_outside_ranges(
             "DELETE FROM {} WHERE {} IN (SELECT id FROM files WHERE {})",
             table, key, predicate
         );
-        tx.prepare_cached(&sql)
-            .and_then(|mut stmt| stmt.execute(params_from_iter(bounds.iter())))
-            .map_err(|e| format!("delete {} outside the roots: {}", table, e))?;
+        exec(tx, &sql, params_from_iter(bounds.iter()), || {
+            format!("delete {} outside the roots", table)
+        })?;
     }
     let sql = format!("DELETE FROM files WHERE {}", predicate);
-    tx.prepare_cached(&sql)
-        .and_then(|mut stmt| stmt.execute(params_from_iter(bounds.iter())))
-        .map_err(|e| format!("delete files outside the roots: {}", e))
+    exec(tx, &sql, params_from_iter(bounds.iter()), || {
+        "delete files outside the roots".to_string()
+    })
 }
 
 /// The tables a file id owns, in the order they must be cleared: everything
@@ -381,15 +426,14 @@ pub fn delete_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<usize, String> {
         }
         for (table, key) in DEPENDENT_TABLES {
             let sql = format!("DELETE FROM {} WHERE {} IN ({})", table, key, placeholders);
-            tx.prepare_cached(&sql)
-                .and_then(|mut stmt| stmt.execute(params_from_iter(chunk.iter())))
-                .map_err(|e| format!("delete {} for {} ids: {}", table, chunk.len(), e))?;
+            exec(tx, &sql, params_from_iter(chunk.iter()), || {
+                format!("delete {} for {} ids", table, chunk.len())
+            })?;
         }
         let sql = format!("DELETE FROM files WHERE id IN ({})", placeholders);
-        removed += tx
-            .prepare_cached(&sql)
-            .and_then(|mut stmt| stmt.execute(params_from_iter(chunk.iter())))
-            .map_err(|e| format!("delete {} file rows: {}", chunk.len(), e))?;
+        removed += exec(tx, &sql, params_from_iter(chunk.iter()), || {
+            format!("delete {} file rows", chunk.len())
+        })?;
     }
     Ok(removed)
 }
@@ -420,8 +464,11 @@ pub fn dir_rows(
     Ok(out)
 }
 
+/// A row the content pass has yet to extract: `(id, name, path, mime)`.
+pub type PendingContentRow = (i64, String, String, Option<String>);
+
 /// One page of rows still awaiting content extraction under `cursor`'s range,
-/// as `(id, name, path, mime)` ordered by id.
+/// ordered by id.
 ///
 /// Keyset, not `OFFSET`: `id > cursor.last_id` means each page is an index
 /// seek rather than a re-scan of everything already handed out, and — because
@@ -434,7 +481,7 @@ pub fn pending_content_page(
     cursor: &crate::file_handling::ExtractCursor,
     max_size: i64,
     limit: i64,
-) -> Result<Vec<(i64, String, String, Option<String>)>, String> {
+) -> Result<Vec<PendingContentRow>, String> {
     let mut stmt = conn
         .prepare_cached(
             "SELECT id, name, path, mime FROM files
@@ -470,6 +517,17 @@ pub struct ScopeRow {
     pub size: u64,
     pub mime: Option<String>,
     pub content_state: i64,
+}
+
+/// How many files the index holds.
+///
+/// A denominator for a scan that pages over all of them, so the cost is paid
+/// once against work measured in pages. SQLite answers it from the smallest
+/// index rather than the table, so it is a key scan and not a row fetch.
+pub fn row_count(conn: &Connection) -> Result<usize, String> {
+    conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))
+        .map(|n| n.max(0) as usize)
+        .map_err(|e| format!("count indexed files: {}", e))
 }
 
 /// One page of rows whose path is `> after` and `< hi`, in path order.
@@ -529,10 +587,9 @@ pub fn drop_stored_text(tx: &Transaction<'_>, ids: &[i64]) -> Result<usize, Stri
             "DELETE FROM documents_text WHERE file_id IN ({})",
             placeholders
         );
-        removed += tx
-            .prepare_cached(&sql)
-            .and_then(|mut stmt| stmt.execute(params_from_iter(chunk.iter())))
-            .map_err(|e| format!("drop stored text for {} ids: {}", chunk.len(), e))?;
+        removed += exec(tx, &sql, params_from_iter(chunk.iter()), || {
+            format!("drop stored text for {} ids", chunk.len())
+        })?;
     }
     Ok(removed)
 }
@@ -545,13 +602,7 @@ pub fn drop_stored_text(tx: &Transaction<'_>, ids: &[i64]) -> Result<usize, Stri
 /// and hash from a fresh stat), but its content must be produced again.
 pub fn reset_content_pending(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
     remove_content_for_id(tx, file_id)?;
-    tx.prepare_cached("UPDATE files SET content_state = ?1, failure_msg = NULL WHERE id = ?2")
-        .and_then(|mut stmt| stmt.execute(params![STATE_PENDING, file_id]))
-        .map_err(|e| format!("reset content_state pending {}: {}", file_id, e))?;
-    tx.prepare_cached("DELETE FROM failed_files WHERE file_id = ?1")
-        .and_then(|mut stmt| stmt.execute(params![file_id]))
-        .map_err(|e| format!("clear failed_files {}: {}", file_id, e))?;
-    Ok(())
+    set_state_clearing_failure(tx, file_id, STATE_PENDING, "reset pending")
 }
 
 /// The stored mtime for one exact path, or `None` if it isn't indexed.
@@ -621,9 +672,9 @@ pub fn remove_content_for_id(tx: &Transaction<'_>, file_id: i64) -> Result<(), S
         ("properties", "file_id"),
     ] {
         let sql = format!("DELETE FROM {} WHERE {} = ?1", table, key);
-        tx.prepare_cached(&sql)
-            .and_then(|mut stmt| stmt.execute(params![file_id]))
-            .map_err(|e| format!("delete {} for {}: {}", table, file_id, e))?;
+        exec(tx, &sql, params![file_id], || {
+            format!("delete {} for {}", table, file_id)
+        })?;
     }
     Ok(())
 }
@@ -779,6 +830,70 @@ pub fn set_last_full_index(conn: &Connection, ts: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// `schema_info` key holding one root's last known file count.
+fn walk_count_key(root: &str) -> String {
+    format!("walk_count:{}", root)
+}
+
+/// How many files the last clean walk of `root` reported.
+///
+/// The progress bar's denominator. Absent means this root has never been walked
+/// to completion — a new root, a fresh index, or a run that was stopped — and
+/// the caller falls back to counting the tree as it goes.
+///
+/// Deliberately last run's *file* count rather than a tree-entry count: it is
+/// the same quantity the numerator counts, where an entry count includes
+/// directories and ignore-pruned subtrees and so reads high (over 1.6x on a home
+/// directory). See [`crate::indexing::RootProgress::walk_denominator`].
+pub fn get_root_walk_count(conn: &Connection, root: &str) -> Option<usize> {
+    conn.query_row(
+        "SELECT value FROM schema_info WHERE key = ?1",
+        params![walk_count_key(root)],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .and_then(|v| v.parse().ok())
+}
+
+/// Record `n` as `root`'s file count, for the next run's progress bar.
+///
+/// Written only after a walk that finished cleanly: a stopped or partially
+/// unreadable walk saw only part of the tree, and storing its count would leave
+/// every later run dividing by a number that is too small.
+pub fn set_root_walk_count(conn: &Connection, root: &str, n: usize) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_info(key, value) VALUES (?1, ?2)",
+        params![walk_count_key(root), n.to_string()],
+    )
+    .map_err(|e| format!("write walk count for {}: {}", root, e))?;
+    Ok(())
+}
+
+/// Forget the stored counts of roots that are no longer configured.
+///
+/// Without this, `schema_info` accumulates a row per root the user ever had —
+/// harmless in size, but it also means a root removed and later re-added would
+/// start from a count that predates everything that happened in between.
+pub fn prune_root_walk_counts(conn: &Connection, keep: &[String]) -> Result<(), String> {
+    let keep: std::collections::HashSet<String> = keep.iter().map(|r| walk_count_key(r)).collect();
+    let mut stmt = conn
+        .prepare("SELECT key FROM schema_info WHERE key LIKE 'walk_count:%'")
+        .map_err(|e| format!("read walk counts: {}", e))?;
+    let stored: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("read walk counts: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+    for key in stored.iter().filter(|k| !keep.contains(*k)) {
+        conn.execute("DELETE FROM schema_info WHERE key = ?1", params![key])
+            .map_err(|e| format!("drop walk count {}: {}", key, e))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -788,16 +903,7 @@ mod tests {
     use crate::db::open_or_recreate;
 
     fn tmp_path() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "quicksearch-repo-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+        crate::testutil::scratch_dir("repo").join("index.sqlite")
     }
 
     #[test]

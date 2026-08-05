@@ -236,7 +236,8 @@ impl TermPattern {
         }
     }
 
-    /// Case-insensitive [`find_first`] against an already-folded haystack.
+    /// Case-insensitive [`TermPattern::find_first`] against an already-folded
+    /// haystack.
     ///
     /// The literal path would otherwise fold the haystack itself, and the
     /// cascade's full-text passes need the same fold for counting, searching
@@ -256,8 +257,8 @@ impl TermPattern {
         }
     }
 
-    /// Case-insensitive [`count`] against an already-folded haystack. See
-    /// [`TermPattern::find_first_folded`].
+    /// Case-insensitive [`TermPattern::count`] against an already-folded
+    /// haystack. See [`TermPattern::find_first_folded`].
     pub fn count_folded(&self, folded: &str) -> usize {
         match self {
             TermPattern::Empty => 0,

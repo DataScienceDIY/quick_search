@@ -29,11 +29,7 @@ pub fn fmt_mtime(unix_secs: i64) -> String {
 /// "5 min ago", "3 h ago", else `YYYY-MM-DD HH:MM`. Gives instant
 /// feedback that an action (like a fast index run) actually happened.
 pub fn fmt_ago(unix_secs: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let age = now.saturating_sub(unix_secs);
+    let age = quicksearch_core::log::now_unix().saturating_sub(unix_secs);
     if age < 60 {
         "just now".to_string()
     } else if age < 3600 {
@@ -59,7 +55,8 @@ pub fn fmt_interval(minutes: u64) -> String {
     if minutes.is_multiple_of(1440) {
         let days = minutes / 1440;
         return if days == 1 {
-            // "24 h" reads better than "1 day" for the shipped default.
+            // A staleness window reads better in hours than in days: "1 day"
+            // invites rounding to "about a day", "24 h" does not.
             "24 h".to_string()
         } else {
             format!("{} days", days)
@@ -76,7 +73,7 @@ pub fn group_thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -106,6 +103,50 @@ pub fn fmt_elapsed(d: std::time::Duration) -> String {
     } else {
         format!("{} ms", ms)
     }
+}
+
+/// A running clock: `0:07`, `4:32`, `1:04:12`.
+///
+/// For work that is still going, where the question is "how long has this
+/// been like this?" — [`fmt_elapsed`] answers a different one and would
+/// render a twenty-minute wait as `1234.5 s`. Seconds are always two digits
+/// so the text does not change width every tick.
+pub fn fmt_duration_clock(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{}:{:02}", m, s)
+    }
+}
+
+/// What a finished configuration reconciliation did, in one line.
+///
+/// The counts are the point: a prune of a small index is over in a
+/// millisecond, so this line is the only evidence the user gets that the
+/// setting they changed reached the index at all. A clause whose count is
+/// zero is left out rather than printed as "0", and a pass that found nothing
+/// to change still reports that it ran — that it ran is the answer.
+pub fn fmt_reconcile_summary(deleted: usize, recontented: usize) -> String {
+    let entries = |n: usize| {
+        format!(
+            "{} {}",
+            group_thousands(n as u64),
+            if n == 1 { "entry" } else { "entries" }
+        )
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if deleted > 0 {
+        parts.push(format!("{} removed", entries(deleted)));
+    }
+    if recontented > 0 {
+        parts.push(format!("{} re-examined", entries(recontented)));
+    }
+    if parts.is_empty() {
+        return "Configuration change applied".to_string();
+    }
+    format!("Configuration change applied · {}", parts.join(" · "))
 }
 
 /// Middle-truncate a path to at most `max_chars` characters.
@@ -141,10 +182,11 @@ mod tests {
         assert_eq!(fmt_interval(0), "run");
         assert_eq!(fmt_interval(1), "1 min");
         assert_eq!(fmt_interval(59), "59 min");
-        assert_eq!(fmt_interval(60), "1 h");
+        assert_eq!(fmt_interval(60), "1 h", "the shipped default");
         assert_eq!(fmt_interval(90), "1 h 30 min");
         assert_eq!(fmt_interval(120), "2 h");
-        assert_eq!(fmt_interval(1440), "24 h", "the shipped default");
+        // A whole day is the one multiple-of-1440 case that stays in hours.
+        assert_eq!(fmt_interval(1440), "24 h");
         assert_eq!(fmt_interval(2880), "2 days");
         assert_eq!(fmt_interval(10_080), "7 days");
     }
@@ -179,15 +221,37 @@ mod tests {
 
     #[test]
     fn ago_buckets() {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = quicksearch_core::log::now_unix();
         assert_eq!(fmt_ago(now), "just now");
         assert_eq!(fmt_ago(now - 59), "just now");
         assert_eq!(fmt_ago(now - 120), "2 min ago");
         assert_eq!(fmt_ago(now - 7200), "2 h ago");
         assert!(fmt_ago(now - 200_000).contains('-'), "old = absolute date");
+    }
+
+    #[test]
+    fn reconcile_summaries_omit_what_did_not_happen() {
+        assert_eq!(
+            fmt_reconcile_summary(0, 0),
+            "Configuration change applied",
+            "a pass with nothing to do still reports that it ran"
+        );
+        assert_eq!(
+            fmt_reconcile_summary(1, 0),
+            "Configuration change applied · 1 entry removed"
+        );
+        assert_eq!(
+            fmt_reconcile_summary(1204, 0),
+            "Configuration change applied · 1,204 entries removed"
+        );
+        assert_eq!(
+            fmt_reconcile_summary(0, 7),
+            "Configuration change applied · 7 entries re-examined"
+        );
+        assert_eq!(
+            fmt_reconcile_summary(2, 3),
+            "Configuration change applied · 2 entries removed · 3 entries re-examined"
+        );
     }
 
     #[test]

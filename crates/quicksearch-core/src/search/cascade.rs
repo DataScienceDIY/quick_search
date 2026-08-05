@@ -213,6 +213,29 @@ fn count_frac(count: usize) -> f64 {
     (1000usize.saturating_sub(count.min(1000))) as f64 / 1000.0
 }
 
+/// The `files` columns every pass selects, in the order the passes index
+/// them: `0` id, `1` name, `2` path, `3` size, `4` mtime. Passes that also
+/// want the stored document text append `dt.text_zstd` as column `5`.
+///
+/// One string rather than seven copies, because the column *order* is what
+/// every `row.get(n)` in this file is written against — a pass that spelled
+/// its own list in a different order would compile and then quietly serve
+/// paths as names.
+const HIT_COLUMNS: &str = "f.id, f.name, f.path, f.size, f.mtime";
+
+/// Columns 3 and 4: the two every pass reads identically and stores without
+/// inspecting.
+///
+/// The clamp is the point of having this in one place. `size` is `INTEGER` in
+/// SQLite and so signed; a corrupt or hand-edited row holding `-1` would
+/// otherwise become 18 exabytes on the way to `u64` and sort to the top of
+/// every size-ordered result.
+fn size_and_mtime(row: &rusqlite::Row<'_>) -> Result<(u64, i64), String> {
+    let size = row.get::<_, i64>(3).map_err(|e| e.to_string())?.max(0) as u64;
+    let mtime = row.get(4).map_err(|e| e.to_string())?;
+    Ok((size, mtime))
+}
+
 /// The path tiers only make sense with enough term to be specific — same
 /// floor the trigram full-text pass uses. Wildcards count only their
 /// literal content (`a*b` is two characters of specificity, not three).
@@ -439,8 +462,9 @@ impl<'a> Cx<'a> {
         // A path always ends in its own name, so `path LIKE` is the
         // superset that feeds both the name and the path tiers.
         let sql = format!(
-            "SELECT f.id, f.name, f.path, f.size, f.mtime FROM files f \
+            "SELECT {} FROM files f \
              WHERE {} LIKE ? ESCAPE '\\'{}",
+            HIT_COLUMNS,
             if with_paths { "f.path" } else { "f.name" },
             query.filter_sql
         );
@@ -469,7 +493,7 @@ impl<'a> Cx<'a> {
         let mut clock = FlushClock::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             scanned += 1;
-            if scanned % CANCEL_CHECK_ROWS == 0 && self.cancelled() {
+            if scanned.is_multiple_of(CANCEL_CHECK_ROWS) && self.cancelled() {
                 return Ok(false);
             }
             let file_id: i64 = row.get(0).map_err(|e| e.to_string())?;
@@ -519,12 +543,13 @@ impl<'a> Cx<'a> {
                 truncated_start: false,
                 truncated_end: false,
             };
+            let (size, mtime) = size_and_mtime(row)?;
             let hit = SearchHit {
                 file_id,
                 name,
                 path,
-                size: row.get::<_, i64>(3).map_err(|e| e.to_string())?.max(0) as u64,
-                mtime: row.get(4).map_err(|e| e.to_string())?,
+                size,
+                mtime,
                 rank,
                 stage: rank as u8,
                 snippet: Some(snip),
@@ -586,20 +611,22 @@ impl<'a> Cx<'a> {
         let (sql, params) = match match_expr {
             Some(expr) => (
                 format!(
-                    "SELECT f.id, f.name, f.path, f.size, f.mtime, dt.text_zstd \
+                    "SELECT {}, dt.text_zstd \
                      FROM searchabletext \
                      JOIN files f ON f.id = searchabletext.rowid \
                      LEFT JOIN documents_text dt ON dt.file_id = f.id \
                      WHERE searchabletext MATCH ?{}",
+                    HIT_COLUMNS,
                     query.filter_sql
                 ),
                 self.params_with_filters(vec![rusqlite::types::Value::Text(expr)]),
             ),
             None => (
                 format!(
-                    "SELECT f.id, f.name, f.path, f.size, f.mtime, dt.text_zstd \
+                    "SELECT {}, dt.text_zstd \
                      FROM documents_text dt \
                      JOIN files f ON f.id = dt.file_id WHERE 1=1{}",
+                    HIT_COLUMNS,
                     query.filter_sql
                 ),
                 self.params_with_filters(Vec::new()),
@@ -692,12 +719,13 @@ impl<'a> Cx<'a> {
                 continue;
             }
 
+            let (size, mtime) = size_and_mtime(row)?;
             buf.push(SearchHit {
                 file_id,
                 name: row.get(1).map_err(|e| e.to_string())?,
                 path,
-                size: row.get::<_, i64>(3).map_err(|e| e.to_string())?.max(0) as u64,
-                mtime: row.get(4).map_err(|e| e.to_string())?,
+                size,
+                mtime,
                 rank,
                 stage,
                 snippet: snip,
@@ -733,7 +761,8 @@ impl<'a> Cx<'a> {
         let with_paths = path_tiers_enabled(&self.query.pattern);
 
         let sql = format!(
-            "SELECT f.id, f.name, f.path, f.size, f.mtime FROM files f WHERE 1=1{}",
+            "SELECT {} FROM files f WHERE 1=1{}",
+            HIT_COLUMNS,
             self.query.filter_sql
         );
         let params = self.params_with_filters(Vec::new());
@@ -750,7 +779,7 @@ impl<'a> Cx<'a> {
         let mut clock = FlushClock::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             scanned += 1;
-            if scanned % 1024 == 0 && self.cancelled() {
+            if scanned.is_multiple_of(1024) && self.cancelled() {
                 return Ok(false);
             }
             let file_id: i64 = row.get(0).map_err(|e| e.to_string())?;
@@ -789,12 +818,13 @@ impl<'a> Cx<'a> {
                 },
             ));
             let is_path_tier = rank >= 11.0;
+            let (size, mtime) = size_and_mtime(row)?;
             let hit = SearchHit {
                 file_id,
                 name,
                 path,
-                size: row.get::<_, i64>(3).map_err(|e| e.to_string())?.max(0) as u64,
-                mtime: row.get(4).map_err(|e| e.to_string())?,
+                size,
+                mtime,
                 rank,
                 stage: rank as u8,
                 snippet: snip,
@@ -838,8 +868,9 @@ impl<'a> Cx<'a> {
         };
 
         let sql = format!(
-            "SELECT f.id, f.name, f.path, f.size, f.mtime, dt.text_zstd \
+            "SELECT {}, dt.text_zstd \
              FROM documents_text dt JOIN files f ON f.id = dt.file_id WHERE 1=1{}",
+            HIT_COLUMNS,
             self.query.filter_sql
         );
         let params = self.params_with_filters(Vec::new());
@@ -882,12 +913,13 @@ impl<'a> Cx<'a> {
                 continue;
             }
             let snip = first.map(|range| snippet::window_around(&text, range, &snippet_opts));
+            let (size, mtime) = size_and_mtime(row)?;
             buf.push(SearchHit {
                 file_id,
                 name: row.get(1).map_err(|e| e.to_string())?,
                 path,
-                size: row.get::<_, i64>(3).map_err(|e| e.to_string())?.max(0) as u64,
-                mtime: row.get(4).map_err(|e| e.to_string())?,
+                size,
+                mtime,
                 rank: 8.0 + count_frac(count),
                 stage: 8,
                 snippet: snip,
@@ -911,7 +943,8 @@ impl<'a> Cx<'a> {
         let query = self.query;
         let re = query.regex.as_ref().expect("regex-only pass list");
         let sql = format!(
-            "SELECT f.id, f.name, f.path, f.size, f.mtime FROM files f WHERE 1=1{}",
+            "SELECT {} FROM files f WHERE 1=1{}",
+            HIT_COLUMNS,
             query.filter_sql
         );
         let params = self.params_with_filters(Vec::new());
@@ -928,7 +961,7 @@ impl<'a> Cx<'a> {
         let mut clock = FlushClock::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             scanned += 1;
-            if scanned % 1024 == 0 && self.cancelled() {
+            if scanned.is_multiple_of(1024) && self.cancelled() {
                 return Ok(false);
             }
             let file_id: i64 = row.get(0).map_err(|e| e.to_string())?;
@@ -956,12 +989,13 @@ impl<'a> Cx<'a> {
                 truncated_start: false,
                 truncated_end: false,
             };
+            let (size, mtime) = size_and_mtime(row)?;
             let hit = SearchHit {
                 file_id,
                 name,
                 path,
-                size: row.get::<_, i64>(3).map_err(|e| e.to_string())?.max(0) as u64,
-                mtime: row.get(4).map_err(|e| e.to_string())?,
+                size,
+                mtime,
                 rank,
                 stage: rank as u8,
                 snippet: Some(snip),
@@ -992,8 +1026,9 @@ impl<'a> Cx<'a> {
         let query = self.query;
         let re = query.regex.as_ref().expect("regex-only pass list");
         let sql = format!(
-            "SELECT f.id, f.name, f.path, f.size, f.mtime, dt.text_zstd \
+            "SELECT {}, dt.text_zstd \
              FROM documents_text dt JOIN files f ON f.id = dt.file_id WHERE 1=1{}",
+            HIT_COLUMNS,
             query.filter_sql
         );
         let params = self.params_with_filters(Vec::new());
@@ -1033,12 +1068,13 @@ impl<'a> Cx<'a> {
                 let r = clamp_match_range(&text, r, SNIPPET_WINDOW_CHARS);
                 snippet::window_around(&text, (r.start, r.end), &snippet_opts)
             });
+            let (size, mtime) = size_and_mtime(row)?;
             buf.push(SearchHit {
                 file_id,
                 name: row.get(1).map_err(|e| e.to_string())?,
                 path,
-                size: row.get::<_, i64>(3).map_err(|e| e.to_string())?.max(0) as u64,
-                mtime: row.get(4).map_err(|e| e.to_string())?,
+                size,
+                mtime,
                 rank: 6.0 + count_frac(count),
                 stage: 6,
                 snippet: snip,

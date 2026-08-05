@@ -3,6 +3,7 @@
 //! validates, saves, and hands the new config to the app.
 
 use crate::keychain;
+use crate::tips::{self, tip_row, Tipped};
 use quicksearch_core::config::Config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,12 +145,12 @@ impl OptionsWindow {
                     .show(ui, |ui| {
                         ui.heading(egui::RichText::new("Paths").strong());
                         egui::Grid::new("opt-paths").num_columns(2).show(ui, |ui| {
-                            ui.label("Database file");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut draft.paths.database_path)
-                                    .desired_width(260.0),
-                            );
-                            ui.end_row();
+                            tip_row(ui, "Database file", &tips::DATABASE_PATH, |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.paths.database_path)
+                                        .desired_width(260.0),
+                                )
+                            });
                         });
                         ui.label(
                             egui::RichText::new(
@@ -182,18 +183,13 @@ impl OptionsWindow {
 
                         ui.heading(egui::RichText::new("Interface").strong());
                         egui::Grid::new("opt-ui").num_columns(2).show(ui, |ui| {
-                            ui.label("UI scale");
-                            ui.add(
-                                egui::Slider::new(&mut draft.ui.scale, 0.5..=2.5)
-                                    .step_by(0.05)
-                                    .fixed_decimals(2),
-                            )
-                            .on_hover_text(
-                                "Zooms the whole interface: fonts, spacing, and \
-                             widgets. Ctrl +/- and Ctrl 0 adjust it temporarily \
-                             at runtime.",
-                            );
-                            ui.end_row();
+                            tip_row(ui, "UI scale", &tips::UI_SCALE, |ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut draft.ui.scale, 0.5..=2.5)
+                                        .step_by(0.05)
+                                        .fixed_decimals(2),
+                                )
+                            });
                         });
                         ui.separator();
 
@@ -208,14 +204,16 @@ impl OptionsWindow {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    let apply = ui.add(crate::ui_util::bordered_button(
-                        "Apply & Save",
-                        if dirty {
-                            crate::ui_util::ORANGE
-                        } else {
-                            crate::ui_util::BLUE
-                        },
-                    ));
+                    let apply = ui
+                        .add(crate::ui_util::bordered_button(
+                            "Apply & Save",
+                            if dirty {
+                                crate::ui_util::ORANGE
+                            } else {
+                                crate::ui_util::BLUE
+                            },
+                        ))
+                        .tip(&tips::APPLY_SAVE);
                     if apply.clicked() {
                         out.applied = Some(draft.clone());
                     }
@@ -264,27 +262,36 @@ fn security_ui(
             ui.label("The index is encrypted; a password is required at startup.");
         }
         ui.horizontal(|ui| {
-            if ui.button("Change password…").clicked() {
+            if ui
+                .button("Change password…")
+                .tip(&tips::CHANGE_PASSWORD)
+                .clicked()
+            {
                 action = Some(SecurityAction::ChangePassword);
             }
-            if ui.button("Disable protection…").clicked() {
+            if ui
+                .button("Disable protection…")
+                .tip(&tips::DISABLE_PASSWORD)
+                .clicked()
+            {
                 action = Some(SecurityAction::Disable);
             }
         });
         let mut remember = current.security.use_keychain;
         if ui
             .checkbox(&mut remember, "Remember on this device")
-            .on_hover_text(
-                "Stores the derived key (not the password) in the OS keychain \
-                 and skips the startup prompt on this machine.",
-            )
+            .tip(&tips::REMEMBER_KEYCHAIN)
             .changed()
         {
             action = Some(SecurityAction::SetKeychain(remember));
         }
     } else {
         ui.label("The index is not encrypted.");
-        if ui.button("Enable password protection…").clicked() {
+        if ui
+            .button("Enable password protection…")
+            .tip(&tips::ENABLE_PASSWORD)
+            .clicked()
+        {
             action = Some(SecurityAction::Enable);
         }
         ui.label(
@@ -299,8 +306,11 @@ fn security_ui(
     action
 }
 
-/// One implementation of the per-section config controls, shared by the
-/// Options window and the Manage tab.
+/// The per-section config controls of the Options window.
+///
+/// Every row goes through [`crate::tips::tip_row`], which takes the tooltip
+/// that explains it: a setting cannot arrive here without one, and hovering
+/// the name works as well as hovering the control.
 pub fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
     match section {
         Section::Indexing => {
@@ -311,42 +321,44 @@ pub fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section
                     // state, switched (and saved) by the Stop / Return to
                     // Automatic buttons on the Manage Index tab. A staged copy
                     // of it here would fight those buttons.
-                    ui.label("Full reindex every");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::DragValue::new(&mut config.indexing.reindex_interval_minutes)
-                                .range(5..=60 * 24 * 30),
-                        );
-                        ui.label("minutes");
+                    tip_row(ui, "Full reindex every", &tips::REINDEX_INTERVAL, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut config.indexing.reindex_interval_minutes)
+                                    .range(5..=60 * 24 * 30),
+                            );
+                            ui.label("minutes");
+                        })
+                        .response
                     });
-                    ui.end_row();
 
-                    ui.label("Follow symlinks");
-                    ui.checkbox(&mut config.indexing.follow_symlinks, "");
-                    ui.end_row();
+                    tip_row(ui, "Follow symlinks", &tips::FOLLOW_SYMLINKS, |ui| {
+                        ui.checkbox(&mut config.indexing.follow_symlinks, "")
+                    });
 
-                    ui.label("Include hidden files");
-                    ui.checkbox(&mut config.indexing.include_hidden, "");
-                    ui.end_row();
+                    tip_row(ui, "Include hidden files", &tips::INCLUDE_HIDDEN, |ui| {
+                        ui.checkbox(&mut config.indexing.include_hidden, "")
+                    });
                 });
         }
         Section::Processing => {
             egui::Grid::new("cfg-processing")
                 .num_columns(2)
                 .show(ui, |ui| {
-                    ui.label("Tokenizer");
-                    egui::ComboBox::from_id_salt("cfg-tokenize")
-                        .selected_text(&config.processing.tokenize)
-                        .show_ui(ui, |ui| {
-                            for opt in ["trigram", "unicode61", "porter"] {
-                                ui.selectable_value(
-                                    &mut config.processing.tokenize,
-                                    opt.to_string(),
-                                    opt,
-                                );
-                            }
-                        });
-                    ui.end_row();
+                    tip_row(ui, "Tokenizer", &tips::TOKENIZER, |ui| {
+                        egui::ComboBox::from_id_salt("cfg-tokenize")
+                            .selected_text(&config.processing.tokenize)
+                            .show_ui(ui, |ui| {
+                                for opt in ["trigram", "unicode61", "porter"] {
+                                    ui.selectable_value(
+                                        &mut config.processing.tokenize,
+                                        opt.to_string(),
+                                        opt,
+                                    );
+                                }
+                            })
+                            .response
+                    });
 
                     ui.label("");
                     ui.hyperlink_to(
@@ -355,101 +367,85 @@ pub fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section
                     );
                     ui.end_row();
 
-                    ui.label("Hash sample size (bytes)");
-                    ui.add(
-                        egui::DragValue::new(&mut config.processing.hash_length)
-                            .range(512..=1_048_576),
-                    );
-                    ui.end_row();
+                    tip_row(ui, "Hash sample size (bytes)", &tips::HASH_LENGTH, |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut config.processing.hash_length)
+                                .range(512..=1_048_576),
+                        )
+                    });
 
-                    ui.label("Max stored text (bytes)");
-                    ui.add(
-                        egui::DragValue::new(&mut config.processing.maximum_text_size)
-                            .range(1024..=16_777_216),
+                    tip_row(
+                        ui,
+                        "Max stored text (bytes)",
+                        &tips::MAX_STORED_TEXT,
+                        |ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut config.processing.maximum_text_size)
+                                    .range(1024..=16_777_216),
+                            )
+                        },
                     );
-                    ui.end_row();
 
-                    ui.label("Max text file size (bytes)");
-                    ui.add(
-                        egui::DragValue::new(&mut config.processing.maximum_text_file_size)
-                            .range(1024..=1_073_741_824),
+                    tip_row(
+                        ui,
+                        "Max text file size (bytes)",
+                        &tips::MAX_TEXT_FILE_SIZE,
+                        |ui| {
+                            ui.add(
+                                egui::DragValue::new(&mut config.processing.maximum_text_file_size)
+                                    .range(1024..=1_073_741_824),
+                            )
+                        },
                     );
-                    ui.end_row();
 
-                    ui.label("Batch size");
-                    ui.add(
-                        egui::DragValue::new(&mut config.processing.batch_size).range(10..=100_000),
-                    );
-                    ui.end_row();
+                    tip_row(ui, "Batch size", &tips::BATCH_SIZE, |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut config.processing.batch_size)
+                                .range(10..=100_000),
+                        )
+                    });
 
-                    ui.label("Max WAL size (bytes)");
-                    ui.add(
-                        egui::DragValue::new(&mut config.processing.maximum_wal_size)
-                            .range(0u64..=8_589_934_592u64),
-                    )
-                    .on_hover_text(
-                        "How large index.sqlite-wal may grow during a run before the \
-                     indexer forces a checkpoint. 0 disables forced checkpoints; \
-                     anything below 16 MiB is raised to it.",
-                    );
-                    ui.end_row();
+                    tip_row(ui, "Max WAL size (bytes)", &tips::MAX_WAL_SIZE, |ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut config.processing.maximum_wal_size)
+                                .range(0u64..=8_589_934_592u64),
+                        )
+                    });
 
-                    ui.label("Store text for snippets");
-                    ui.checkbox(&mut config.processing.store_text_for_snippets, "")
-                        .on_hover_text(
-                            "Off: smaller index, but no previews, occurrence ranking, \
-                         case verification, or fuzzy full-text search",
-                        );
-                    ui.end_row();
+                    tip_row(ui, "Store text for snippets", &tips::STORE_TEXT, |ui| {
+                        ui.checkbox(&mut config.processing.store_text_for_snippets, "")
+                    });
                 });
         }
         Section::Search => {
             egui::Grid::new("cfg-search").num_columns(2).show(ui, |ui| {
-                ui.label("Fuzzy search ON by default");
-                ui.checkbox(&mut config.search.fuzzy_default, "");
-                ui.end_row();
-
-                ui.label("Fuzzy edit distance");
-                ui.vertical(|ui| {
-                    ui.add(egui::DragValue::new(&mut config.search.fuzzy_max_edits).range(0..=8))
-                        .on_hover_text(
-                            "Ceiling on the typo budget. The allowance grows with the \
-                             search term, one edit per three characters, up to this \
-                             value, so 2 means \"1 edit for short terms, 2 for longer \
-                             ones\". 0 turns the fuzzy stages off.",
-                        );
-                    if let Some(warning) = config.search.fuzzy_edits_warning() {
-                        ui.label(
-                            egui::RichText::new(warning)
-                                .small()
-                                .color(crate::ui_util::ORANGE),
-                        );
-                    }
-                });
-                ui.end_row();
-
-                ui.label("Display limit");
-                ui.add(egui::DragValue::new(&mut config.search.display_limit).range(50..=100_000));
-                ui.end_row();
-
-                ui.label("Stream batch size");
-                ui.add(
-                    egui::DragValue::new(&mut config.search.results_per_page).range(10..=10_000),
+                tip_row(
+                    ui,
+                    "Fuzzy search ON by default",
+                    &tips::FUZZY_DEFAULT,
+                    |ui| ui.checkbox(&mut config.search.fuzzy_default, ""),
                 );
-                ui.end_row();
 
-                ui.label("Debounce (ms)");
-                ui.add(egui::DragValue::new(&mut config.search.debounce_ms).range(0..=2000));
-                ui.end_row();
+                tip_row(ui, "Fuzzy edit distance", &tips::FUZZY_EDITS, |ui| {
+                    ui.add(egui::DragValue::new(&mut config.search.fuzzy_max_edits).range(0..=8))
+                });
 
-                ui.label("Fuzzy max edits");
-                ui.add(egui::DragValue::new(&mut config.search.fuzzy_max_edits).range(0..=8))
-                    .on_hover_text(
-                        "Ceiling on fuzzy edit distance (the budget grows one \
-                         edit per three characters of the term). 0 disables \
-                         the fuzzy passes.",
-                    );
-                ui.end_row();
+                tip_row(ui, "Display limit", &tips::DISPLAY_LIMIT, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut config.search.display_limit).range(50..=100_000),
+                    )
+                });
+
+                tip_row(ui, "Stream batch size", &tips::RESULTS_PER_PAGE, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut config.search.results_per_page)
+                            .range(10..=10_000),
+                    )
+                });
+
+                tip_row(ui, "Debounce (ms)", &tips::DEBOUNCE, |ui| {
+                    ui.add(egui::DragValue::new(&mut config.search.debounce_ms).range(0..=2000))
+                });
             });
             // A warning that comes and goes as the value is edited would
             // otherwise move every widget below it in the window; see
@@ -525,29 +521,151 @@ mod tests {
         assert!(w.draft.is_none());
     }
 
-    /// Where `needle` was painted this frame, as the center of its galley —
-    /// a click target that follows the layout instead of pinning it.
-    fn painted_text_center(out: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
-        fn walk(shape: &egui::epaint::Shape, needle: &str, found: &mut Option<egui::Pos2>) {
-            match shape {
-                egui::epaint::Shape::Text(t) => {
-                    if t.galley.text() == needle {
-                        *found = Some(t.pos + t.galley.size() / 2.0);
-                    }
+    use crate::test_ui::{painted_text, painted_text_center};
+
+    /// Every row of every section, with the tip it must show. `tip_row`
+    /// makes a row without *a* tooltip impossible; this table is what makes
+    /// a row with the *wrong* one impossible.
+    const ROWS: &[(Section, &str, &tips::Tip)] = &[
+        (
+            Section::Indexing,
+            "Full reindex every",
+            &tips::REINDEX_INTERVAL,
+        ),
+        (Section::Indexing, "Follow symlinks", &tips::FOLLOW_SYMLINKS),
+        (
+            Section::Indexing,
+            "Include hidden files",
+            &tips::INCLUDE_HIDDEN,
+        ),
+        (Section::Processing, "Tokenizer", &tips::TOKENIZER),
+        (
+            Section::Processing,
+            "Hash sample size (bytes)",
+            &tips::HASH_LENGTH,
+        ),
+        (
+            Section::Processing,
+            "Max stored text (bytes)",
+            &tips::MAX_STORED_TEXT,
+        ),
+        (
+            Section::Processing,
+            "Max text file size (bytes)",
+            &tips::MAX_TEXT_FILE_SIZE,
+        ),
+        (Section::Processing, "Batch size", &tips::BATCH_SIZE),
+        (
+            Section::Processing,
+            "Max WAL size (bytes)",
+            &tips::MAX_WAL_SIZE,
+        ),
+        (
+            Section::Processing,
+            "Store text for snippets",
+            &tips::STORE_TEXT,
+        ),
+        (
+            Section::Search,
+            "Fuzzy search ON by default",
+            &tips::FUZZY_DEFAULT,
+        ),
+        (Section::Search, "Fuzzy edit distance", &tips::FUZZY_EDITS),
+        (Section::Search, "Display limit", &tips::DISPLAY_LIMIT),
+        (
+            Section::Search,
+            "Stream batch size",
+            &tips::RESULTS_PER_PAGE,
+        ),
+        (Section::Search, "Debounce (ms)", &tips::DEBOUNCE),
+    ];
+
+    /// Hovering a row's name paints that row's own explanation. Rendered
+    /// without the window's scroll area so nothing sits below the fold.
+    #[test]
+    fn every_row_shows_its_own_tip() {
+        for (section, label, tip) in ROWS {
+            let ctx = egui::Context::default();
+            ctx.style_mut(|s| {
+                s.interaction.tooltip_delay = 0.0;
+                s.interaction.show_tooltips_only_when_still = false;
+            });
+            let mut cfg = Config::default();
+            let mut run = |events: Vec<egui::Event>| {
+                let input = crate::test_ui::raw_input(egui::vec2(600.0, 800.0), events);
+                ctx.run(input, |ctx| {
+                    egui::CentralPanel::default()
+                        .show(ctx, |ui| config_editor_ui(ui, &mut cfg, *section));
+                })
+            };
+
+            let first = run(vec![]);
+            let pos = painted_text_center(&first, label)
+                .unwrap_or_else(|| panic!("{label} was not painted"));
+
+            // Enough of the body to be unique, and short enough to survive
+            // an edit to the sentence it starts.
+            let opening: String = tip.body.chars().take(40).collect();
+            let mut out = run(vec![egui::Event::PointerMoved(pos)]);
+            let mut found = false;
+            for _ in 0..3 {
+                // The tooltip is an area of its own, so it can land a frame
+                // late.
+                if painted_text(&out).join("\n").contains(&opening) {
+                    found = true;
+                    break;
                 }
-                egui::epaint::Shape::Vec(v) => {
-                    for s in v {
-                        walk(s, needle, found);
-                    }
-                }
-                _ => {}
+                out = run(vec![]);
+            }
+            assert!(found, "hovering {label:?} did not show {:?}", tip.title);
+        }
+    }
+
+    /// Hovering a setting's *name* explains it, not just its control: the
+    /// label is the larger target and the one a reader's eye is already on.
+    /// Checks the wiring, so the tooltip timing is turned off.
+    #[test]
+    fn hovering_a_setting_label_explains_it() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| {
+            s.interaction.tooltip_delay = 0.0;
+            s.interaction.show_tooltips_only_when_still = false;
+        });
+        let cfg = Config::default();
+        let mut w = OptionsWindow::new();
+        w.open_with(&cfg);
+
+        let run = |w: &mut OptionsWindow, events: Vec<egui::Event>| {
+            let input = crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), events);
+            ctx.run(input, |ctx| {
+                w.ui(ctx, &cfg);
+            })
+        };
+
+        // The window spends its first frames sizing itself and painting
+        // nothing; run until the label is on screen.
+        let mut target = None;
+        for _ in 0..5 {
+            let full = run(&mut w, vec![]);
+            target = painted_text_center(&full, "Tokenizer");
+            if target.is_some() {
+                break;
             }
         }
-        let mut found = None;
-        for clipped in &out.shapes {
-            walk(&clipped.shape, needle, &mut found);
+        let target = target.expect("the Tokenizer label was not painted");
+
+        // The tooltip is an area of its own, so it can land a frame late.
+        let mut out = run(&mut w, vec![egui::Event::PointerMoved(target)]);
+        for _ in 0..3 {
+            let painted = painted_text(&out).join("\n");
+            if painted.contains(crate::tips::TOKENIZER.title)
+                && painted.contains("cut up so that it can be")
+            {
+                return;
+            }
+            out = run(&mut w, vec![]);
         }
-        found
+        panic!("no tooltip appeared over the Tokenizer label");
     }
 
     /// One real frame of the window in a headless context: it renders, and
@@ -561,14 +679,7 @@ mod tests {
         w.draft.as_mut().unwrap().search.debounce_ms += 100;
 
         let run = |w: &mut OptionsWindow, events: Vec<egui::Event>| {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1000.0, 900.0),
-                )),
-                events,
-                ..Default::default()
-            };
+            let input = crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), events);
             let mut out = OptionsOutput::default();
             let full = ctx.run(input, |ctx| out = w.ui(ctx, &cfg));
             (out, full)

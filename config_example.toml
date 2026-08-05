@@ -34,7 +34,7 @@ database_path = "~/.local/share/quicksearch/index.sqlite"
 # buttons on the Manage Index tab write this value, so the mode you left the
 # app in is the mode it starts in.
 auto_index = true
-reindex_interval_minutes = 1440
+reindex_interval_minutes = 60
 # Follow symbolic links during directory walks. Applies to links pointing at
 # files as well as at directories: with this off a symlink is not resolved at
 # all, so its target is never indexed — which matters because a target can
@@ -43,8 +43,12 @@ reindex_interval_minutes = 1440
 # that are no longer in scope; turning it on reindexes to find them.
 follow_symlinks = false
 # Index hidden files and directories. That means dot-files everywhere, and
-# additionally anything carrying the Hidden or System attribute on Windows
-# (AppData, $RECYCLE.BIN, System Volume Information, pagefile.sys ...).
+# additionally anything carrying the Hidden attribute on Windows (AppData,
+# $RECYCLE.BIN, System Volume Information, pagefile.sys ...). The System
+# attribute on its own does not count: Windows honours the desktop.ini inside
+# a folder only if the folder carries System or Read-only, so cloud sync roots
+# (ownCloud, Nextcloud, OneDrive, Google Drive) and any folder given a custom
+# icon carry it purely to get that icon, and are indexed normally.
 # Turning this off removes the hidden entries already indexed.
 include_hidden = false
 # Empty = extract text from every supported format. Non-empty = content
@@ -145,6 +149,13 @@ use_keychain = false
 # together (0.5 – 2.5). Ctrl +/- and Ctrl 0 adjust it temporarily at
 # runtime; this value is the persistent baseline.
 scale = 1.1
+# Written by QuickSearch, not by you: the folders that have already shown
+# the "more subfolders than the watcher can follow" warning, so restarting
+# does not repeat it. Keyed by folder rather than a single flag so that
+# adding a folder warns again — the trade-off changed — and pruned to the
+# current folder list whenever it is applied. Deleting it just means the
+# warnings come back once each.
+watch_cap_warned_roots = []
 
 [search]
 # Start with the fuzzy passes enabled.

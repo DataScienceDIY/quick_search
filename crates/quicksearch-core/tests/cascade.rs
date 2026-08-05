@@ -1,7 +1,7 @@
 //! Integration tests for the ranked search cascade and the streaming
 //! search service, against real temp databases.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -11,19 +11,8 @@ use quicksearch_core::mime::FileType;
 use quicksearch_core::query::split::split_for_cascade;
 use quicksearch_core::search::{cascade, SearchHit, SearchOptions, SearchService, SearchUpdate};
 
-fn tmp_db(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "qs-cascade-{}-{}-{}.sqlite",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    p
-}
+mod common;
+use common::scratch_db as tmp_db;
 
 struct Seeder {
     conn: rusqlite::Connection,
@@ -31,7 +20,7 @@ struct Seeder {
 }
 
 impl Seeder {
-    fn new(path: &PathBuf, store_text: bool) -> Seeder {
+    fn new(path: &Path, store_text: bool) -> Seeder {
         Seeder {
             conn: open_or_recreate(path.to_str().unwrap(), "trigram").unwrap(),
             store_text,

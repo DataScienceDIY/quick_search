@@ -1,10 +1,27 @@
-//! Programmatic read-only query helpers.
+//! Programmatic query helpers.
 //!
 //! Pure functions that open a DB, run a query, and return structured data.
-//! No stdout, no CLI framing — callers (GUI, future CLI binaries, Set B
-//! `balooctl`) format the result as they see fit. Mutating operations live
-//! on [`crate::indexing::IndexingService`] since they require a running
-//! worker thread.
+//! No stdout, no CLI framing — the GUI and `quicksearch-cli` format the
+//! result as they see fit. Indexing operations live on
+//! [`crate::indexing::IndexingService`] since they require a running worker
+//! thread.
+//!
+//! # These are consumed from outside this repository
+//!
+//! QuickSearch is a sub-repo. Of everything here only [`index_counts`] has a
+//! caller in this tree (the GUI status bar); [`status_for_path`],
+//! [`list_failed`], [`index_size_breakdown`], [`pending_content_count`] and
+//! [`clear_path`] are called by the parent repository's Baloo compat daemon,
+//! which is what reports them to `balooctl` and mirrors them into LMDB.
+//!
+//! So they are **not dead code**, and their signatures are a compatibility
+//! surface rather than an internal detail: a search of this repository alone
+//! will not turn up the callers that break when one changes.
+//!
+//! One exception to the "query helpers" framing: [`clear_path`] mutates. It
+//! opens its own writer, which sidesteps the single-writer discipline the
+//! coordinator maintains, so it is safe only against an index no local
+//! coordinator is running against.
 
 use rusqlite::{params, OptionalExtension};
 
@@ -233,16 +250,7 @@ mod tests {
     use crate::mime::FileType;
 
     fn tmp_path() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "qs-cli-test-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+        crate::testutil::scratch_dir("cli").join("index.sqlite")
     }
 
     fn seed_fixture(db_path: &str) -> (i64, i64) {
@@ -326,6 +334,79 @@ mod tests {
         assert_eq!(failed[0].reason.as_deref(), Some("bad extract"));
 
         std::fs::remove_file(&p).ok();
+    }
+
+    /// The count is "outstanding extraction work", which is a narrower thing
+    /// than "rows without text": a file nothing extracts is settled, not
+    /// waiting, and would otherwise be reported as a backlog that never
+    /// drains.
+    #[test]
+    fn pending_content_count_counts_only_outstanding_work() {
+        let p = tmp_path();
+        let dbp = p.to_str().unwrap();
+        // a is Done, b is Failed — both resolved, neither pending.
+        let _ = seed_fixture(dbp);
+        assert_eq!(pending_content_count(dbp).unwrap(), 0);
+
+        let mut conn = open_or_recreate(dbp, "trigram").unwrap();
+        {
+            let tx = conn.transaction().unwrap();
+            // Claimed by an extractor, text not read yet: this is the backlog.
+            insert_file(
+                &tx,
+                &NewFile {
+                    name: "c.txt",
+                    path: "/tmp/c.txt",
+                    parent: "/tmp",
+                    size: 1,
+                    mtime: 1,
+                    inode: None,
+                    device_id: None,
+                    mime: Some("text/plain"),
+                    ftype: FileType::TEXT,
+                    hash: None,
+                    needs_content: true,
+                },
+            )
+            .unwrap()
+            .expect("unique path");
+            // Nothing extracts this one, so it is NA on arrival and must not
+            // inflate the figure.
+            insert_file(
+                &tx,
+                &NewFile {
+                    name: "d.bin",
+                    path: "/tmp/d.bin",
+                    parent: "/tmp",
+                    size: 1,
+                    mtime: 1,
+                    inode: None,
+                    device_id: None,
+                    mime: None,
+                    ftype: FileType::EMPTY,
+                    hash: None,
+                    needs_content: false,
+                },
+            )
+            .unwrap()
+            .expect("unique path");
+            tx.commit().unwrap();
+        }
+        drop(conn);
+
+        assert_eq!(
+            pending_content_count(dbp).unwrap(),
+            1,
+            "only the file awaiting extraction counts"
+        );
+
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn pending_content_count_on_a_missing_db_is_an_error() {
+        let missing = crate::testutil::scratch_dir("cli-missing").join("nope.sqlite");
+        assert!(pending_content_count(missing.to_str().unwrap()).is_err());
     }
 
     #[test]

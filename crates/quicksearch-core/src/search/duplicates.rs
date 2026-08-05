@@ -88,15 +88,7 @@ mod tests {
     use crate::mime::FileType;
 
     fn seed_db() -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "qs-dups-{}-{}.sqlite",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let p = crate::testutil::scratch_dir("dups").join("index.sqlite");
         let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         let tx = conn.transaction().unwrap();
         let add = |name: &str, path: &str, size: u64, hash: Option<&[u8]>| {

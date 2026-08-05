@@ -122,9 +122,16 @@ say "Installed ${#icons[@]} icon sizes plus the scalable SVG"
 # Debian wants man pages and the changelog compressed, with no gzip timestamp so
 # repeat builds are byte-identical. quicksearch-cli.1 is a one-line .so stub
 # pointing at quicksearch.1, which documents both binaries.
+#
+# The .TH version field is rewritten from $version on the way through, so the
+# footer of an installed page tracks [workspace.package] version instead of
+# needing a hand-edit every release. The stub has no .TH, so the sed is a
+# no-op there.
 install -dm755 "$stage/usr/share/man/man1"
 for page in "${BINARIES[@]}"; do
-    gzip -9nc "$REPO_ROOT/packaging/$page.1" > "$stage/usr/share/man/man1/$page.1.gz"
+    sed "/^\.TH /s/\"quicksearch [^\"]*\"/\"quicksearch $version\"/" \
+        "$REPO_ROOT/packaging/$page.1" \
+        | gzip -9nc > "$stage/usr/share/man/man1/$page.1.gz"
     chmod 644 "$stage/usr/share/man/man1/$page.1.gz"
 done
 

@@ -16,7 +16,6 @@
 //!     --test snippet_perf -- --nocapture
 //! ```
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use quicksearch_core::snippet;
@@ -123,19 +122,8 @@ fn seed_text(rng: &mut u64, target_words: usize) -> String {
     out
 }
 
-fn tmp_path(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "qs-snippet-perf-{}-{}-{}.sqlite",
-        tag,
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    p
-}
+mod common;
+use common::scratch_db as tmp_path;
 
 #[test]
 fn snippet_paths_perf_comparison() {

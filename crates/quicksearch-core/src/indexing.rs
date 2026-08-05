@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, InterruptHandle, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -36,9 +36,14 @@ pub struct RootProgress {
     /// Files the walk has seen so far. Final and exact once the root leaves
     /// [`RootPhase::Walking`] — see [`RootProgress::walk_denominator`].
     pub walked: usize,
-    /// Concurrent `find`-based *estimate*; `None` until the count lands.
-    /// Counts tree entries, not walkable files, so it reads high — read it
-    /// through [`RootProgress::walk_denominator`] rather than directly.
+    /// What to divide `walked` by, from whichever source this root has.
+    /// `None` until one lands.
+    ///
+    /// Exact on a root walked before — last clean run's file count, read from
+    /// the index and available immediately. Only a root with no stored count
+    /// falls back to the concurrent `find` scan, which counts tree *entries*
+    /// rather than walkable files and so reads high. Read it through
+    /// [`RootProgress::walk_denominator`] rather than directly.
     pub walk_total: Option<usize>,
     /// Rows with searchable text: extracted in earlier runs plus this one.
     pub extracted: usize,
@@ -60,15 +65,16 @@ pub struct RootProgress {
 impl RootProgress {
     /// This root's walk-phase contribution to a progress denominator.
     ///
-    /// While the walk runs, the only figure available is the concurrent
-    /// `find` count, which counts tree *entries* — directories, hidden
-    /// entries and ignore-pruned subtrees included — where `walked` counts
-    /// only the files the walk emits. On a home directory that estimate runs
-    /// over 1.6x high. Once the walk ends `walked` is final and exact, so the
-    /// estimate is dropped: keeping it is what stopped the bar reaching 100%.
+    /// While the walk runs, `walk_total` is the best figure there is, and how
+    /// good that is depends on where it came from — see the field. A root
+    /// walked before contributes its exact stored count; a first-time root
+    /// contributes the `find` scan's entry count, which on a home directory
+    /// runs over 1.6x high. Once the walk ends `walked` is final and exact for
+    /// *both*, so `walk_total` is dropped either way: keeping it is what
+    /// stopped the bar reaching 100%.
     pub fn walk_denominator(&self) -> Option<usize> {
         match self.phase {
-            // Never below what has already been walked: an estimate the walk
+            // Never below what has already been walked: a denominator the walk
             // has overtaken is provably wrong, and a bar pinned at 100%
             // mid-walk reads as a hang.
             RootPhase::Walking => self.walk_total.map(|t| t.max(self.walked)),
@@ -121,9 +127,63 @@ pub fn overall_progress(roots: &[RootProgress]) -> OverallProgress {
     OverallProgress { processed, total }
 }
 
+/// How far a configuration reconciliation has got.
+///
+/// Reported by both places one can run: a full run's prologue
+/// ([`IndexingService::reconcile_stored_config`]) and the coordinator's
+/// between-runs pass ([`crate::scope::advance`] driven from its tick). On a
+/// multi-million-row index either is minutes of work with nothing else to
+/// show for it, so it gets its own counters rather than a spinner.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileProgress {
+    /// Stored rows re-tested against the current configuration so far.
+    pub examined: usize,
+    /// Rows in the index, counted once when the scan starts. `None` while
+    /// the plan is doing whole-range work that reads no rows at all.
+    pub total: Option<usize>,
+    pub deleted: usize,
+    /// Rows whose content state or stored text was re-decided.
+    pub recontented: usize,
+}
+
+impl ReconcileProgress {
+    /// Completed share, clamped to 1. `None` when there is nothing to divide
+    /// by, matching [`OverallProgress::fraction`].
+    pub fn fraction(&self) -> Option<f64> {
+        match self.total {
+            Some(total) if total > 0 => Some((self.examined as f64 / total as f64).min(1.0)),
+            _ => None,
+        }
+    }
+}
+
+/// What a run is doing before its first file is walked.
+///
+/// Each of these can run for minutes on a large index — a WAL recovery, a
+/// previous run winding down, a full re-test of every stored row against a
+/// changed configuration — and all of them used to be one static "Starting…"
+/// with no elapsed clock, which is indistinguishable from a hang.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrepStep {
+    /// Waiting on the previous run's thread to wind down.
+    PreviousRun,
+    /// [`db::open_or_recreate`]: schema migration and WAL recovery.
+    OpeningIndex,
+    /// Re-testing stored rows against a configuration that changed since the
+    /// last run.
+    Reconciling(ReconcileProgress),
+}
+
 #[derive(Debug, Clone)]
 pub enum IndexingStatus {
     Idle,
+    /// A run has been claimed but has not reached its walk yet. Holds the
+    /// database exactly as `Running` does, so every caller that defers to a
+    /// run must defer to this too.
+    Preparing {
+        start_time: Instant,
+        step: PrepStep,
+    },
     Running {
         start_time: Instant,
         roots: Vec<RootProgress>,
@@ -150,11 +210,15 @@ pub struct ConfigChange {
     pub current: String,
 }
 
+// `Start` carries a whole `Config`. Like `CoordCmd`, these are one-per-user-
+// action control messages, not a data path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum IndexingCommand {
     Start {
-        /// One or more directory roots to index. Order determines walk order;
-        /// duplicates are silently dropped at run time.
+        /// One or more directory roots to index. Every root walks
+        /// concurrently on its own pool, so order decides only which spelling
+        /// of a duplicated root survives; duplicates are dropped at run time.
         paths: Vec<String>,
         db_path: String,
         config: Config,
@@ -210,25 +274,6 @@ fn sweep_unvisited_parents(
     Ok(())
 }
 
-/// One placeholder progress row per root, so the GUI has structure to draw
-/// between the click and the writer loop's first real numbers.
-fn starting_roots(paths: &[String]) -> Vec<RootProgress> {
-    paths
-        .iter()
-        .map(|p| RootProgress {
-            root: p.clone(),
-            phase: RootPhase::Walking,
-            walked: 0,
-            walk_total: None,
-            extracted: 0,
-            extract_total: 0,
-            current_file: Some("Starting…".to_string()),
-            active_workers: 0,
-            total_workers: 0,
-        })
-        .collect()
-}
-
 // No `Debug`: rusqlite's `InterruptHandle` has none, and nothing formats the
 // service anyway.
 pub struct IndexingService {
@@ -236,10 +281,12 @@ pub struct IndexingService {
     command_tx: mpsc::Sender<IndexingCommand>,
     db_connection: Arc<Mutex<Option<Arc<Mutex<Connection>>>>>,
     suspend_flag: Arc<AtomicBool>,
-    /// Set while [`IndexingStatus::Optimizing`] holds, so the one caller that
-    /// cannot wait out a VACUUM can cut it short. See
-    /// [`IndexingService::cancel_optimizing`].
-    maintenance: Arc<Mutex<Option<InterruptHandle>>>,
+    /// The long single statement a run is inside, if any: the reconcile scan
+    /// in its prologue, or the VACUUM in its epilogue. Never both — one is
+    /// what the run does before it walks and the other what it does after —
+    /// so one slot is enough, and one [`IndexingService::cancel_db_work`]
+    /// reaches whichever is there.
+    interrupt: Arc<db::InterruptSlot>,
     _handle: thread::JoinHandle<()>,
 }
 
@@ -309,7 +356,9 @@ impl Drop for CancelOnDrop {
 struct RootPipeline {
     root: String,
     walk: ParallelWalk,
-    /// Concurrent `find` count; 0 = not yet known.
+    /// This root's walk denominator; 0 = not yet known. Stored at once from
+    /// last run's count, or filled in later by the `find` scan for a root that
+    /// has none. See [`RootProgress::walk_total`].
     count_total: Arc<AtomicUsize>,
     /// Threads this root gets, for the walk and then for extraction: both are
     /// round-trip bound on a share for the same reason, so both use the value
@@ -325,6 +374,77 @@ struct RootPipeline {
     extract_total: usize,
     extracted: usize,
     current_file: Option<String>,
+    /// When this root's current phase began, for the one line each phase logs
+    /// when it ends.
+    ///
+    /// Timing lives here rather than in a probe binary because the gap this
+    /// exists to measure is between *platforms*, and nobody reproducing a slow
+    /// index on their own machine is going to build an example first. One line
+    /// per phase per root is cheap enough to leave on always — `log::record`
+    /// takes a global mutex and writes stderr unbuffered, which is only a
+    /// problem at per-file rates.
+    phase_started: Instant,
+}
+
+impl RootPipeline {
+    /// End the current phase and return how long it took, restarting the clock
+    /// for the next one.
+    fn phase_elapsed(&mut self) -> Duration {
+        let started = std::mem::replace(&mut self.phase_started, Instant::now());
+        started.elapsed()
+    }
+}
+
+/// `n` per second, or `None` when the interval is too short to divide by.
+///
+/// Guards the display, not the arithmetic: a walk that finishes in under a
+/// millisecond would otherwise report a rate in the millions, which reads as a
+/// bug rather than as "there was nothing to do".
+fn per_second(n: usize, elapsed: Duration) -> Option<f64> {
+    let secs = elapsed.as_secs_f64();
+    (secs >= 0.001).then(|| n as f64 / secs)
+}
+
+/// How long the writer loop waits when every root has momentarily run dry.
+///
+/// A ceiling, not a delay: the loop parks on a channel, so a walker that
+/// produces anything wakes it at once. It only matters when nothing at all is
+/// happening, and then only to bound how long a newly-arrived event can sit.
+const IDLE_BACKOFF: Duration = Duration::from_millis(2);
+
+/// Report what the per-run warning throttles counted but did not print.
+///
+/// The count is the informative part: three unhashable files and thirty
+/// thousand call for very different responses, and neither reads as such from a
+/// wall of identical lines. See [`crate::log::Throttle`].
+fn report_run_warnings() {
+    let (failed, suppressed) = crate::file_handling::hash_failure_counts();
+    if failed > 0 {
+        crate::log_warn!(
+            "{} file{} could not be read to hash{}",
+            failed,
+            if failed == 1 { "" } else { "s" },
+            if suppressed > 0 {
+                format!(" ({} similar warnings not shown)", suppressed)
+            } else {
+                String::new()
+            }
+        );
+    }
+}
+
+/// One phase's timing line: "12,345 files in 41.2s (300/s)".
+fn phase_summary(n: usize, noun: &str, elapsed: Duration) -> String {
+    match per_second(n, elapsed) {
+        Some(rate) => format!(
+            "{} {} in {:.1}s ({:.0}/s)",
+            n,
+            noun,
+            elapsed.as_secs_f64(),
+            rate
+        ),
+        None => format!("{} {} in {:.3}s", n, noun, elapsed.as_secs_f64()),
+    }
 }
 
 impl RootPipeline {
@@ -349,19 +469,19 @@ impl IndexingService {
         let (command_tx, command_rx) = mpsc::channel();
         let db_connection = Arc::new(Mutex::new(None));
         let suspend_flag = Arc::new(AtomicBool::new(false));
-        let maintenance = Arc::new(Mutex::new(None));
+        let interrupt: Arc<db::InterruptSlot> = Arc::new(db::InterruptSlot::default());
 
         let status_clone = status.clone();
         let db_connection_clone = db_connection.clone();
         let suspend_clone = suspend_flag.clone();
-        let maintenance_clone = maintenance.clone();
+        let interrupt_clone = interrupt.clone();
         let handle = thread::spawn(move || {
             Self::indexing_thread(
                 status_clone,
                 command_rx,
                 db_connection_clone,
                 suspend_clone,
-                maintenance_clone,
+                interrupt_clone,
             );
         });
 
@@ -370,23 +490,24 @@ impl IndexingService {
             command_tx,
             db_connection,
             suspend_flag,
-            maintenance,
+            interrupt,
             _handle: handle,
         }
     }
 
-    /// Cut short an [`IndexingStatus::Optimizing`] pass. No-op otherwise.
+    /// Cut short the long statement a run is inside — an
+    /// [`IndexingStatus::Optimizing`] VACUUM, or the reconcile scan of its
+    /// prologue. No-op when there is none.
     ///
-    /// Stop deliberately does *not* do this — optimizing is what runs after a
-    /// run stops. This exists for the one caller that cannot wait: deleting
-    /// the index for a rebuild, where a VACUUM still holding the file would
-    /// fail the delete outright on Windows. An interrupted VACUUM rolls back.
-    pub fn cancel_optimizing(&self) {
-        if let Ok(slot) = self.maintenance.lock() {
-            if let Some(handle) = slot.as_ref() {
-                handle.interrupt();
-            }
-        }
+    /// The interrupt half of the pair [`db::InterruptSlot`] describes. Stop
+    /// reaches the reconcile through it as well as through the stop flag; it
+    /// does *not* reach the VACUUM, because optimizing is what runs after a run
+    /// stops and waiting it out is the normal case. The exception is the caller
+    /// that cannot wait — deleting the index for a rebuild, where a VACUUM
+    /// still holding the file would fail the delete outright on Windows. An
+    /// interrupted statement rolls back.
+    pub fn cancel_db_work(&self) {
+        db::interrupt(&self.interrupt)
     }
 
     /// Pause the indexer. All worker loops that call [`should_abort`] will
@@ -407,11 +528,16 @@ impl IndexingService {
         self.suspend_flag.load(Ordering::Relaxed)
     }
 
-    /// Start indexing one or more roots. Paths are walked in order; duplicate
-    /// or nested roots are de-duplicated by the indexer. At least one path is
-    /// required. Returns `Err` if a run is already in flight.
+    /// Start indexing one or more roots. Each root gets its own walker and
+    /// they all run concurrently, funnelling into one writer thread; duplicate
+    /// roots collapse to one walk, and a file reachable from more than one of
+    /// them is written once. At least one path is required. Returns `Err` if a
+    /// run is already in flight.
     ///
-    /// The `Idle → Running` transition happens **here**, synchronously, not on
+    /// Nested roots are not de-duplicated here — they are refused outright,
+    /// before this is ever called (see [`crate::config::nested_roots`]).
+    ///
+    /// The `Idle → Preparing` transition happens **here**, synchronously, not on
     /// the service's command thread. Callers use [`get_status`](Self::get_status)
     /// to enforce the single-writer rule, and the command thread cannot flip the
     /// status until it has finished joining the *previous* run's thread — which
@@ -420,6 +546,10 @@ impl IndexingService {
     /// possibly wipe). Claiming the status under one lock before sending closes
     /// that window entirely, and makes "already running" a reportable error
     /// rather than a silently dropped command.
+    ///
+    /// That join is also the first thing the new run reports, which is why the
+    /// claim is [`PrepStep::PreviousRun`] rather than an empty `Running`: the
+    /// wait is real work with a real duration, and the status says so.
     pub fn start_indexing(
         &self,
         paths: Vec<String>,
@@ -433,13 +563,15 @@ impl IndexingService {
             let mut status = self.status.lock().unwrap();
             if matches!(
                 *status,
-                IndexingStatus::Running { .. } | IndexingStatus::Stopping
+                IndexingStatus::Preparing { .. }
+                    | IndexingStatus::Running { .. }
+                    | IndexingStatus::Stopping
             ) {
                 return Err("indexing is already running".into());
             }
-            *status = IndexingStatus::Running {
+            *status = IndexingStatus::Preparing {
                 start_time: Instant::now(),
-                roots: starting_roots(&paths),
+                step: PrepStep::PreviousRun,
             };
         }
         self.command_tx
@@ -464,15 +596,15 @@ impl IndexingService {
     }
 
     pub fn stop_indexing(&self) -> Result<(), String> {
-        // First send the stop command
         self.command_tx
             .send(IndexingCommand::Stop)
             .map_err(|e| format!("Failed to send stop command: {}", e))?;
 
-        // Wait for indexing to transition to stopping state
         let mut attempts = 0;
         while attempts < 50 {
-            // Wait up to 5 seconds
+            // 50 × 100 ms: five seconds for the command thread to pick the
+            // Stop up. Past that, checkpoint anyway rather than block a caller
+            // that is usually shutting the process down.
             match self.get_status() {
                 IndexingStatus::Stopping => break,
                 IndexingStatus::Idle => return Ok(()), // Already stopped
@@ -503,6 +635,31 @@ impl IndexingService {
         self.status.lock().unwrap().clone()
     }
 
+    /// Move the prologue on to `step`, keeping the run's start time so one
+    /// elapsed clock spans the whole run.
+    ///
+    /// A no-op once the status has left `Preparing`: a Stop that arrives
+    /// mid-prologue owns the status from that point on, the same deference
+    /// `run_indexing`'s `publish` shows it.
+    fn set_prep_step(status: &Arc<Mutex<IndexingStatus>>, step: PrepStep) {
+        if let Ok(mut g) = status.lock() {
+            if let IndexingStatus::Preparing { start_time, .. } = *g {
+                *g = IndexingStatus::Preparing { start_time, step };
+            }
+        }
+    }
+
+    /// The instant this run was claimed, so the prologue and the walk share
+    /// one clock. Falls back to now for a caller that drives `run_indexing`
+    /// without going through [`Self::start_indexing`] — the tests and probes.
+    fn run_start(status: &Arc<Mutex<IndexingStatus>>) -> Instant {
+        match status.lock().map(|g| g.clone()) {
+            Ok(IndexingStatus::Preparing { start_time, .. })
+            | Ok(IndexingStatus::Running { start_time, .. }) => start_time,
+            _ => Instant::now(),
+        }
+    }
+
     /// Force graceful shutdown - used for signal handling
     pub fn graceful_shutdown(&self) -> Result<(), String> {
         self.stop_indexing()
@@ -528,24 +685,25 @@ impl IndexingService {
 
     /// Stop indexing and delete the database file for a clean rebuild
     pub fn delete_index_for_rebuild(&self, db_path: &str) -> Result<(), String> {
-        // Stop any running indexing first
         self.stop_indexing()
             .map_err(|e| format!("Failed to stop indexing: {}", e))?;
         // And cut short the optimize pass that follows it — this is the one
         // caller that cannot wait it out, since the file it is about to delete
         // is the file that pass has open.
-        self.cancel_optimizing();
+        self.cancel_db_work();
 
-        // Wait for indexing to actually stop
         let mut attempts = 0;
         while attempts < 50 {
-            // Wait up to 5 seconds
+            // Five seconds, as in `stop_indexing`. Past that the delete below
+            // is attempted anyway — on Windows it will fail while a handle is
+            // still open, and the error says so.
             match self.get_status() {
                 IndexingStatus::Idle => break,
                 // Optimizing holds the file about to be deleted, so it is
-                // waited on like a run; `cancel_optimizing` above is what
+                // waited on like a run; `cancel_db_work` above is what
                 // keeps that wait short.
                 IndexingStatus::Stopping
+                | IndexingStatus::Preparing { .. }
                 | IndexingStatus::Running { .. }
                 | IndexingStatus::Optimizing => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -555,7 +713,6 @@ impl IndexingService {
             }
         }
 
-        // Delete the database file and its WAL sidecars.
         if std::path::Path::new(db_path).exists() {
             std::fs::remove_file(db_path)
                 .map_err(|e| format!("Failed to delete database file: {}", e))?;
@@ -572,7 +729,7 @@ impl IndexingService {
         command_rx: mpsc::Receiver<IndexingCommand>,
         db_connection: Arc<Mutex<Option<Arc<Mutex<Connection>>>>>,
         suspend_flag: Arc<AtomicBool>,
-        maintenance: Arc<Mutex<Option<InterruptHandle>>>,
+        interrupt: Arc<db::InterruptSlot>,
     ) {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let mut indexing_handle: Option<thread::JoinHandle<()>> = None;
@@ -596,7 +753,6 @@ impl IndexingService {
 
                     stop_flag.store(false, Ordering::Relaxed);
 
-                    // Run indexing in a separate thread
                     let status_clone = status.clone();
                     let stop_flag_clone = stop_flag.clone();
                     let paths_owned = paths.clone();
@@ -605,7 +761,7 @@ impl IndexingService {
 
                     let db_connection_clone = db_connection.clone();
                     let suspend_clone = suspend_flag.clone();
-                    let maintenance_clone = maintenance.clone();
+                    let interrupt_clone = interrupt.clone();
                     indexing_handle = Some(thread::spawn(move || {
                         // The writer thread: every DB write and every text
                         // extraction a run performs happens here.
@@ -618,6 +774,7 @@ impl IndexingService {
                             &suspend_clone,
                             &config_owned,
                             &db_connection_clone,
+                            &interrupt_clone,
                         );
 
                         // Released before maintenance, not after: VACUUM needs
@@ -635,7 +792,7 @@ impl IndexingService {
                             // deleting rows, slack to reclaim.
                             Ok(()) => {
                                 *status_clone.lock().unwrap() = IndexingStatus::Optimizing;
-                                Self::run_maintenance(&db_path_owned, &maintenance_clone);
+                                Self::run_maintenance(&db_path_owned, &interrupt_clone);
                                 *status_clone.lock().unwrap() = IndexingStatus::Idle;
                             }
                         }
@@ -646,15 +803,24 @@ impl IndexingService {
                     // *after* a run stops, so a Stop landing during it has
                     // nothing left to ask for.
                     let mut guard = status.lock().unwrap();
-                    if matches!(*guard, IndexingStatus::Running { .. }) {
+                    if matches!(
+                        *guard,
+                        IndexingStatus::Preparing { .. } | IndexingStatus::Running { .. }
+                    ) {
                         *guard = IndexingStatus::Stopping;
                         stop_flag.store(true, Ordering::Relaxed);
+                        // The flag alone only stops the *next* statement, and
+                        // the reconcile in a run's prologue can be inside one
+                        // for minutes. Nothing else a run does holds the slot,
+                        // so this is a no-op for a walk.
+                        db::interrupt(&interrupt);
                     }
                 }
             }
         }
 
-        // Clean up any remaining indexing thread
+        // The command channel closed, so the service is going away; a run
+        // still in flight has to be joined before its thread outlives us.
         if let Some(handle) = indexing_handle {
             let _ = handle.join();
         }
@@ -671,8 +837,8 @@ impl IndexingService {
     ///
     /// Deliberately not cancelled by the stop flag: Stop ends *indexing*, and
     /// this is what runs afterwards. `interrupt` is the one way out, for the
-    /// caller that cannot wait — see [`Self::cancel_optimizing`].
-    fn run_maintenance(db_path: &str, interrupt: &Arc<Mutex<Option<InterruptHandle>>>) {
+    /// caller that cannot wait — see [`Self::cancel_db_work`].
+    fn run_maintenance(db_path: &str, interrupt: &db::InterruptSlot) {
         let conn = match crate::db::open::open_maintenance(db_path) {
             Ok(conn) => conn,
             Err(e) => {
@@ -680,9 +846,7 @@ impl IndexingService {
                 return;
             }
         };
-        if let Ok(mut slot) = interrupt.lock() {
-            *slot = Some(conn.get_interrupt_handle());
-        }
+        let armed = db::InterruptGuard::arm(interrupt, &conn);
 
         let dir = std::path::Path::new(db_path)
             .parent()
@@ -690,9 +854,7 @@ impl IndexingService {
             .unwrap_or_default();
         let outcome = crate::db::repo::maintain(&conn, &dir);
 
-        if let Ok(mut slot) = interrupt.lock() {
-            *slot = None;
-        }
+        drop(armed);
         match outcome {
             Ok(true) => crate::log_info!("optimized the index and reclaimed unused space"),
             Ok(false) => {}
@@ -700,6 +862,10 @@ impl IndexingService {
         }
     }
 
+    // Eight parameters, each a distinct piece of per-run state that the
+    // thread genuinely needs. A struct to hold them would exist only to be
+    // destructured on the first line.
+    #[allow(clippy::too_many_arguments)]
     fn run_indexing(
         status: &Arc<Mutex<IndexingStatus>>,
         paths: &[String],
@@ -708,10 +874,17 @@ impl IndexingService {
         suspend_flag: &Arc<AtomicBool>,
         config: &Config,
         db_connection: &Arc<Mutex<Option<Arc<Mutex<Connection>>>>>,
+        interrupt: &db::InterruptSlot,
     ) -> Result<(), String> {
         if paths.is_empty() {
             return Err("run_indexing: no paths provided".into());
         }
+
+        let run_started = Instant::now();
+        // Per-run, so the counts these report describe this run rather than
+        // everything since the process started.
+        crate::walk::reset_run_warnings();
+        crate::file_handling::reset_run_warnings();
 
         // De-duplicate while preserving order. Roots are canonicalized first
         // so `/home/jeremy` and `/home/jeremy/` (or a symlink to either)
@@ -732,7 +905,15 @@ impl IndexingService {
         // invisible, it just quietly walks with the auto-detected count.
         let worker_overrides = resolved_root_workers(config);
 
-        // Open and migrate the database to the current schema version.
+        // One clock for the whole run: the prologue below can outlast the walk
+        // on a large index, and an elapsed time that restarted at the walk
+        // would hide exactly the wait the user is trying to understand.
+        let run_start = Self::run_start(status);
+
+        // Open and migrate the database to the current schema version. A
+        // recovery of a large WAL happens here, before anything else can be
+        // reported, so it is announced before it is attempted.
+        Self::set_prep_step(status, PrepStep::OpeningIndex);
         let mut conn = db::open_or_recreate(db_path, &config.processing.tokenize)?;
 
         // Reconcile against the settings the index was last written under,
@@ -749,7 +930,17 @@ impl IndexingService {
         // walk are a parameter of this call, and nothing makes the caller
         // pass the ones its config names. Reconciling against the config
         // would then delete every row of the tree actually being indexed.
-        Self::reconcile_stored_config(&mut conn, config, &roots, stop_flag)?;
+        //
+        // Stamping is conditional on the reconcile *finishing*. A scan the stop
+        // flag cut short has left rows the new configuration disowns still in
+        // the index, and a walk cannot find them — it never descends into a
+        // pruned directory. Stamping anyway would tell every future run the
+        // index already matches, orphaning those rows for good; leaving the old
+        // record in place is what makes the next run pick the work back up.
+        if !Self::reconcile_stored_config(status, interrupt, &mut conn, config, &roots, stop_flag)?
+        {
+            return Ok(());
+        }
         Self::update_config(&conn, config, &roots)?;
 
         // No up-front load of the whole `files` table: each walk's prefetcher
@@ -759,12 +950,11 @@ impl IndexingService {
 
         let conn_mutex = Arc::new(Mutex::new(conn));
 
-        // Store the database connection for proper cleanup on stop
+        // Published so `stop_indexing` can checkpoint through it without
+        // waiting for this run's thread to unwind.
         if let Ok(mut db_opt) = db_connection.lock() {
             *db_opt = Some(conn_mutex.clone());
         }
-
-        let run_start = Instant::now();
 
         // Per-root concurrent counts, killed the moment this run exits by
         // any path — the guard flips the token on drop and the count
@@ -777,11 +967,25 @@ impl IndexingService {
         let registry = Arc::new(Registry::default_set());
         let quantum = config.processing.batch_size.max(1);
 
+        // Roots that have been walked before need no counting at all — last
+        // run's file count is both cheaper and more accurate than a concurrent
+        // scan. Read them all up front, under one lock, before the walks start
+        // competing for the connection.
+        let stored_counts: Vec<Option<usize>> = {
+            let conn = conn_mutex.lock().unwrap();
+            let _ = crate::db::repo::prune_root_walk_counts(&conn, &roots);
+            roots
+                .iter()
+                .map(|r| crate::db::repo::get_root_walk_count(&conn, r))
+                .collect()
+        };
+
         // One pipeline per root: its own walker (with per-root worker
-        // count), its own count thread, its own buffers and extraction
-        // cursor. They all funnel into this single writer thread.
+        // count), its own buffers and extraction cursor, and — only on a root
+        // never walked before — its own count thread. They all funnel into this
+        // single writer thread.
         let mut pipelines: Vec<RootPipeline> = Vec::with_capacity(roots.len());
-        for root in &roots {
+        for (root, stored_count) in roots.iter().zip(stored_counts) {
             let ignore = crate::config::IgnoreSet::compile(&config.indexing.ignore_patterns)
                 .map_err(|e| format!("ignore patterns: {}", e))?;
             let workers = worker_overrides
@@ -803,27 +1007,38 @@ impl IndexingService {
                 workers,
             );
 
+            // A root walked before needs no scan: its stored file count is the
+            // denominator, available instantly and exact rather than 1.6x high.
+            // Only a root with no stored count pays for one — and that scan is a
+            // second full traversal of the tree, concurrent with the real walk,
+            // which is precisely what this avoids repeating on every run.
             let count_total = Arc::new(AtomicUsize::new(0));
-            {
-                let root = root.clone();
-                let cancel = count_cancel.clone();
-                let total = count_total.clone();
-                let _ = thread::Builder::new()
-                    .name("qs-count".into())
-                    .spawn(move || {
-                        crate::platform::set_background_priority();
-                        match count_tree_entries_fast(&root, &cancel) {
-                            // A genuinely empty root stores 1 so "known" stays
-                            // distinguishable from the 0 = unknown sentinel; an
-                            // empty root's walk finishes instantly anyway.
-                            Ok(n) => total.store(n.max(1), Ordering::Relaxed),
-                            Err(e) => {
-                                if !e.contains("cancelled") {
-                                    crate::log_warn!("count for {}: {}", root, e);
+            match stored_count {
+                // `max(1)` for the same reason the counting arm uses it: 0 is
+                // the "unknown" sentinel, so an empty root must not store it.
+                Some(n) => count_total.store(n.max(1), Ordering::Relaxed),
+                None => {
+                    let root = root.clone();
+                    let cancel = count_cancel.clone();
+                    let total = count_total.clone();
+                    let _ = thread::Builder::new()
+                        .name("qs-count".into())
+                        .spawn(move || {
+                            crate::platform::set_background_priority();
+                            match count_tree_entries_fast(&root, &cancel) {
+                                // A genuinely empty root stores 1 so "known"
+                                // stays distinguishable from the 0 = unknown
+                                // sentinel; an empty root's walk finishes
+                                // instantly anyway.
+                                Ok(n) => total.store(n.max(1), Ordering::Relaxed),
+                                Err(e) => {
+                                    if !e.contains("cancelled") {
+                                        crate::log_warn!("count for {}: {}", root, e);
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                }
             }
 
             pipelines.push(RootPipeline {
@@ -840,6 +1055,7 @@ impl IndexingService {
                 extract_total: 0,
                 extracted: 0,
                 current_file: None,
+                phase_started: Instant::now(),
             });
         }
 
@@ -877,11 +1093,6 @@ impl IndexingService {
         };
         publish(&pipelines);
 
-        // Round-robin with skipping: each round takes at most one quantum
-        // from every root that has work ready. Write-bottlenecked, all
-        // active roots get even quanta; read-bottlenecked, roots with
-        // empty channels are skipped and the firehose roots get the
-        // writer's full attention.
         // 128-bit path digests, not paths. Its only job is to drop a repeat
         // visit, and at millions of files owning every path string again —
         // on top of the rows SQLite already holds — was the single largest
@@ -898,7 +1109,6 @@ impl IndexingService {
         let aborted;
         let mut stale_cleanup_ok = true;
         let mut cleanup_done = false;
-        let mut stale_deleted = 0usize;
         let mut rr = 0usize;
         // Log size at which to force a checkpoint, re-armed after every
         // attempt. See [`wal_len`] for why the run has to do this itself
@@ -910,6 +1120,10 @@ impl IndexingService {
         };
         let mut checkpoint_at = wal_cap;
 
+        // Round-robin with skipping: each round takes at most one quantum from
+        // every root that has work ready. Write-bottlenecked, all active roots
+        // get even quanta; read-bottlenecked, roots with empty channels are
+        // skipped and the firehose roots get the writer's full attention.
         loop {
             if should_abort(stop_flag, suspend_flag) {
                 aborted = true;
@@ -936,7 +1150,7 @@ impl IndexingService {
                                 TryNext::Item(WalkEvent::File(file)) => {
                                     took += 1;
                                     p.walked += 1;
-                                    if p.walked % 64 == 0 {
+                                    if p.walked.is_multiple_of(64) {
                                         p.current_file = Some(file.path.clone());
                                     }
                                     if file.aliased {
@@ -980,10 +1194,8 @@ impl IndexingService {
                                 }
                                 TryNext::Empty => break,
                                 TryNext::Finished => {
-                                    // Join before deciding anything: workers
-                                    // close the channel when they stop for
-                                    // *any* reason, so a panic and a finished
-                                    // walk look identical from here.
+                                    // Join before deciding anything about what
+                                    // this walk saw; see `ParallelWalk::finish`.
                                     p.walk_clean = p.walk.finish();
                                     process_batch_updates(
                                         &conn_mutex,
@@ -1000,6 +1212,15 @@ impl IndexingService {
                                     )?;
                                     p.pending_inserts.clear();
 
+                                    let walk_time = p.phase_elapsed();
+                                    crate::log_info!(
+                                        "{}: walk {} — {} ({} workers)",
+                                        p.root,
+                                        if p.walk_clean { "done" } else { "ended early" },
+                                        phase_summary(p.walked, "files", walk_time),
+                                        p.workers
+                                    );
+
                                     if !p.walk_clean {
                                         crate::log_warn!(
                                             "a walk worker for {} terminated abnormally; \
@@ -1011,6 +1232,30 @@ impl IndexingService {
                                     } else if stop_flag.load(Ordering::Relaxed) {
                                         p.phase = RootPhase::Done;
                                     } else {
+                                        // A walk that saw the whole tree has the
+                                        // next run's denominator in hand — and
+                                        // is the reason that run spawns no
+                                        // counting scan at all. Recorded only
+                                        // when it really did see all of it: a
+                                        // directory it could not read is a
+                                        // subtree missing from `walked`, and
+                                        // the figure is sticky, so one blip
+                                        // would teach every later run to divide
+                                        // by a number that is too small. The
+                                        // stop and panic cases are already
+                                        // excluded by the branches above; this
+                                        // is the third way a walk comes back
+                                        // short. `unreadable()` is final here —
+                                        // the workers have exited and
+                                        // `finish()` joined them.
+                                        if p.walk.unreadable().is_empty() {
+                                            let conn = conn_mutex.lock().unwrap();
+                                            if let Err(e) = crate::db::repo::set_root_walk_count(
+                                                &conn, &p.root, p.walked,
+                                            ) {
+                                                crate::log_warn!("{}", e);
+                                            }
+                                        }
                                         let cursor = ExtractCursor::for_root(&p.root);
                                         let scope =
                                             extract_scope_prepare(&conn_mutex, &cursor, config)?;
@@ -1071,9 +1316,7 @@ impl IndexingService {
                         let took = batch.len();
                         p.extracted += store_extracted(&conn_mutex, &batch, stop_flag, config)?;
                         if finished {
-                            // Join before deciding: workers close the channel
-                            // when they stop for any reason, so a panic and a
-                            // finished pass look identical from here.
+                            // Join before deciding; see `ParallelWalk::finish`.
                             if !pass.finish() {
                                 crate::log_warn!(
                                     "a content worker for {} terminated abnormally",
@@ -1082,6 +1325,12 @@ impl IndexingService {
                             }
                             p.content = None;
                             p.phase = RootPhase::Done;
+                            let extract_time = p.phase_elapsed();
+                            crate::log_info!(
+                                "{}: content done — {}",
+                                p.root,
+                                phase_summary(p.extracted, "files with text", extract_time)
+                            );
                         }
                         progressed |= finished || took > 0;
                     }
@@ -1143,17 +1392,35 @@ impl IndexingService {
                             if unreadable_count == 1 { "y" } else { "ies" }
                         );
                     }
+                    // One line for the whole run, not one per entry — see
+                    // `walk::PruneCounts`. Reported only on a complete run,
+                    // because a stopped one pruned an arbitrary partial set and
+                    // the number would mean nothing.
+                    for p in &pipelines {
+                        if let Some(summary) = p.walk.pruned().summary() {
+                            crate::log_info!("{}: {}", p.root, summary);
+                        }
+                    }
                     if !stale_paths.is_empty() {
                         if let Some(first) = pipelines.first_mut() {
                             first.current_file = Some("Removing stale index entries…".to_string());
                         }
-                        stale_deleted = cleanup_stale_index_entries(
+                        let started = Instant::now();
+                        let stale_deleted = cleanup_stale_index_entries(
                             &conn_mutex,
                             stale_paths.as_slice(),
                             stop_flag,
                             suspend_flag,
                             config,
                         )?;
+                        crate::log_info!(
+                            "stale cleanup — {}",
+                            phase_summary(
+                                stale_deleted,
+                                "index entries removed",
+                                started.elapsed()
+                            )
+                        );
                     }
                 }
                 progressed = true;
@@ -1200,7 +1467,21 @@ impl IndexingService {
                 break;
             }
             if !progressed {
-                thread::sleep(Duration::from_millis(2));
+                // Park on a walking root's channel rather than sleeping a fixed
+                // interval: a sender wakes this immediately, and on Windows a
+                // 2 ms `thread::sleep` really stalls for the 15.6 ms timer tick.
+                // `wait_ready` holds whatever it pulls, so the round-robin below
+                // still sees it in order.
+                let waited = pipelines
+                    .iter_mut()
+                    .find(|p| p.phase == RootPhase::Walking)
+                    .map(|p| p.walk.wait_ready(IDLE_BACKOFF))
+                    .is_some();
+                // Nothing is walking — the roots left are extracting, whose
+                // passes have no equivalent handle here. Fall back to the sleep.
+                if !waited {
+                    thread::sleep(IDLE_BACKOFF);
+                }
             }
         }
 
@@ -1215,19 +1496,21 @@ impl IndexingService {
             // Deliberately no stale cleanup: a partial walk has a partial
             // seen set, and deleting everything it did not reach would
             // empty most of the index.
-            //
+            report_run_warnings();
+            crate::log_info!(
+                "indexing stopped after {:.1}s",
+                run_started.elapsed().as_secs_f64()
+            );
             // The final status is the caller's to publish: a stopped run is
             // still followed by an optimize pass, so this is not yet Idle.
             return Ok(());
         }
 
-        if stale_deleted > 0 {
-            crate::log_info!(
-                "removed {} stale index entr{}",
-                stale_deleted,
-                if stale_deleted == 1 { "y" } else { "ies" }
-            );
-        }
+        report_run_warnings();
+        crate::log_info!(
+            "indexing complete in {:.1}s",
+            run_started.elapsed().as_secs_f64()
+        );
 
         // FTS housekeeping once per completed run (cheap if nothing changed).
         {
@@ -1236,13 +1519,18 @@ impl IndexingService {
         }
 
         // Stamp the successful run so the coordinator can schedule the next
-        // periodic reindex from it.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        if let Ok(conn) = conn_mutex.lock() {
-            let _ = crate::db::repo::set_last_full_index(&conn, now);
+        // periodic reindex from it. Losing this stamp is not cosmetic: an
+        // absent one reads as "never indexed", which `periodic_due` answers
+        // by starting another full run on the very next tick, and then again
+        // on the one after that.
+        let now = crate::log::now_unix();
+        match conn_mutex.lock() {
+            Ok(conn) => {
+                if let Err(e) = crate::db::repo::set_last_full_index(&conn, now) {
+                    crate::log_warn!("{}", e);
+                }
+            }
+            Err(e) => crate::log_warn!("last-full-index stamp skipped: {}", e),
         }
 
         Ok(())
@@ -1364,13 +1652,23 @@ impl IndexingService {
     ///
     /// Runs to completion rather than under a deadline — the run owns the
     /// database until it finishes anyway, and a caller waiting on the walk is
-    /// not a caller that would rather have a half-reconciled index.
+    /// not a caller that would rather have a half-reconciled index. It still
+    /// slices, so the status moves and the stop flag is read between
+    /// statements; `interrupt` is what reaches the statement already running.
+    ///
+    /// Returns whether it finished. On a multi-million-row index this is the
+    /// longest thing that can happen before a single file is walked, so it
+    /// publishes its cursor after every slice and says up front that it has
+    /// started; `false` means it was cut short and nothing may be recorded as
+    /// reconciled.
     fn reconcile_stored_config(
+        status: &Arc<Mutex<IndexingStatus>>,
+        interrupt: &db::InterruptSlot,
         conn: &mut Connection,
         config: &Config,
         roots: &[String],
         stop_flag: &Arc<AtomicBool>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         // What this run is about to index, which is `config` everywhere except
         // its roots — see the caller.
         let mut current = config.clone();
@@ -1379,21 +1677,59 @@ impl IndexingService {
         let stored = crate::scope::stored_config(conn, &current)?;
         let work = crate::config::diff_actions(&stored, &current).work;
         if !work.touches_index() {
-            return Ok(());
+            return Ok(true);
         }
+        // Ahead of the scan, not after it: the line that used to report this
+        // only appeared once the work was already done, which is no help at
+        // all to someone watching a run that has not moved for ten minutes.
+        crate::log_info!(
+            "configuration changed since the last run: reconciling the index ({})",
+            work.summary()
+        );
         let registry = Registry::default_set();
         let mut cursor = crate::scope::WorkCursor::new(work, &current)?;
         while !cursor.done() {
             if stop_flag.load(Ordering::Relaxed) {
-                return Ok(());
+                crate::log_info!(
+                    "configuration reconcile interrupted after {} index entries; \
+                     the next run starts it again",
+                    cursor.progress().examined
+                );
+                return Ok(false);
             }
-            crate::scope::advance(
-                conn,
-                &current,
-                &registry,
-                &mut cursor,
-                Instant::now() + crate::scope::SLICE,
-            )?;
+            let outcome = {
+                // Armed per slice, so the handle names a statement this scan
+                // is actually running and nothing else. `advance` reads the
+                // same stop flag before each statement; this reaches the one
+                // already in flight.
+                let _armed = db::InterruptGuard::arm(interrupt, conn);
+                crate::scope::advance(
+                    conn,
+                    &current,
+                    &registry,
+                    &mut cursor,
+                    Instant::now() + crate::scope::SLICE,
+                    stop_flag,
+                )
+            };
+            if let Err(e) = outcome {
+                // A statement cut short by the interrupt fails like any other
+                // and cannot be told apart from a real failure by its message.
+                // The flag we set ourselves is the answer: a stopped run is
+                // not an error, it just records nothing.
+                if stop_flag.load(Ordering::Relaxed) {
+                    crate::log_info!(
+                        "configuration reconcile interrupted after {} index entries; \
+                         the next run starts it again",
+                        cursor.progress().examined
+                    );
+                    return Ok(false);
+                }
+                return Err(e);
+            }
+            // The slice budget is already the GUI's repaint cadence, so this
+            // needs no pacing of its own.
+            Self::set_prep_step(status, PrepStep::Reconciling(cursor.progress()));
         }
         if cursor.deleted > 0 || cursor.recontented > 0 {
             crate::log_info!(
@@ -1403,12 +1739,46 @@ impl IndexingService {
                 cursor.recontented
             );
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Stamp the index with the settings it's being built under.
     fn update_config(conn: &Connection, config: &Config, roots: &[String]) -> Result<(), String> {
-        for (key, current) in Self::config_validation_entries(config, roots) {
+        Self::stamp(conn, Self::config_validation_entries(config, roots))
+    }
+
+    /// Record the settings a reconciliation has just brought the index into
+    /// line with.
+    ///
+    /// Everything except [`Self::REBUILD_KEYS`], which a scan cannot satisfy:
+    /// a hash written under a different length, or an FTS table built with a
+    /// different tokenizer, needs the wipe the user was prompted for. Stamping
+    /// those here would clear a rebuild prompt the user declined, and it would
+    /// be cleared by an unrelated later edit at that.
+    ///
+    /// Without this the record only ever moved at the end of a full run, so a
+    /// prune applied between runs left the index describing itself with the
+    /// *old* configuration — and every subsequent run re-derived the same plan
+    /// and rescanned every row under every root to re-apply work that was
+    /// already done.
+    pub(crate) fn stamp_reconciled(
+        conn: &Connection,
+        config: &Config,
+        roots: &[String],
+    ) -> Result<(), String> {
+        Self::stamp(
+            conn,
+            Self::config_validation_entries(config, roots)
+                .into_iter()
+                .filter(|(key, _)| !Self::REBUILD_KEYS.contains(key)),
+        )
+    }
+
+    fn stamp(
+        conn: &Connection,
+        entries: impl IntoIterator<Item = (&'static str, String)>,
+    ) -> Result<(), String> {
+        for (key, current) in entries {
             conn.execute(
                 "INSERT OR REPLACE INTO config_validation (key, value) VALUES (?1, ?2)",
                 params![key, current],
@@ -1421,7 +1791,6 @@ impl IndexingService {
 
 impl Drop for IndexingService {
     fn drop(&mut self) {
-        // Ensure graceful shutdown when the service is dropped
         let _ = self.stop_indexing();
     }
 }
@@ -1437,19 +1806,10 @@ mod tests {
     use super::*;
 
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "quicksearch-idx-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        // The temp dir itself may sit behind a symlink (/tmp -> /private/tmp).
-        p.canonicalize().unwrap()
+        // Canonical: the temp dir itself may sit behind a symlink
+        // (/tmp -> /private/tmp), and these tests compare walked paths
+        // against the root they passed in.
+        crate::testutil::scratch_dir_canonical(tag)
     }
 
     fn config_with(roots: Vec<String>, overrides: &[(&str, usize)]) -> Config {
@@ -1563,6 +1923,7 @@ mod tests {
             walked: 0,
             walk_clean: true,
             phase: RootPhase::Walking,
+            phase_started: Instant::now(),
             content: Some(content),
             extract_total: 0,
             extracted: 0,
@@ -1576,6 +1937,154 @@ mod tests {
         assert_eq!(p.worker_counts(), (0, 0), "a finished root runs nothing");
 
         drop(p);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One full run over `config`'s roots, driven directly so the caller owns
+    /// the stop flag. Returns when the run does.
+    fn run_with(config: &Config, db_path: &str, stop: &Arc<AtomicBool>) -> Result<(), String> {
+        IndexingService::run_indexing(
+            &Arc::new(Mutex::new(IndexingStatus::Idle)),
+            &config.paths.indexing_paths,
+            db_path,
+            stop,
+            &Arc::new(AtomicBool::new(false)),
+            config,
+            &Arc::new(Mutex::new(None)),
+            &db::InterruptSlot::default(),
+        )
+    }
+
+    fn outstanding_work(db_path: &str, config: &Config) -> crate::config::IndexWork {
+        crate::scope::outstanding_work(db_path, config).unwrap()
+    }
+
+    /// The count `root`'s last clean walk recorded, if any.
+    fn stored_walk_count(db_path: &str, root: &str) -> Option<usize> {
+        let conn = db::open_existing(db_path, false).unwrap();
+        crate::db::repo::get_root_walk_count(&conn, root)
+    }
+
+    /// A walk that could not read part of its tree must not record its count.
+    ///
+    /// The figure is the next run's progress denominator, and nothing ever
+    /// re-derives it: a run that missed a subtree because of a permissions
+    /// blip or an unplugged share would leave every later run dividing by a
+    /// number that is too small, with the bar saturating early and staying
+    /// there. Both halves are pinned, because a guard that simply never
+    /// recorded anything would also pass the negative case.
+    ///
+    /// Unix only: `deny_read` needs the whole run to actually be refused, and
+    /// on Windows the `icacls` deny ACE does not bind the process that owns
+    /// the directory reliably enough to test against.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_keeps_the_walk_count_unrecorded() {
+        let dir = tmp_dir("unreadable-count");
+        // The tree is a subdirectory, so the index and its WAL sidecars do not
+        // sit inside the root being walked and count as files.
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("visible.txt"), "indexed").unwrap();
+        let locked = tree.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("inside.txt"), "never seen").unwrap();
+
+        let db_path = dir.join("index.db").to_string_lossy().into_owned();
+        let mut config = Config::default();
+        config.paths.indexing_paths = vec![tree.to_string_lossy().into_owned()];
+        config.paths.database_path = db_path.clone();
+        let root = normalize_root_string(&tree.to_string_lossy());
+
+        crate::platform::deny_read(&locked).unwrap();
+        let blocked = run_with(&config, &db_path, &Arc::new(AtomicBool::new(false)));
+        // Restore before asserting, so a failure still leaves a removable tree.
+        crate::platform::restore_read(&locked).ok();
+        blocked.unwrap();
+
+        assert_eq!(
+            stored_walk_count(&db_path, &root),
+            None,
+            "a walk that could not read a directory saw only part of the tree"
+        );
+
+        // And the same tree, readable, does record one — otherwise the
+        // assertion above would hold for a guard that never records anything.
+        run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+        assert_eq!(
+            stored_walk_count(&db_path, &root),
+            Some(2),
+            "a clean walk records its file count"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A run the stop flag cut short is the other way a walk comes back with a
+    /// partial count.
+    #[test]
+    fn a_stopped_run_keeps_the_walk_count_unrecorded() {
+        let dir = tmp_dir("stopped-count");
+        for i in 0..20 {
+            std::fs::write(dir.join(format!("f{}.txt", i)), "body").unwrap();
+        }
+        let db_path = dir.join("index.db").to_string_lossy().into_owned();
+        let mut config = Config::default();
+        config.paths.indexing_paths = vec![dir.to_string_lossy().into_owned()];
+        config.paths.database_path = db_path.clone();
+        let root = normalize_root_string(&dir.to_string_lossy());
+
+        // Already set, so the run stops at its first check — the deterministic
+        // stand-in for a shutdown part-way through a walk.
+        run_with(&config, &db_path, &Arc::new(AtomicBool::new(true))).unwrap();
+        assert_eq!(stored_walk_count(&db_path, &root), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A reconcile the stop flag cut short must leave the stored fingerprint
+    /// alone.
+    ///
+    /// Stamping it would tell every later run the index already matches the
+    /// new configuration, and nothing would ever revisit the rows the scan had
+    /// not reached — a walk cannot find them, because it never descends into a
+    /// directory the new rules prune. The stale record is the only thing that
+    /// makes the work resumable at all.
+    #[test]
+    fn an_interrupted_reconcile_records_nothing() {
+        let dir = tmp_dir("interrupted-reconcile");
+        std::fs::write(dir.join("keep.txt"), "kept").unwrap();
+        std::fs::write(dir.join("drop.log"), "dropped").unwrap();
+        let db_path = dir.join("index.db").to_string_lossy().into_owned();
+
+        let mut config = Config::default();
+        config.paths.indexing_paths = vec![dir.to_string_lossy().into_owned()];
+        config.paths.database_path = db_path.clone();
+        config.indexing.ignore_patterns = vec![];
+        run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+
+        let mut narrowed = config.clone();
+        narrowed.indexing.ignore_patterns = vec!["*.log".into()];
+        let pending = outstanding_work(&db_path, &narrowed);
+        assert!(pending.touches_index(), "the narrowing has rows to remove");
+
+        // Already set, so the reconcile aborts on its first check — the
+        // deterministic stand-in for a shutdown part-way through a scan of
+        // millions of rows.
+        run_with(&narrowed, &db_path, &Arc::new(AtomicBool::new(true))).unwrap();
+        assert_eq!(
+            outstanding_work(&db_path, &narrowed),
+            pending,
+            "the same work is still owed"
+        );
+
+        // And the run that is allowed to finish both applies and records it.
+        run_with(&narrowed, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(
+            outstanding_work(&db_path, &narrowed).is_empty(),
+            "a completed run leaves nothing to reconcile"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

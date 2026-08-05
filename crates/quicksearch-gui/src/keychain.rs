@@ -33,10 +33,16 @@ pub fn load_key(db_path: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Forget the remembered key. Best-effort: an entry that never existed or
-/// a dead keychain daemon are both fine outcomes for "forget".
-pub fn delete_key(db_path: &str) {
-    if let Ok(entry) = entry(db_path) {
-        let _ = entry.delete_credential();
+/// Forget the remembered key. An entry that never existed is a fine outcome
+/// for "forget" and reports success.
+///
+/// A real failure is not: the derived SQLCipher key is still sitting in the
+/// OS keychain, so a caller that goes on to record "not remembered" would be
+/// describing a machine state that isn't true. Callers surface this rather
+/// than assuming the key is gone.
+pub fn delete_key(db_path: &str) -> Result<(), String> {
+    match entry(db_path)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("keychain delete failed: {}", e)),
     }
 }

@@ -207,7 +207,7 @@ fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Optio
             file,
         });
 
-        if ticks % marker_every == 0 && db.exists() {
+        if ticks.is_multiple_of(marker_every) && db.exists() {
             if let Ok(conn) = rusqlite::Connection::open(db) {
                 if quicksearch_core::db::repo::get_last_full_index(&conn).is_some() {
                     done = true;
@@ -254,6 +254,9 @@ fn progress(status: &IndexingStatus) -> (usize, usize, &'static str, String) {
     (walked, extracted, phase, file)
 }
 
+/// Eight columns of one probe run, printed as a line. Grouping them into a
+/// struct would only move the same eight names one level out.
+#[allow(clippy::too_many_arguments)]
 fn report(
     mode: &str,
     elapsed: Duration,
@@ -267,8 +270,8 @@ fn report(
     // One line per 5% of the run, so the shape is visible at any duration.
     let step = (samples.len() / 20).max(1);
     eprintln!(
-        "\n  {:>8}  {:>10}  {:>9}  {:>10}  {}",
-        "t", "RSS", "walked", "extracted", "phase"
+        "\n  {:>8}  {:>10}  {:>9}  {:>10}  phase",
+        "t", "RSS", "walked", "extracted"
     );
     for s in samples.iter().step_by(step) {
         eprintln!(

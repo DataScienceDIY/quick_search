@@ -24,6 +24,9 @@ mod options;
 mod platform;
 mod query_highlight;
 mod search_tab;
+#[cfg(test)]
+mod test_ui;
+mod tips;
 mod tracker;
 mod ui_util;
 mod unlock;

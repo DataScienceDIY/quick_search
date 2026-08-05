@@ -198,7 +198,7 @@ fn prose(rng: &mut Rng, target: usize) -> String {
     let mut s = String::with_capacity(target + 16);
     while s.len() < target {
         s.push_str(WORDS[rng.next() as usize % WORDS.len()]);
-        s.push(if rng.next() % 12 == 0 { '\n' } else { ' ' });
+        s.push(if rng.next().is_multiple_of(12) { '\n' } else { ' ' });
     }
     s.truncate(target);
     s

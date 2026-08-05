@@ -7,7 +7,8 @@
 //! exactly the ones a user needs when something looks wrong, and they were
 //! going nowhere.
 //!
-//! So background reporting goes through [`log_info!`] and [`log_warn!`]
+//! So background reporting goes through [`crate::log_info!`] and
+//! [`crate::log_warn!`]
 //! instead of `println!`/`eprintln!`: each writes the same line to stderr
 //! *and* appends it to a bounded ring the GUI's Logs tab reads. A terminal
 //! run looks exactly as it did; a windowed run gains the tab.
@@ -66,7 +67,8 @@ macro_rules! log_warn {
 
 /// Write `message` to stderr and to the ring.
 ///
-/// Prefer the [`log_info!`] / [`log_warn!`] macros; this is what they call.
+/// Prefer the [`crate::log_info!`] / [`crate::log_warn!`] macros; this is what
+/// they call.
 ///
 /// A failed stderr write is ignored rather than propagated: `eprintln!`
 /// *panics* when the handle is unwritable, which on a process launched
@@ -80,6 +82,56 @@ pub fn record(level: Level, message: String) {
     };
     let _ = writeln!(std::io::stderr(), "{}", text);
     lock().push(level, text);
+}
+
+/// A cap on how many times one *kind* of warning is allowed to speak.
+///
+/// Some failures are per-file and arrive in the thousands: a directory tree the
+/// user cannot read, or — the case that motivated this — a Windows machine where
+/// `ERROR_SHARING_VIOLATION` from a file some other process holds open is
+/// routine and has no Unix equivalent. Logging each one costs a global mutex and
+/// an unbuffered stderr write on the walk's hottest path, and it evicts the
+/// [`CAPACITY`]-line ring so thoroughly that the warnings worth reading are gone
+/// before the run ends.
+///
+/// So the first few speak and the rest are counted. The count is the part that
+/// actually informs: "3 files could not be hashed" and "31,402 files could not
+/// be hashed" call for very different responses, and neither is legible as a
+/// wall of identical lines.
+///
+/// Declared as a `static` next to the call site it guards, and reset by whoever
+/// owns the run, so the numbers describe one run rather than the process.
+pub struct Throttle {
+    limit: u64,
+    seen: std::sync::atomic::AtomicU64,
+}
+
+impl Throttle {
+    pub const fn new(limit: u64) -> Throttle {
+        Throttle {
+            limit,
+            seen: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Count one occurrence, and answer whether it may be logged individually.
+    pub fn allow(&self) -> bool {
+        self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < self.limit
+    }
+
+    /// Occurrences counted since the last [`Throttle::reset`].
+    pub fn seen(&self) -> u64 {
+        self.seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many went unlogged — what a summary line should report.
+    pub fn suppressed(&self) -> u64 {
+        self.seen().saturating_sub(self.limit)
+    }
+
+    pub fn reset(&self) {
+        self.seen.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Every retained line, oldest first.
@@ -152,7 +204,17 @@ impl Ring {
     }
 }
 
-fn now_unix() -> u64 {
+/// Seconds since the Unix epoch.
+///
+/// Lives here because this is the lowest-level module in the crate and every
+/// layer above it wanted the same four lines — log lines, the `last_full_index`
+/// stamp, `schema_info.created_at`, failure timestamps, and the GUI's
+/// "5 min ago".
+///
+/// A clock set before 1970 yields `0` rather than an error. Every caller is
+/// stamping a record or measuring an age, and none has anything better to do
+/// with a failure than what `0` already does: read as "very long ago".
+pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -213,6 +275,33 @@ mod tests {
         assert!(ring.lines.is_empty());
         assert_eq!(ring.dropped, 0, "dropped counts against what is shown");
         assert_eq!(ring.recorded, 4, "the running total survives a clear");
+    }
+
+    #[test]
+    fn a_throttle_lets_the_first_few_through_and_counts_the_rest() {
+        let t = Throttle::new(3);
+        assert_eq!((t.seen(), t.suppressed()), (0, 0));
+        for _ in 0..3 {
+            assert!(t.allow(), "the first `limit` occurrences speak");
+        }
+        for _ in 0..7 {
+            assert!(!t.allow(), "the rest are counted only");
+        }
+        assert_eq!(t.seen(), 10);
+        assert_eq!(t.suppressed(), 7);
+
+        t.reset();
+        assert_eq!((t.seen(), t.suppressed()), (0, 0));
+        assert!(t.allow(), "a reset throttle speaks again");
+    }
+
+    /// A zero limit must silence rather than divide by anything.
+    #[test]
+    fn a_zero_limit_throttle_logs_nothing() {
+        let t = Throttle::new(0);
+        assert!(!t.allow());
+        assert_eq!(t.seen(), 1);
+        assert_eq!(t.suppressed(), 1);
     }
 
     /// Through the global: the macros must land in the snapshot, and a

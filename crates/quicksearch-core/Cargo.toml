@@ -29,6 +29,11 @@ walkdir = "2.5.0"
 # stored, so zstd/bzip2/aes-crypto are all dead weight here.
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 quick-xml = "0.31"
+# OLE2 compound-file reader, for the pre-2007 binary Office formats
+# (.doc/.xls/.ppt) whose text lives in named streams rather than a zip. Already
+# in the lockfile transitively via infer, so naming it directly compiles
+# nothing new.
+cfb = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 mime_guess = "2.0"
@@ -62,8 +67,10 @@ regex = "1"
 libc = "0.2"
 
 # `GetDriveTypeW` (a mapped drive letter is the only way to spot an SMB share
-# that isn't written as UNC) plus the FILE_ATTRIBUTE_* constants for hidden
-# detection. Pinned to 0.52 deliberately: walkdir → winapi-util already
+# that isn't written as UNC) plus the FILE_ATTRIBUTE_* constants, which
+# `platform.rs` spells out for itself so its tests run on Linux and then
+# const-asserts against this crate on Windows builds.
+# Pinned to 0.52 deliberately: walkdir → winapi-util already
 # resolves exactly that version, so this adds no new crate compilations.
 [target.'cfg(windows)'.dependencies]
 # GetDriveTypeW and the FILE_ATTRIBUTE_* constants live in
@@ -73,6 +80,9 @@ libc = "0.2"
 # GetCurrentThread need Win32_Foundation for HANDLE/BOOL.
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
+    # SECURITY_ATTRIBUTES, which `CreateFileW`'s signature names even though
+    # the directory-count path passes null for it.
+    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",

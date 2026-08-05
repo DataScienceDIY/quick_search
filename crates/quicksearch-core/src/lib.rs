@@ -3,7 +3,6 @@ pub mod config;
 pub mod content;
 pub mod coordinator;
 pub mod db;
-pub mod document_extraction;
 pub mod extract;
 pub mod file_handling;
 pub mod incremental;
@@ -17,6 +16,8 @@ pub mod search;
 pub mod security;
 pub mod shutdown;
 pub mod snippet;
+#[doc(hidden)]
+pub mod testutil;
 pub mod textenc;
 pub mod walk;
 pub mod watcher;
