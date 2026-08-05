@@ -1119,6 +1119,10 @@ impl QuickSearchApp {
     pub(crate) fn capture_focus_search(&mut self) {
         self.search.capture_focus();
     }
+
+    pub(crate) fn capture_match_cell(&self, n: usize) -> Option<egui::Rect> {
+        self.search.capture_match_cell(n)
+    }
 }
 
 /// Overwrite the fields a config draft must never carry back.

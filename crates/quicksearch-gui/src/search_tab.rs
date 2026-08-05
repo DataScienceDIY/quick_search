@@ -11,6 +11,11 @@ use quicksearch_core::snippet::Snippet;
 use crate::format::{fmt_elapsed, fmt_mtime, human_size};
 use crate::platform;
 
+/// Width of the query strip's status slot, in points. Wide enough for the
+/// longest query time `fmt_elapsed` produces, and held whether the slot is
+/// showing the spinner, a time or nothing, so the query box stays put.
+const STATUS_SLOT_WIDTH: f32 = 52.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
     Rank,
@@ -111,6 +116,10 @@ pub struct SearchTab {
     focus_query: bool,
     /// Query syntax-highlight segments, cached per text.
     highlight: crate::query_highlight::HighlightCache,
+    /// Screen rects of the Match cells rendered last frame, in display
+    /// order — the capture driver's coordinate-free hover targets.
+    #[cfg(feature = "capture")]
+    pub(crate) capture_match_rects: Vec<egui::Rect>,
 }
 
 impl SearchTab {
@@ -140,6 +149,8 @@ impl SearchTab {
             hovered_row: None,
             focus_query: true,
             highlight: Default::default(),
+            #[cfg(feature = "capture")]
+            capture_match_rects: Vec::new(),
         }
     }
 
@@ -162,6 +173,13 @@ impl SearchTab {
     #[cfg(feature = "capture")]
     pub(crate) fn capture_focus(&mut self) {
         self.focus_query = true;
+    }
+
+    /// Screen rect of the Nth visible Match cell from the last rendered
+    /// frame, if that many are on screen.
+    #[cfg(feature = "capture")]
+    pub(crate) fn capture_match_cell(&self, n: usize) -> Option<egui::Rect> {
+        self.capture_match_rects.get(n).copied()
     }
 
     /// A new search was submitted under `generation`. The previous
@@ -337,55 +355,64 @@ impl SearchTab {
         let mut actions = SearchActions::default();
 
         // --- Query strip -------------------------------------------------
+        // Laid out right to left: help, fuzzy and the status slot pin to the
+        // right edge, and the query box takes whatever is left. The status
+        // slot keeps a fixed width whether it holds the spinner, the query
+        // time or nothing at all, so the box never resizes as you type.
         ui.horizontal(|ui| {
-            let show_elapsed =
-                !self.running && self.elapsed.is_some() && !self.query.trim().is_empty();
-            let slot_room = if self.running {
-                24.0
-            } else if show_elapsed {
-                60.0
-            } else {
-                0.0
-            };
-            let width = ui.available_width() - 170.0 - slot_room;
-            let highlight = &mut self.highlight;
-            let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
-                crate::query_highlight::galley(ui, highlight, buf.as_str())
-            };
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.query)
-                    .desired_width(width.max(120.0))
-                    .hint_text("Search names and contents…  (type:Document regex:… budget*)")
-                    .layouter(&mut layouter),
-            );
-            if self.focus_query {
-                response.request_focus();
-                self.focus_query = false;
-            }
-            if response.changed() {
-                self.pending_edit = Some(Instant::now());
-            }
-            // One slot right of the box: spinner while searching, then the
-            // total wall time of all cascade passes once it lands.
-            if self.running {
-                ui.add(egui::Spinner::new().size(16.0));
-            } else if show_elapsed {
-                if let Some(elapsed) = self.elapsed {
-                    ui.label(egui::RichText::new(fmt_elapsed(elapsed)).small().weak())
-                        .on_hover_text("Time to run all search passes");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("?").on_hover_text("Query syntax help").clicked() {
+                    self.help_open = !self.help_open;
                 }
-            }
-            if ui
-                .checkbox(&mut self.fuzzy, "Fuzzy")
-                .on_hover_text("Also run fuzzy filename and full-text passes (slower)")
-                .changed()
-            {
-                actions.save_fuzzy_default = Some(self.fuzzy);
-                actions.rerun = true;
-            }
-            if ui.button("?").on_hover_text("Query syntax help").clicked() {
-                self.help_open = !self.help_open;
-            }
+                if ui
+                    .checkbox(&mut self.fuzzy, "Fuzzy")
+                    .on_hover_text("Also run fuzzy filename and full-text passes (slower)")
+                    .changed()
+                {
+                    actions.save_fuzzy_default = Some(self.fuzzy);
+                    actions.rerun = true;
+                }
+                // Spinner while searching, then the total wall time of all
+                // cascade passes once it lands.
+                let show_elapsed =
+                    !self.running && self.elapsed.is_some() && !self.query.trim().is_empty();
+                ui.allocate_ui_with_layout(
+                    egui::vec2(STATUS_SLOT_WIDTH, ui.spacing().interact_size.y),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        // The child shrinks to its content when it finishes,
+                        // so hold the width from the inside — otherwise an
+                        // empty slot would give its space back to the box.
+                        ui.set_min_width(STATUS_SLOT_WIDTH);
+                        if self.running {
+                            ui.add(egui::Spinner::new().size(16.0));
+                        } else if show_elapsed {
+                            if let Some(elapsed) = self.elapsed {
+                                ui.label(egui::RichText::new(fmt_elapsed(elapsed)).small().weak())
+                                    .on_hover_text("Time to run all search passes");
+                            }
+                        }
+                    },
+                );
+                let width = ui.available_width();
+                let highlight = &mut self.highlight;
+                let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap: f32| {
+                    crate::query_highlight::galley(ui, highlight, buf.as_str())
+                };
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.query)
+                        .desired_width(width.max(120.0))
+                        .hint_text("Search names and contents…  (type:Document regex:… budget*)")
+                        .layouter(&mut layouter),
+                );
+                if self.focus_query {
+                    response.request_focus();
+                    self.focus_query = false;
+                }
+                if response.changed() {
+                    self.pending_edit = Some(Instant::now());
+                }
+            });
         });
 
         // Session ignore chips.
@@ -431,14 +458,14 @@ impl SearchTab {
         }
 
         // Result-set transitions pulse instead of strobing: the old table
-        // fades out over 0.25 s while the new hits stage, the sets swap at
-        // zero opacity, and the new table fades back in over 0.25 s.
+        // fades out over 0.15 s while the new hits stage, the sets swap at
+        // zero opacity, and the new table fades back in over 0.15 s.
         // `animate_value_with_time` keeps requesting repaints until the
         // value settles.
         let fade_target = if self.swap_pending { 0.0 } else { 1.0 };
         let fade =
             ui.ctx()
-                .animate_value_with_time(egui::Id::new("qs-results-fade"), fade_target, 0.25);
+                .animate_value_with_time(egui::Id::new("qs-results-fade"), fade_target, 0.15);
         if self.swap_pending && fade <= 0.01 {
             self.results = std::mem::take(&mut self.staging);
             self.has_snippets = self.staging_has_snippets;
@@ -476,6 +503,10 @@ impl SearchTab {
         // self` for selection and hover, so a field read would conflict — but
         // a plain local does not, and this runs every frame.
         let order = std::mem::take(&mut self.order);
+        // Same local-then-assign dance for the capture driver's hover
+        // targets: rebuilt every frame from what actually rendered.
+        #[cfg(feature = "capture")]
+        let mut capture_match_rects: Vec<egui::Rect> = Vec::new();
 
         let table_scroll = ui
             .push_id("results", |ui| {
@@ -565,6 +596,8 @@ impl SearchTab {
                                                 ui.label(job);
                                             });
                                         }
+                                        #[cfg(feature = "capture")]
+                                        capture_match_rects.push(response.rect);
                                         cell_responses.push(response);
                                     }
                                 });
@@ -649,6 +682,10 @@ impl SearchTab {
         self.order = order;
         crate::ui_util::more_below_hint(ui, &table_scroll);
         self.hovered_row = hovered_now;
+        #[cfg(feature = "capture")]
+        {
+            self.capture_match_rects = capture_match_rects;
+        }
 
         if let Some(ix) = open_ignore_dialog {
             let hit = &self.results[ix];

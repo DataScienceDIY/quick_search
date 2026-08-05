@@ -30,12 +30,24 @@ window 1120 750                   # compact clip: the smallest layout at
                                   # away, defeating the demo), at 1.5x
 wait_ms 800                       # the resize lands asynchronously
 record_start search
-type "fn main" cps 4              # a phrase that lives in file bodies, not
-                                  # names -- results stream in with content
-                                  # snippets in the Match column
+# The query is typed in quick bursts with human hesitations; each pause
+# outlives the debounce, so results visibly refine at every stop. The phrase
+# lives in file bodies, not names -- results stream in with content snippets,
+# and its ~130 matches stay under the display cap so the footer shows a real
+# count.
+type "race con" cps 10
+wait_ms 400
+type "dit" cps 7
+wait_ms 300
+type "ion" cps 10
 wait_search_done max 8000
-wait_ms 2000
-record_stop
+wait_ms 1000
+hover_match 2                     # pin the pointer on the 3rd result's Match
+                                  # cell: the tooltip expands the snippet
+                                  # with surrounding file content
+wait_ms 2500                      # tooltip delay, then linger on it
+record_stop                       # end the clip with the tooltip on screen
+hover_off
 window 1400 980                   # back to full size for the screenshots
 wait_ms 800
 
