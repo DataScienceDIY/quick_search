@@ -47,7 +47,7 @@ impl IndexKey {
         hex_encode(&self.0)
     }
 
-    /// Strict inverse of [`to_hex`]: exactly 64 hex digits, any case.
+    /// Strict inverse of [`IndexKey::to_hex`]: exactly 64 hex digits, any case.
     pub fn from_hex(hex: &str) -> Result<IndexKey, String> {
         let bytes = hex_decode(hex)?;
         let arr: [u8; KEY_LEN] = bytes
@@ -102,7 +102,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("hex string has odd length".to_string());
     }
     if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {

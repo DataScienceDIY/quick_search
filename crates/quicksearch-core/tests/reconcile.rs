@@ -8,69 +8,28 @@
 //! assertion a regression that quietly reintroduces the rebuild would pass
 //! every other check in this file.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use quicksearch_core::config::{diff_actions, Config};
 use quicksearch_core::db;
 use quicksearch_core::extract::Registry;
-use quicksearch_core::indexing::{IndexingService, IndexingStatus};
 use quicksearch_core::scope::{advance, WorkCursor, SLICE};
 
-fn tmp_dir(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "quicksearch-reconcile-{}-{}-{}",
-        tag,
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    std::fs::canonicalize(&p).unwrap()
-}
-
-fn touch(p: &Path, body: &[u8]) {
-    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::write(p, body).unwrap();
-}
+mod common;
+use common::{scratch_dir_canonical as tmp_dir, touch};
 
 /// Run one full index over `config`'s roots and wait for it to finish.
 fn index_once(db: &Path, config: &Config) {
-    if db.exists() {
-        let conn = rusqlite::Connection::open(db).unwrap();
-        conn.execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
-            .unwrap();
+    common::IndexOnce {
+        db,
+        roots: config.paths.indexing_paths.clone(),
+        config,
+        fresh_marker: true,
+        encrypted: false,
     }
-    let service = IndexingService::new();
-    service
-        .start_indexing(
-            config.paths.indexing_paths.clone(),
-            db.to_string_lossy().into_owned(),
-            config.clone(),
-        )
-        .unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut done = false;
-    while Instant::now() < deadline {
-        if let IndexingStatus::Error(e) = service.get_status() {
-            panic!("indexing failed: {}", e);
-        }
-        if db.exists() {
-            if let Ok(conn) = rusqlite::Connection::open(db) {
-                if db::repo::get_last_full_index(&conn).is_some() {
-                    done = true;
-                    break;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(done, "indexing did not finish within the timeout");
-    service.stop_indexing().unwrap();
+    .run()
 }
 
 /// Apply the reconciliation `old -> new` implies, exactly as the coordinator
@@ -84,6 +43,7 @@ fn reconcile(db: &Path, old: &Config, new: &Config) -> (usize, usize) {
     let mut conn = db::open_existing(&db.to_string_lossy(), true).unwrap();
     let registry = Registry::default_set();
     let mut cursor = WorkCursor::new(actions.work, new).unwrap();
+    let run = AtomicBool::new(false);
     while !cursor.done() {
         advance(
             &mut conn,
@@ -91,6 +51,7 @@ fn reconcile(db: &Path, old: &Config, new: &Config) -> (usize, usize) {
             &registry,
             &mut cursor,
             Instant::now() + SLICE,
+            &run,
         )
         .unwrap();
     }

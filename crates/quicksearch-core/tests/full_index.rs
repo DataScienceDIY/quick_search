@@ -6,74 +6,27 @@
 //! invisible on a first index — `existing_files` is empty, so nothing is
 //! stale — and only appears on the second run.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use quicksearch_core::config::Config;
 use quicksearch_core::file_handling::{extract_scope_prepare, ExtractCursor};
 use quicksearch_core::indexing::{IndexingService, IndexingStatus, RootPhase};
 
-fn tmp_dir(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "quicksearch-e2e-{}-{}-{}",
-        tag,
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
-}
+mod common;
+use common::{scratch_dir as tmp_dir, touch};
 
-fn touch(p: &Path, body: &[u8]) {
-    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::write(p, body).unwrap();
-}
-
-/// Run one full index and wait for it to finish.
-///
-/// Completion is detected via the `last_full_index` marker, which
-/// `run_indexing` writes only on a successful finish. Polling the status
-/// enum instead would race: a small tree finishes between two polls, so
-/// `Idle` is ambiguous between "not started yet" and "already done".
+/// Run one full index over `root` and wait for it to finish.
 fn index_once(root: &Path, db: &Path, config: &Config) {
-    if db.exists() {
-        let conn = rusqlite::Connection::open(db).unwrap();
-        conn.execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
-            .unwrap();
+    common::IndexOnce {
+        db,
+        roots: vec![root.to_string_lossy().into_owned()],
+        config,
+        fresh_marker: true,
+        encrypted: false,
     }
-
-    let service = IndexingService::new();
-    service
-        .start_indexing(
-            vec![root.to_string_lossy().into_owned()],
-            db.to_string_lossy().into_owned(),
-            config.clone(),
-        )
-        .unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut done = false;
-    while Instant::now() < deadline {
-        if let IndexingStatus::Error(e) = service.get_status() {
-            panic!("indexing failed: {}", e);
-        }
-        if db.exists() {
-            if let Ok(conn) = rusqlite::Connection::open(db) {
-                if quicksearch_core::db::repo::get_last_full_index(&conn).is_some() {
-                    done = true;
-                    break;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(done, "indexing did not finish within the timeout");
-    service.stop_indexing().unwrap();
+    .run()
 }
 
 /// (path, mtime, content_state) for every indexed row, ordered by path.
@@ -91,10 +44,10 @@ fn rows(db: &Path) -> Vec<(String, i64, i64)> {
 }
 
 fn test_config() -> Config {
-    let config = Config::default();
+    
     // Keep the run to phase 1 semantics we're asserting on; extraction is
     // covered elsewhere.
-    config
+    Config::default()
 }
 
 #[test]
@@ -393,9 +346,12 @@ fn starting_a_run_claims_the_status_before_it_returns() {
         )
         .unwrap();
 
-    // No sleep, no poll: the very next observation must already be Running.
+    // No sleep, no poll: the very next observation must already show the run.
+    // `Preparing` is what a claim looks like before the command thread has
+    // even picked the start up — it is still joining the previous run — and
+    // it holds the index exactly as `Running` does.
     assert!(
-        matches!(service.get_status(), IndexingStatus::Running { .. }),
+        matches!(service.get_status(), IndexingStatus::Preparing { .. }),
         "status must be claimed synchronously, got {:?}",
         service.get_status()
     );
@@ -781,7 +737,9 @@ fn a_directory_that_becomes_unreadable_deletes_nothing() {
 
 /// Everything about a file's indexed content that a user can observe: its
 /// state, the stored snippet body, and its property rows.
-fn content_rows(db: &Path) -> Vec<(String, i64, Option<String>, Option<i64>, String)> {
+type ContentRow = (String, i64, Option<String>, Option<i64>, String);
+
+fn content_rows(db: &Path) -> Vec<ContentRow> {
     let conn = rusqlite::Connection::open(db).unwrap();
     let mut stmt = conn
         .prepare(
@@ -943,6 +901,41 @@ fn undecodable_small_files_are_reported_as_failures_not_silently_skipped() {
         msg.unwrap_or_default().contains("bad.txt"),
         "the failure names the file"
     );
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// A `.doc` that is not a readable OLE2 compound file — a truncated download,
+/// or something misnamed — records a failure with a reason.
+///
+/// This is the end-to-end shape of the legacy-Office support: the walk types
+/// the file from its extension, the office extractor claims `application/
+/// msword`, and the OLE2 reader either produces text or says why it could not.
+/// Until that reader existed, every `.doc` took the third path instead —
+/// `DONE` with empty text — which reads as "indexed, contains nothing" and is
+/// indistinguishable from a genuinely empty document.
+#[test]
+fn an_unreadable_legacy_office_file_fails_with_a_reason() {
+    let root = tmp_dir("legacy-doc");
+    let db_dir = tmp_dir("legacy-doc-db");
+    let db = db_dir.join("index.sqlite");
+
+    touch(&root.join("broken.doc"), b"D0CF11E0 this is not really a compound file");
+    index_once(&root, &db, &Config::default());
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (state, msg): (i64, Option<String>) = conn
+        .query_row(
+            "SELECT content_state, failure_msg FROM files WHERE path LIKE '%broken.doc'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, 2, "an unreadable .doc is FAILED, not DONE-with-no-text");
+    let msg = msg.unwrap_or_default();
+    assert!(msg.contains("broken.doc"), "names the file: {msg}");
+    assert!(msg.contains("compound file"), "says what went wrong: {msg}");
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&db_dir).ok();
@@ -1306,6 +1299,10 @@ fn a_heavy_root_does_not_stall_a_light_one() {
                     }
                 }
             }
+            // The run is claimed but has not reached its walk yet; there is
+            // nothing to sample, and breaking here would end the watch before
+            // the run it is watching had started.
+            IndexingStatus::Preparing { .. } => {}
             IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
             _ => break,
         }
@@ -1410,7 +1407,10 @@ fn the_wal_stays_bounded_during_a_run() {
         }
         last = len;
         match service.get_status() {
-            IndexingStatus::Running { .. } => {}
+            // Preparing included: the run is claimed but has not opened the
+            // database yet, so there is no log to watch and nothing to stop
+            // watching for either.
+            IndexingStatus::Running { .. } | IndexingStatus::Preparing { .. } => {}
             IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
             _ => break,
         }

@@ -1,5 +1,8 @@
-//! SQL strings for the current schema. Versioned; [`migrate`](super::migrate)
-//! drives the upgrade path.
+//! SQL strings for the current schema.
+//!
+//! Versioned by [`super::open::CURRENT_SCHEMA_VERSION`], but there is no
+//! upgrade path: a database written under any other version is wiped and
+//! recreated from [`SCHEMA_CURRENT`]. See [`super::open`] for why.
 
 /// Pragmas applied on every writable connection open.
 ///

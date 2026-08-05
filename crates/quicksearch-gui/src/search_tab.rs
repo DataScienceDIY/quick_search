@@ -10,6 +10,7 @@ use quicksearch_core::snippet::Snippet;
 
 use crate::format::{fmt_elapsed, fmt_mtime, human_size};
 use crate::platform;
+use crate::ui_util::middle_elide;
 
 /// Width of the query strip's status slot, in points. Wide enough for the
 /// longest query time `fmt_elapsed` produces, and held whether the slot is
@@ -496,7 +497,8 @@ impl SearchTab {
         let preview_height = if preview_snippet.is_some() { 44.0 } else { 0.0 };
         let table_height = (ui.available_height() - preview_height).max(60.0);
 
-        let text_height = egui::TextStyle::Body.resolve(ui.style()).size + 4.0;
+        let body_font = egui::TextStyle::Body.resolve(ui.style());
+        let text_height = body_font.size + 4.0;
         let mut open_ignore_dialog: Option<usize> = None;
         let mut hovered_now: Option<usize> = None;
         // Moved out of `self` rather than cloned. The row closure needs `&mut
@@ -564,8 +566,37 @@ impl SearchTab {
                                 cell_responses.push(ui.label(&hit.name));
                             });
                             row.col(|ui| {
-                                cell_responses
-                                    .push(ui.label(egui::RichText::new(&hit.path).weak()));
+                                // Center-elided: egui's own truncation keeps
+                                // the head and drops the deepest directories
+                                // — the half that actually says where the
+                                // file lives. A sizing pass hands out cell
+                                // rects that are not final yet, so nothing is
+                                // measured against one.
+                                let shown = if ui.is_sizing_pass() {
+                                    std::borrow::Cow::Borrowed(hit.path.as_str())
+                                } else {
+                                    middle_elide(
+                                        ui,
+                                        &hit.path,
+                                        // A point of slack, so a rounding
+                                        // disagreement with egui's layout
+                                        // cannot cost a second ellipsis.
+                                        ui.available_width() - 1.0,
+                                        &body_font,
+                                    )
+                                };
+                                let elided = matches!(shown, std::borrow::Cow::Owned(_));
+                                // egui offers a full-text tooltip only when
+                                // *it* elided the galley, and it would be
+                                // handed the string already shortened here.
+                                let mut response = ui.add(
+                                    egui::Label::new(egui::RichText::new(shown.as_ref()).weak())
+                                        .show_tooltip_when_elided(false),
+                                );
+                                if elided {
+                                    response = response.on_hover_text(&hit.path);
+                                }
+                                cell_responses.push(response);
                             });
                             if self.has_snippets {
                                 // Borrowed, not cloned: a snippet window runs
@@ -643,7 +674,7 @@ impl SearchTab {
 
                             let mut response = row.response();
                             for r in cell_responses {
-                                response = response | r;
+                                response |= r;
                             }
                             if response.contains_pointer() {
                                 hovered_now = Some(display_ix);
@@ -1098,10 +1129,7 @@ fn rank_tier_color(stage: u8) -> egui::Color32 {
 /// Timestamp color: fresh files get a green tint that fades into the weak
 /// text color over ~2 years on a log scale.
 fn recency_color(ui: &egui::Ui, mtime: i64) -> egui::Color32 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = quicksearch_core::log::now_unix() as i64;
     let age_hours = ((now - mtime).max(0) as f32 / 3600.0).max(1.0);
     const HORIZON_HOURS: f32 = 24.0 * 365.0 * 2.0;
     let t = (age_hours.ln() / HORIZON_HOURS.ln()).clamp(0.0, 1.0);
@@ -1144,14 +1172,7 @@ mod tests {
         tab: &mut SearchTab,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1000.0, 700.0),
-            )),
-            events,
-            ..Default::default()
-        };
+        let input = crate::test_ui::raw_input(egui::vec2(1000.0, 700.0), events);
         ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 tab.ui(ui);
@@ -1173,6 +1194,79 @@ mod tests {
             }
         }
         panic!("never landed on row {row}'s label text");
+    }
+
+    use crate::test_ui::painted_text;
+
+    /// Far too long for the Path column at the test's 1000pt screen width.
+    fn deep_path() -> String {
+        concat!(
+            "/media/shared/QuickSearch/crates/quicksearch-gui/src/",
+            "deeply/nested/under/several/more/directories/alpha_widget_0.txt"
+        )
+        .to_string()
+    }
+
+    /// The Path column drops out of the *middle*, so the volume the file
+    /// sits on and the directories right above it both stay on screen.
+    /// egui's own truncation would keep the head and throw the tail away —
+    /// and the tail is the half that says where the file lives.
+    #[test]
+    fn long_paths_elide_from_the_middle_of_the_path_column() {
+        let ctx = egui::Context::default();
+        let mut tab = tab_with_results(1);
+        let path = deep_path();
+        tab.results[0].path = path.clone();
+
+        let painted = painted_text(&run_frame(&ctx, &mut tab, vec![]));
+        let cell = painted
+            .iter()
+            .find(|t| t.starts_with("/media") && t.contains('…'))
+            .unwrap_or_else(|| panic!("no elided path cell among {painted:?}"));
+
+        assert!(!painted.contains(&path), "painted in full");
+        assert_eq!(cell.matches('…').count(), 1, "elided twice: {cell}");
+        let (head, tail) = cell.split_once('…').expect("one ellipsis");
+        assert!(path.starts_with(head), "{cell}");
+        assert!(path.ends_with(tail), "{cell}");
+        assert!(
+            tail.ends_with("alpha_widget_0.txt"),
+            "the deep end survives: {cell}"
+        );
+    }
+
+    /// The whole path stays reachable on hover. egui hands out that tooltip
+    /// for free only while *it* did the eliding, so text shortened ahead of
+    /// time has to bring its own — and it is easy to lose silently.
+    #[test]
+    fn an_elided_path_still_shows_the_whole_thing_on_hover() {
+        let ctx = egui::Context::default();
+        // Testing that the tooltip is wired up, not egui's hover timing.
+        ctx.style_mut(|s| {
+            s.interaction.tooltip_delay = 0.0;
+            s.interaction.show_tooltips_only_when_still = false;
+        });
+        let mut tab = tab_with_results(1);
+        let path = deep_path();
+        tab.results[0].path = path.clone();
+
+        run_frame(&ctx, &mut tab, vec![]); // settle the table's layout
+        for y in 40..250 {
+            // x lands in the Path column, past the 220pt Name column.
+            let pos = egui::pos2(300.0, y as f32);
+            let mut out = run_frame(&ctx, &mut tab, vec![egui::Event::PointerMoved(pos)]);
+            if tab.hovered_row != Some(0) {
+                continue;
+            }
+            // The tooltip is its own area, so it may land a frame behind.
+            for _ in 0..3 {
+                if painted_text(&out).contains(&path) {
+                    return;
+                }
+                out = run_frame(&ctx, &mut tab, vec![]);
+            }
+        }
+        panic!("the full path never appeared on hover");
     }
 
     fn click(pos: egui::Pos2, button: egui::PointerButton) -> Vec<egui::Event> {

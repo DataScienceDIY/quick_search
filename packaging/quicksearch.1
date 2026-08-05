@@ -1,4 +1,7 @@
-.TH QUICKSEARCH 1 "2026-08-02" "quicksearch 0.1.0" "User Commands"
+.\" The version in the .TH line above is rewritten from [workspace.package]
+.\" version by packaging/build-deb.sh at package time; the literal here is
+.\" only what an uninstalled read of this file shows.
+.TH QUICKSEARCH 1 "2026-08-05" "quicksearch 1.0.2" "User Commands"
 .SH NAME
 quicksearch, quicksearch\-cli \- fast full\-text search across your files
 .SH SYNOPSIS
@@ -60,29 +63,78 @@ of bare paths. Highlights the match in bold when stdout is a terminal.
 .TP
 .BR \-h ", " \-\-help
 Print usage and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and the commit it was built from, then exit. Quote this in
+bug reports.
 .PP
 An unrecognised option given without any query terms is passed through and the
 application is opened, since it may be an option for the windowing backend.
 .SH QUERY SYNTAX
-Plain words form a single phrase. Filters may be combined with it:
+Plain words form a single phrase, matched against names, contents and paths.
+Filters may be combined with it:
+.TP
+.B \(dq\fIexact phrase\fB\(dq
+Quoting keeps spaces, stars and filter\-like words literal.
+.B \(dq\(dq
+escapes a quote.
+.TP
+.BI bud * port
+.B *
+matches any run of characters, staying within one line of content.
+.B %
+and
+.B _
+are always literal.
+.TP
+.B regex:\fIpattern\fR
+Match a regular expression against names, contents and paths, for example
+.BR regex:\(dq(foo|bar)\ed+\(dq .
+Case\-insensitive by default;
+.B (?\-i:\(dq\(dq)
+overrides. Quote patterns containing spaces or
+.BR "( ) : = < > \(dq" .
 .TP
 .B type:\fIName\fR
-Match a file class, for example
-.IR type:Document ", " type:Image ", " type:Audio .
+Match a file class: one of
+.IR Audio ", " Image ", " Video ", " Document ", " Text ", " Archive ", "
+.IR Spreadsheet ", " Presentation ", " Folder .
 .TP
 .B modified:\fIexpr\fR
 Compare against the modification date, for example
 .IR modified:>=2024-01-01 .
+Also
+.BR < ", " <= ", " > " and " = ;
+dates are
+.IR yyyy-mm-dd .
+.B mtime:
+is an alias.
 .TP
 .B path:\fI/dir\fR
-Restrict results to a directory.
+Restrict results to a directory and its subdirectories.
+.B folder:
+and
+.B includefolder:
+are aliases.
+.B *
+is literal here.
 .TP
 .B mime:\fItype\fR
-Match a MIME type, for example
+Match a MIME type exactly, for example
 .IR mime:application/pdf .
 .TP
 .B name:\fIfragment\fR
-Match a fragment of the filename.
+Match a fragment of the filename. A filter, so it does not affect ranking.
+.B filename:
+is an alias; an unquoted
+.B *
+globs.
+.PP
+Unrecognised
+.I key:value
+text stays part of the search phrase.
+.BR AND ", " OR
+and parentheses are treated as plain words.
 .SH PASSWORD PROTECTION
 The index can be encrypted with a password (application Options, Security).
 A protected index must be unlocked every time either binary starts. The

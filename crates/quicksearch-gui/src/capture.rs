@@ -193,8 +193,16 @@ fn parse_line(tokens: &[Token], line_no: usize) -> Result<Option<Cmd>, ParseErro
         "clear_query" => Cmd::ClearQuery,
         "focus_search" => Cmd::FocusSearch,
         "window" => {
-            let w = parse_int("width", next_word(rest, line_no, "width in points")?, line_no)?;
-            let h = parse_int("height", next_word(rest, line_no, "height in points")?, line_no)?;
+            let w = parse_int(
+                "width",
+                next_word(rest, line_no, "width in points")?,
+                line_no,
+            )?;
+            let h = parse_int(
+                "height",
+                next_word(rest, line_no, "height in points")?,
+                line_no,
+            )?;
             if w == 0 || h == 0 {
                 return Err(err("window dimensions must be positive".to_string()));
             }
@@ -203,9 +211,11 @@ fn parse_line(tokens: &[Token], line_no: usize) -> Result<Option<Cmd>, ParseErro
                 h: h as f32,
             }
         }
-        "hover_match" => Cmd::HoverMatch(
-            parse_int("row", next_word(rest, line_no, "row index")?, line_no)? as usize,
-        ),
+        "hover_match" => {
+            Cmd::HoverMatch(
+                parse_int("row", next_word(rest, line_no, "row index")?, line_no)? as usize,
+            )
+        }
         "hover_off" => Cmd::HoverOff,
         "tab" => Cmd::Tab(match next_word(rest, line_no, "tab name")? {
             "search" => Tab::Search,
@@ -452,7 +462,7 @@ impl CaptureDriver {
         }
 
         let Some(cmd) = self.cmds.get(self.pc).cloned() else {
-            self.quit(ctx);
+            self.quit(app, ctx);
             return;
         };
         let started = match self.cmd_started {
@@ -542,7 +552,7 @@ impl CaptureDriver {
                     ShotTag,
                 )));
             }
-            Cmd::Quit => self.quit(ctx),
+            Cmd::Quit => self.quit(app, ctx),
         }
         if matches!(cmd, Cmd::RecordStop) {
             self.stop_recorder();
@@ -572,7 +582,8 @@ impl CaptureDriver {
                 capped(max_ms)
                     || matches!(
                         app.capture_indexing_status(),
-                        IndexingStatus::Running { .. }
+                        IndexingStatus::Preparing { .. }
+                            | IndexingStatus::Running { .. }
                             | IndexingStatus::Stopping
                             | IndexingStatus::Optimizing
                     )
@@ -590,8 +601,13 @@ impl CaptureDriver {
         }
     }
 
-    fn quit(&mut self, ctx: &egui::Context) {
+    fn quit(&mut self, app: &mut QuickSearchApp, ctx: &egui::Context) {
         self.stop_recorder();
+        // A scripted quit answers the guards up front. Nothing a scenario does
+        // dirties an editor, but a scenario that changed the indexed folders
+        // can leave a reconcile running, and its modal would hold the window
+        // open until the run timed out.
+        app.capture_confirm_quit();
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         self.finished = true;
     }

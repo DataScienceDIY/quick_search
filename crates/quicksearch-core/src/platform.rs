@@ -29,12 +29,72 @@ pub fn home_dir() -> Option<OsString> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
 }
 
-/// Whether a directory entry counts as hidden.
+/// `FILE_ATTRIBUTE_HIDDEN`.
 ///
-/// Unix: a leading dot. Windows: a leading dot **or** `FILE_ATTRIBUTE_HIDDEN`
-/// / `FILE_ATTRIBUTE_SYSTEM` — without which `include_hidden = false` hides
-/// nothing on Windows, and `$RECYCLE.BIN`, `System Volume Information`,
-/// `pagefile.sys` and `AppData` all get indexed.
+/// Spelled out rather than imported, for the reason in the module header:
+/// `windows-sys` is a `cfg(windows)`-only dependency, and
+/// [`attributes_are_hidden`] has to compile — and be tested — on Linux, where
+/// the suite runs.
+const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+
+/// The cross-compiled Windows build is where the spelling above is checked
+/// against the real header value, so a typo fails that job rather than quietly
+/// indexing `$RECYCLE.BIN`.
+#[cfg(windows)]
+const _: () = assert!(
+    FILE_ATTRIBUTE_HIDDEN == windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN
+);
+
+/// Whether a Windows attribute word marks an entry hidden.
+///
+/// `FILE_ATTRIBUTE_HIDDEN` and nothing else. `FILE_ATTRIBUTE_SYSTEM` was part
+/// of this test and was removed, because it pruned users' cloud folders:
+/// Windows honours the `desktop.ini` inside a folder only if the folder itself
+/// carries Read-only or System, so the ownCloud, Nextcloud, OneDrive and Google
+/// Drive clients set System on their sync root purely to get a branded icon.
+/// Such a folder has no Hidden bit and is plainly visible in Explorer, yet the
+/// whole subtree vanished from the index with nothing to explain it — only
+/// "Index hidden files" brought it back, which is the opposite of what that
+/// setting is for. Any folder given a custom icon is the same case.
+///
+/// Nothing the System term existed for is lost. `$RECYCLE.BIN`, `System Volume
+/// Information`, `pagefile.sys` and the legacy per-user junctions (`My
+/// Documents`, `Local Settings`, `Application Data`) are Hidden **and** System —
+/// that pairing is Windows' own definition of a protected operating system file
+/// — and `AppData` is Hidden alone. Hidden catches every one. The drive-root
+/// names are excluded by [`crate::config`]'s default ignore patterns as well, so
+/// they have two independent reasons to stay out.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn attributes_are_hidden(attributes: u32) -> bool {
+    attributes & FILE_ATTRIBUTE_HIDDEN != 0
+}
+
+/// Why an entry counted as hidden.
+///
+/// The distinction exists for the walk's log line: a dot prefix explains itself
+/// and an ignore pattern is something the user typed, but "this visible folder
+/// was skipped over an attribute you cannot see" has no discoverability at all,
+/// so only that case is worth reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HiddenReason {
+    DotPrefix,
+    Attribute,
+}
+
+/// Whether a directory entry counts as hidden, and why.
+///
+/// Unix: a leading dot. Windows: a leading dot **or** `FILE_ATTRIBUTE_HIDDEN` —
+/// without which `include_hidden = false` hides nothing on Windows, and
+/// `$RECYCLE.BIN`, `System Volume Information`, `pagefile.sys` and `AppData` all
+/// get indexed. `FILE_ATTRIBUTE_SYSTEM` is deliberately not part of it; see
+/// [`attributes_are_hidden`].
+///
+/// `meta` must report the attributes of the entry **itself**, never of a link
+/// target — callers pass `symlink_metadata` or an already-cached directory
+/// entry. A hidden symlink is a hidden alias; a visible symlink to a hidden
+/// target is a visible alias. All four call sites have to agree on that, or a
+/// full run indexes a file the watcher then refuses to update and the index
+/// churns on every cycle.
 ///
 /// `meta` is a closure because on Unix it is never called: the walkers
 /// deliberately avoid `metadata()`, which would cost an extra `lstat` per
@@ -42,28 +102,207 @@ pub fn home_dir() -> Option<OsString> {
 /// zero anyway — both `std::fs::DirEntry::metadata` and
 /// `walkdir::DirEntry::metadata` hand back data already cached from
 /// `FindNextFileW`.
-pub fn entry_is_hidden<F>(name: &str, meta: F) -> bool
+pub fn entry_hidden_reason<F>(name: &str, meta: F) -> Option<HiddenReason>
 where
     F: FnOnce() -> Option<std::fs::Metadata>,
 {
     if name.starts_with('.') {
-        return true;
+        return Some(HiddenReason::DotPrefix);
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
-        };
         if let Some(m) = meta() {
-            return m.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0;
+            if attributes_are_hidden(m.file_attributes()) {
+                return Some(HiddenReason::Attribute);
+            }
         }
     }
     #[cfg(not(windows))]
     {
         let _ = meta;
     }
-    false
+    None
+}
+
+/// [`entry_hidden_reason`] for the callers that only need the verdict.
+pub fn entry_is_hidden<F>(name: &str, meta: F) -> bool
+where
+    F: FnOnce() -> Option<std::fs::Metadata>,
+{
+    entry_hidden_reason(name, meta).is_some()
+}
+
+/// `FILE_ATTRIBUTE_REPARSE_POINT`. Spelled out for [`FILE_ATTRIBUTE_HIDDEN`]'s
+/// reason, and checked against the real header value the same way.
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+#[cfg(windows)]
+const _: () = assert!(
+    FILE_ATTRIBUTE_REPARSE_POINT
+        == windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+);
+
+/// The attributes a dehydrated cloud file carries.
+///
+/// `FILE_ATTRIBUTE_OFFLINE` (0x1000) is the old tape-archive bit that OneDrive
+/// reused; `RECALL_ON_OPEN` (0x40000) marks a file whose *metadata* is local but
+/// whose data is not; `RECALL_ON_DATA_ACCESS` (0x400000) is the modern
+/// Files-On-Demand placeholder. Any one of them means opening the file for read
+/// pulls it over the network.
+const FILE_ATTRIBUTE_OFFLINE: u32 = 0x1000;
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x4_0000;
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+
+#[cfg(windows)]
+const _: () = {
+    use windows_sys::Win32::Storage::FileSystem as fs_attrs;
+    assert!(FILE_ATTRIBUTE_OFFLINE == fs_attrs::FILE_ATTRIBUTE_OFFLINE);
+    assert!(FILE_ATTRIBUTE_RECALL_ON_OPEN == fs_attrs::FILE_ATTRIBUTE_RECALL_ON_OPEN);
+    assert!(FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS == fs_attrs::FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS);
+};
+
+/// Whether reading this file's contents would pull it down from the cloud.
+///
+/// OneDrive, and every other Files-On-Demand provider, leaves a placeholder on
+/// disk with real metadata and no data. Opening one for read is not a local
+/// operation: it blocks on a network download of the entire file. The default
+/// indexing root is `%USERPROFILE%`, the OneDrive folder beneath it is not
+/// hidden, and the walk hashes the first 8 KiB of every new or changed file — so
+/// without this test a first index quietly downloads the user's whole cloud
+/// drive, filling their disk with the files they had deliberately offloaded.
+///
+/// Named for the question the caller is actually asking ("will reading this
+/// cost a download?") rather than for the bits, because the answer is what the
+/// indexing path branches on. Always `false` off Windows: no other platform this
+/// runs on has an equivalent, and a `stat` there tells the truth about the data.
+pub fn is_cloud_placeholder(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        return attributes_are_dehydrated(meta.file_attributes());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// The bit test behind [`is_cloud_placeholder`], split out so the Linux suite
+/// exercises it. See this module's second rule.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn attributes_are_dehydrated(attributes: u32) -> bool {
+    attributes
+        & (FILE_ATTRIBUTE_OFFLINE
+            | FILE_ATTRIBUTE_RECALL_ON_OPEN
+            | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+        != 0
+}
+
+/// Whether a Windows attribute word marks an entry as a reparse point.
+///
+/// Split out from [`entry_cached_metadata`] so the bit test is exercised by the
+/// Linux suite, per this module's second rule. Deliberately *not* the same
+/// question as `FileType::is_symlink`, which additionally requires the
+/// name-surrogate bit: see [`entry_cached_metadata`] for why that distinction is
+/// the whole point.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn attributes_are_reparse_point(attributes: u32) -> bool {
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Metadata a directory read already handed back, on the platforms that hand
+/// any back at all.
+///
+/// `std::fs::Metadata` on Windows: `FindFirstFileW`/`FindNextFileW` return size,
+/// timestamps and attributes with every name, and `std::fs::DirEntry::metadata`
+/// is a copy of that buffer rather than a syscall. A `fs::metadata(path)` on the
+/// same entry is therefore a whole extra `CreateFileW` +
+/// `GetFileInformationByHandle` + `CloseHandle` — an `IRP_MJ_CREATE` through
+/// every antivirus and EDR minifilter on the machine — for data already in hand.
+///
+/// Uninhabited everywhere else, because `getdents64` returns only `d_type`: size
+/// and mtime genuinely need the `statx`, and `DirEntry::metadata` there is a
+/// *second* syscall rather than a saved one. Uninhabited rather than a unit
+/// struct so `Option<CachedMetadata>` is zero-sized off Windows — the walker
+/// queues one per pending file and nothing throttles file chunks (see
+/// `walk::Job::Files`), so carrying `Option<std::fs::Metadata>` would cost Linux
+/// 176 bytes per queued file to hold nothing at all.
+#[cfg(windows)]
+pub(crate) type CachedMetadata = std::fs::Metadata;
+#[cfg(not(windows))]
+pub(crate) type CachedMetadata = std::convert::Infallible;
+
+/// The zero-cost half of the claim above, enforced rather than asserted in
+/// prose: a layout change in a future toolchain becomes a compile error instead
+/// of a silent regression in the walker's memory profile.
+#[cfg(not(windows))]
+const _: () = assert!(std::mem::size_of::<Option<CachedMetadata>>() == 0);
+
+/// The metadata a directory read already produced for one entry — but only
+/// where trusting it is both free *and* indistinguishable from a fresh `stat`.
+///
+/// `meta` is a closure for exactly [`entry_hidden_reason`]'s reason: on Unix it
+/// is never called, because `std::fs::DirEntry::metadata` there is a real
+/// `lstat` and the walk spends exactly one `statx` per file by design.
+///
+/// `None` for a reparse point even on Windows, and that is the whole subtlety.
+/// `fs::metadata` *follows* a reparse point; the cached buffer describes the
+/// link itself. The tags std does not classify as symlinks reach the walk's
+/// ordinary file arm — `IO_REPARSE_TAG_APPEXECLINK`, the zero-byte Store app
+/// stubs under `WindowsApps`, and the OneDrive `IO_REPARSE_TAG_CLOUD_*` family —
+/// and for those the two answers differ: today an AppExecLink fails
+/// `CreateFileW` with `ERROR_CANT_ACCESS_FILE` and is skipped, while its
+/// directory entry looks like an ordinary empty file and would get indexed.
+/// Sending every reparse point back to the path-based `fs::metadata` keeps the
+/// semantics identical and leaves only the common case on the fast path.
+///
+/// Tested against the raw `FILE_ATTRIBUTE_REPARSE_POINT` bit, deliberately not
+/// against `file_type().is_symlink()`: std's `is_symlink` additionally requires
+/// the name-surrogate bit `0x20000000`, which is precisely the test that lets
+/// AppExecLink and the cloud tags through.
+pub(crate) fn entry_cached_metadata<F>(meta: F) -> Option<CachedMetadata>
+where
+    F: FnOnce() -> Option<std::fs::Metadata>,
+{
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if let Some(m) = meta().filter(|m| !attributes_are_reparse_point(m.file_attributes())) {
+            return Some(m);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = meta;
+    }
+    None
+}
+
+/// A file's `std::fs::Metadata`, from the directory read where that read
+/// supplied it and from a `stat` where it did not.
+///
+/// The `#[cfg]` lives here rather than at the call site, per this module's first
+/// rule. Off Windows `cached` is uninhabited and therefore provably `None`,
+/// which is why the walk still costs exactly one `statx` per file there.
+#[cfg(windows)]
+pub(crate) fn metadata_or_stat(
+    path: &Path,
+    cached: Option<CachedMetadata>,
+) -> std::io::Result<std::fs::Metadata> {
+    match cached {
+        Some(m) => Ok(m),
+        None => std::fs::metadata(path),
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn metadata_or_stat(
+    path: &Path,
+    _cached: Option<CachedMetadata>,
+) -> std::io::Result<std::fs::Metadata> {
+    std::fs::metadata(path)
 }
 
 /// Whether `path` has a hidden component *below* the root that contains it.
@@ -101,7 +340,11 @@ pub fn path_has_hidden_component_under(path: &Path, roots: &[PathBuf]) -> bool {
         current.push(component);
         if let Component::Normal(name) = component {
             let name = name.to_string_lossy();
-            if entry_is_hidden(&name, || std::fs::metadata(&current).ok()) {
+            // `symlink_metadata`, not `metadata`: each component is judged as
+            // itself, which is what the walkers do. Only the final component
+            // stops being followed, so intermediate ones still resolve
+            // normally. See `entry_hidden_reason`.
+            if entry_is_hidden(&name, || std::fs::symlink_metadata(&current).ok()) {
                 return true;
             }
         }
@@ -234,6 +477,15 @@ pub const WATCH_ROOTS_RECURSIVELY: bool = cfg!(windows);
 /// on both sides, consistently.
 pub const PATH_COLLATION: &str = if cfg!(windows) { "NOCASE" } else { "BINARY" };
 
+/// Whether this platform's filesystem matches names without regard to case.
+///
+/// What ignore patterns compile against: on Windows and macOS `node_modules`
+/// has to exclude `Node_Modules`, and on Linux it must not. Named here rather
+/// than spelled `cfg!(any(windows, target_os = "macos"))` at each use, so the
+/// two places that must agree — [`crate::config::IgnoreSet`]'s literal set and
+/// its glob set — cannot drift apart.
+pub const PATHS_ARE_CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
+
 /// Drop the **calling thread** to background scheduling priority.
 ///
 /// Per-thread, not per-process. The GUI shares this process, so lowering the
@@ -245,6 +497,19 @@ pub const PATH_COLLATION: &str = if cfg!(windows) { "NOCASE" } else { "BINARY" }
 ///
 /// Best-effort and idempotent: a refusal is not worth reporting, since the
 /// only consequence is that indexing competes on equal terms.
+///
+/// **CPU only, on every platform.** This used to be
+/// `THREAD_MODE_BACKGROUND_BEGIN` on Windows, which is background *mode*: it
+/// lowers the thread to base priority 4 and drops it to `IoPriorityVeryLow`, a
+/// tier the kernel does not merely deprioritise but actively rate-limits — the
+/// same one SuperFetch and defrag run in. Linux's `nice` has no I/O half at all
+/// under the usual schedulers, so the two platforms were not doing remotely the
+/// same thing: every walker, prefetcher, extractor *and* the single SQLite
+/// writer thread were throttled on Windows and full-speed on Linux, which is
+/// most of why Windows indexing was so much slower. Matching `nice`'s CPU-only
+/// semantics is the deliberate choice; a machine that genuinely needs I/O
+/// throttling needs it as a user-visible setting, not as a silent per-platform
+/// difference.
 pub fn set_background_priority() {
     #[cfg(target_os = "linux")]
     {
@@ -256,12 +521,12 @@ pub fn set_background_priority() {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Threading::{
-            GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
         };
-        // Background *mode*, not merely a lower priority number: it drops I/O
-        // priority as well, which is what actually keeps a walk from starving
-        // the foreground on a spinning disk.
-        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) };
+        // Yields the CPU to the foreground without touching I/O priority — the
+        // closest Windows equivalent of `nice(10)`. See the note above for why
+        // this is not `THREAD_MODE_BACKGROUND_BEGIN`.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
     }
     // Elsewhere (macOS, BSD): deliberately nothing. `nice` there applies to the
     // whole process, so it would hit the GUI. The right call is
@@ -426,10 +691,163 @@ mod tests {
         assert!(!called, "a dot prefix must short-circuit before any stat");
     }
 
+    /// Each of the three attributes on its own must be enough: providers do not
+    /// agree on which they set, and getting this wrong means silently
+    /// downloading someone's entire cloud drive.
+    #[test]
+    fn any_recall_attribute_marks_a_file_dehydrated() {
+        for bit in [OFFLINE, RECALL_ON_OPEN, RECALL_ON_DATA_ACCESS] {
+            assert!(attributes_are_dehydrated(bit));
+            assert!(attributes_are_dehydrated(ARCHIVE | REPARSE_POINT | bit));
+        }
+        // A synced-down file keeps the reparse point but drops the recall bits.
+        assert!(!attributes_are_dehydrated(ARCHIVE | REPARSE_POINT));
+        assert!(!attributes_are_dehydrated(ARCHIVE));
+        assert!(!attributes_are_dehydrated(NORMAL));
+        assert!(!attributes_are_dehydrated(0));
+    }
+
+    /// Off Windows there is no such thing, and a local `stat` tells the truth.
+    #[test]
+    #[cfg(not(windows))]
+    fn nothing_is_a_cloud_placeholder_off_windows() {
+        let meta = std::fs::metadata(env!("CARGO_MANIFEST_DIR")).unwrap();
+        assert!(!is_cloud_placeholder(&meta));
+    }
+
+    /// The bit test behind the walk's fast path, exercised where the suite
+    /// actually runs. A junction, an AppExecLink stub and a OneDrive
+    /// placeholder all carry this bit; an ordinary file does not.
+    #[test]
+    fn reparse_points_are_recognised_by_attribute() {
+        assert!(attributes_are_reparse_point(REPARSE_POINT));
+        assert!(attributes_are_reparse_point(DIRECTORY | REPARSE_POINT));
+        // A dehydrated cloud file: reparse point plus the recall attributes.
+        assert!(attributes_are_reparse_point(
+            ARCHIVE | REPARSE_POINT | 0x40_0000
+        ));
+        assert!(!attributes_are_reparse_point(ARCHIVE));
+        assert!(!attributes_are_reparse_point(NORMAL));
+        assert!(!attributes_are_reparse_point(DIRECTORY));
+        assert!(!attributes_are_reparse_point(0));
+    }
+
+    /// Off Windows the directory read supplies nothing, and asking it for
+    /// anything would be the `lstat` per entry the walker exists to avoid.
+    #[test]
+    #[cfg(not(windows))]
+    fn nothing_is_served_from_a_directory_read_off_windows() {
+        let mut called = false;
+        let got = entry_cached_metadata(|| {
+            called = true;
+            None
+        });
+        assert!(got.is_none());
+        assert!(
+            !called,
+            "DirEntry::metadata here is an lstat, which is the syscall the walk exists to avoid"
+        );
+    }
+
+    /// `fs::metadata` follows a reparse point and the cached buffer does not,
+    /// so the fast path must decline every one of them — including the tags std
+    /// does not call symlinks, which are precisely the ones that reach the
+    /// walk's ordinary file arm.
+    #[test]
+    #[cfg(windows)]
+    fn a_reparse_point_is_never_served_from_the_directory_read() {
+        let dir = std::env::temp_dir().join(format!("qs-reparse-{}", std::process::id()));
+        let target = dir.join("target");
+        let link = dir.join("link");
+        let plain = dir.join("plain.txt");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(&plain, b"x").unwrap();
+
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if made {
+            let m = std::fs::symlink_metadata(&link).unwrap();
+            assert!(
+                entry_cached_metadata(|| Some(m)).is_none(),
+                "a junction must fall back to the path-based stat"
+            );
+        }
+
+        let m = std::fs::metadata(&plain).unwrap();
+        assert!(
+            entry_cached_metadata(|| Some(m)).is_some(),
+            "an ordinary file must take the fast path"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn ordinary_names_are_not_hidden() {
         assert!(!entry_is_hidden("Documents", || None));
         assert!(!entry_is_hidden("report.txt", || None));
+    }
+
+    /// The real `FILE_ATTRIBUTE_*` bits, so the cases below read as the files
+    /// they stand for.
+    const READONLY: u32 = 0x1;
+    const HIDDEN: u32 = 0x2;
+    const SYSTEM: u32 = 0x4;
+    const DIRECTORY: u32 = 0x10;
+    const ARCHIVE: u32 = 0x20;
+    const NORMAL: u32 = 0x80;
+    const REPARSE_POINT: u32 = 0x400;
+    const OFFLINE: u32 = 0x1000;
+    const RECALL_ON_OPEN: u32 = 0x4_0000;
+    const RECALL_ON_DATA_ACCESS: u32 = 0x40_0000;
+
+    /// The attribute half of `entry_is_hidden`, which the Windows arm cannot
+    /// be asked about from Linux. Split out precisely so this test runs
+    /// everywhere.
+    #[test]
+    fn only_the_hidden_bit_hides_an_entry() {
+        // AppData: Hidden alone, and `std::env::temp_dir()` lives under it.
+        assert!(attributes_are_hidden(HIDDEN | DIRECTORY));
+        // $RECYCLE.BIN, System Volume Information, and the legacy per-user
+        // junctions: Hidden+System, Windows' own definition of a protected
+        // operating system file.
+        assert!(attributes_are_hidden(HIDDEN | SYSTEM | DIRECTORY));
+        // pagefile.sys.
+        assert!(attributes_are_hidden(HIDDEN | SYSTEM | ARCHIVE));
+
+        assert!(!attributes_are_hidden(0));
+        assert!(!attributes_are_hidden(NORMAL));
+        assert!(!attributes_are_hidden(DIRECTORY));
+        assert!(!attributes_are_hidden(READONLY | DIRECTORY));
+    }
+
+    /// Regression: a cloud sync root carries System and *not* Hidden — Windows
+    /// will not honour the `desktop.ini` supplying its branded icon otherwise —
+    /// and is fully visible in Explorer. Keying on System pruned the folder and
+    /// every file beneath it, silently, and only "include hidden files" brought
+    /// it back.
+    #[test]
+    fn a_sync_root_marked_system_but_not_hidden_is_not_hidden() {
+        assert!(!attributes_are_hidden(SYSTEM | DIRECTORY));
+        // Read-only is the other attribute that enables desktop.ini, and
+        // Explorer sets it when a user picks a custom folder icon.
+        assert!(!attributes_are_hidden(READONLY | SYSTEM | DIRECTORY));
+        assert!(!attributes_are_hidden(SYSTEM));
+    }
+
+    /// The walk announces an attribute prune and stays quiet about a dot
+    /// prefix, so the two must stay distinguishable.
+    #[test]
+    fn a_dot_prefix_reports_itself_as_the_reason() {
+        assert_eq!(
+            entry_hidden_reason(".git", || None),
+            Some(HiddenReason::DotPrefix)
+        );
+        assert_eq!(entry_hidden_reason("Documents", || None), None);
     }
 
     #[test]

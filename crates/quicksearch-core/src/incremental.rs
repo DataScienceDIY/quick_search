@@ -73,8 +73,14 @@ fn upsert_path(
     if meta.is_dir() {
         // A moved-in tree surfaces as one directory event; walk it with
         // the same filters as a full run.
+        //
+        // `filtered_walk` wants a `&str`, so a path that is not valid UTF-8
+        // cannot be walked here. That is a whole subtree missing from the
+        // index, not one file, so it is an error rather than a quiet `Ok`:
+        // the caller answers it by scheduling a full run, which walks from
+        // the configured root and never needs the path as a `str`.
         let Some(root) = path.to_str() else {
-            return Ok(());
+            return Err(format!("directory path is not valid UTF-8: {:?}", path));
         };
         let entries: Vec<_> = filtered_walk(
             root,
@@ -168,11 +174,17 @@ fn remove_path(conn: &mut Connection, path: &Path) -> Result<(), String> {
 /// `dir` sweeps its whole path range, each descendant event is duplicate work —
 /// 10 000 of them for a 10 000-file tree.
 ///
+/// This is for a caller holding a raw removal set. The coordinator is not one:
+/// it collapses as events *arrive*, in `collapse_pending_removals`, because it
+/// has to measure its queue after collapsing rather than before (see
+/// `Inner::drain_events`). Same rule, two entry points, deliberately — a
+/// mass deletion must be one path by the time either of them is done with it.
+///
 /// Ancestor membership is tested against a set rather than by sorting, which
-/// keeps this obviously correct: no ordering argument to get wrong, and
-/// `Path::ancestors` walks whole components, so `/a/bc` is never treated as
-/// living under `/a/b` — the same rule `remove_tree` and
-/// `UnreadableDirs::covers` use. Paths are shallow, so the cost is linear.
+/// keeps this obviously correct: there is no ordering argument to get wrong.
+/// Containment is component-wise, per
+/// [`crate::file_handling::UnreadableDirs::covers`]. Paths are shallow, so the
+/// cost is linear.
 pub fn collapse_removal_roots(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
     if paths.len() < 2 {
         return paths;
@@ -188,11 +200,13 @@ pub fn collapse_removal_roots(paths: Vec<std::path::PathBuf>) -> Vec<std::path::
 /// Delete `paths` and everything indexed beneath them, in transactions of at
 /// most `chunk` paths.
 ///
-/// A mass deletion is the case this exists for. Callers hand over the *roots*
-/// of the removal set (see [`collapse_removal_roots`]), so `rm -rf dir/` is one
-/// path here rather than one per file, and each one costs a fixed handful of
-/// range-driven statements ([`repo::delete_subtree`]) instead of a full table
-/// scan plus five statements per file.
+/// Correct for any path set, but a mass deletion is the case it exists for,
+/// and it pays off only if the caller has already reduced that set to its
+/// *roots* — then `rm -rf dir/` is one path here rather than one per file, and
+/// costs a fixed handful of range-driven statements
+/// ([`repo::delete_subtree`]) instead of a full table scan plus five
+/// statements per file. Both callers do: the coordinator collapses on arrival,
+/// and anyone else has [`collapse_removal_roots`].
 ///
 /// Chunking bounds how long any single transaction holds the connection, the
 /// same way `process_batch_inserts` bounds the indexer's writes.
@@ -239,17 +253,10 @@ mod tests {
 
     impl Fixture {
         fn new() -> Fixture {
-            let stamp = format!(
-                "{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            );
-            let dir = std::env::temp_dir().join(format!("qs-incr-{}", stamp));
+            let scratch = crate::testutil::scratch_dir("incr");
+            let dir = scratch.join("tree");
             std::fs::create_dir_all(&dir).unwrap();
-            let db = std::env::temp_dir().join(format!("qs-incr-{}.sqlite", stamp));
+            let db = scratch.join("index.sqlite");
             let conn = open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
             let config = Config::default();
             let ignore = IgnoreSet::compile(&config.indexing.ignore_patterns).unwrap();

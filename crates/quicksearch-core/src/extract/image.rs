@@ -1,4 +1,4 @@
-//! Image metadata extraction via [`kamadak_exif`]. Reads EXIF tags (camera
+//! Image metadata extraction via `kamadak-exif`. Reads EXIF tags (camera
 //! make/model, date, GPS, dimensions) into properties. `text` is left empty
 //! — this extractor does not OCR.
 

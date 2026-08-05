@@ -7,59 +7,31 @@
 //! do. Everything runs inside a single #[test] so the key transitions are
 //! strictly ordered.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use quicksearch_core::config::Config;
 use quicksearch_core::db;
-use quicksearch_core::indexing::{IndexingService, IndexingStatus};
+use quicksearch_core::indexing::IndexingService;
 use quicksearch_core::security::{derive_key, salt_from_hex};
 
-fn tmp_dir(tag: &str) -> PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!(
-        "quicksearch-enc-{}-{}-{}",
-        tag,
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
-}
+mod common;
+use common::scratch_dir as tmp_dir;
 
 /// Run one full index over `root` and wait for the completion marker,
-/// reading it through the keyed open so the poll works on encrypted DBs.
+/// reading it through the keyed open so the poll works on encrypted indexes.
+///
+/// The marker is deliberately *not* cleared first: this suite indexes into a
+/// database whose enable/disable rebuild cycle it is itself testing, and each
+/// rebuild already starts from a fresh file.
 fn index_once(root: &Path, db_path: &Path, config: &Config) {
-    let service = IndexingService::new();
-    service
-        .start_indexing(
-            vec![root.to_string_lossy().into_owned()],
-            db_path.to_string_lossy().into_owned(),
-            config.clone(),
-        )
-        .unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut done = false;
-    while Instant::now() < deadline {
-        if let IndexingStatus::Error(e) = service.get_status() {
-            panic!("indexing failed: {}", e);
-        }
-        if db_path.exists() {
-            if let Ok(conn) = db::open_existing(&db_path.to_string_lossy(), false) {
-                if quicksearch_core::db::repo::get_last_full_index(&conn).is_some() {
-                    done = true;
-                    break;
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    common::IndexOnce {
+        db: db_path,
+        roots: vec![root.to_string_lossy().into_owned()],
+        config,
+        fresh_marker: false,
+        encrypted: true,
     }
-    assert!(done, "indexing did not finish within the timeout");
-    service.stop_indexing().unwrap();
+    .run()
 }
 
 fn header(db_path: &Path) -> [u8; 16] {

@@ -320,9 +320,9 @@ mod tests {
             }
             std::mem::swap(&mut prev, &mut cur);
         }
-        for j in 0..=hay.len() {
-            best = best.min(prev[j]);
-        }
+        // The best occurrence may end at any text position, so the answer is
+        // the smallest value in the final row.
+        best = prev.iter().copied().min().unwrap_or(best);
         if best <= k {
             Some(best)
         } else {

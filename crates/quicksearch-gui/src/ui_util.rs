@@ -1,7 +1,8 @@
 //! Shared UI helpers: emphasis colors, bordered widgets, ignore-pattern
-//! validation, and the "more content below" scroll hint.
+//! validation, text eliding, and the "more content below" scroll hint.
 
 use quicksearch_core::config::IgnoreSet;
+use std::borrow::Cow;
 
 /// Warning/emphasis orange, also used for the fuzzy-edit-distance warning.
 pub const ORANGE: egui::Color32 = egui::Color32::from_rgb(220, 150, 40);
@@ -136,6 +137,81 @@ pub fn pattern_edit(
     (response, valid)
 }
 
+/// Middle-elide `text` so it fits `max_width` pixels when laid out in
+/// `font_id`, returning it borrowed and untouched when it already fits.
+///
+/// A path's two ends are the informative ones — the head says which volume
+/// or home it lives under, the tail names the deepest directories — so a
+/// column too narrow for the whole thing should drop out of the middle
+/// rather than tail-truncate the way egui does by default.
+///
+/// The budget is in pixels, summed from the font's own glyph advances (the
+/// same numbers egui's layout adds up), not a character count scaled by the
+/// width of one sample glyph. The proportional body font makes that estimate
+/// wrong in both directions: overshoot and egui elides the result a *second*
+/// time, painting two ellipses; undershoot and the column sits visibly short
+/// of full.
+///
+/// The borrowed/owned distinction is also the caller's signal that something
+/// was dropped, which is what a "full text on hover" tooltip keys off.
+pub fn middle_elide<'a>(
+    ui: &egui::Ui,
+    text: &'a str,
+    max_width: f32,
+    font_id: &egui::FontId,
+) -> Cow<'a, str> {
+    ui.fonts(|f| {
+        let width_of = |c: char| f.glyph_width(font_id, c);
+        if text.chars().map(width_of).sum::<f32>() <= max_width {
+            return Cow::Borrowed(text);
+        }
+        let budget = max_width - width_of('…');
+
+        // Grow a head and a tail toward each other through the middle,
+        // each step feeding whichever side is currently narrower so the cut
+        // lands near the middle. Indices advance by whole characters, so
+        // they always land on UTF-8 boundaries.
+        let (mut head, mut tail) = (0usize, text.len());
+        let (mut head_w, mut tail_w) = (0.0f32, 0.0f32);
+        while head < tail {
+            let rest = &text[head..tail];
+            let front = rest.chars().next().expect("head < tail");
+            let back = rest.chars().next_back().expect("head < tail");
+            let (front_w, back_w) = (width_of(front), width_of(back));
+            let used = head_w + tail_w;
+            let (front_fits, back_fits) = (used + front_w <= budget, used + back_w <= budget);
+            if !front_fits && !back_fits {
+                break;
+            }
+            // The preferred side wins when it fits; otherwise the other one
+            // does, since at least one of them just did.
+            let take_front = if head_w <= tail_w {
+                front_fits
+            } else {
+                !back_fits
+            };
+            if take_front {
+                head += front.len_utf8();
+                head_w += front_w;
+            } else {
+                tail -= back.len_utf8();
+                tail_w += back_w;
+            }
+        }
+        if head >= tail {
+            // The two halves met without dropping anything — splicing an
+            // ellipsis in now would only lengthen a string that fits.
+            return Cow::Borrowed(text);
+        }
+
+        let mut out = String::with_capacity(head + '…'.len_utf8() + (text.len() - tail));
+        out.push_str(&text[..head]);
+        out.push('…');
+        out.push_str(&text[tail..]);
+        Cow::Owned(out)
+    })
+}
+
 /// Paint a semitransparent down-arrow near the bottom edge of a scroll
 /// area while more content lies below the fold. Painter-only, so it can
 /// never swallow clicks. (The bundled fonts have no ▼ glyph — this is a
@@ -175,7 +251,115 @@ pub fn more_below_hint<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutp
 
 #[cfg(test)]
 mod tests {
-    use super::{ignore_pattern_valid, pattern_border, pattern_hint, INVALID_RED, VALID_GREEN};
+    use super::{
+        ignore_pattern_valid, middle_elide, pattern_border, pattern_hint, Cow, INVALID_RED,
+        VALID_GREEN,
+    };
+
+    /// A `Ui` from a real (headless) egui pass, so `middle_elide` measures
+    /// with the same fonts the app paints with — the whole point of the
+    /// helper is that its arithmetic agrees with egui's layout.
+    fn with_ui<R>(f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+        let ctx = egui::Context::default();
+        let mut f = Some(f);
+        let mut out = None;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(f) = f.take() {
+                    out = Some(f(ui));
+                }
+            });
+        });
+        out.expect("the central panel ran")
+    }
+
+    fn body_font(ui: &egui::Ui) -> egui::FontId {
+        egui::TextStyle::Body.resolve(ui.style())
+    }
+
+    const DEEP: &str = "/media/shared/QuickSearch/crates/quicksearch-gui/src/search_tab.rs";
+
+    #[test]
+    fn text_that_fits_comes_back_untouched() {
+        with_ui(|ui| {
+            let font = body_font(ui);
+            let out = middle_elide(ui, DEEP, 10_000.0, &font);
+            assert!(matches!(out, Cow::Borrowed(_)), "borrowed when it fits");
+            assert_eq!(out, DEEP);
+            // Nothing to elide, however little room there is.
+            assert!(matches!(middle_elide(ui, "", 0.0, &font), Cow::Borrowed(_)));
+        });
+    }
+
+    #[test]
+    fn eliding_keeps_both_ends_and_cuts_once() {
+        with_ui(|ui| {
+            let out = middle_elide(ui, DEEP, 200.0, &body_font(ui));
+            assert!(matches!(out, Cow::Owned(_)), "{out}");
+            assert_eq!(out.matches('…').count(), 1, "{out}");
+            let (head, tail) = out.split_once('…').expect("one ellipsis");
+            assert!(
+                !head.is_empty() && !tail.is_empty(),
+                "both ends survive: {out}"
+            );
+            assert!(DEEP.starts_with(head), "{out}");
+            assert!(DEEP.ends_with(tail), "{out}");
+            assert!(
+                tail.ends_with("search_tab.rs"),
+                "the filename survives: {out}"
+            );
+        });
+    }
+
+    /// The load-bearing property. If the result laid out in the same font
+    /// were wider than the budget, egui would elide it a *second* time and
+    /// paint two ellipses.
+    #[test]
+    fn the_result_fits_the_budget_it_was_given() {
+        with_ui(|ui| {
+            let font = body_font(ui);
+            for width in [40.0f32, 60.0, 121.5, 200.0, 337.5, 480.0] {
+                let out = middle_elide(ui, DEEP, width, &font);
+                let painted = ui.fonts(|f| {
+                    f.layout_no_wrap(out.to_string(), font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x
+                });
+                assert!(
+                    painted <= width,
+                    "at {width}: {out:?} lays out at {painted}"
+                );
+            }
+        });
+    }
+
+    /// An ellipsis is the least that can stand for the text; a column too
+    /// narrow even for that gets it anyway rather than a panic.
+    #[test]
+    fn degenerate_widths_never_panic() {
+        with_ui(|ui| {
+            let font = body_font(ui);
+            for width in [f32::NEG_INFINITY, -50.0, 0.0] {
+                assert_eq!(middle_elide(ui, DEEP, width, &font), "…", "at {width}");
+            }
+        });
+    }
+
+    /// Indices walk by whole characters, so a path of multi-byte glyphs
+    /// slices cleanly instead of panicking mid-codepoint.
+    #[test]
+    fn multi_byte_paths_split_on_character_boundaries() {
+        with_ui(|ui| {
+            let font = body_font(ui);
+            let path = "/srv/données/日本語/архив/файл-très-long.txt";
+            for width in [30.0f32, 55.0, 90.0, 140.0, 210.0, 400.0] {
+                let out = middle_elide(ui, path, width, &font);
+                let (head, tail) = out.split_once('…').unwrap_or((out.as_ref(), ""));
+                assert!(path.starts_with(head), "at {width}: {out}");
+                assert!(path.ends_with(tail), "at {width}: {out}");
+            }
+        });
+    }
 
     /// The trap behind "my ignore filters don't work" reports: ".jpg" is an
     /// exact-name pattern, and the hint must say so and offer "*.jpg".

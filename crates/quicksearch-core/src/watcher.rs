@@ -160,7 +160,7 @@ impl std::error::Error for WatchError {}
 
 /// Render the directory cap compactly: the default 128_000 reads "128k".
 fn fmt_cap(cap: usize) -> String {
-    if cap >= 1000 && cap % 1000 == 0 {
+    if cap >= 1000 && cap.is_multiple_of(1000) {
         format!("{}k", cap / 1000)
     } else {
         cap.to_string()
@@ -266,12 +266,12 @@ impl WatchRegistry {
     }
 
     /// Forget `dir` and every watched directory beneath it, returning how
-    /// many were dropped.
+    /// many were dropped. Containment is component-wise, per
+    /// [`crate::file_handling::UnreadableDirs::covers`].
     ///
-    /// `Path::starts_with` compares whole components, so `/a/bc` is not
-    /// treated as living under `/a/b`. The kernel drops watches for deleted
-    /// directories on its own; unwatching anyway keeps notify's internal
-    /// descriptor map from growing across a long session of directory churn.
+    /// The kernel drops watches for deleted directories on its own; unwatching
+    /// anyway keeps notify's internal descriptor map from growing across a long
+    /// session of directory churn.
     fn remove_tree(&mut self, dir: &Path) -> usize {
         // The scan below is O(watched dirs), and the event loop calls this for
         // every Remove — files included. Deleting a directory of 10k files
@@ -564,7 +564,7 @@ fn run_loop(rx: mpsc::Receiver<NotifyEvent>, ctx: LoopCtx) {
 
         // Periodic GC of abandoned throttle entries.
         tick_counter = tick_counter.wrapping_add(1);
-        if tick_counter % prune_interval_ticks == 0 {
+        if tick_counter.is_multiple_of(prune_interval_ticks) {
             let max_age = ctx
                 .config
                 .throttle_window
@@ -809,19 +809,8 @@ mod tests {
         }
     }
 
-    /// Unique temp directory; the repo has no `tempfile` dev-dependency.
     fn tmp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "qs-watch-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutil::scratch_dir(tag)
     }
 
     /// A registry with `dirs` seeded directly, so the pure set logic can be
@@ -903,8 +892,10 @@ mod tests {
             );
         }
         let (sink, got) = sink_to_vec();
-        let mut config = WatcherConfig::default();
-        config.max_dirs_per_tick = 3;
+        let config = WatcherConfig {
+            max_dirs_per_tick: 3,
+            ..WatcherConfig::default()
+        };
         flush_ready(&mut map, &sink, &config);
         // Each dir contributes one event because each entry has one path.
         assert_eq!(got.lock().unwrap().len(), 3);

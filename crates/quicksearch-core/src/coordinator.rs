@@ -35,7 +35,7 @@ use crate::config::{diff_actions, Config, IgnoreSet, IndexWork};
 use crate::db;
 use crate::extract::Registry;
 use crate::incremental::apply_fs_event;
-use crate::indexing::{ConfigChange, IndexingService, IndexingStatus};
+use crate::indexing::{ConfigChange, IndexingService, IndexingStatus, PrepStep, ReconcileProgress};
 use crate::scope::WorkCursor;
 use crate::watcher::{FsEvent, WatchError, WatchFilters, Watcher, WatcherConfig};
 
@@ -67,6 +67,28 @@ pub enum WatcherStatus {
     Disabled { reason: WatchError },
 }
 
+/// A config reconciliation the coordinator applies between runs.
+///
+/// Separate from [`IndexingStatus`] on purpose. That enum is what every caller
+/// reads to decide whether a full run owns the database, and this work is the
+/// coordinator's own — putting it there would make the tick that performs it
+/// believe it must keep off the file. On a large index it is minutes of
+/// scanning that used to report nothing but `Idle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileState {
+    /// Scanning now; the counters move every slice.
+    Running(ReconcileProgress),
+    /// Finished within the last [`RECONCILE_SUMMARY_LINGER`].
+    ///
+    /// The tail is the whole point: narrowing a filter on a small index is
+    /// over in a millisecond, and a display that only existed while the work
+    /// did would leave the user with no sign it ever happened.
+    Finished(ReconcileProgress),
+}
+
+/// How long a finished reconciliation keeps reporting itself.
+pub const RECONCILE_SUMMARY_LINGER: Duration = Duration::from_secs(10);
+
 /// One-stop poll surface for the GUI.
 #[derive(Debug, Clone)]
 pub struct IndexerState {
@@ -78,8 +100,21 @@ pub struct IndexerState {
     pub queued_events: usize,
     /// Live-update health; see [`WatcherStatus`].
     pub watcher: WatcherStatus,
+    /// The between-runs reconciliation, while it runs and briefly after.
+    ///
+    /// A run's *own* reconciliation is not here — it is a step of the run, and
+    /// reads as [`IndexingStatus::Preparing`] with a
+    /// [`PrepStep::Reconciling`]. Both report the same
+    /// [`ReconcileProgress`], so the display does not have to care which one
+    /// it is looking at.
+    pub reconcile: Option<ReconcileState>,
 }
 
+// `ConfigChanged(Config)` dwarfs the unit variants, but these are sent one
+// at a time down an mpsc channel at human cadence — a mode flip, a settings
+// save. Boxing would trade a rare oversized move for an allocation on a path
+// whose whole job is to be simple.
+#[allow(clippy::large_enum_variant)]
 enum CoordCmd {
     SetMode(IndexMode),
     ReindexNow,
@@ -95,6 +130,34 @@ pub struct IndexCoordinator {
     shared: Arc<Mutex<Shared>>,
     handle: Mutex<Option<JoinHandle<()>>>,
     stopped: AtomicBool,
+    /// How [`Self::shutdown`] reaches a reconciliation in progress; see
+    /// [`Inner::apply_work`].
+    reconcile_stop: Arc<ReconcileStop>,
+}
+
+/// The two halves of cutting the coordinator's reconciliation short — the pair
+/// [`db::InterruptSlot`] describes.
+///
+/// A command cannot do it: the thread that would read the command is the
+/// thread inside the scan. Closing the window used to wait for both.
+#[derive(Default)]
+struct ReconcileStop {
+    cancel: AtomicBool,
+    interrupt: db::InterruptSlot,
+}
+
+impl ReconcileStop {
+    /// Flag first, then interrupt: the flag is what stops the *next*
+    /// statement, and setting it after the interrupt would leave a window in
+    /// which the pass starts one more.
+    fn stop(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        db::interrupt(&self.interrupt);
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
 }
 
 /// State mirrored out of the coordinator thread for `state()`.
@@ -103,6 +166,7 @@ struct Shared {
     last_full_index: Option<u64>,
     queued_events: usize,
     watcher: WatcherStatus,
+    reconcile: Option<ReconcileState>,
 }
 
 impl IndexCoordinator {
@@ -130,12 +194,15 @@ impl IndexCoordinator {
             last_full_index: None,
             queued_events: 0,
             watcher: WatcherStatus::Off,
+            reconcile: None,
         }));
 
+        let reconcile_stop = Arc::new(ReconcileStop::default());
         let mut inner = Inner {
             config,
             indexing: indexing.clone(),
             shared: shared.clone(),
+            reconcile_stop: reconcile_stop.clone(),
             event_tx,
             event_rx,
             watcher: None,
@@ -147,6 +214,8 @@ impl IndexCoordinator {
             pending_since: None,
             needs_full_run: false,
             pending_work: None,
+            reconcile_done: None,
+            reconcile_cut_short: false,
             saw_running: false,
             write_conn: None,
             ignore: Arc::new(IgnoreSet::compile(&[]).expect("empty ignore set")),
@@ -167,6 +236,7 @@ impl IndexCoordinator {
             shared,
             handle: Mutex::new(Some(handle)),
             stopped: AtomicBool::new(false),
+            reconcile_stop,
         })
     }
 
@@ -178,6 +248,7 @@ impl IndexCoordinator {
             last_full_index: shared.last_full_index,
             queued_events: shared.queued_events,
             watcher: shared.watcher.clone(),
+            reconcile: shared.reconcile,
         }
     }
 
@@ -223,14 +294,40 @@ impl IndexCoordinator {
 
     /// Stop the watcher, any running index pass, and the coordinator
     /// thread. Idempotent; usable from a signal handler through an Arc.
+    ///
+    /// Cancelling the reconciliation comes *before* the command, because the
+    /// command is read by the thread the scan is running on: a pass part-way
+    /// through a large index would otherwise hold this join — and with it the
+    /// window close that called it — for as long as the scan had left.
     pub fn shutdown(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.reconcile_stop.stop();
         let _ = self.cmd_tx.send(CoordCmd::Shutdown);
         if let Some(handle) = self.handle.lock().unwrap().take() {
             let _ = handle.join();
         }
+    }
+
+    /// Whether a configuration change is being applied to the index right
+    /// now, by either of the two places that can be doing it.
+    ///
+    /// For a caller deciding whether to warn before quitting: an abandoned
+    /// pass leaves entries the user excluded still in the index until the next
+    /// indexing run redoes it.
+    pub fn reconciling(&self) -> bool {
+        // The lock is released before the service is asked, so this never
+        // holds two of them at once.
+        let between_runs = self.shared.lock().unwrap().reconcile;
+        matches!(between_runs, Some(ReconcileState::Running(_)))
+            || matches!(
+                self.indexing.get_status(),
+                IndexingStatus::Preparing {
+                    step: PrepStep::Reconciling(_),
+                    ..
+                }
+            )
     }
 }
 
@@ -281,9 +378,7 @@ fn collapse_pending_removals(pending: &mut HashMap<PathBuf, FsEvent>) {
         .filter(|(_, ev)| is_removal(ev))
         .map(|(p, _)| p.clone())
         .collect();
-    // `Path::ancestors` walks whole components, so `/a/bc` is never treated as
-    // living under `/a/b` — the rule `remove_tree` and `UnreadableDirs::covers`
-    // also use.
+    // Component-wise containment, per `UnreadableDirs::covers`.
     pending.retain(|path, ev| {
         !is_removal(ev) || !path.ancestors().skip(1).any(|a| removed.contains(a))
     });
@@ -303,6 +398,9 @@ struct Inner {
     config: Config,
     indexing: Arc<IndexingService>,
     shared: Arc<Mutex<Shared>>,
+    /// Read inside the reconciliation, set from the thread that shuts this
+    /// one down; see [`ReconcileStop`].
+    reconcile_stop: Arc<ReconcileStop>,
     event_tx: mpsc::Sender<FsEvent>,
     event_rx: mpsc::Receiver<FsEvent>,
     watcher: Option<Watcher>,
@@ -325,6 +423,11 @@ struct Inner {
     /// manual mode, whereas a config change the user just made is acted on in
     /// either mode.
     pending_work: Option<WorkCursor>,
+    /// The last reconciliation to finish, and when. Published until it is
+    /// [`RECONCILE_SUMMARY_LINGER`] old; see [`ReconcileState::Finished`].
+    reconcile_done: Option<(ReconcileProgress, Instant)>,
+    /// A reconciliation was abandoned part-way; read by [`Inner::teardown`].
+    reconcile_cut_short: bool,
     /// A start was requested; set false once the service reports running,
     /// so idle-after-running transitions are detectable.
     saw_running: bool,
@@ -407,8 +510,11 @@ impl Inner {
             CoordCmd::RebuildIndex => {
                 let db = self.db_path();
                 self.write_conn = None;
-                // Nothing to reconcile against once the file is gone.
+                // Nothing to reconcile against once the file is gone — and
+                // nothing to report about what was reconciled in the index
+                // that is about to stop existing.
                 self.pending_work = None;
+                self.reconcile_done = None;
                 if let Err(e) = self.indexing.delete_index_for_rebuild(&db) {
                     crate::log_warn!("coordinator: rebuild: {}", e);
                 }
@@ -423,6 +529,7 @@ impl Inner {
                 self.enter_manual_stopped();
                 self.write_conn = None;
                 self.pending_work = None;
+                self.reconcile_done = None;
                 let db = self.db_path();
                 if let Err(e) = self.indexing.delete_index_for_rebuild(&db) {
                     crate::log_warn!("coordinator: clear index: {}", e);
@@ -439,7 +546,8 @@ impl Inner {
 
         let status = self.indexing.get_status();
         match status {
-            IndexingStatus::Running { .. }
+            IndexingStatus::Preparing { .. }
+            | IndexingStatus::Running { .. }
             | IndexingStatus::Stopping
             | IndexingStatus::Optimizing => {
                 // Single-writer rule: never touch the DB while a full run
@@ -545,15 +653,34 @@ impl Inner {
             }
         };
         let mut cursor = self.pending_work.take().expect("caller checked");
-        let outcome = crate::scope::advance(
-            &mut conn,
-            &self.config,
-            &self.registry,
-            &mut cursor,
-            Instant::now() + crate::scope::SLICE,
-        );
+        let outcome = {
+            // Held only for the slice: the handle names whatever statement
+            // this connection is running, and outside `advance` that is
+            // nothing this cancellation has any business ending.
+            let _armed = db::InterruptGuard::arm(&self.reconcile_stop.interrupt, &conn);
+            crate::scope::advance(
+                &mut conn,
+                &self.config,
+                &self.registry,
+                &mut cursor,
+                Instant::now() + crate::scope::SLICE,
+                &self.reconcile_stop.cancel,
+            )
+        };
         self.write_conn = Some(conn);
         if let Err(e) = outcome {
+            // A cancelled statement fails like any other, and telling the two
+            // apart from a stringified error is guesswork — so ask the flag we
+            // set ourselves. Shutting down mid-scan is not a fault to report.
+            if self.reconcile_stop.cancelled() {
+                self.reconcile_cut_short = true;
+                crate::log_info!(
+                    "configuration change interrupted after {} index entries; \
+                     the next indexing run starts it again",
+                    cursor.progress().examined
+                );
+                return;
+            }
             // Abandoned rather than retried: the cursor is already dropped,
             // and a database error that persists would otherwise spin this
             // loop for the life of the process. The next full run reconciles
@@ -566,8 +693,33 @@ impl Inner {
             return;
         }
         if !cursor.done() {
+            // Nothing is recorded for a pass that stopped early, cancelled or
+            // not: the stale record is what makes the next run redo it.
             self.pending_work = Some(cursor);
             return;
+        }
+        // Held for the linger so the display outlives the work: on a small
+        // index this whole pass is over between two frames.
+        self.reconcile_done = Some((cursor.progress(), Instant::now()));
+        // Record what the pass just brought the index into line with. Only
+        // here, on the path where the work finished and nothing errored: the
+        // stale record is what makes the next full run redo an abandoned
+        // reconcile, and it is the documented backstop for the error path
+        // above. Without this stamp a completed prune left the index still
+        // describing itself with the old configuration, so every later run
+        // rescanned every row to re-apply work already done — the silent wait
+        // a large index spends before its walk starts.
+        if let Some(conn) = self.write_conn.as_ref() {
+            // The same spelling a run records: canonicalized, and sorted into
+            // one string by `config_validation_entries`.
+            let roots: Vec<String> = self
+                .config
+                .normalized_indexing_paths()
+                .into_iter()
+                .collect();
+            if let Err(e) = IndexingService::stamp_reconciled(conn, &self.config, &roots) {
+                crate::log_warn!("coordinator: record reconciled configuration: {}", e);
+            }
         }
         if cursor.deleted > 0 || cursor.recontented > 0 {
             crate::log_info!(
@@ -617,7 +769,7 @@ impl Inner {
     /// create-then-delete ends with it absent, because the upsert half consults
     /// the filesystem and finds nothing there.
     fn apply_pending(&mut self) {
-        let conn = match self.ensure_write_conn() {
+        let mut conn = match self.ensure_write_conn() {
             Ok(conn) => conn,
             Err(e) => {
                 // Missing or stale DB: incremental can't help, rebuild.
@@ -629,8 +781,6 @@ impl Inner {
                 return;
             }
         };
-        // Borrow dance: pull the connection out while applying.
-        let mut conn = conn;
         let deadline = Instant::now() + APPLY_BUDGET;
         let chunk = self.config.processing.batch_size.max(1);
 
@@ -642,7 +792,11 @@ impl Inner {
             .collect();
         for batch in removals.chunks(chunk) {
             if let Err(e) = crate::incremental::remove_paths(&mut conn, batch, chunk) {
-                crate::log_warn!("coordinator: remove: {}", e);
+                // The batch leaves `pending` either way — replaying a write
+                // that just failed, once a tick forever, is the worse
+                // failure. A full run is what recovers the rows instead.
+                crate::log_warn!("coordinator: remove: {}; scheduling full run", e);
+                self.needs_full_run = true;
             }
             for path in batch {
                 self.pending.remove(path);
@@ -666,7 +820,11 @@ impl Inner {
                 if let Err(e) =
                     apply_fs_event(&mut conn, &ev, &self.config, &self.ignore, &self.registry)
                 {
-                    crate::log_warn!("coordinator: apply {:?}: {}", ev, e);
+                    // Same reasoning as the removal half above: the event is
+                    // already out of `pending`, so a full run is the only
+                    // thing that still picks the file up.
+                    crate::log_warn!("coordinator: apply {:?}: {}; scheduling full run", ev, e);
+                    self.needs_full_run = true;
                 }
                 if Instant::now() >= deadline {
                     break;
@@ -918,23 +1076,51 @@ impl Inner {
         Ok(())
     }
 
+    /// Re-read the stamp the last completed full run left behind.
+    ///
+    /// A failure to open is deliberately *not* published as `None`. Only a
+    /// successful read means "never indexed", and `periodic_due` answers that
+    /// by starting a full run immediately — so treating a locked or
+    /// contended database as "never" would schedule a fresh run every tick
+    /// for as long as the condition lasts. Keeping the previous value leaves
+    /// the schedule where it was until a read succeeds.
     fn refresh_last_full_index(&self) {
-        let last = db::open_existing(&self.db_path(), false)
-            .ok()
-            .and_then(|conn| db::repo::get_last_full_index(&conn));
-        self.shared.lock().unwrap().last_full_index = last;
+        match db::open_existing(&self.db_path(), false) {
+            Ok(conn) => {
+                let last = db::repo::get_last_full_index(&conn);
+                self.shared.lock().unwrap().last_full_index = last;
+            }
+            Err(e) => crate::log_warn!("coordinator: last-full-index unreadable: {}", e),
+        }
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
+        let reconcile = match &self.pending_work {
+            Some(cursor) => Some(ReconcileState::Running(cursor.progress())),
+            None => {
+                // The tail ages out here rather than in `tick`, which returns
+                // early for the whole length of a run; this runs every turn of
+                // the loop, so it expires within a second of its deadline
+                // whatever else is going on.
+                let now = Instant::now();
+                self.reconcile_done = self
+                    .reconcile_done
+                    .filter(|(_, at)| summary_is_fresh(*at, now));
+                self.reconcile_done
+                    .map(|(progress, _)| ReconcileState::Finished(progress))
+            }
+        };
         let mut shared = self.shared.lock().unwrap();
         shared.mode = self.mode;
         shared.queued_events = self.pending.len();
+        shared.reconcile = reconcile;
     }
 
     /// Must stay fast: it runs (transitively) on the GUI thread during
     /// window close, and desktops show a "terminate this application?"
     /// dialog after a few unresponsive seconds. Signal, don't wait — an
-    /// abandoned run is safe under WAL.
+    /// abandoned run is safe under WAL, and so is an abandoned reconcile:
+    /// nothing recorded it, so the next run does it again.
     fn teardown(mut self) {
         self.stop_watcher();
         let status = self.indexing.get_status();
@@ -946,10 +1132,18 @@ impl Inner {
             // window during an optimize pass would wait out a rewrite of the
             // whole index. The interrupted VACUUM rolls back, and the next
             // run's checkpoints land the log.
-            self.indexing.cancel_optimizing();
+            self.indexing.cancel_db_work();
         }
+        // Unfinished either way it can end: still holding its cursor, or
+        // abandoned mid-statement by the cancellation.
+        let cut_short = self.reconcile_cut_short || self.pending_work.is_some();
         if let Some(conn) = self.write_conn.take() {
-            if idle {
+            // A reconciliation cut short is the one idle case that must not
+            // checkpoint. It can have written a great deal of WAL — deleting
+            // a root's rows is all log — and a TRUNCATE checkpoint of it is
+            // more of exactly the wait the cancellation just spared the user.
+            // Dropping is safe: WAL keeps the log and the next run lands it.
+            if idle && !cut_short {
                 db::repo::checkpoint_and_close(conn);
             }
             // Otherwise just drop: a TRUNCATE checkpoint would block
@@ -958,12 +1152,14 @@ impl Inner {
     }
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Whether a reconciliation that finished at `at` is still worth reporting.
+///
+/// Its own function so the rule can be tested without waiting the linger out.
+fn summary_is_fresh(at: Instant, now: Instant) -> bool {
+    now.duration_since(at) < RECONCILE_SUMMARY_LINGER
 }
+
+use crate::log::now_unix;
 
 #[cfg(test)]
 mod tests {
@@ -988,17 +1184,10 @@ mod tests {
 
     impl Fixture {
         fn new(auto: bool) -> Fixture {
-            let stamp = format!(
-                "{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            );
-            let dir = std::env::temp_dir().join(format!("qs-coord-{}", stamp));
+            let scratch = crate::testutil::scratch_dir("coord");
+            let dir = scratch.join("tree");
             std::fs::create_dir_all(&dir).unwrap();
-            let db = std::env::temp_dir().join(format!("qs-coord-{}.sqlite", stamp));
+            let db = scratch.join("index.sqlite");
             let mut config = Config::default();
             config.paths.indexing_paths = vec![dir.to_string_lossy().into_owned()];
             config.paths.database_path = db.to_string_lossy().into_owned();
@@ -1013,6 +1202,21 @@ mod tests {
                     .unwrap_or(0),
                 Err(_) => -1,
             }
+        }
+
+        /// What a run starting now would still find to reconcile.
+        fn outstanding_work(&self, config: &Config) -> IndexWork {
+            crate::scope::outstanding_work(&self.db.to_string_lossy(), config).unwrap()
+        }
+
+        fn stored_value(&self, key: &str) -> Option<String> {
+            let conn = db::open_existing(&self.db.to_string_lossy(), false).unwrap();
+            conn.query_row(
+                "SELECT value FROM config_validation WHERE key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .ok()
         }
     }
 
@@ -1040,6 +1244,51 @@ mod tests {
         });
         assert_eq!(f.file_count(), 1);
         coord.shutdown();
+    }
+
+    /// Closing the window during a prune must not wait the prune out. The
+    /// thread that reads the shutdown command is the thread inside the scan,
+    /// so before this the join sat behind however many rows were left — on a
+    /// large index, minutes of it, with the window still on screen and the
+    /// desktop offering to kill the app.
+    #[test]
+    fn shutdown_during_a_prune_does_not_wait_for_it() {
+        let f = Fixture::new(false);
+        // Enough rows that the scan cannot plausibly finish between the
+        // config landing and the shutdown two lines later.
+        for i in 0..400 {
+            std::fs::write(f.dir.join(format!("f{}.log", i)), "dropped content").unwrap();
+        }
+        std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
+
+        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        coord.reindex_now();
+        wait_for("initial run", Duration::from_secs(60), || {
+            coord.state().last_full_index.is_some() && f.file_count() == 401
+        });
+
+        let mut narrowed = f.config.clone();
+        narrowed.indexing.ignore_patterns.push("*.log".into());
+        // One row per page, so the scan is as many statements as there are
+        // rows: the shape a huge index has, at a size a test can afford.
+        narrowed.processing.batch_size = 1;
+        coord.apply_config(narrowed.clone());
+
+        let asked = Instant::now();
+        coord.shutdown();
+        let took = asked.elapsed();
+        assert!(
+            took < Duration::from_secs(5),
+            "shutdown waited {:?} for the prune",
+            took
+        );
+        // And it really did leave the work unfinished rather than racing
+        // through it: the stored record still describes the old settings, so
+        // the next run derives the same plan and applies it.
+        assert!(
+            f.outstanding_work(&narrowed).touches_index(),
+            "the prune ran to completion, so this proves nothing about waiting"
+        );
     }
 
     /// A narrowed filter is applied to the stored index without a prompt and
@@ -1081,6 +1330,144 @@ mod tests {
             coord.state().last_full_index,
             stamped,
             "no run happened — narrowing needs no walk"
+        );
+        coord.shutdown();
+    }
+
+    /// A prune that finishes must record what it reconciled against, or every
+    /// later run re-derives the same plan and rescans every row under every
+    /// root to redo work already done. On a multi-million-file index that
+    /// rescan is minutes of silence before the walk starts — the whole reason
+    /// indexing looked hung after a prune.
+    #[test]
+    fn a_completed_prune_records_what_it_reconciled() {
+        let f = Fixture::new(false);
+        std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
+        std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
+
+        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        coord.reindex_now();
+        wait_for("initial run", Duration::from_secs(20), || {
+            let s = coord.state();
+            s.last_full_index.is_some() && f.file_count() == 2
+        });
+
+        let mut narrowed = f.config.clone();
+        narrowed.indexing.ignore_patterns.push("*.log".into());
+        assert!(
+            f.outstanding_work(&narrowed).touches_index(),
+            "the edit must be one the index does not yet reflect"
+        );
+
+        coord.apply_config(narrowed.clone());
+        wait_for(
+            "the log entry to be pruned",
+            Duration::from_secs(20),
+            || f.file_count() == 1,
+        );
+        // The prune and the stamp are two steps of one tick; the count above
+        // can be observed between them.
+        wait_for("the prune to be recorded", Duration::from_secs(20), || {
+            !f.outstanding_work(&narrowed).touches_index()
+        });
+
+        assert!(
+            f.outstanding_work(&narrowed).is_empty(),
+            "a run starting now has nothing left to reconcile"
+        );
+        coord.shutdown();
+    }
+
+    /// A prune of a two-file index is one transaction, over well inside a
+    /// frame. Reporting it only while it runs would mean the user changes a
+    /// setting and sees nothing at all — so the result outlives the work.
+    #[test]
+    fn a_finished_prune_keeps_reporting_itself_for_a_while() {
+        let f = Fixture::new(false);
+        std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
+        std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
+
+        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        coord.reindex_now();
+        wait_for("initial run", Duration::from_secs(20), || {
+            let s = coord.state();
+            s.last_full_index.is_some() && f.file_count() == 2
+        });
+
+        let mut narrowed = f.config.clone();
+        narrowed.indexing.ignore_patterns.push("*.log".into());
+        coord.apply_config(narrowed);
+        wait_for("the summary to appear", Duration::from_secs(20), || {
+            matches!(coord.state().reconcile, Some(ReconcileState::Finished(_)))
+        });
+
+        let Some(ReconcileState::Finished(progress)) = coord.state().reconcile else {
+            panic!("the summary went away as soon as it arrived");
+        };
+        assert_eq!(progress.deleted, 1, "the log entry, and only it");
+        coord.shutdown();
+    }
+
+    /// And it does go away: a summary is a report of what just happened, not
+    /// a state the app sits in. The rule is tested directly rather than by
+    /// sleeping out the linger.
+    #[test]
+    fn a_summary_stops_being_fresh_once_the_linger_is_up() {
+        let now = Instant::now();
+        assert!(summary_is_fresh(now, now));
+        assert!(summary_is_fresh(
+            now,
+            now + RECONCILE_SUMMARY_LINGER - Duration::from_millis(1)
+        ));
+        assert!(!summary_is_fresh(now, now + RECONCILE_SUMMARY_LINGER));
+        assert!(!summary_is_fresh(now, now + RECONCILE_SUMMARY_LINGER * 60));
+    }
+
+    /// The three settings no scan can satisfy stay at the values the index was
+    /// *built* with. A prune that stamped them would clear a rebuild the user
+    /// was prompted for and declined — and would clear it from an unrelated
+    /// later edit at that.
+    #[test]
+    fn a_prune_never_records_settings_only_a_rebuild_can_satisfy() {
+        let f = Fixture::new(false);
+        std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
+        std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
+
+        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        coord.reindex_now();
+        wait_for("initial run", Duration::from_secs(20), || {
+            let s = coord.state();
+            s.last_full_index.is_some() && f.file_count() == 2
+        });
+        let built_with = f.stored_value("hash_length").unwrap();
+
+        // The user changes the hash length and declines the rebuild it needs.
+        // The coordinator takes the config either way — a wipe is the caller's
+        // decision — so from here its copy disagrees with the stored hashes,
+        // and nothing short of a rebuild can make them agree.
+        let mut rebuilt = f.config.clone();
+        rebuilt.processing.hash_length = f.config.processing.hash_length * 2;
+        coord.apply_config(rebuilt.clone());
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Then they edit a filter. This one *is* reconcilable, and the pass
+        // that applies it stamps — with the coordinator's config, whose hash
+        // length is the one the index does not have.
+        let mut narrowed = rebuilt.clone();
+        narrowed.indexing.ignore_patterns.push("*.log".into());
+        coord.apply_config(narrowed);
+        wait_for(
+            "the log entry to be pruned",
+            Duration::from_secs(20),
+            || f.file_count() == 1,
+        );
+        std::thread::sleep(Duration::from_millis(500));
+
+        assert_eq!(
+            f.stored_value("hash_length"),
+            Some(built_with),
+            "the recorded hash length still describes the stored hashes, so the \
+             rebuild prompt survives an unrelated prune"
         );
         coord.shutdown();
     }

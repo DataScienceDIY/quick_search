@@ -54,6 +54,8 @@ impl DuplicatesTab {
                         .weak(),
                 );
             }
+            // The spinner and its label are already on the header row above,
+            // so a second progress line here would just repeat them.
             DupState::Loading => {}
             DupState::Error(e) => {
                 ui.colored_label(ui.visuals().error_fg_color, e);

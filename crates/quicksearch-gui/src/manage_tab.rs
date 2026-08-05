@@ -5,11 +5,18 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use quicksearch_core::config::Config;
-use quicksearch_core::coordinator::{IndexMode, IndexerState, WatcherStatus};
-use quicksearch_core::indexing::{IndexingStatus, RootPhase, RootProgress};
+use quicksearch_core::coordinator::{IndexMode, IndexerState, ReconcileState, WatcherStatus};
+use quicksearch_core::indexing::{
+    IndexingStatus, PrepStep, ReconcileProgress, RootPhase, RootProgress,
+};
 
-use crate::format::{fmt_interval, fmt_rate, group_thousands, human_size, middle_truncate};
+use crate::format::{
+    fmt_duration_clock, fmt_interval, fmt_rate, fmt_reconcile_summary, group_thousands, human_size,
+    middle_truncate,
+};
+use crate::tips::{self, Tipped};
 use crate::tracker::SpeedTracker;
+use crate::ui_util::middle_elide;
 
 /// What the tab asks the app to do after this frame.
 #[derive(Default)]
@@ -65,9 +72,13 @@ impl ManageTab {
                 let total: usize = roots.iter().map(|r| r.walked + r.extracted).sum();
                 self.speed.record(total);
             }
-            IndexingStatus::Idle | IndexingStatus::Error(_) | IndexingStatus::Optimizing => {
-                self.speed.reset()
-            }
+            // Preparing included: the prologue has its own counters and no
+            // files to rate, and a stale files/sec left over from the last
+            // run would read as progress that is not happening.
+            IndexingStatus::Idle
+            | IndexingStatus::Error(_)
+            | IndexingStatus::Optimizing
+            | IndexingStatus::Preparing { .. } => self.speed.reset(),
             _ => {}
         }
     }
@@ -202,6 +213,7 @@ impl ManageTab {
                     );
                     if ui
                         .add_enabled(!running, egui::Button::new("Start indexing now"))
+                        .tip(&tips::START_NOW)
                         .clicked()
                     {
                         actions.start_now = true;
@@ -211,10 +223,7 @@ impl ManageTab {
                             running || state.mode == IndexMode::Auto,
                             egui::Button::new("Stop"),
                         )
-                        .on_hover_text(
-                            "Stop indexing and switch to manual. Saved right away: it \
-                         stays manual on the next launch too.",
-                        )
+                        .tip(&tips::STOP_INDEXING)
                         .clicked()
                     {
                         actions.stop = true;
@@ -224,10 +233,7 @@ impl ManageTab {
                             state.mode != IndexMode::Auto,
                             egui::Button::new("Return to Automatic"),
                         )
-                        .on_hover_text(
-                            "Watch for changes and reindex periodically again. Also \
-                         saved, so this is how the app starts from now on.",
-                        )
+                        .tip(&tips::RETURN_TO_AUTO)
                         .clicked()
                     {
                         actions.auto = true;
@@ -243,7 +249,7 @@ impl ManageTab {
                         .button(
                             egui::RichText::new("Clear index…").color(ui.visuals().error_fg_color),
                         )
-                        .on_hover_text("Delete the index database (asks for confirmation)")
+                        .tip(&tips::CLEAR_INDEX)
                         .clicked()
                     {
                         actions.clear_index = true;
@@ -268,7 +274,7 @@ impl ManageTab {
                         // never push them out of view; the path truncates into
                         // whatever width remains (full path on hover).
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Remove").clicked() {
+                            if ui.small_button("Remove").tip(&tips::REMOVE_ROOT).clicked() {
                                 remove = Some(i);
                             }
                             // Per-root walker override; 0 = auto (4 local / 16
@@ -295,11 +301,7 @@ impl ManageTab {
                                             }
                                         }),
                                 )
-                                .on_hover_text(
-                                    "Walker threads for this folder. auto = 4 on local \
-                                 storage, 16 on network mounts. Takes effect on \
-                                 the next indexing run.",
-                                );
+                                .tip(&tips::ROOT_WORKERS);
                             #[cfg(test)]
                             tests::record_widget("workers", &response);
                             if response.changed() {
@@ -316,12 +318,9 @@ impl ManageTab {
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     let font_id = egui::TextStyle::Monospace.resolve(ui.style());
-                                    let char_width =
-                                        ui.fonts(|f| f.glyph_width(&font_id, '0')).max(1.0);
-                                    let budget =
-                                        ((ui.available_width() / char_width) as usize).max(16);
-                                    ui.monospace(middle_truncate(root, budget))
-                                        .on_hover_text(root);
+                                    let shown =
+                                        middle_elide(ui, root, ui.available_width(), &font_id);
+                                    ui.monospace(shown.as_ref()).on_hover_text(root);
                                 },
                             );
                         });
@@ -332,7 +331,7 @@ impl ManageTab {
                     draft.indexing.root_workers.remove(&removed);
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Add folder…").clicked() {
+                    if ui.button("Add folder…").tip(&tips::ADD_ROOT).clicked() {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             let path = dir.to_string_lossy().into_owned();
                             try_add_root(draft, path, &mut self.root_error);
@@ -342,8 +341,11 @@ impl ManageTab {
                         egui::TextEdit::singleline(&mut self.new_root)
                             .desired_width(240.0)
                             .hint_text("or type a path"),
-                    );
-                    if ui.button("Add").clicked() && !self.new_root.trim().is_empty() {
+                    )
+                    .tip(&tips::ADD_ROOT);
+                    if ui.button("Add").tip(&tips::ADD_ROOT).clicked()
+                        && !self.new_root.trim().is_empty()
+                    {
                         let path = self.new_root.trim().to_string();
                         if try_add_root(draft, path, &mut self.root_error) {
                             self.new_root.clear();
@@ -369,7 +371,9 @@ impl ManageTab {
                 // --- Filters ---------------------------------------------------
                 ui.heading(egui::RichText::new("Content filters").strong());
                 ui.columns(2, |cols| {
-                    cols[0].label("Full-text extensions whitelist (empty = all supported):");
+                    cols[0]
+                        .label("Full-text extensions whitelist (empty = all supported):")
+                        .tip(&tips::EXT_WHITELIST);
                     cols[0]
                         .add(
                             egui::TextEdit::multiline(&mut self.ext_filter_text)
@@ -377,15 +381,10 @@ impl ManageTab {
                                 .desired_width(f32::INFINITY)
                                 .hint_text("txt\nmd\npdf  # comments allowed\n(none)"),
                         )
-                        .on_hover_text(
-                            "One extension per line, leading dot optional. A non-empty \
-                             list also excludes files that have no extension at all \
-                             (Makefile, README, .bashrc) — add the line \"(none)\" to \
-                             keep extracting text from those.\n\n\
-                             \"#\" starts a comment, either on its own line or after an \
-                             entry, so a type can be commented out without losing it.",
-                        );
-                    cols[1].label("Ignore patterns (excluded entirely):");
+                        .tip(&tips::EXT_WHITELIST);
+                    cols[1]
+                        .label("Ignore patterns (excluded entirely):")
+                        .tip(&tips::IGNORE_PATTERNS);
                     let mut remove_pat: Option<usize> = None;
                     // The list grows and shrinks — including from outside
                     // this tab — so it is kept off the id of the editor
@@ -425,7 +424,11 @@ impl ManageTab {
                         );
                         let submitted =
                             response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if ui.add_enabled(valid, egui::Button::new("Add")).clicked()
+                        response.tip(&tips::IGNORE_PATTERNS);
+                        if ui
+                            .add_enabled(valid, egui::Button::new("Add"))
+                            .tip(&tips::IGNORE_PATTERNS)
+                            .clicked()
                             || (submitted && valid)
                         {
                             let pat = self.new_ignore.trim().to_string();
@@ -463,14 +466,16 @@ impl ManageTab {
 
                 let dirty = self.is_dirty();
                 ui.horizontal(|ui| {
-                    let apply = ui.add(crate::ui_util::bordered_button(
-                        "Apply & Save",
-                        if dirty {
-                            crate::ui_util::ORANGE
-                        } else {
-                            crate::ui_util::BLUE
-                        },
-                    ));
+                    let apply = ui
+                        .add(crate::ui_util::bordered_button(
+                            "Apply & Save",
+                            if dirty {
+                                crate::ui_util::ORANGE
+                            } else {
+                                crate::ui_util::BLUE
+                            },
+                        ))
+                        .tip(&tips::APPLY_SAVE);
                     #[cfg(test)]
                     tests::record_widget("apply", &apply);
                     // The label comes and goes with the dirty state; keep it
@@ -572,7 +577,7 @@ fn db_size_tooltip(ui: &mut egui::Ui) {
     ui.set_max_width(440.0);
     ui.strong("To reduce the index size");
     for lever in [
-        "Add ignore filters for files and folders you never search — the ignore \
+        "Add ignore filters for files and folders you never search, in the ignore \
          pattern list further down this tab.",
         "Remove indexed folders you do not need, in Indexed folders above.",
         "Narrow the full-text extension whitelist, so text is only extracted \
@@ -588,7 +593,7 @@ fn db_size_tooltip(ui: &mut egui::Ui) {
     ui.label(
         egui::RichText::new(
             "Narrowing any of these removes the entries it excludes straight away, \
-             but the file does not shrink on its own: the freed space is reused by \
+             but the file does not shrink on its own. The freed space is reused by \
              the index rather than returned to the disk, until an indexing run's \
              optimize pass compacts it.",
         )
@@ -682,6 +687,21 @@ fn status_panel(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker) {
 fn status_contents(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker) {
     match &state.activity {
         IndexingStatus::Idle => {
+            // A reconcile the coordinator is applying between runs. No run
+            // owns the index, so the activity really is Idle — but the thread
+            // is scanning every row, which on a large index is minutes of
+            // work that used to be reported as nothing at all.
+            match &state.reconcile {
+                Some(ReconcileState::Running(r)) => return reconcile_row(ui, r, None),
+                // Kept on screen for a few seconds after the work ends: a
+                // narrowed filter on a small index is applied faster than the
+                // display could show it happening.
+                Some(ReconcileState::Finished(r)) => {
+                    ui.label(fmt_reconcile_summary(r.deleted, r.recontented));
+                    return;
+                }
+                None => {}
+            }
             // Relative wording makes even a milliseconds-fast run visibly
             // register ("just now") instead of looking like a dead button.
             let last = state
@@ -689,6 +709,9 @@ fn status_contents(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker
                 .map(crate::format::fmt_ago)
                 .unwrap_or_else(|| "never".to_string());
             ui.label(format!("Idle; last full index: {}", last));
+        }
+        IndexingStatus::Preparing { start_time, step } => {
+            prep_row(ui, step, start_time.elapsed());
         }
         IndexingStatus::Error(e) => {
             ui.colored_label(ui.visuals().error_fg_color, format!("Error: {}", e));
@@ -713,6 +736,99 @@ fn status_contents(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker
                 );
             }
         }
+    }
+}
+
+/// What a run is doing before it walks its first file.
+///
+/// Every one of these can outlast the walk itself on a large index, and they
+/// all used to render as one motionless "Starting…". The elapsed clock is the
+/// point of the row: it is the only thing that distinguishes slow work from a
+/// hang, and it is why each label carries one even when there is nothing to
+/// count.
+fn prep_row(ui: &mut egui::Ui, step: &PrepStep, elapsed: Duration) {
+    match step {
+        PrepStep::PreviousRun => waiting_row(ui, "Finishing the previous run…", elapsed),
+        PrepStep::OpeningIndex => waiting_row(ui, "Opening the index…", elapsed),
+        PrepStep::Reconciling(r) => reconcile_row(ui, r, Some(elapsed)),
+    }
+}
+
+/// A prologue step with no counters: label, clock, indeterminate bar.
+fn waiting_row(ui: &mut egui::Ui, label: &str, elapsed: Duration) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        ui.label(
+            egui::RichText::new(fmt_duration_clock(elapsed))
+                .small()
+                .weak(),
+        );
+        ui.add(
+            egui::ProgressBar::new(0.0)
+                .animate(true)
+                .desired_width(160.0),
+        );
+    });
+}
+
+/// A configuration reconciliation, from either place one runs.
+///
+/// `elapsed` is `Some` for a run's prologue, which has a start time to
+/// measure from; the coordinator's between-runs pass has none, and its
+/// examined count moves often enough to serve the same purpose.
+fn reconcile_row(ui: &mut egui::Ui, r: &ReconcileProgress, elapsed: Option<Duration>) {
+    ui.horizontal(|ui| {
+        ui.label("Applying configuration change");
+        ui.label(egui::RichText::new("|").weak());
+        match (r.total, r.fraction()) {
+            (Some(total), Some(frac)) => {
+                ui.label(format!(
+                    "{} / {} ({:.0}%) entries checked",
+                    group_thousands(r.examined as u64),
+                    group_thousands(total as u64),
+                    frac * 100.0
+                ));
+            }
+            _ => {
+                ui.label(format!(
+                    "{} entries checked",
+                    group_thousands(r.examined as u64)
+                ));
+            }
+        }
+        if let Some(elapsed) = elapsed {
+            ui.label(
+                egui::RichText::new(fmt_duration_clock(elapsed))
+                    .small()
+                    .weak(),
+            );
+        }
+        match r.fraction() {
+            Some(frac) => {
+                ui.add(egui::ProgressBar::new(frac as f32).desired_width(160.0));
+            }
+            // Whole-range deletions read no rows, so they reach the bar with
+            // no denominator — the same indeterminate form a walk uses before
+            // its count lands.
+            None => {
+                ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .animate(true)
+                        .desired_width(160.0),
+                );
+            }
+        }
+    });
+    if r.deleted > 0 || r.recontented > 0 {
+        ui.label(
+            egui::RichText::new(format!(
+                "{} entries removed, {} re-examined for text extraction",
+                group_thousands(r.deleted as u64),
+                group_thousands(r.recontented as u64)
+            ))
+            .small()
+            .weak(),
+        );
     }
 }
 
@@ -830,6 +946,7 @@ mod tests {
             last_full_index: Some(0),
             queued_events: 0,
             watcher: WatcherStatus::Active { dirs: 10 },
+            reconcile: None,
         }
     }
 
@@ -858,26 +975,29 @@ mod tests {
     /// contents — not just their widget ids — are under test.
     fn state_with(roots: Vec<RootProgress>) -> IndexerState {
         IndexerState {
-            mode: IndexMode::Auto,
             activity: IndexingStatus::Running {
                 start_time: std::time::Instant::now(),
                 roots,
             },
-            last_full_index: Some(0),
-            queued_events: 0,
-            watcher: WatcherStatus::Active { dirs: 10 },
+            ..idle_state()
         }
     }
 
-    fn raw_input(events: Vec<egui::Event>) -> egui::RawInput {
-        egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1000.0, 900.0),
-            )),
-            events,
-            ..Default::default()
+    /// A run still in its prologue, before the walk has produced anything.
+    fn preparing_state(step: PrepStep) -> IndexerState {
+        IndexerState {
+            activity: IndexingStatus::Preparing {
+                start_time: std::time::Instant::now(),
+                step,
+            },
+            ..idle_state()
         }
+    }
+
+    use crate::test_ui::{click_at, painted_text};
+
+    fn raw_input(events: Vec<egui::Event>) -> egui::RawInput {
+        crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), events)
     }
 
     /// One frame of the real tab, with `events` delivered to it.
@@ -917,23 +1037,7 @@ mod tests {
                 tab.ui(ui, state, cfg);
             });
         });
-        let mut text = Vec::new();
-        for clipped in &out.shapes {
-            collect_text(&clipped.shape, &mut text);
-        }
-        text
-    }
-
-    fn collect_text(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
-        match shape {
-            egui::epaint::Shape::Text(t) => out.push(t.galley.text().to_string()),
-            egui::epaint::Shape::Vec(shapes) => {
-                for s in shapes {
-                    collect_text(s, out);
-                }
-            }
-            _ => {}
-        }
+        painted_text(&out)
     }
 
     fn pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
@@ -943,14 +1047,6 @@ mod tests {
             pressed,
             modifiers: egui::Modifiers::NONE,
         }
-    }
-
-    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
-        vec![
-            egui::Event::PointerMoved(pos),
-            pointer(pos, true),
-            pointer(pos, false),
-        ]
     }
 
     fn cfg_with_root() -> Config {
@@ -1181,14 +1277,154 @@ mod tests {
         assert!(!text.contains(" / "), "invented a denominator: {}", text);
     }
 
+    /// Every step of the prologue names itself. These used to be one static
+    /// "Starting…" with no clock, which on a large index is indistinguishable
+    /// from a hang for as long as the step takes.
+    #[test]
+    fn each_prologue_step_says_what_it_is_waiting_on() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+
+        for (step, expected) in [
+            (PrepStep::PreviousRun, "Finishing the previous run…"),
+            (PrepStep::OpeningIndex, "Opening the index…"),
+        ] {
+            let text = frame_text(&ctx, &mut tab, &preparing_state(step)).join(" | ");
+            assert!(text.contains(expected), "{}", text);
+            // The clock is the point of the row.
+            assert!(text.contains("0:00"), "no elapsed time shown: {}", text);
+        }
+    }
+
+    /// The reconcile is the long one, and the only prologue step with
+    /// something to count. It reports its position in the scan.
+    #[test]
+    fn a_reconcile_reports_how_far_through_the_index_it_is() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let text = frame_text(
+            &ctx,
+            &mut tab,
+            &preparing_state(PrepStep::Reconciling(ReconcileProgress {
+                examined: 2_500_000,
+                total: Some(8_000_000),
+                deleted: 1_204,
+                recontented: 0,
+            })),
+        )
+        .join(" | ");
+
+        assert!(text.contains("Applying configuration change"), "{}", text);
+        assert!(
+            text.contains("2,500,000 / 8,000,000 (31%) entries checked"),
+            "{}",
+            text
+        );
+        assert!(text.contains("1,204 entries removed"), "{}", text);
+    }
+
+    /// Whole-range deletions read no rows, so the scan can reach the display
+    /// with nothing to divide by. It must not invent a denominator — the same
+    /// rule the walk follows before its count lands.
+    #[test]
+    fn a_reconcile_without_a_row_count_shows_no_denominator() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let text = frame_text(
+            &ctx,
+            &mut tab,
+            &preparing_state(PrepStep::Reconciling(ReconcileProgress::default())),
+        )
+        .join(" | ");
+        assert!(text.contains("0 entries checked"), "{}", text);
+        assert!(!text.contains(" / "), "invented a denominator: {}", text);
+    }
+
+    /// The coordinator applies a prune between runs, so no run owns the index
+    /// and the activity really is `Idle` — but the thread is scanning every
+    /// row of it. Reporting "Idle" for the minutes that takes is what made a
+    /// working app look like a stopped one.
+    #[test]
+    fn a_prune_between_runs_is_reported_instead_of_idle() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let state = IndexerState {
+            reconcile: Some(ReconcileState::Running(ReconcileProgress {
+                examined: 40_000,
+                total: Some(80_000),
+                deleted: 0,
+                recontented: 0,
+            })),
+            ..idle_state()
+        };
+
+        let text = frame_text(&ctx, &mut tab, &state).join(" | ");
+        assert!(
+            text.contains("Applying configuration change"),
+            "the scan is invisible: {}",
+            text
+        );
+        assert!(text.contains("40,000 / 80,000 (50%)"), "{}", text);
+        assert!(
+            !text.contains("Idle; last full index"),
+            "reported idle while scanning: {}",
+            text
+        );
+    }
+
+    /// The pass itself can be over between two frames — narrowing a filter on
+    /// a small index is one transaction. Without a tail the user changes a
+    /// setting, sees nothing move, and has no way to tell whether it took.
+    #[test]
+    fn a_finished_prune_reports_what_it_did() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let state = IndexerState {
+            reconcile: Some(ReconcileState::Finished(ReconcileProgress {
+                examined: 80_000,
+                total: Some(80_000),
+                deleted: 1_204,
+                recontented: 7,
+            })),
+            ..idle_state()
+        };
+
+        let text = frame_text(&ctx, &mut tab, &state).join(" | ");
+        assert!(
+            text.contains("Configuration change applied"),
+            "the finished pass left no trace: {}",
+            text
+        );
+        assert!(text.contains("1,204 entries removed"), "{}", text);
+        assert!(text.contains("7 entries re-examined"), "{}", text);
+        assert!(
+            !text.contains("Idle; last full index"),
+            "the summary was replaced by the idle line: {}",
+            text
+        );
+    }
+
+    /// The placeholder this whole prologue display replaced. It carried no
+    /// phase, no counters and no clock, and it was on screen for every one of
+    /// the steps above.
+    #[test]
+    fn the_starting_placeholder_is_gone() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        for state in [
+            preparing_state(PrepStep::PreviousRun),
+            preparing_state(PrepStep::OpeningIndex),
+            preparing_state(PrepStep::Reconciling(ReconcileProgress::default())),
+            idle_state(),
+        ] {
+            let text = frame_text(&ctx, &mut tab, &state).join(" | ");
+            assert!(!text.contains("Starting"), "{}", text);
+        }
+    }
+
     /// A scratch directory of its own for each size test, so two of them
     /// running in parallel cannot see each other's files.
-    fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("qs-dbsize-{}-{}", std::process::id(), tag));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        dir
-    }
+    use quicksearch_core::testutil::scratch_dir;
 
     fn write_bytes(path: &Path, len: usize) {
         std::fs::write(path, vec![b'x'; len]).expect("write");
@@ -1599,5 +1835,41 @@ mod tests {
             dirty
         );
         assert_eq!(widget("apply").0, clean_id, "the label renamed the button");
+    }
+
+    /// The status area gains a row while a prune runs, another while its
+    /// summary lingers, and loses both afterwards. Every one of those frames
+    /// must leave the widgets below it with the ids they had: an editor whose
+    /// id changes mid-edit loses its buffer, and a prune is exactly when the
+    /// user is looking at the filter list they just changed.
+    #[test]
+    fn the_prune_rows_come_and_go_without_renaming_anything_below() {
+        let ctx = egui::Context::default();
+        let mut tab = ManageTab::new();
+        let cfg = cfg_with_root();
+        let progress = ReconcileProgress {
+            examined: 40_000,
+            total: Some(80_000),
+            deleted: 12,
+            recontented: 0,
+        };
+
+        frame_text_with(&ctx, &mut tab, &cfg, &idle_state());
+        let (apply, _) = widget("apply");
+        let (workers, _) = widget("workers");
+
+        for reconcile in [
+            Some(ReconcileState::Running(progress)),
+            Some(ReconcileState::Finished(progress)),
+            None,
+        ] {
+            let state = IndexerState {
+                reconcile,
+                ..idle_state()
+            };
+            frame_text_with(&ctx, &mut tab, &cfg, &state);
+            assert_eq!(widget("apply").0, apply, "renamed by {reconcile:?}");
+            assert_eq!(widget("workers").0, workers, "renamed by {reconcile:?}");
+        }
     }
 }

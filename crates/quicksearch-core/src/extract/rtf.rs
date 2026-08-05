@@ -58,17 +58,8 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str, body: &[u8]) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "qs-rtf-{}-{}-{}.rtf",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&p, body).unwrap();
+        let p = crate::testutil::scratch_dir(tag).join("sample.rtf");
+        crate::testutil::touch(&p, body);
         p
     }
 
@@ -98,7 +89,13 @@ mod tests {
     fn malformed_input_errors_and_names_the_file() {
         let p = tmp("broken", br"{\rtf1 truncated");
         let err = RtfExtractor.extract(&p).unwrap_err();
-        assert!(err.contains("qs-rtf-broken"), "must name the file: {}", err);
+        // The path itself, not a fixed prefix: this is the message a user sees
+        // in `list-failed`, and it is useless without naming the file.
+        assert!(
+            err.contains(&p.display().to_string()),
+            "must name the file: {}",
+            err
+        );
         std::fs::remove_file(&p).ok();
     }
 

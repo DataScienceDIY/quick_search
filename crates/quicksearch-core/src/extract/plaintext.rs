@@ -124,17 +124,8 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str, body: &[u8]) -> std::path::PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "qs-plaintext-{}-{}-{}.txt",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&p, body).unwrap();
+        let p = crate::testutil::scratch_dir(tag).join("sample.txt");
+        crate::testutil::touch(&p, body);
         p
     }
 

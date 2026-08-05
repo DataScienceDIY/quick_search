@@ -38,6 +38,9 @@ pub enum KeySource {
 
 /// The application shell handed to eframe: locked (unlock screen) or
 /// running (the real app).
+// Exactly one of these exists for the lifetime of the process, and it is
+// already boxed on the side that would matter.
+#[allow(clippy::large_enum_variant)]
 pub enum Gate {
     Locked(UnlockScreen),
     Running(Box<QuickSearchApp>),
@@ -339,12 +342,11 @@ impl UnlockScreen {
     /// UI-side buffers.
     fn submit(&mut self, ctx: &egui::Context) {
         self.error = None;
-        if matches!(self.mode, Mode::Create) {
-            if self.password.is_empty() {
+        if matches!(self.mode, Mode::Create)
+            && self.password.is_empty() {
                 self.error = Some("The password may not be empty.".to_string());
                 return;
             }
-        }
         let Ok(salt) = self.cfg.security.salt_bytes() else {
             return; // BrokenSalt mode never reaches submit
         };
@@ -381,8 +383,10 @@ impl UnlockScreen {
                 // stick. Surface it in the running app's banner.
                 self.config_error = Some(e);
             }
-        } else {
-            keychain::delete_key(&db_path.to_string_lossy());
+        } else if let Err(e) = keychain::delete_key(&db_path.to_string_lossy()) {
+            // Same treatment as the store half above: unlock proceeds, but
+            // the banner says the old key is still on the keychain.
+            self.config_error = Some(e);
         }
         if self.cfg.security.use_keychain != self.remember {
             self.cfg.security.use_keychain = self.remember;
@@ -447,7 +451,12 @@ impl UnlockScreen {
                         if let Err(e) = delete_index_files(&db_path) {
                             self.error = Some(e);
                         } else {
-                            keychain::delete_key(&db_path.to_string_lossy());
+                            // The index files are already gone; a surviving
+                            // entry would point at a database that no longer
+                            // exists. Non-fatal, but not silent.
+                            if let Err(e) = keychain::delete_key(&db_path.to_string_lossy()) {
+                                self.config_error = Some(e);
+                            }
                             db::set_process_key(None);
                             self.cfg.security = SecurityConfig::default();
                             if let Err(e) = self.cfg.save() {
@@ -508,6 +517,9 @@ fn delete_index_files(db_path: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The unlock screen is the whole window, so its viewport is the window's.
+    const SCREEN: egui::Vec2 = egui::vec2(900.0, 600.0);
+
     /// A protected config whose salt parses, so the screen lands in a real
     /// password mode rather than `BrokenSalt`.
     fn locked_config() -> Config {
@@ -522,13 +534,7 @@ mod tests {
     }
 
     fn frame(ctx: &egui::Context, screen: &mut UnlockScreen) {
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(900.0, 600.0),
-            )),
-            ..Default::default()
-        };
+        let input = crate::test_ui::raw_input(SCREEN, Vec::new());
         let _ = ctx.run(input, |ctx| {
             // `update` only builds the app on a successful unlock, which needs
             // a derived key — so with nothing submitted this stays on screen.
@@ -591,13 +597,7 @@ mod tests {
     fn the_lock_screen_shows_the_build_id() {
         let ctx = egui::Context::default();
         let mut screen = UnlockScreen::new(locked_config(), None, None);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(900.0, 600.0),
-            )),
-            ..Default::default()
-        };
+        let input = crate::test_ui::raw_input(SCREEN, Vec::new());
 
         let out = ctx.run(input, |ctx| {
             assert!(screen.update(ctx).is_none());

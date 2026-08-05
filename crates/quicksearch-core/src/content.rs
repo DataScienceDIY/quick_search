@@ -175,11 +175,9 @@ impl ContentPass {
         self.stats.clone()
     }
 
-    /// Join the workers and report whether every one finished cleanly.
-    ///
-    /// The caller needs this for the same reason the walk does: a dead worker
-    /// and a finished worker both close the channel, so from the receiving end
-    /// they are indistinguishable.
+    /// Join the workers and report whether every one finished cleanly. Needed
+    /// for the same reason as [`crate::walk::ParallelWalk::finish`], which
+    /// states it.
     pub fn finish(&mut self) -> bool {
         // Dropping the receiver first releases any worker parked in `send`.
         self.rx = None;
@@ -357,20 +355,9 @@ mod tests {
     use crate::file_handling::{extract_scope_prepare, store_extracted};
     use crate::mime::FileType;
     use std::path::{Path, PathBuf};
-    use std::time::UNIX_EPOCH;
-
+    /// A path that does not exist yet — the caller builds the tree under it.
     fn tmp(tag: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "qs-content-{}-{}-{}",
-            tag,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+        crate::testutil::scratch_dir(tag).join("tree")
     }
 
     /// A tree of `n` text files under `root/sub`, plus an index holding a

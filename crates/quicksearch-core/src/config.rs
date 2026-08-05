@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub paths: PathConfig,
     pub indexing: IndexingConfig,
@@ -192,7 +193,7 @@ impl Default for IndexingConfig {
     fn default() -> Self {
         IndexingConfig {
             auto_index: true,
-            reindex_interval_minutes: 24 * 60,
+            reindex_interval_minutes: 60,
             follow_symlinks: false,
             include_hidden: false,
             content_extensions: Vec::new(),
@@ -293,19 +294,6 @@ impl Default for UiConfig {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            paths: PathConfig::default(),
-            indexing: IndexingConfig::default(),
-            processing: ProcessingConfig::default(),
-            search: SearchConfig::default(),
-            ui: UiConfig::default(),
-            security: SecurityConfig::default(),
-            source: None,
-        }
-    }
-}
 
 /// Directories and files excluded from a fresh index.
 ///
@@ -451,8 +439,10 @@ impl Config {
             cfg.source = Some(path.to_path_buf());
             Ok(cfg)
         } else {
-            let mut cfg = Config::default();
-            cfg.source = Some(path.to_path_buf());
+            let cfg = Config {
+                source: Some(path.to_path_buf()),
+                ..Config::default()
+            };
             cfg.save()?;
             Ok(cfg)
         }
@@ -511,7 +501,7 @@ impl Config {
     }
 
     /// `indexing_paths` with the same resolution rules as
-    /// [`resolved_database_path`].
+    /// [`Config::resolved_database_path`].
     pub fn resolved_indexing_paths(&self) -> Vec<PathBuf> {
         self.paths
             .indexing_paths
@@ -567,11 +557,44 @@ pub fn content_allowed(path: &Path, cfg: &Config) -> bool {
     }
 }
 
+/// Longest name folded without allocating. Comfortably above `NAME_MAX` on the
+/// filesystems that matter (255 bytes), so the heap path is effectively dead
+/// code kept for correctness rather than for use.
+const FOLD_BUF: usize = 256;
+
+/// Whether `pat` is a plain name with no glob syntax in it.
+///
+/// `\` is included even though it is not glob syntax everywhere: a pattern
+/// containing one is routed to the path set rather than the component set, so
+/// treating it as literal here would put it in the wrong place.
+fn is_literal_name(pat: &str) -> bool {
+    !pat.contains(['*', '?', '[', ']', '{', '}', '/', '\\'])
+}
+
 /// Compiled ignore patterns, split by matching scope: patterns without a
 /// path separator match any single path component; the rest match the full
 /// path. Both use glob syntax.
 #[derive(Debug)]
 pub struct IgnoreSet {
+    /// Component patterns that are plain ASCII names — `.git`, `node_modules`,
+    /// `System Volume Information`. Held apart from `component` purely for
+    /// speed, and it is a large difference on Windows.
+    ///
+    /// globset compiles a case-insensitive glob by giving up every fast path it
+    /// has: `Glob::literal`, `ext`, `prefix`, `suffix` and `basename_tokens` all
+    /// return `None` the moment `case_insensitive` is set, so every pattern
+    /// falls through to a `RegexSet` scan. Case-sensitively, `.git` and
+    /// `node_modules` compile to a hash lookup and `*.tmp` to an extension
+    /// lookup. That left Windows — which is case-insensitive *and* carries seven
+    /// extra default patterns — running a 12-pattern regex DFA over every single
+    /// directory entry, where Linux did five hash lookups.
+    ///
+    /// Folded and compared as **ASCII**, matching [`PATH_COLLATION`]'s reasoning
+    /// exactly: SQLite's `NOCASE` and `LIKE` fold ASCII only, so the glob layer
+    /// agreeing with them is what keeps a path filter from disagreeing with the
+    /// ignore rules. Patterns that are not ASCII stay in `component` and keep
+    /// globset's Unicode folding, so nothing that matched before stops matching.
+    literal_components: std::collections::HashSet<String>,
     component: globset::GlobSet,
     path: globset::GlobSet,
     empty: bool,
@@ -579,6 +602,7 @@ pub struct IgnoreSet {
 
 impl IgnoreSet {
     pub fn compile(patterns: &[String]) -> Result<IgnoreSet, String> {
+        let mut literal_components = std::collections::HashSet::new();
         let mut component = globset::GlobSetBuilder::new();
         let mut path = globset::GlobSetBuilder::new();
         for pat in patterns {
@@ -605,6 +629,17 @@ impl IgnoreSet {
             if pat.is_empty() {
                 continue;
             }
+            // A plain ASCII name needs no glob machinery at all — see
+            // `literal_components`. Everything else, including every non-ASCII
+            // pattern, goes on to globset unchanged.
+            if pat.is_ascii() && is_literal_name(pat) {
+                literal_components.insert(if crate::platform::PATHS_ARE_CASE_INSENSITIVE {
+                    pat.to_ascii_lowercase()
+                } else {
+                    pat.to_string()
+                });
+                continue;
+            }
             let glob = globset::GlobBuilder::new(pat)
                 .literal_separator(false)
                 // Match the filesystem's own rules, or `node_modules` fails to
@@ -612,7 +647,7 @@ impl IgnoreSet {
                 // half of Windows compatibility on its own: `Candidate` folds
                 // `\` to `/` when matching, and backslash-as-escape is off
                 // wherever `\` is a separator.
-                .case_insensitive(cfg!(any(windows, target_os = "macos")))
+                .case_insensitive(crate::platform::PATHS_ARE_CASE_INSENSITIVE)
                 .build()
                 .map_err(|e| format!("invalid ignore pattern {:?}: {}", pat, e))?;
             if pat.contains('/') || pat.contains('\\') {
@@ -627,18 +662,54 @@ impl IgnoreSet {
         let path = path
             .build()
             .map_err(|e| format!("compile ignore patterns: {}", e))?;
-        let empty = component.is_empty() && path.is_empty();
+        let empty = literal_components.is_empty() && component.is_empty() && path.is_empty();
         Ok(IgnoreSet {
+            literal_components,
             component,
             path,
             empty,
         })
     }
 
+    /// Whether `name` is one of the plain-name patterns, folded per platform.
+    ///
+    /// Allocation-free for any name that fits [`FOLD_BUF`], which is every name
+    /// a real filesystem can produce. This runs on every directory entry the
+    /// walker sees, so it is the one place in the ignore path worth keeping off
+    /// the heap.
+    fn matches_literal(&self, name: &str) -> bool {
+        if self.literal_components.is_empty() {
+            return false;
+        }
+        if !crate::platform::PATHS_ARE_CASE_INSENSITIVE {
+            return self.literal_components.contains(name);
+        }
+        // Every stored literal is ASCII, and ASCII case folding maps ASCII to
+        // ASCII, so a name containing any non-ASCII byte cannot equal one.
+        if !name.is_ascii() {
+            return false;
+        }
+        if name.len() <= FOLD_BUF {
+            let mut buf = [0u8; FOLD_BUF];
+            let buf = &mut buf[..name.len()];
+            buf.copy_from_slice(name.as_bytes());
+            buf.make_ascii_lowercase();
+            // Lowercasing ASCII yields ASCII, which is always valid UTF-8.
+            let folded = std::str::from_utf8(buf).expect("ascii stays utf-8");
+            return self.literal_components.contains(folded);
+        }
+        self.literal_components.contains(&name.to_ascii_lowercase())
+    }
+
     /// Match a single file/directory name. Used by the walker to prune
     /// subtrees before descending.
     pub fn matches_component(&self, name: &str) -> bool {
-        !self.empty && self.component.is_match(name)
+        if self.empty {
+            return false;
+        }
+        // The literal set answers almost every call — the defaults are all
+        // plain names — and answers it without touching the regex engine.
+        self.matches_literal(name) || self.component.is_match(name)
     }
 
     /// Match a path against the full-path patterns only. The path *and its
@@ -669,9 +740,12 @@ impl IgnoreSet {
         if self.matches_path_pattern(path) {
             return true;
         }
-        path.components().any(|c| {
-            matches!(c, std::path::Component::Normal(name)
-                if self.component.is_match(Path::new(name)))
+        path.components().any(|c| match c {
+            // Routed through `matches_component` rather than `self.component`
+            // directly, or the literal patterns would be invisible here and the
+            // watcher would index what the walker prunes.
+            std::path::Component::Normal(name) => self.matches_component(&name.to_string_lossy()),
+            _ => false,
         })
     }
 
@@ -764,6 +838,42 @@ impl IndexWork {
     pub fn scans_rows(&self) -> bool {
         self.prune_scope || self.reconcile_content || self.restore_text || self.drop_text
     }
+
+    /// The plan in one line, for the log entry that announces the scan.
+    ///
+    /// Names what changed rather than what will happen to the rows: the
+    /// reader is someone asking why a run has not started walking yet, and
+    /// the answer they need is which edit of theirs caused it.
+    pub fn summary(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.drop_roots.is_empty() {
+            parts.push(format!(
+                "{} root(s) no longer indexed",
+                self.drop_roots.len()
+            ));
+        }
+        if self.prune_scope {
+            parts.push("narrowed ignore or hidden-file rules".into());
+        }
+        if self.drop_aliases {
+            parts.push("symlinks no longer followed".into());
+        }
+        if self.reconcile_content {
+            parts.push("changed content extensions".into());
+        }
+        if self.restore_text {
+            parts.push("snippet text turned on".into());
+        }
+        if self.drop_text {
+            parts.push("snippet text turned off".into());
+        }
+        if parts.is_empty() {
+            // `touches_index` is false here, so no caller logs this; a
+            // placeholder beats an empty pair of parentheses if one ever does.
+            return "no stored rows affected".into();
+        }
+        parts.join("; ")
+    }
 }
 
 /// What running services must do after a config edit. Computed by the GUI
@@ -788,8 +898,8 @@ pub struct ConfigActions {
 /// duplicates are reported once). Nested roots are disallowed: with one
 /// walker per root they would race for the same files and split progress
 /// attribution. Comparison is on best-effort canonicalized paths (an
-/// unresolvable root is compared as spelled) and is component-boundary
-/// aware — `/a/bc` is not under `/a/b`.
+/// unresolvable root is compared as spelled), component-wise per
+/// [`crate::file_handling::UnreadableDirs::covers`].
 pub fn nested_roots(roots: &[String]) -> Vec<(String, String)> {
     let resolved: Vec<PathBuf> = roots
         .iter()
@@ -932,17 +1042,7 @@ mod tests {
     use super::*;
 
     fn tmp_dir() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "quicksearch-config-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&p).unwrap();
-        p
+        crate::testutil::scratch_dir("config")
     }
 
     #[test]
@@ -1298,6 +1398,89 @@ mod tests {
         );
     }
 
+    /// Which patterns take the fast path, and that taking it changes nothing
+    /// observable. A plain name is matched whole — never as a prefix, a
+    /// substring or a wildcard — and only its case is allowed to vary.
+    #[test]
+    fn the_literal_fast_path_matches_whole_names_only() {
+        let literal = IgnoreSet::compile(&["node_modules".to_string()]).unwrap();
+        assert!(
+            !literal.literal_components.is_empty(),
+            "a plain name belongs on the fast path"
+        );
+        for globby in ["node_module?", "node_*", "*.tmp", "a[bc]d", "x{1,2}"] {
+            assert!(
+                IgnoreSet::compile(&[globby.to_string()])
+                    .unwrap()
+                    .literal_components
+                    .is_empty(),
+                "{} has glob syntax and must stay with globset",
+                globby
+            );
+        }
+
+        assert!(literal.matches_component("node_modules"));
+        for cased in ["Node_Modules", "NODE_MODULES", "node_moduleS"] {
+            assert_eq!(
+                literal.matches_component(cased),
+                cfg!(any(windows, target_os = "macos")),
+                "only case may vary, and only where the filesystem says so: {}",
+                cased
+            );
+        }
+        for name in [
+            "node_modules_",
+            "_node_modules",
+            "nodemodules",
+            "node_module",
+            "src",
+            "",
+        ] {
+            assert!(
+                !literal.matches_component(name),
+                "{} is not the ignored name",
+                name
+            );
+        }
+    }
+
+    /// A non-ASCII pattern keeps globset's Unicode folding rather than being
+    /// silently downgraded to the ASCII fast path.
+    #[test]
+    fn non_ascii_patterns_stay_on_the_glob_path() {
+        let set = IgnoreSet::compile(&["café".to_string()]).unwrap();
+        assert!(
+            set.literal_components.is_empty(),
+            "a non-ASCII name must not join the ASCII-folded set"
+        );
+        assert!(set.matches_component("café"));
+        assert!(!set.matches_component("cafe"));
+    }
+
+    /// Names longer than the stack fold buffer take the heap path, and must
+    /// come back with the same answer.
+    #[test]
+    fn overlong_names_still_fold_correctly() {
+        let long = "a".repeat(FOLD_BUF + 10);
+        let set = IgnoreSet::compile(std::slice::from_ref(&long)).unwrap();
+        assert!(set.matches_component(&long));
+        assert_eq!(
+            set.matches_component(&long.to_uppercase()),
+            cfg!(any(windows, target_os = "macos"))
+        );
+        assert!(!set.matches_component(&"a".repeat(FOLD_BUF + 9)));
+    }
+
+    /// Watcher events are matched by whole path, and the literal patterns have
+    /// to be visible on that route too — otherwise the watcher indexes exactly
+    /// what the walker prunes and the index churns every cycle.
+    #[test]
+    fn full_path_matching_sees_literal_component_patterns() {
+        let set = IgnoreSet::compile(&["node_modules".to_string()]).unwrap();
+        assert!(set.matches_path(Path::new("/home/me/proj/node_modules/pkg/index.js")));
+        assert!(!set.matches_path(Path::new("/home/me/proj/src/index.js")));
+    }
+
     #[test]
     fn default_ignore_patterns_cover_the_platform() {
         let d = IndexingConfig::default().ignore_patterns;
@@ -1374,8 +1557,10 @@ mod tests {
     fn root_workers_round_trip() {
         let dir = tmp_dir();
         let path = dir.join("config.toml");
-        let mut cfg = Config::default();
-        cfg.source = Some(path.clone());
+        let mut cfg = Config {
+            source: Some(path.clone()),
+            ..Config::default()
+        };
         cfg.paths.indexing_paths = vec!["/data".into(), "/share".into()];
         cfg.indexing.root_workers.insert("/share".into(), 24);
         cfg.save().unwrap();
@@ -1705,8 +1890,10 @@ mod tests {
     fn watch_cap_warned_roots_round_trips() {
         let dir = tmp_dir();
         let path = dir.join("config.toml");
-        let mut cfg = Config::default();
-        cfg.source = Some(path.clone());
+        let mut cfg = Config {
+            source: Some(path.clone()),
+            ..Config::default()
+        };
         cfg.ui.watch_cap_warned_roots =
             vec!["/media/ApolloStore".to_string(), "/media/GSSD".to_string()];
         cfg.save().unwrap();
@@ -1740,8 +1927,10 @@ mod tests {
     fn fuzzy_max_edits_round_trips() {
         let dir = tmp_dir();
         let path = dir.join("config.toml");
-        let mut cfg = Config::default();
-        cfg.source = Some(path.clone());
+        let mut cfg = Config {
+            source: Some(path.clone()),
+            ..Config::default()
+        };
         cfg.search.fuzzy_max_edits = 4;
         cfg.save().unwrap();
 

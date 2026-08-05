@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 
 use quicksearch_core::cli::IndexCounts;
 use quicksearch_core::config::{diff_actions, nested_roots, Config, SecurityConfig};
-use quicksearch_core::coordinator::{IndexMode, IndexerState, WatcherStatus};
+use quicksearch_core::coordinator::{IndexMode, IndexerState, ReconcileState, WatcherStatus};
 use quicksearch_core::db;
-use quicksearch_core::indexing::{overall_progress, ConfigChange, IndexingStatus, RootPhase};
+use quicksearch_core::indexing::{
+    overall_progress, ConfigChange, IndexingStatus, PrepStep, RootPhase,
+};
 use quicksearch_core::search::SearchOptions;
 use quicksearch_core::security::{derive_key, generate_salt, salt_to_hex, IndexKey};
 use quicksearch_core::watcher::WatchError;
@@ -79,6 +81,18 @@ fn guard_source(
     }
 }
 
+/// Whether quitting now needs the "settings are still being applied" warning.
+///
+/// Only a Quit, and only while a reconciliation is actually running: leaving
+/// mid-pass leaves entries the user excluded still in the index until an
+/// indexing run redoes the work, which in manual mode means until they ask for
+/// one. Its own function because it is a rule, not a rendering decision, and
+/// because the guard it belongs to has two entrances — the close request, and
+/// the unsaved-changes prompt resolving to Quit.
+fn quit_needs_reconcile_warning(intent: NavIntent, reconciling: bool) -> bool {
+    intent == NavIntent::Quit && reconciling
+}
+
 pub struct QuickSearchApp {
     cfg: Config,
     backend: Backend,
@@ -103,6 +117,13 @@ pub struct QuickSearchApp {
     /// and the next run will replace it; see
     /// [`QuickSearchApp::stale_index_prompt_ui`].
     stale_index_prompt: bool,
+    /// Set at startup when the index has not caught up with the settings —
+    /// a reconciliation cut short by a previous quit, or a config edited
+    /// while the app was closed. See [`QuickSearchApp::reconcile_owed_ui`].
+    reconcile_owed: bool,
+    /// `last_full_index` as it read at startup; the run that moves it past
+    /// this is the run that clears `reconcile_owed`.
+    reconcile_owed_since: Option<u64>,
     /// Set when the watcher gave up on the directory budget and live
     /// updates are off; see [`QuickSearchApp::check_watch_cap_warning`].
     watch_cap_prompt: Option<WatchError>,
@@ -177,7 +198,20 @@ impl QuickSearchApp {
         let stale_index_prompt =
             db::index_needs_rebuild(&cfg.resolved_database_path().to_string_lossy());
 
+        // Also before the backend, and for the same reason: in automatic mode
+        // the coordinator's first run can reconcile — and clear the answer —
+        // before the first frame is drawn. A missing or unreadable index owes
+        // nothing; it has never been reconciled against anything.
+        let db_path = cfg.resolved_database_path().to_string_lossy().into_owned();
+        let reconcile_owed = quicksearch_core::scope::outstanding_work(&db_path, &cfg)
+            .map(|work| work.touches_index())
+            .unwrap_or(false);
+
         let backend = Backend::start(&cfg, ctx.clone())?;
+        // Read from the coordinator rather than the file: it stamps this at
+        // startup, before its thread can run anything, so it is the same
+        // number the frames below compare against.
+        let reconcile_owed_since = backend.coordinator.state().last_full_index;
         let fuzzy = cfg.search.fuzzy_default;
         // Startup validation: a hand-edited config can nest roots, which
         // per-root pipelines can't accept. Redirect straight to the folder
@@ -208,6 +242,8 @@ impl QuickSearchApp {
             nested_prompt,
             key_source,
             stale_index_prompt,
+            reconcile_owed,
+            reconcile_owed_since,
             watch_cap_prompt: None,
             security_prompt: None,
             pending_nav: None,
@@ -261,8 +297,13 @@ impl QuickSearchApp {
             .watch_cap_warned_roots
             .retain(|root| new.paths.indexing_paths.contains(root));
         let actions = diff_actions(&self.cfg, &new);
+        // A config that could not be written must not take effect either: a
+        // read-only config directory would otherwise apply the settings to
+        // this process, revert them on restart, and — because `is_dirty`
+        // compares against `self.cfg` — show nothing unsaved in between.
         if let Err(e) = new.save() {
             self.config_error = Some(e);
+            return false;
         }
         if (new.ui.scale - self.cfg.ui.scale).abs() > f32::EPSILON {
             ctx.set_zoom_factor(clamp_scale(new.ui.scale));
@@ -321,13 +362,9 @@ impl QuickSearchApp {
 
     fn drain_events(&mut self) {
         // Streamed search results.
-        loop {
-            match self.backend.search_rx.try_recv() {
-                Ok(update) => self
-                    .search
-                    .apply_update(update, self.cfg.search.display_limit),
-                Err(_) => break,
-            }
+        while let Ok(update) = self.backend.search_rx.try_recv() {
+            self.search
+                .apply_update(update, self.cfg.search.display_limit);
         }
         // Status-bar counts worker.
         if let Some(rx) = &self.backend.counts_job {
@@ -430,6 +467,65 @@ impl QuickSearchApp {
         egui::TopBottomPanel::bottom("status-bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 match &state.activity {
+                    // A reconcile the coordinator applies between runs: no run
+                    // holds the index, but it is scanning every row of it —
+                    // and for a moment after, so a pass shorter than a frame
+                    // still leaves a trace.
+                    IndexingStatus::Idle if state.reconcile.is_some() => {
+                        match state.reconcile.expect("matched Some") {
+                            ReconcileState::Running(r) => {
+                                ui.label(
+                                    egui::RichText::new(match (r.total, r.fraction()) {
+                                        (Some(total), Some(frac)) => format!(
+                                            "Applying configuration change · {} / {} ({:.0}%)",
+                                            group_thousands(r.examined as u64),
+                                            group_thousands(total as u64),
+                                            frac * 100.0
+                                        ),
+                                        _ => format!(
+                                            "Applying configuration change · {} entries",
+                                            group_thousands(r.examined as u64)
+                                        ),
+                                    })
+                                    .small(),
+                                );
+                                progress_widget(ui, r.fraction());
+                            }
+                            ReconcileState::Finished(r) => {
+                                ui.label(
+                                    egui::RichText::new(crate::format::fmt_reconcile_summary(
+                                        r.deleted,
+                                        r.recontented,
+                                    ))
+                                    .small(),
+                                );
+                            }
+                        }
+                    }
+                    IndexingStatus::Preparing { start_time, step } => {
+                        let (label, frac) = match step {
+                            PrepStep::PreviousRun => {
+                                ("Finishing the previous run…".to_string(), None)
+                            }
+                            PrepStep::OpeningIndex => ("Opening the index…".to_string(), None),
+                            PrepStep::Reconciling(r) => (
+                                format!(
+                                    "Applying configuration change · {} entries",
+                                    group_thousands(r.examined as u64)
+                                ),
+                                r.fraction(),
+                            ),
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {}",
+                                label,
+                                crate::format::fmt_duration_clock(start_time.elapsed())
+                            ))
+                            .small(),
+                        );
+                        progress_widget(ui, frac);
+                    }
                     IndexingStatus::Idle => {
                         let mode = match state.mode {
                             IndexMode::Auto => "Auto",
@@ -497,14 +593,7 @@ impl QuickSearchApp {
                             text.push_str(&format!(" · {}/{} workers", active, total_workers));
                         }
                         ui.label(egui::RichText::new(text).small());
-                        match frac {
-                            Some(frac) => {
-                                ui.add(egui::ProgressBar::new(frac as f32).desired_width(120.0));
-                            }
-                            None => {
-                                ui.add(egui::Spinner::new().size(12.0));
-                            }
-                        }
+                        progress_widget(ui, frac);
                     }
                 }
 
@@ -525,11 +614,15 @@ impl QuickSearchApp {
             });
         });
 
-        // Keep painting while anything is moving.
+        // Keep painting while anything is moving. The reconcile clause is not
+        // redundant: the coordinator's own pass runs with the activity `Idle`,
+        // so without it the counters would freeze mid-scan until the pointer
+        // moved — and the summary that follows would never age off screen.
         if !matches!(
             state.activity,
             IndexingStatus::Idle | IndexingStatus::Error(_)
-        ) {
+        ) || state.reconcile.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         // Watcher registration walks every root, so its verdict can land
@@ -631,8 +724,12 @@ impl QuickSearchApp {
                             return;
                         }
                     }
-                } else {
-                    keychain::delete_key(&db_path.to_string_lossy());
+                } else if let Err(e) = keychain::delete_key(&db_path.to_string_lossy()) {
+                    // Mirrors the store half: the preference describes what
+                    // is on the keychain, so it must not claim the key is
+                    // gone while it is still there.
+                    self.config_error = Some(e);
+                    return;
                 }
                 self.cfg.security.use_keychain = remember;
                 if let Err(e) = self.cfg.save() {
@@ -823,13 +920,32 @@ impl QuickSearchApp {
                 }
             }
             // Disabling protection, or "remember" off: no stored key may
-            // survive pointing at the previous encryption state.
-            _ => keychain::delete_key(&db_path),
+            // survive pointing at the previous encryption state. A failure
+            // here leaves one that does, which is worth saying out loud.
+            _ => {
+                if let Err(e) = keychain::delete_key(&db_path) {
+                    self.config_error = Some(e);
+                }
+            }
         }
         db::set_process_key(new_key);
         self.backend.coordinator.rebuild_index();
         self.counts = None;
         self.dups.state = DupState::NotLoaded;
+    }
+}
+
+/// The status bar's trailing progress indicator: a bar when the work has a
+/// denominator, a spinner when it does not. One helper so every kind of
+/// activity the bar reports ends the same way.
+fn progress_widget(ui: &mut egui::Ui, fraction: Option<f64>) {
+    match fraction {
+        Some(frac) => {
+            ui.add(egui::ProgressBar::new(frac as f32).desired_width(120.0));
+        }
+        None => {
+            ui.add(egui::Spinner::new().size(12.0));
+        }
     }
 }
 
@@ -896,6 +1012,49 @@ impl QuickSearchApp {
             self.backend.coordinator.rebuild_index();
             self.counts = None;
             self.dups.state = DupState::NotLoaded;
+        }
+    }
+
+    /// Tell the user their settings have not reached the index, and offer the
+    /// one thing that fixes it.
+    ///
+    /// The condition is the index's own record: a reconciliation that finishes
+    /// stamps it, so work still owed means a pass was abandoned — quitting
+    /// during one is the ordinary way — or the config was edited while the app
+    /// was closed. In automatic mode the periodic run clears it without the
+    /// user doing anything, which is why the banner is a line and a button
+    /// rather than a modal; in manual mode nothing happens until they ask.
+    ///
+    /// Held out of the way while a run or a reconcile is in progress: that is
+    /// the work itself, and it can only be answered by waiting.
+    fn reconcile_owed_ui(&mut self, ctx: &egui::Context) {
+        if !self.reconcile_owed {
+            return;
+        }
+        let state = self.backend.coordinator.state();
+        // A completed run is the proof: it reconciles from the same record
+        // and stamps it. A run the user stops does not move this, and the
+        // banner correctly comes back.
+        if state.last_full_index > self.reconcile_owed_since {
+            self.reconcile_owed = false;
+            return;
+        }
+        if !matches!(
+            state.activity,
+            IndexingStatus::Idle | IndexingStatus::Error(_)
+        ) || state.reconcile.is_some()
+        {
+            return;
+        }
+        match reconcile_owed_banner(ctx) {
+            None => {}
+            Some(ReconcileOwedChoice::StartIndexing) => {
+                self.backend.coordinator.reindex_now();
+                // Not cleared here: the run that finishes clears it, and one
+                // that is stopped half-way leaves the reminder standing.
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            Some(ReconcileOwedChoice::Dismiss) => self.reconcile_owed = false,
         }
     }
 
@@ -1020,6 +1179,23 @@ impl QuickSearchApp {
         };
         let dirty = (self.manage.is_dirty(), self.options.is_dirty(&self.cfg));
         let Some(source) = guard_source(intent, dirty.0, dirty.1) else {
+            // Second in line, and inside the guard rather than beside it: the
+            // Discard-then-quit path sets `quit_confirmed` and never returns
+            // to the close-request check, so a warning that lived only there
+            // would be skipped by exactly the user who dirtied an editor.
+            if quit_needs_reconcile_warning(intent, self.backend.coordinator.reconciling()) {
+                // Repaint on its own: a reconcile that ends while the modal is
+                // up should take the modal with it.
+                ctx.request_repaint_after(Duration::from_millis(250));
+                match reconcile_quit_modal(ctx) {
+                    None => return,
+                    Some(false) => {
+                        self.pending_nav = None;
+                        return;
+                    }
+                    Some(true) => {}
+                }
+            }
             return self.complete_nav(ctx, intent);
         };
         match unsaved_changes_modal(ctx, source) {
@@ -1099,6 +1275,11 @@ impl QuickSearchApp {
 
     pub(crate) fn capture_indexing_status(&self) -> IndexingStatus {
         self.backend.coordinator.state().activity
+    }
+
+    /// Let the close request a scripted quit sends through both guards.
+    pub(crate) fn capture_confirm_quit(&mut self) {
+        self.quit_confirmed = true;
     }
 
     pub(crate) fn capture_search_settled(&self) -> bool {
@@ -1182,6 +1363,85 @@ fn unsaved_changes_modal(ctx: &egui::Context, source: UnsavedSource) -> Option<U
     });
     if choice.is_none() && modal.should_close() {
         choice = Some(UnsavedChoice::Cancel);
+    }
+    choice
+}
+
+/// What the user chose in the "settings not applied yet" banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ReconcileOwedChoice {
+    StartIndexing,
+    Dismiss,
+}
+
+/// The banner's body, as a top panel under the config-error one.
+///
+/// A free function for the same reason as [`stale_index_window`]: a test can
+/// render it and click its buttons without a coordinator behind it.
+fn reconcile_owed_banner(ctx: &egui::Context) -> Option<ReconcileOwedChoice> {
+    let mut choice = None;
+    egui::TopBottomPanel::top("reconcile-owed").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "⚠ Your indexing settings have not been applied to the index yet.",
+            );
+            if ui.small_button("Start indexing now").clicked() {
+                choice = Some(ReconcileOwedChoice::StartIndexing);
+            }
+            if ui.small_button("Dismiss").clicked() {
+                choice = Some(ReconcileOwedChoice::Dismiss);
+            }
+        });
+    });
+    choice
+}
+
+/// Body of the quit-during-a-reconcile guard; `Some(true)` to quit anyway,
+/// `Some(false)` to stay. Esc and a backdrop click count as staying.
+///
+/// The same blocking `egui::Modal` the unsaved guard uses, and for the same
+/// reason: this is a decision, not a notice. Quitting is not refused — the
+/// pass is cancellable and the index stays consistent either way — but the
+/// consequence is invisible otherwise, since the entries the user excluded go
+/// on appearing in search results until an indexing run finishes the job.
+fn reconcile_quit_modal(ctx: &egui::Context) -> Option<bool> {
+    let mut choice = None;
+    let modal = egui::Modal::new(egui::Id::new("reconcile-quit-guard")).show(ctx, |ui| {
+        ui.set_max_width(460.0);
+        ui.heading("Settings are still being applied");
+        ui.label(
+            "QuickSearch is still applying your indexing settings to the index. If you \
+             quit now it stops part-way, and entries you excluded can still turn up in \
+             search results.",
+        );
+        ui.add_space(4.0);
+        ui.label(
+            "Nothing is lost: the next indexing run picks the work up again. In manual \
+             mode, choose \"Start indexing now\" on the Manage Index tab after the next \
+             launch.",
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button(egui::RichText::new("Quit anyway").color(ui.visuals().error_fg_color))
+                .clicked()
+            {
+                choice = Some(true);
+            }
+            if ui
+                .add(crate::ui_util::bordered_button(
+                    "Cancel",
+                    crate::ui_util::BLUE,
+                ))
+                .clicked()
+            {
+                choice = Some(false);
+            }
+        });
+    });
+    if choice.is_none() && modal.should_close() {
+        choice = Some(false);
     }
     choice
 }
@@ -1274,7 +1534,12 @@ impl eframe::App for QuickSearchApp {
         // window is gone there is nothing left to ask — and re-sent from
         // `complete_nav` if the user chooses to leave.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quit_confirmed {
-            if self.manage.is_dirty() || self.options.is_dirty(&self.cfg) {
+            // A reconciliation in flight gets the same treatment as an unsaved
+            // editor: hold the close and say what leaving now costs.
+            if self.manage.is_dirty()
+                || self.options.is_dirty(&self.cfg)
+                || self.backend.coordinator.reconciling()
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 // Quitting subsumes any narrower pending navigation.
                 self.pending_nav = Some(NavIntent::Quit);
@@ -1335,6 +1600,7 @@ impl eframe::App for QuickSearchApp {
                 });
             });
         }
+        self.reconcile_owed_ui(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Search => {
@@ -1426,30 +1692,16 @@ mod tests {
     use super::*;
 
     fn frame(ctx: &egui::Context, source: KeySource, events: Vec<egui::Event>) -> bool {
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1000.0, 700.0),
-            )),
-            events,
-            ..Default::default()
-        };
+        let input = crate::test_ui::raw_input(SCREEN, events);
         let mut clicked = false;
         let _ = ctx.run(input, |ctx| clicked = stale_index_window(ctx, source));
         clicked
     }
 
-    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
-        [true, false]
-            .into_iter()
-            .map(|pressed| egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed,
-                modifiers: egui::Modifiers::default(),
-            })
-            .collect()
-    }
+    use crate::test_ui::click_at;
+
+    /// The viewport every modal in this module is centred in.
+    const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
 
     /// The modal the user sees after unlocking onto an index from an older
     /// version. It must render under every key source — each produces a
@@ -1566,14 +1818,7 @@ mod tests {
         source: UnsavedSource,
         events: Vec<egui::Event>,
     ) -> Option<UnsavedChoice> {
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1000.0, 700.0),
-            )),
-            events,
-            ..Default::default()
-        };
+        let input = crate::test_ui::raw_input(SCREEN, events);
         let mut choice = None;
         let _ = ctx.run(input, |ctx| choice = unsaved_changes_modal(ctx, source));
         choice
@@ -1626,5 +1871,99 @@ mod tests {
             );
             assert_eq!(esc, Some(UnsavedChoice::Cancel), "Esc must cancel");
         }
+    }
+
+    /// Quitting mid-reconcile is the one case that needs saying out loud: the
+    /// index is left describing settings the user has already changed, and in
+    /// manual mode nothing fixes that until they ask for a run. Nothing else
+    /// warrants the prompt — a tab switch does not end the pass, and a quit
+    /// with no pass running has nothing to warn about.
+    #[test]
+    fn only_quitting_during_a_reconcile_warns() {
+        use NavIntent::*;
+        assert!(quit_needs_reconcile_warning(Quit, true));
+        assert!(!quit_needs_reconcile_warning(Quit, false));
+        assert!(!quit_needs_reconcile_warning(SwitchTab(Tab::Search), true));
+        assert!(!quit_needs_reconcile_warning(CloseOptions, true));
+    }
+
+    fn reconcile_modal_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> Option<bool> {
+        let input = crate::test_ui::raw_input(SCREEN, events);
+        let mut choice = None;
+        let _ = ctx.run(input, |ctx| choice = reconcile_quit_modal(ctx));
+        choice
+    }
+
+    /// Both ways out of the quit warning work, and neither is the default: a
+    /// modal whose "Quit anyway" did nothing would trap the user in an app
+    /// they asked to close, and one that quit on Esc would make the warning
+    /// pointless.
+    #[test]
+    fn the_quit_warning_reports_both_answers() {
+        let ctx = egui::Context::default();
+        assert_eq!(
+            reconcile_modal_frame(&ctx, Vec::new()),
+            None,
+            "an untouched frame must not decide"
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for y in (250..450).step_by(3) {
+            for x in (250..760).step_by(6) {
+                if let Some(choice) =
+                    reconcile_modal_frame(&ctx, click_at(egui::pos2(x as f32, y as f32)))
+                {
+                    seen.insert(choice);
+                }
+            }
+        }
+        assert!(seen.contains(&true), "\"Quit anyway\" never fired");
+        assert!(seen.contains(&false), "Cancel never fired");
+
+        let esc = reconcile_modal_frame(
+            &ctx,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(esc, Some(false), "Esc must keep the app open");
+    }
+
+    fn banner_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> Option<ReconcileOwedChoice> {
+        let input = crate::test_ui::raw_input(SCREEN, events);
+        let mut choice = None;
+        let _ = ctx.run(input, |ctx| choice = reconcile_owed_banner(ctx));
+        choice
+    }
+
+    /// The reminder a quit mid-prune leaves behind. Its Start button is the
+    /// whole point — the banner exists because in manual mode nothing else
+    /// will finish the work — and Dismiss must not be the only live control.
+    #[test]
+    fn the_reconcile_banner_reports_both_buttons() {
+        let ctx = egui::Context::default();
+        assert_eq!(banner_frame(&ctx, Vec::new()), None);
+
+        let mut seen = std::collections::HashSet::new();
+        // A top panel, so it sits in the first rows of the window.
+        for y in (0..60).step_by(2) {
+            for x in (0..1000).step_by(4) {
+                if let Some(choice) = banner_frame(&ctx, click_at(egui::pos2(x as f32, y as f32))) {
+                    seen.insert(choice);
+                }
+            }
+        }
+        assert!(
+            seen.contains(&ReconcileOwedChoice::StartIndexing),
+            "\"Start indexing now\" never fired"
+        );
+        assert!(
+            seen.contains(&ReconcileOwedChoice::Dismiss),
+            "Dismiss never fired"
+        );
     }
 }
