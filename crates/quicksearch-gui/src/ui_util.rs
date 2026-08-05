@@ -255,23 +255,7 @@ mod tests {
         ignore_pattern_valid, middle_elide, pattern_border, pattern_hint, Cow, INVALID_RED,
         VALID_GREEN,
     };
-
-    /// A `Ui` from a real (headless) egui pass, so `middle_elide` measures
-    /// with the same fonts the app paints with — the whole point of the
-    /// helper is that its arithmetic agrees with egui's layout.
-    fn with_ui<R>(f: impl FnOnce(&mut egui::Ui) -> R) -> R {
-        let ctx = egui::Context::default();
-        let mut f = Some(f);
-        let mut out = None;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                if let Some(f) = f.take() {
-                    out = Some(f(ui));
-                }
-            });
-        });
-        out.expect("the central panel ran")
-    }
+    use crate::test_ui::with_ui;
 
     fn body_font(ui: &egui::Ui) -> egui::FontId {
         egui::TextStyle::Body.resolve(ui.style())

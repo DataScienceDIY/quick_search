@@ -49,8 +49,12 @@ chardetng = "1.0"
 # RTF text extraction. Pure Rust; with the default `jsbindings` feature off
 # (it exists for the crate's WASM build) it depends only on serde.
 rtf-parser = { version = "0.4", default-features = false }
+# `lopdf` is deliberately NOT declared here. `pdf-extract` re-exports it
+# (`pub use lopdf::*`), and `extract/pdf.rs` reaches it that way. Naming it
+# directly resolves a *second*, older copy alongside pdf-extract's — which is
+# what used to make every PDF parse twice, and what pulled in rayon (whose
+# global thread pool is never torn down), chrono, time, md5 and a second nom.
 pdf-extract = "0.12"
-lopdf = "0.32"
 lofty = "0.19"
 kamadak-exif = "0.5"
 notify = "6.1"

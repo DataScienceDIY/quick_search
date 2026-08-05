@@ -23,6 +23,36 @@ pub use open::{
     CURRENT_SCHEMA_VERSION, KEY_MISMATCH_PREFIX,
 };
 
+/// Bumped whenever the index file is replaced rather than modified.
+///
+/// Process-wide, like [`key::process_key`], and for the same reason: it is a
+/// fact about the index this process is working with, not about any one
+/// connection to it.
+///
+/// Anything holding a connection open across operations needs to know that the
+/// file underneath it has been swapped, and the path cannot tell it — a
+/// rebuild and a clear both put a *new* file at the *same* path. A connection
+/// that missed the change keeps serving the deleted inode: stale results, and
+/// on Linux the old file's blocks stay allocated for as long as the handle
+/// lives. [`crate::search`] is the only long-lived reader today; it compares
+/// this against the value it opened with.
+static INDEX_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current index generation. See [`INDEX_EPOCH`].
+pub fn index_epoch() -> u64 {
+    INDEX_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Declare that the index file has been replaced.
+///
+/// Called from [`open::open_or_recreate`]'s wipe path — the one place a wipe
+/// actually happens, so a schema drift nobody asked for cannot slip past —
+/// and from the coordinator's explicit rebuild and clear commands, which
+/// delete the file without going through it.
+pub fn bump_index_epoch() {
+    INDEX_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// A shared slot holding the interrupt handle of whatever long statement is
 /// running, so another thread can cut it short.
 ///

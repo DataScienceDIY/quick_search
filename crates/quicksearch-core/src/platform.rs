@@ -9,6 +9,12 @@
 //! - Anything that can be decided from a string rather than a syscall is
 //!   split out and made testable everywhere ([`is_unc_string`],
 //!   [`PATH_COLLATION`]), because the test suite runs on Linux.
+//!
+//! Beyond filesystem and path semantics, this is also where the process's
+//! dealings with its own allocator and threads live — [`release_free_heap`]
+//! and [`heap_stats`], which are glibc-only, and [`spawn_worker`], which puts
+//! the run's worker stack size in one place. They are here for the same reason
+//! everything else is: they are `#[cfg]`, and `#[cfg]` lives here.
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -532,6 +538,106 @@ pub fn set_background_priority() {
     // whole process, so it would hit the GUI. The right call is
     // `pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0)`, which is worth
     // adding on its own terms rather than approximating here.
+}
+
+/// Stack size for the per-run worker threads spawned by [`spawn_worker`].
+///
+/// Rust's default is 8 MiB of *reserved* address space, of which only touched
+/// pages become resident — so on its own the default costs nothing much. What
+/// costs is that glibc **caches freed thread stacks** rather than unmapping
+/// them (`stack_cache_maxsize`, 40 MiB by default) and a cached stack keeps
+/// its dirty pages. A run spawns walk and extraction workers per root, so the
+/// pages those threads touched outlive them and sit in that cache for the life
+/// of the process.
+///
+/// 512 KiB is ample for what these threads actually do: bounded loops over a
+/// directory's entries and over a batch of rows. The one thing here that
+/// recurses on untrusted input is document parsing — OLE2 compound files and
+/// zip/XML containers — and that runs on extraction workers, so if a malformed
+/// document ever overflows this it should be raised rather than reverted, and
+/// the parser given a depth limit.
+const WORKER_STACK_SIZE: usize = 512 * 1024;
+
+/// Spawn one of a run's short-lived worker threads.
+///
+/// Exists to put [`WORKER_STACK_SIZE`] in one place rather than at each of the
+/// four spawn sites, and to name the threads while it is at it — `qs-walk`,
+/// `qs-extract` and friends show up in `top -H` and in a debugger, which the
+/// anonymous `thread::spawn` versions did not.
+///
+/// Panics if the thread cannot be spawned, exactly as `thread::spawn` does: a
+/// run that cannot start its workers has nothing to fall back to.
+pub fn spawn_worker<F, T>(name: &str, f: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(WORKER_STACK_SIZE)
+        .spawn(f)
+        .expect("spawn worker thread")
+}
+
+/// Return free heap pages to the kernel.
+///
+/// glibc's `free` returns a chunk to its arena's free list, not to the OS —
+/// only the top of an arena is ever trimmed, and only past `M_TRIM_THRESHOLD`.
+/// So a transient peak stays in RSS for the life of the process even though
+/// nothing is using it. Indexing peaks around 200 MiB above baseline on a
+/// large root (see `examples/memprobe.rs`), and a full-table scan fills a
+/// connection's SQLite page cache with 4 KiB allocations that are individually
+/// far below the mmap threshold — both land in an arena and stay there. This
+/// is what gives them back.
+///
+/// Process-wide despite being one call: `malloc_trim(0)` walks *every* arena,
+/// so calling it on the coordinator's thread also reclaims what the search
+/// worker and the finished indexing threads left behind. That is why there are
+/// only two call sites rather than one per subsystem — and why it must not go
+/// anywhere hot, since the walk plus the `madvise` per free page costs
+/// milliseconds on a large heap.
+///
+/// Best-effort and idempotent, like [`set_background_priority`]: a refusal
+/// means only that the memory stays where it was.
+pub fn release_free_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: no arguments, no pointers, and safe to call from any thread
+        // at any time — glibc takes the arena locks itself.
+        unsafe { libc::malloc_trim(0) };
+    }
+    // Elsewhere: deliberately nothing. `malloc_trim` is a glibc extension —
+    // musl has no equivalent and does not need one (its allocator returns
+    // spans to the kernel on free), and the Windows CRT heap has
+    // `_heapmin`, which is worth adding on its own terms if Windows RSS ever
+    // proves to be a problem rather than assuming it behaves like glibc.
+}
+
+/// Live and free-but-retained heap bytes, as `(in_use, free)`.
+///
+/// The gap between the two *is* the retention this module's
+/// [`release_free_heap`] exists to close: `in_use` is memory something still
+/// holds, `free` is memory the program has already given back to the allocator
+/// and which glibc is nonetheless still charging the process for. A large
+/// `free` immediately after a trim is the signal that `malloc_trim` cannot
+/// reach the fragmentation and a different allocator is the answer.
+///
+/// `None` where the platform has no way to answer.
+pub fn heap_stats() -> Option<(u64, u64)> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // `mallinfo2`, not `mallinfo`: the older struct is `int`-typed and
+        // silently wraps past 2 GiB, which is exactly the size where the
+        // answer starts to matter.
+        //
+        // SAFETY: no arguments, returns a plain struct by value.
+        let info = unsafe { libc::mallinfo2() };
+        Some((info.uordblks as u64, info.fordblks as u64))
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        None
+    }
 }
 
 /// How long to keep retrying a delete that fails because something else holds

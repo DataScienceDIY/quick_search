@@ -4,10 +4,16 @@
 //! searches stream over an mpsc receiver drained each frame, indexing
 //! state is polled, and the duplicates query runs on a throwaway worker
 //! thread. Core threads wake the UI through `ctx.request_repaint()`.
+//!
+//! The duplicates scan is the *only* throwaway thread left here, and it fires
+//! on a user action rather than a timer. The status bar's file count used to
+//! spawn one every five seconds, each opening its own connection — a page
+//! cache and a fresh allocator arena per refresh, neither of which glibc gives
+//! back. It now rides on `IndexerState`, published by the coordinator off the
+//! connection it already holds.
 
 use std::sync::{mpsc, Arc};
 
-use quicksearch_core::cli::IndexCounts;
 use quicksearch_core::config::Config;
 use quicksearch_core::coordinator::IndexCoordinator;
 use quicksearch_core::search::{DuplicateGroup, SearchService, SearchUpdate};
@@ -18,8 +24,6 @@ pub struct Backend {
     pub search: Option<SearchService>,
     pub search_rx: mpsc::Receiver<SearchUpdate>,
     pub dup_job: Option<mpsc::Receiver<Result<Vec<DuplicateGroup>, String>>>,
-    /// In-flight status-bar count; see [`Backend::start_index_counts`].
-    pub counts_job: Option<mpsc::Receiver<IndexCounts>>,
 }
 
 impl Backend {
@@ -40,33 +44,7 @@ impl Backend {
             search: Some(search),
             search_rx,
             dup_job: None,
-            counts_job: None,
         })
-    }
-
-    /// Refresh the status bar's "N files indexed" on a worker thread.
-    ///
-    /// Three `COUNT(*)` scans, and on a multi-million-row index the unfiltered
-    /// one alone reads the whole primary key. Running it inline in `update()`
-    /// froze a frame every refresh for a number that is purely decorative — so
-    /// it goes the same way the duplicates scan does. No-op while one is
-    /// already in flight.
-    pub fn start_index_counts(&mut self, config: &Config, ctx: egui::Context) {
-        if self.counts_job.is_some() {
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        let db = config.resolved_database_path();
-        std::thread::spawn(move || {
-            // A missing or unreadable index is not worth reporting here: the
-            // status bar has nothing useful to say about it that the indexing
-            // state does not already say.
-            if let Ok(counts) = quicksearch_core::cli::index_counts(&db.to_string_lossy()) {
-                let _ = tx.send(counts);
-            }
-            ctx.request_repaint();
-        });
-        self.counts_job = Some(rx);
     }
 
     pub fn search(&self) -> &SearchService {

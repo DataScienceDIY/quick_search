@@ -29,7 +29,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::UNIX_EPOCH;
 
 use sha2::{Digest, Sha256};
@@ -1170,7 +1170,7 @@ pub fn walk_indexable_files(
     let handles = (0..threads)
         .map(|_| {
             let (shared, ctx, tx) = (shared.clone(), ctx.clone(), tx.clone());
-            thread::spawn(move || {
+            crate::platform::spawn_worker("qs-walk", move || {
                 // Walker threads are the bulk of a run's CPU and I/O; the
                 // foreground must stay ahead of them.
                 crate::platform::set_background_priority();
@@ -1185,7 +1185,7 @@ pub fn walk_indexable_files(
 
     let prefetch = {
         let (shared, db_path) = (shared.clone(), db_path.to_string());
-        thread::spawn(move || {
+        crate::platform::spawn_worker("qs-prefetch", move || {
             crate::platform::set_background_priority();
             prefetcher(&shared, &db_path)
         })

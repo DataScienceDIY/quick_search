@@ -974,29 +974,147 @@ fn snippet_formats(ui: &egui::Ui) -> SnippetFormats {
     }
 }
 
+/// The mark on a snippet that starts partway into its window. Named because
+/// `first_visible_byte` has to pay for its width in advance.
+const SNIPPET_LEAD: &str = "… ";
+
+/// Append `window[range]` to `job`, highlighting whatever parts of `ranges`
+/// (byte offsets into `window`) fall inside it.
+///
+/// Shared by the one-line Match cell and the multi-row hover and preview
+/// jobs: all three paint a sub-slice of one window with the same highlights,
+/// and clipping a range against a slice is exactly the sort of off-by-one
+/// that gets fixed in one of two copies.
+fn append_marked(
+    job: &mut LayoutJob,
+    fmt: &SnippetFormats,
+    window: &str,
+    ranges: &[(usize, usize)],
+    range: std::ops::Range<usize>,
+) {
+    let mut cursor = range.start;
+    for &(a, b) in ranges {
+        let (a, b) = (a.max(range.start), b.min(range.end));
+        if a >= b {
+            continue; // wholly before or after the slice
+        }
+        if a > cursor {
+            job.append(&window[cursor..a], 0.0, fmt.normal.clone());
+        }
+        job.append(&window[a..b], 0.0, fmt.highlight.clone());
+        cursor = b;
+    }
+    if cursor < range.end {
+        job.append(&window[cursor..range.end], 0.0, fmt.normal.clone());
+    }
+}
+
+/// The byte offset in `snip.window` that rendering has to start at for the
+/// first match to land on a row that survives `max_rows`. `0` — render the
+/// whole window — whenever it already does, which is the usual case.
+///
+/// epaint lays a job out row by row and simply stops at `wrap.max_rows`, and
+/// *every* `\n` costs a row, blank line or not. A snippet window opens a
+/// third of its byte budget ahead of the hit, so a couple of hundred bytes of
+/// ragged lead-in — indented code, a run of blank lines — spends the whole
+/// row budget before layout reaches the match, and the mouseover ends up
+/// showing context with nothing in it to be context *for*.
+///
+/// The row is measured rather than estimated from a character budget: with a
+/// proportional font and word wrapping, characters-per-row is wrong in both
+/// directions (`ui_util::middle_elide` documents the same lesson), and an
+/// estimate would have to re-derive what epaint already knows about tabs
+/// (four spaces wide), `\r` (invisible) and empty paragraphs. The probe is
+/// one more galley, memoized by job hash, for the one hovered row per frame.
+fn first_visible_byte(
+    ui: &egui::Ui,
+    snip: &Snippet,
+    fmt: &SnippetFormats,
+    max_rows: usize,
+    wrap_width: f32,
+) -> usize {
+    let Some(&(match_start, _)) = snip.ranges.first() else {
+        return 0; // a head-of-file window, with nothing to keep on screen
+    };
+
+    // The rendered job pays for a leading mark this probe does not, so the
+    // probe wraps to a narrower width — a point narrower still, since epaint
+    // rounds `wrap.max_width` before laying out. Every rendered row then
+    // holds at least what the probe row starting at the same character held,
+    // so the match cannot drift *down* a row when the job is rebuilt.
+    let lead_width = ui.fonts(|f| {
+        SNIPPET_LEAD
+            .chars()
+            .map(|c| f.glyph_width(&fmt.normal.font_id, c))
+            .sum::<f32>()
+    });
+    let mut probe = LayoutJob::default();
+    probe.wrap.max_width = (wrap_width - lead_width - 1.0).max(1.0);
+    probe.append(&snip.window, 0.0, fmt.normal.clone());
+    let galley = ui.fonts(|f| f.layout_job(probe));
+
+    // Cursors index characters; snippet ranges are byte offsets. epaint
+    // counts the `\n` that ends a row, so the two spaces line up 1:1.
+    let cursor = egui::text::CCursor {
+        index: snip.window[..match_start].chars().count(),
+        // At a wrap, the character belongs to the row it is drawn on, not
+        // the one it was pushed off.
+        prefer_next_row: true,
+    };
+    let match_row = galley.layout_from_cursor(cursor).row;
+
+    // epaint trades a glyph or two off the end of the last visible row for
+    // its own overflow ellipsis, so a match sitting there only counts as
+    // visible when there was nothing below it to elide in the first place.
+    let visible_rows = if galley.rows.len() > max_rows {
+        max_rows.saturating_sub(1)
+    } else {
+        max_rows
+    };
+    if match_row < visible_rows {
+        return 0;
+    }
+
+    // Keep a third of the budget as lead-in so the hit is not pinned to the
+    // top edge — the same shape as the window `snippet::extract` picks. The
+    // two-row preview strip keeps none, and starts on the match's own row.
+    let mut cursor = cursor;
+    for _ in 0..max_rows / 3 {
+        // `Some(0.0)` asks for the row above, not the character above.
+        cursor = galley.cursor_up_one_row(&cursor, Some(0.0)).0;
+    }
+    let start_char = galley.cursor_begin_of_row(&cursor).index;
+    snip.window
+        .char_indices()
+        .nth(start_char)
+        .map_or(snip.window.len(), |(i, _)| i)
+}
+
 /// Build a highlighted snippet LayoutJob from byte ranges, wrapped to at
-/// most `max_rows`. Cheap enough to run per visible row per frame.
+/// most `max_rows` and started far enough into the window that the first
+/// match survives the cap. Cheap enough to run per visible row per frame.
 fn snippet_job(ui: &egui::Ui, snip: &Snippet, max_rows: usize) -> LayoutJob {
     let fmt = snippet_formats(ui);
+    // The width `ui.label` is about to wrap this job to: in a top-down `Ui`
+    // it overwrites `wrap.max_width` with exactly `ui.available_width()`.
+    // Setting it here anyway is what lets `first_visible_byte` — and a test —
+    // lay the job out and see the rows the user will see.
+    let wrap_width = ui.available_width();
+    let start = first_visible_byte(ui, snip, &fmt, max_rows, wrap_width);
+
     let mut job = LayoutJob::default();
+    job.wrap.max_width = wrap_width;
     job.wrap.max_rows = max_rows;
-    if max_rows == 1 {
-        job.wrap.break_anywhere = true;
+    if start > 0 || snip.truncated_start {
+        job.append(SNIPPET_LEAD, 0.0, fmt.weak.clone());
     }
-    if snip.truncated_start {
-        job.append("… ", 0.0, fmt.weak.clone());
-    }
-    let mut cursor = 0;
-    for &(start, end) in &snip.ranges {
-        if start > cursor {
-            job.append(&snip.window[cursor..start], 0.0, fmt.normal.clone());
-        }
-        job.append(&snip.window[start..end], 0.0, fmt.highlight.clone());
-        cursor = end;
-    }
-    if cursor < snip.window.len() {
-        job.append(&snip.window[cursor..], 0.0, fmt.normal.clone());
-    }
+    append_marked(
+        &mut job,
+        &fmt,
+        &snip.window,
+        &snip.ranges,
+        start..snip.window.len(),
+    );
     if snip.truncated_end {
         job.append(" …", 0.0, fmt.weak);
     }
@@ -1014,12 +1132,6 @@ fn centered_match_job(
     whole_field: bool,
 ) -> LayoutJob {
     let fmt = snippet_formats(ui);
-    let font_id = egui::TextStyle::Body.resolve(ui.style());
-    let char_width = ui.fonts(|f| f.glyph_width(&font_id, '0')).max(1.0);
-    let mut budget = ((width_px / char_width) as usize).saturating_sub(2).max(8);
-    if whole_field {
-        budget = budget.saturating_sub(2); // room for the brackets
-    }
 
     // Newlines force line breaks even in a one-row LayoutJob, wrecking the
     // centered single-line cell. Flatten them to spaces — a byte-for-byte
@@ -1033,76 +1145,140 @@ fn centered_match_job(
         .contains(['\n', '\r', '\t'])
         .then(|| snip.window.replace(['\n', '\r', '\t'], " "));
     let window = flattened.as_deref().unwrap_or(&snip.window);
-    let (start, end) = match snip.ranges.first().copied() {
-        Some((a, b)) => {
-            let match_chars = window[a..b].chars().count();
-            let side = budget.saturating_sub(match_chars) / 2;
-            let before = &window[..a];
-            let after = &window[b..];
-            let before_count = before.chars().count();
-            let after_count = after.chars().count();
-            // Equal context on both sides; leftover budget from a short
-            // side flows to the other.
-            let take_before = (side + side.saturating_sub(after_count)).min(before_count);
-            let take_after = (side + side.saturating_sub(before_count)).min(after_count);
-            let start = if take_before == 0 {
-                a
-            } else {
-                before
-                    .char_indices()
-                    .nth_back(take_before - 1)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            };
-            let end = b + after
-                .char_indices()
-                .nth(take_after)
-                .map(|(i, _)| i)
-                .unwrap_or(after.len());
-            (start, end)
+
+    // The budget is in pixels, summed from the font's own glyph advances,
+    // because nothing else is holding this cell inside its column: the
+    // centered-and-justified layout puts egui in Extend mode, which lays the
+    // job out at infinite width, and `Column::clip` then trims a *centered*
+    // overflow from both ends at once — silently, and taking the highlighted
+    // match with it. A character count scaled by one sample glyph overshoots
+    // by a quarter of the column on ordinary text.
+    let (start, end, decorate) = ui.fonts(|f| {
+        let font_id = &fmt.normal.font_id;
+        let width_of = |c: char| f.glyph_width(font_id, c);
+        let ellipsis = width_of('…');
+        let brackets = if whole_field {
+            width_of('[') + width_of(']')
+        } else {
+            0.0
+        };
+        let mut marks = 0.0;
+        if snip.truncated_start {
+            marks += ellipsis;
         }
-        None => {
+        if snip.truncated_end {
+            marks += ellipsis;
+        }
+        if fits_within(window, width_px - brackets - marks, width_of) {
+            return (0, window.len(), true);
+        }
+
+        // Something has to go, so either end may gain a mark. Reserving for
+        // a cut that does not happen costs a few points of context; missing
+        // one overflows the column, which is the failure with no mark to
+        // show for it.
+        let budget = width_px - brackets - 2.0 * ellipsis;
+        let Some(&(a, b)) = snip.ranges.first() else {
             // No ranges (shouldn't happen for match cells) — head trim.
-            let end = window
-                .char_indices()
-                .nth(budget)
-                .map(|(i, _)| i)
-                .unwrap_or(window.len());
-            (0, end)
+            return (0, take_forward(window, 0, budget.max(0.0), width_of), true);
+        };
+        if budget <= 0.0 {
+            // A column narrower than its own punctuation. Spend every point
+            // on the hit and drop the decoration: the table's 120pt floor
+            // keeps this out of reach, but a cell that overflows is clipped
+            // from both ends without a mark to say so, which is the whole
+            // failure this budget exists to prevent.
+            return (a, take_forward(window, a, width_px, width_of), false);
         }
-    };
+        if !fits_within(&window[a..b], budget, width_of) {
+            // A hit wider than the whole column — a greedy regex or wildcard
+            // match. Its beginning is the part that has to survive.
+            return (a, take_forward(window, a, budget, width_of), true);
+        }
+        let match_w: f32 = window[a..b].chars().map(width_of).sum();
+
+        // Equal context on both sides, grown outward one character at a
+        // time; whichever side is currently narrower is fed first, so the
+        // leftover from a short side flows to the other.
+        let (mut start, mut end) = (a, b);
+        let (mut before_w, mut after_w) = (0.0f32, 0.0f32);
+        loop {
+            let prev = window[..start].chars().next_back();
+            let next = window[end..].chars().next();
+            let used = before_w + match_w + after_w;
+            let prev_fits = prev.is_some_and(|c| used + width_of(c) <= budget);
+            let next_fits = next.is_some_and(|c| used + width_of(c) <= budget);
+            if !prev_fits && !next_fits {
+                break;
+            }
+            // The preferred side wins when it fits; otherwise the other one
+            // does, since at least one of them just did.
+            let take_prev = if before_w <= after_w {
+                prev_fits
+            } else {
+                !next_fits
+            };
+            if take_prev {
+                let c = prev.expect("prev_fits");
+                start -= c.len_utf8();
+                before_w += width_of(c);
+            } else {
+                let c = next.expect("next_fits");
+                end += c.len_utf8();
+                after_w += width_of(c);
+            }
+        }
+        (start, end, true)
+    });
 
     let mut job = LayoutJob::default();
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
-    if whole_field {
+    if whole_field && decorate {
         job.append("[", 0.0, fmt.weak.clone());
     }
-    if start > 0 || snip.truncated_start {
+    if decorate && (start > 0 || snip.truncated_start) {
         job.append("…", 0.0, fmt.weak.clone());
     }
-    let mut cursor = start;
-    for &(a, b) in &snip.ranges {
-        let (a, b) = (a.max(start), b.min(end));
-        if a >= b || a >= end {
-            continue;
-        }
-        if a > cursor {
-            job.append(&window[cursor..a], 0.0, fmt.normal.clone());
-        }
-        job.append(&window[a..b], 0.0, fmt.highlight.clone());
-        cursor = b;
-    }
-    if cursor < end {
-        job.append(&window[cursor..end], 0.0, fmt.normal.clone());
-    }
-    if end < window.len() || snip.truncated_end {
+    append_marked(&mut job, &fmt, window, &snip.ranges, start..end);
+    if decorate && (end < window.len() || snip.truncated_end) {
         job.append("…", 0.0, fmt.weak.clone());
     }
-    if whole_field {
+    if whole_field && decorate {
         job.append("]", 0.0, fmt.weak);
     }
     job
+}
+
+/// Whether the whole of `text` fits in `budget` pixels. Stops at the first
+/// character that does not, so measuring a 600-character snippet window
+/// against a 200-point column costs no more than the column can hold — and
+/// this runs for every visible row, every frame.
+fn fits_within(text: &str, budget: f32, width_of: impl Fn(char) -> f32) -> bool {
+    let mut used = 0.0;
+    for c in text.chars() {
+        used += width_of(c);
+        if used > budget {
+            return false;
+        }
+    }
+    true
+}
+
+/// The byte offset one past the last character of `text[from..]` that still
+/// fits in `budget` pixels.
+fn take_forward(text: &str, from: usize, budget: f32, width_of: impl Fn(char) -> f32) -> usize {
+    let mut end = from;
+    let mut used = 0.0;
+    for c in text[from..].chars() {
+        let w = width_of(c);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        end += c.len_utf8();
+    }
+    end
 }
 
 /// Jet-colormap chip color per cascade stage — the rank reads as a
@@ -1565,5 +1741,169 @@ mod tests {
             last,
             "out-of-range stages share the fuzzy-path chip"
         );
+    }
+
+    // --- snippet rendering ----------------------------------------------
+
+    use crate::test_ui::{painted_rows, with_ui};
+
+    /// The rows `job` actually lays out: what the user sees, as opposed to
+    /// the text the job was built from. `Galley::text` is the latter — it
+    /// hands back the whole job, including every row epaint dropped at
+    /// `wrap.max_rows` — so it cannot see a truncation at all.
+    fn laid_out_rows(ui: &egui::Ui, job: LayoutJob) -> Vec<String> {
+        ui.fonts(|f| f.layout_job(job))
+            .rows
+            .iter()
+            .map(|r| r.text())
+            .collect()
+    }
+
+    /// A content snippet whose lead-in is `lines` short lines — the shape
+    /// that used to eat the whole row budget before the hit was reached.
+    /// The lead-in is multi-byte on purpose: snippet ranges are byte
+    /// offsets while row arithmetic counts characters.
+    fn ragged_snippet(lines: usize) -> Snippet {
+        let lead = "café\n".repeat(lines);
+        Snippet {
+            ranges: vec![(lead.len(), lead.len() + 6)],
+            window: format!("{lead}NEEDLE and trailing context"),
+            truncated_start: true,
+            truncated_end: true,
+        }
+    }
+
+    /// The mouseover exists to show the hit in context. A window whose
+    /// lead-in is dozens of short lines spends the whole row budget before
+    /// layout reaches the hit, and the tooltip ends up showing context with
+    /// nothing in it to be context *for*.
+    #[test]
+    fn the_hover_snippet_keeps_the_match_when_the_lead_in_is_all_newlines() {
+        with_ui(|ui| {
+            ui.set_max_width(520.0); // what the Match cell's tooltip sets
+            let snip = ragged_snippet(40);
+            let rows = laid_out_rows(ui, snippet_job(ui, &snip, 10));
+            assert!(rows.len() <= 10, "over the row budget: {rows:#?}");
+            assert!(
+                rows.iter().any(|r| r.contains("NEEDLE")),
+                "the match never made it on screen: {rows:#?}"
+            );
+            // Trimmed at a line boundary and said so. A start landing mid
+            // character would read "…afé" — or panic on a byte offset that
+            // is not a char boundary.
+            assert_eq!(rows[0], "… café", "{rows:#?}");
+        });
+    }
+
+    /// Same bug, worse: the preview strip under the table has two rows to
+    /// spend, so a single stray newline in the lead-in is enough.
+    #[test]
+    fn the_preview_strip_keeps_the_match_too() {
+        with_ui(|ui| {
+            let snip = ragged_snippet(40);
+            let rows = laid_out_rows(ui, snippet_job(ui, &snip, 2));
+            assert!(rows.len() <= 2, "over the row budget: {rows:#?}");
+            assert!(
+                rows.iter().any(|r| r.contains("NEEDLE")),
+                "the match never made it on screen: {rows:#?}"
+            );
+        });
+    }
+
+    /// A window that already fits is rendered exactly as it arrived: no
+    /// trimming, and no ellipsis for a trim that did not happen.
+    #[test]
+    fn a_snippet_that_fits_is_left_alone() {
+        with_ui(|ui| {
+            let snip = Snippet {
+                window: "alpha beta NEEDLE gamma".into(),
+                ranges: vec![(11, 17)],
+                truncated_start: false,
+                truncated_end: false,
+            };
+            assert_eq!(
+                laid_out_rows(ui, snippet_job(ui, &snip, 10)),
+                vec!["alpha beta NEEDLE gamma".to_string()]
+            );
+        });
+    }
+
+    /// The Match cell is laid out in Extend mode — egui hands it an infinite
+    /// wrap width — so nothing but the cell's own budget keeps it inside the
+    /// column, and an overshoot is clipped on *both* sides with no ellipsis,
+    /// which in a narrow column eats the highlighted match itself.
+    #[test]
+    fn the_match_cell_stays_inside_its_column() {
+        with_ui(|ui| {
+            let snip = Snippet {
+                window: "a long stretch of leading context NEEDLE and a long tail after it".into(),
+                ranges: vec![(34, 40)],
+                truncated_start: true,
+                truncated_end: true,
+            };
+            // Down to widths the column itself cannot reach, so the budget
+            // degrades rather than overflowing.
+            for width in [20.0, 60.0, 90.0, 120.0, 150.0, 240.0, 400.0, 4000.0] {
+                for whole_field in [false, true] {
+                    let job = centered_match_job(ui, &snip, width, whole_field);
+                    let galley = ui.fonts(|f| f.layout_job(job));
+                    assert!(
+                        galley.size().x <= width,
+                        "{}pt of text in a {width}pt column (whole_field={whole_field}): {:?}",
+                        galley.size().x,
+                        galley.text()
+                    );
+                    // The Match column is `Column::remainder().at_least(120.0)`,
+                    // so anything that wide has to keep the whole hit; below
+                    // that, only its head can be shown, but it is still the
+                    // hit that gets the room rather than the context.
+                    let kept = if width >= 120.0 { "NEEDLE" } else { "N" };
+                    assert!(
+                        galley.text().contains(kept),
+                        "the match was budgeted away at {width}pt: {:?}",
+                        galley.text()
+                    );
+                }
+            }
+        });
+    }
+
+    /// End to end: hovering the Match cell puts the hit on screen. The cell
+    /// paints the match once by itself, so the tooltip is the *second*
+    /// appearance — asserting on one would pass with the bug present.
+    #[test]
+    fn hovering_the_match_cell_shows_the_match_in_the_tooltip() {
+        let ctx = egui::Context::default();
+        // Testing that the tooltip carries the match, not egui's hover timing.
+        ctx.style_mut(|s| {
+            s.interaction.tooltip_delay = 0.0;
+            s.interaction.show_tooltips_only_when_still = false;
+        });
+        let mut tab = tab_with_results(1);
+        tab.has_snippets = true;
+        tab.results[0].stage = 6; // a full-text stage: no [brackets]
+        tab.results[0].snippet = Some(ragged_snippet(40));
+
+        run_frame(&ctx, &mut tab, vec![]); // settle the table's layout
+        for y in 40..250 {
+            // x lands in the Match column, past Name and Path.
+            let pos = egui::pos2(600.0, y as f32);
+            let mut out = run_frame(&ctx, &mut tab, vec![egui::Event::PointerMoved(pos)]);
+            if tab.hovered_row != Some(0) {
+                continue;
+            }
+            // The tooltip is its own area, so it may land a frame behind.
+            for _ in 0..3 {
+                let showing = painted_rows(&out)
+                    .iter()
+                    .filter(|r| r.contains("NEEDLE"))
+                    .count();
+                if showing >= 2 {
+                    return;
+                }
+                out = run_frame(&ctx, &mut tab, vec![]);
+            }
+        }
+        panic!("the match never appeared in the hover tooltip");
     }
 }

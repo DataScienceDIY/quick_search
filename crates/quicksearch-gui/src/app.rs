@@ -2,9 +2,8 @@
 //! status bar, and config-change routing.
 
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use quicksearch_core::cli::IndexCounts;
 use quicksearch_core::config::{diff_actions, nested_roots, Config, SecurityConfig};
 use quicksearch_core::coordinator::{IndexMode, IndexerState, ReconcileState, WatcherStatus};
 use quicksearch_core::db;
@@ -102,8 +101,6 @@ pub struct QuickSearchApp {
     dups: DuplicatesTab,
     logs: LogsTab,
     options: OptionsWindow,
-    /// Cached idle counts for the status bar, refreshed at most every 5 s.
-    counts: Option<(Instant, IndexCounts)>,
     /// Set when applying a config that invalidates the stored index.
     rebuild_prompt: Option<Vec<ConfigChange>>,
     /// Set while the "delete the index?" confirmation is open.
@@ -236,7 +233,6 @@ impl QuickSearchApp {
             dups: DuplicatesTab::new(),
             logs: LogsTab::new(),
             options: OptionsWindow::new(),
-            counts: None,
             rebuild_prompt: None,
             clear_prompt: false,
             nested_prompt,
@@ -312,7 +308,6 @@ impl QuickSearchApp {
             self.backend
                 .search()
                 .set_db_path(new.resolved_database_path());
-            self.counts = None;
         }
         // Everything the index can reconcile in place — pruning rows a
         // narrowed filter put out of scope, re-deciding extracted text,
@@ -365,28 +360,6 @@ impl QuickSearchApp {
         while let Ok(update) = self.backend.search_rx.try_recv() {
             self.search
                 .apply_update(update, self.cfg.search.display_limit);
-        }
-        // Status-bar counts worker.
-        if let Some(rx) = &self.backend.counts_job {
-            match rx.try_recv() {
-                Ok(counts) => {
-                    self.counts = Some((Instant::now(), counts));
-                    self.backend.counts_job = None;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                // The worker gave up (missing or unreadable index). Keep the
-                // last known figures but restamp them, so the next attempt
-                // waits its turn instead of respawning a thread every frame.
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    let last = self.counts.map(|(_, c)| c).unwrap_or(IndexCounts {
-                        files: 0,
-                        content_done: 0,
-                        content_pending: 0,
-                    });
-                    self.counts = Some((Instant::now(), last));
-                    self.backend.counts_job = None;
-                }
-            }
         }
         // Duplicates worker.
         if let Some(rx) = &self.backend.dup_job {
@@ -532,17 +505,7 @@ impl QuickSearchApp {
                             IndexMode::ManualStopped => "Manual",
                             IndexMode::ManualRunning => "Manual",
                         };
-                        let stale = self
-                            .counts
-                            .map(|(at, _)| at.elapsed() > Duration::from_secs(5))
-                            .unwrap_or(true);
-                        if stale {
-                            // Kicked off, not awaited: the result lands through
-                            // `drain_events` on a later frame.
-                            let cfg = self.cfg.clone();
-                            self.backend.start_index_counts(&cfg, ctx.clone());
-                        }
-                        let files = self.counts.map(|(_, c)| c.files).unwrap_or(0);
+                        let files = state.files.unwrap_or(0);
                         ui.label(
                             egui::RichText::new(format!(
                                 "Idle · {} · {} files indexed",
@@ -930,7 +893,6 @@ impl QuickSearchApp {
         }
         db::set_process_key(new_key);
         self.backend.coordinator.rebuild_index();
-        self.counts = None;
         self.dups.state = DupState::NotLoaded;
     }
 }
@@ -1010,7 +972,6 @@ impl QuickSearchApp {
         if stale_index_window(ctx, self.key_source) {
             self.stale_index_prompt = false;
             self.backend.coordinator.rebuild_index();
-            self.counts = None;
             self.dups.state = DupState::NotLoaded;
         }
     }
@@ -1153,7 +1114,6 @@ impl QuickSearchApp {
                         // launch must not undo that either.
                         self.set_index_mode(false);
                         self.backend.coordinator.clear_index();
-                        self.counts = None;
                         self.dups.state = DupState::NotLoaded;
                         close = true;
                     }
@@ -1294,7 +1254,10 @@ impl QuickSearchApp {
     /// search runs and the results table clears.
     pub(crate) fn capture_clear_query(&mut self) {
         self.search.query.clear();
-        self.search.pending_edit = Some(Instant::now());
+        // Qualified rather than imported: this is the only `Instant` left in
+        // this module, and it is behind `feature = "capture"`, so a plain
+        // `use` would warn in every default build.
+        self.search.pending_edit = Some(std::time::Instant::now());
     }
 
     pub(crate) fn capture_focus_search(&mut self) {

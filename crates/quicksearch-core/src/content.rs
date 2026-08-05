@@ -23,7 +23,7 @@
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 
 use crate::config::Config;
 use crate::extract::Registry;
@@ -311,7 +311,7 @@ pub fn extract_content(
             let (registry, config) = (registry.clone(), config.clone());
             let (stop_flag, suspend_flag) = (stop_flag.clone(), suspend_flag.clone());
             let stats = stats.clone();
-            thread::spawn(move || {
+            crate::platform::spawn_worker("qs-extract", move || {
                 crate::platform::set_background_priority();
                 worker(
                     &shared,
@@ -332,7 +332,7 @@ pub fn extract_content(
 
     let feeder_handle = {
         let (shared, db_path, cursor) = (shared.clone(), db_path.to_string(), cursor.clone());
-        thread::spawn(move || {
+        crate::platform::spawn_worker("qs-feeder", move || {
             crate::platform::set_background_priority();
             feeder(&shared, &db_path, cursor, max_size)
         })
@@ -350,6 +350,10 @@ pub fn extract_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests sleep; the pass itself spawns through
+    // `platform::spawn_worker` and blocks on channels rather than polling.
+    use std::thread;
+
     use crate::db::open_or_recreate;
     use crate::db::repo::{self, insert_file, NewFile};
     use crate::file_handling::{extract_scope_prepare, store_extracted};
