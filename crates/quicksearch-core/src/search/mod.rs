@@ -24,15 +24,35 @@
 //!
 //! Consumers that want a plain blocking search (the CLI mode) skip the
 //! service entirely and call [`cascade::run`] with a collecting sink.
+//!
+//! # The worker's connection
+//!
+//! The worker holds one connection across requests and releases it after
+//! [`IDLE_RELEASE`] of quiet. This is not an optimisation of open cost — an
+//! open is microseconds — but of the page cache behind it: a search runs on
+//! every character typed, so reopening per request meant paying to warm a
+//! cache and then discarding it, once per keystroke, forever.
+//!
+//! What the old per-request open bought, and what now has to be arranged
+//! deliberately, is never operating on an index that has been replaced
+//! underneath it. Two things can do that, and only one is visible in the path:
+//! the config can point at a different file, and a rebuild, clear or
+//! schema-drift wipe can put a *new* file at the *same* path. The second is
+//! why [`crate::db::index_epoch`] exists — see [`Worker::take_connection`].
+//! Holding a handle on a replaced index would mean stale results and, on
+//! Linux, its blocks staying allocated until the handle closed.
 
 pub mod cascade;
 pub mod duplicates;
 pub mod fuzzy;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
+
+use rusqlite::Connection;
 
 use crate::db;
 use crate::query::split::split_for_cascade;
@@ -40,6 +60,19 @@ use crate::snippet::Snippet;
 
 pub use cascade::Outcome;
 pub use duplicates::{find_duplicate_groups, DuplicateGroup};
+
+/// How long the worker keeps its connection after the last request.
+///
+/// The connection is held across requests so a typing session runs against a
+/// warm page cache (see [`Worker::take_connection`]). It is not held *forever*, for
+/// two reasons that have nothing to do with the cache: an open handle on a
+/// deleted index keeps its blocks allocated on disk, and an open reader stops
+/// SQLite from resetting the WAL, which would then grow toward
+/// `maximum_wal_size` and never come back down.
+///
+/// So: long enough to span the pauses inside a search session, short enough
+/// that an abandoned one is not still holding the index minutes later.
+const IDLE_RELEASE: Duration = Duration::from_secs(30);
 
 /// One search result. `rank` is the sort key (lower = better): integer
 /// part = cascade stage (1–11), fraction = occurrence-count or
@@ -148,6 +181,18 @@ impl SearchService {
         db_path: PathBuf,
         notify: Arc<dyn Fn() + Send + Sync>,
     ) -> (SearchService, mpsc::Receiver<SearchUpdate>) {
+        Self::new_with_idle_release(db_path, notify, IDLE_RELEASE)
+    }
+
+    /// [`Self::new`] with an explicit connection-release window.
+    ///
+    /// Tests use short windows; the default [`IDLE_RELEASE`] is right for real
+    /// use, where the window has to span the pauses inside a typing session.
+    pub fn new_with_idle_release(
+        db_path: PathBuf,
+        notify: Arc<dyn Fn() + Send + Sync>,
+        idle_release: Duration,
+    ) -> (SearchService, mpsc::Receiver<SearchUpdate>) {
         let (req_tx, req_rx) = mpsc::channel::<SearchRequest>();
         let (update_tx, update_rx) = mpsc::channel::<SearchUpdate>();
         let latest_gen = Arc::new(AtomicU64::new(0));
@@ -161,6 +206,8 @@ impl SearchService {
             latest_gen: latest_gen.clone(),
             in_flight: in_flight.clone(),
             db_path: db_path.clone(),
+            open: None,
+            idle_release,
         };
         let handle = std::thread::Builder::new()
             .name("qs-search".into())
@@ -268,11 +315,37 @@ struct Worker {
     latest_gen: Arc<AtomicU64>,
     in_flight: InFlight,
     db_path: Arc<Mutex<PathBuf>>,
+    /// The connection, and the index generation and path it was opened
+    /// against. See [`Worker::take_connection`].
+    open: Option<OpenIndex>,
+    /// How long `open` survives with no requests; [`IDLE_RELEASE`] outside
+    /// tests.
+    idle_release: Duration,
+}
+
+/// A connection held across requests, tagged with what it was opened on.
+struct OpenIndex {
+    conn: Connection,
+    epoch: u64,
+    path: PathBuf,
 }
 
 impl Worker {
-    fn run(self) {
-        while let Ok(first) = self.req_rx.recv() {
+    fn run(mut self) {
+        loop {
+            // `recv_timeout`, not `recv`: a search session is a burst of
+            // requests one keystroke apart, and the connection is worth
+            // keeping for the length of one. Past that it is worth strictly
+            // less than nothing — see [`IDLE_RELEASE`].
+            let first = match self.req_rx.recv_timeout(self.idle_release) {
+                Ok(req) => req,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.open = None;
+                    continue;
+                }
+                // The service was dropped; nothing more is coming.
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            };
             // A fast typist queues several requests; only the newest one
             // matters.
             let mut req = first;
@@ -286,12 +359,50 @@ impl Worker {
         }
     }
 
+    /// Take the connection to run this request on, reopening if the one held
+    /// cannot be reused.
+    ///
+    /// Taken out and handed back by the caller, rather than borrowed from
+    /// `self`, for the same reason [`crate::coordinator`]'s writer is: the
+    /// cascade needs the connection for its whole run, and everything else on
+    /// `self` — the update channel, the generation counter, the interrupt slot
+    /// — has to stay reachable while it does.
+    ///
+    /// Reuse is what makes [`crate::db::schema::PRAGMAS_SEARCH`]'s page cache
+    /// worth having: searches run on every character typed, so the second
+    /// query of a session and every one after it finds the b-tree interior
+    /// pages and FTS5 segment tips already resident. Opening per request threw
+    /// that away each time.
+    ///
+    /// It is reopened when either half of what it was opened against has
+    /// changed. The path moves when the user points the config at a different
+    /// index. The epoch moves when the file at the *same* path is replaced —
+    /// a rebuild, a clear, or a schema-drift wipe — which no comparison of
+    /// paths could ever catch, and which would otherwise leave this worker
+    /// querying a deleted inode and pinning its blocks on disk.
+    fn take_connection(&mut self, db_path: &Path) -> Result<OpenIndex, String> {
+        let epoch = db::index_epoch();
+        if let Some(open) = self.open.take() {
+            if open.epoch == epoch && open.path == db_path {
+                return Ok(open);
+            }
+            // Dropped here, before the open below, so the handle on the old
+            // index is gone before a handle on the new one exists.
+            drop(open);
+        }
+        Ok(OpenIndex {
+            conn: db::open::open_search_reader(&db_path.to_string_lossy())?,
+            epoch,
+            path: db_path.to_path_buf(),
+        })
+    }
+
     fn send(&self, update: SearchUpdate) {
         let _ = self.update_tx.send(update);
         (self.notify)();
     }
 
-    fn handle(&self, req: SearchRequest) {
+    fn handle(&mut self, req: SearchRequest) {
         let generation = req.generation;
         self.send(SearchUpdate::Started { generation });
 
@@ -307,9 +418,7 @@ impl Worker {
         };
 
         let db_path = self.db_path.lock().unwrap().clone();
-        // Per-request open: microseconds, and always sees a freshly
-        // rebuilt index file rather than pinning a deleted inode.
-        let conn = match db::open_existing(&db_path.to_string_lossy(), false) {
+        let open = match self.take_connection(&db_path) {
             Ok(c) => c,
             Err(e) => {
                 self.send(SearchUpdate::Error {
@@ -322,13 +431,13 @@ impl Worker {
         // Publish the handle tagged with the generation it kills, before the
         // first statement runs. Anyone cancelling from here on can tell this
         // search apart from the one that supersedes it.
-        *self.in_flight.lock().unwrap() = Some((generation, conn.get_interrupt_handle()));
+        *self.in_flight.lock().unwrap() = Some((generation, open.conn.get_interrupt_handle()));
 
         let mut sink = |hits: Vec<SearchHit>| {
             self.send(SearchUpdate::Hits { generation, hits });
         };
         let outcome = cascade::run(
-            &conn,
+            &open.conn,
             &split,
             &req.options,
             generation,
@@ -337,6 +446,15 @@ impl Worker {
         );
 
         *self.in_flight.lock().unwrap() = None;
+
+        // Kept only if it still works. A failed cascade may have failed
+        // *because* of this connection — a torn file, or an interrupt that
+        // left it unusable — and putting it back would wedge every search
+        // after this one behind the same bad handle. Dropping it costs one
+        // reopen.
+        if outcome.is_ok() {
+            self.open = Some(open);
+        }
 
         match outcome {
             Ok(Some(Outcome { total, limited })) => self.send(SearchUpdate::Completed {

@@ -1,16 +1,30 @@
 //! PDF text extraction.
 //!
-//! Primary path: [`pdf_extract::extract_text`], which handles most modern PDFs
-//! and is simple to call. It can panic or hard-error on malformed files; any
-//! failure is surfaced to the caller and marks the file's content state as
-//! failed. Properties (title, author, etc.) from the PDF `Info` dictionary
-//! are pulled via `lopdf` where available.
+//! One `Document::load` per file, then both the text and the `Info` dictionary
+//! are taken off it. `pdf_extract` can panic or hard-error on malformed files;
+//! any failure is surfaced to the caller and marks the file's content state as
+//! failed.
+//!
+//! This used to be two loads of the same file — `pdf_extract::extract_text`,
+//! which parses the document internally, followed by a second parse through a
+//! directly-declared `lopdf` purely to read six `Info` strings. Both object
+//! graphs and the full extracted text were live at once, on the extractor that
+//! `examples/memprobe.rs` already named as a run's largest single consumer.
+//! Naming `lopdf` as a direct dependency also resolved a *second, older* copy
+//! of it, which is what dragged `rayon` — and a global thread pool that is
+//! never torn down — plus `chrono`, `time`, `md5` and a second `nom` into the
+//! build.
+//!
+//! So `lopdf` is reached through `pdf_extract`'s own `pub use lopdf::*` and
+//! must not be declared in `Cargo.toml` again. The re-export is not a
+//! semver-guaranteed surface, but a break in it is a compile error rather than
+//! a silent behaviour change, and the fixtures below cover the behaviour.
 
 use std::cell::Cell;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use lopdf::{Document as LopdfDocument, Object};
+use pdf_extract::{Document, Object, PlainTextOutput};
 
 use super::{ExtractError, ExtractedContent, Extractor};
 
@@ -56,45 +70,69 @@ impl Extractor for PdfExtractor {
     }
 
     fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError> {
-        // Text. Catch panics from pdf_extract (some PDFs crash its parser)
-        // and keep the default hook from spamming stderr about them.
+        // Catch panics from pdf_extract (some PDFs crash its parser) and keep
+        // the default hook from spamming stderr about them. The whole
+        // operation is inside the guard, document loading included — that used
+        // to sit outside both it and the suppression window, so a panic in the
+        // parser reached the process hook and took the thread with it.
         install_quiet_panic_hook();
         let path_buf = path.to_path_buf();
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(true));
-        let result = std::panic::catch_unwind(move || pdf_extract::extract_text(&path_buf));
+        let result = std::panic::catch_unwind(move || extract_one_pass(&path_buf));
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(false));
-        let text = result
-            .map_err(|panic| format!("pdf_extract panicked: {}", panic_message(&*panic)))?
-            .map_err(|e| format!("pdf_extract: {}", e))?;
+        result.map_err(|panic| format!("pdf_extract panicked: {}", panic_message(&*panic)))?
+    }
+}
 
-        let mut out = ExtractedContent::with_text(text);
+/// The six `Info` keys worth keeping, in the order they are written.
+const INFO_KEYS: [&str; 6] = [
+    "Title", "Author", "Subject", "Keywords", "Creator", "Producer",
+];
 
-        // Info dictionary via lopdf. Soft-fail: if lopdf can't open the file
-        // we still return the text.
-        if let Ok(doc) = LopdfDocument::load(path) {
-            if let Ok(info_ref) = doc.trailer.get(b"Info") {
-                if let Ok(info_id) = info_ref.as_reference() {
-                    if let Ok(info) = doc.get_object(info_id) {
-                        if let Ok(dict) = info.as_dict() {
-                            for key in [
-                                "Title", "Author", "Subject", "Keywords", "Creator", "Producer",
-                            ] {
-                                if let Ok(val) = dict.get(key.as_bytes()) {
-                                    if let Some(s) = object_to_string(val) {
-                                        if !s.is_empty() {
-                                            out.properties.insert(key.to_ascii_lowercase(), s);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+/// Load the document once; take the text and the `Info` dictionary off it.
+///
+/// This is `pdf_extract::extract_text` — whose body is load, decrypt,
+/// `output_doc` — with the `Info` read folded in where the document is still
+/// in scope, which is the entire reason it is spelled out here rather than
+/// called.
+fn extract_one_pass(path: &Path) -> Result<ExtractedContent, ExtractError> {
+    let mut doc = Document::load(path).map_err(|e| format!("pdf_extract: {}", e))?;
+    // What `pdf_extract`'s own (private) `maybe_decrypt` does, and it has to
+    // happen before either the content streams or the `Info` strings mean
+    // anything — the previous two-load version never decrypted for the `Info`
+    // half, so those properties were garbage on any encrypted file. Empty
+    // password only: a real one is the user's to supply and nothing on this
+    // path can ask for it.
+    if doc.is_encrypted() {
+        doc.decrypt("").map_err(|e| format!("pdf_extract: {}", e))?;
+    }
+
+    let mut text = String::new();
+    {
+        let mut sink = PlainTextOutput::new(&mut text);
+        pdf_extract::output_doc(&doc, &mut sink).map_err(|e| format!("pdf_extract: {}", e))?;
+    }
+    let mut out = ExtractedContent::with_text(text);
+
+    // Soft-fail, unchanged: a document with no readable `Info` dictionary
+    // still has its text, and the text is the half that matters.
+    let info = doc
+        .trailer
+        .get(b"Info")
+        .ok()
+        .and_then(|o| o.as_reference().ok())
+        .and_then(|id| doc.get_object(id).ok())
+        .and_then(|o| o.as_dict().ok());
+    if let Some(dict) = info {
+        for key in INFO_KEYS {
+            if let Some(s) = dict.get(key.as_bytes()).ok().and_then(object_to_string) {
+                if !s.is_empty() {
+                    out.properties.insert(key.to_ascii_lowercase(), s);
                 }
             }
         }
-
-        Ok(out)
     }
+    Ok(out)
 }
 
 fn object_to_string(obj: &Object) -> Option<String> {
@@ -130,5 +168,174 @@ mod tests {
     fn supports_pdf_mime() {
         assert!(PdfExtractor.supports("application/pdf"));
         assert!(!PdfExtractor.supports("application/zip"));
+    }
+
+    use pdf_extract::{dictionary, Dictionary, Stream, StringFormat};
+    use std::path::PathBuf;
+
+    /// Write a one-page PDF drawing `body`, with `info` as its `Info`
+    /// dictionary, and return the path.
+    ///
+    /// Built here rather than checked in as a blob, following the convention
+    /// [`super::super::ole`] states: a fixture asserted to have a particular
+    /// structure is not reviewable when it is opaque bytes. Everything needed
+    /// is public through `pdf_extract`'s `lopdf` re-export, which is the same
+    /// surface the extractor itself uses — so if that re-export ever moves,
+    /// these fail to compile alongside it rather than silently stopping
+    /// covering anything.
+    ///
+    /// The page is deliberately minimal but complete: `output_doc` walks
+    /// Catalog → Pages → Page and needs `MediaBox`, a `Resources` font it can
+    /// resolve, and a content stream. Helvetica is one of the base-14 fonts,
+    /// for which `pdf_extract` carries built-in encoding tables, so no font
+    /// file is involved.
+    fn write_pdf(tag: &str, body: &str, info: Option<Dictionary>) -> PathBuf {
+        let mut doc = Document::with_version("1.5");
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let resources = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font },
+        });
+        let content = format!("BT /F1 24 Tf 72 720 Td ({}) Tj ET", body);
+        let contents = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let pages_id = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => contents,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page.into()],
+                "Count" => 1,
+                "Resources" => resources,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog);
+        if let Some(info) = info {
+            let info_id = doc.add_object(Object::Dictionary(info));
+            doc.trailer.set("Info", info_id);
+        }
+
+        let path = crate::testutil::scratch_dir(tag).join("fixture.pdf");
+        doc.save(&path).expect("write fixture pdf");
+        path
+    }
+
+    fn text_string(s: &str) -> Object {
+        Object::String(s.as_bytes().to_vec(), StringFormat::Literal)
+    }
+
+    #[test]
+    fn extracts_text_and_info_properties() {
+        let path = write_pdf(
+            "pdf-full",
+            "Hello QuickSearch",
+            Some(dictionary! {
+                "Title" => text_string("The Title"),
+                "Author" => text_string("An Author"),
+                "Subject" => text_string("A Subject"),
+                "Keywords" => text_string("alpha beta"),
+                "Creator" => text_string("A Creator"),
+                "Producer" => text_string("A Producer"),
+            }),
+        );
+
+        let out = PdfExtractor.extract(&path).expect("extract");
+        assert!(
+            out.text.contains("Hello QuickSearch"),
+            "drawn text missing from {:?}",
+            out.text
+        );
+        // Lowercased keys, which is the contract the rest of the pipeline
+        // stores under.
+        assert_eq!(out.properties.get("title").map(String::as_str), Some("The Title"));
+        assert_eq!(out.properties.get("author").map(String::as_str), Some("An Author"));
+        assert_eq!(out.properties.get("subject").map(String::as_str), Some("A Subject"));
+        assert_eq!(out.properties.get("keywords").map(String::as_str), Some("alpha beta"));
+        assert_eq!(out.properties.get("creator").map(String::as_str), Some("A Creator"));
+        assert_eq!(out.properties.get("producer").map(String::as_str), Some("A Producer"));
+    }
+
+    /// The soft-fail path: no `Info` dictionary is not an extraction failure,
+    /// because the text is the half that matters.
+    #[test]
+    fn missing_info_dictionary_still_yields_text() {
+        let path = write_pdf("pdf-noinfo", "Body Only", None);
+        let out = PdfExtractor.extract(&path).expect("extract");
+        assert!(out.text.contains("Body Only"));
+        assert!(
+            out.properties.is_empty(),
+            "unexpected properties: {:?}",
+            out.properties
+        );
+    }
+
+    /// An empty `Info` value is absence, not an empty property.
+    #[test]
+    fn empty_info_values_are_not_stored() {
+        let path = write_pdf(
+            "pdf-emptyinfo",
+            "Body",
+            Some(dictionary! {
+                "Title" => text_string(""),
+                "Author" => text_string("Real Author"),
+            }),
+        );
+        let out = PdfExtractor.extract(&path).expect("extract");
+        assert!(!out.properties.contains_key("title"), "empty title stored");
+        assert_eq!(
+            out.properties.get("author").map(String::as_str),
+            Some("Real Author")
+        );
+    }
+
+    /// `Info` values that are not strings or names are skipped rather than
+    /// rendered — pins `object_to_string`'s catch-all arm.
+    #[test]
+    fn non_string_info_values_are_skipped() {
+        let path = write_pdf(
+            "pdf-badinfo",
+            "Body",
+            Some(dictionary! {
+                "Producer" => 42,
+                "Title" => text_string("Kept"),
+            }),
+        );
+        let out = PdfExtractor.extract(&path).expect("extract");
+        assert!(
+            !out.properties.contains_key("producer"),
+            "integer Info value was rendered: {:?}",
+            out.properties
+        );
+        assert_eq!(out.properties.get("title").map(String::as_str), Some("Kept"));
+    }
+
+    /// Malformed input must come back as an error, not take the process down.
+    /// This is the case the widened `catch_unwind` exists for: the document
+    /// load now runs inside it, where it used to run outside.
+    #[test]
+    fn malformed_pdf_fails_without_panicking_the_process() {
+        let path = crate::testutil::scratch_dir("pdf-malformed").join("broken.pdf");
+        std::fs::write(&path, b"%PDF-1.4\n\x00\x01\x02 not a pdf at all \xff\xfe").unwrap();
+
+        let err = PdfExtractor
+            .extract(&path)
+            .expect_err("malformed pdf must fail");
+        assert!(
+            err.starts_with("pdf_extract"),
+            "unexpected failure reason: {}",
+            err
+        );
     }
 }

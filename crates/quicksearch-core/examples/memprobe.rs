@@ -52,13 +52,29 @@
 //!   peak to the walk or to extraction; a sampled peak far under VmHWM means
 //!   the real spike was shorter than the sampling interval.
 //!
-//! Nothing here is evictable page cache. The connection sets no `mmap_size`,
-//! so SQLite reads the index through its own `malloc`'d page cache (`PRAGMA
-//! cache_size`, 10000 pages ≈ 40 MiB) rather than mapping the file, and the
-//! `by mapping` breakdown confirms it: the index never appears as a
-//! file-backed mapping. Every megabyte reported is memory the process
-//! actually holds. `/usr/bin/time -v` on this binary reports the same VmHWM,
-//! as a cross-check that nothing here is fooling itself.
+//! Nothing here is evictable page cache. The connections set no `mmap_size`,
+//! so SQLite reads the index through its own `malloc`'d page cache (see
+//! [`quicksearch_core::db::schema`], where every profile's ceiling is set and
+//! argued) rather than mapping the file, and the `by mapping` breakdown
+//! confirms it: the index never appears as a file-backed mapping. Every
+//! megabyte reported is memory the process actually holds. `/usr/bin/time -v`
+//! on this binary reports the same VmHWM, as a cross-check that nothing here
+//! is fooling itself.
+//!
+//! # Peak, settled, and the difference between them
+//!
+//! `settled RSS` is read once the run is over and the service is idle, and it
+//! is the number that matters for a process that stays open. It is not the
+//! peak minus the run's buffers: glibc's `free` returns a chunk to its arena
+//! rather than to the kernel, so without an explicit
+//! [`quicksearch_core::platform::release_free_heap`] a run's high-water
+//! becomes the process's floor for as long as it lives. On a 65k-file tree
+//! that was the difference between settling at 89 MiB and settling at 34 MiB.
+//!
+//! For the *idle* footprint of a running GUI — which includes the window, the
+//! GL stack and everything this binary deliberately excludes — use
+//! [`rssprobe`](rssprobe.rs), which reads another process's `/proc` and so can
+//! measure a build that was made without knowing it would be measured.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -79,6 +95,18 @@ const MARKER_INTERVAL_MS: u64 = 500;
 /// this is a hang, and reporting a peak for a run that never finished would
 /// be worse than failing.
 const TIMEOUT: Duration = Duration::from_secs(3 * 3600);
+
+/// How long to wait for the run to reach `Idle` before measuring what it left
+/// behind. Generous because the wait is for `VACUUM` on a multi-gigabyte index
+/// ([`quicksearch_core::db::open`]'s maintenance connection), not for anything
+/// that scales with the sampling interval.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The pause after `Idle` is published. The writer thread releases its
+/// connection and returns free pages to the kernel *after* setting the status,
+/// so sampling the instant it flips would miss exactly the thing being
+/// measured.
+const SETTLE_QUIET: Duration = Duration::from_secs(2);
 
 /// Resident bytes at the peak, grouped by what the mapping is.
 ///
@@ -222,11 +250,38 @@ fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Optio
     // nothing that VmHWM would forget anyway.
     let hwm = vm_hwm();
     assert!(done, "indexing did not finish within {:?}", TIMEOUT);
+
+    let settled = settle(&service);
     service.stop_indexing().expect("stop");
 
     report(
-        mode, elapsed, baseline, hwm, &samples, db, interval, &at_peak,
+        mode, elapsed, baseline, hwm, settled, &samples, db, interval, &at_peak,
     );
+}
+
+/// RSS once the run has fully finished and stopped allocating.
+///
+/// The peak says what indexing needs; this says what it *keeps*, and the gap
+/// between them is the number that decides whether an idle QuickSearch is
+/// holding memory it has no use for. They differ by more than the run's own
+/// buffers: `free` under glibc returns a chunk to its arena rather than to the
+/// kernel, so what is measured here is the floor the process will sit at for
+/// as long as it stays open.
+///
+/// The marker this loop's caller watches for is written *during* the run, so
+/// maintenance and the final release are still ahead of it — hence waiting for
+/// `Idle` rather than sampling immediately, and then a little longer, because
+/// the last of it happens after the status is published.
+fn settle(service: &IndexingService) -> u64 {
+    let deadline = Instant::now() + SETTLE_TIMEOUT;
+    while Instant::now() < deadline {
+        if matches!(service.get_status(), IndexingStatus::Idle) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(SETTLE_QUIET);
+    rss().unwrap_or(0)
 }
 
 /// Flatten per-root progress into one line's worth of numbers. Roots are
@@ -262,6 +317,7 @@ fn report(
     elapsed: Duration,
     baseline: u64,
     hwm: Option<u64>,
+    settled: u64,
     samples: &[Sample],
     db: &Path,
     interval: Duration,
@@ -316,6 +372,17 @@ fn report(
         );
     }
     eprintln!("  baseline RSS      {}", mib(baseline));
+    eprintln!(
+        "  settled RSS       {} (once idle: what the run kept, not what it needed)",
+        mib(settled)
+    );
+    if let Some(h) = hwm {
+        eprintln!(
+            "  returned          {} of the {} the run took above baseline",
+            mib(h.saturating_sub(settled)),
+            mib(h.saturating_sub(baseline))
+        );
+    }
     if let Some(h) = hwm {
         if files > 0 {
             eprintln!(

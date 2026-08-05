@@ -3,8 +3,63 @@
 //! Versioned by [`super::open::CURRENT_SCHEMA_VERSION`], but there is no
 //! upgrade path: a database written under any other version is wiped and
 //! recreated from [`SCHEMA_CURRENT`]. See [`super::open`] for why.
+//!
+//! # The pragma profiles, and why there are six of them
+//!
+//! Each profile below belongs to one kind of connection, and the only field
+//! that differs between most of them is `cache_size`. They are separate
+//! constants rather than one shared string because the page cache is the
+//! largest thing a connection holds, and what the right size is depends
+//! entirely on what the connection does and how long it lives — a question
+//! with six different answers here.
+//!
+//! **A negative `cache_size` is KiB; a positive one would be a page count.**
+//! Nothing sets `page_size`, so a page count would be an unfalsifiable claim
+//! about SQLCipher's default, and SQLCipher reserves per-page bytes for the IV
+//! and HMAC on top of that, so pages do not convert to bytes by a clean
+//! multiply. Every value here is a ceiling in KiB, which is the thing actually
+//! being reasoned about.
+//!
+//! It *is* a ceiling and not a reservation — a connection that touches ten
+//! pages holds ten pages. What matters is which connections can reach the
+//! ceiling, which is any of them that scans a table, and how long they hold it
+//! afterwards. Page cache is `malloc`ed in 4 KiB units, far below glibc's mmap
+//! threshold, so a filled cache is arena memory: closing the connection
+//! returns it to the arena, not to the kernel. That is why these numbers show
+//! up in an *idle* process's footprint at all, and why
+//! [`crate::platform::release_free_heap`] exists alongside them.
+//!
+//! Note which way each profile is sized. Every one of them is small because
+//! its connection either scans once or lives a long time — except
+//! [`PRAGMAS_SEARCH`], which is large because it is the only cache that is
+//! *reused* often enough to pay for itself, and which is released when
+//! searching stops so that it never becomes part of the idle floor.
+//!
+//! | Profile | Connection | Lifetime | Cache |
+//! |---|---|---|---|
+//! | [`PRAGMAS_FAST`] | bulk indexer writer | one run | 8 MiB |
+//! | [`PRAGMAS_INCREMENTAL`] | coordinator's writer | released when idle | 4 MiB |
+//! | [`PRAGMAS_SEARCH`] | search worker | held across a typing session | 32 MiB |
+//! | [`PRAGMAS_READONLY`] | one-shot readers | a single query | 4 MiB |
+//! | [`PRAGMAS_MAINTENANCE`] | VACUUM | one bulk copy | 8 MiB |
+//! | [`PRAGMAS_WALK_READER`] | per-root row prefetch | the walk | 1 MiB |
+//!
+//! `PRAGMA mmap_size` is deliberately absent from all of them. It is not
+//! compile-disabled, and SQLCipher's codec only turns it off at runtime when a
+//! key is set — so an unprotected index could use it. It stays off because
+//! mapped pages still count in `VmRSS`, so it would not help the number this
+//! is all about, and because it would make memory behaviour differ between
+//! protected and unprotected installs, which is exactly the kind of silent
+//! per-configuration difference [`crate::platform`] argues against.
 
-/// Pragmas applied on every writable connection open.
+/// The bulk indexer's write connection: one per run, dies with it.
+///
+/// 8 MiB of page cache, not the 40 MiB this profile used to take. The cache
+/// buys a writer the chance to batch dirty pages before spilling mid
+/// transaction, and a run commits every `batch_size` rows (200–500), so the
+/// working set between commits is nowhere near 40 MiB. The old figure was
+/// never chosen for this connection — it was chosen once and then inherited by
+/// every other profile that copied this one.
 ///
 /// WAL, not journal-off: auto-indexing writes continuously while searches
 /// stream from their own read-only connections, and WAL is what lets those
@@ -21,7 +76,7 @@ pub const PRAGMAS_FAST: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 5000;
-    PRAGMA cache_size = 10000;
+    PRAGMA cache_size = -8192;
     PRAGMA temp_store = MEMORY;
     PRAGMA foreign_keys = ON;
 ";
@@ -36,14 +91,82 @@ pub const PRAGMAS_FAST: &str = "
 /// entire rebuilt index in RAM. See [`super::repo::maintain`], which also
 /// points the temp directory at the index's own volume.
 ///
-/// The smaller page cache is because this connection does one bulk copy and
-/// then closes; the 40 MiB the indexer keeps hot buys it nothing.
+/// The page cache is sized for one bulk copy followed by a close, which is
+/// all this connection ever does.
 pub const PRAGMAS_MAINTENANCE: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 5000;
-    PRAGMA cache_size = 2000;
+    PRAGMA cache_size = -8192;
     PRAGMA temp_store = FILE;
+    PRAGMA foreign_keys = ON;
+";
+
+/// The coordinator's long-lived write connection.
+///
+/// [`PRAGMAS_FAST`] without the `journal_mode`/`synchronous` lines it does not
+/// need to set again, and with a smaller cache, which is why it is its own
+/// profile. This connection exists to apply a handful of single-row upserts
+/// and deletes per batch of watcher events; it has no bulk phase to batch for.
+///
+/// The size matters more here than anywhere else because of the lifetime. This
+/// is the one connection that lives as long as the process, so whatever it
+/// reaches, it holds — and [`super::super::scope::advance`] runs a
+/// forward-only scan of `files` through it after a config change, which is
+/// exactly the access pattern that fills a cache to its ceiling. Before this
+/// profile existed that meant an idle QuickSearch carried a full 40 MiB page
+/// cache from a reconciliation the user did once. It is now also dropped
+/// outright when the coordinator settles (see `Inner::go_idle`); this profile
+/// bounds what it can reach *before* then.
+pub const PRAGMAS_INCREMENTAL: &str = "
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA cache_size = -4096;
+    PRAGMA temp_store = MEMORY;
+    PRAGMA foreign_keys = ON;
+";
+
+/// The search worker's connection, which is held across requests.
+///
+/// A search fires on every character typed, and the worker keeps one
+/// connection for the whole typing session rather than opening one per
+/// keystroke (see [`crate::search`]). That inverts what the cache is for: it
+/// is not there to absorb a single cold cascade, it is there to still be warm
+/// when the next character arrives.
+///
+/// **This is the one profile that is deliberately large, and the size is
+/// measured rather than reasoned.** `tests/search_perf.rs` sweeps it; on an
+/// encrypted index the curve is not a gradient but a cliff, and the cliff is
+/// at the working set:
+///
+/// | ceiling | warm, unencrypted | warm, encrypted |
+/// |---|---|---|
+/// | 32–40 MiB | ~19 ms | **~19 ms** |
+/// | 1–16 MiB | ~20 ms | **~47 ms** |
+///
+/// Unencrypted, the ceiling makes no difference at all — a miss is a `pread`
+/// from the OS page cache and a `memcpy`. Encrypted, SQLCipher caches pages
+/// *decrypted*, so a hit skips an AES-CBC decrypt and an HMAC-SHA512 verify
+/// per 4 KiB; below the working set every warm query pays for all of them
+/// again, which is the 2.5× above. One number covers both because sizing this
+/// by whether a key happens to be set would make search latency depend on a
+/// setting nobody would connect it to.
+///
+/// The ceiling only stands while someone is searching: the worker releases the
+/// connection after [`crate::search`]'s idle window, and
+/// [`crate::platform::release_free_heap`] returns the pages. So this buys warm
+/// search latency without adding to what an idle process holds — which is the
+/// trade the rest of these profiles are making in the other direction.
+///
+/// The knee tracks index size, so on a very large encrypted index even this
+/// will not hold the working set. That degrades to the old behaviour rather
+/// than to something worse, and the fix if it ever matters is a bigger number
+/// here, informed by the same test.
+pub const PRAGMAS_SEARCH: &str = "
+    PRAGMA busy_timeout = 5000;
+    PRAGMA cache_size = -32768;
+    PRAGMA temp_store = MEMORY;
     PRAGMA foreign_keys = ON;
 ";
 
@@ -51,9 +174,15 @@ pub const PRAGMAS_MAINTENANCE: &str = "
 /// and `synchronous` can't be changed on the file. Used by
 /// [`super::open::open_existing`] for read-only opens; write paths get the
 /// full [`PRAGMAS_FAST`] set.
+///
+/// This is the *one-shot* reader now that the search worker has
+/// [`PRAGMAS_SEARCH`]: the CLI query helpers, the duplicates scan, the
+/// coordinator's own small reads. Each opens, runs a single query, and closes.
+/// A cache only pays for itself across queries, and these connections have no
+/// across.
 pub const PRAGMAS_READONLY: &str = "
     PRAGMA busy_timeout = 5000;
-    PRAGMA cache_size = 10000;
+    PRAGMA cache_size = -4096;
     PRAGMA temp_store = MEMORY;
     PRAGMA foreign_keys = ON;
 ";
@@ -62,17 +191,17 @@ pub const PRAGMAS_READONLY: &str = "
 ///
 /// Identical to [`PRAGMAS_READONLY`] but for `cache_size`, and that one
 /// difference is the point. One of these connections exists per indexing
-/// root, so the 10000-page (~40 MiB) cache the other profiles take would
-/// cost ~200 MiB across five roots — more than the per-directory
-/// classification this connection exists to serve was meant to save.
+/// root, so a cache sized for a connection that runs alone would be
+/// multiplied by the root count — and this was the first profile to be sized
+/// for its access pattern rather than copied from [`PRAGMAS_FAST`], which is
+/// why the others now are too.
 ///
-/// 256 pages (~1 MiB) is enough to hold the upper levels of
-/// `idx_files_parent` hot, which is all these queries touch: each one is a
-/// single index range lookup, and the pages under it are read once and not
-/// revisited.
+/// 1 MiB is enough to hold the upper levels of `idx_files_parent` hot, which
+/// is all these queries touch: each one is a single index range lookup, and
+/// the pages under it are read once and not revisited.
 pub const PRAGMAS_WALK_READER: &str = "
     PRAGMA busy_timeout = 5000;
-    PRAGMA cache_size = 256;
+    PRAGMA cache_size = -1024;
     PRAGMA temp_store = MEMORY;
     PRAGMA foreign_keys = ON;
 ";

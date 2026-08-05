@@ -40,18 +40,34 @@ pub fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
     ]
 }
 
-/// Every text galley painted this frame, each with the rectangle it occupies.
-///
-/// Labels carry no widget id worth recording, so reading the shapes back is
-/// the only way to check the text a user actually sees — and the only way to
-/// find a click target that follows the layout instead of pinning it.
-pub fn painted(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
-    fn walk(shape: &egui::epaint::Shape, into: &mut Vec<(String, egui::Rect)>) {
+/// A `Ui` from a real (headless) egui pass, so measuring helpers see the same
+/// fonts the app paints with — the whole point of `middle_elide` and of the
+/// snippet row arithmetic is that they agree with egui's own layout.
+pub fn with_ui<R>(f: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let ctx = egui::Context::default();
+    let mut f = Some(f);
+    let mut out = None;
+    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(f) = f.take() {
+                out = Some(f(ui));
+            }
+        });
+    });
+    out.expect("the central panel ran")
+}
+
+/// Every text galley painted this frame, in paint order, each with the
+/// rectangle it occupies.
+fn painted_galleys(out: &egui::FullOutput) -> Vec<(&std::sync::Arc<egui::Galley>, egui::Rect)> {
+    fn walk<'a>(
+        shape: &'a egui::epaint::Shape,
+        into: &mut Vec<(&'a std::sync::Arc<egui::Galley>, egui::Rect)>,
+    ) {
         match shape {
-            egui::epaint::Shape::Text(t) => into.push((
-                t.galley.text().to_string(),
-                egui::Rect::from_min_size(t.pos, t.galley.size()),
-            )),
+            egui::epaint::Shape::Text(t) => {
+                into.push((&t.galley, egui::Rect::from_min_size(t.pos, t.galley.size())))
+            }
             egui::epaint::Shape::Vec(shapes) => {
                 for s in shapes {
                     walk(s, into);
@@ -60,16 +76,42 @@ pub fn painted(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
             _ => {}
         }
     }
-    let mut out_text = Vec::new();
+    let mut galleys = Vec::new();
     for clipped in &out.shapes {
-        walk(&clipped.shape, &mut out_text);
+        walk(&clipped.shape, &mut galleys);
     }
-    out_text
+    galleys
+}
+
+/// Every text galley painted this frame, each with the rectangle it occupies.
+///
+/// Labels carry no widget id worth recording, so reading the shapes back is
+/// the only way to check the text a user actually sees — and the only way to
+/// find a click target that follows the layout instead of pinning it.
+pub fn painted(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+    painted_galleys(out)
+        .into_iter()
+        .map(|(g, rect)| (g.text().to_string(), rect))
+        .collect()
 }
 
 /// Every string painted this frame, in paint order.
 pub fn painted_text(out: &egui::FullOutput) -> Vec<String> {
     painted(out).into_iter().map(|(text, _)| text).collect()
+}
+
+/// Every *visible* row of every galley painted this frame, in paint order.
+///
+/// Not the same thing as [`painted_text`]: a galley's `text()` is the job it
+/// was laid out from, including the rows epaint dropped at `wrap.max_rows`. A
+/// label that silently truncated away the very thing it was meant to show
+/// still reads as complete there; the laid-out rows are the only place the
+/// loss is visible.
+pub fn painted_rows(out: &egui::FullOutput) -> Vec<String> {
+    painted_galleys(out)
+        .into_iter()
+        .flat_map(|(g, _)| g.rows.iter().map(|r| r.text()).collect::<Vec<_>>())
+        .collect()
 }
 
 /// The centre of `needle`'s galley, as a click target.

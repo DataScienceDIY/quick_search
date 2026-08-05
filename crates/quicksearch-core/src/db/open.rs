@@ -18,8 +18,8 @@ use std::path::Path;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use super::schema::{
-    effective_tokenizer, fts_create_sql, PRAGMAS_FAST, PRAGMAS_MAINTENANCE, PRAGMAS_READONLY,
-    PRAGMAS_WALK_READER, SCHEMA_CURRENT,
+    effective_tokenizer, fts_create_sql, PRAGMAS_FAST, PRAGMAS_INCREMENTAL, PRAGMAS_MAINTENANCE,
+    PRAGMAS_READONLY, PRAGMAS_SEARCH, PRAGMAS_WALK_READER, SCHEMA_CURRENT,
 };
 use crate::security::IndexKey;
 
@@ -116,6 +116,35 @@ pub fn open_walk_reader(db_path: &str) -> Result<Connection, String> {
         false,
         super::key::process_key().as_ref(),
         PRAGMAS_WALK_READER,
+    )
+}
+
+/// The search worker's connection, held across requests.
+///
+/// Identical to `open_existing(_, false)` except for the pragma profile: see
+/// [`PRAGMAS_SEARCH`] for why this one is deliberately larger than the
+/// one-shot readers' and still smaller than what it replaced.
+pub fn open_search_reader(db_path: &str) -> Result<Connection, String> {
+    open_keyed_with_pragmas(
+        db_path,
+        false,
+        super::key::process_key().as_ref(),
+        PRAGMAS_SEARCH,
+    )
+}
+
+/// The coordinator's write connection, for applying watcher events and
+/// reconciling a config change.
+///
+/// Identical to `open_existing(_, true)` except for the pragma profile: see
+/// [`PRAGMAS_INCREMENTAL`] for why the process's longest-lived writer must not
+/// take the cache the bulk indexer does.
+pub fn open_incremental_writer(db_path: &str) -> Result<Connection, String> {
+    open_keyed_with_pragmas(
+        db_path,
+        true,
+        super::key::process_key().as_ref(),
+        PRAGMAS_INCREMENTAL,
     )
 }
 
@@ -369,6 +398,10 @@ fn wipe_and_reopen(
     key: Option<&IndexKey>,
 ) -> Result<Connection, String> {
     drop(conn);
+    // Before the delete, not after: anything holding a connection to the file
+    // about to disappear must be told, and told even if the removal below
+    // fails partway. See [`super::bump_index_epoch`].
+    super::bump_index_epoch();
     // Primary file may already be absent (fresh open that just needed
     // the table applied). Ignore NotFound; anything else is an error.
     //

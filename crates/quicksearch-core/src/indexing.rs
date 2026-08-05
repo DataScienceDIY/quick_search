@@ -713,6 +713,12 @@ impl IndexingService {
             }
         }
 
+        // Before the removal, and unconditionally: readers holding this file
+        // open have to be told even if the delete below fails, because the
+        // half-deleted case is exactly the one where a stale handle does
+        // damage. See [`db::bump_index_epoch`].
+        db::bump_index_epoch();
+
         if std::path::Path::new(db_path).exists() {
             std::fs::remove_file(db_path)
                 .map_err(|e| format!("Failed to delete database file: {}", e))?;
@@ -796,6 +802,17 @@ impl IndexingService {
                                 *status_clone.lock().unwrap() = IndexingStatus::Idle;
                             }
                         }
+
+                        // A run's whole working set becomes garbage at once
+                        // here: the walk's in-flight buffers, every extractor's
+                        // scratch, `seen_paths`, and the writer's page cache.
+                        // Under glibc none of it goes back to the OS on its
+                        // own, so a peak measured in hundreds of megabytes
+                        // would otherwise be the process's floor for as long as
+                        // it stays open. After the match, not inside it,
+                        // because a failed or stopped run leaves exactly as
+                        // much behind as a successful one.
+                        crate::platform::release_free_heap();
                     }));
                 }
                 IndexingCommand::Stop => {

@@ -389,14 +389,25 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   open applies the Argon2id-derived raw key (`security.rs`, process-global
   in `db/key.rs`) before anything reads the file; a wrong key is a tagged
   `KEY_MISMATCH` error, structurally distinct from the schema drift that
-  may wipe, so it can never destroy an intact index.
+  may wipe, so it can never destroy an intact index. Each kind of connection
+  takes a page cache sized for what it does and how long it lives, rather than
+  one figure applied everywhere (`db/schema.rs` sets six profiles and argues
+  each): the caches are `malloc`ed, so a connection that scans a table and is
+  then held — the coordinator's writer, before it learned to let go when idle —
+  keeps that memory for the life of the process. Search is the one deliberately
+  large one, because it is the only cache reused often enough to pay for
+  itself, and it is released once searching stops.
 - **Indexing** (`indexing.rs`, `file_handling.rs`): full runs walk each
   root (`filtered_walk` prunes hidden/ignored subtrees before descending),
   classify files by mtime into insert/update/skip, batch-write metadata,
   sweep stale rows, then extract content (plaintext, RTF, Office — both the
   OOXML/ODF zip formats and the pre-2007 binary `.doc`/`.xls`/`.ppt`, whose
   OLE2 streams are read in `extract/ole.rs` — PDF, audio tags, EXIF; see
-  `extract/`) for FTS. Files whose extension no MIME
+  `extract/`) for FTS. PDFs are parsed once, with the text and the `Info`
+  dictionary taken off the same document: the two-parse version that preceded
+  it was a run's largest single memory consumer, and it was what pulled a
+  second copy of `lopdf` — and with it rayon's never-torn-down thread pool —
+  into the build. Files whose extension no MIME
   table knows — including extensionless ones like `README` or `Makefile` —
   are sniffed from their head bytes and indexed as text only when that head
   is provably text: valid UTF-8, or BOM-marked (`mime.rs`, `textenc.rs`).
@@ -466,7 +477,11 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
 - **Search** (`search/`): `SearchService` runs one worker thread; each
   query is a *generation*. New queries interrupt the in-flight SQLite
   statement (`InterruptHandle`) and stale generations stop cooperatively,
-  so typing never waits. The cascade streams rank-ordered batches: one
+  so typing never waits. The worker keeps its connection across requests and
+  drops it once searching stops, so a typing session runs against a page cache
+  that is already warm instead of rebuilding one per keystroke; because a
+  rebuild or clear puts a *new* file at the *same* path, an index generation
+  counter (`db::index_epoch`) is what tells the held connection to reopen. The cascade streams rank-ordered batches: one
   `files` scan classifies exact/case/substring filename matches (ranks
   1–4) and, since a path contains its own name, sets aside full-path
   matches from the same rows (ranks 9–10); one FTS phrase probe verified
@@ -533,6 +548,24 @@ pagination: the table is virtualized, so a single scroll list capped at
   and duplicates tabs, and query highlighting.
 - `QSB_SNIPPET_PERF=1 cargo test --release -p quicksearch-core --test
   snippet_perf -- --nocapture`: snippet pipeline benchmark.
+- `QSB_SEARCH_PERF=1 cargo test --release -p quicksearch-core --test
+  search_perf -- --nocapture`: what a warm page cache is worth to search, swept
+  across cache ceilings and run both encrypted and not. It exists because the
+  right size for `PRAGMAS_SEARCH` is not something to reason about: encrypted,
+  the curve has a cliff at the working set, because SQLCipher caches pages
+  decrypted and a miss below that costs an AES-CBC plus an HMAC-SHA512 per
+  4 KiB page. Unencrypted it is flat. Read it before changing that number.
+- Memory probes, all under `crates/quicksearch-core/examples/`:
+  `memprobe <cold|warm> <root> <db>` reports an indexing run's peak *and* what
+  it settles at once idle — the gap between those is the memory a process
+  keeps for nothing, since glibc's `free` returns chunks to its arena rather
+  than to the kernel. `rssprobe <pid> [duration_s]` attributes a *running*
+  process's footprint instead, splitting anonymous heap (ours) from
+  file-backed pages (the binary, libc, the GL stack), reading `Private_Dirty`
+  rather than `VmRSS`, and counting glibc's arenas so retention is
+  distinguishable from live data. It reads another process's `/proc`, so it
+  measures a build made without knowing it would be measured.
+  `indexprobe` and `walkprobe` answer "how fast" rather than "how much".
 - `.forgejo/workflows/ci.yml`: builds both platforms on every push to `master`
   and every pull request. To cut a release, bump `[workspace.package] version`
   in `Cargo.toml` and push the commit on a branch named `Release...`; CI runs

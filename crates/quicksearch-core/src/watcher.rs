@@ -775,6 +775,13 @@ fn prune_stale(throttle: &mut HashMap<PathBuf, DirThrottleEntry>, max_age: Durat
             || entry.immediate
             || now.saturating_duration_since(entry.record_time) < max_age
     });
+    // `retain` frees the entries but keeps the table sized for the busiest
+    // moment this map has ever seen — and a build or an unpack can put tens of
+    // thousands of directories through it in a burst, once, on a process that
+    // then sits idle for days.
+    if throttle.is_empty() {
+        throttle.shrink_to_fit();
+    }
 }
 
 #[cfg(test)]

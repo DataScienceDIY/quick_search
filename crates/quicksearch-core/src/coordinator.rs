@@ -21,6 +21,18 @@
 //! run is active — the coordinator's tick simply does nothing until the
 //! `IndexingService` reports idle, then drains its queue. Overflowing the
 //! queue (>100k pending paths) collapses into one full run instead.
+//!
+//! Settling is part of the state machine, not an implementation detail. The
+//! first tick that finds nothing to do calls [`Inner::go_idle`], which drops
+//! the write connection — reopening it is cheap, and holding it means holding
+//! whatever page cache the last reconciliation filled for the life of the
+//! process — and then returns the heap that this coordinator, the search
+//! worker and the last indexing run have all freed into their allocator
+//! arenas. It fires once per busy→idle transition, so a coordinator that has
+//! nothing to do costs nothing to have around. This is also where the
+//! published file count comes from: the status bar's figure is read off the
+//! connection this thread already holds, on an interval, rather than by a
+//! frontend opening its own.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,6 +53,15 @@ use crate::watcher::{FsEvent, WatchError, WatchFilters, Watcher, WatcherConfig};
 
 /// Pending-event ceiling; beyond this a full run is cheaper than replay.
 const PENDING_OVERFLOW: usize = 100_000;
+
+/// How often the published file count is re-read while idle.
+///
+/// It moves only when something writes to the index, and everything that does
+/// so — a run finishing, a batch of watcher events — either invalidates it
+/// directly or is followed by another tick within this window. Long enough
+/// that a `COUNT(*)` over a multi-million-row index is not a recurring cost,
+/// short enough that the status bar is not visibly wrong.
+const FILE_COUNT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexMode {
@@ -96,6 +117,12 @@ pub struct IndexerState {
     pub activity: IndexingStatus,
     /// Unix seconds of the last completed full run, if any.
     pub last_full_index: Option<u64>,
+    /// Rows in the index, refreshed while idle. `None` before the first read.
+    ///
+    /// Deliberately approximate: it is a status-bar figure, not a fact
+    /// anything decides on, and the alternative to letting it lag is running a
+    /// `COUNT(*)` on a cadence rather than when the index is quiet.
+    pub files: Option<i64>,
     /// Watcher events waiting to be applied.
     pub queued_events: usize,
     /// Live-update health; see [`WatcherStatus`].
@@ -164,6 +191,15 @@ impl ReconcileStop {
 struct Shared {
     mode: IndexMode,
     last_full_index: Option<u64>,
+    /// Rows in `files`, for the idle status bar's "N files indexed".
+    ///
+    /// Published from here rather than fetched by the frontend because the
+    /// coordinator is already the thing that holds a connection and already
+    /// knows when the index is quiet enough to ask. The GUI used to spawn a
+    /// thread and open its own connection for this every five seconds, which
+    /// cost a page cache and an arena per refresh for a decorative number.
+    /// `None` until the first successful read.
+    files: Option<i64>,
     queued_events: usize,
     watcher: WatcherStatus,
     reconcile: Option<ReconcileState>,
@@ -192,6 +228,7 @@ impl IndexCoordinator {
         let shared = Arc::new(Mutex::new(Shared {
             mode: initial_mode,
             last_full_index: None,
+            files: None,
             queued_events: 0,
             watcher: WatcherStatus::Off,
             reconcile: None,
@@ -217,6 +254,8 @@ impl IndexCoordinator {
             reconcile_done: None,
             reconcile_cut_short: false,
             saw_running: false,
+            files_at: None,
+            was_busy: false,
             write_conn: None,
             ignore: Arc::new(IgnoreSet::compile(&[]).expect("empty ignore set")),
             registry: Registry::default_set(),
@@ -246,6 +285,7 @@ impl IndexCoordinator {
             mode: shared.mode,
             activity: self.indexing.get_status(),
             last_full_index: shared.last_full_index,
+            files: shared.files,
             queued_events: shared.queued_events,
             watcher: shared.watcher.clone(),
             reconcile: shared.reconcile,
@@ -431,6 +471,17 @@ struct Inner {
     /// A start was requested; set false once the service reports running,
     /// so idle-after-running transitions are detectable.
     saw_running: bool,
+    /// When the published file count was last read, so it can be refreshed on
+    /// an interval rather than every tick. `None` forces the next tick to
+    /// re-read it.
+    files_at: Option<Instant>,
+    /// Something has happened since the last time this coordinator settled.
+    ///
+    /// Drives [`Inner::go_idle`], which must fire once per busy→idle
+    /// transition rather than once per tick: releasing the page cache and
+    /// trimming the heap are both worth doing when the work stops and both are
+    /// pure overhead every second thereafter.
+    was_busy: bool,
     write_conn: Option<Connection>,
     /// Shared with the watcher, which filters registrations by the same set.
     ignore: Arc<IgnoreSet>,
@@ -484,8 +535,10 @@ impl Inner {
                 if let Err(e) = self.reload_filters() {
                     crate::log_warn!("coordinator: {}", e);
                 }
-                // The write connection may point at an old database_path.
+                // The write connection may point at an old database_path, and
+                // so may the count read through it.
                 self.write_conn = None;
+                self.files_at = None;
                 // A wipe stays the caller's decision — it is destructive and
                 // the GUI may have to ask first (see `rebuild_index`).
                 // Everything short of one this thread reconciles itself, in
@@ -510,6 +563,11 @@ impl Inner {
             CoordCmd::RebuildIndex => {
                 let db = self.db_path();
                 self.write_conn = None;
+                // The file is about to be deleted, so the published count is
+                // about to be wrong by all of it. Re-read on the next tick
+                // rather than letting the interval carry a stale figure across
+                // a wipe the user just asked for.
+                self.files_at = None;
                 // Nothing to reconcile against once the file is gone — and
                 // nothing to report about what was reconciled in the index
                 // that is about to stop existing.
@@ -534,7 +592,14 @@ impl Inner {
                 if let Err(e) = self.indexing.delete_index_for_rebuild(&db) {
                     crate::log_warn!("coordinator: clear index: {}", e);
                 }
-                self.shared.lock().unwrap().last_full_index = None;
+                let mut shared = self.shared.lock().unwrap();
+                shared.last_full_index = None;
+                // Zero, not `None`: nothing is going to rebuild this index, so
+                // there is no later read to correct a stale figure, and "0
+                // files indexed" is the truth about what was just deleted.
+                shared.files = Some(0);
+                drop(shared);
+                self.files_at = None;
             }
             CoordCmd::Shutdown => unreachable!("handled in run()"),
         }
@@ -564,11 +629,17 @@ impl Inner {
         // resolve the manual-run mode.
         if self.saw_running {
             self.saw_running = false;
+            self.was_busy = true;
             self.refresh_last_full_index();
+            // Eagerly, not on the usual interval: the number the run just
+            // changed is the one the user is looking at when it finishes.
+            self.files_at = None;
             if self.mode == IndexMode::ManualRunning {
                 self.mode = IndexMode::ManualStopped;
             }
         }
+
+        self.refresh_file_count();
 
         // Ahead of the mode gate: a config edit is reconciled in manual mode
         // too. It may end by starting a run, which is why this cannot wait for
@@ -582,16 +653,51 @@ impl Inner {
             if self.mode == IndexMode::ManualStopped {
                 self.clear_pending();
             }
+            self.go_idle();
             return;
         }
 
+        let mut worked = false;
         if !self.pending.is_empty() && !self.needs_full_run && self.pending_settled() {
             self.apply_pending();
+            worked = true;
         }
 
         if self.needs_full_run || self.periodic_due() {
             self.start_full_run();
+            worked = true;
         }
+
+        // Only when this tick found nothing to do. A tick that applied a batch
+        // is very likely to be followed by another that does the same, and
+        // releasing the connection between them would reopen it a moment later
+        // with a cold cache.
+        if !worked {
+            self.go_idle();
+        }
+    }
+
+    /// Settle: hand back what the work needed and the process no longer does.
+    ///
+    /// Two things, and they have to happen in this order. Dropping
+    /// [`Inner::write_conn`] closes a connection whose page cache a
+    /// reconciliation pass can have filled to its ceiling, and which is
+    /// otherwise held for the life of the process —
+    /// [`Inner::ensure_write_conn`] reopens it lazily, and cheaply, because
+    /// the key is applied in raw form and never re-derived. Then
+    /// [`crate::platform::release_free_heap`] returns those pages, and
+    /// everything the last indexing run and the search worker freed into
+    /// their arenas, to the kernel.
+    ///
+    /// Gated on [`Inner::was_busy`] so it runs once when the work stops rather
+    /// than every tick forever after.
+    fn go_idle(&mut self) {
+        if !self.was_busy {
+            return;
+        }
+        self.was_busy = false;
+        self.write_conn = None;
+        crate::platform::release_free_heap();
     }
 
     fn drain_events(&mut self) {
@@ -602,6 +708,7 @@ impl Inner {
         }
         if received {
             let now = Instant::now();
+            self.was_busy = true;
             self.last_event_at = Some(now);
             self.pending_since.get_or_insert(now);
             // Before the overflow test, not after: an `rm -rf` of half a
@@ -641,6 +748,7 @@ impl Inner {
     /// Advance the queued reconciliation by one slice, and start the full run
     /// it asked for once it is finished.
     fn apply_work(&mut self) {
+        self.was_busy = true;
         let mut conn = match self.ensure_write_conn() {
             Ok(conn) => conn,
             Err(e) => {
@@ -744,6 +852,11 @@ impl Inner {
     /// `pending_since` cannot force an immediate apply of the next event.
     fn clear_pending(&mut self) {
         self.pending.clear();
+        // `clear` empties the map but keeps the table it grew into, and this
+        // one grows to [`PENDING_OVERFLOW`] — an `rm -rf` of a large watched
+        // tree leaves a 100k-slot allocation behind for the life of the
+        // process. Releasing it is the point of clearing here at all.
+        self.pending.shrink_to_fit();
         self.last_event_at = None;
         self.pending_since = None;
     }
@@ -769,6 +882,7 @@ impl Inner {
     /// create-then-delete ends with it absent, because the upsert half consults
     /// the filesystem and finds nothing there.
     fn apply_pending(&mut self) {
+        self.was_busy = true;
         let mut conn = match self.ensure_write_conn() {
             Ok(conn) => conn,
             Err(e) => {
@@ -846,7 +960,12 @@ impl Inner {
         if let Some(conn) = self.write_conn.take() {
             return Ok(conn);
         }
-        db::open_existing(&self.db_path(), true)
+        // Not `open_existing(_, true)`: that hands out the bulk indexer's
+        // profile, and this connection outlives every run. See
+        // [`db::schema::PRAGMAS_INCREMENTAL`]. Reopening is cheap — the key is
+        // applied in raw form and never re-derived — which is what makes
+        // dropping it in `go_idle` reasonable.
+        db::open::open_incremental_writer(&self.db_path())
     }
 
     fn periodic_due(&self) -> bool {
@@ -1084,6 +1203,43 @@ impl Inner {
     /// contended database as "never" would schedule a fresh run every tick
     /// for as long as the condition lasts. Keeping the previous value leaves
     /// the schedule where it was until a read succeeds.
+    /// Re-read the published row count, at most every [`FILE_COUNT_INTERVAL`].
+    ///
+    /// Called only from the idle half of [`Inner::tick`], so it cannot run
+    /// while a full run holds the database. `COUNT(*)` is answered from the
+    /// narrowest index rather than the table (see [`db::repo::row_count`]),
+    /// but it is still a key scan of every row, so it runs behind an interval
+    /// and behind the interrupt guard that lets shutdown cut it short rather
+    /// than waiting out a scan of a several-million-row index.
+    fn refresh_file_count(&mut self) {
+        if let Some(at) = self.files_at {
+            if at.elapsed() < FILE_COUNT_INTERVAL {
+                return;
+            }
+        }
+        // Stamped before the read, not after: a count that keeps failing must
+        // back off exactly as a successful one does, or a missing index turns
+        // into an open attempt every tick.
+        self.files_at = Some(Instant::now());
+
+        let Ok(conn) = db::open_existing(&self.db_path(), false) else {
+            // No readable index yet. The status bar says "0 files indexed",
+            // which is both true and what the empty case should look like.
+            return;
+        };
+        // The same slot `apply_work` arms: it is how the thread tearing this
+        // one down cuts short whatever statement the coordinator is inside,
+        // which a command cannot do because this thread is the one that would
+        // read the command.
+        let _guard = db::InterruptGuard::arm(&self.reconcile_stop.interrupt, &conn);
+        match db::repo::row_count(&conn) {
+            Ok(n) => self.shared.lock().unwrap().files = Some(n as i64),
+            // Interrupted by a shutdown, or a torn index a run will rebuild.
+            // Either way the last figure is better than none.
+            Err(e) => crate::log_warn!("coordinator: file count unavailable: {}", e),
+        }
+    }
+
     fn refresh_last_full_index(&self) {
         match db::open_existing(&self.db_path(), false) {
             Ok(conn) => {

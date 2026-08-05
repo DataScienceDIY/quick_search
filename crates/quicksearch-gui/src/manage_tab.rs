@@ -944,6 +944,7 @@ mod tests {
             mode: IndexMode::Auto,
             activity: IndexingStatus::Idle,
             last_full_index: Some(0),
+            files: Some(0),
             queued_events: 0,
             watcher: WatcherStatus::Active { dirs: 10 },
             reconcile: None,

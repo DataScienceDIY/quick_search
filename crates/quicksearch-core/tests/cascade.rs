@@ -1072,6 +1072,213 @@ fn service_reports_missing_db_as_error() {
     service.shutdown();
 }
 
+/// Collect the names one search returns, or the error it produced.
+///
+/// The worker now keeps its connection between requests, so every test below
+/// runs *several* searches against one service — which is the situation the
+/// reuse has to survive, and the reason these are written against the service
+/// rather than against `cascade::run`.
+fn search_names(
+    service: &SearchService,
+    updates: &std::sync::mpsc::Receiver<SearchUpdate>,
+    query: &str,
+) -> Result<Vec<String>, String> {
+    let generation = service.search(query, SearchOptions::default());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut names = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match updates.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(SearchUpdate::Hits { generation: g, hits }) if g == generation => {
+                names.extend(hits.into_iter().map(|h| h.name));
+            }
+            Ok(SearchUpdate::Completed { generation: g, .. }) if g == generation => {
+                names.sort();
+                return Ok(names);
+            }
+            Ok(SearchUpdate::Error {
+                generation: g,
+                message,
+            }) if g == generation => return Err(message),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    panic!("search {:?} never completed", query);
+}
+
+/// The connection is reused across requests, so a service that has already
+/// searched must keep answering correctly rather than serving whatever its
+/// first query happened to warm.
+#[test]
+fn repeated_searches_on_one_service_stay_correct() {
+    let p = tmp_db("warmrepeat");
+    let mut s = Seeder::new(&p, true);
+    s.add("alpha.txt", "/d", 1, Some("alpha body"));
+    s.add("beta.txt", "/d", 1, Some("beta body"));
+    drop(s.done());
+
+    let (service, updates) = SearchService::new(p.clone(), Arc::new(|| {}));
+    for _ in 0..3 {
+        assert_eq!(
+            search_names(&service, &updates, "alpha").unwrap(),
+            vec!["alpha.txt"]
+        );
+        assert_eq!(
+            search_names(&service, &updates, "beta").unwrap(),
+            vec!["beta.txt"]
+        );
+    }
+    service.shutdown();
+
+    std::fs::remove_file(&p).ok();
+}
+
+/// The hazard the old per-request open made impossible, and the reason
+/// `db::index_epoch` exists: a rebuild replaces the file at the *same path*,
+/// so nothing about the path tells a held connection that it is now looking at
+/// a deleted inode.
+#[test]
+fn a_rebuilt_index_at_the_same_path_is_picked_up() {
+    let p = tmp_db("warmrebuild");
+    let mut s = Seeder::new(&p, true);
+    s.add("before.txt", "/d", 1, Some("shared body"));
+    drop(s.done());
+
+    let (service, updates) = SearchService::new(p.clone(), Arc::new(|| {}));
+    assert_eq!(
+        search_names(&service, &updates, "shared").unwrap(),
+        vec!["before.txt"],
+        "the pre-rebuild index answers first"
+    );
+
+    // A rebuild, spelled the way the coordinator spells one: delete the file
+    // and recreate it. `open_or_recreate` on the now-missing path takes its
+    // wipe branch, which is the real call site that bumps the epoch — so this
+    // exercises the actual invalidation rather than poking the counter.
+    for suffix in ["", "-wal", "-shm"] {
+        std::fs::remove_file(format!("{}{}", p.display(), suffix)).ok();
+    }
+    let mut s = Seeder::new(&p, true);
+    s.add("after.txt", "/d", 1, Some("shared body"));
+    drop(s.done());
+
+    assert_eq!(
+        search_names(&service, &updates, "shared").unwrap(),
+        vec!["after.txt"],
+        "a held connection served the replaced index"
+    );
+    service.shutdown();
+
+    std::fs::remove_file(&p).ok();
+}
+
+/// The other half of invalidation: the config points somewhere else entirely.
+#[test]
+fn set_db_path_repoints_a_held_connection() {
+    let first = tmp_db("warmpath1");
+    let mut s = Seeder::new(&first, true);
+    s.add("infirst.txt", "/d", 1, Some("shared body"));
+    drop(s.done());
+
+    let second = tmp_db("warmpath2");
+    let mut s = Seeder::new(&second, true);
+    s.add("insecond.txt", "/d", 1, Some("shared body"));
+    drop(s.done());
+
+    let (service, updates) = SearchService::new(first.clone(), Arc::new(|| {}));
+    assert_eq!(
+        search_names(&service, &updates, "shared").unwrap(),
+        vec!["infirst.txt"]
+    );
+
+    service.set_db_path(second.clone());
+    assert_eq!(
+        search_names(&service, &updates, "shared").unwrap(),
+        vec!["insecond.txt"],
+        "the connection stayed on the old index after the path moved"
+    );
+    service.shutdown();
+
+    std::fs::remove_file(&first).ok();
+    std::fs::remove_file(&second).ok();
+}
+
+/// A failed search drops the connection rather than putting it back, so one
+/// bad handle cannot wedge every search that follows it.
+#[test]
+fn a_failed_search_does_not_wedge_the_next_one() {
+    let p = tmp_db("warmrecover");
+    let (service, updates) = SearchService::new(p.clone(), Arc::new(|| {}));
+
+    search_names(&service, &updates, "anything").expect_err("no index yet");
+
+    let mut s = Seeder::new(&p, true);
+    s.add("arrived.txt", "/d", 1, Some("shared body"));
+    drop(s.done());
+
+    assert_eq!(
+        search_names(&service, &updates, "shared").unwrap(),
+        vec!["arrived.txt"],
+        "the failure left the worker unable to open the index that appeared"
+    );
+    service.shutdown();
+
+    std::fs::remove_file(&p).ok();
+}
+
+/// The connection is released once a search session goes quiet.
+///
+/// Not about memory here — it is about the two things an open handle costs
+/// that have nothing to do with the page cache: a deleted index keeps its
+/// blocks until the last handle closes, and an open reader stops SQLite from
+/// resetting the WAL. Checked through `/proc/self/fd` because "the file is no
+/// longer open" is the actual claim, and a reopen-still-works assertion would
+/// pass whether or not anything was ever released.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_connection_is_released_once_searching_stops() {
+    let p = tmp_db("warmrelease");
+    let mut s = Seeder::new(&p, true);
+    s.add("held.txt", "/d", 1, Some("shared body"));
+    drop(s.done());
+
+    let holds_index = || {
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return false;
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .any(|target| target == p)
+    };
+
+    let (service, updates) = SearchService::new_with_idle_release(
+        p.clone(),
+        Arc::new(|| {}),
+        std::time::Duration::from_millis(150),
+    );
+    assert_eq!(
+        search_names(&service, &updates, "shared").unwrap(),
+        vec!["held.txt"]
+    );
+    assert!(holds_index(), "the connection should be held across requests");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while holds_index() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!holds_index(), "the idle connection was never released");
+
+    // And the release must not be terminal: the next search reopens.
+    assert_eq!(
+        search_names(&service, &updates, "shared").unwrap(),
+        vec!["held.txt"]
+    );
+    service.shutdown();
+
+    std::fs::remove_file(&p).ok();
+}
+
 /// The point of the whole change: a pass hands hits over *while* it scans, so
 /// the UI has something to show long before the scan ends.
 ///

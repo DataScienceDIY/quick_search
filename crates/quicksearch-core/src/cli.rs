@@ -8,15 +8,22 @@
 //!
 //! # These are consumed from outside this repository
 //!
-//! QuickSearch is a sub-repo. Of everything here only [`index_counts`] has a
-//! caller in this tree (the GUI status bar); [`status_for_path`],
-//! [`list_failed`], [`index_size_breakdown`], [`pending_content_count`] and
-//! [`clear_path`] are called by the parent repository's Baloo compat daemon,
-//! which is what reports them to `balooctl` and mirrors them into LMDB.
+//! QuickSearch is a sub-repo, and **nothing in this module has a caller in
+//! this tree**. [`status_for_path`], [`list_failed`], [`index_size_breakdown`],
+//! [`pending_content_count`] and [`clear_path`] are called by the parent
+//! repository's Baloo compat daemon, which is what reports them to `balooctl`
+//! and mirrors them into LMDB.
 //!
 //! So they are **not dead code**, and their signatures are a compatibility
 //! surface rather than an internal detail: a search of this repository alone
 //! will not turn up the callers that break when one changes.
+//!
+//! There used to be an `index_counts` here as well, for the GUI's status bar.
+//! It ran three `COUNT(*)` scans — one of them unindexed — of which the
+//! frontend displayed one, on a thread and a connection opened afresh every
+//! five seconds. The surviving figure is published by
+//! [`crate::coordinator::IndexerState::files`] instead, off the connection the
+//! coordinator already has.
 //!
 //! One exception to the "query helpers" framing: [`clear_path`] mutates. It
 //! opens its own writer, which sidesteps the single-writer discipline the
@@ -204,29 +211,6 @@ pub fn pending_content_count(db_path: &str) -> Result<i64, String> {
         |r| r.get(0),
     )
     .map_err(|e| format!("pending_content_count: {}", e))
-}
-
-/// Cheap aggregate counts for the GUI's idle status bar ("N files
-/// indexed"). Callers cache the result; it's three COUNT scans, not
-/// something to run per frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexCounts {
-    pub files: i64,
-    pub content_done: i64,
-    pub content_pending: i64,
-}
-
-pub fn index_counts(db_path: &str) -> Result<IndexCounts, String> {
-    let conn = open_existing(db_path, false)?;
-    let count = |sql: &str| -> Result<i64, String> {
-        conn.query_row(sql, [], |r| r.get(0))
-            .map_err(|e| format!("index_counts: {}", e))
-    };
-    Ok(IndexCounts {
-        files: count("SELECT COUNT(*) FROM files")?,
-        content_done: count("SELECT COUNT(*) FROM files WHERE content_state = 1")?,
-        content_pending: count("SELECT COUNT(*) FROM files WHERE content_state = 0")?,
-    })
 }
 
 /// Remove a single file from the index. Returns whether a row was deleted.
