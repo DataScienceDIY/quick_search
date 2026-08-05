@@ -31,11 +31,12 @@ use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
-use crate::config::{Config, IgnoreSet};
+use crate::config::{diff_actions, Config, IgnoreSet, IndexWork};
 use crate::db;
 use crate::extract::Registry;
 use crate::incremental::apply_fs_event;
 use crate::indexing::{ConfigChange, IndexingService, IndexingStatus};
+use crate::scope::WorkCursor;
 use crate::watcher::{FsEvent, WatchError, WatchFilters, Watcher, WatcherConfig};
 
 /// Pending-event ceiling; beyond this a full run is cheaper than replay.
@@ -145,6 +146,7 @@ impl IndexCoordinator {
             last_event_at: None,
             pending_since: None,
             needs_full_run: false,
+            pending_work: None,
             saw_running: false,
             write_conn: None,
             ignore: Arc::new(IgnoreSet::compile(&[]).expect("empty ignore set")),
@@ -214,7 +216,7 @@ impl IndexCoordinator {
         config: &Config,
     ) -> Result<Option<Vec<ConfigChange>>, String> {
         let db = config.resolved_database_path();
-        let roots = joined_roots(config);
+        let roots: Vec<String> = config.normalized_indexing_paths().into_iter().collect();
         self.indexing
             .check_config_validation(&db.to_string_lossy(), config, &roots)
     }
@@ -236,17 +238,6 @@ impl Drop for IndexCoordinator {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-/// Newline-joined resolved roots — the shape `start_indexing` /
-/// `config_validation` store.
-fn joined_roots(config: &Config) -> String {
-    config
-        .resolved_indexing_paths()
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Fold `event` into the last-event-wins pending map. Renames split into
@@ -327,6 +318,13 @@ struct Inner {
     /// defer application past `pending_max_defer`.
     pending_since: Option<Instant>,
     needs_full_run: bool,
+    /// Reconciliation owed to a config change, part-applied across ticks.
+    ///
+    /// Deliberately not folded into `needs_full_run`: that flag also carries
+    /// watcher overflow and incremental failure, which must stay dormant in
+    /// manual mode, whereas a config change the user just made is acted on in
+    /// either mode.
+    pending_work: Option<WorkCursor>,
     /// A start was requested; set false once the service reports running,
     /// so idle-after-running transitions are detectable.
     saw_running: bool,
@@ -343,7 +341,17 @@ impl Inner {
             self.enter_auto();
         }
         loop {
-            match cmd_rx.recv_timeout(Duration::from_secs(1)) {
+            // Reconciliation is applied one slice per tick, so while any is
+            // owed the idle wait has to shrink or the slices are a second
+            // apart and a large index's prune stretches over minutes of wall
+            // clock. Coming straight back keeps the duty cycle high while
+            // still servicing every queued command between slices.
+            let idle = if self.pending_work.is_some() {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_secs(1)
+            };
+            match cmd_rx.recv_timeout(idle) {
                 Ok(CoordCmd::Shutdown) => break,
                 Ok(cmd) => self.handle_cmd(cmd),
                 Err(mpsc::RecvTimeoutError::Timeout) => self.tick(),
@@ -368,12 +376,22 @@ impl Inner {
             }
             CoordCmd::ConfigChanged(new) => {
                 let want_auto = new.indexing.auto_index;
+                let actions = diff_actions(&self.config, &new);
                 self.config = new;
                 if let Err(e) = self.reload_filters() {
                     crate::log_warn!("coordinator: {}", e);
                 }
                 // The write connection may point at an old database_path.
                 self.write_conn = None;
+                // A wipe stays the caller's decision — it is destructive and
+                // the GUI may have to ask first (see `rebuild_index`).
+                // Everything short of one this thread reconciles itself, in
+                // both modes and without asking: deleting rows the user just
+                // put out of scope is not a change to confirm, it is the
+                // change they made.
+                if !actions.requires_rebuild && !actions.work.is_empty() {
+                    self.start_work(actions.work);
+                }
                 if want_auto && self.mode != IndexMode::Auto {
                     // The mode lives in `auto_index`, so a config that
                     // disagrees with the running mode *is* a mode change.
@@ -389,6 +407,8 @@ impl Inner {
             CoordCmd::RebuildIndex => {
                 let db = self.db_path();
                 self.write_conn = None;
+                // Nothing to reconcile against once the file is gone.
+                self.pending_work = None;
                 if let Err(e) = self.indexing.delete_index_for_rebuild(&db) {
                     crate::log_warn!("coordinator: rebuild: {}", e);
                 }
@@ -402,6 +422,7 @@ impl Inner {
                 // missing index and rebuild what was just deleted.
                 self.enter_manual_stopped();
                 self.write_conn = None;
+                self.pending_work = None;
                 let db = self.db_path();
                 if let Err(e) = self.indexing.delete_index_for_rebuild(&db) {
                     crate::log_warn!("coordinator: clear index: {}", e);
@@ -441,6 +462,14 @@ impl Inner {
             }
         }
 
+        // Ahead of the mode gate: a config edit is reconciled in manual mode
+        // too. It may end by starting a run, which is why this cannot wait for
+        // the Auto-only scheduling below.
+        if self.pending_work.is_some() {
+            self.apply_work();
+            return;
+        }
+
         if self.mode != IndexMode::Auto {
             if self.mode == IndexMode::ManualStopped {
                 self.clear_pending();
@@ -478,6 +507,84 @@ impl Inner {
             // incremental full run (unchanged files skip on mtime).
             self.clear_pending();
             self.needs_full_run = true;
+        }
+    }
+
+    /// Queue reconciliation for a config change.
+    ///
+    /// A plan still in flight is folded in and restarted rather than dropped:
+    /// it was computed against the previous configuration, so the new one —
+    /// which diffs against that same previous config — cannot know what it
+    /// had left undone. Restarting re-does the finished half, which every
+    /// part of the pass is idempotent precisely so that it can.
+    fn start_work(&mut self, mut work: IndexWork) {
+        if let Some(outstanding) = self.pending_work.take() {
+            work.merge_from(outstanding.work());
+        }
+        match WorkCursor::new(work, &self.config) {
+            Ok(cursor) => self.pending_work = Some(cursor),
+            // Only an uncompilable ignore pattern gets here, and the GUI
+            // validates those before saving. Refusing to reconcile is the
+            // safe half: nothing is deleted on a filter nobody could build.
+            Err(e) => crate::log_warn!("coordinator: cannot reconcile config change: {}", e),
+        }
+    }
+
+    /// Advance the queued reconciliation by one slice, and start the full run
+    /// it asked for once it is finished.
+    fn apply_work(&mut self) {
+        let mut conn = match self.ensure_write_conn() {
+            Ok(conn) => conn,
+            Err(e) => {
+                // No index to reconcile: a run builds it under the new config
+                // anyway, which reaches the same place by a longer road.
+                crate::log_warn!("coordinator: reconcile unavailable ({}); scheduling run", e);
+                self.pending_work = None;
+                self.needs_full_run = true;
+                return;
+            }
+        };
+        let mut cursor = self.pending_work.take().expect("caller checked");
+        let outcome = crate::scope::advance(
+            &mut conn,
+            &self.config,
+            &self.registry,
+            &mut cursor,
+            Instant::now() + crate::scope::SLICE,
+        );
+        self.write_conn = Some(conn);
+        if let Err(e) = outcome {
+            // Abandoned rather than retried: the cursor is already dropped,
+            // and a database error that persists would otherwise spin this
+            // loop for the life of the process. The next full run reconciles
+            // from the stored fingerprint, which is the backstop for exactly
+            // this.
+            crate::log_warn!(
+                "coordinator: reconcile: {}; leaving it to the next indexing run",
+                e
+            );
+            return;
+        }
+        if !cursor.done() {
+            self.pending_work = Some(cursor);
+            return;
+        }
+        if cursor.deleted > 0 || cursor.recontented > 0 {
+            crate::log_info!(
+                "configuration change: {} index entries removed, {} re-examined \
+                 for text extraction",
+                cursor.deleted,
+                cursor.recontented
+            );
+        }
+        // Widening the configuration adds files that exist only on disk, so
+        // only a walk can produce their rows. `ReindexNow`'s exact behaviour,
+        // including the manual-mode round trip back to stopped.
+        if cursor.reindex() {
+            self.start_full_run();
+            if self.mode != IndexMode::Auto {
+                self.mode = IndexMode::ManualRunning;
+            }
         }
     }
 
@@ -666,6 +773,12 @@ impl Inner {
         self.config.indexing.auto_index = false;
         self.stop_watcher();
         self.clear_pending();
+        // Stopping means "no runs now", so a config change that also widened
+        // the scope loses its walk — but keeps its pruning. Deleting rows the
+        // user put out of scope is the edit they made, not indexing work.
+        if let Some(cursor) = self.pending_work.as_mut() {
+            cursor.cancel_reindex();
+        }
         let status = self.indexing.get_status();
         if !matches!(status, IndexingStatus::Idle | IndexingStatus::Error(_)) {
             // Signal only — waiting up to 5 s here would stall every
@@ -926,6 +1039,122 @@ mod tests {
             s.last_full_index.is_some() && s.mode == IndexMode::ManualStopped
         });
         assert_eq!(f.file_count(), 1);
+        coord.shutdown();
+    }
+
+    /// A narrowed filter is applied to the stored index without a prompt and
+    /// without a run — including in manual mode, where the user has said not
+    /// to index anything. Deleting entries they just excluded is not indexing
+    /// work; it is the edit they made.
+    #[test]
+    fn manual_mode_prunes_a_narrowed_filter_without_running() {
+        let f = Fixture::new(false);
+        std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
+        std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
+
+        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        coord.reindex_now();
+        wait_for("initial run", Duration::from_secs(20), || {
+            let s = coord.state();
+            s.last_full_index.is_some() && s.mode == IndexMode::ManualStopped && f.file_count() == 2
+        });
+        let stamped = coord.state().last_full_index;
+
+        // Appended, not replaced: dropping the default patterns at the same
+        // time would be a widening too, and this is about narrowing alone.
+        let mut narrowed = f.config.clone();
+        narrowed.indexing.ignore_patterns.push("*.log".into());
+        coord.apply_config(narrowed);
+
+        wait_for(
+            "the log entry to be pruned",
+            Duration::from_secs(20),
+            || f.file_count() == 1,
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            coord.state().mode,
+            IndexMode::ManualStopped,
+            "still stopped"
+        );
+        assert_eq!(
+            coord.state().last_full_index,
+            stamped,
+            "no run happened — narrowing needs no walk"
+        );
+        coord.shutdown();
+    }
+
+    /// Widening it does the opposite: nothing is deleted, and the walk that
+    /// finds the newly-eligible files starts on its own, returning manual mode
+    /// to stopped afterwards the way `reindex_now` does.
+    #[test]
+    fn manual_mode_reindexes_a_widened_filter_and_returns_to_stopped() {
+        let f = Fixture::new(false);
+        std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
+        std::fs::write(f.dir.join("later.log"), "arrives later").unwrap();
+
+        let mut narrowed = f.config.clone();
+        narrowed.indexing.ignore_patterns.push("*.log".into());
+        let coord = IndexCoordinator::start(narrowed.clone()).unwrap();
+        coord.reindex_now();
+        wait_for("initial run", Duration::from_secs(20), || {
+            let s = coord.state();
+            s.last_full_index.is_some() && s.mode == IndexMode::ManualStopped && f.file_count() == 1
+        });
+
+        coord.apply_config(f.config.clone());
+        wait_for(
+            "the widened walk to find it",
+            Duration::from_secs(20),
+            || f.file_count() == 2 && coord.state().mode == IndexMode::ManualStopped,
+        );
+        coord.shutdown();
+    }
+
+    /// Stopping is the user saying "no runs now", so a widening edit already
+    /// in flight loses its walk — but keeps the pruning half, which is not
+    /// indexing work.
+    #[test]
+    fn stopping_cancels_a_queued_walk_but_not_a_queued_prune() {
+        let f = Fixture::new(false);
+        std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
+        std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
+
+        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        coord.reindex_now();
+        wait_for("initial run", Duration::from_secs(20), || {
+            let s = coord.state();
+            s.last_full_index.is_some() && s.mode == IndexMode::ManualStopped && f.file_count() == 2
+        });
+        let stamped = coord.state().last_full_index;
+
+        // Narrow and widen at once: one new pattern to prune by, one root
+        // added to walk for. Turning auto off in the same edit is what makes
+        // the coordinator enter manual-stopped with the plan already queued.
+        let extra = f.dir.join("extra");
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(extra.join("new.txt"), "in the new root").unwrap();
+        let mut edited = f.config.clone();
+        edited.indexing.ignore_patterns.push("*.log".into());
+        edited
+            .paths
+            .indexing_paths
+            .push(extra.to_string_lossy().into_owned());
+        edited.indexing.auto_index = false;
+        coord.set_mode(IndexMode::ManualStopped);
+        coord.apply_config(edited);
+
+        wait_for("the prune to land", Duration::from_secs(20), || {
+            f.file_count() == 1
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            coord.state().last_full_index,
+            stamped,
+            "the walk the widening asked for was cancelled by the stop"
+        );
+        assert_eq!(f.file_count(), 1, "and the new root is still unindexed");
         coord.shutdown();
     }
 

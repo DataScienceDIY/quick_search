@@ -11,7 +11,7 @@ use crate::db::repo;
 use crate::extract::Registry;
 use crate::file_handling::{
     cleanup_stale_index_entries, count_tree_entries_fast, extract_scope_prepare,
-    fts_finalize_after_text_indexing, path_to_db_string, process_batch_inserts,
+    fts_finalize_after_text_indexing, normalize_root_string, process_batch_inserts,
     process_batch_updates, store_extracted, ExtractCursor, FileIndexAction, OwnedNewFile,
 };
 use crate::walk::{thread_count_for, walk_indexable_files, ParallelWalk, TryNext, WalkEvent};
@@ -518,10 +518,10 @@ impl IndexingService {
         &self,
         db_path: &str,
         config: &Config,
-        indexing_path: &str,
+        roots: &[String],
     ) -> Result<Option<Vec<ConfigChange>>, String> {
         match db::open_existing(db_path, false) {
-            Ok(conn) => Self::validate_config(&conn, config, indexing_path),
+            Ok(conn) => Self::validate_config(&conn, config, roots),
             Err(_) => Ok(None),
         }
     }
@@ -733,13 +733,24 @@ impl IndexingService {
         let worker_overrides = resolved_root_workers(config);
 
         // Open and migrate the database to the current schema version.
-        let conn = db::open_or_recreate(db_path, &config.processing.tokenize)?;
+        let mut conn = db::open_or_recreate(db_path, &config.processing.tokenize)?;
 
-        // Update configuration (for new installations or when no validation issues).
-        // `indexing_path` in the validation table stores the joined list so
-        // adding/removing a root triggers the same rebuild prompt as changing
-        // the legacy single path did.
-        Self::update_config(&conn, config, &roots.join("\n"))?;
+        // Reconcile against the settings the index was last written under,
+        // *before* stamping the new ones over them — the old record is the
+        // only thing that knows a root was dropped. This is what makes a
+        // config hand-edited while the app was closed behave like one edited
+        // live: the walk below handles narrowed ignore rules on its own (a
+        // filtered-out entry is simply absent from the directory listing it
+        // reconciles against), but nothing in it ever visits a root that is no
+        // longer configured, or revisits the content of a file whose mtime has
+        // not moved.
+        //
+        // Against `roots`, not `config.paths.indexing_paths`: the roots to
+        // walk are a parameter of this call, and nothing makes the caller
+        // pass the ones its config names. Reconciling against the config
+        // would then delete every row of the tree actually being indexed.
+        Self::reconcile_stored_config(&mut conn, config, &roots, stop_flag)?;
+        Self::update_config(&conn, config, &roots)?;
 
         // No up-front load of the whole `files` table: each walk's prefetcher
         // fetches one directory's rows at a time, so classification data is
@@ -1237,13 +1248,17 @@ impl IndexingService {
         Ok(())
     }
 
-    /// The config keys whose change invalidates the stored index, paired
-    /// with their current values. One list drives both [`validate_config`]
-    /// and [`update_config`] so the two can never drift apart.
-    fn config_validation_entries(
-        config: &Config,
-        indexing_path: &str,
-    ) -> Vec<(&'static str, String)> {
+    /// The settings the index was built under, paired with their current
+    /// values. One list drives [`validate_config`], [`update_config`] and
+    /// [`crate::scope::stored_config`], so the record, the comparison and the
+    /// reconstruction can never drift apart.
+    ///
+    /// Every list value is sorted before joining, and the roots arrive already
+    /// canonicalized: the record describes what the walk *did*, and reordering
+    /// or re-spelling a list does not change that. `stored_config` parses these
+    /// back, so a key added here becomes a key a hand-edited config can be
+    /// reconciled against.
+    fn config_validation_entries(config: &Config, roots: &[String]) -> Vec<(&'static str, String)> {
         let sorted_joined = |v: &[String]| {
             let mut v: Vec<String> = v.to_vec();
             v.sort();
@@ -1256,12 +1271,11 @@ impl IndexingService {
             // whenever the digest input changes so existing indexes are
             // offered a rebuild instead of silently mixing schemes.
             ("hash_algorithm", "size+head".to_string()),
-            ("indexing_path", normalize_root_string(indexing_path)),
+            ("indexing_path", sorted_joined(roots)),
             ("tokenize", config.processing.tokenize.clone()),
             ("include_hidden", config.indexing.include_hidden.to_string()),
             // Decides whether symlink targets are in the index at all, so a
-            // change leaves rows that no longer belong — the rebuild prompt has
-            // to be able to name it.
+            // change leaves rows that no longer belong.
             (
                 "follow_symlinks",
                 config.indexing.follow_symlinks.to_string(),
@@ -1274,21 +1288,48 @@ impl IndexingService {
                 "content_extensions",
                 sorted_joined(&config.indexing.content_extensions),
             ),
+            (
+                "store_text_for_snippets",
+                config.processing.store_text_for_snippets.to_string(),
+            ),
         ]
     }
 
-    /// Compare current config against the values stored in the index.
-    /// Returns `Some(changes)` when the index was built under settings
-    /// that no longer match — the caller offers a rebuild. A key absent
-    /// from the DB (older index) only counts as changed when the DB has
-    /// stored *any* validation state before.
+    /// Every recorded `config_validation` key, for
+    /// [`crate::scope::stored_config`] to rebuild the configuration the index
+    /// was last written under.
+    pub(crate) fn stored_validation(conn: &Connection) -> Result<Vec<(String, String)>, String> {
+        let mut stmt = conn
+            .prepare("SELECT key, value FROM config_validation")
+            .map_err(|e| format!("prepare config_validation read: {}", e))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| format!("read config_validation: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("read config_validation row: {}", e))
+    }
+
+    /// The recorded settings a difference in which cannot be reconciled: the
+    /// FTS tokenizer is part of the table definition, and a hash written under
+    /// a different length or algorithm cannot be compared with a new one.
+    /// Everything else `config_validation_entries` records is recoverable —
+    /// see [`crate::scope`] — and naming it in a rebuild prompt would be
+    /// asking the user to pay for a wipe that is not needed.
+    const REBUILD_KEYS: [&'static str; 3] = ["hash_length", "hash_algorithm", "tokenize"];
+
+    /// The settings the index was built under that no longer match and cannot
+    /// be reconciled — the list a rebuild prompt shows. `None` when there are
+    /// none. A key absent from the DB (older index) never counts as changed.
     fn validate_config(
         conn: &Connection,
         config: &Config,
-        indexing_path: &str,
+        roots: &[String],
     ) -> Result<Option<Vec<ConfigChange>>, String> {
         let mut changes = Vec::new();
-        for (key, current) in Self::config_validation_entries(config, indexing_path) {
+        for (key, current) in Self::config_validation_entries(config, roots)
+            .into_iter()
+            .filter(|(key, _)| Self::REBUILD_KEYS.contains(key))
+        {
             let stored: Option<String> = conn
                 .query_row(
                     "SELECT value FROM config_validation WHERE key = ?1",
@@ -1314,13 +1355,60 @@ impl IndexingService {
         })
     }
 
-    /// Stamp the index with the settings it's being built under.
-    fn update_config(
-        conn: &Connection,
+    /// Bring the index into line with `config` before a run walks anything.
+    ///
+    /// A no-op in the normal case: the coordinator already reconciled when the
+    /// config was edited, so the stored record matches and the plan is empty.
+    /// It earns its place for configs changed while the app was not running,
+    /// where nothing else ever compares the two.
+    ///
+    /// Runs to completion rather than under a deadline — the run owns the
+    /// database until it finishes anyway, and a caller waiting on the walk is
+    /// not a caller that would rather have a half-reconciled index.
+    fn reconcile_stored_config(
+        conn: &mut Connection,
         config: &Config,
-        indexing_path: &str,
+        roots: &[String],
+        stop_flag: &Arc<AtomicBool>,
     ) -> Result<(), String> {
-        for (key, current) in Self::config_validation_entries(config, indexing_path) {
+        // What this run is about to index, which is `config` everywhere except
+        // its roots — see the caller.
+        let mut current = config.clone();
+        current.paths.indexing_paths = roots.to_vec();
+
+        let stored = crate::scope::stored_config(conn, &current)?;
+        let work = crate::config::diff_actions(&stored, &current).work;
+        if !work.touches_index() {
+            return Ok(());
+        }
+        let registry = Registry::default_set();
+        let mut cursor = crate::scope::WorkCursor::new(work, &current)?;
+        while !cursor.done() {
+            if stop_flag.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            crate::scope::advance(
+                conn,
+                &current,
+                &registry,
+                &mut cursor,
+                Instant::now() + crate::scope::SLICE,
+            )?;
+        }
+        if cursor.deleted > 0 || cursor.recontented > 0 {
+            crate::log_info!(
+                "configuration changed since the last run: {} index entries removed, \
+                 {} re-examined for text extraction",
+                cursor.deleted,
+                cursor.recontented
+            );
+        }
+        Ok(())
+    }
+
+    /// Stamp the index with the settings it's being built under.
+    fn update_config(conn: &Connection, config: &Config, roots: &[String]) -> Result<(), String> {
+        for (key, current) in Self::config_validation_entries(config, roots) {
             conn.execute(
                 "INSERT OR REPLACE INTO config_validation (key, value) VALUES (?1, ?2)",
                 params![key, current],
@@ -1329,22 +1417,6 @@ impl IndexingService {
         }
         Ok(())
     }
-}
-
-/// Canonicalize a root string for storage/comparison, stripping the Windows
-/// UNC prefix. Multi-root strings (newline-joined) fail canonicalize and
-/// pass through verbatim, which still compares consistently.
-///
-/// The UNC strip is [`path_to_db_string`]'s, not a hand-rolled one: chopping
-/// four characters would turn `\\?\UNC\server\share` into
-/// `UNC\server\share`, which is not a path — and no longer looks like a
-/// share, so the root would walk with the local thread count instead of the
-/// network one.
-fn normalize_root_string(indexing_path: &str) -> String {
-    let path = std::path::Path::new(indexing_path)
-        .canonicalize()
-        .unwrap_or_else(|_| std::path::PathBuf::from(indexing_path));
-    path_to_db_string(&path)
 }
 
 impl Drop for IndexingService {

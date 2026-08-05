@@ -21,6 +21,12 @@ path = "src/main.rs"
 name = "quicksearch-cli"
 path = "src/cli_main.rs"
 
+[features]
+# Scripted self-capture driver used by packaging/capture.sh to regenerate the
+# website screenshots and screencasts. Adds no dependencies and is inert
+# unless QS_CAPTURE_SCRIPT is set at runtime.
+capture = []
+
 [dependencies]
 quicksearch-core = { path = "../quicksearch-core" }
 

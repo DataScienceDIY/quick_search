@@ -12,6 +12,7 @@ pub mod log;
 pub mod mime;
 pub mod platform;
 pub mod query;
+pub mod scope;
 pub mod search;
 pub mod security;
 pub mod shutdown;

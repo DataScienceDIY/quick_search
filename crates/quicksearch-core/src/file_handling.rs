@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 // Only the Unix entry-count path shells out; Windows walks the tree directly.
@@ -65,6 +65,26 @@ pub(crate) fn path_to_db_string(path: &Path) -> String {
     } else {
         s.into_owned()
     }
+}
+
+/// Canonicalize a root string for storage/comparison, stripping the Windows
+/// UNC prefix. Multi-root strings (newline-joined) fail canonicalize and
+/// pass through verbatim, which still compares consistently.
+///
+/// The UNC strip is [`path_to_db_string`]'s, not a hand-rolled one: chopping
+/// four characters would turn `\\?\UNC\server\share` into
+/// `UNC\server\share`, which is not a path — and no longer looks like a
+/// share, so the root would walk with the local thread count instead of the
+/// network one.
+///
+/// This is the spelling `files.path` rows are prefixed with, so it is also the
+/// form roots must be compared in: `~/docs` and `/home/me/docs` name one root
+/// and must not read as a change. See [`crate::config::diff_actions`].
+pub(crate) fn normalize_root_string(indexing_path: &str) -> String {
+    let path = Path::new(indexing_path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(indexing_path));
+    path_to_db_string(&path)
 }
 
 /// Warn and report `true` for a path that cannot round-trip through

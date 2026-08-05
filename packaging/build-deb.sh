@@ -7,7 +7,7 @@
 #   ./packaging/build-deb.sh --no-strip      keep debug symbols (25 MB vs 20 MB)
 #   ./packaging/build-deb.sh -o /tmp/out     write the .deb somewhere else
 #
-# Environment: DEB_REVISION (default 1), DEB_MAINTAINER, SOURCE_DATE_EPOCH.
+# Environment: DEB_MAINTAINER, SOURCE_DATE_EPOCH.
 #
 # Deliberately does not use cargo-deb, debhelper, fakeroot or an SVG rasteriser:
 # dpkg-deb and desktop-file-utils are the only tools required, and both are part
@@ -56,12 +56,13 @@ done
 version="$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' "$REPO_ROOT/Cargo.toml")"
 [ -n "$version" ] || die "could not read version from Cargo.toml"
 
-revision="${DEB_REVISION:-1}"
+# No Debian revision: QuickSearch is only ever packaged from its own source, so
+# the version is native (no hyphen) and the .deb is named for the crate version
+# alone, matching the Windows installer.
 maintainer="${DEB_MAINTAINER:-Jeremy <jeremy@karsttech.com>}"
 arch="$(dpkg --print-architecture)"
-deb_version="${version}-${revision}"
-stage="$out_dir/${PKG}_${deb_version}_${arch}"
-deb="$out_dir/${PKG}_${deb_version}_${arch}.deb"
+stage="$out_dir/${PKG}_${version}_${arch}"
+deb="$out_dir/${PKG}_${version}_${arch}.deb"
 
 # ---------------------------------------------------------------- build ----
 
@@ -132,14 +133,16 @@ if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
 else
     changelog_date="$(date -R)"
 fi
-gzip -9nc <<EOF > "$stage/usr/share/doc/$PKG/changelog.Debian.gz"
-$PKG ($deb_version) unstable; urgency=medium
+# changelog.gz, not changelog.Debian.gz: with a native version there is no
+# separate Debian revision to log, and policy puts the one changelog here.
+gzip -9nc <<EOF > "$stage/usr/share/doc/$PKG/changelog.gz"
+$PKG ($version) unstable; urgency=medium
 
   * Package build of $PKG $version.
 
  -- $maintainer  $changelog_date
 EOF
-chmod 644 "$stage/usr/share/doc/$PKG/changelog.Debian.gz"
+chmod 644 "$stage/usr/share/doc/$PKG/changelog.gz"
 
 # No config.toml is installed anywhere. Config::config_path() treats a
 # config.toml sitting next to the executable as portable mode and lets it
@@ -191,7 +194,7 @@ recommends="desktop-file-utils, xdg-utils, dbus-bin, xdg-desktop-portal"
 install -dm755 "$stage/DEBIAN"
 cat > "$stage/DEBIAN/control" <<EOF
 Package: $PKG
-Version: $deb_version
+Version: $version
 Section: utils
 Priority: optional
 Architecture: $arch

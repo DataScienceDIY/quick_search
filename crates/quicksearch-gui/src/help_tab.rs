@@ -109,16 +109,45 @@ pub fn ui(ui: &mut egui::Ui) {
             );
 
             ui.add_space(12.0);
-            ui.label(
-                egui::RichText::new(
-                    "Everything else — building from source, configuration, the \
-                     complete query reference — is covered in README.md in the \
-                     QuickSearch folder (installed under /usr/share/doc/quicksearch/ \
-                     on Debian and Ubuntu).",
-                )
-                .small()
-                .weak(),
-            );
+            ui.horizontal_wrapped(|ui| {
+                // The sentence is assembled from several widgets, so the
+                // spacing between them has to come from the text itself.
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let quiet = |text: &str| egui::RichText::new(text).small().weak();
+                ui.label(quiet(
+                    "Building from source, configuration, query structuring and more \
+                     are covered in ",
+                ));
+                if let Some(path) = readme_path() {
+                    let path = path.display().to_string();
+                    if ui
+                        .link(egui::RichText::new("README.md").small())
+                        .on_hover_text(&path)
+                        .clicked()
+                    {
+                        crate::platform::open_file(&path);
+                    }
+                } else {
+                    ui.label(quiet("README.md"));
+                }
+                ui.label(quiet("."));
+            });
         });
     crate::ui_util::more_below_hint(ui, &scroll);
+}
+
+/// Where this build left the README: under the install prefix's `share/doc`
+/// (the .deb puts it in `/usr/share/doc/quicksearch/`), beside the executable
+/// (the Windows installer and portable copies), or at the top of a build tree
+/// a few levels above `target/`.
+fn readme_path() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let installed = dir
+        .parent()
+        .map(|prefix| prefix.join("share/doc/quicksearch/README.md"));
+    installed
+        .into_iter()
+        .chain(dir.ancestors().take(4).map(|d| d.join("README.md")))
+        .find(|p| p.is_file())
 }

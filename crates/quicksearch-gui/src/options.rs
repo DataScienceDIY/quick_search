@@ -233,8 +233,9 @@ impl OptionsWindow {
                 });
                 ui.label(
                     egui::RichText::new(
-                        "Changes to tokenizer, filters, hidden files, or hashing \
-                         prompt an index rebuild.",
+                        "Narrowing a filter removes the entries it excludes; widening \
+                         one reindexes to find what it now allows. Only the tokenizer \
+                         and hash length require a full rebuild.",
                     )
                     .small()
                     .weak(),

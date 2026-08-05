@@ -2,3 +2,4 @@
 /dist
 *.db
 config.toml
+/packaging/captures/

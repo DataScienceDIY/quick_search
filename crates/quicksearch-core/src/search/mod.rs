@@ -15,6 +15,13 @@
 //!   phases like FTS candidate gathering). An interrupted stale search is
 //!   normal cancellation, not an error.
 //!
+//! The interrupt handle is stored tagged with the generation that owns it,
+//! and only ever fired at a generation the counter has already moved past.
+//! Interrupting the *current* generation would surface to the user as
+//! "Search failed: interrupted" instead of results, and the window for it
+//! is real: the worker can dequeue and start a request before the caller
+//! that queued it gets back onto the CPU.
+//!
 //! Consumers that want a plain blocking search (the CLI mode) skip the
 //! service entirely and call [`cascade::run`] with a collecting sink.
 
@@ -118,10 +125,16 @@ struct SearchRequest {
     options: SearchOptions,
 }
 
+/// The search the worker is executing right now, and the handle that kills
+/// its statement. Tagged with the generation so a caller can tell whether
+/// the thing it is about to interrupt is the search it means to cancel or
+/// one that has since replaced it.
+type InFlight = Arc<Mutex<Option<(u64, rusqlite::InterruptHandle)>>>;
+
 pub struct SearchService {
     req_tx: mpsc::Sender<SearchRequest>,
     latest_gen: Arc<AtomicU64>,
-    interrupt: Arc<Mutex<Option<rusqlite::InterruptHandle>>>,
+    in_flight: InFlight,
     db_path: Arc<Mutex<PathBuf>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -138,7 +151,7 @@ impl SearchService {
         let (req_tx, req_rx) = mpsc::channel::<SearchRequest>();
         let (update_tx, update_rx) = mpsc::channel::<SearchUpdate>();
         let latest_gen = Arc::new(AtomicU64::new(0));
-        let interrupt = Arc::new(Mutex::new(None));
+        let in_flight: InFlight = Arc::new(Mutex::new(None));
         let db_path = Arc::new(Mutex::new(db_path));
 
         let worker = Worker {
@@ -146,7 +159,7 @@ impl SearchService {
             update_tx,
             notify,
             latest_gen: latest_gen.clone(),
-            interrupt: interrupt.clone(),
+            in_flight: in_flight.clone(),
             db_path: db_path.clone(),
         };
         let handle = std::thread::Builder::new()
@@ -158,7 +171,7 @@ impl SearchService {
             SearchService {
                 req_tx,
                 latest_gen,
-                interrupt,
+                in_flight,
                 db_path,
                 handle: Some(handle),
             },
@@ -170,21 +183,22 @@ impl SearchService {
     /// generation whose events to keep.
     pub fn search(&self, input: &str, options: SearchOptions) -> u64 {
         let generation = self.latest_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        // Interrupt before enqueueing: an idle worker can dequeue the new
+        // request and be mid-statement within microseconds, and there is no
+        // point handing it a kill the worker has to survive.
+        self.interrupt_stale();
         let _ = self.req_tx.send(SearchRequest {
             generation,
             input: input.to_string(),
             options,
         });
-        // The new request can't be running yet (the worker hasn't dequeued
-        // it), so this only ever kills a stale generation's statement.
-        self.interrupt_current();
         generation
     }
 
     /// Cancel without starting anything new.
     pub fn cancel(&self) {
         self.latest_gen.fetch_add(1, Ordering::SeqCst);
-        self.interrupt_current();
+        self.interrupt_stale();
     }
 
     /// Point subsequent searches at a different index file.
@@ -193,10 +207,24 @@ impl SearchService {
         self.cancel();
     }
 
-    fn interrupt_current(&self) {
-        if let Ok(guard) = self.interrupt.lock() {
-            if let Some(handle) = guard.as_ref() {
-                handle.interrupt();
+    /// Kill the running statement — but only if the generation counter has
+    /// already moved past the search that owns it.
+    ///
+    /// Callers bump `latest_gen` first, so anything still tagged with an
+    /// older generation is stale by definition. The tag is what makes this
+    /// safe rather than merely well-timed: interrupting the *newest* search
+    /// does not cancel anything, it fails it, and the cascade reports that
+    /// as `Search failed: interrupted` because its own generation is still
+    /// current. On a loaded machine the worker really can pick up and start
+    /// a request before the thread that queued it runs again, so "the new
+    /// search cannot have started yet" is not an assumption to build on.
+    fn interrupt_stale(&self) {
+        let latest = self.latest_gen.load(Ordering::SeqCst);
+        if let Ok(guard) = self.in_flight.lock() {
+            if let Some((generation, handle)) = guard.as_ref() {
+                if *generation != latest {
+                    handle.interrupt();
+                }
             }
         }
     }
@@ -238,7 +266,7 @@ struct Worker {
     update_tx: mpsc::Sender<SearchUpdate>,
     notify: Arc<dyn Fn() + Send + Sync>,
     latest_gen: Arc<AtomicU64>,
-    interrupt: Arc<Mutex<Option<rusqlite::InterruptHandle>>>,
+    in_flight: InFlight,
     db_path: Arc<Mutex<PathBuf>>,
 }
 
@@ -291,7 +319,10 @@ impl Worker {
                 return;
             }
         };
-        *self.interrupt.lock().unwrap() = Some(conn.get_interrupt_handle());
+        // Publish the handle tagged with the generation it kills, before the
+        // first statement runs. Anyone cancelling from here on can tell this
+        // search apart from the one that supersedes it.
+        *self.in_flight.lock().unwrap() = Some((generation, conn.get_interrupt_handle()));
 
         let mut sink = |hits: Vec<SearchHit>| {
             self.send(SearchUpdate::Hits { generation, hits });
@@ -305,7 +336,7 @@ impl Worker {
             &mut sink,
         );
 
-        *self.interrupt.lock().unwrap() = None;
+        *self.in_flight.lock().unwrap() = None;
 
         match outcome {
             Ok(Some(Outcome { total, limited })) => self.send(SearchUpdate::Completed {
@@ -326,6 +357,91 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Start a query long enough to be killed while it is executing, on its
+    /// own thread. Returns the handle that kills it and the result channel.
+    fn spawn_slow_query() -> (
+        rusqlite::InterruptHandle,
+        mpsc::Receiver<rusqlite::Result<i64>>,
+    ) {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let handle = conn.get_interrupt_handle();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let counted = conn.query_row(
+                "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000) \
+                 SELECT count(*) FROM c",
+                [],
+                |row| row.get::<_, i64>(0),
+            );
+            let _ = tx.send(counted);
+        });
+        (handle, rx)
+    }
+
+    /// Cancel repeatedly for as long as the query runs, so every window in
+    /// which an interrupt could land is exercised rather than hoped past.
+    fn cancel_until_done(
+        service: &SearchService,
+        rx: &mpsc::Receiver<rusqlite::Result<i64>>,
+    ) -> rusqlite::Result<i64> {
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => service.interrupt_stale(),
+                Err(mpsc::RecvTimeoutError::Disconnected) => panic!("query thread died"),
+            }
+        }
+    }
+
+    fn idle_service() -> SearchService {
+        // Nothing is ever enqueued, so the path is never opened.
+        SearchService::new(PathBuf::from("/nonexistent"), Arc::new(|| {})).0
+    }
+
+    /// Typing the next character must not kill the search that character
+    /// started. The worker can be mid-statement on the newest generation by
+    /// the time the caller gets around to cancelling — on a slow machine that
+    /// is common, not exotic — and killing it there surfaces as
+    /// "Search failed: interrupted" instead of results.
+    #[test]
+    fn cancelling_spares_the_newest_generation() {
+        let service = idle_service();
+        let (handle, rx) = spawn_slow_query();
+        service.latest_gen.store(7, Ordering::SeqCst);
+        *service.in_flight.lock().unwrap() = Some((7, handle));
+
+        let result = cancel_until_done(&service, &rx);
+        *service.in_flight.lock().unwrap() = None;
+        assert_eq!(
+            result.ok(),
+            Some(1_000_000),
+            "the newest generation was interrupted"
+        );
+        service.shutdown();
+    }
+
+    /// The other half: a generation the counter has moved past still dies
+    /// promptly, which is what keeps a keystroke from waiting on the previous
+    /// query.
+    #[test]
+    fn cancelling_kills_a_superseded_generation() {
+        let service = idle_service();
+        let (handle, rx) = spawn_slow_query();
+        service.latest_gen.store(8, Ordering::SeqCst);
+        *service.in_flight.lock().unwrap() = Some((7, handle));
+
+        let err = cancel_until_done(&service, &rx)
+            .expect_err("a superseded generation must be interrupted");
+        *service.in_flight.lock().unwrap() = None;
+        assert_eq!(
+            err.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OperationInterrupted),
+            "unexpected error: {}",
+            err
+        );
+        service.shutdown();
+    }
 
     #[test]
     fn key_mismatch_is_never_classified_as_corruption() {

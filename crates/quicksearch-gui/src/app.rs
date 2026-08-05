@@ -25,7 +25,7 @@ use crate::search_tab::SearchTab;
 use crate::unlock::KeySource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Tab {
+pub(crate) enum Tab {
     Search,
     Manage,
     Duplicates,
@@ -114,6 +114,10 @@ pub struct QuickSearchApp {
     /// The guard resolved a Quit: let the next close request through.
     quit_confirmed: bool,
     config_error: Option<String>,
+    /// Scripted self-capture driver; `None` unless a `capture` build has
+    /// `QS_CAPTURE_SCRIPT` set. See [`crate::capture`].
+    #[cfg(feature = "capture")]
+    pub(crate) capture: Option<Box<crate::capture::CaptureDriver>>,
 }
 
 /// The two-step security flow: collect a password (enable/change), derive
@@ -209,6 +213,8 @@ impl QuickSearchApp {
             pending_nav: None,
             quit_confirmed: false,
             config_error,
+            #[cfg(feature = "capture")]
+            capture: crate::capture::CaptureDriver::from_env(),
         })
     }
 
@@ -267,24 +273,16 @@ impl QuickSearchApp {
                 .set_db_path(new.resolved_database_path());
             self.counts = None;
         }
+        // Everything the index can reconcile in place — pruning rows a
+        // narrowed filter put out of scope, re-deciding extracted text,
+        // walking for files a widened one brought in — the coordinator does
+        // on its own, in either mode and without asking. Only the three
+        // settings that leave the stored file unreadable get this far.
         self.backend.coordinator.apply_config(new.clone());
         if actions.requires_rebuild {
             if self.backend.coordinator.state().mode == IndexMode::Auto {
-                // Automatic mode is hands-off: reconcile immediately, no
-                // prompt. Root-only changes need just a full run — the
-                // walk indexes new roots and the stale sweep drops removed
-                // ones. Anything else (tokenizer, hashing, filters, hidden
-                // files) invalidates stored data and gets the real wipe.
-                let roots_only = {
-                    let mut probe = new.clone();
-                    probe.paths.indexing_paths = self.cfg.paths.indexing_paths.clone();
-                    !diff_actions(&self.cfg, &probe).requires_rebuild
-                };
-                if roots_only {
-                    self.backend.coordinator.reindex_now();
-                } else {
-                    self.backend.coordinator.rebuild_index();
-                }
+                // Automatic mode is hands-off: wipe and start over.
+                self.backend.coordinator.rebuild_index();
             } else {
                 let changes = self
                     .backend
@@ -510,10 +508,16 @@ impl QuickSearchApp {
                     }
                 }
 
-                // Right corner: search result count.
+                // Right corner: build id, then the search result count. In a
+                // right-to-left layout the first widget added is the rightmost,
+                // so the version is the fixed anchor and the count grows away
+                // from it rather than shoving it around.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(crate::version::BUILD_ID).small().weak())
+                        .on_hover_text(crate::version::BUILD_ID_HINT);
                     if self.tab == Tab::Search {
                         if let Some(label) = self.search.result_count_label() {
+                            ui.label(egui::RichText::new("·").small().weak());
                             ui.label(egui::RichText::new(label).small().weak());
                         }
                     }
@@ -551,7 +555,7 @@ impl QuickSearchApp {
                 ui.label("These settings differ from what the index was built with:");
                 ui.add_space(4.0);
                 if changes.is_empty() {
-                    ui.monospace("indexing settings changed");
+                    ui.monospace("the index cannot be read with the new settings");
                 }
                 for change in &changes {
                     ui.strong(format!("{}:", change.key));
@@ -568,8 +572,10 @@ impl QuickSearchApp {
                 }
                 ui.label(
                     egui::RichText::new(
-                        "A full rebuild applies them everywhere. Until then, existing \
-                         entries keep the old settings.",
+                        "Unlike folders, filters and hidden files — which are applied \
+                         to the existing index in place — these cannot be, so the \
+                         index has to be built again. Until it is, existing entries \
+                         keep the old settings.",
                     )
                     .small()
                     .weak(),
@@ -1077,6 +1083,44 @@ impl QuickSearchApp {
     }
 }
 
+/// State the scripted capture driver steers and waits on; see
+/// [`crate::capture`].
+#[cfg(feature = "capture")]
+impl QuickSearchApp {
+    /// Route through the same pending-nav path a click takes: `complete_nav`
+    /// resolves it at the end of this frame, so the Duplicates auto-scan
+    /// still fires and the unsaved-changes guard keeps its invariants
+    /// (capture scenarios never dirty an editor, so the guard never prompts).
+    pub(crate) fn capture_request_tab(&mut self, tab: Tab) {
+        if self.pending_nav.is_none() {
+            self.pending_nav = Some(NavIntent::SwitchTab(tab));
+        }
+    }
+
+    pub(crate) fn capture_indexing_status(&self) -> IndexingStatus {
+        self.backend.coordinator.state().activity
+    }
+
+    pub(crate) fn capture_search_settled(&self) -> bool {
+        self.search.capture_settled()
+    }
+
+    pub(crate) fn capture_dups_done(&self) -> bool {
+        matches!(self.dups.state, DupState::Loaded(_) | DupState::Error(_))
+    }
+
+    /// Empty the query through the same edit path typing uses, so the empty
+    /// search runs and the results table clears.
+    pub(crate) fn capture_clear_query(&mut self) {
+        self.search.query.clear();
+        self.search.pending_edit = Some(Instant::now());
+    }
+
+    pub(crate) fn capture_focus_search(&mut self) {
+        self.search.capture_focus();
+    }
+}
+
 /// Overwrite the fields a config draft must never carry back.
 ///
 /// Both are live state the GUI changes through their own controls — the
@@ -1213,6 +1257,11 @@ fn clamp_scale(scale: f32) -> f32 {
 
 impl eframe::App for QuickSearchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // First, so a command's effect is fully rendered before the next one
+        // starts, and `previous_tab` below sees pre-navigation state.
+        #[cfg(feature = "capture")]
+        self.capture_tick(ctx);
+
         self.drain_events();
         self.tick_debounce(ctx);
 

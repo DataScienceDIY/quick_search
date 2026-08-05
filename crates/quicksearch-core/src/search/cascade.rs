@@ -169,6 +169,15 @@ pub fn run(
             Ok(true) => {}
             Ok(false) => return Ok(None), // cancelled mid-pass
             Err(e) => {
+                // A kill from `interrupt()` arrives as an ordinary SQL error,
+                // and SQLite's interrupt flag carries no ordering edge to the
+                // generation counter the canceller bumped just before it. On a
+                // weakly-ordered CPU the plain load in `cancelled()` may still
+                // read the pre-bump value here, which would report routine
+                // cancellation as `Search failed: interrupted`. Fence first, so
+                // having seen the kill implies seeing the bump that caused it.
+                // Error path only — the per-row checks stay relaxed.
+                std::sync::atomic::fence(Ordering::Acquire);
                 if cx.cancelled() {
                     return Ok(None); // interrupt() killed the statement
                 }

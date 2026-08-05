@@ -32,6 +32,7 @@ FLAGS:
     --limit <N>     maximum results (default: [search].display_limit)
     --long          rank, size, mtime, and snippets instead of bare paths
     -h, --help      this help
+    -V, --version   version and the commit it was built from
 
 Query syntax matches the GUI: plain words form one phrase; filters like
 type:Document, modified:>=2024-01-01, path:/dir, mime:application/pdf,
@@ -54,8 +55,12 @@ variables are visible to other processes of the same user.";
 ///
 /// [`IndexCoordinator`]: quicksearch_core::coordinator::IndexCoordinator
 pub fn maybe_run_cli() -> Option<i32> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    run_cli(std::env::args().skip(1).collect())
+}
 
+/// The body of [`maybe_run_cli`], taking argv rather than reading it, so the
+/// flag surface can be exercised from tests.
+fn run_cli(args: Vec<String>) -> Option<i32> {
     let mut fuzzy = false;
     let mut long = false;
     let mut limit: Option<usize> = None;
@@ -66,6 +71,10 @@ pub fn maybe_run_cli() -> Option<i32> {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!("{}", USAGE);
+                return Some(0);
+            }
+            "-V" | "--version" => {
+                println!("QuickSearch {}", crate::version::BUILD_ID);
                 return Some(0);
             }
             "--fuzzy" => fuzzy = true,
@@ -372,6 +381,38 @@ mod tests {
 
     fn mismatch() -> Result<(), String> {
         Err(format!("{}wrong password", db::KEY_MISMATCH_PREFIX))
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// The flags that answer and exit without touching the index. Each must
+    /// report success, because a shell script asking `quicksearch --version`
+    /// reads the exit code, not the text.
+    #[test]
+    fn informational_flags_answer_and_succeed() {
+        for flag in ["-V", "--version", "-h", "--help"] {
+            assert_eq!(run_cli(argv(&[flag])), Some(0), "{flag} should exit 0");
+        }
+    }
+
+    /// Nothing to search for means "open the GUI", and that must survive the
+    /// new flag: `quicksearch` with no arguments is how most people start it.
+    #[test]
+    fn nothing_to_search_for_opens_the_gui() {
+        assert_eq!(run_cli(argv(&[])), None);
+        // Including flags the GUI stack might want for itself.
+        assert_eq!(run_cli(argv(&["--some-winit-flag"])), None);
+    }
+
+    /// A malformed value is a usage error, not a silent default — in both
+    /// spellings, since only one of them goes through `it.next()`.
+    #[test]
+    fn a_non_numeric_limit_is_a_usage_error() {
+        assert_eq!(run_cli(argv(&["--limit", "x", "term"])), Some(2));
+        assert_eq!(run_cli(argv(&["--limit=x", "term"])), Some(2));
+        assert_eq!(run_cli(argv(&["--limit"])), Some(2));
     }
 
     #[test]

@@ -150,6 +150,20 @@ impl SearchTab {
         self.pending_edit = Some(Instant::now());
     }
 
+    /// The query has executed and the fade/stage swap has landed — what the
+    /// capture driver's `wait_search_done` means by "done".
+    #[cfg(feature = "capture")]
+    pub(crate) fn capture_settled(&self) -> bool {
+        !self.running && self.pending_edit.is_none() && !self.swap_pending
+    }
+
+    /// Re-arm the one-shot first-frame focus: tab switches drop egui focus,
+    /// and injected text needs the caret back in the search box.
+    #[cfg(feature = "capture")]
+    pub(crate) fn capture_focus(&mut self) {
+        self.focus_query = true;
+    }
+
     /// A new search was submitted under `generation`. The previous
     /// results stay on screen (fading out); the new ones stage until the
     /// fade reaches zero.
@@ -1023,23 +1037,24 @@ fn centered_match_job(
     job
 }
 
-/// Tier-list chip color per cascade stage — lower rank, higher tier:
-/// S-red for exact case-sensitive filename matches down through the
-/// pastel ramp to purple for fuzzy full-text and on to the grey path
-/// tiers. Dark text on these pastels stays readable in both themes.
+/// Jet-colormap chip color per cascade stage — the rank reads as a
+/// colorbar: cool blue for the strongest matches, warming through cyan,
+/// green and yellow to red for the weakest path tiers. Pastel rather than
+/// true jet, since every channel stays at or above 127 so the chip's dark
+/// text keeps its contrast in both themes.
 fn rank_tier_color(stage: u8) -> egui::Color32 {
     match stage {
-        1 => egui::Color32::from_rgb(255, 127, 127),  // S
-        2 => egui::Color32::from_rgb(255, 191, 127),  // A
-        3 => egui::Color32::from_rgb(255, 223, 127),  // B
-        4 => egui::Color32::from_rgb(255, 255, 127),  // C
-        5 => egui::Color32::from_rgb(191, 255, 127),  // D
-        6 => egui::Color32::from_rgb(127, 255, 127),  // E
-        7 => egui::Color32::from_rgb(127, 191, 255),  // F
-        8 => egui::Color32::from_rgb(191, 127, 255),  // G
-        9 => egui::Color32::from_rgb(223, 159, 255),  // H — path, exact case
-        10 => egui::Color32::from_rgb(239, 191, 239), // I — path, any case
-        _ => egui::Color32::from_rgb(199, 199, 199),  // J — fuzzy path
+        1 => egui::Color32::from_rgb(127, 127, 255), // name exact, exact case
+        2 => egui::Color32::from_rgb(127, 178, 255), // name exact, any case
+        3 => egui::Color32::from_rgb(127, 229, 255), // name substring, exact case
+        4 => egui::Color32::from_rgb(127, 255, 229), // name substring, any case
+        5 => egui::Color32::from_rgb(127, 255, 178), // full text, exact case
+        6 => egui::Color32::from_rgb(127, 255, 127), // full text, any case
+        7 => egui::Color32::from_rgb(178, 255, 127), // fuzzy name
+        8 => egui::Color32::from_rgb(229, 255, 127), // fuzzy full text
+        9 => egui::Color32::from_rgb(255, 229, 127), // path substring, exact case
+        10 => egui::Color32::from_rgb(255, 178, 127), // path substring, any case
+        _ => egui::Color32::from_rgb(255, 127, 127), // fuzzy path
     }
 }
 
@@ -1382,5 +1397,42 @@ mod tests {
             );
             assert_eq!(dir_ignore_pattern(Path::new(r"C:\")), r"C:\*");
         }
+    }
+
+    /// The rank chips read as a jet colorbar: blue at the best ranks
+    /// warming monotonically to red at the worst, and never so dark that
+    /// the chip's fixed dark text loses its contrast. Stage 12 stands in
+    /// for the catch-all arm.
+    #[test]
+    fn the_rank_ramp_runs_blue_to_red_and_stays_light() {
+        let ramp: Vec<egui::Color32> = (1..=11).map(rank_tier_color).collect();
+        let (first, last) = (ramp[0], ramp[10]);
+        assert!(
+            first.b() > first.r(),
+            "the best rank should be blue: {first:?}"
+        );
+        assert!(
+            last.r() > last.b(),
+            "the worst rank should be red: {last:?}"
+        );
+
+        for pair in ramp.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            assert!(a.r() <= b.r(), "red must not cool off: {a:?} then {b:?}");
+            assert!(a.b() >= b.b(), "blue must not warm up: {a:?} then {b:?}");
+        }
+
+        for stage in 1..=12u8 {
+            let c = rank_tier_color(stage);
+            assert!(
+                c.r() >= 127 && c.g() >= 127 && c.b() >= 127,
+                "stage {stage} is too dark for the chip's dark text: {c:?}"
+            );
+        }
+        assert_eq!(
+            rank_tier_color(12),
+            last,
+            "out-of-range stages share the fuzzy-path chip"
+        );
     }
 }

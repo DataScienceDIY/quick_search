@@ -29,6 +29,12 @@ env:
   # cached target/ tree for nothing.
   CARGO_INCREMENTAL: '0'
   RUST_BACKTRACE: '1'
+  # Baked into the binaries by crates/quicksearch-gui/build.rs and shown in the
+  # GUI status bar, so a screenshot or a bug report identifies the exact build.
+  # Handed over rather than shelled out to git: checkout leaves a shallow clone
+  # this would otherwise have to trust, and the runner already knows the SHA.
+  # The version itself still comes from [workspace.package], as everywhere else.
+  QS_COMMIT: ${{ github.sha }}
 
 jobs:
   # ---------------------------------------------------------------- linux ----
@@ -238,9 +244,12 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update -qq
+          # nsis is what compiles the Windows installer, and it compiles it here
+          # rather than on Windows: makensis is a Linux binary that emits a PE,
+          # so both Windows assets come out of this one job.
           apt-get install -y --no-install-recommends \
             build-essential perl make pkg-config \
-            gcc-mingw-w64-x86-64 zip
+            gcc-mingw-w64-x86-64 zip nsis
 
       - name: Trust the workspace
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -288,6 +297,15 @@ jobs:
               fi
           done
 
+      - name: Build the installer
+        # --no-build reuses the binaries from the Build step rather than
+        # cross-compiling them a second time. The installer and the .zip below
+        # are alternatives, not a two-step download: the installer puts the app
+        # in Program Files with a Start menu entry and an uninstall entry, the
+        # .zip is the same binaries for anyone who wants them unpacked by hand
+        # or run portably.
+        run: ./packaging/build-installer.sh --no-build
+
       - name: Package the binaries
         run: |
           version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
@@ -313,7 +331,9 @@ jobs:
       - uses: actions/upload-artifact@v3-node20
         with:
           name: windows-x86_64
-          path: dist/*.zip
+          path: |
+            dist/*-setup.exe
+            dist/*.zip
           if-no-files-found: error
           retention-days: 14
 
