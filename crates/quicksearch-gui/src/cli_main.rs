@@ -12,6 +12,10 @@ mod format;
 // The GUI stores/deletes keychain entries; the CLI only reads them.
 #[allow(dead_code)]
 mod keychain;
+// The GUI also shows the build id in its status bar; --version is all the CLI
+// needs from it.
+#[allow(dead_code)]
+mod version;
 
 fn main() {
     // `maybe_run_cli` returns `None` for "no query given", which the combined

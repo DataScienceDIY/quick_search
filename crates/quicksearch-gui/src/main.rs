@@ -10,6 +10,8 @@
 
 mod app;
 mod backend;
+#[cfg(feature = "capture")]
+mod capture;
 #[cfg(not(windows))]
 mod cli;
 mod duplicates_tab;
@@ -25,6 +27,7 @@ mod search_tab;
 mod tracker;
 mod ui_util;
 mod unlock;
+mod version;
 
 use quicksearch_core::config::Config;
 

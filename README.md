@@ -21,6 +21,9 @@ the distribution's package manager via `sudo` (apt/dnf/pacman/zypper) and the
 Rust toolchain with rustup; `build.bat` uses winget and rustup. Both take
 `--check` to report dependency status without installing or building,
 `--no-run` to stop after the build, and `--` to pass the rest to the binary.
+`build.sh` also takes `--installer`, which adds NSIS and the mingw-w64 cross
+toolchain to what it installs and builds the Windows installer instead of
+launching anything — see [Install (Windows)](#install-windows).
 
 Building by hand needs a Rust toolchain plus, on every platform, a C toolchain
 and Perl: SQLCipher, zstd and OpenSSL are compiled from bundled C sources, and
@@ -63,15 +66,15 @@ and exit codes behave normally. On Unix `quicksearch` also does both, and
 
 ```sh
 ./packaging/build-deb.sh
-sudo apt install ./dist/quicksearch_0.1.0-1_amd64.deb
+sudo apt install ./dist/quicksearch_0.1.0_amd64.deb
 ```
 
 The script builds the release binary, strips it, and assembles a `.deb` with
 `dpkg-deb`. It needs no `cargo-deb`, no `debhelper` and no SVG rasteriser —
 only `dpkg-deb` and `desktop-file-utils`, both standard on Debian and Ubuntu.
 Useful flags: `--no-build` to package a binary you already built, `--no-strip`
-to keep debug symbols, `-o DIR` to write elsewhere. `DEB_REVISION` and
-`DEB_MAINTAINER` override the packaging revision and maintainer.
+to keep debug symbols, `-o DIR` to write elsewhere. `DEB_MAINTAINER` overrides
+the packaging maintainer.
 
 The package installs:
 
@@ -106,6 +109,76 @@ X11 takes the window icon from the embedded PNG. Wayland ignores it and
 matches the app id (`quicksearch`) against the installed
 `quicksearch.desktop`, so under Wayland the titlebar icon appears only once
 the package is installed.
+
+`quicksearch.ico` in the same directory bundles the 16–256px PNGs unchanged
+(one PNG-compressed entry per size) for the Windows installer, which uses it
+for the installer window, the shortcuts and the Add/Remove Programs entry.
+Regenerate it from the PNGs with Pillow: open each `quicksearch-N.png`,
+largest first, and `save(..., format="ICO", sizes=[...], append_images=rest)`
+— passing the images rather than one image and a size list is what keeps the
+committed pixels instead of resampling them.
+
+## Install (Windows)
+
+Download `quicksearch-<version>-windows-x86_64-setup.exe` from the release
+page and run it, or build it on a Linux machine:
+
+```sh
+./build.sh --installer           # installs the two extra packages first
+./packaging/build-installer.sh   # or straight to the build
+```
+
+That cross-compiles for `x86_64-pc-windows-gnu` and compiles the installer
+with NSIS, which runs on Linux — no Windows machine is involved, and CI
+produces the installer in the same job as the `.zip`. It needs `nsis` and
+`gcc-mingw-w64-x86-64` (`mingw32-nsis` and `mingw64-gcc` on Fedora, `nsis` and
+`mingw-w64-gcc` on Arch; on openSUSE both come from the `windows:mingw` OBS
+project, so `build.sh` names them and leaves the repository to you). The same
+flags as `build-deb.sh` apply: `--no-build` to package binaries you already
+built, `--no-strip`, `-o DIR`; after `--`, `build.sh --installer` passes them
+straight through.
+
+The install is per-machine and asks for elevation. Into
+`C:\Program Files\QuickSearch` go:
+
+| File | Contents |
+| --- | --- |
+| `quicksearch.exe` | the desktop app |
+| `quicksearch-cli.exe` | terminal search |
+| `quicksearch.ico` | icon for the shortcuts and Add/Remove Programs |
+| `README.md`, `LICENSE.txt`, `config_example.toml` | documentation |
+| `uninstall.exe` | written by the installer; Add/Remove Programs runs it |
+
+The components page offers a Start menu shortcut (on) and a desktop shortcut
+(off); both are created for all users. No `config.toml` is installed, for the
+same reason the `.deb` ships none — one next to the binaries is portable mode
+(see [Configuration](#configuration)) and would override the personal config
+of every account. The app writes `%APPDATA%\quicksearch\config.toml` on first
+run instead.
+
+Installing over an older version reuses wherever that one went, taken from its
+registry entry rather than guessed. Both the installer and the uninstaller
+stop with a message if QuickSearch is still running, since Windows will not
+replace a running executable and the alternative is a half-replaced install.
+
+Uninstalling removes what was installed and nothing else. The index in
+`%LOCALAPPDATA%\quicksearch` and the config in `%APPDATA%\quicksearch` stay,
+so reinstalling picks up the existing index; the program directory is removed
+only if empty, which leaves a portable-mode `config.toml` and its index alone.
+
+`PATH` is deliberately untouched — add `C:\Program Files\QuickSearch` to it
+yourself if you want `quicksearch-cli` on every prompt. It is an NSIS
+installer, so it takes `/S` for a silent install and `/D=` for the directory
+(last argument, unquoted):
+
+```bat
+quicksearch-0.9.1-windows-x86_64-setup.exe /S /D=C:\Tools\QuickSearch
+```
+
+The `.zip` on the release page is the alternative to all of this: the same two
+binaries, no registry entries and nothing to uninstall. Unpack it anywhere,
+and drop a `config.toml` next to the binaries to keep the config and index
+inside that folder.
 
 ## Usage
 
@@ -256,6 +329,23 @@ containing the binary, its config, and its index can be moved wholesale.
 
 The GUI edits the config live; external edits apply on next start.
 
+**Changing what is indexed** does not throw the index away. Narrowing the
+scope — removing a folder, adding an ignore pattern, turning off hidden
+files or symlink following, shortening `content_extensions` — deletes
+exactly the entries that fell out of scope, in place. Widening it — adding
+a folder, deleting a pattern, lengthening the extension list — schedules a
+reindex to find what is newly in scope. Both happen automatically, in
+automatic and manual mode alike, and neither asks first: it is the edit you
+just made. Order and spelling are not changes at all, so reordering the
+folder list or writing `~/docs` where you wrote `/home/you/docs` costs
+nothing.
+
+Only three settings still delete and rebuild the index, because nothing
+stored survives them: `processing.tokenize` (part of the FTS table's
+definition), `processing.hash_length` (existing hashes become
+incomparable), and turning password protection on or off or changing the
+password. In manual mode those ask for confirmation first.
+
 ## Engineering overview
 
 Two crates:
@@ -308,6 +398,20 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   checkpoint, VACUUM if the file has at least 10% slack to reclaim, `PRAGMA
   optimize`, checkpoint again. Progress streams through a polled
   `IndexingStatus`, which reads `Optimizing` for the duration of that pass.
+- **Scope reconciliation** (`scope.rs`): the index is a cache of what a walk
+  under the configured roots would produce, so a configuration change is a
+  difference between the two rather than a reason to start over.
+  `config::diff_actions` turns old-versus-new into an `IndexWork` plan —
+  roots to delete by path range, rows to re-test against the walker's own
+  filtering rules (`Scope::covers` mirrors `read_directory` exactly, or the
+  next run would re-add what the last prune removed), stored text to
+  re-decide, and whether a walk must follow. The coordinator applies it in
+  250 ms slices so a multi-million-row scan never blocks its command loop,
+  and every run applies it once more against the `config_validation`
+  fingerprint, which is what makes a config hand-edited while the app was
+  closed behave like one edited live. The scan is per-root, by `[lo, hi)`
+  range: a symlink target stored outside every root has no owning root and
+  therefore no rules that could be applied to it, so it is never visited.
 - **Coordinator** (`coordinator.rs`): the object binaries construct.
   Owns the `IndexingService`, the debouncing filesystem watcher
   (`watcher.rs`), and the mode state machine (Auto / Manual, persisted as
@@ -316,7 +420,8 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   events become single-file transactions (`incremental.rs`) that keep
   `files`, FTS, and the text sidecar consistent per commit; a full
   reindex runs on a configurable interval. Incremental writes defer while
-  a full run is active, so there is exactly one writer at a time.
+  a full run is active, so there is exactly one writer at a time — scope
+  reconciliation defers with them, for the same reason.
   Registration follows what the platform's notification API can do:
   inotify covers one directory per watch, so the roots are walked and each
   surviving directory registered individually (skipping `.git`,
@@ -396,16 +501,35 @@ pagination: the table is virtualized, so a single scroll list capped at
   crates, so the `--locked` build after it still fails on a dependency added or
   bumped without committing `Cargo.lock`. Once both
   build jobs are green, CI tags that commit `v<version>` and publishes a release
-  with the `.deb`, a Linux tarball and a Windows zip attached; pushing a `v*`
-  tag by hand does the same thing. The version is never taken from the branch
+  with the `.deb`, a Linux tarball, the Windows installer and a Windows zip
+  attached; pushing a `v*` tag by hand does the same thing. The version is never taken from the branch
   name, and a tag that already exists at a different commit aborts the release
-  rather than shipping two builds under one version. The Linux job runs in an Ubuntu
+  rather than shipping two builds under one version. Every build carries its
+  identity: `crates/quicksearch-gui/build.rs` bakes in the commit CI passes as
+  `QS_COMMIT`, and the pair shows up as `v<version> (<commit>)` in the
+  bottom-right of the status bar, from `quicksearch-cli --version`, and in the
+  Windows `.exe` properties. A build made outside a git checkout reads
+  `unknown` there rather than failing. The Linux job runs in an Ubuntu
   22.04 container on purpose — `packaging/build-deb.sh` reads the package's
   `libc6` floor from the binary it just built, so the builder's glibc becomes
   the package's minimum, and 22.04 pins it at 2.35. The Windows job
   cross-compiles with mingw-w64 and fails if either `.exe` picks up a
-  dependency on a non-system DLL.
+  dependency on a non-system DLL, then builds both Windows assets from those
+  binaries — `packaging/build-installer.sh` runs `makensis`, which is a Linux
+  program, so the installer needs no Windows runner either.
 - New extractors: implement `extract::Extractor` and register it in
   `Registry::default_set()` — order matters, the first extractor whose
   `supports` accepts a MIME wins. New cascade behavior: `search/cascade.rs`
   documents the rank invariants that keep streamed results append-only.
+- `packaging/capture.sh`: regenerates the website assets — `search.webm`,
+  `manage-indexing.webm`, `duplicates.png`, `query-highlight.png` — into
+  `packaging/captures/` (gitignored). It builds the GUI with the `capture`
+  feature, whose scripted driver types, switches tabs, waits on indexer
+  state, and captures both screenshots and video frames from the app's own
+  framebuffer (piped to ffmpeg), so the display server never matters — X11
+  and Wayland record identically, and overlapping windows can't leak into
+  the footage; `packaging/capture-scenario.txt` is the choreography and is
+  meant to be edited. Runs against a throwaway index of this repository plus
+  `~/.cargo/registry/src` under scratch XDG dirs, so your real config and
+  index are untouched. Needs a graphical session and ffmpeg with
+  `libx264rgb` and `libvpx-vp9`.

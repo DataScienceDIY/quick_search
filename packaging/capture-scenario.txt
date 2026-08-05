@@ -1,0 +1,55 @@
+# QuickSearch website-asset capture scenario, run by packaging/capture.sh.
+# Grammar and command list: crates/quicksearch-gui/src/capture.rs (feature
+# "capture"). Edit this file to re-choreograph the captures; timings are in
+# milliseconds and `max` caps bound clip length without failing the run.
+
+# The demo config sets [ui] scale = 1.5, so every window size here is 1.5x
+# the layout it shows: high-resolution captures of an unchanged layout.
+
+# --- 1. manage-indexing.webm: the fresh auto-index in progress -------------
+window 1400 980                   # full-size captures render at 1400x980
+wait_ms 800                       # the resize lands asynchronously
+tab manage
+wait_index_running max 15000      # the auto run starts moments after launch;
+                                  # the cap tolerates "already running"
+record_start manage-indexing
+wait_index_idle max 13000         # ~13 s of progress bars and files/sec,
+                                  # shorter if the run finishes early
+wait_ms 1500                      # linger on the completed state
+record_stop
+wait_index_idle                   # hard wait: the full index must exist
+                                  # before the search captures
+
+# --- 2. search.webm: slow typing, streaming full-text results --------------
+tab search
+focus_search                      # tab switches drop egui focus; re-arm it
+clear_query
+window 1120 750                   # compact clip: the smallest layout at
+                                  # which every results column still fits
+                                  # (any narrower clips the Match column
+                                  # away, defeating the demo), at 1.5x
+wait_ms 800                       # the resize lands asynchronously
+record_start search
+type "fn main" cps 4              # a phrase that lives in file bodies, not
+                                  # names -- results stream in with content
+                                  # snippets in the Match column
+wait_search_done max 8000
+wait_ms 2000
+record_stop
+window 1400 980                   # back to full size for the screenshots
+wait_ms 800
+
+# --- 3. query-highlight.png: syntax highlighting in the search box ---------
+clear_query
+wait_ms 300
+type "type:Text modified:>=2024-01-01 index" cps 30
+wait_search_done max 8000
+wait_ms 500                       # let the results fade settle
+screenshot query-highlight
+
+# --- 4. duplicates.png -----------------------------------------------------
+tab duplicates                    # entering the tab starts the scan
+wait_dups_done
+wait_ms 600
+screenshot duplicates
+quit

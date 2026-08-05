@@ -14,7 +14,7 @@
 //! |     2 | failed  |
 //! |     3 | not applicable (content only) |
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 
 use crate::mime::FileType;
 
@@ -270,12 +270,7 @@ pub fn delete_file_by_path(tx: &Transaction<'_>, path: &str) -> Result<bool, Str
 pub fn delete_subtree(tx: &Transaction<'_>, lo: &str, hi: &str) -> Result<usize, String> {
     // Every dependent table is keyed by the file id, so they share one
     // sub-select; `files` itself goes last, once nothing references it.
-    for (table, key) in [
-        ("searchabletext", "rowid"),
-        ("documents_text", "file_id"),
-        ("properties", "file_id"),
-        ("failed_files", "file_id"),
-    ] {
+    for (table, key) in DEPENDENT_TABLES {
         let sql = format!(
             "DELETE FROM {} WHERE {} IN \
              (SELECT id FROM files WHERE path >= ?1 AND path < ?2)",
@@ -289,6 +284,113 @@ pub fn delete_subtree(tx: &Transaction<'_>, lo: &str, hi: &str) -> Result<usize,
         .prepare_cached("DELETE FROM files WHERE path >= ?1 AND path < ?2")
         .and_then(|mut stmt| stmt.execute(params![lo, hi]))
         .map_err(|e| format!("delete files under {}: {}", lo, e))?;
+    Ok(removed)
+}
+
+/// Delete every row whose path falls in *none* of `ranges`, keeping the four
+/// dependent tables in step. Returns how many `files` rows went. An empty
+/// `ranges` deletes nothing.
+///
+/// The complement of [`delete_subtree`], for the one case that needs it:
+/// with `follow_symlinks` off, a file outside every configured root cannot be
+/// produced by any walk, so rows left there by a followed symlink are
+/// unreachable — no root's range covers them, so no scan will ever visit
+/// them again either. This is a scan of `files` rather than a seek, which is
+/// why it is reserved for that one transition instead of being the general
+/// prune.
+///
+/// An empty `ranges` means no roots are configured. Deleting everything would
+/// be the literal reading and is certainly not what a half-written config
+/// means, so it is a no-op.
+pub fn delete_outside_ranges(
+    tx: &Transaction<'_>,
+    ranges: &[(String, String)],
+) -> Result<usize, String> {
+    if ranges.is_empty() {
+        return Ok(0);
+    }
+    let mut predicate = String::new();
+    for i in 0..ranges.len() {
+        if i > 0 {
+            predicate.push_str(" AND ");
+        }
+        predicate.push_str(&format!(
+            "NOT (path >= ?{} AND path < ?{})",
+            i * 2 + 1,
+            i * 2 + 2
+        ));
+    }
+    let bounds: Vec<&String> = ranges.iter().flat_map(|(lo, hi)| [lo, hi]).collect();
+    for (table, key) in DEPENDENT_TABLES {
+        let sql = format!(
+            "DELETE FROM {} WHERE {} IN (SELECT id FROM files WHERE {})",
+            table, key, predicate
+        );
+        tx.prepare_cached(&sql)
+            .and_then(|mut stmt| stmt.execute(params_from_iter(bounds.iter())))
+            .map_err(|e| format!("delete {} outside the roots: {}", table, e))?;
+    }
+    let sql = format!("DELETE FROM files WHERE {}", predicate);
+    tx.prepare_cached(&sql)
+        .and_then(|mut stmt| stmt.execute(params_from_iter(bounds.iter())))
+        .map_err(|e| format!("delete files outside the roots: {}", e))
+}
+
+/// The tables a file id owns, in the order they must be cleared: everything
+/// keyed to `files.id` first, then `files` itself once nothing references it.
+///
+/// `searchabletext` is an FTS5 virtual table with no foreign key at all, so
+/// none of this can be left to `ON DELETE CASCADE` without splitting one rule
+/// across two mechanisms — half declarative, half manual, free to drift the
+/// moment someone opens a connection without `PRAGMA foreign_keys`. Shared by
+/// [`delete_subtree`] and [`delete_ids`] so the two ways of removing a file
+/// cannot disagree about what a file owns.
+const DEPENDENT_TABLES: [(&str, &str); 4] = [
+    ("searchabletext", "rowid"),
+    ("documents_text", "file_id"),
+    ("properties", "file_id"),
+    ("failed_files", "file_id"),
+];
+
+/// How many ids [`delete_ids`] binds into one statement.
+///
+/// Fixed so `prepare_cached` sees a bounded set of distinct SQL texts: every
+/// full chunk of a batch shares one statement and only the short final chunk
+/// varies, where a per-call length would mint a new prepared statement each
+/// time.
+const DELETE_IDS_CHUNK: usize = 512;
+
+/// Delete the given file ids and everything keyed to them, keeping FTS,
+/// `documents_text`, `properties` and `failed_files` in step. Returns how many
+/// `files` rows went.
+///
+/// The id counterpart to [`delete_subtree`], for rows chosen by a predicate no
+/// SQL range can express — a glob ignore pattern, say. Five statements per
+/// [`DELETE_IDS_CHUNK`] ids rather than five per file, which is the difference
+/// that lets a newly-added ignore pattern prune a large index instead of
+/// forcing a rebuild.
+pub fn delete_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<usize, String> {
+    let mut removed = 0;
+    for chunk in ids.chunks(DELETE_IDS_CHUNK) {
+        let mut placeholders = String::with_capacity(chunk.len() * 2);
+        for i in 0..chunk.len() {
+            if i > 0 {
+                placeholders.push(',');
+            }
+            placeholders.push('?');
+        }
+        for (table, key) in DEPENDENT_TABLES {
+            let sql = format!("DELETE FROM {} WHERE {} IN ({})", table, key, placeholders);
+            tx.prepare_cached(&sql)
+                .and_then(|mut stmt| stmt.execute(params_from_iter(chunk.iter())))
+                .map_err(|e| format!("delete {} for {} ids: {}", table, chunk.len(), e))?;
+        }
+        let sql = format!("DELETE FROM files WHERE id IN ({})", placeholders);
+        removed += tx
+            .prepare_cached(&sql)
+            .and_then(|mut stmt| stmt.execute(params_from_iter(chunk.iter())))
+            .map_err(|e| format!("delete {} file rows: {}", chunk.len(), e))?;
+    }
     Ok(removed)
 }
 
@@ -357,6 +459,99 @@ pub fn pending_content_page(
         .map_err(|e| format!("query pending content: {}", e))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read pending content row: {}", e))
+}
+
+/// A stored row as the scope reconciler sees it: enough to decide both
+/// whether the path is still in scope and whether its content still is.
+#[derive(Debug, Clone)]
+pub struct ScopeRow {
+    pub id: i64,
+    pub path: String,
+    pub size: u64,
+    pub mime: Option<String>,
+    pub content_state: i64,
+}
+
+/// One page of rows whose path is `> after` and `< hi`, in path order.
+///
+/// Keyset on `path` rather than on `id`: the range is already a seek on
+/// `UNIQUE(files.path)`, so paging by the same column keeps every page an
+/// index walk with no sort step, and — because the cursor only moves forward
+/// — a row is served at most once even though the caller is deleting behind
+/// the reader. Seed `after` with the range's `lo` bound, which is
+/// `root + separator` and so can never equal a stored path.
+pub fn rows_in_range_page(
+    conn: &Connection,
+    after: &str,
+    hi: &str,
+    limit: i64,
+) -> Result<Vec<ScopeRow>, String> {
+    let mut stmt = conn
+        .prepare_cached(
+            "SELECT id, path, size, mime, content_state FROM files
+              WHERE path > ?1 AND path < ?2
+              ORDER BY path
+              LIMIT ?3",
+        )
+        .map_err(|e| format!("prepare range page: {}", e))?;
+    let rows = stmt
+        .query_map(params![after, hi, limit], |row| {
+            Ok(ScopeRow {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                size: row.get::<_, i64>(2)?.max(0) as u64,
+                mime: row.get(3)?,
+                content_state: row.get(4)?,
+            })
+        })
+        .map_err(|e| format!("query range page after {}: {}", after, e))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("read range page row: {}", e))
+}
+
+/// Drop the stored text of the given file ids, leaving their FTS row and
+/// `files` row intact.
+///
+/// Turning `store_text_for_snippets` off means exactly this: full-text search
+/// keeps working from the FTS index, and only the snippet/occurrence source
+/// goes away. Re-extracting to achieve it would re-read every file for nothing.
+pub fn drop_stored_text(tx: &Transaction<'_>, ids: &[i64]) -> Result<usize, String> {
+    let mut removed = 0;
+    for chunk in ids.chunks(DELETE_IDS_CHUNK) {
+        let mut placeholders = String::with_capacity(chunk.len() * 2);
+        for i in 0..chunk.len() {
+            if i > 0 {
+                placeholders.push(',');
+            }
+            placeholders.push('?');
+        }
+        let sql = format!(
+            "DELETE FROM documents_text WHERE file_id IN ({})",
+            placeholders
+        );
+        removed += tx
+            .prepare_cached(&sql)
+            .and_then(|mut stmt| stmt.execute(params_from_iter(chunk.iter())))
+            .map_err(|e| format!("drop stored text for {} ids: {}", chunk.len(), e))?;
+    }
+    Ok(removed)
+}
+
+/// Put a file's content back in the pending queue without touching its row's
+/// metadata, clearing whatever the last extraction left behind.
+///
+/// For a config change that widens what gets extracted: the file itself has
+/// not changed, so `update_file_basic` would be wrong (it rewrites size, mtime
+/// and hash from a fresh stat), but its content must be produced again.
+pub fn reset_content_pending(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
+    remove_content_for_id(tx, file_id)?;
+    tx.prepare_cached("UPDATE files SET content_state = ?1, failure_msg = NULL WHERE id = ?2")
+        .and_then(|mut stmt| stmt.execute(params![STATE_PENDING, file_id]))
+        .map_err(|e| format!("reset content_state pending {}: {}", file_id, e))?;
+    tx.prepare_cached("DELETE FROM failed_files WHERE file_id = ?1")
+        .and_then(|mut stmt| stmt.execute(params![file_id]))
+        .map_err(|e| format!("clear failed_files {}: {}", file_id, e))?;
+    Ok(())
 }
 
 /// The stored mtime for one exact path, or `None` if it isn't indexed.
@@ -916,6 +1111,329 @@ mod tests {
             v
         };
         assert_eq!(survivors, vec!["/tree2/keep.txt", "/treeX/keep.txt"]);
+
+        drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Seed a database with `paths` as fully-indexed rows, each carrying an
+    /// FTS entry, stored text and a property. Returns `path -> id`.
+    fn seeded(conn: &mut Connection, paths: &[&str]) -> std::collections::HashMap<String, i64> {
+        let tx = conn.transaction().unwrap();
+        let mut ids = std::collections::HashMap::new();
+        for path in paths {
+            let name = path.rsplit('/').next().unwrap();
+            let parent = &path[..path.rfind('/').unwrap()];
+            let id = insert_file(
+                &tx,
+                &NewFile {
+                    name,
+                    path,
+                    parent,
+                    size: 1,
+                    mtime: 1,
+                    inode: None,
+                    device_id: None,
+                    mime: Some("text/plain"),
+                    ftype: FileType::TEXT,
+                    hash: None,
+                    needs_content: true,
+                },
+            )
+            .unwrap()
+            .expect("unique path");
+            set_content_done(
+                &tx,
+                id,
+                name,
+                "body text",
+                &[("k".into(), "v".into())],
+                true,
+            )
+            .unwrap();
+            ids.insert((*path).to_string(), id);
+        }
+        tx.commit().unwrap();
+        ids
+    }
+
+    /// The out-of-root sweep must keep every configured root's rows and take
+    /// everything else — including a path that merely *starts* with a root's
+    /// name, which is a different folder.
+    #[test]
+    fn delete_outside_ranges_keeps_exactly_the_configured_roots() {
+        let p = tmp_path();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        seeded(
+            &mut conn,
+            &[
+                "/roots/one/a.txt",
+                "/roots/one/deep/b.txt",
+                "/roots/two/c.txt",
+                "/roots/onefold/d.txt",
+                "/elsewhere/target.txt",
+            ],
+        );
+
+        let ranges: Vec<(String, String)> = ["/roots/one", "/roots/two"]
+            .iter()
+            .map(|r| {
+                let range = crate::file_handling::ExtractCursor::for_root(r);
+                (range.lo, range.hi)
+            })
+            .collect();
+        let removed = {
+            let tx = conn.transaction().unwrap();
+            let n = delete_outside_ranges(&tx, &ranges).unwrap();
+            tx.commit().unwrap();
+            n
+        };
+        assert_eq!(removed, 2, "the name-prefix sibling and the outsider");
+
+        let survivors: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT path FROM files ORDER BY path")
+                .unwrap();
+            let v = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            v
+        };
+        assert_eq!(
+            survivors,
+            vec![
+                "/roots/one/a.txt",
+                "/roots/one/deep/b.txt",
+                "/roots/two/c.txt"
+            ]
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM searchabletext", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM documents_text", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+
+        // No roots configured is a half-written config, not an instruction to
+        // delete the entire index.
+        let tx = conn.transaction().unwrap();
+        assert_eq!(delete_outside_ranges(&tx, &[]).unwrap(), 0);
+        tx.commit().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+
+        drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// `delete_ids` is what a newly-added ignore pattern prunes with, and a
+    /// file is only really gone when its name row, its FTS postings, its
+    /// stored text, its properties and any failure record all go. A survivor
+    /// in any one of them keeps the file findable, which is the whole thing
+    /// the user asked to stop.
+    #[test]
+    fn delete_ids_clears_every_dependent_table() {
+        let p = tmp_path();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        let ids = seeded(
+            &mut conn,
+            &["/t/a.txt", "/t/b.log", "/t/deep/c.log", "/t/keep.txt"],
+        );
+        {
+            let tx = conn.transaction().unwrap();
+            set_content_failed(&tx, ids["/t/deep/c.log"], "bad parse").unwrap();
+            tx.commit().unwrap();
+        }
+
+        let doomed = vec![ids["/t/b.log"], ids["/t/deep/c.log"]];
+        let removed = {
+            let tx = conn.transaction().unwrap();
+            let n = delete_ids(&tx, &doomed).unwrap();
+            tx.commit().unwrap();
+            n
+        };
+        assert_eq!(removed, 2);
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM files"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM searchabletext"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM documents_text"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM properties"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM failed_files"), 0);
+
+        // The FTS index really lost them, not just the `files` row: a
+        // contentless table keeps serving deleted rowids without the tombstone.
+        let hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH 'body'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 2);
+
+        // Empty input is a no-op, not a statement with an empty `IN ()`.
+        let tx = conn.transaction().unwrap();
+        assert_eq!(delete_ids(&tx, &[]).unwrap(), 0);
+        tx.commit().unwrap();
+
+        drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// More ids than `DELETE_IDS_CHUNK`, so the short final chunk and the
+    /// full ones both run — the boundary a fixed-size placeholder list makes
+    /// easy to get wrong.
+    #[test]
+    fn delete_ids_spans_chunk_boundaries() {
+        let p = tmp_path();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        let paths: Vec<String> = (0..DELETE_IDS_CHUNK + 7)
+            .map(|i| format!("/t/f{:05}.txt", i))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let ids = seeded(&mut conn, &refs);
+
+        let mut all: Vec<i64> = ids.values().copied().collect();
+        all.sort_unstable();
+        let keep = all.pop().unwrap();
+        let removed = {
+            let tx = conn.transaction().unwrap();
+            let n = delete_ids(&tx, &all).unwrap();
+            tx.commit().unwrap();
+            n
+        };
+        assert_eq!(removed, DELETE_IDS_CHUNK + 6);
+        let left: i64 = conn
+            .query_row("SELECT id FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, keep);
+
+        drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Dropping stored text must cost the file its snippets and nothing else:
+    /// the FTS postings are what full-text search runs on, and re-extracting
+    /// every file to turn a storage setting off would be absurd.
+    #[test]
+    fn drop_stored_text_keeps_the_file_searchable() {
+        let p = tmp_path();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        let ids = seeded(&mut conn, &["/t/a.txt", "/t/b.txt"]);
+
+        {
+            let tx = conn.transaction().unwrap();
+            drop_stored_text(&tx, &[ids["/t/a.txt"]]).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM documents_text"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM files"), 2);
+        assert_eq!(count("SELECT COUNT(*) FROM searchabletext"), 2);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH 'body'"),
+            2,
+            "both files still match on content"
+        );
+        assert_eq!(count("SELECT COUNT(*) FROM properties"), 2);
+
+        drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Re-queuing content leaves the row's metadata alone — the file has not
+    /// changed, the configuration has — but clears what the last extraction
+    /// produced, so a second pass cannot double-insert into the FTS table.
+    #[test]
+    fn reset_content_pending_clears_the_last_extraction() {
+        let p = tmp_path();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        let ids = seeded(&mut conn, &["/t/a.txt", "/t/b.txt"]);
+        let id = ids["/t/a.txt"];
+        {
+            let tx = conn.transaction().unwrap();
+            set_content_failed(&tx, ids["/t/b.txt"], "bad parse").unwrap();
+            tx.commit().unwrap();
+        }
+
+        {
+            let tx = conn.transaction().unwrap();
+            reset_content_pending(&tx, id).unwrap();
+            reset_content_pending(&tx, ids["/t/b.txt"]).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let row: (i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT content_state, mtime, failure_msg FROM files WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, STATE_PENDING);
+        assert_eq!(row.1, 1, "metadata untouched — the file did not change");
+        assert_eq!(row.2, None);
+
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM files"), 2, "rows stay");
+        assert_eq!(count("SELECT COUNT(*) FROM searchabletext"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM documents_text"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM properties"), 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM failed_files"),
+            0,
+            "a stale failure must not outlive the retry it was queued for"
+        );
+
+        drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// The reconciliation scan pages by path, so it must serve every row in
+    /// the range exactly once, in order, and stop at the range bound rather
+    /// than at a name prefix.
+    #[test]
+    fn rows_in_range_page_walks_the_range_once() {
+        let p = tmp_path();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        seeded(
+            &mut conn,
+            &[
+                "/t/a.txt",
+                "/t/deep/b.txt",
+                "/t/deep/deeper/c.txt",
+                "/t2/outside.txt",
+                "/tX/outside.txt",
+            ],
+        );
+
+        let range = crate::file_handling::ExtractCursor::for_root("/t");
+        let mut seen = Vec::new();
+        let mut after = range.lo.clone();
+        loop {
+            let page = rows_in_range_page(&conn, &after, &range.hi, 2).unwrap();
+            let Some(last) = page.last() else { break };
+            after = last.path.clone();
+            seen.extend(page.into_iter().map(|r| r.path));
+        }
+        assert_eq!(
+            seen,
+            vec!["/t/a.txt", "/t/deep/b.txt", "/t/deep/deeper/c.txt"],
+            "in path order, once each, and the prefix siblings are outside"
+        );
 
         drop(conn);
         std::fs::remove_file(&p).ok();

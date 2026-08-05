@@ -11,6 +11,9 @@
 [paths]
 # One or more directory roots to index. Walked in order; duplicate and
 # nested roots are de-duplicated automatically. `~` expands to home.
+# Adding a folder reindexes to pick it up; removing one deletes its entries
+# and leaves the rest of the index alone. Order and spelling do not matter:
+# "~/docs", "/home/you/docs" and "/home/you/docs/" are one folder.
 indexing_paths = ["~"]
 # SQLite index location. Default: ~/.local/share/quicksearch/index.sqlite
 # On Windows the default is %LOCALAPPDATA%\quicksearch\index.sqlite. Write
@@ -36,12 +39,13 @@ reindex_interval_minutes = 1440
 # files as well as at directories: with this off a symlink is not resolved at
 # all, so its target is never indexed — which matters because a target can
 # live outside every folder listed above. A resolved target is stored under
-# its own real path, not the link's. Changing this changes what is in the
-# index, so it prompts for a rebuild.
+# its own real path, not the link's. Turning this off removes the entries
+# that are no longer in scope; turning it on reindexes to find them.
 follow_symlinks = false
 # Index hidden files and directories. That means dot-files everywhere, and
 # additionally anything carrying the Hidden or System attribute on Windows
 # (AppData, $RECYCLE.BIN, System Volume Information, pagefile.sys ...).
+# Turning this off removes the hidden entries already indexed.
 include_hidden = false
 # Empty = extract text from every supported format. Non-empty = content
 # indexing only for these extensions; other files are still listed for
@@ -51,6 +55,9 @@ include_hidden = false
 # Inside an entry, "#" starts a comment that runs to its end, so entries may
 # be annotated or commented out:
 #   content_extensions = ["txt", "md # docs", "# pdf — too slow", "(none)"]
+# Narrowing this drops the stored text of the files it now excludes, leaving
+# them findable by name; widening it reindexes to extract the ones it now
+# allows. Order, case, a leading dot and comments make no difference.
 content_extensions = []
 # Excluded from the index entirely. A pattern without a separator matches
 # any single path component (so ".git" prunes whole subtrees); patterns
@@ -115,6 +122,8 @@ tokenize = "trigram"
 # Store extracted text (zstd-compressed) alongside the FTS index. Off:
 # the index shrinks to roughly stock-Baloo size, but search loses snippet
 # previews, occurrence ranking, case verification, and fuzzy full-text.
+# Turning it off discards the stored text immediately; turning it on
+# re-extracts, because the text of files already indexed was never kept.
 store_text_for_snippets = true
 
 [security]

@@ -355,6 +355,15 @@ impl ManageTab {
                         ui.colored_label(ui.visuals().error_fg_color, err);
                     }
                 });
+                ui.label(
+                    egui::RichText::new(
+                        "Removing a folder removes its entries and leaves the rest of \
+                         the index untouched; adding one reindexes to pick it up. \
+                         Neither rebuilds.",
+                    )
+                    .small()
+                    .weak(),
+                );
                 ui.separator();
 
                 // --- Filters ---------------------------------------------------
@@ -429,7 +438,9 @@ impl ManageTab {
                     crate::ui_util::pattern_hint_label(&mut cols[1], &self.new_ignore);
                     cols[1].label(
                         egui::RichText::new(
-                            "Changes apply on Apply & Save (may trigger index rebuild).",
+                            "Changes apply on Apply & Save. A new pattern removes the \
+                             entries it matches; removing one reindexes to bring them \
+                             back.",
                         )
                         .small()
                         .weak(),
@@ -576,9 +587,10 @@ fn db_size_tooltip(ui: &mut egui::Ui) {
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(
-            "The file does not shrink on its own: freed space is reused by the \
-             index rather than returned to the disk. To hand it back after \
-             narrowing the filters, use Clear index… and reindex.",
+            "Narrowing any of these removes the entries it excludes straight away, \
+             but the file does not shrink on its own: the freed space is reused by \
+             the index rather than returned to the disk, until an indexing run's \
+             optimize pass compacts it.",
         )
         .small()
         .weak(),

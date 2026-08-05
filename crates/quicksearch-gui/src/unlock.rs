@@ -83,6 +83,17 @@ impl eframe::App for Gate {
             app.on_exit(gl);
         }
     }
+
+    /// The scripted capture driver injects keystrokes and harvests
+    /// screenshots here, before egui sees the frame's input. While locked
+    /// there is nothing to drive; capture runs use an unprotected config, so
+    /// the gate is `Running` from the first frame.
+    #[cfg(feature = "capture")]
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if let Gate::Running(app) = self {
+            app.capture_raw_input(raw_input);
+        }
+    }
 }
 
 /// Try to unlock with the keychain before any window exists. `true` means
@@ -199,6 +210,18 @@ impl UnlockScreen {
                 }
             }
         }
+
+        // The lock screen owns the whole window and so has no status bar to
+        // carry the build id. Give it the same corner the unlocked app uses,
+        // so a screenshot of a machine that never got past the password is
+        // still identifiable. Declared before the central panel, as egui
+        // requires.
+        egui::TopBottomPanel::bottom("version-bar").show(ctx, |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(egui::RichText::new(crate::version::BUILD_ID).small().weak())
+                    .on_hover_text(crate::version::BUILD_ID_HINT);
+            });
+        });
 
         let mut submitted = false;
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -558,5 +581,36 @@ mod tests {
         screen.focus_password = true; // what the error path sets
         frame(&ctx, &mut screen);
         assert!(ctx.memory(|m| m.has_focus(pw_field_id())));
+    }
+
+    /// This screen is the whole window on a protected index, so the build id
+    /// in its corner is the only thing identifying a machine that never got
+    /// past the password. Assert it is painted rather than merely laid out —
+    /// a panel declared after the central one would compile and show nothing.
+    #[test]
+    fn the_lock_screen_shows_the_build_id() {
+        let ctx = egui::Context::default();
+        let mut screen = UnlockScreen::new(locked_config(), None, None);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            ..Default::default()
+        };
+
+        let out = ctx.run(input, |ctx| {
+            assert!(screen.update(ctx).is_none());
+        });
+
+        let painted = out.shapes.iter().any(|clipped| match &clipped.shape {
+            egui::epaint::Shape::Text(text) => text.galley.text() == crate::version::BUILD_ID,
+            _ => false,
+        });
+        assert!(
+            painted,
+            "{} is not painted on the lock screen",
+            crate::version::BUILD_ID
+        );
     }
 }

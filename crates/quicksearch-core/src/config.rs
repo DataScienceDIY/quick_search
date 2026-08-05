@@ -13,6 +13,7 @@
 //! watcher, repoint search).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -494,6 +495,21 @@ impl Config {
         }
     }
 
+    /// `resolved_indexing_paths` canonicalized and spelled the way
+    /// `files.path` prefixes them.
+    ///
+    /// The form roots must be compared in: `~/docs`, `docs` in a portable
+    /// config and `/home/me/docs` are one root under three spellings, and a
+    /// re-spelling is not a configuration change. Duplicates collapse, order
+    /// is not preserved — a caller that needs one uses
+    /// [`Config::resolved_indexing_paths`].
+    pub fn normalized_indexing_paths(&self) -> BTreeSet<String> {
+        self.resolved_indexing_paths()
+            .iter()
+            .map(|p| crate::file_handling::normalize_root_string(&p.to_string_lossy()))
+            .collect()
+    }
+
     /// `indexing_paths` with the same resolution rules as
     /// [`resolved_database_path`].
     pub fn resolved_indexing_paths(&self) -> Vec<PathBuf> {
@@ -664,15 +680,106 @@ impl IgnoreSet {
     }
 }
 
+/// What must happen to the *stored index* to bring it back in line with the
+/// configuration, short of deleting and rebuilding it.
+///
+/// Every field is independently satisfiable and the whole thing is
+/// idempotent: applying it twice does nothing the second time, which is what
+/// lets the same plan be produced from a live config edit and from the
+/// `config_validation` fingerprint of a config that was hand-edited while the
+/// app was closed. See [`crate::scope`] for the pass that applies it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IndexWork {
+    /// Roots that are no longer configured, in `files.path` spelling. Every
+    /// row beneath one is deleted; no filesystem access is involved, so a
+    /// root whose folder is gone is handled the same as one that still
+    /// exists.
+    pub drop_roots: Vec<String>,
+    /// The ignore/hidden rules narrowed. Stored rows under the surviving
+    /// roots are re-tested against them and the ones the walker would no
+    /// longer emit are deleted.
+    pub prune_scope: bool,
+    /// Symlink following was turned off. A followed target is stored under
+    /// its own canonical path, which can be outside every root; with links
+    /// off no walk can produce such a row, and no root's range would ever
+    /// visit it again, so every row outside the roots goes.
+    pub drop_aliases: bool,
+    /// The `content_extensions` filter changed. Kept rows are re-tested
+    /// against it in both directions: newly-included files go back to
+    /// pending, newly-excluded ones give up their text, properties and FTS
+    /// row but keep the name/path row that filename search needs.
+    pub reconcile_content: bool,
+    /// `store_text_for_snippets` turned on. Rows that finished extraction
+    /// under the old setting kept no text, so they must run again.
+    pub restore_text: bool,
+    /// `store_text_for_snippets` turned off. The stored text is dead weight
+    /// now; dropping it leaves full-text search working and only costs
+    /// snippets.
+    pub drop_text: bool,
+    /// Files that are newly in scope exist only on disk — nothing in the
+    /// index points at them, so a full walk has to go and find them.
+    pub reindex: bool,
+}
+
+impl IndexWork {
+    /// Whether there is nothing to do at all.
+    pub fn is_empty(&self) -> bool {
+        *self == IndexWork::default()
+    }
+
+    /// Fold `other` in, so one pass satisfies both.
+    ///
+    /// For a second config edit arriving while the first is still being
+    /// applied: the plans are computed against different configurations and
+    /// neither knows what the other left undone, so the union of the two is
+    /// the only thing that is certainly enough. Every part is idempotent, so
+    /// re-doing the finished half of the first costs time and nothing else.
+    pub fn merge_from(&mut self, other: &IndexWork) {
+        for root in &other.drop_roots {
+            if !self.drop_roots.contains(root) {
+                self.drop_roots.push(root.clone());
+            }
+        }
+        self.drop_aliases |= other.drop_aliases;
+        self.prune_scope |= other.prune_scope;
+        self.reconcile_content |= other.reconcile_content;
+        self.restore_text |= other.restore_text;
+        self.drop_text |= other.drop_text;
+        self.reindex |= other.reindex;
+    }
+
+    /// Whether any part of this touches stored rows, as opposed to only
+    /// asking for another walk.
+    pub fn touches_index(&self) -> bool {
+        !self.drop_roots.is_empty()
+            || self.drop_aliases
+            || self.prune_scope
+            || self.reconcile_content
+            || self.restore_text
+            || self.drop_text
+    }
+
+    /// Whether applying this means scanning the rows under each surviving
+    /// root, rather than just deleting whole ranges.
+    pub fn scans_rows(&self) -> bool {
+        self.prune_scope || self.reconcile_content || self.restore_text || self.drop_text
+    }
+}
+
 /// What running services must do after a config edit. Computed by the GUI
-/// (the only runtime editor) after saving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (the only runtime editor) after saving, and by the coordinator from the
+/// config it was already holding.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConfigActions {
-    /// The stored index no longer matches how it would be built — offer the
-    /// user a rebuild (mirrors the `config_validation` mechanism).
+    /// The stored file cannot be read or compared under the new
+    /// configuration and must be deleted and rebuilt from scratch. Reserved
+    /// for the three settings that leave no other option: the FTS tokenizer
+    /// (baked into the table definition), the hash length (stored hashes
+    /// become incomparable) and the encryption key.
     pub requires_rebuild: bool,
-    /// Watched roots or link semantics changed — restart the watcher.
-    pub restart_watcher: bool,
+    /// Reconciliation the index can do in place. Empty when
+    /// `requires_rebuild` is set — a wipe subsumes all of it.
+    pub work: IndexWork,
     /// Searches must reopen against a different database file.
     pub search_db_changed: bool,
 }
@@ -709,32 +816,113 @@ pub fn nested_roots(roots: &[String]) -> Vec<(String, String)> {
     out
 }
 
+/// The `content_extensions` entries that decide what a file is matched
+/// against, normalized the way [`content_allowed`] compares them: comments
+/// stripped, a leading dot optional, case-insensitive. Two lists with the
+/// same set here filter identically, however they are spelled or ordered.
+fn content_filter_set(list: &[String]) -> BTreeSet<String> {
+    content_filter_entries(list)
+        .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether `new` accepts everything `old` did and more.
+///
+/// An empty list means "no filter, everything allowed", so it is a superset
+/// of every other list rather than the empty set — the one case plain set
+/// arithmetic gets backwards.
+fn filter_widened(old: &BTreeSet<String>, new: &BTreeSet<String>) -> bool {
+    match (old.is_empty(), new.is_empty()) {
+        (_, true) => !old.is_empty(),
+        (true, false) => false,
+        (false, false) => new.difference(old).next().is_some(),
+    }
+}
+
+/// What an edit means for the running services and the stored index.
+///
+/// The guiding rule: a wipe is only for data that cannot be read or compared
+/// any more. Everything else is a difference between what the index holds and
+/// what the configuration would produce, and a difference can be reconciled —
+/// rows that fell out of scope are deleted ([`IndexWork::prune_scope`],
+/// [`IndexWork::drop_roots`]), rows whose content scope moved are re-tested
+/// ([`IndexWork::reconcile_content`]), and files that came *into* scope are
+/// found by another walk ([`IndexWork::reindex`]).
+///
+/// Roots, ignore patterns and content extensions are compared as **sets**
+/// after normalization, so reordering a list or re-spelling a root is not a
+/// change at all.
 pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
-    let roots_changed = old.paths.indexing_paths != new.paths.indexing_paths;
+    let old_roots = old.normalized_indexing_paths();
+    let new_roots = new.normalized_indexing_paths();
+
     // Encryption on↔off or a different salt (⇒ a different key) makes the
-    // on-disk file unreadable to the new configuration: rebuild. The GUI's
-    // security flows drive their own explicit rebuild dialog; this covers
-    // hand-edited configs applied through the generic path. `use_keychain`
-    // only changes where the key is remembered, not the file.
+    // on-disk file unreadable to the new configuration. The tokenizer is part
+    // of the FTS table's definition, and `hash_length` decides what bytes a
+    // stored hash covers, so old and new hashes cannot be compared. Those
+    // three are the whole of it; the GUI's security flows drive their own
+    // explicit dialog, and this covers hand-edited configs applied through
+    // the generic path. `use_keychain` only changes where the key is
+    // remembered, not the file.
     let requires_rebuild = old.processing.hash_length != new.processing.hash_length
         || old.processing.tokenize != new.processing.tokenize
-        || old.indexing.include_hidden != new.indexing.include_hidden
-        // Not merely a walk-behaviour knob: with links off, a symlink's target
-        // is not indexed at all, so turning it off leaves rows for files that
-        // are no longer in scope — including ones whose real parent lies
-        // outside every root, which no sweep will ever reach.
-        || old.indexing.follow_symlinks != new.indexing.follow_symlinks
-        || old.indexing.ignore_patterns != new.indexing.ignore_patterns
-        // Comments are not part of the filter, so annotating the list is not
-        // a reason to rebuild — only a change to what it actually matches is.
-        || !content_filter_entries(&old.indexing.content_extensions)
-            .eq(content_filter_entries(&new.indexing.content_extensions))
         || old.security.password_protected != new.security.password_protected
-        || old.security.salt != new.security.salt
-        || roots_changed;
+        || old.security.salt != new.security.salt;
+
+    let mut work = IndexWork::default();
+    if !requires_rebuild {
+        work.drop_roots = old_roots.difference(&new_roots).cloned().collect();
+
+        let old_ignores: BTreeSet<&str> = old
+            .indexing
+            .ignore_patterns
+            .iter()
+            .map(|s| s.trim())
+            .collect();
+        let new_ignores: BTreeSet<&str> = new
+            .indexing
+            .ignore_patterns
+            .iter()
+            .map(|s| s.trim())
+            .collect();
+
+        // Hidden files narrow the walk exactly the way an added ignore pattern
+        // does, so they take the same route.
+        work.prune_scope = new_ignores.difference(&old_ignores).next().is_some()
+            || (old.indexing.include_hidden && !new.indexing.include_hidden);
+
+        // Symlinks do not: a followed target is stored under its own canonical
+        // path, which is either inside a root — where a direct walk produces
+        // exactly the same row, so nothing changes — or outside every root,
+        // where turning links off strands it somewhere no walk and no
+        // per-root scan will ever look again.
+        work.drop_aliases = old.indexing.follow_symlinks && !new.indexing.follow_symlinks;
+
+        let old_content = content_filter_set(&old.indexing.content_extensions);
+        let new_content = content_filter_set(&new.indexing.content_extensions);
+        let content_widened = filter_widened(&old_content, &new_content);
+        work.reconcile_content = old_content != new_content;
+
+        let old_store = old.processing.store_text_for_snippets;
+        let new_store = new.processing.store_text_for_snippets;
+        work.restore_text = !old_store && new_store;
+        work.drop_text = old_store && !new_store;
+
+        // Widening only ever *adds* files, and a file that is not in the index
+        // is not findable from it: only a walk can produce those rows. Text
+        // that has to be extracted again needs a run for the same reason —
+        // the content pass runs as part of one.
+        work.reindex = new_roots.difference(&old_roots).next().is_some()
+            || old_ignores.difference(&new_ignores).next().is_some()
+            || (!old.indexing.include_hidden && new.indexing.include_hidden)
+            || (!old.indexing.follow_symlinks && new.indexing.follow_symlinks)
+            || content_widened
+            || work.restore_text;
+    }
+
     ConfigActions {
         requires_rebuild,
-        restart_watcher: requires_rebuild || roots_changed,
+        work,
         search_db_changed: old.paths.database_path != new.paths.database_path,
     }
 }
@@ -947,24 +1135,56 @@ mod tests {
         assert!(content_allowed(Path::new("/a/Makefile"), &all_comments));
     }
 
+    /// Comments, spelling and order are not part of the content filter, so
+    /// editing them is no work at all — and a real change to it is never a
+    /// rebuild, only a re-decision of the text already stored.
     #[test]
-    fn comment_only_edit_does_not_force_rebuild() {
+    fn comment_only_edit_is_no_work_at_all() {
         let mut old = Config::default();
         old.indexing.content_extensions = vec!["txt".into(), "md".into()];
-        let mut new = old.clone();
-        new.indexing.content_extensions =
-            vec!["# my notes".into(), "txt".into(), "md  # markdown".into()];
-        assert!(!diff_actions(&old, &new).requires_rebuild);
 
-        // Changing what the list matches still does.
-        let mut changed = old.clone();
-        changed.indexing.content_extensions = vec!["txt".into(), "md".into(), "(none)".into()];
-        assert!(diff_actions(&old, &changed).requires_rebuild);
+        for cosmetic in [
+            vec!["# my notes".into(), "txt".into(), "md  # markdown".into()],
+            vec!["md".into(), "txt".into()],
+            vec![".TXT".into(), ".Md".into()],
+        ] {
+            let mut new = old.clone();
+            new.indexing.content_extensions = cosmetic;
+            let a = diff_actions(&old, &new);
+            assert_eq!(a, ConfigActions::default(), "cosmetic edit is not a change");
+        }
 
-        // ... including commenting an entry out.
-        let mut disabled = old.clone();
-        disabled.indexing.content_extensions = vec!["txt".into(), "# md".into()];
-        assert!(diff_actions(&old, &disabled).requires_rebuild);
+        // Adding an extension widens the filter: files already indexed by
+        // name need their text extracted, which takes a run.
+        let mut widened = old.clone();
+        widened.indexing.content_extensions = vec!["txt".into(), "md".into(), "(none)".into()];
+        let a = diff_actions(&old, &widened);
+        assert!(!a.requires_rebuild);
+        assert!(a.work.reconcile_content && a.work.reindex);
+
+        // Commenting one out narrows it: the stored text goes, and nothing
+        // needs walking to make that true.
+        let mut narrowed = old.clone();
+        narrowed.indexing.content_extensions = vec!["txt".into(), "# md".into()];
+        let a = diff_actions(&old, &narrowed);
+        assert!(!a.requires_rebuild);
+        assert!(a.work.reconcile_content && !a.work.reindex);
+    }
+
+    /// An empty list means "everything allowed", so it is a superset of every
+    /// other list — the case plain set arithmetic reads backwards.
+    #[test]
+    fn an_empty_content_filter_is_the_widest_one() {
+        let mut listed = Config::default();
+        listed.indexing.content_extensions = vec!["txt".into()];
+        let mut unfiltered = listed.clone();
+        unfiltered.indexing.content_extensions = vec![];
+
+        let widening = diff_actions(&listed, &unfiltered).work;
+        assert!(widening.reconcile_content && widening.reindex);
+
+        let narrowing = diff_actions(&unfiltered, &listed).work;
+        assert!(narrowing.reconcile_content && !narrowing.reindex);
     }
 
     #[test]
@@ -1169,40 +1389,148 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// Only three settings may wipe the index: the FTS tokenizer, the hash
+    /// length and the encryption key. Anything else that reaches
+    /// `requires_rebuild` is a bug — it costs the user everything the index
+    /// took hours to learn.
     #[test]
-    fn diff_actions_matrix() {
+    fn only_unreadable_data_forces_a_rebuild() {
         let base = Config::default();
 
-        let same = diff_actions(&base, &base.clone());
-        assert_eq!(
-            same,
-            ConfigActions {
-                requires_rebuild: false,
-                restart_watcher: false,
-                search_db_changed: false
-            }
+        let mut tokenizer = base.clone();
+        tokenizer.processing.tokenize = "unicode61".into();
+        let mut hash = base.clone();
+        hash.processing.hash_length = base.processing.hash_length + 1;
+        let mut protect = base.clone();
+        protect.security.password_protected = true;
+        let mut salt = base.clone();
+        salt.security.salt = Some("00".repeat(16));
+
+        for c in [&tokenizer, &hash, &protect, &salt] {
+            let a = diff_actions(&base, c);
+            assert!(a.requires_rebuild, "must wipe");
+            assert!(
+                a.work.is_empty(),
+                "a wipe subsumes reconciliation; leaving work behind would run it \
+                 against a file that is about to be deleted"
+            );
+        }
+
+        // The keychain only decides where the key is remembered, not what the
+        // file was written with.
+        let mut keychain = base.clone();
+        keychain.security.use_keychain = true;
+        assert_eq!(diff_actions(&base, &keychain), ConfigActions::default());
+    }
+
+    /// Narrowing deletes; widening walks. Nothing here may wipe.
+    #[test]
+    fn diff_actions_matrix() {
+        let dir = tmp_dir();
+        let kept = dir.join("kept");
+        let dropped = dir.join("dropped");
+        fs::create_dir_all(&kept).unwrap();
+        fs::create_dir_all(&dropped).unwrap();
+        let (kept, dropped) = (
+            kept.to_string_lossy().into_owned(),
+            dropped.to_string_lossy().into_owned(),
         );
 
-        let mut c = base.clone();
-        c.processing.tokenize = "unicode61".into();
-        assert!(diff_actions(&base, &c).requires_rebuild);
+        let mut base = Config::default();
+        base.paths.indexing_paths = vec![kept.clone(), dropped.clone()];
+        base.indexing.ignore_patterns = vec!["node_modules".into()];
+        base.indexing.include_hidden = true;
+        base.indexing.follow_symlinks = true;
 
-        let mut c = base.clone();
-        c.indexing.ignore_patterns.push("*.log".into());
-        let a = diff_actions(&base, &c);
-        assert!(a.requires_rebuild && a.restart_watcher);
+        assert_eq!(diff_actions(&base, &base.clone()), ConfigActions::default());
 
-        // `follow_symlinks` decides what is in the index, not just how the walk
-        // moves, so it rebuilds as well as restarting the watcher.
+        // Removing a root: its rows are deleted by range, and no walk is
+        // needed to establish that they should go.
         let mut c = base.clone();
-        c.indexing.follow_symlinks = true;
+        c.paths.indexing_paths = vec![kept.clone()];
         let a = diff_actions(&base, &c);
-        assert!(a.requires_rebuild && a.restart_watcher);
+        assert!(!a.requires_rebuild);
+        assert_eq!(a.work.drop_roots, vec![dropped.clone()]);
+        assert!(!a.work.reindex && !a.work.prune_scope);
+
+        // Adding one: nothing stored is wrong, there is just more to find.
+        let a = diff_actions(&c, &base);
+        assert!(!a.requires_rebuild);
+        assert!(a.work.drop_roots.is_empty() && a.work.reindex && !a.work.prune_scope);
+
+        for (narrow, widen, what) in [
+            (
+                {
+                    let mut c = base.clone();
+                    c.indexing.ignore_patterns.push("*.log".into());
+                    c
+                },
+                {
+                    let mut c = base.clone();
+                    c.indexing.ignore_patterns.clear();
+                    c
+                },
+                "ignore patterns",
+            ),
+            (
+                {
+                    let mut c = base.clone();
+                    c.indexing.include_hidden = false;
+                    c
+                },
+                base.clone(),
+                "hidden files",
+            ),
+        ] {
+            let a = diff_actions(&base, &narrow);
+            assert!(!a.requires_rebuild, "{} must not wipe", what);
+            assert!(
+                a.work.prune_scope && !a.work.reindex,
+                "narrowing {} prunes and needs no walk",
+                what
+            );
+            let a = diff_actions(&narrow, &widen);
+            assert!(!a.requires_rebuild, "{} must not wipe", what);
+            assert!(
+                a.work.reindex && !a.work.prune_scope,
+                "widening {} walks and deletes nothing",
+                what
+            );
+        }
+
+        // Symlinks take their own route: with links on, a target inside a root
+        // is stored under exactly the path a direct walk would produce, so
+        // nothing in scope changes. What turning them off strands is the rows
+        // *outside* every root, which no per-root scan would ever revisit.
+        let mut no_links = base.clone();
+        no_links.indexing.follow_symlinks = false;
+        let a = diff_actions(&base, &no_links);
+        assert!(!a.requires_rebuild);
+        assert!(
+            a.work.drop_aliases && !a.work.prune_scope && !a.work.reindex,
+            "turning links off sweeps outside the roots and nothing else"
+        );
+        let a = diff_actions(&no_links, &base);
+        assert!(
+            a.work.reindex && !a.work.drop_aliases && !a.work.prune_scope,
+            "turning links on only adds"
+        );
+
+        // Stored text: turning it on means re-extracting, turning it off means
+        // throwing the blobs away — never a rebuild either way.
+        let mut off = base.clone();
+        off.processing.store_text_for_snippets = false;
+        let mut on = base.clone();
+        on.processing.store_text_for_snippets = true;
+        let a = diff_actions(&on, &off);
+        assert!(a.work.drop_text && !a.work.restore_text && !a.work.reindex);
+        let a = diff_actions(&off, &on);
+        assert!(a.work.restore_text && !a.work.drop_text && a.work.reindex);
 
         let mut c = base.clone();
         c.paths.database_path = "/elsewhere.sqlite".into();
         let a = diff_actions(&base, &c);
-        assert!(a.search_db_changed && !a.requires_rebuild);
+        assert!(a.search_db_changed && !a.requires_rebuild && a.work.is_empty());
 
         let mut c = base.clone();
         c.search.display_limit = 5000;
@@ -1210,28 +1538,92 @@ mod tests {
         c.processing.maximum_wal_size = 0;
         c.indexing.auto_index = false;
         c.indexing.reindex_interval_minutes = 5;
-        let a = diff_actions(&base, &c);
         assert_eq!(
-            a,
-            ConfigActions {
-                requires_rebuild: false,
-                restart_watcher: false,
-                search_db_changed: false
-            },
-            "soft knobs never force restarts"
+            diff_actions(&base, &c),
+            ConfigActions::default(),
+            "soft knobs are not index work"
         );
 
-        // Security: protection on↔off and salt changes rebuild; the
-        // keychain preference is a soft knob.
-        let mut c = base.clone();
-        c.security.password_protected = true;
-        assert!(diff_actions(&base, &c).requires_rebuild);
-        let mut c = base.clone();
-        c.security.salt = Some("00".repeat(16));
-        assert!(diff_actions(&base, &c).requires_rebuild);
-        let mut c = base.clone();
-        c.security.use_keychain = true;
-        assert!(!diff_actions(&base, &c).requires_rebuild);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A second edit landing while the first is still being applied must not
+    /// lose the first's work: the two plans are computed against different
+    /// configurations, so neither knows what the other left undone.
+    #[test]
+    fn merging_two_plans_loses_nothing() {
+        let first = IndexWork {
+            drop_roots: vec!["/gone".into(), "/shared".into()],
+            prune_scope: true,
+            drop_text: true,
+            ..IndexWork::default()
+        };
+        let second = IndexWork {
+            drop_roots: vec!["/shared".into(), "/also-gone".into()],
+            reconcile_content: true,
+            reindex: true,
+            ..IndexWork::default()
+        };
+
+        let mut merged = second.clone();
+        merged.merge_from(&first);
+        assert_eq!(
+            merged.drop_roots,
+            vec!["/shared", "/also-gone", "/gone"],
+            "every root from both, each once"
+        );
+        assert!(merged.prune_scope && merged.drop_text);
+        assert!(merged.reconcile_content && merged.reindex);
+
+        // Merging an empty plan changes nothing, and merging a plan into
+        // itself is the identity — both are what make a restart safe.
+        let mut untouched = first.clone();
+        untouched.merge_from(&IndexWork::default());
+        assert_eq!(untouched, first);
+        untouched.merge_from(&first);
+        assert_eq!(untouched, first);
+    }
+
+    /// Order and spelling are not configuration. Reordering the folder list,
+    /// reordering the ignore patterns, or writing a root a different way used
+    /// to wipe a multi-million-file index for nothing.
+    #[test]
+    fn respelling_a_list_is_not_a_change() {
+        let dir = tmp_dir();
+        let a_dir = dir.join("alpha");
+        let b_dir = dir.join("beta");
+        fs::create_dir_all(&a_dir).unwrap();
+        fs::create_dir_all(&b_dir).unwrap();
+
+        let mut base = Config::default();
+        base.paths.indexing_paths = vec![
+            a_dir.to_string_lossy().into_owned(),
+            b_dir.to_string_lossy().into_owned(),
+        ];
+        base.indexing.ignore_patterns = vec!["node_modules".into(), "*.tmp".into()];
+
+        let mut reordered = base.clone();
+        reordered.paths.indexing_paths.reverse();
+        reordered.indexing.ignore_patterns.reverse();
+        assert_eq!(diff_actions(&base, &reordered), ConfigActions::default());
+
+        // A trailing separator, a `.` hop and a duplicate entry all name the
+        // same two roots.
+        let mut respelled = base.clone();
+        respelled.paths.indexing_paths = vec![
+            format!("{}{}", a_dir.to_string_lossy(), std::path::MAIN_SEPARATOR),
+            b_dir.join(".").to_string_lossy().into_owned(),
+            a_dir.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(diff_actions(&base, &respelled), ConfigActions::default());
+
+        // Whitespace around an ignore pattern is trimmed before it compiles,
+        // so it cannot be a change either.
+        let mut padded = base.clone();
+        padded.indexing.ignore_patterns = vec!["  node_modules ".into(), "*.tmp".into()];
+        assert_eq!(diff_actions(&base, &padded), ConfigActions::default());
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1306,15 +1698,7 @@ mod tests {
         let base = Config::default();
         let mut c = base.clone();
         c.ui.watch_cap_warned_roots = vec!["/media/ApolloStore".to_string()];
-        let a = diff_actions(&base, &c);
-        assert_eq!(
-            a,
-            ConfigActions {
-                requires_rebuild: false,
-                restart_watcher: false,
-                search_db_changed: false
-            }
-        );
+        assert_eq!(diff_actions(&base, &c), ConfigActions::default());
     }
 
     #[test]

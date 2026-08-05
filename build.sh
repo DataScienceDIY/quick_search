@@ -8,6 +8,7 @@
 #   ./build.sh                 install what is missing, build release, launch
 #   ./build.sh --no-run        stop after the build
 #   ./build.sh --check         report dependency status; install and build nothing
+#   ./build.sh --installer     build the Windows installer instead of running
 #   ./build.sh -- <args>       pass everything after -- to the launched binary
 #
 # Anything the script does not recognise ends its own option parsing, so a bare
@@ -18,6 +19,13 @@
 # with rustup. Every stage is skipped when what it provides is already present,
 # so the everyday run costs one `cargo build`.
 # Other Unixes only get the Rust stage — see the README for their toolchains.
+#
+# --installer adds NSIS and the mingw-w64 cross toolchain to that list and hands
+# off to packaging/build-installer.sh, which cross-compiles and produces
+# dist/quicksearch-<version>-windows-x86_64-setup.exe. Arguments after -- go to
+# that script, so `./build.sh --installer -- --no-strip` works. It is opt-in
+# because neither tool has anything to do with building or running QuickSearch
+# here: an ordinary ./build.sh should not install a Windows installer compiler.
 set -e
 
 # Not `dirname`: a script whose job is to install missing tools should lean on
@@ -34,11 +42,14 @@ need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 do_run=1
 mode=run
+want_installer=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-run) do_run=0 ;;
         --check) mode=check ;;
+        # There is no Linux binary to launch at the end of an installer build.
+        --installer) want_installer=1; do_run=0 ;;
         # Print the header comment block, however long it grows.
         -h|--help) awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         --) shift; break ;;
@@ -94,24 +105,51 @@ check_deps() {
     need_cmd pkg-config || missing="$missing pkg-config"
     # curl is a build dependency only while rustup still has to be downloaded.
     if ! have_cargo && ! need_cmd curl; then missing="$missing curl"; fi
+    # Only for --installer: makensis compiles the .nsi into the installer, and
+    # the mingw-w64 gcc is the linker and the C compiler for the bundled
+    # SQLCipher, OpenSSL and zstd sources on the Windows target. It also brings
+    # in the cross binutils, which is where the windres the GUI's build script
+    # uses to compile the .exe version resource comes from. The Rust side
+    # needs nothing extra — rust-toolchain.toml already lists the target, so
+    # rustup installs it with the pinned toolchain.
+    if [ "$want_installer" = 1 ]; then
+        need_cmd makensis || missing="$missing makensis"
+        need_cmd x86_64-w64-mingw32-gcc || missing="$missing x86_64-w64-mingw32-gcc"
+    fi
 }
 
 # The tool -> package mapping, per package manager. Packages named twice (a
 # single build-essential covers both cc and make) are deduplicated by the caller.
+# Printing nothing means "this distribution has no package for it in its default
+# repositories", which the caller reports rather than guessing a name; the two
+# --installer tools are the only ones where that happens.
 packages_for() {
     case "$1:$2" in
         apt-get:cc|apt-get:make)  echo build-essential ;;
+        apt-get:makensis)         echo nsis ;;
+        apt-get:x86_64-w64-mingw32-gcc) echo gcc-mingw-w64-x86-64 ;;
         apt-get:*)                echo "$2" ;;
 
         dnf:cc)                   echo gcc gcc-c++ ;;
         dnf:pkg-config)           echo pkgconf-pkg-config ;;
+        # Fedora ships NSIS as part of its mingw stack, so the name looks
+        # cross-ish; makensis in it is a native Linux binary all the same.
+        dnf:makensis)             echo mingw32-nsis ;;
+        dnf:x86_64-w64-mingw32-gcc) echo mingw64-gcc ;;
         dnf:*)                    echo "$2" ;;
 
         pacman:cc|pacman:make)    echo base-devel ;;
         pacman:pkg-config)        echo pkgconf ;;
+        pacman:makensis)          echo nsis ;;
+        pacman:x86_64-w64-mingw32-gcc) echo mingw-w64-gcc ;;
         pacman:*)                 echo "$2" ;;
 
         zypper:cc)                echo gcc gcc-c++ ;;
+        # Neither NSIS nor the mingw toolchain is in the openSUSE distribution
+        # repositories — both live in the windows:mingw OBS project, which is a
+        # repository the user has to add and not something to do behind their
+        # back. Hence no mapping.
+        zypper:makensis|zypper:x86_64-w64-mingw32-gcc) ;;
         zypper:*)                 echo "$2" ;;
     esac
 }
@@ -161,10 +199,25 @@ ensure_system_deps() {
     [ -n "$pm" ] || die "missing build dependencies:$missing (no apt-get, dnf, pacman or zypper here — install them with your distribution's tools)"
 
     pkgs=''
+    unmapped=''
     for tool in $missing; do
-        pkgs="$pkgs $(packages_for "$pm" "$tool")"
+        mapped="$(packages_for "$pm" "$tool")"
+        if [ -n "$mapped" ]; then
+            pkgs="$pkgs $mapped"
+        else
+            unmapped="$unmapped $tool"
+        fi
     done
     pkgs="$(printf '%s\n' $pkgs | sort -u | tr '\n' ' ')"
+
+    if [ -n "$unmapped" ]; then
+        say "no package for$unmapped in this distribution's repositories — install it yourself, see the README"
+        # Nothing left to install means there is nothing to say beyond that.
+        if [ -z "$pkgs" ]; then
+            if [ "$mode" = run ]; then die "cannot continue without$unmapped"; fi
+            return 0
+        fi
+    fi
 
     can_install=1
     resolve_sudo || can_install=0
@@ -215,6 +268,14 @@ fi
 ensure_rust
 
 cd "$REPO_ROOT"
+
+# The installer build has its own cargo invocation — a different target, its own
+# staging and makensis - so there is nothing for the native build below to
+# contribute, and no Linux binary to launch afterwards.
+if [ "$want_installer" = 1 ]; then
+    exec "$REPO_ROOT/packaging/build-installer.sh" "$@"
+fi
+
 cargo build --release -p quicksearch-gui
 
 if [ "$do_run" = 0 ]; then
