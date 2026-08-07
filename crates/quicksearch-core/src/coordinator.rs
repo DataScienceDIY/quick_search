@@ -206,14 +206,17 @@ struct Shared {
 }
 
 impl IndexCoordinator {
-    pub fn start(config: Config) -> Result<IndexCoordinator, String> {
-        Self::start_with_watcher_config(config, WatcherConfig::default())
+    /// `notify` is called when this coordinator starts doing something the
+    /// frontend should be drawing; see [`Notify`].
+    pub fn start(config: Config, notify: Notify) -> Result<IndexCoordinator, String> {
+        Self::start_with_watcher_config(config, notify, WatcherConfig::default())
     }
 
     /// [`Self::start`] with explicit watcher debounce tuning (tests use
     /// short windows; the default 30 s throttle is right for real use).
     pub fn start_with_watcher_config(
         config: Config,
+        notify: Notify,
         watcher_config: WatcherConfig,
     ) -> Result<IndexCoordinator, String> {
         let indexing = Arc::new(IndexingService::new());
@@ -239,6 +242,8 @@ impl IndexCoordinator {
             config,
             indexing: indexing.clone(),
             shared: shared.clone(),
+            notify,
+            awake: false,
             reconcile_stop: reconcile_stop.clone(),
             event_tx,
             event_rx,
@@ -434,10 +439,22 @@ fn collapse_pending_removals(pending: &mut HashMap<PathBuf, FsEvent>) {
 /// multi-tick drain is visible rather than silent.
 const APPLY_BUDGET: Duration = Duration::from_millis(250);
 
+/// Wakes the frontend when this thread changes something worth drawing.
+///
+/// Same shape, and the same reason, as the one [`crate::search::SearchService`]
+/// takes: a reactive GUI paints on input and on request, and only this thread
+/// knows a run has begun.
+pub type Notify = Arc<dyn Fn() + Send + Sync>;
+
 struct Inner {
     config: Config,
     indexing: Arc<IndexingService>,
     shared: Arc<Mutex<Shared>>,
+    notify: Notify,
+    /// Last published value of the "something is moving" predicate, so
+    /// [`Inner::publish`] can wake the frontend on the rising edge instead of
+    /// every turn of the loop. See there for why the edge matters.
+    awake: bool,
     /// Read inside the reconciliation, set from the thread that shuts this
     /// one down; see [`ReconcileStop`].
     reconcile_stop: Arc<ReconcileStop>,
@@ -977,7 +994,17 @@ impl Inner {
         let last = self.shared.lock().unwrap().last_full_index;
         match last {
             None => true,
-            Some(last) => now_unix().saturating_sub(last) >= interval_secs,
+            Some(last) => {
+                let now = now_unix();
+                // A stamp ahead of the clock is not a schedule, it is a broken
+                // one: an NTP correction backwards, or an index carried over
+                // from a machine that was running fast. Subtracting would
+                // saturate to zero and read as "just indexed", suppressing the
+                // periodic reindex for as long as the skew lasted — days, in
+                // the case that produces the largest stamps. Due instead, which
+                // re-stamps it from this machine's clock and ends the problem.
+                now < last || now - last >= interval_secs
+            }
         }
     }
 
@@ -1195,14 +1222,6 @@ impl Inner {
         Ok(())
     }
 
-    /// Re-read the stamp the last completed full run left behind.
-    ///
-    /// A failure to open is deliberately *not* published as `None`. Only a
-    /// successful read means "never indexed", and `periodic_due` answers that
-    /// by starting a full run immediately — so treating a locked or
-    /// contended database as "never" would schedule a fresh run every tick
-    /// for as long as the condition lasts. Keeping the previous value leaves
-    /// the schedule where it was until a read succeeds.
     /// Re-read the published row count, at most every [`FILE_COUNT_INTERVAL`].
     ///
     /// Called only from the idle half of [`Inner::tick`], so it cannot run
@@ -1240,6 +1259,14 @@ impl Inner {
         }
     }
 
+    /// Re-read the stamp the last completed full run left behind.
+    ///
+    /// A failure to open is deliberately *not* published as `None`. Only a
+    /// successful read means "never indexed", and `periodic_due` answers that
+    /// by starting a full run immediately — so treating a locked or
+    /// contended database as "never" would schedule a fresh run every tick
+    /// for as long as the condition lasts. Keeping the previous value leaves
+    /// the schedule where it was until a read succeeds.
     fn refresh_last_full_index(&self) {
         match db::open_existing(&self.db_path(), false) {
             Ok(conn) => {
@@ -1266,10 +1293,36 @@ impl Inner {
                     .map(|(progress, _)| ReconcileState::Finished(progress))
             }
         };
+        let busy = reconcile.is_some()
+            || !matches!(
+                self.indexing.get_status(),
+                IndexingStatus::Idle | IndexingStatus::Error(_)
+            );
         let mut shared = self.shared.lock().unwrap();
         shared.mode = self.mode;
         shared.queued_events = self.pending.len();
         shared.reconcile = reconcile;
+        drop(shared);
+
+        // Wake the frontend when the work starts. A reactive GUI keeps itself
+        // painting for as long as it can see something moving, but only a frame
+        // that observes the movement can begin that chain — and the frame that
+        // would have observed the *first* one is the frame nothing asks for.
+        // The periodic reindex a fresh launch is due is exactly that case: the
+        // window has settled at "Idle; last full index: 2 days ago" by the time
+        // the first tick starts the run, and it stays there until the pointer
+        // happens to move over it.
+        //
+        // Edge-triggered, because this runs every turn of the loop and a
+        // level-triggered call would hold a repaint at the tick rate for as
+        // long as the work lasts — and, worse, cost a wake-up per second
+        // forever after `go_idle` has given the memory back. One repaint on the
+        // transition is enough; the frontend's own cadence takes over from that
+        // frame and is still running to catch the fall back to idle.
+        if busy && !self.awake {
+            (self.notify)();
+        }
+        self.awake = busy;
     }
 
     /// Must stay fast: it runs (transitively) on the GUI thread during
@@ -1332,6 +1385,17 @@ mod tests {
         panic!("timed out waiting for {}", what);
     }
 
+    /// A coordinator whose wake-up goes nowhere, which is what every test that
+    /// polls `state()` wants. The tests that are *about* the wake-up pass their
+    /// own sink; see `a_run_it_schedules_itself_wakes_the_frontend`.
+    fn start_coord(config: Config) -> IndexCoordinator {
+        IndexCoordinator::start(config, Arc::new(|| {})).unwrap()
+    }
+
+    fn start_coord_watching(config: Config, watcher: WatcherConfig) -> IndexCoordinator {
+        IndexCoordinator::start_with_watcher_config(config, Arc::new(|| {}), watcher).unwrap()
+    }
+
     struct Fixture {
         dir: PathBuf,
         db: PathBuf,
@@ -1374,6 +1438,30 @@ mod tests {
             )
             .ok()
         }
+
+        /// Leave a real, complete index on disk and stop — the state a
+        /// program that ran once and was closed leaves behind, and the
+        /// starting point for every test about what the *next* launch does.
+        ///
+        /// Runs off `reindex_now` rather than automatic mode so the seeding
+        /// is one run and not a schedule.
+        fn seed_index(&self) {
+            let mut manual = self.config.clone();
+            manual.indexing.auto_index = false;
+            let coord = start_coord(manual);
+            coord.reindex_now();
+            wait_for("seed index", Duration::from_secs(30), || {
+                coord.state().last_full_index.is_some()
+            });
+            coord.shutdown();
+        }
+
+        /// Rewrite the stamp the periodic scheduler measures against, as a
+        /// program that last finished indexing at `ts` would have left it.
+        fn stamp_last_index(&self, ts: u64) {
+            let conn = db::open_existing(&self.db.to_string_lossy(), true).unwrap();
+            db::repo::set_last_full_index(&conn, ts).unwrap();
+        }
     }
 
     impl Drop for Fixture {
@@ -1388,7 +1476,7 @@ mod tests {
         let f = Fixture::new(false);
         std::fs::write(f.dir.join("one.txt"), "manual mode content").unwrap();
 
-        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        let coord = start_coord(f.config.clone());
         assert_eq!(coord.state().mode, IndexMode::ManualStopped);
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(f.file_count(), -1, "no run without a command");
@@ -1417,7 +1505,7 @@ mod tests {
         }
         std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
 
-        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        let coord = start_coord(f.config.clone());
         coord.reindex_now();
         wait_for("initial run", Duration::from_secs(60), || {
             coord.state().last_full_index.is_some() && f.file_count() == 401
@@ -1457,7 +1545,7 @@ mod tests {
         std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
         std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
 
-        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        let coord = start_coord(f.config.clone());
         coord.reindex_now();
         wait_for("initial run", Duration::from_secs(20), || {
             let s = coord.state();
@@ -1501,7 +1589,7 @@ mod tests {
         std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
         std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
 
-        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        let coord = start_coord(f.config.clone());
         coord.reindex_now();
         wait_for("initial run", Duration::from_secs(20), || {
             let s = coord.state();
@@ -1543,7 +1631,7 @@ mod tests {
         std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
         std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
 
-        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        let coord = start_coord(f.config.clone());
         coord.reindex_now();
         wait_for("initial run", Duration::from_secs(20), || {
             let s = coord.state();
@@ -1589,7 +1677,7 @@ mod tests {
         std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
         std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
 
-        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        let coord = start_coord(f.config.clone());
         coord.reindex_now();
         wait_for("initial run", Duration::from_secs(20), || {
             let s = coord.state();
@@ -1639,7 +1727,7 @@ mod tests {
 
         let mut narrowed = f.config.clone();
         narrowed.indexing.ignore_patterns.push("*.log".into());
-        let coord = IndexCoordinator::start(narrowed.clone()).unwrap();
+        let coord = start_coord(narrowed.clone());
         coord.reindex_now();
         wait_for("initial run", Duration::from_secs(20), || {
             let s = coord.state();
@@ -1664,7 +1752,7 @@ mod tests {
         std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
         std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
 
-        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        let coord = start_coord(f.config.clone());
         coord.reindex_now();
         wait_for("initial run", Duration::from_secs(20), || {
             let s = coord.state();
@@ -1713,13 +1801,136 @@ mod tests {
         }
     }
 
+    /// The interval is measured against a stamp on disk, not against process
+    /// uptime, so the time the program spent closed counts toward it: come
+    /// back later than the interval and the reindex is owed on the first
+    /// tick, not an interval after the window opened.
+    #[test]
+    fn a_lapsed_stamp_starts_a_run_at_startup() {
+        let mut f = Fixture::new(false);
+        std::fs::write(f.dir.join("seed.txt"), "content").unwrap();
+        f.seed_index();
+
+        let stamped = now_unix() - 7200;
+        f.stamp_last_index(stamped);
+        f.config.indexing.auto_index = true;
+        f.config.indexing.reindex_interval_minutes = 1;
+
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
+        wait_for(
+            "a run without waiting out the interval",
+            Duration::from_secs(20),
+            || coord.state().last_full_index.is_some_and(|t| t > stamped),
+        );
+        coord.shutdown();
+    }
+
+    /// The other half of the same rule, and the one that keeps it from being
+    /// satisfied by "always run at startup": a stamp still inside the
+    /// interval is not due, and a launch must leave it alone.
+    #[test]
+    fn a_fresh_stamp_waits_out_the_interval() {
+        let mut f = Fixture::new(false);
+        std::fs::write(f.dir.join("seed.txt"), "content").unwrap();
+        f.seed_index();
+
+        let stamped = now_unix();
+        f.stamp_last_index(stamped);
+        f.config.indexing.auto_index = true;
+        f.config.indexing.reindex_interval_minutes = 600;
+
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            coord.state().last_full_index,
+            Some(stamped),
+            "a stamp inside the interval must not start a run"
+        );
+        coord.shutdown();
+    }
+
+    /// A clock corrected backwards by NTP, or an index carried over from a
+    /// machine that was running fast. The elapsed time is negative, and
+    /// subtracting saturates it to zero — which reads as "just indexed", so
+    /// without the guard the reindex is suppressed for as long as the skew
+    /// lasts rather than for the interval.
+    #[test]
+    fn a_stamp_from_the_future_is_treated_as_due() {
+        let mut f = Fixture::new(false);
+        std::fs::write(f.dir.join("seed.txt"), "content").unwrap();
+        f.seed_index();
+
+        let ahead = now_unix() + 86_400;
+        f.stamp_last_index(ahead);
+        f.config.indexing.auto_index = true;
+        f.config.indexing.reindex_interval_minutes = 600;
+
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
+        // The run re-stamps from *this* machine's clock, so the skew is not
+        // just ignored for one tick — it is gone.
+        wait_for(
+            "a run despite the future stamp",
+            Duration::from_secs(20),
+            || coord.state().last_full_index.is_some_and(|t| t < ahead),
+        );
+        coord.shutdown();
+    }
+
+    /// A reactive frontend paints on input and on request, and this thread is
+    /// the only one that knows a *scheduled* run began — nothing the user did
+    /// starts it. Without the wake-up the window keeps showing "Idle; last
+    /// full index: 2 days ago" while the run it should be reporting is
+    /// already going, until the pointer happens to move over it.
+    #[test]
+    fn a_run_it_schedules_itself_wakes_the_frontend() {
+        use std::sync::atomic::AtomicUsize;
+
+        let mut f = Fixture::new(false);
+        std::fs::write(f.dir.join("seed.txt"), "content").unwrap();
+        f.seed_index();
+
+        let stamped = now_unix() - 7200;
+        f.stamp_last_index(stamped);
+        f.config.indexing.auto_index = true;
+        f.config.indexing.reindex_interval_minutes = 1;
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let counter = wakes.clone();
+        let coord = IndexCoordinator::start_with_watcher_config(
+            f.config.clone(),
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }),
+            fast_watcher(),
+        )
+        .unwrap();
+
+        wait_for("the scheduled run", Duration::from_secs(20), || {
+            coord.state().last_full_index.is_some_and(|t| t > stamped)
+        });
+        let during = wakes.load(Ordering::Relaxed);
+        assert!(during > 0, "the run started without waking the frontend");
+
+        // And the wake is an edge into work, not a heartbeat. An idle
+        // coordinator still ticks once a second, and a wake per tick would
+        // hold a reactive frontend at a repaint per second forever — undoing
+        // exactly what `go_idle` is there to achieve. Well inside the one
+        // minute before this stamp comes due again.
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            during,
+            "an idle coordinator must not keep waking the frontend"
+        );
+        coord.shutdown();
+    }
+
     #[test]
     fn auto_mode_runs_initial_index_and_applies_watcher_events() {
         let f = Fixture::new(true);
         std::fs::write(f.dir.join("seed.txt"), "initial content").unwrap();
 
-        let coord =
-            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
         wait_for("initial auto index", Duration::from_secs(20), || {
             coord.state().last_full_index.is_some() && f.file_count() == 1
         });
@@ -1745,8 +1956,7 @@ mod tests {
     fn auto_mode_reports_an_active_watcher() {
         let f = Fixture::new(true);
         std::fs::create_dir_all(f.dir.join("sub")).unwrap();
-        let coord =
-            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
 
         wait_for("watcher active", Duration::from_secs(20), || {
             matches!(coord.state().watcher, WatcherStatus::Active { .. })
@@ -1773,8 +1983,7 @@ mod tests {
             max_watched_dirs: 2,
             ..fast_watcher()
         };
-        let coord =
-            IndexCoordinator::start_with_watcher_config(f.config.clone(), watcher_config).unwrap();
+        let coord = start_coord_watching(f.config.clone(), watcher_config);
 
         wait_for("watcher disabled", Duration::from_secs(20), || {
             matches!(coord.state().watcher, WatcherStatus::Disabled { .. })
@@ -1802,7 +2011,7 @@ mod tests {
     #[test]
     fn manual_mode_reports_the_watcher_off() {
         let f = Fixture::new(false);
-        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        let coord = start_coord(f.config.clone());
         std::thread::sleep(Duration::from_millis(300));
         assert_eq!(coord.state().watcher, WatcherStatus::Off);
         coord.shutdown();
@@ -1811,8 +2020,7 @@ mod tests {
     #[test]
     fn stopping_turns_the_watcher_status_off() {
         let f = Fixture::new(true);
-        let coord =
-            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
         wait_for("watcher active", Duration::from_secs(20), || {
             matches!(coord.state().watcher, WatcherStatus::Active { .. })
         });
@@ -1828,7 +2036,7 @@ mod tests {
     fn manual_stop_drops_watcher_and_events() {
         let f = Fixture::new(true);
         std::fs::write(f.dir.join("seed.txt"), "content").unwrap();
-        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        let coord = start_coord(f.config.clone());
         wait_for("initial index", Duration::from_secs(20), || {
             f.file_count() == 1
         });
@@ -1853,8 +2061,7 @@ mod tests {
     #[test]
     fn applying_a_config_switches_the_mode_to_match_auto_index() {
         let f = Fixture::new(true);
-        let coord =
-            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
         wait_for("watcher active", Duration::from_secs(20), || {
             matches!(coord.state().watcher, WatcherStatus::Active { .. })
         });
@@ -1886,8 +2093,7 @@ mod tests {
         // the command loop).
         let f = Fixture::new(true);
         std::fs::write(f.dir.join("first.txt"), "one").unwrap();
-        let coord =
-            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
         wait_for("initial index", Duration::from_secs(20), || {
             f.file_count() == 1
         });
@@ -1978,8 +2184,7 @@ mod tests {
         }
         std::fs::write(f.dir.join("keep.txt"), "survivor").unwrap();
 
-        let coord =
-            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
         wait_for("initial index", Duration::from_secs(30), || {
             f.file_count() == 41
         });
@@ -2005,8 +2210,7 @@ mod tests {
             std::fs::write(&p, format!("body {}", i)).unwrap();
         }
 
-        let coord =
-            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
         coord.reindex_now();
         wait_for("first run", Duration::from_secs(30), || {
             coord.state().last_full_index.is_some() && f.file_count() == 300
@@ -2058,8 +2262,7 @@ mod tests {
     fn clear_index_deletes_db_and_stays_manual() {
         let f = Fixture::new(true); // auto mode — clear must not auto-resurrect
         std::fs::write(f.dir.join("a.txt"), "content").unwrap();
-        let coord =
-            IndexCoordinator::start_with_watcher_config(f.config.clone(), fast_watcher()).unwrap();
+        let coord = start_coord_watching(f.config.clone(), fast_watcher());
         wait_for("initial index", Duration::from_secs(20), || {
             f.file_count() == 1
         });
@@ -2093,7 +2296,7 @@ mod tests {
             .paths
             .indexing_paths
             .push(child.to_string_lossy().into_owned());
-        let coord = IndexCoordinator::start(config).unwrap();
+        let coord = start_coord(config);
         coord.reindex_now();
         std::thread::sleep(Duration::from_secs(3));
         assert_eq!(
@@ -2107,7 +2310,7 @@ mod tests {
     #[test]
     fn shutdown_is_idempotent_and_joins() {
         let f = Fixture::new(false);
-        let coord = IndexCoordinator::start(f.config.clone()).unwrap();
+        let coord = start_coord(f.config.clone());
         coord.shutdown();
         coord.shutdown(); // second call is a no-op
     }

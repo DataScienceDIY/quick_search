@@ -3,7 +3,9 @@
 //! All communication is non-blocking from the UI's point of view:
 //! searches stream over an mpsc receiver drained each frame, indexing
 //! state is polled, and the duplicates query runs on a throwaway worker
-//! thread. Core threads wake the UI through `ctx.request_repaint()`.
+//! thread. Core threads wake the UI through `ctx.request_repaint()` — every
+//! one of them, which is what makes polling enough: the frame that starts the
+//! UI's own cadence is the one the waking thread asks for.
 //!
 //! The duplicates scan is the *only* throwaway thread left here, and it fires
 //! on a user action rather than a timer. The status bar's file count used to
@@ -28,7 +30,16 @@ pub struct Backend {
 
 impl Backend {
     pub fn start(config: &Config, ctx: egui::Context) -> Result<Backend, String> {
-        let coordinator = Arc::new(IndexCoordinator::start(config.clone())?);
+        // The coordinator gets the same repaint hook the search worker does,
+        // and needs it for the same reason: eframe is reactive, and a run it
+        // schedules on its own — the periodic reindex a launch is already due —
+        // would otherwise sit unseen behind a settled window until the pointer
+        // moved. It calls this on the edge into work, not on a cadence.
+        let coord_ctx = ctx.clone();
+        let coordinator = Arc::new(IndexCoordinator::start(
+            config.clone(),
+            Arc::new(move || coord_ctx.request_repaint()),
+        )?);
         if let Err(e) = shutdown::install_signal_handler(coordinator.clone()) {
             quicksearch_core::log_warn!("failed to install signal handler: {}", e);
         }
