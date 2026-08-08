@@ -87,7 +87,7 @@ done
 # the appstream package. Unlike build-deb.sh, which is deliberately buildable
 # with nothing but a stock Debian install, this script already downloads
 # appimagetool, so a couple more packages cost nothing in reach.
-for tool in curl sha256sum desktop-file-validate zsyncmake appstreamcli strings; do
+for tool in curl sha256sum desktop-file-validate zsyncmake appstreamcli readelf; do
     command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
 [ "$do_strip" -eq 0 ] || command -v strip >/dev/null 2>&1 || die "missing strip (install binutils, or pass --no-strip)"
@@ -286,8 +286,16 @@ appimage_len="$(stat -c %s "$appimage")"
     || die "$zsync describes $zsync_len bytes, but the AppImage is $appimage_len"
 
 # The update information the runtime itself carries, which is what
-# AppImageUpdate reads before it ever looks for a sidecar.
-embedded="$(strings -a "$appimage" | grep -m1 '^zsync|' || true)"
+# AppImageUpdate and Gear Lever read before they ever look for a sidecar - both
+# via readelf on this section, which is why it is read the same way here.
+#
+# Not `strings | grep '^zsync|'`: .digest_md5 is 16 bytes ending immediately
+# where .upd_info begins, with no padding between them, so whenever the digest
+# happens to end in printable bytes - roughly one build in three - strings joins
+# them into a single line and an anchored match finds nothing. That failure
+# depends only on the digest, so it is invisible until it is not.
+embedded="$(readelf --string-dump=.upd_info --wide "$appimage" 2>/dev/null \
+    | grep -o 'zsync|.*' | head -1)"
 [ "$embedded" = "zsync|$UPDATE_URL" ] \
     || die "embedded update info is '$embedded', expected 'zsync|$UPDATE_URL'"
 
