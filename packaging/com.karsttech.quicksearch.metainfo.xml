@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata for QuickSearch.
+
+  @VERSION@ and @DATE@ are substituted at package time by build-deb.sh and
+  build-appimage.sh, the same way build-deb.sh rewrites the man page .TH version.
+  [workspace.package] version in Cargo.toml stays the single source of truth, so
+  nothing here needs a hand-edit at release time.
+
+  The file name has to match the component id, which is why it is not simply
+  quicksearch.metainfo.xml.
+-->
+<component type="desktop-application">
+  <id>com.karsttech.quicksearch</id>
+  <name>QuickSearch</name>
+  <summary>Fast full-text search across your files</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <!-- A reverse-DNS id cannot also be the desktop file's basename, so this is
+       what ties the component to packaging/quicksearch.desktop. -->
+  <launchable type="desktop-id">quicksearch.desktop</launchable>
+
+  <description>
+    <p>
+      QuickSearch keeps a SQLite/FTS5 index of the directories you choose and
+      searches them by both filename and file content. It extracts text from
+      documents, PDFs, archives and office files, watches the indexed paths for
+      changes and reindexes in the background while the application is open.
+    </p>
+    <p>
+      The same binary doubles as a terminal search tool: "quicksearch" followed
+      by search terms prints ranked results and exits without starting the
+      indexer, the file watcher or any background thread.
+    </p>
+  </description>
+
+  <url type="homepage">https://quicksearch.karsttech.com</url>
+  <url type="bugtracker">https://github.com/DataScienceDIY/quick_search/issues</url>
+  <url type="vcs-browser">https://code.karsttech.com/jeremy/quick_search</url>
+
+  <provides>
+    <binary>quicksearch</binary>
+    <binary>quicksearch-cli</binary>
+  </provides>
+
+  <!-- Kept in step with packaging/quicksearch.desktop. A distribution's metadata
+       generator merges these from the desktop file, but an AppImage has no such
+       step, so they are spelled out here too. -->
+  <categories>
+    <category>Utility</category>
+    <category>Filesystem</category>
+  </categories>
+
+  <keywords>
+    <keyword>search</keyword>
+    <keyword>find</keyword>
+    <keyword>index</keyword>
+    <keyword>full-text</keyword>
+    <keyword>files</keyword>
+    <keyword>content</keyword>
+  </keywords>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="@VERSION@" date="@DATE@"/>
+  </releases>
+</component>

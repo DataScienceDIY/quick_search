@@ -99,9 +99,15 @@ jobs:
           # for before it will run.
           # libcap2-bin provides capsh, which the Test step uses to drop the two
           # DAC capabilities so root obeys permission bits.
+          # zsync and appstream are for build-appimage.sh: appimagetool shells
+          # out to zsyncmake rather than bundling it, and reports success while
+          # writing nothing when it is absent, so the script checks for it up
+          # front. appstream provides the appstreamcli that validates the
+          # metainfo both packages ship.
           apt-get install -y --no-install-recommends \
             build-essential perl pkg-config \
-            binutils dpkg-dev desktop-file-utils gzip libcap2-bin
+            binutils dpkg-dev desktop-file-utils gzip libcap2-bin \
+            zsync appstream
 
       - name: Trust the workspace
         # checkout writes as root into a directory git then considers dubiously
@@ -187,6 +193,19 @@ jobs:
           fi
           echo "OK: glibc floor $floor <= $MAX_GLIBC"
 
+      - name: Build the AppImage
+        # After the glibc gate, so the cheaper check still fails first. --no-build
+        # reuses the binaries from the Build step, as the .deb step does, and
+        # SOURCE_DATE_EPOCH pins the date substituted into the AppStream release
+        # entry the same way it pins the .deb changelog.
+        #
+        # The script downloads appimagetool and the AppImage runtime, both pinned
+        # by sha256, and needs no FUSE: it runs appimagetool with
+        # APPIMAGE_EXTRACT_AND_RUN so the container needs no /dev/fuse.
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)" \
+            ./packaging/build-appimage.sh --no-build
+
       - name: Package the binaries
         # A tarball for anyone not installing the .deb, stripped to match what
         # build-deb.sh ships.
@@ -214,9 +233,15 @@ jobs:
       - uses: actions/upload-artifact@v3-node20
         with:
           name: linux-x86_64
+          # The .zsync is not optional: the update URL baked into every AppImage
+          # points at it, so leaving it unpublished breaks AppImageUpdate for
+          # everyone who already installed one. It is the one asset named without
+          # a version, because that URL has to keep resolving across releases.
           path: |
             dist/*.deb
             dist/*.tar.gz
+            dist/*.AppImage
+            dist/*.zsync
           if-no-files-found: error
           retention-days: 14
 

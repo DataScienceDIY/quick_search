@@ -6,6 +6,16 @@ sidecar), keeps it fresh automatically with filesystem watchers and
 periodic reindexing, and serves ranked search-as-you-type results in a
 compact egui desktop app, or straight to your terminal.
 
+## AI Disclaimer
+QuickSearch has a core designed by it's developer and built by hand, however the majority of it's codebase including it's GUI was designed by a human and built using AI agents with human review, improvements, and testing.
+
+## GitHub Mirror
+The primary home of this software is:
+https://code.karsttech.com/jeremy/quick_search
+
+The code is also mirrored to GitHub for easier bug reporting and issue tracking:
+https://github.com/DataScienceDIY/quick_search
+
 ## Build & run
 
 ```sh
@@ -85,6 +95,7 @@ The package installs:
 | `/usr/share/applications/quicksearch.desktop` | menu entry, so QuickSearch appears in the app launcher |
 | `/usr/share/icons/hicolor/{16,22,24,32,48,64,128,256}x*/apps/` | icons at each size |
 | `/usr/share/icons/hicolor/scalable/apps/quicksearch.svg` | the source icon |
+| `/usr/share/metainfo/com.karsttech.quicksearch.metainfo.xml` | AppStream data, so software centres show a real listing |
 | `/usr/share/man/man1/quicksearch{,-cli}.1.gz` | `man quicksearch`; the `-cli` page is a `.so` stub pointing at it |
 | `/usr/share/doc/quicksearch/` | copyright, changelog, README, `config_example.toml` |
 
@@ -117,6 +128,32 @@ Regenerate it from the PNGs with Pillow: open each `quicksearch-N.png`,
 largest first, and `save(..., format="ICO", sizes=[...], append_images=rest)`
 — passing the images rather than one image and a size list is what keeps the
 committed pixels instead of resampling them.
+
+## Install (AppImage)
+
+For anything that is not Debian or Ubuntu. Download
+`quicksearch-<version>-x86_64.AppImage` from the release page, make it
+executable and run it:
+
+```sh
+chmod +x quicksearch-1.0.4-x86_64.AppImage
+./quicksearch-1.0.4-x86_64.AppImage
+```
+
+If it fails to start with a FUSE error — some distributions no longer install
+FUSE by default — either install the distribution's FUSE package or run it
+unpacked:
+
+```sh
+APPIMAGE_EXTRACT_AND_RUN=1 ./quicksearch-1.0.4-x86_64.AppImage
+```
+
+To build one, `./packaging/build-appimage.sh` takes the same flags as
+`build-deb.sh` (`--no-build`, `--no-strip`, `-o DIR`). It downloads
+`appimagetool` and the AppImage runtime, both pinned by sha256 and cached under
+`~/.cache/quicksearch`, and needs `zsync` and `appstream` installed for
+`zsyncmake` and `appstreamcli`. `APPIMAGETOOL` points it at a copy you already
+have. It needs no FUSE itself, which is what lets CI build one in a container.
 
 ## Install (Windows)
 
@@ -263,12 +300,9 @@ rebuilds the index — there is no in-place conversion.
 - Forgot the password? The unlock screen can delete the index and disable
   protection; your files are untouched and re-indexing rebuilds it.
 
-What this protects: the index file at rest — disk theft, backups, other
-accounts reading the file. What it does not protect: a compromised running
-session (the derived key is in process memory while the app runs), and the
-files themselves, which are exactly as readable as before. A wrong
-password can never wipe the index; it is refused without touching the
-file.
+This protects the index itself and for attacks like data theft.
+Anything malicious running with user permissions could bypass this protection,
+but anything with user permissions can also access all of the same files.
 
 ### Query syntax
 
@@ -574,8 +608,15 @@ pagination: the table is virtualized, so a single scroll list capped at
   crates, so the `--locked` build after it still fails on a dependency added or
   bumped without committing `Cargo.lock`. Once both
   build jobs are green, CI tags that commit `v<version>` and publishes a release
-  with the `.deb`, a Linux tarball, the Windows installer and a Windows zip
-  attached; pushing a `v*` tag by hand does the same thing. The version is never taken from the branch
+  with the `.deb`, an AppImage and its `.zsync` sidecar, a Linux tarball, the
+  Windows installer and a Windows zip attached; pushing a `v*` tag by hand does
+  the same thing. The sidecar is the one asset named without a version, because
+  every released AppImage embeds its URL and that URL has to keep resolving as
+  releases come and go — Forgejo resolves the literal tag `latest` to the newest
+  release and looks an asset up by name, so it is always at
+  `.../releases/download/latest/quicksearch-x86_64.AppImage.zsync`. Note that is
+  `/releases/download/latest/`, not the GitHub-style `/releases/latest/download/`,
+  which Forgejo does not implement. The version is never taken from the branch
   name, and a tag that already exists at a different commit aborts the release
   rather than shipping two builds under one version. Every build carries its
   identity: `crates/quicksearch-gui/build.rs` bakes in the commit CI passes as
@@ -585,7 +626,10 @@ pagination: the table is virtualized, so a single scroll list capped at
   `unknown` there rather than failing. The Linux job runs in an Ubuntu
   22.04 container on purpose — `packaging/build-deb.sh` reads the package's
   `libc6` floor from the binary it just built, so the builder's glibc becomes
-  the package's minimum, and 22.04 pins it at 2.35. The Windows job
+  the package's minimum, and 22.04 pins it at 2.35. The AppImage is cut from
+  that same binary and bundles no libraries, so 2.35 is its floor too — it is
+  the one number that decides how far either Linux artifact reaches.
+  The Windows job
   cross-compiles with mingw-w64 and fails if either `.exe` picks up a
   dependency on a non-system DLL, then builds both Windows assets from those
   binaries — `packaging/build-installer.sh` runs `makensis`, which is a Linux

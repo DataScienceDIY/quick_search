@@ -249,11 +249,97 @@ pub fn more_below_hint<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutp
     ));
 }
 
+/// Height of the wipe's soft edge, as a fraction of the section it travels
+/// over — a proportional band so the transition reads the same on a tall
+/// window as on a short one.
+const WIPE_BAND: f32 = 0.45;
+/// …but never thinner than this, so a two-row table still gets a gradient
+/// rather than a hard cut.
+const WIPE_BAND_MIN: f32 = 24.0;
+
+/// The two y-coordinates a wipe's scrim ramps between: fully clear at and
+/// above the first, fully opaque at and below the second.
+///
+/// `wipe` is 1 when the section is entirely covered and 0 when it is
+/// entirely on screen, and the edge travels monotonically with it — so
+/// walking `wipe` down from 1 slides the covered region off the bottom of
+/// the section, uncovering the top first.
+fn wipe_edges(rect: egui::Rect, wipe: f32) -> (f32, f32) {
+    let band = (rect.height() * WIPE_BAND).max(WIPE_BAND_MIN);
+    let covered = rect.bottom() + band - wipe * (rect.height() + band);
+    (covered - band, covered)
+}
+
+/// The scrim hiding the `wipe` of `rect` not yet revealed: a vertical
+/// gradient from transparent to solid `fill`, or `None` once nothing is
+/// covered.
+///
+/// Painting the background colour over the results is equivalent to fading
+/// them into it, and unlike a per-row opacity it reaches the parts of an
+/// `egui_extras` table that the caller never gets a `Ui` for — the stripes,
+/// the selection fill, the scroll bar.
+pub fn wipe_mesh(rect: egui::Rect, wipe: f32, fill: egui::Color32) -> Option<egui::Mesh> {
+    if wipe <= 0.0 || rect.height() <= 0.0 || rect.width() <= 0.0 {
+        return None;
+    }
+    let (clear, covered) = wipe_edges(rect, wipe);
+    let alpha_at = |y: f32| ((y - clear) / (covered - clear)).clamp(0.0, 1.0);
+
+    // The gradient is linear between the two edges and flat outside them, so
+    // the quads only have to break where an edge falls inside the rect.
+    let mut stops = vec![rect.top(), rect.bottom()];
+    stops.extend(
+        [clear, covered]
+            .into_iter()
+            .filter(|&y| rect.y_range().contains(y)),
+    );
+    stops.sort_by(f32::total_cmp);
+
+    let mut mesh = egui::Mesh::default();
+    for pair in stops.windows(2) {
+        let (top, bottom) = (pair[0], pair[1]);
+        let (a_top, a_bottom) = (alpha_at(top), alpha_at(bottom));
+        // Sub-point slivers and the still-clear stretch above the edge would
+        // contribute nothing but vertices.
+        if bottom - top < 0.5 || (a_top <= 0.0 && a_bottom <= 0.0) {
+            continue;
+        }
+        let base = mesh.vertices.len() as u32;
+        for (y, alpha) in [(top, a_top), (bottom, a_bottom)] {
+            // Mesh vertices carry premultiplied colors, which is exactly
+            // what scaling an opaque one by `gamma_multiply` produces.
+            let color = fill.gamma_multiply(alpha);
+            for x in [rect.left(), rect.right()] {
+                mesh.colored_vertex(egui::pos2(x, y), color);
+            }
+        }
+        mesh.add_triangle(base, base + 1, base + 2);
+        mesh.add_triangle(base + 1, base + 2, base + 3);
+    }
+    (!mesh.is_empty()).then_some(mesh)
+}
+
+/// Paint [`wipe_mesh`] over `rect` in the panel's own background color.
+///
+/// Drawn through the layer painter, like [`more_below_hint`]: last in the
+/// caller's layer so it covers the content painted before it, and — the
+/// reason it cannot use `ui.painter()` — outside the section-wide opacity
+/// the caller has already set, which would otherwise scale the scrim along
+/// with what it is meant to hide.
+pub fn wipe_scrim(ui: &egui::Ui, rect: egui::Rect, wipe: f32) {
+    let Some(mesh) = wipe_mesh(rect, wipe, ui.visuals().panel_fill) else {
+        return;
+    };
+    ui.ctx()
+        .layer_painter(ui.layer_id())
+        .add(egui::Shape::mesh(mesh));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ignore_pattern_valid, middle_elide, pattern_border, pattern_hint, Cow, INVALID_RED,
-        VALID_GREEN,
+        ignore_pattern_valid, middle_elide, pattern_border, pattern_hint, wipe_mesh, Cow,
+        INVALID_RED, VALID_GREEN, WIPE_BAND_MIN,
     };
     use crate::test_ui::with_ui;
 
@@ -433,5 +519,135 @@ mod tests {
         // Typed, but trims away to nothing under the pattern rules — still
         // worth flagging, unlike a box the user simply has not filled in.
         assert_eq!(pattern_border("/"), Some(INVALID_RED));
+    }
+
+    // --- The results wipe ---------------------------------------------------
+
+    const SECTION: egui::Rect = egui::Rect {
+        min: egui::pos2(10.0, 100.0),
+        max: egui::pos2(410.0, 500.0),
+    };
+    const FILL: egui::Color32 = egui::Color32::from_rgb(27, 27, 27);
+
+    /// Every vertex of `mesh` as (y, alpha), in paint order.
+    fn ramp(mesh: &egui::Mesh) -> Vec<(f32, u8)> {
+        mesh.vertices
+            .iter()
+            .map(|v| (v.pos.y, v.color.a()))
+            .collect()
+    }
+
+    /// The y ranges the mesh's quads cover, merged where they touch.
+    fn covered_spans(mesh: &egui::Mesh) -> Vec<(f32, f32)> {
+        let mut spans: Vec<(f32, f32)> = Vec::new();
+        for quad in mesh.vertices.chunks(4) {
+            let (top, bottom) = (quad[0].pos.y, quad[3].pos.y);
+            match spans.last_mut() {
+                Some(last) if (last.1 - top).abs() < 1e-3 => last.1 = bottom,
+                _ => spans.push((top, bottom)),
+            }
+        }
+        spans
+    }
+
+    #[test]
+    fn a_revealed_section_paints_no_scrim() {
+        // The steady state is the common one: no shape, no vertices, no cost.
+        assert!(wipe_mesh(SECTION, 0.0, FILL).is_none());
+        assert!(wipe_mesh(SECTION, -0.5, FILL).is_none());
+    }
+
+    #[test]
+    fn a_degenerate_section_paints_no_scrim() {
+        let flat = egui::Rect::from_min_max(egui::pos2(10.0, 100.0), egui::pos2(410.0, 100.0));
+        assert!(wipe_mesh(flat, 0.5, FILL).is_none());
+        let sliver = egui::Rect::from_min_max(egui::pos2(10.0, 100.0), egui::pos2(10.0, 500.0));
+        assert!(wipe_mesh(sliver, 0.5, FILL).is_none());
+    }
+
+    #[test]
+    fn an_unstarted_wipe_covers_the_whole_section() {
+        let mesh = wipe_mesh(SECTION, 1.0, FILL).expect("fully hidden");
+        assert!(
+            ramp(&mesh).iter().all(|&(_, a)| a == 255),
+            "nothing may show through before the reveal starts: {:?}",
+            ramp(&mesh)
+        );
+        assert_eq!(
+            covered_spans(&mesh),
+            vec![(SECTION.top(), SECTION.bottom())],
+            "the quads must tile the section with no gap"
+        );
+    }
+
+    #[test]
+    fn the_scrim_ramps_clear_at_the_top_to_solid_at_the_bottom() {
+        let mesh = wipe_mesh(SECTION, 0.5, FILL).expect("mid-travel");
+        let ramp = ramp(&mesh);
+        assert_eq!(ramp.first().expect("vertices").1, 0, "the top is untouched");
+        assert_eq!(ramp.last().expect("vertices").1, 255, "the bottom is gone");
+        // Alpha only ever increases downward, and the quads stay contiguous:
+        // a gradient, not a stack of steps.
+        for pair in ramp.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0 && pair[1].1 >= pair[0].1,
+                "vertices run down the section, clear to opaque: {ramp:?}"
+            );
+        }
+        assert_eq!(covered_spans(&mesh).len(), 1, "one contiguous scrim");
+    }
+
+    #[test]
+    fn less_of_the_section_shows_the_further_the_wipe_is_from_done() {
+        // How much of the section's height the scrim swallows: the integral
+        // of alpha down it, so a widening gradient counts as well as a
+        // growing solid block.
+        let hidden_height = |wipe: f32| {
+            let mesh = wipe_mesh(SECTION, wipe, FILL).expect("travelling");
+            mesh.vertices
+                .chunks(4)
+                .map(|quad| {
+                    let alpha = |v: &egui::epaint::Vertex| v.color.a() as f32 / 255.0;
+                    (quad[3].pos.y - quad[0].pos.y) * (alpha(&quad[0]) + alpha(&quad[3])) / 2.0
+                })
+                .sum::<f32>()
+        };
+        let mut previous = 0.0;
+        for step in 1..=10 {
+            let hidden = hidden_height(step as f32 / 10.0);
+            assert!(
+                hidden > previous,
+                "each step hides more than the last: {hidden} after {previous}"
+            );
+            previous = hidden;
+        }
+        assert!(
+            (previous - SECTION.height()).abs() < 0.5,
+            "and the section is entirely gone by the end: {previous} of {}",
+            SECTION.height()
+        );
+    }
+
+    #[test]
+    fn a_short_section_still_gets_a_gradient() {
+        // Two rows tall: the proportional band would be a few points, small
+        // enough to read as a hard cut, so the floor takes over.
+        let short = egui::Rect::from_min_max(egui::pos2(10.0, 100.0), egui::pos2(410.0, 130.0));
+        let mesh = wipe_mesh(short, 0.5, FILL).expect("mid-travel");
+        let gradient = mesh
+            .vertices
+            .chunks(4)
+            .any(|quad| quad[0].color.a() < quad[3].color.a());
+        assert!(
+            gradient,
+            "the edge ramps rather than cutting: {:?}",
+            ramp(&mesh)
+        );
+        let (clear, covered) = super::wipe_edges(short, 0.5);
+        assert!(
+            (covered - clear - WIPE_BAND_MIN).abs() < 1e-3,
+            "the band is held at its floor: {}",
+            covered - clear
+        );
     }
 }

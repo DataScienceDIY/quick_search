@@ -114,6 +114,31 @@ pub fn painted_rows(out: &egui::FullOutput) -> Vec<String> {
         .collect()
 }
 
+/// Every mesh painted this frame, in paint order.
+///
+/// The app paints text and rectangles; a mesh means a shape assembled
+/// vertex by vertex, which is the only way to get a gradient out of egui.
+/// Reading the vertices back is the only way to check one, since the colour
+/// that matters varies across the shape rather than being a property of it.
+pub fn painted_meshes(out: &egui::FullOutput) -> Vec<&egui::Mesh> {
+    fn walk<'a>(shape: &'a egui::epaint::Shape, into: &mut Vec<&'a egui::Mesh>) {
+        match shape {
+            egui::epaint::Shape::Mesh(mesh) => into.push(mesh),
+            egui::epaint::Shape::Vec(shapes) => {
+                for s in shapes {
+                    walk(s, into);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut meshes = Vec::new();
+    for clipped in &out.shapes {
+        walk(&clipped.shape, &mut meshes);
+    }
+    meshes
+}
+
 /// The centre of `needle`'s galley, as a click target.
 ///
 /// The *last* match wins, so a string painted both behind a modal and on it
