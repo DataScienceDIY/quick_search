@@ -26,6 +26,7 @@ readonly BINARIES=(quicksearch quicksearch-cli)
 readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ICON_SRC="$REPO_ROOT/crates/quicksearch-gui/assets/icons"
 readonly ICON_SVG="$ICON_SRC/quicksearch_icon.svg"
+readonly METAINFO=com.karsttech.quicksearch.metainfo.xml
 
 do_build=1
 do_strip=1
@@ -78,6 +79,7 @@ done
 # Both binaries link the same crates, so either gives the same glibc floor.
 readonly primary_binary="$REPO_ROOT/target/release/$PKG"
 [ -f "$ICON_SVG" ] || die "no icon at $ICON_SVG"
+[ -f "$REPO_ROOT/packaging/$METAINFO" ] || die "no metainfo at packaging/$METAINFO"
 
 say "Validating desktop entry"
 desktop-file-validate "$REPO_ROOT/packaging/$PKG.desktop"
@@ -118,6 +120,22 @@ for png in "${icons[@]}"; do
     install -Dm644 "$png" "$stage/usr/share/icons/hicolor/${n}x${n}/apps/$PKG.png"
 done
 say "Installed ${#icons[@]} icon sizes plus the scalable SVG"
+
+# AppStream metadata, so software centres show a real listing rather than a bare
+# package name. @VERSION@/@DATE@ are substituted the same way the man page .TH
+# line is below, keeping [workspace.package] version the only thing a release
+# bumps. build-appimage.sh ships the identical file and is where it gets
+# validated - appstreamcli is not something a stock Debian install has, and this
+# script deliberately needs nothing beyond dpkg-deb and desktop-file-utils.
+if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+    metainfo_date="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%d)"
+else
+    metainfo_date="$(date -u +%Y-%m-%d)"
+fi
+install -dm755 "$stage/usr/share/metainfo"
+sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$metainfo_date/" \
+    "$REPO_ROOT/packaging/$METAINFO" > "$stage/usr/share/metainfo/$METAINFO"
+chmod 644 "$stage/usr/share/metainfo/$METAINFO"
 
 # Debian wants man pages and the changelog compressed, with no gzip timestamp so
 # repeat builds are byte-identical. quicksearch-cli.1 is a one-line .so stub

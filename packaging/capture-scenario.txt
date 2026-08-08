@@ -24,7 +24,7 @@ wait_index_idle                   # hard wait: the full index must exist
 tab search
 focus_search                      # tab switches drop egui focus; re-arm it
 clear_query
-window 1120 750                   # compact clip: the smallest layout at
+window 1200 600                   # compact clip: the smallest layout at
                                   # which every results column still fits
                                   # (any narrower clips the Match column
                                   # away, defeating the demo), at 1.5x

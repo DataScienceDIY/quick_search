@@ -17,6 +17,21 @@ use crate::ui_util::middle_elide;
 /// showing the spinner, a time or nothing, so the query box stays put.
 const STATUS_SLOT_WIDTH: f32 = 52.0;
 
+/// How long the old results take to clear: a plain dip to nothing, with no
+/// wipe. Very short on purpose — the swap waits for it, so it is latency in
+/// front of every new result set, and there is nothing to look at on the
+/// way out anyway.
+const FADE_OUT_SECS: f32 = 0.15;
+/// How long the new results take to wipe in. It can afford to be five times
+/// as long, because the reveal starts at the top of the table — the first
+/// hits are readable within a couple of frames either way.
+const FADE_IN_SECS: f32 = 0.50;
+/// The fraction of the reveal over which the section-wide opacity climbs to
+/// full. The rest is carried by the wipe alone, so rows the edge has
+/// already uncovered sit at full strength instead of dimming along with the
+/// ones still to come.
+const FADE_ALPHA_SPAN: f32 = 0.50;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKey {
     Rank,
@@ -93,6 +108,21 @@ pub struct SearchTab {
     staging_has_snippets: bool,
     /// True from search start until the staged set has been swapped in.
     swap_pending: bool,
+    /// How much of the results section the reveal still hides: 0 fully on
+    /// screen, 1 fully covered. Set to 1 at the swap and travels back down
+    /// to 0 as the new results wipe in — and *only* then. Clearing the old
+    /// set holds it still, so an interrupted reveal does not flash the rows
+    /// it had already covered back on screen on the way out.
+    wipe: f32,
+    /// The section's own opacity, which is all there is to clearing the old
+    /// results. Follows `wipe` while the new ones arrive and decays on its
+    /// own while the old ones go, so it is continuous across the turn.
+    ///
+    /// Both are stepped by frame time rather than handed to egui's animation
+    /// manager, which reads the value of a transition it is already running
+    /// against whatever duration the current call passes — and the two
+    /// directions here have very different ones.
+    fade: f32,
     /// Display permutation over `results`.
     order: Vec<u32>,
     sort: (SortKey, bool),
@@ -134,6 +164,8 @@ impl SearchTab {
             staging: Vec::new(),
             staging_has_snippets: false,
             swap_pending: false,
+            wipe: 0.0,
+            fade: 1.0,
             order: Vec::new(),
             sort: (SortKey::Rank, true),
             sort_dirty: false,
@@ -162,11 +194,14 @@ impl SearchTab {
         self.pending_edit = Some(Instant::now());
     }
 
-    /// The query has executed and the fade/stage swap has landed — what the
-    /// capture driver's `wait_search_done` means by "done".
+    /// The query has executed, the stage swap has landed and the table has
+    /// wiped all the way back in — what the capture driver's
+    /// `wait_search_done` means by "done". The reveal is part of it because
+    /// it outlasts the swap by half a second, and a screenshot taken during
+    /// it catches a half-drawn table.
     #[cfg(feature = "capture")]
     pub(crate) fn capture_settled(&self) -> bool {
-        !self.running && self.pending_edit.is_none() && !self.swap_pending
+        !self.running && self.pending_edit.is_none() && self.fade_settled()
     }
 
     /// Re-arm the one-shot first-frame focus: tab switches drop egui focus,
@@ -196,6 +231,34 @@ impl SearchTab {
         self.elapsed = None;
         self.limited = false;
         self.error = None;
+    }
+
+    /// Nothing left to animate: the section is fully on screen and no result
+    /// swap is waiting on it.
+    fn fade_settled(&self) -> bool {
+        !self.swap_pending && self.wipe <= 0.0 && self.fade >= 1.0
+    }
+
+    /// Move the transition on by `dt` seconds.
+    ///
+    /// The two halves are not mirror images. Clearing the old results is a
+    /// plain fade — the reveal holds where it stands, because a search fired
+    /// part way through the previous one's wipe would otherwise un-cover the
+    /// rows it had just covered, flashing them back on screen on the way
+    /// out. The opacity carries straight on from whatever the reveal had it
+    /// at, so the turn is continuous either way.
+    ///
+    /// Steps are clamped rather than merely added: a stalled frame must not
+    /// overshoot into a value the swap test or the scrim would have to guard
+    /// against.
+    fn advance_fade(&mut self, dt: f32) {
+        let dt = dt.max(0.0);
+        if self.swap_pending {
+            self.fade = (self.fade - dt / FADE_OUT_SECS).max(0.0);
+        } else {
+            self.wipe = (self.wipe - dt / FADE_IN_SECS).max(0.0);
+            self.fade = ((1.0 - self.wipe) / FADE_ALPHA_SPAN).min(1.0);
+        }
     }
 
     pub fn apply_update(&mut self, update: SearchUpdate, display_limit: usize) {
@@ -458,32 +521,40 @@ impl SearchTab {
             ui.label(egui::RichText::new("No results.").small().weak());
         }
 
-        // Result-set transitions pulse instead of strobing: the old table
-        // fades out over 0.15 s while the new hits stage, the sets swap at
-        // zero opacity, and the new table fades back in over 0.15 s.
-        // `animate_value_with_time` keeps requesting repaints until the
-        // value settles.
-        let fade_target = if self.swap_pending { 0.0 } else { 1.0 };
-        let fade =
-            ui.ctx()
-                .animate_value_with_time(egui::Id::new("qs-results-fade"), fade_target, 0.15);
-        if self.swap_pending && fade <= 0.01 {
+        // Result-set transitions arrive instead of strobing: the old table
+        // dips out over `FADE_OUT_SECS` while the new hits stage, the sets
+        // swap once nothing is left on screen, and the new table is then
+        // uncovered from the top down over `FADE_IN_SECS`. Repaints have to
+        // be asked for by hand, since the values are ours rather than the
+        // animation manager's — and the swap frame needs one too, having
+        // just finished the fade-out without yet starting the reveal.
+        self.advance_fade(ui.input(|i| i.stable_dt));
+        if self.swap_pending && self.fade <= 0.0 {
             self.results = std::mem::take(&mut self.staging);
             self.has_snippets = self.staging_has_snippets;
             self.selected = None;
             self.swap_pending = false;
+            // The new set starts fully covered, and the reveal walks it back
+            // down from there.
+            self.wipe = 1.0;
             // Staged hits arrived in scan order too, so the table has to be
             // ordered here as well — including under the default key.
             self.sort_dirty = true;
+        }
+        if !self.fade_settled() {
+            ui.ctx().request_repaint();
         }
 
         if self.sort_dirty {
             self.resort();
         }
 
-        // Fade covers the table and the preview strip below it; the modal
-        // windows and notices render at full opacity on their own layers.
-        ui.set_opacity(fade);
+        // The section-wide half of the effect: the whole of the fade-out,
+        // and a short climb at the start of the reveal so its leading edge
+        // does not have to carry that alone. Rows the edge has passed stay
+        // at full strength. The modal windows and the notices above render
+        // at full opacity on their own layers either way.
+        ui.set_opacity(self.fade);
 
         // --- Results table ------------------------------------------------
         // Reserve room for the selected-row snippet preview strip. Only
@@ -509,6 +580,10 @@ impl SearchTab {
         // targets: rebuilt every frame from what actually rendered.
         #[cfg(feature = "capture")]
         let mut capture_match_rects: Vec<egui::Rect> = Vec::new();
+
+        // Where the wiped section begins. Its end is only known once the
+        // preview strip below has been laid out.
+        let section_top = ui.cursor().top();
 
         let table_scroll = ui
             .push_id("results", |ui| {
@@ -741,6 +816,16 @@ impl SearchTab {
             let job = snippet_job(ui, snip, 2);
             ui.label(job);
         }
+
+        // The reveal uncovers everything from the column headers to the
+        // bottom of the preview strip together — table, scroll bar, "more
+        // below" hint and all. Painted last so it covers them, and outside
+        // the opacity set above so the scrim itself is not faded by it.
+        let section = egui::Rect::from_x_y_ranges(
+            ui.max_rect().x_range(),
+            section_top..=ui.min_rect().bottom(),
+        );
+        crate::ui_util::wipe_scrim(ui, section, self.wipe);
 
         self.ignore_dialog_ui(ui.ctx(), &mut actions);
         self.help_window_ui(ui.ctx());
@@ -1620,8 +1705,9 @@ mod tests {
         );
     }
 
-    /// Batches arriving during the fade get the same treatment; the ordering
-    /// problem must not simply move inside the 250 ms window.
+    /// Batches arriving while the old table wipes away get the same
+    /// treatment; the ordering problem must not simply move inside
+    /// `FADE_OUT_SECS`.
     #[test]
     fn staged_batches_are_ordered_once_the_fade_swaps() {
         let mut tab = SearchTab::new(false);
@@ -1647,6 +1733,308 @@ mod tests {
         tab.sort_dirty = true;
         tab.resort();
         assert_eq!(displayed(&tab), vec!["best.txt", "worst.txt"]);
+    }
+
+    /// Step the transition at a steady 60 fps until `done`, and report how
+    /// long it took.
+    fn run_fade(tab: &mut SearchTab, done: impl Fn(&SearchTab) -> bool) -> f32 {
+        let dt = 1.0 / 60.0;
+        for frame in 0..1000 {
+            if done(tab) {
+                return frame as f32 * dt;
+            }
+            tab.advance_fade(dt);
+        }
+        panic!("the transition never finished");
+    }
+
+    #[test]
+    fn each_half_of_the_transition_takes_its_own_duration() {
+        let mut tab = SearchTab::new(false);
+        tab.swap_pending = true;
+        let out = run_fade(&mut tab, |t| t.fade <= 0.0);
+        assert_eq!(tab.fade, 0.0, "settles exactly on invisible");
+        assert!(
+            (out - FADE_OUT_SECS).abs() <= 1.0 / 60.0,
+            "clearing runs for FADE_OUT_SECS, took {out}"
+        );
+
+        // What `ui` does at the swap.
+        tab.swap_pending = false;
+        tab.wipe = 1.0;
+        let into = run_fade(&mut tab, |t| t.wipe <= 0.0);
+        assert_eq!(tab.fade, 1.0, "and the reveal settles on fully opaque");
+        assert!(
+            (into - FADE_IN_SECS).abs() <= 1.0 / 60.0,
+            "the reveal runs for FADE_IN_SECS, took {into}"
+        );
+    }
+
+    #[test]
+    fn a_stalled_frame_does_not_overshoot() {
+        let mut tab = SearchTab::new(false);
+        tab.swap_pending = true;
+        tab.advance_fade(10.0);
+        assert_eq!(tab.fade, 0.0, "a whole ten seconds lands, not passes");
+
+        tab.swap_pending = false;
+        tab.wipe = 1.0;
+        tab.advance_fade(10.0);
+        assert_eq!(tab.wipe, 0.0);
+        assert_eq!(tab.fade, 1.0);
+    }
+
+    /// Clearing the old results is a plain fade. Nothing about the reveal
+    /// runs backwards — a search fired part way through the previous one's
+    /// wipe would otherwise uncover the rows it had just covered, flashing
+    /// them back on screen on the very frame they were told to leave.
+    #[test]
+    fn clearing_results_holds_the_reveal_where_it_stands() {
+        let mut tab = SearchTab::new(false);
+        tab.wipe = 1.0;
+        tab.advance_fade(FADE_IN_SECS / 5.0);
+        let standing = tab.wipe;
+        assert!((standing - 0.8).abs() < 1e-4, "one fifth in: {standing}");
+        let carried = tab.fade;
+
+        tab.swap_pending = true;
+        tab.advance_fade(0.0);
+        assert_eq!(tab.wipe, standing, "the reveal is frozen, not rewound");
+        assert_eq!(tab.fade, carried, "and the opacity carries on from here");
+
+        // The scrim holds its position for the whole of the fade-out, and
+        // the opacity takes the full FADE_OUT_SECS to get from here to zero.
+        let out = run_fade(&mut tab, |t| t.fade <= 0.0);
+        assert_eq!(tab.wipe, standing, "still frozen at the end of it");
+        let expected = carried * FADE_OUT_SECS;
+        assert!(
+            (out - expected).abs() <= 1.0 / 60.0,
+            "a partly faded section clears proportionally: {out} vs {expected}"
+        );
+    }
+
+    #[test]
+    fn a_settled_section_stops_asking_for_frames() {
+        let mut tab = SearchTab::new(false);
+        // Nothing pending, nothing covered, nothing dimmed: the steady state
+        // must not repaint forever.
+        assert!(tab.fade_settled());
+        tab.advance_fade(1.0 / 60.0);
+        assert!(tab.fade_settled());
+
+        // Whereas each stage of a transition keeps the frames coming, the
+        // swap frame — cleared out but not yet revealing — included.
+        tab.swap_pending = true;
+        assert!(!tab.fade_settled());
+        tab.advance_fade(FADE_OUT_SECS);
+        tab.swap_pending = false;
+        tab.wipe = 1.0;
+        assert!(!tab.fade_settled());
+    }
+
+    /// Drive frames until the reveal has uncovered all but `to` of the
+    /// section, and hand back the frame it got there on. `run_frame` leaves
+    /// `RawInput::time` unset, so egui advances its own clock a predicted
+    /// frame at a time and the tab sees a steady `stable_dt`.
+    fn reveal_to(ctx: &egui::Context, tab: &mut SearchTab, to: f32) -> egui::FullOutput {
+        for _ in 0..200 {
+            let out = run_frame(ctx, tab, vec![]);
+            if tab.wipe <= to {
+                return out;
+            }
+        }
+        panic!("the reveal never got down to {to}");
+    }
+
+    /// Drive frames until the staged results swap in, and hand back the
+    /// frame it happened on — the one where the new set is fully covered
+    /// and the reveal is about to start.
+    fn swap_in(ctx: &egui::Context, tab: &mut SearchTab) -> egui::FullOutput {
+        for _ in 0..200 {
+            let out = run_frame(ctx, tab, vec![]);
+            if !tab.swap_pending {
+                return out;
+            }
+        }
+        panic!("the staged results never swapped in");
+    }
+
+    /// Twenty staged hits under whatever generation is in flight.
+    fn stage_results(tab: &mut SearchTab) {
+        batch(
+            tab,
+            (0..20)
+                .map(|i| hit(i, &format!("alpha_widget_{i}.txt"), 3.0, 116))
+                .collect(),
+        );
+    }
+
+    /// Where the first and last result rows were painted.
+    fn row_bounds(out: &egui::FullOutput) -> (egui::Rect, egui::Rect) {
+        let rows: Vec<egui::Rect> = crate::test_ui::painted(out)
+            .into_iter()
+            .filter(|(text, _)| text.starts_with("alpha_widget_"))
+            .map(|(_, rect)| rect)
+            .collect();
+        (
+            *rows.first().expect("rows painted"),
+            *rows.last().expect("rows painted"),
+        )
+    }
+
+    /// Vertices down the scrim as (y, alpha), in paint order.
+    fn scrim(out: &egui::FullOutput) -> Vec<(f32, u8)> {
+        let meshes = crate::test_ui::painted_meshes(out);
+        assert_eq!(meshes.len(), 1, "one scrim over the section, no more");
+        meshes[0]
+            .vertices
+            .iter()
+            .map(|v| (v.pos.y, v.color.a()))
+            .collect()
+    }
+
+    /// The y where the scrim first turns fully solid — the edge of what is
+    /// still hidden.
+    fn solid_from(ramp: &[(f32, u8)]) -> f32 {
+        ramp.iter()
+            .find(|&&(_, a)| a == 255)
+            .expect("a solid stretch")
+            .0
+    }
+
+    /// Clearing the old results paints no scrim at all: it is a plain dip
+    /// to nothing, so there is no edge travelling anywhere on the way out.
+    #[test]
+    fn clearing_results_paints_no_scrim() {
+        let ctx = egui::Context::default();
+        let mut tab = tab_with_results(20);
+
+        let settled = run_frame(&ctx, &mut tab, vec![]);
+        assert!(
+            crate::test_ui::painted_meshes(&settled).is_empty(),
+            "a settled table pays nothing for the effect"
+        );
+
+        tab.on_search_started(1);
+        stage_results(&mut tab);
+        let mut dimmest: f32 = 1.0;
+        for frame in 0..200 {
+            let out = run_frame(&ctx, &mut tab, vec![]);
+            if !tab.swap_pending {
+                // The swap frame belongs to the new set, which starts
+                // covered — checked separately below.
+                assert!(frame > 0, "the fade-out was over before it began");
+                break;
+            }
+            assert!(
+                crate::test_ui::painted_meshes(&out).is_empty(),
+                "no scrim while the old results clear, at fade {}",
+                tab.fade
+            );
+            dimmest = dimmest.min(tab.fade);
+        }
+        assert!(
+            dimmest < 0.35,
+            "the section really does dim on the way out: got no lower than {dimmest}"
+        );
+    }
+
+    /// The new set arrives fully covered, headers included. The scrim
+    /// carries its own alpha — painting it through the `Ui` would have
+    /// scaled it by the section-wide opacity, which is exactly zero on this
+    /// frame, leaving the unsorted new table on screen at full strength.
+    #[test]
+    fn new_results_start_completely_covered() {
+        let ctx = egui::Context::default();
+        let mut tab = tab_with_results(20);
+        run_frame(&ctx, &mut tab, vec![]);
+
+        tab.on_search_started(1);
+        stage_results(&mut tab);
+        let swapped = swap_in(&ctx, &mut tab);
+        assert_eq!(tab.wipe, 1.0, "the reveal starts from the top");
+
+        let ramp = scrim(&swapped);
+        assert!(
+            ramp.iter().all(|&(_, a)| a == 255),
+            "nothing shows through: {ramp:?}"
+        );
+        assert!(
+            !crate::test_ui::painted_text(&swapped)
+                .iter()
+                .any(|t| t.starts_with("alpha_widget_")),
+            "at zero opacity egui drops the section's shapes outright, so \
+             the scrim is belt to that braces"
+        );
+
+        // Which is also why the rows have to be measured from a frame the
+        // reveal has let some light through.
+        let (first, last) = row_bounds(&reveal_to(&ctx, &mut tab, 0.8));
+        let (top, bottom) = (
+            ramp.first().expect("vertices").0,
+            ramp.last().expect("vertices").0,
+        );
+        assert!(
+            top < first.top(),
+            "the scrim starts above the first row, so the column headers \
+             are covered too: {top} vs {}",
+            first.top()
+        );
+        assert!(
+            bottom >= last.bottom(),
+            "and runs past the last one: {bottom} vs {}",
+            last.bottom()
+        );
+    }
+
+    /// The reveal uncovers the table from the top down, and gets to the
+    /// first rows early — which is the whole reason it can afford to run
+    /// for half a second.
+    #[test]
+    fn new_results_are_uncovered_from_the_top_down() {
+        let ctx = egui::Context::default();
+        let mut tab = tab_with_results(20);
+        run_frame(&ctx, &mut tab, vec![]);
+
+        tab.on_search_started(1);
+        stage_results(&mut tab);
+        swap_in(&ctx, &mut tab);
+
+        // A fifth of the way in: the head of the table is out from behind
+        // the scrim while the foot is still under it.
+        let early_frame = reveal_to(&ctx, &mut tab, 0.8);
+        let (first, last) = row_bounds(&early_frame);
+        let early = solid_from(&scrim(&early_frame));
+        assert!(
+            early > first.bottom(),
+            "the first row is readable a fifth of the way in: {early} vs {}",
+            first.bottom()
+        );
+        assert!(
+            early < last.top(),
+            "while the last is still covered: {early} vs {}",
+            last.top()
+        );
+
+        // …and the edge keeps going down, not back up.
+        let later = solid_from(&scrim(&reveal_to(&ctx, &mut tab, 0.4)));
+        assert!(
+            later > early,
+            "the edge travels downward: {early} then {later}"
+        );
+        assert!(
+            later > last.top(),
+            "and has uncovered the last row by then: {later} vs {}",
+            last.top()
+        );
+
+        // It ends with the scrim gone entirely rather than lingering.
+        let done = reveal_to(&ctx, &mut tab, 0.0);
+        assert!(
+            crate::test_ui::painted_meshes(&done).is_empty(),
+            "the scrim clears away at the end of the reveal"
+        );
+        assert!(tab.fade_settled(), "and the section stops animating");
     }
 
     /// A selected row is identified by file id, so it survives both the

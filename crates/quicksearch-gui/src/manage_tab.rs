@@ -730,9 +730,13 @@ fn status_contents(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker
             }
             if let Some(rate) = speed.files_per_sec() {
                 ui.label(
-                    egui::RichText::new(format!("overall: {}", fmt_rate(rate)))
-                        .small()
-                        .weak(),
+                    egui::RichText::new(format!(
+                        "last {}s: {}",
+                        crate::tracker::WINDOW.as_secs(),
+                        fmt_rate(rate)
+                    ))
+                    .small()
+                    .weak(),
                 );
             }
         }

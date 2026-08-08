@@ -71,7 +71,7 @@ ignore_patterns = []
 # 1.5x zoom + proportionally larger windows (set in the scenario) render the
 # same layout at ~1.5x the pixel density, for crisper website assets.
 [ui]
-scale = 1.5
+scale = 1.25
 EOF
 
 # --- run the scripted app ---------------------------------------------------
