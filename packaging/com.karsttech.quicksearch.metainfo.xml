@@ -36,9 +36,14 @@
     </p>
   </description>
 
+  <!-- Only url types the oldest AppStream we validate against understands. CI
+       runs appstreamcli from Ubuntu 22.04 (AppStream 0.15), which rejects
+       vcs-browser as an unknown type and fails the build on the warning - newer
+       appstreamcli accepts it, so this passes locally and breaks in CI. Same
+       reasoning as the glibc floor: target the oldest supported LTS. The source
+       repository is linked from the homepage. -->
   <url type="homepage">https://quicksearch.karsttech.com</url>
   <url type="bugtracker">https://github.com/DataScienceDIY/quick_search/issues</url>
-  <url type="vcs-browser">https://code.karsttech.com/jeremy/quick_search</url>
 
   <provides>
     <binary>quicksearch</binary>
