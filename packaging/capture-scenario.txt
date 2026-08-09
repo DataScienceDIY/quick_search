@@ -35,11 +35,11 @@ record_start search
 # lives in file bodies, not names -- results stream in with content snippets,
 # and its ~130 matches stay under the display cap so the footer shows a real
 # count.
-type "race con" cps 10
+type "rac" cps 10
 wait_ms 400
-type "dit" cps 7
+type "e cond" cps 7
 wait_ms 300
-type "ion" cps 10
+type "ition" cps 10
 wait_search_done max 8000
 wait_ms 1000
 hover_match 2                     # pin the pointer on the 3rd result's Match

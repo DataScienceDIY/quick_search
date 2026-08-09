@@ -1088,7 +1088,10 @@ fn search_names(
     let mut names = Vec::new();
     while std::time::Instant::now() < deadline {
         match updates.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(SearchUpdate::Hits { generation: g, hits }) if g == generation => {
+            Ok(SearchUpdate::Hits {
+                generation: g,
+                hits,
+            }) if g == generation => {
                 names.extend(hits.into_iter().map(|h| h.name));
             }
             Ok(SearchUpdate::Completed { generation: g, .. }) if g == generation => {
@@ -1261,7 +1264,10 @@ fn the_connection_is_released_once_searching_stops() {
         search_names(&service, &updates, "shared").unwrap(),
         vec!["held.txt"]
     );
-    assert!(holds_index(), "the connection should be held across requests");
+    assert!(
+        holds_index(),
+        "the connection should be held across requests"
+    );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while holds_index() && std::time::Instant::now() < deadline {

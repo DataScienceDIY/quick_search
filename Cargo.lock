@@ -1499,6 +1499,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "global-hotkey"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c386b0a4a70cb2d39fffd74480f985b6f0bfbcb934b6a6b6b7e630e448f242e"
+dependencies = [
+ "crossbeam-channel",
+ "keyboard-types",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "once_cell",
+ "thiserror 2.0.19",
+ "windows-sys 0.59.0",
+ "x11rb",
+ "xkeysym",
+]
+
+[[package]]
 name = "globset"
 version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2005,6 +2022,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef4fc70d0ab7e5b6bafa30216a6b48705ea964cdfc29c050f2412295eba58077"
 dependencies = [
  "mutate_once",
+]
+
+[[package]]
+name = "keyboard-types"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b750dcadc39a09dbadd74e118f6dd6598df77fa01df0cfcdc52c28dece74528a"
+dependencies = [
+ "bitflags 2.13.1",
+ "serde",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -3131,16 +3159,23 @@ dependencies = [
 name = "quicksearch-gui"
 version = "1.0.5"
 dependencies = [
+ "ashpd",
  "chrono",
  "eframe",
  "egui",
  "egui_extras",
+ "futures-channel",
+ "futures-util",
+ "global-hotkey",
  "keyring",
  "open",
+ "pollster",
  "quicksearch-core",
+ "raw-window-handle",
  "rfd",
  "rpassword",
  "windows-sys 0.59.0",
+ "x11rb",
  "zeroize",
 ]
 

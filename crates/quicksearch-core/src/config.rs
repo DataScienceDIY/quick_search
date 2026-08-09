@@ -283,6 +283,24 @@ pub struct UiConfig {
     /// again — the trade-off changed — while restarting the app does not.
     /// Pruned to the current root set whenever the folder list is applied.
     pub watch_cap_warned_roots: Vec<String>,
+    /// System-wide shortcut that raises the window and puts the caret in the
+    /// search box, as `Ctrl+Shift+F`: modifiers from `Ctrl`, `Alt` and
+    /// `Shift`, then one key, joined by `+`. Empty disables it.
+    ///
+    /// A plain string rather than a structured key so that a hand-edited
+    /// config reads the way the Options window prints it, and so an
+    /// unparseable value degrades to "no shortcut" with a message instead of
+    /// refusing to load. On Wayland the desktop, not this value, has the
+    /// final say — see the GUI's `hotkey` module.
+    pub search_hotkey: String,
+    /// `dark` or `light`. Applied live; the desktop's own light/dark setting
+    /// is deliberately not consulted, since reading it means opening a D-Bus
+    /// session and subscribing to the user's settings.
+    ///
+    /// A plain string for the same reason as `search_hotkey`: a value nobody
+    /// recognises falls back to dark, where a typed-out enum would fail to
+    /// deserialize and take the whole config file down with it.
+    pub color_scheme: String,
 }
 
 impl Default for UiConfig {
@@ -290,10 +308,11 @@ impl Default for UiConfig {
         UiConfig {
             scale: 1.1,
             watch_cap_warned_roots: Vec::new(),
+            search_hotkey: "Ctrl+Shift+F".to_string(),
+            color_scheme: "dark".to_string(),
         }
     }
 }
-
 
 /// Directories and files excluded from a fresh index.
 ///
@@ -1097,6 +1116,9 @@ mod tests {
         assert_eq!(cfg.processing.batch_size, 500, "missing sections default");
         assert_eq!(cfg.search.debounce_ms, 150);
         assert!((cfg.ui.scale - 1.1).abs() < f32::EPSILON);
+        // A config written before the shortcut existed must come back with
+        // one, not with no shortcut at all.
+        assert_eq!(cfg.ui.search_hotkey, "Ctrl+Shift+F");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1920,6 +1942,51 @@ mod tests {
         let cfg = Config::load_from(&path).unwrap();
         assert!(cfg.ui.watch_cap_warned_roots.is_empty());
         assert_eq!(cfg.ui.scale, 1.25, "existing ui keys still parse");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Which theme the window uses is nobody's business but the window's: it
+    /// must never cost a reindex or a watcher restart.
+    #[test]
+    fn color_scheme_is_a_soft_knob() {
+        let base = Config::default();
+        let mut c = base.clone();
+        c.ui.color_scheme = "light".to_string();
+        assert_eq!(diff_actions(&base, &c), ConfigActions::default());
+    }
+
+    #[test]
+    fn color_scheme_round_trips_and_defaults_to_dark() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        assert_eq!(Config::default().ui.color_scheme, "dark");
+
+        let mut cfg = Config {
+            source: Some(path.clone()),
+            ..Config::default()
+        };
+        cfg.ui.color_scheme = "light".to_string();
+        cfg.save().unwrap();
+        assert_eq!(Config::load_from(&path).unwrap().ui.color_scheme, "light");
+
+        // A config written before the setting existed keeps the appearance it
+        // had, which was dark.
+        fs::write(
+            &path,
+            "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n[ui]\nscale=1.25\n",
+        )
+        .unwrap();
+        assert_eq!(Config::load_from(&path).unwrap().ui.color_scheme, "dark");
+
+        // A value nobody recognises is not a broken config file: the whole
+        // point of storing it as a string is that the app still starts.
+        fs::write(
+            &path,
+            "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n\
+             [ui]\ncolor_scheme=\"drak\"\n",
+        )
+        .unwrap();
+        assert_eq!(Config::load_from(&path).unwrap().ui.color_scheme, "drak");
         fs::remove_dir_all(&dir).ok();
     }
 

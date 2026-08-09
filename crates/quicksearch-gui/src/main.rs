@@ -14,9 +14,11 @@ mod backend;
 mod capture;
 #[cfg(not(windows))]
 mod cli;
+mod color;
 mod duplicates_tab;
 mod format;
 mod help_tab;
+mod hotkey;
 mod keychain;
 mod logs_tab;
 mod manage_tab;
@@ -109,6 +111,16 @@ fn main() {
         "QuickSearch",
         native_options,
         Box::new(move |cc| {
+            // Here rather than earlier in `main`: on Windows the registration
+            // owns a hidden window whose messages the event loop has to
+            // dispatch, so it has to be made on that loop's thread with the
+            // loop already running. This closure is the first place that is
+            // true. Registering before the gate also means the shortcut works
+            // while the unlock screen is up.
+            hotkey::init(&cc.egui_ctx, &config.ui.search_hotkey);
+            // Before the gate so the unlock screen is not the one window that
+            // ignores the setting.
+            app::apply_theme(&cc.egui_ctx, &config.ui.color_scheme);
             let gate = match key_source {
                 Some(source) => {
                     unlock::Gate::running(&cc.egui_ctx, config, config_error, initial_query, source)

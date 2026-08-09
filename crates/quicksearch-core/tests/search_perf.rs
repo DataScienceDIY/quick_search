@@ -72,9 +72,33 @@ impl Lcg {
 }
 
 const WORDS: &[&str] = &[
-    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
-    "lambda", "quartz", "quartzite", "quarry", "quarter", "quantum", "brown", "fox", "jumps",
-    "lazy", "index", "search", "cascade", "snippet", "document", "content", "extract",
+    "alpha",
+    "beta",
+    "gamma",
+    "delta",
+    "epsilon",
+    "zeta",
+    "eta",
+    "theta",
+    "iota",
+    "kappa",
+    "lambda",
+    "quartz",
+    "quartzite",
+    "quarry",
+    "quarter",
+    "quantum",
+    "brown",
+    "fox",
+    "jumps",
+    "lazy",
+    "index",
+    "search",
+    "cascade",
+    "snippet",
+    "document",
+    "content",
+    "extract",
 ];
 
 /// Seed an index with `NUM_FILES` rows, a tenth of them content-indexed.

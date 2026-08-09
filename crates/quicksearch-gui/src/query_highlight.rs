@@ -287,30 +287,6 @@ impl Emitter<'_> {
 // egui layer
 // ---------------------------------------------------------------------------
 
-struct QueryPalette {
-    keyword: Color32,
-    argument: Color32,
-    operator: Color32,
-}
-
-/// GitHub Primer syntax colors — readable on egui's near-black and white
-/// text-field backgrounds. Same convention as `rank_tier_color`.
-fn query_palette(dark_mode: bool) -> QueryPalette {
-    if dark_mode {
-        QueryPalette {
-            keyword: Color32::from_rgb(255, 123, 114),
-            argument: Color32::from_rgb(121, 192, 255),
-            operator: Color32::from_rgb(126, 231, 135),
-        }
-    } else {
-        QueryPalette {
-            keyword: Color32::from_rgb(207, 34, 46),
-            argument: Color32::from_rgb(5, 80, 174),
-            operator: Color32::from_rgb(26, 127, 55),
-        }
-    }
-}
-
 struct QueryFormats {
     plain: TextFormat,
     keyword: TextFormat,
@@ -322,7 +298,11 @@ struct QueryFormats {
 
 fn query_formats(ui: &egui::Ui) -> QueryFormats {
     let font_id = egui::TextStyle::Body.resolve(ui.style());
-    let palette = query_palette(ui.visuals().dark_mode);
+    // The query language's three classes take three of the palette's hues,
+    // the same ones the rest of the GUI uses for the same kind of thing: red
+    // for what the parser reacts to, green for what joins, blue for what the
+    // user typed.
+    let palette = crate::color::palette(ui.visuals().dark_mode);
     let base = |color: Color32| TextFormat {
         font_id: font_id.clone(),
         color,
@@ -331,9 +311,9 @@ fn query_formats(ui: &egui::Ui) -> QueryFormats {
     let error = ui.visuals().error_fg_color;
     QueryFormats {
         plain: base(ui.visuals().text_color()),
-        keyword: base(palette.keyword),
-        operator: base(palette.operator),
-        argument: base(palette.argument),
+        keyword: base(palette.red),
+        operator: base(palette.green),
+        argument: base(palette.blue),
         // The keyword red and the error red are near neighbors in dark
         // mode; the underline disambiguates at a glance.
         invalid: TextFormat {

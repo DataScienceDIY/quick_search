@@ -45,6 +45,8 @@ pub struct OptionsWindow {
     /// `use_keychain` preference it was probed under.
     keychain_probed_for: Option<bool>,
     keychain_active: bool,
+    /// The search-shortcut button is waiting for a key press to bind.
+    capturing_hotkey: bool,
 }
 
 impl OptionsWindow {
@@ -54,7 +56,15 @@ impl OptionsWindow {
             draft: None,
             keychain_probed_for: None,
             keychain_active: false,
+            capturing_hotkey: false,
         }
+    }
+
+    /// Whether the shortcut button is reading a key press right now, so the
+    /// app can hold the shortcut it is about to replace. See
+    /// [`crate::unlock::Gate::handle_hotkey`].
+    pub fn capturing_hotkey(&self) -> bool {
+        self.open && self.capturing_hotkey
     }
 
     pub fn open_with(&mut self, current: &Config) {
@@ -85,6 +95,7 @@ impl OptionsWindow {
     pub fn close_discard(&mut self) {
         self.open = false;
         self.draft = None;
+        self.capturing_hotkey = false;
     }
 
     /// Adopt the window's open flag for this frame. A dirty close is
@@ -133,6 +144,7 @@ impl OptionsWindow {
         let mut open = self.open;
         let keychain_active = self.keychain_active(current);
         let dirty = self.is_dirty(current);
+        let capturing = &mut self.capturing_hotkey;
         let draft = self.draft.as_mut().unwrap();
 
         egui::Window::new("Options")
@@ -190,7 +202,14 @@ impl OptionsWindow {
                                         .fixed_decimals(2),
                                 )
                             });
+                            tip_row(ui, "Search shortcut", &tips::SEARCH_HOTKEY, |ui| {
+                                hotkey_edit(ui, &mut draft.ui.search_hotkey, capturing)
+                            });
+                            tip_row(ui, "Color scheme", &tips::COLOR_SCHEME, |ui| {
+                                color_scheme_edit(ui, &mut draft.ui.color_scheme)
+                            });
                         });
+                        hotkey_note(ui, &draft.ui.search_hotkey, &current.ui.search_hotkey);
                         ui.separator();
 
                         // Security acts on the live config, not the draft: each
@@ -203,15 +222,12 @@ impl OptionsWindow {
                 crate::ui_util::more_below_hint(ui, &scroll);
 
                 ui.separator();
+                let p = crate::color::palette(ui.visuals().dark_mode);
                 ui.horizontal(|ui| {
                     let apply = ui
                         .add(crate::ui_util::bordered_button(
                             "Apply & Save",
-                            if dirty {
-                                crate::ui_util::ORANGE
-                            } else {
-                                crate::ui_util::BLUE
-                            },
+                            if dirty { p.orange } else { p.blue },
                         ))
                         .tip(&tips::APPLY_SAVE);
                     if apply.clicked() {
@@ -224,7 +240,7 @@ impl OptionsWindow {
                             ui.label(
                                 egui::RichText::new("Unsaved changes")
                                     .small()
-                                    .color(crate::ui_util::ORANGE),
+                                    .color(p.orange),
                             );
                         }
                     });
@@ -243,6 +259,164 @@ impl OptionsWindow {
         out.close_requested = self.intercept_close(open, current);
         out
     }
+}
+
+/// The color schemes, as stored and as shown. Stored lowercase so a
+/// hand-edited config reads like the rest of the file.
+const COLOR_SCHEMES: [(&str, &str); 2] = [("dark", "Dark"), ("light", "Light")];
+
+/// What the dropdown shows for a stored value.
+///
+/// Resolved through [`crate::app::theme_for`] rather than by looking the string
+/// up, so the box says what the app will actually do with whatever is in the
+/// config file — including a value it does not recognise, which is dark and
+/// should read that way.
+fn scheme_label(value: &str) -> &'static str {
+    match crate::app::theme_for(value) {
+        egui::Theme::Dark => "Dark",
+        egui::Theme::Light => "Light",
+    }
+}
+
+/// The color scheme dropdown. Returns the box, which is what the row's
+/// tooltip hangs off.
+fn color_scheme_edit(ui: &mut egui::Ui, setting: &mut String) -> egui::Response {
+    egui::ComboBox::from_id_salt("cfg-color-scheme")
+        .selected_text(scheme_label(setting))
+        .show_ui(ui, |ui| {
+            for (stored, label) in COLOR_SCHEMES {
+                ui.selectable_value(setting, stored.to_string(), label);
+            }
+        })
+        .response
+}
+
+/// The search shortcut's control: a button showing the current binding that
+/// turns into a key-press reader when clicked, and a Clear beside it.
+///
+/// A reader rather than a text field because the shortcut is a thing you
+/// press, not a thing you spell, and because it keeps the only way to name a
+/// key inside [`crate::hotkey`] where the two backends agree on it.
+///
+/// Returns the button, which is what the row's tooltip hangs off.
+fn hotkey_edit(ui: &mut egui::Ui, setting: &mut String, capturing: &mut bool) -> egui::Response {
+    let p = crate::color::palette(ui.visuals().dark_mode);
+    ui.horizontal(|ui| {
+        let label = if *capturing {
+            "Press a key combination...".to_string()
+        } else if setting.trim().is_empty() {
+            "None".to_string()
+        } else {
+            setting.clone()
+        };
+        let button = ui.add(crate::ui_util::bordered_button(
+            label,
+            if *capturing { p.orange } else { p.blue },
+        ));
+        // A second click backs out, so the button is never a one-way door.
+        if button.clicked() {
+            *capturing = !*capturing;
+        } else if *capturing {
+            match read_capture(ui) {
+                Some(Some(binding)) => {
+                    *setting = binding.to_string();
+                    *capturing = false;
+                }
+                Some(None) => *capturing = false,
+                None => {}
+            }
+        }
+        if ui
+            .add_enabled(
+                !setting.trim().is_empty(),
+                egui::Button::new("Clear").small(),
+            )
+            .clicked()
+        {
+            setting.clear();
+            *capturing = false;
+        }
+        button
+    })
+    .inner
+}
+
+/// One frame of shortcut capture: `Some(Some(binding))` for a press worth
+/// binding, `Some(None)` for a cancel, `None` while nothing usable has
+/// arrived.
+///
+/// Reads raw events rather than `egui::Ui::input_mut`'s shortcut matching,
+/// which answers "was *this* combination pressed" and cannot report an
+/// arbitrary one. Presses that are not a valid shortcut, such as a bare
+/// letter, are ignored rather than treated as a cancel: they are almost
+/// always someone reaching for the modifier a moment too late.
+fn read_capture(ui: &egui::Ui) -> Option<Option<crate::hotkey::Binding>> {
+    ui.input(|i| {
+        for event in &i.events {
+            let egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if *key == egui::Key::Escape {
+                return Some(None);
+            }
+            if let Some(binding) = crate::hotkey::Binding::from_egui(*key, modifiers) {
+                return Some(Some(binding));
+            }
+        }
+        None
+    })
+}
+
+/// What the shortcut is really doing, under the Interface grid.
+///
+/// Silent while it is registered and working: the button already says what
+/// the key is, and a line confirming it would be noise on every other
+/// setting's behalf. The cases worth a line are the ones where what is on
+/// the button is not what is in force.
+fn hotkey_note(ui: &mut egui::Ui, draft: &str, live: &str) {
+    use crate::hotkey::Status;
+    let (text, color) = if draft.trim() != live.trim() {
+        ("Not registered until Apply and Save.".to_string(), None)
+    } else {
+        match crate::hotkey::status() {
+            Status::Disabled | Status::Active => (String::new(), None),
+            Status::Pending => (
+                "Waiting for your desktop to accept the shortcut.".to_string(),
+                None,
+            ),
+            Status::PortalBound(trigger) => (
+                format!(
+                    "Your desktop registered this as {}. It has the final say; \
+                     change it in its own keyboard settings. On Wayland it also \
+                     decides whether the window comes forward, so a minimised \
+                     window may stay minimised.",
+                    trigger
+                ),
+                None,
+            ),
+            Status::Error(why) => (
+                format!("The shortcut is not active: {}.", why),
+                Some(crate::color::palette(ui.visuals().dark_mode).orange),
+            ),
+        }
+    };
+    // Comes and goes with the state; keep it off the ids of what follows.
+    crate::ui_util::stable_section(ui, |ui| {
+        if text.is_empty() {
+            return;
+        }
+        let rich = egui::RichText::new(text).small();
+        ui.label(match color {
+            Some(color) => rich.color(color),
+            None => rich.weak(),
+        });
+    });
 }
 
 /// The Security block: status plus action buttons. Never renders the salt.
@@ -521,7 +695,193 @@ mod tests {
         assert!(w.draft.is_none());
     }
 
-    use crate::test_ui::{painted_text, painted_text_center};
+    use crate::test_ui::{click_at, painted_text, painted_text_center};
+
+    /// One frame of the shortcut control on its own, outside the window's
+    /// scroll area so it is never below the fold. A free function rather
+    /// than a closure because the assertions between frames need the
+    /// borrows back.
+    fn run_hotkey_edit(
+        ctx: &egui::Context,
+        setting: &mut String,
+        capturing: &mut bool,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = crate::test_ui::raw_input(egui::vec2(600.0, 200.0), events);
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                hotkey_edit(ui, setting, capturing);
+            });
+        })
+    }
+
+    /// One frame of the color scheme control on its own, for the same reason
+    /// as [`run_hotkey_edit`].
+    fn run_color_scheme_edit(
+        ctx: &egui::Context,
+        setting: &mut String,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = crate::test_ui::raw_input(egui::vec2(600.0, 200.0), events);
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                color_scheme_edit(ui, setting);
+            });
+        })
+    }
+
+    /// The dropdown says which scheme is in force and writes the one that is
+    /// picked. The stored values are lowercase, so what it shows and what it
+    /// stores are deliberately not the same string.
+    #[test]
+    fn the_color_scheme_box_shows_and_sets_the_scheme() {
+        let ctx = egui::Context::default();
+        let mut setting = "dark".to_string();
+
+        let closed = run_color_scheme_edit(&ctx, &mut setting, vec![]);
+        let target =
+            painted_text_center(&closed, "Dark").expect("the current scheme was not painted");
+
+        run_color_scheme_edit(&ctx, &mut setting, click_at(target));
+        let open = run_color_scheme_edit(&ctx, &mut setting, vec![]);
+        let light = painted_text_center(&open, "Light").expect("the list did not open");
+
+        run_color_scheme_edit(&ctx, &mut setting, click_at(light));
+        assert_eq!(setting, "light", "picking Light stores the config value");
+
+        let after = run_color_scheme_edit(&ctx, &mut setting, vec![]);
+        assert!(
+            painted_text(&after).iter().any(|t| t == "Light"),
+            "the closed box still says what is in force: {:?}",
+            painted_text(&after)
+        );
+    }
+
+    /// A hand-edited config can hold anything. The box reports what the app
+    /// will actually do with it rather than echoing it back.
+    #[test]
+    fn an_unknown_scheme_reads_as_dark() {
+        assert_eq!(scheme_label("dark"), "Dark");
+        assert_eq!(scheme_label("light"), "Light");
+        // Written the way a person would, and still honoured, so the box has
+        // to agree with what the theme module makes of it.
+        assert_eq!(scheme_label("  LIGHT "), "Light");
+        for nonsense in ["", "drak", "system", "auto"] {
+            assert_eq!(scheme_label(nonsense), "Dark", "{:?}", nonsense);
+        }
+    }
+
+    fn press(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }]
+    }
+
+    const CTRL_ALT: egui::Modifiers = egui::Modifiers {
+        alt: true,
+        ctrl: true,
+        shift: false,
+        mac_cmd: false,
+        command: true,
+    };
+
+    /// The whole point of the control: click it, press the combination, and
+    /// the setting is what was pressed. Never spelled out by hand.
+    #[test]
+    fn the_shortcut_button_binds_what_was_pressed() {
+        let ctx = egui::Context::default();
+        let mut setting = "Ctrl+Shift+F".to_string();
+        let mut capturing = false;
+
+        let first = run_hotkey_edit(&ctx, &mut setting, &mut capturing, vec![]);
+        let button = painted_text_center(&first, "Ctrl+Shift+F")
+            .expect("the current shortcut was not painted");
+
+        run_hotkey_edit(&ctx, &mut setting, &mut capturing, click_at(button));
+        assert!(capturing, "clicking the button starts a capture");
+        let waiting = run_hotkey_edit(&ctx, &mut setting, &mut capturing, vec![]);
+        assert!(
+            painted_text(&waiting)
+                .iter()
+                .any(|t| t.starts_with("Press a key")),
+            "a capturing button says so"
+        );
+
+        run_hotkey_edit(
+            &ctx,
+            &mut setting,
+            &mut capturing,
+            press(egui::Key::G, CTRL_ALT),
+        );
+        assert_eq!(setting, "Ctrl+Alt+G");
+        assert!(!capturing, "a bound press ends the capture");
+    }
+
+    /// Escape backs out, and a press that could not be a shortcut is waited
+    /// through rather than treated as one.
+    #[test]
+    fn capture_ignores_what_it_cannot_bind_and_escape_cancels() {
+        let ctx = egui::Context::default();
+        let mut setting = "Ctrl+Shift+F".to_string();
+        let mut capturing = true;
+
+        // A bare letter: someone reaching for the modifier a moment late.
+        run_hotkey_edit(
+            &ctx,
+            &mut setting,
+            &mut capturing,
+            press(egui::Key::G, egui::Modifiers::NONE),
+        );
+        assert_eq!(setting, "Ctrl+Shift+F", "a bare key binds nothing");
+        assert!(capturing, "and does not end the capture");
+
+        run_hotkey_edit(
+            &ctx,
+            &mut setting,
+            &mut capturing,
+            press(egui::Key::Escape, egui::Modifiers::NONE),
+        );
+        assert_eq!(setting, "Ctrl+Shift+F", "Escape leaves the shortcut alone");
+        assert!(!capturing);
+    }
+
+    #[test]
+    fn clear_switches_the_shortcut_off() {
+        let ctx = egui::Context::default();
+        let mut setting = "Ctrl+Shift+F".to_string();
+        let mut capturing = false;
+
+        let first = run_hotkey_edit(&ctx, &mut setting, &mut capturing, vec![]);
+        let clear = painted_text_center(&first, "Clear").expect("Clear was not painted");
+        run_hotkey_edit(&ctx, &mut setting, &mut capturing, click_at(clear));
+        assert_eq!(setting, "");
+
+        // With no shortcut set there is nothing to clear, and the button
+        // says what the state is rather than going blank.
+        let empty = run_hotkey_edit(&ctx, &mut setting, &mut capturing, vec![]);
+        assert!(painted_text(&empty).iter().any(|t| t == "None"));
+    }
+
+    /// The draft is what the button shows, but the registration is what the
+    /// app is actually holding, and until Apply they can disagree.
+    #[test]
+    fn an_unapplied_shortcut_says_it_is_not_in_force_yet() {
+        let ctx = egui::Context::default();
+        let run = |draft: &str, live: &str| {
+            let input = crate::test_ui::raw_input(egui::vec2(600.0, 200.0), vec![]);
+            let out = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| hotkey_note(ui, draft, live));
+            });
+            painted_text(&out).join("\n")
+        };
+        assert!(run("Ctrl+Alt+K", "Ctrl+Shift+F").contains("Apply and Save"));
+        // Matching, and nothing registered in a test process: nothing to say.
+        assert_eq!(run("Ctrl+Shift+F", "Ctrl+Shift+F"), "");
+    }
 
     /// Every row of every section, with the tip it must show. `tip_row`
     /// makes a row without *a* tooltip impossible; this table is what makes

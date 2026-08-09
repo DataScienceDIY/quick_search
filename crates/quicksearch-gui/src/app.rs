@@ -8,7 +8,7 @@ use quicksearch_core::config::{diff_actions, nested_roots, Config, SecurityConfi
 use quicksearch_core::coordinator::{IndexMode, IndexerState, ReconcileState, WatcherStatus};
 use quicksearch_core::db;
 use quicksearch_core::indexing::{
-    overall_progress, ConfigChange, IndexingStatus, PrepStep, RootPhase,
+    overall_progress, ConfigChange, IndexingStatus, PrepStep, RootPhase, RootProgress,
 };
 use quicksearch_core::search::SearchOptions;
 use quicksearch_core::security::{derive_key, generate_salt, salt_to_hex, IndexKey};
@@ -16,6 +16,7 @@ use quicksearch_core::watcher::WatchError;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::backend::Backend;
+use crate::color::{palette, Palette};
 use crate::duplicates_tab::{DupState, DuplicatesTab};
 use crate::format::{fmt_interval, group_thousands};
 use crate::keychain;
@@ -90,6 +91,20 @@ fn guard_source(
 /// the unsaved-changes prompt resolving to Quit.
 fn quit_needs_reconcile_warning(intent: NavIntent, reconciling: bool) -> bool {
     intent == NavIntent::Quit && reconciling
+}
+
+/// Whether leaving the current tab has to go through the unsaved-changes
+/// guard instead of happening directly.
+///
+/// Its own function because the tab strip is no longer the only way to leave
+/// a tab: the system-wide search shortcut does it too, from outside the
+/// window, and a second copy of this rule is how one of them would quietly
+/// start discarding a page of staged index settings.
+///
+/// A navigation already on hold wins: the guard is walking one decision at a
+/// time and a second intent would replace the answer it is waiting for.
+fn switch_needs_guard(from: Tab, manage_dirty: bool, nav_pending: bool) -> bool {
+    from == Tab::Manage && manage_dirty && !nav_pending
 }
 
 pub struct QuickSearchApp {
@@ -181,8 +196,11 @@ impl QuickSearchApp {
         initial_query: Option<String>,
         key_source: KeySource,
     ) -> Result<QuickSearchApp, String> {
-        // Compact styling: results density is the whole point.
-        ctx.style_mut(|style| {
+        // Compact styling: results density is the whole point. Both themes,
+        // because `style_mut` reaches only the one in use — styling just the
+        // live theme means the spacing reverts to egui's defaults the moment
+        // the color scheme is switched.
+        ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = egui::vec2(6.0, 3.0);
             style.spacing.button_padding = egui::vec2(6.0, 2.0);
         });
@@ -304,6 +322,15 @@ impl QuickSearchApp {
         if (new.ui.scale - self.cfg.ui.scale).abs() > f32::EPSILON {
             ctx.set_zoom_factor(clamp_scale(new.ui.scale));
         }
+        if new.ui.search_hotkey != self.cfg.ui.search_hotkey {
+            // Re-registering is cheap but not free — on Wayland it opens a
+            // new portal session, which some desktops confirm with the user —
+            // so it happens only when the setting actually moved.
+            crate::hotkey::apply(&new.ui.search_hotkey);
+        }
+        if new.ui.color_scheme != self.cfg.ui.color_scheme {
+            apply_theme(ctx, &new.ui.color_scheme);
+        }
         if actions.search_db_changed {
             self.backend
                 .search()
@@ -332,6 +359,28 @@ impl QuickSearchApp {
         }
         self.cfg = new;
         true
+    }
+
+    /// What the system-wide search shortcut does once the window is up:
+    /// show the Search tab with the caret in the query box and whatever was
+    /// there already selected, so the next keystroke starts a new search
+    /// instead of extending the last one.
+    ///
+    /// The tab switch goes through the same guard as a click on the tab strip
+    /// rather than around it. Someone who pressed the shortcut wants to
+    /// search, not to silently lose a page of unapplied index settings.
+    pub(crate) fn activate_search(&mut self) {
+        if switch_needs_guard(self.tab, self.manage.is_dirty(), self.pending_nav.is_some()) {
+            self.pending_nav = Some(NavIntent::SwitchTab(Tab::Search));
+        } else {
+            self.tab = Tab::Search;
+        }
+        self.search.request_focus();
+    }
+
+    /// Whether the Options window is currently reading a key press to bind.
+    pub(crate) fn capturing_hotkey(&self) -> bool {
+        self.options.capturing_hotkey()
     }
 
     /// Switch the indexing mode and write it to the config immediately.
@@ -500,19 +549,10 @@ impl QuickSearchApp {
                         progress_widget(ui, frac);
                     }
                     IndexingStatus::Idle => {
-                        let mode = match state.mode {
-                            IndexMode::Auto => "Auto",
-                            IndexMode::ManualStopped => "Manual",
-                            IndexMode::ManualRunning => "Manual",
-                        };
-                        let files = state.files.unwrap_or(0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Idle · {} · {} files indexed",
-                                mode,
-                                group_thousands(files.max(0) as u64)
-                            ))
-                            .small(),
+                        let colors = palette(ui.visuals().dark_mode);
+                        status_line(
+                            ui,
+                            &idle_line(state.mode, state.files.unwrap_or(0), &colors),
                         );
                     }
                     IndexingStatus::Error(e) => {
@@ -528,35 +568,10 @@ impl QuickSearchApp {
                         ui.label(egui::RichText::new("Optimizing index…").small());
                     }
                     IndexingStatus::Running { roots, .. } => {
-                        let done = roots.iter().filter(|r| r.phase == RootPhase::Done).count();
-                        let progress = overall_progress(roots);
-                        let frac = progress.fraction();
-
-                        let mut text = match (progress.total, frac) {
-                            (Some(total), Some(frac)) => format!(
-                                "Indexing {} / {} ({:.0}%)",
-                                group_thousands(progress.processed as u64),
-                                group_thousands(total as u64),
-                                frac * 100.0
-                            ),
-                            _ => format!(
-                                "Indexing · {} files",
-                                group_thousands(progress.processed as u64)
-                            ),
-                        };
-                        if roots.len() > 1 {
-                            text.push_str(&format!(" · {}/{} roots done", done, roots.len()));
-                        }
-                        if let Some(rate) = self.manage.speed.files_per_sec() {
-                            text.push_str(&format!(" · {}", crate::format::fmt_rate(rate)));
-                        }
-                        let active: usize = roots.iter().map(|r| r.active_workers).sum();
-                        let total_workers: usize = roots.iter().map(|r| r.total_workers).sum();
-                        if total_workers > 0 {
-                            text.push_str(&format!(" · {}/{} workers", active, total_workers));
-                        }
-                        ui.label(egui::RichText::new(text).small());
-                        progress_widget(ui, frac);
+                        let colors = palette(ui.visuals().dark_mode);
+                        let rate = self.manage.speed.files_per_sec();
+                        status_line(ui, &running_line(roots, rate, &colors));
+                        progress_widget(ui, overall_progress(roots).fraction());
                     }
                 }
 
@@ -895,6 +910,88 @@ impl QuickSearchApp {
         self.backend.coordinator.rebuild_index();
         self.dups.state = DupState::NotLoaded;
     }
+}
+
+/// One run of status text and the color hint it carries, if any. `None` is
+/// the theme's own text color, not an absence of paint.
+type Span = (String, Option<egui::Color32>);
+
+/// A status line assembled from colored spans, painted as one small widget so
+/// the segments keep the exact spacing they would have had inside a single
+/// label — and so the bar's widget count does not depend on how many spans a
+/// state happens to need.
+fn status_line(ui: &mut egui::Ui, spans: &[Span]) {
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    let default = ui.visuals().text_color();
+    let mut job = egui::text::LayoutJob::default();
+    for (text, color) in spans {
+        job.append(
+            text,
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: color.unwrap_or(default),
+                ..Default::default()
+            },
+        );
+    }
+    ui.label(job);
+}
+
+/// The bottom bar's line for a run in progress, where only the phase word
+/// carries the hint: the counters beside it are read, not glanced at.
+///
+/// One line covers every root, so mixed phases need a rule — and a run with
+/// any root still walking is still walking, since the walk is what decides how
+/// much extraction there will be. Once none is left the only work remaining is
+/// extraction; a root that reached `Done` early has nothing left to contribute.
+fn running_line(roots: &[RootProgress], rate: Option<f64>, colors: &Palette) -> Vec<Span> {
+    let phase = if roots.iter().any(|r| r.phase == RootPhase::Walking) {
+        colors.yellow
+    } else {
+        colors.green
+    };
+    let done = roots.iter().filter(|r| r.phase == RootPhase::Done).count();
+    let progress = overall_progress(roots);
+    let mut rest = match (progress.total, progress.fraction()) {
+        (Some(total), Some(frac)) => format!(
+            " {} / {} ({:.0}%)",
+            group_thousands(progress.processed as u64),
+            group_thousands(total as u64),
+            frac * 100.0
+        ),
+        _ => format!(" · {} files", group_thousands(progress.processed as u64)),
+    };
+    if roots.len() > 1 {
+        rest.push_str(&format!(" · {}/{} roots done", done, roots.len()));
+    }
+    if let Some(rate) = rate {
+        rest.push_str(&format!(" · {}", crate::format::fmt_rate(rate)));
+    }
+    let active: usize = roots.iter().map(|r| r.active_workers).sum();
+    let total_workers: usize = roots.iter().map(|r| r.total_workers).sum();
+    if total_workers > 0 {
+        rest.push_str(&format!(" · {}/{} workers", active, total_workers));
+    }
+    vec![("Indexing".to_string(), Some(phase)), (rest, None)]
+}
+
+/// The bottom bar's idle line. Manual mode is the one worth flagging — it
+/// means the index will not refresh itself — so Auto stays unpainted: a hint
+/// that is always on says nothing.
+fn idle_line(mode: IndexMode, files: i64, colors: &Palette) -> Vec<Span> {
+    let (mode_text, mode_color) = match mode {
+        IndexMode::Auto => ("Auto", None),
+        IndexMode::ManualStopped | IndexMode::ManualRunning => ("Manual", Some(colors.orange)),
+    };
+    vec![
+        ("Idle · ".to_string(), None),
+        (mode_text.to_string(), mode_color),
+        (
+            format!(" · {} files indexed", group_thousands(files.max(0) as u64)),
+            None,
+        ),
+    ]
 }
 
 /// The status bar's trailing progress indicator: a bar when the work has a
@@ -1261,7 +1358,7 @@ impl QuickSearchApp {
     }
 
     pub(crate) fn capture_focus_search(&mut self) {
-        self.search.capture_focus();
+        self.search.request_focus();
     }
 
     pub(crate) fn capture_match_cell(&self, n: usize) -> Option<egui::Rect> {
@@ -1307,7 +1404,7 @@ fn unsaved_changes_modal(ctx: &egui::Context, source: UnsavedSource) -> Option<U
             if ui
                 .add(crate::ui_util::bordered_button(
                     "Apply & Save",
-                    crate::ui_util::BLUE,
+                    palette(ui.visuals().dark_mode).blue,
                 ))
                 .clicked()
             {
@@ -1395,7 +1492,7 @@ fn reconcile_quit_modal(ctx: &egui::Context) -> Option<bool> {
             if ui
                 .add(crate::ui_util::bordered_button(
                     "Cancel",
-                    crate::ui_util::BLUE,
+                    palette(ui.visuals().dark_mode).blue,
                 ))
                 .clicked()
             {
@@ -1482,6 +1579,31 @@ fn clamp_scale(scale: f32) -> f32 {
     }
 }
 
+/// What `[ui] color_scheme` means to egui.
+///
+/// Anything but `light` is dark, `dark` included: the setting is
+/// hand-editable, and a typo should not leave the window in some third state
+/// nobody chose.
+///
+/// The desktop's own light/dark setting is deliberately not consulted. On
+/// Linux nothing in the window system reports it, so the only way to know is
+/// to connect to the session message bus and subscribe to the user's settings
+/// feed — more of someone's session than a search tool should be in, to decide
+/// what color some text is.
+pub(crate) fn theme_for(setting: &str) -> egui::Theme {
+    match setting.trim().to_ascii_lowercase().as_str() {
+        "light" => egui::Theme::Light,
+        _ => egui::Theme::Dark,
+    }
+}
+
+/// Apply the configured color scheme. Called once at startup, before the
+/// unlock gate, and again whenever the setting changes; egui repaints with it
+/// on the next frame, so neither needs a restart.
+pub(crate) fn apply_theme(ctx: &egui::Context, setting: &str) {
+    ctx.set_theme(theme_for(setting));
+}
+
 impl eframe::App for QuickSearchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // First, so a command's effect is fully rendered before the next one
@@ -1538,7 +1660,7 @@ impl eframe::App for QuickSearchApp {
             });
         });
         if requested != self.tab {
-            if self.tab == Tab::Manage && self.manage.is_dirty() && self.pending_nav.is_none() {
+            if switch_needs_guard(self.tab, self.manage.is_dirty(), self.pending_nav.is_some()) {
                 self.pending_nav = Some(NavIntent::SwitchTab(requested));
             } else {
                 self.tab = requested;
@@ -1738,6 +1860,28 @@ mod tests {
     /// two sequential prompts, because each draft is a full `Config`
     /// snapshot and applying both in one step would let the second revert
     /// the first.
+    /// The system-wide search shortcut leaves a tab the same way a click on
+    /// the tab strip does. Someone who pressed it wants to search, which is
+    /// not a reason to throw away a page of staged index settings.
+    #[test]
+    fn leaving_a_dirty_manage_tab_is_guarded_however_it_is_asked_for() {
+        assert!(switch_needs_guard(Tab::Manage, true, false));
+        assert!(
+            !switch_needs_guard(Tab::Manage, false, false),
+            "a clean editor has nothing to ask about"
+        );
+        assert!(
+            !switch_needs_guard(Tab::Manage, true, true),
+            "one held navigation at a time"
+        );
+        for tab in [Tab::Search, Tab::Duplicates, Tab::Logs, Tab::Help] {
+            assert!(
+                !switch_needs_guard(tab, true, false),
+                "{tab:?} holds no unapplied edits of its own"
+            );
+        }
+    }
+
     #[test]
     fn guard_source_orders_quit_prompts_options_first() {
         use NavIntent::*;
@@ -1928,5 +2072,176 @@ mod tests {
             seen.contains(&ReconcileOwedChoice::Dismiss),
             "Dismiss never fired"
         );
+    }
+
+    fn root(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> RootProgress {
+        RootProgress {
+            root: "/data".to_string(),
+            phase,
+            walked,
+            walk_total,
+            extracted: 0,
+            extract_total: 0,
+            current_file: None,
+            active_workers: 2,
+            total_workers: 4,
+        }
+    }
+
+    /// What the user reads: the spans are a presentation detail, the sentence
+    /// they spell is not.
+    fn line(spans: &[Span]) -> String {
+        spans.iter().map(|(text, _)| text.as_str()).collect()
+    }
+
+    /// Splitting the line to color its first word must not move a character
+    /// of it — the spacing around the phase word comes from the text itself,
+    /// not from egui's item spacing.
+    #[test]
+    fn the_running_line_reads_as_one_sentence() {
+        let colors = palette(true);
+
+        assert_eq!(
+            line(&running_line(
+                &[root(RootPhase::Walking, 100, Some(1000))],
+                None,
+                &colors
+            )),
+            "Indexing 100 / 1,000 (10%) · 2/4 workers"
+        );
+
+        // No count has landed yet: no denominator is invented for it.
+        assert_eq!(
+            line(&running_line(
+                &[root(RootPhase::Walking, 100, None)],
+                None,
+                &colors
+            )),
+            "Indexing · 100 files · 2/4 workers"
+        );
+
+        let mut extracting = root(RootPhase::Extracting, 1_000, None);
+        extracting.extracted = 200;
+        extracting.extract_total = 800;
+        extracting.active_workers = 3;
+        let mut done = root(RootPhase::Done, 500, None);
+        done.extracted = 500;
+        done.extract_total = 500;
+        done.active_workers = 0;
+        done.total_workers = 0;
+        assert_eq!(
+            line(&running_line(&[extracting, done], Some(120.0), &colors)),
+            "Indexing 2,200 / 2,800 (79%) · 1/2 roots done · 120 files/s · 3/4 workers"
+        );
+    }
+
+    /// The hint is on the phase word alone: coloring the counters too would
+    /// make the moving numbers the loudest thing in the window.
+    #[test]
+    fn only_the_phase_word_of_the_running_line_is_hinted() {
+        for dark in [true, false] {
+            let colors = palette(dark);
+            let spans = running_line(&[root(RootPhase::Walking, 100, Some(1000))], None, &colors);
+            assert_eq!(spans[0].0, "Indexing");
+            assert_eq!(spans[0].1, Some(colors.yellow), "dark_mode={}", dark);
+            assert!(
+                spans[1..].iter().all(|(_, color)| color.is_none()),
+                "the counters carry a hint: {:?}",
+                spans
+            );
+        }
+    }
+
+    /// A run with any root still walking is still walking: the walk is what
+    /// decides how much extraction there will be, so it owns the hint until
+    /// the last one ends.
+    #[test]
+    fn the_running_hint_follows_the_least_advanced_root() {
+        let colors = palette(true);
+        let hint = |roots: &[RootProgress]| running_line(roots, None, &colors)[0].1;
+
+        assert_eq!(
+            hint(&[
+                root(RootPhase::Extracting, 100, None),
+                root(RootPhase::Walking, 100, Some(1000)),
+                root(RootPhase::Done, 100, None),
+            ]),
+            Some(colors.yellow)
+        );
+        assert_eq!(
+            hint(&[
+                root(RootPhase::Extracting, 100, None),
+                root(RootPhase::Done, 100, None),
+            ]),
+            Some(colors.green)
+        );
+        // Every root finished, but the run has not torn itself down yet.
+        assert_eq!(
+            hint(&[root(RootPhase::Done, 100, None)]),
+            Some(colors.green)
+        );
+    }
+
+    /// Manual mode is the one idle state worth flagging: it means nothing
+    /// will refresh the index until the user says so. Auto is the expected
+    /// state, and a hint that is always on says nothing.
+    #[test]
+    fn only_manual_idle_is_hinted() {
+        for dark in [true, false] {
+            let colors = palette(dark);
+
+            let auto = idle_line(IndexMode::Auto, 12_000, &colors);
+            assert_eq!(line(&auto), "Idle · Auto · 12,000 files indexed");
+            assert!(
+                auto.iter().all(|(_, color)| color.is_none()),
+                "automatic mode is not a warning: {:?}",
+                auto
+            );
+
+            for mode in [IndexMode::ManualStopped, IndexMode::ManualRunning] {
+                let spans = idle_line(mode, 12_000, &colors);
+                assert_eq!(line(&spans), "Idle · Manual · 12,000 files indexed");
+                let hinted: Vec<_> = spans.iter().filter(|(_, c)| c.is_some()).collect();
+                assert_eq!(
+                    hinted,
+                    vec![&("Manual".to_string(), Some(colors.orange))],
+                    "{:?} in dark_mode={}",
+                    mode,
+                    dark
+                );
+            }
+        }
+    }
+
+    /// A count read back as negative is a bug, not something to print.
+    #[test]
+    fn a_negative_file_count_reads_as_zero() {
+        let colors = palette(true);
+        assert_eq!(
+            line(&idle_line(IndexMode::Auto, -1, &colors)),
+            "Idle · Auto · 0 files indexed"
+        );
+    }
+
+    /// The two values the Options window writes, plus everything a
+    /// hand-edited config might hold instead.
+    #[test]
+    fn only_light_is_light() {
+        assert_eq!(theme_for("light"), egui::Theme::Light);
+        assert_eq!(theme_for("dark"), egui::Theme::Dark);
+
+        // Spelled the user's way, not the config's.
+        assert_eq!(theme_for("  LIGHT  "), egui::Theme::Light);
+        assert_eq!(theme_for("Dark"), egui::Theme::Dark);
+
+        // A typo costs the preference, not the config file.
+        for nonsense in ["", "   ", "lite", "system", "auto", "true"] {
+            assert_eq!(
+                theme_for(nonsense),
+                egui::Theme::Dark,
+                "{:?} should be dark",
+                nonsense
+            );
+        }
     }
 }

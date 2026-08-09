@@ -100,6 +100,27 @@ pub fn painted_text(out: &egui::FullOutput) -> Vec<String> {
     painted(out).into_iter().map(|(text, _)| text).collect()
 }
 
+/// Every styled *run* of text painted this frame with the color it was
+/// painted in, in paint order.
+///
+/// [`painted`] and [`painted_text`] are color-blind, and a galley can hold
+/// several colors at once (a status line whose phase word is hinted and whose
+/// counters are not), so a color hint can only be checked one section at a
+/// time. Runs are the layout job's own sections, so a single-color label
+/// yields exactly one entry.
+pub fn painted_spans(out: &egui::FullOutput) -> Vec<(String, egui::Color32)> {
+    painted_galleys(out)
+        .into_iter()
+        .flat_map(|(g, _)| {
+            g.job
+                .sections
+                .iter()
+                .map(|s| (g.job.text[s.byte_range.clone()].to_string(), s.format.color))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Every *visible* row of every galley painted this frame, in paint order.
 ///
 /// Not the same thing as [`painted_text`]: a galley's `text()` is the job it

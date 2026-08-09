@@ -176,11 +176,7 @@ fn xml_members_under<R: Read + Seek>(
 }
 
 /// A format whose whole text lives in one member under one spec.
-fn single_member(
-    path: &Path,
-    member: &str,
-    spec: &TextSpec,
-) -> Result<String, Box<dyn Error>> {
+fn single_member(path: &Path, member: &str, spec: &TextSpec) -> Result<String, Box<dyn Error>> {
     let mut archive = open_container(path)?;
     let xml = member_text(&mut archive, member)?;
     let mut out = String::new();
@@ -474,8 +470,11 @@ mod tests {
         let p = container(
             "xlsx-nosst",
             "xlsx",
-            &[("xl/worksheets/sheet1.xml", "<worksheet><sheetData>\
-                <row><c t=\"n\"><v>7</v></c></row></sheetData></worksheet>")],
+            &[(
+                "xl/worksheets/sheet1.xml",
+                "<worksheet><sheetData>\
+                <row><c t=\"n\"><v>7</v></c></row></sheetData></worksheet>",
+            )],
         );
         assert_eq!(extract_document_text(&p, "xlsx").unwrap(), "7 \n");
     }
@@ -510,10 +509,26 @@ mod tests {
     #[test]
     fn malformed_xml_returns_an_error_rather_than_looping() {
         for (ext, member, body) in [
-            ("docx", "word/document.xml", "<w:t>bad &nonsuch; entity</w:t>"),
-            ("odt", "content.xml", "<text:p>bad &nonsuch; entity</text:p>"),
-            ("ods", "content.xml", "<text:p>bad &nonsuch; entity</text:p>"),
-            ("pptx", "ppt/slides/slide1.xml", "<a:t>bad &nonsuch; entity</a:t>"),
+            (
+                "docx",
+                "word/document.xml",
+                "<w:t>bad &nonsuch; entity</w:t>",
+            ),
+            (
+                "odt",
+                "content.xml",
+                "<text:p>bad &nonsuch; entity</text:p>",
+            ),
+            (
+                "ods",
+                "content.xml",
+                "<text:p>bad &nonsuch; entity</text:p>",
+            ),
+            (
+                "pptx",
+                "ppt/slides/slide1.xml",
+                "<a:t>bad &nonsuch; entity</a:t>",
+            ),
         ] {
             let p = container(&format!("bad-{ext}"), ext, &[(member, body)]);
             assert!(

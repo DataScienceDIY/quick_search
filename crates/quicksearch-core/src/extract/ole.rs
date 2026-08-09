@@ -949,7 +949,10 @@ mod tests {
         let p = container("xls-num", "xls", &[("Workbook", book)]);
         let text = extract_ole_text(&p, "xls").unwrap();
         assert!(text.contains("2024"), "{text}");
-        assert!(!text.contains("2024.0"), "whole numbers read as typed: {text}");
+        assert!(
+            !text.contains("2024.0"),
+            "whole numbers read as typed: {text}"
+        );
     }
 
     /// A cell indexing past the end of the shared-string table. Dropped, not
@@ -1016,7 +1019,10 @@ mod tests {
 
     #[test]
     fn ppt_reads_both_atom_widths() {
-        let bytes = encoding_rs::WINDOWS_1252.encode("Slide title").0.into_owned();
+        let bytes = encoding_rs::WINDOWS_1252
+            .encode("Slide title")
+            .0
+            .into_owned();
         let mut wide = Vec::new();
         for u in "Ωmega body".encode_utf16() {
             wide.extend_from_slice(&le16(u));
@@ -1033,15 +1039,16 @@ mod tests {
     /// Atoms live inside nested containers; the walk has to descend to them.
     #[test]
     fn ppt_descends_into_containers() {
-        let bytes = encoding_rs::WINDOWS_1252.encode("Nested deep").0.into_owned();
+        let bytes = encoding_rs::WINDOWS_1252
+            .encode("Nested deep")
+            .0
+            .into_owned();
         let atom = ppt_record(0x0000, ppt::TEXT_BYTES_ATOM, &bytes);
         let inner = ppt_record(0x000F, 0x0FF0, &atom);
         let outer = ppt_record(0x000F, 0x03E8, &inner);
 
         let p = container("ppt-nest", "ppt", &[("PowerPoint Document", outer)]);
-        assert!(extract_ole_text(&p, "ppt")
-            .unwrap()
-            .contains("Nested deep"));
+        assert!(extract_ole_text(&p, "ppt").unwrap().contains("Nested deep"));
     }
 
     /// A container that claims to hold itself. The depth bound is what stops

@@ -616,8 +616,7 @@ impl<'a> Cx<'a> {
                      JOIN files f ON f.id = searchabletext.rowid \
                      LEFT JOIN documents_text dt ON dt.file_id = f.id \
                      WHERE searchabletext MATCH ?{}",
-                    HIT_COLUMNS,
-                    query.filter_sql
+                    HIT_COLUMNS, query.filter_sql
                 ),
                 self.params_with_filters(vec![rusqlite::types::Value::Text(expr)]),
             ),
@@ -626,8 +625,7 @@ impl<'a> Cx<'a> {
                     "SELECT {}, dt.text_zstd \
                      FROM documents_text dt \
                      JOIN files f ON f.id = dt.file_id WHERE 1=1{}",
-                    HIT_COLUMNS,
-                    query.filter_sql
+                    HIT_COLUMNS, query.filter_sql
                 ),
                 self.params_with_filters(Vec::new()),
             ),
@@ -762,8 +760,7 @@ impl<'a> Cx<'a> {
 
         let sql = format!(
             "SELECT {} FROM files f WHERE 1=1{}",
-            HIT_COLUMNS,
-            self.query.filter_sql
+            HIT_COLUMNS, self.query.filter_sql
         );
         let params = self.params_with_filters(Vec::new());
         let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -870,8 +867,7 @@ impl<'a> Cx<'a> {
         let sql = format!(
             "SELECT {}, dt.text_zstd \
              FROM documents_text dt JOIN files f ON f.id = dt.file_id WHERE 1=1{}",
-            HIT_COLUMNS,
-            self.query.filter_sql
+            HIT_COLUMNS, self.query.filter_sql
         );
         let params = self.params_with_filters(Vec::new());
         let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -944,8 +940,7 @@ impl<'a> Cx<'a> {
         let re = query.regex.as_ref().expect("regex-only pass list");
         let sql = format!(
             "SELECT {} FROM files f WHERE 1=1{}",
-            HIT_COLUMNS,
-            query.filter_sql
+            HIT_COLUMNS, query.filter_sql
         );
         let params = self.params_with_filters(Vec::new());
         let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;
@@ -1028,8 +1023,7 @@ impl<'a> Cx<'a> {
         let sql = format!(
             "SELECT {}, dt.text_zstd \
              FROM documents_text dt JOIN files f ON f.id = dt.file_id WHERE 1=1{}",
-            HIT_COLUMNS,
-            query.filter_sql
+            HIT_COLUMNS, query.filter_sql
         );
         let params = self.params_with_filters(Vec::new());
         let mut stmt = self.conn.prepare(&sql).map_err(|e| e.to_string())?;

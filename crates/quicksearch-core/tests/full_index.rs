@@ -44,7 +44,6 @@ fn rows(db: &Path) -> Vec<(String, i64, i64)> {
 }
 
 fn test_config() -> Config {
-    
     // Keep the run to phase 1 semantics we're asserting on; extraction is
     // covered elsewhere.
     Config::default()
@@ -921,7 +920,10 @@ fn an_unreadable_legacy_office_file_fails_with_a_reason() {
     let db_dir = tmp_dir("legacy-doc-db");
     let db = db_dir.join("index.sqlite");
 
-    touch(&root.join("broken.doc"), b"D0CF11E0 this is not really a compound file");
+    touch(
+        &root.join("broken.doc"),
+        b"D0CF11E0 this is not really a compound file",
+    );
     index_once(&root, &db, &Config::default());
 
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -932,7 +934,10 @@ fn an_unreadable_legacy_office_file_fails_with_a_reason() {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
-    assert_eq!(state, 2, "an unreadable .doc is FAILED, not DONE-with-no-text");
+    assert_eq!(
+        state, 2,
+        "an unreadable .doc is FAILED, not DONE-with-no-text"
+    );
     let msg = msg.unwrap_or_default();
     assert!(msg.contains("broken.doc"), "names the file: {msg}");
     assert!(msg.contains("compound file"), "says what went wrong: {msg}");

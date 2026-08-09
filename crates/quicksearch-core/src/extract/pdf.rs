@@ -259,12 +259,30 @@ mod tests {
         );
         // Lowercased keys, which is the contract the rest of the pipeline
         // stores under.
-        assert_eq!(out.properties.get("title").map(String::as_str), Some("The Title"));
-        assert_eq!(out.properties.get("author").map(String::as_str), Some("An Author"));
-        assert_eq!(out.properties.get("subject").map(String::as_str), Some("A Subject"));
-        assert_eq!(out.properties.get("keywords").map(String::as_str), Some("alpha beta"));
-        assert_eq!(out.properties.get("creator").map(String::as_str), Some("A Creator"));
-        assert_eq!(out.properties.get("producer").map(String::as_str), Some("A Producer"));
+        assert_eq!(
+            out.properties.get("title").map(String::as_str),
+            Some("The Title")
+        );
+        assert_eq!(
+            out.properties.get("author").map(String::as_str),
+            Some("An Author")
+        );
+        assert_eq!(
+            out.properties.get("subject").map(String::as_str),
+            Some("A Subject")
+        );
+        assert_eq!(
+            out.properties.get("keywords").map(String::as_str),
+            Some("alpha beta")
+        );
+        assert_eq!(
+            out.properties.get("creator").map(String::as_str),
+            Some("A Creator")
+        );
+        assert_eq!(
+            out.properties.get("producer").map(String::as_str),
+            Some("A Producer")
+        );
     }
 
     /// The soft-fail path: no `Info` dictionary is not an extraction failure,
@@ -318,7 +336,10 @@ mod tests {
             "integer Info value was rendered: {:?}",
             out.properties
         );
-        assert_eq!(out.properties.get("title").map(String::as_str), Some("Kept"));
+        assert_eq!(
+            out.properties.get("title").map(String::as_str),
+            Some("Kept")
+        );
     }
 
     /// Malformed input must come back as an error, not take the process down.

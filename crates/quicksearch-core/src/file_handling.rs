@@ -490,9 +490,9 @@ fn count_tree_entries_win32(
     use std::sync::atomic::Ordering;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, GetFileInformationByHandleEx, FileIdBothDirectoryInfo, FILE_ID_BOTH_DIR_INFO,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, FileIdBothDirectoryInfo, GetFileInformationByHandleEx,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
     /// One call returns as many entries as fit here. 64 KiB holds several
@@ -574,9 +574,8 @@ fn count_tree_entries_win32(
                 // NUL-terminated, so the length is the only thing that says
                 // where it ends.
                 let name_units = (info.FileNameLength as usize) / 2;
-                let name = unsafe {
-                    std::slice::from_raw_parts(info.FileName.as_ptr(), name_units)
-                };
+                let name =
+                    unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), name_units) };
                 let name = OsString::from_wide(name);
 
                 // "." and ".." are entries of the listing, not of the tree.
