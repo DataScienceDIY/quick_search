@@ -10,6 +10,7 @@ use quicksearch_core::db::repo::{insert_file, set_content_done, NewFile};
 use quicksearch_core::mime::FileType;
 use quicksearch_core::query::split::split_for_cascade;
 use quicksearch_core::search::{cascade, SearchHit, SearchOptions, SearchService, SearchUpdate};
+use quicksearch_core::testutil::zstd_of;
 
 mod common;
 use common::scratch_db as tmp_db;
@@ -50,7 +51,8 @@ impl Seeder {
         .unwrap()
         .expect("unique path");
         if let Some(text) = text {
-            set_content_done(&tx, id, name, text, &[], self.store_text).unwrap();
+            let zstd = self.store_text.then(|| zstd_of(text)).flatten();
+            set_content_done(&tx, id, name, text, &[], zstd.as_deref()).unwrap();
         }
         tx.commit().unwrap();
         id

@@ -655,7 +655,7 @@ impl IndexingService {
         // compete for the connection.
         let stored_counts: Vec<Option<usize>> = {
             let conn = crate::lock_ok(&cx.conn_mutex);
-            let _ = crate::db::repo::prune_root_walk_counts(&conn, &roots);
+            let _ = crate::db::repo::prune_root_stats(&conn, &roots);
             roots
                 .iter()
                 .map(|r| crate::db::repo::get_root_walk_count(&conn, r))
@@ -803,6 +803,26 @@ impl IndexingService {
         let conn = crate::lock_ok(&cx.conn_mutex);
         if let Err(e) = crate::db::repo::set_last_full_index(&conn, now) {
             crate::log_warn!("{}", e);
+        }
+
+        // What each root holds, for the folder list to show once these
+        // pipelines and their `RootProgress` rows are gone. Here rather than on
+        // a cadence: `count_root` reads every row in the range, and this run
+        // has just written them, so the pages are as warm as they will ever be.
+        // Under the interrupt guard because it is still a scan per root, and
+        // quitting should not wait out one of them; a root whose count fails
+        // keeps the figure it had.
+        let _guard = db::InterruptGuard::arm(interrupt, &conn);
+        for root in &roots {
+            let range = ExtractCursor::for_root(root);
+            match repo::count_root(&conn, &range.lo, &range.hi) {
+                Ok(counts) => {
+                    if let Err(e) = repo::set_root_counts(&conn, root, counts) {
+                        crate::log_warn!("{}", e);
+                    }
+                }
+                Err(e) => crate::log_warn!("counts for {} unavailable: {}", root, e),
+            }
         }
 
         Ok(())

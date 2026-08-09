@@ -302,7 +302,11 @@ pub fn extract_and_store(
     config: &Config,
 ) -> Result<(), String> {
     let outcome = decide_content(path, mime, registry, config);
-    store_content_outcome(tx, file_id, name, &outcome, config)
+    let zstd = match outcome_body(&outcome) {
+        Some(text) => repo::encode_one(text, config.processing.store_text_for_snippets)?,
+        None => None,
+    };
+    store_content_outcome(tx, file_id, name, &outcome, zstd.as_deref())
 }
 
 /// What should be written for one file's content, decided without touching
@@ -375,23 +379,30 @@ pub fn decide_content(
 
 /// Apply a decision from [`decide_content`]. The cheap half: pure database
 /// writes, so this is all that runs with the connection held.
+///
+/// `text_zstd` is the compressed body for a `Done` outcome, prepared by the
+/// caller before it took the lock — see [`repo::set_content_done`].
 pub fn store_content_outcome(
     tx: &rusqlite::Transaction<'_>,
     file_id: i64,
     name: &str,
     outcome: &ContentOutcome,
-    config: &Config,
+    text_zstd: Option<&[u8]>,
 ) -> Result<(), String> {
     match outcome {
-        ContentOutcome::Done { text, properties } => repo::set_content_done(
-            tx,
-            file_id,
-            name,
-            text,
-            properties,
-            config.processing.store_text_for_snippets,
-        ),
+        ContentOutcome::Done { text, properties } => {
+            repo::set_content_done(tx, file_id, name, text, properties, text_zstd)
+        }
         ContentOutcome::NotApplicable => repo::set_content_na(tx, file_id),
         ContentOutcome::Failed(reason) => repo::set_content_failed(tx, file_id, reason),
+    }
+}
+
+/// The body a [`ContentOutcome`] would store, if any — what the caller feeds
+/// to its [`repo::DocEncoder`] ahead of the lock.
+pub fn outcome_body(outcome: &ContentOutcome) -> Option<&str> {
+    match outcome {
+        ContentOutcome::Done { text, .. } => Some(text),
+        _ => None,
     }
 }

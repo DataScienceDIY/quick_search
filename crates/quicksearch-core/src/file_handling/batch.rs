@@ -11,6 +11,58 @@ use crate::config::Config;
 use crate::db::repo::{self};
 use crate::indexing::should_abort;
 
+/// The compressed sidecar for one row, or `None` where there is none to write
+/// — an empty body, or `store_text_for_snippets` turned off.
+///
+/// `Err` is kept per row rather than failing the batch, because every caller
+/// here already logs and skips a row whose write fails.
+type Body = Result<Option<Vec<u8>>, String>;
+
+/// Compress a batch's bodies through one context, before the caller takes the
+/// connection.
+///
+/// Compression used to run inside the transaction, so a chunk's worth of it —
+/// measured at ~8 ms per 500 documents — sat inside the `conn_mutex` hold as
+/// pure CPU. Hoisting it here leaves the lock covering only the SQL, and
+/// reusing one [`repo::DocEncoder`] across the batch cuts the compression
+/// itself by ~4.7x (`benches/index.rs`, group `zstd_encode`).
+///
+/// What that lock does *not* gate, so the benefit is not overclaimed: search
+/// holds its own connection (`db::open::open_search_reader`) and the database
+/// is WAL, where a reader never blocks on a writer. `conn_mutex` serializes
+/// the indexer against itself — one root's content stores against another's
+/// walk inserts, the scope reconciler's slices, and WAL checkpointing. A
+/// whole-tree wall-clock run is dominated by FTS5 trigram tokenization and
+/// does not move measurably from this change; it is contention that improves,
+/// not throughput.
+fn compress_bodies<'a>(
+    texts: impl Iterator<Item = Option<&'a str>>,
+    config: &Config,
+) -> Result<Vec<Body>, String> {
+    let mut enc = repo::DocEncoder::new()?;
+    Ok(texts
+        .map(|text| match text {
+            Some(t) if config.processing.store_text_for_snippets && !t.is_empty() => {
+                enc.encode(t).map(Some)
+            }
+            _ => Ok(None),
+        })
+        .collect())
+}
+
+/// The sidecar blob for row `i`, or a logged skip if its compression failed.
+macro_rules! body_or_skip {
+    ($bodies:expr, $i:expr, $what:expr) => {
+        match &$bodies[$i] {
+            Ok(b) => b.as_deref(),
+            Err(e) => {
+                crate::log_warn!("compress text for {}: {}", $what, e);
+                continue;
+            }
+        }
+    };
+}
+
 /// Write already-prepared records for files whose content changed.
 ///
 /// The records arrive fully built (see [`prepare_file_record`]), so this does
@@ -35,12 +87,14 @@ pub fn process_batch_updates(
             return Ok(());
         }
 
+        // Outside the lock — see `compress_bodies`.
+        let bodies = compress_bodies(batch.iter().map(|r| r.inline_text.as_deref()), config)?;
         let conn = crate::lock_ok(conn_mutex);
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
-        for rec in batch.iter() {
+        for (i, rec) in batch.iter().enumerate() {
             if stop_flag.load(Ordering::Relaxed) {
                 drop(tx);
                 drop(conn);
@@ -70,7 +124,8 @@ pub fn process_batch_updates(
             };
 
             if let (Some(id), Some(text)) = (id, rec.inline_text.as_deref()) {
-                store_inline_text(&tx, id, rec, text, config)?;
+                let zstd = body_or_skip!(bodies, i, rec.path);
+                store_inline_text(&tx, id, rec, text, zstd)?;
             }
         }
 
@@ -89,16 +144,9 @@ pub(crate) fn store_inline_text(
     file_id: i64,
     rec: &OwnedNewFile,
     text: &str,
-    config: &Config,
+    text_zstd: Option<&[u8]>,
 ) -> Result<(), String> {
-    repo::set_content_done(
-        tx,
-        file_id,
-        &rec.name,
-        text,
-        &[],
-        config.processing.store_text_for_snippets,
-    )
+    repo::set_content_done(tx, file_id, &rec.name, text, &[], text_zstd)
 }
 
 /// Write already-prepared records for newly discovered files. Silent, like
@@ -119,12 +167,14 @@ pub fn process_batch_inserts(
             return Ok(());
         }
 
+        // Outside the lock — see `compress_bodies`.
+        let bodies = compress_bodies(batch.iter().map(|r| r.inline_text.as_deref()), config)?;
         let conn = crate::lock_ok(conn_mutex);
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
 
-        for rec in batch.iter() {
+        for (i, rec) in batch.iter().enumerate() {
             if stop_flag.load(Ordering::Relaxed) {
                 drop(tx);
                 drop(conn);
@@ -133,7 +183,8 @@ pub fn process_batch_inserts(
             let id = repo::insert_file(&tx, &rec.as_new_file())
                 .map_err(|e| format!("Failed to insert file record: {}", e))?;
             if let (Some(id), Some(text)) = (id, rec.inline_text.as_deref()) {
-                store_inline_text(&tx, id, rec, text, config)?;
+                let zstd = body_or_skip!(bodies, i, rec.path);
+                store_inline_text(&tx, id, rec, text, zstd)?;
             }
         }
 
@@ -307,13 +358,20 @@ pub fn store_extracted(
         if stop_flag.load(Ordering::Relaxed) {
             return Ok(written);
         }
+        // Outside the lock — see `compress_bodies`.
+        let bodies = compress_bodies(
+            batch
+                .iter()
+                .map(|r| crate::file_handling::outcome_body(&r.outcome)),
+            config,
+        )?;
         let conn = crate::lock_ok(conn_mutex);
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
-        for row in batch {
-            if let Err(e) = store_content_outcome(&tx, row.file_id, &row.name, &row.outcome, config)
-            {
+        for (i, row) in batch.iter().enumerate() {
+            let zstd = body_or_skip!(bodies, i, row.name);
+            if let Err(e) = store_content_outcome(&tx, row.file_id, &row.name, &row.outcome, zstd) {
                 crate::log_warn!("content indexing for {}: {}", row.name, e);
                 continue;
             }

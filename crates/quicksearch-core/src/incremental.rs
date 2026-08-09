@@ -137,7 +137,8 @@ fn upsert_file(
         repo::set_content_na(&tx, file_id)?;
     } else if let Some(text) = rec.inline_text.as_deref() {
         // `prepare_file_record_from_path` already read the whole file.
-        store_inline_text(&tx, file_id, &rec, text, config)?;
+        let zstd = repo::encode_one(text, config.processing.store_text_for_snippets)?;
+        store_inline_text(&tx, file_id, &rec, text, zstd.as_deref())?;
     } else {
         extract_and_store(
             &tx,

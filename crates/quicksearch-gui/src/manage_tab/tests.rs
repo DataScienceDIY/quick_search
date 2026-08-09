@@ -1,6 +1,10 @@
 use super::*;
 
 use std::cell::RefCell;
+use std::sync::Arc;
+
+use quicksearch_core::coordinator::RootCount;
+use quicksearch_core::db::repo::RootCounts;
 
 // The widgets under test report themselves here so their identity can be
 // checked across frames.
@@ -32,6 +36,19 @@ fn idle_state() -> IndexerState {
         queued_events: 0,
         watcher: WatcherStatus::Active { dirs: 10 },
         reconcile: None,
+        root_counts: Arc::new(Vec::new()),
+    }
+}
+
+/// An idle state carrying figures for `/data`, the root `cfg_with_root`
+/// configures.
+fn counted_state(files: i64, fts: i64) -> IndexerState {
+    IndexerState {
+        root_counts: Arc::new(vec![RootCount {
+            root: "/data".into(),
+            counts: RootCounts { files, fts },
+        }]),
+        ..idle_state()
     }
 }
 
@@ -171,6 +188,9 @@ fn the_worker_field_keeps_its_identity_as_the_status_changes() {
         running_state(&["/data"], Some("/data/file")),
         running_state(&["/data", "/other"], None),
         idle_state(),
+        // The per-root figures appear and disappear on the same row as the
+        // field, which is the case a conditionally-drawn label would break.
+        counted_state(1_234_567, 456_789),
         IndexerState {
             watcher: WatcherStatus::Off,
             ..idle_state()
@@ -311,6 +331,61 @@ fn a_finished_root_reports_its_exact_count_not_the_estimate() {
     assert!(
         !text.contains("6,677,062"),
         "the stale estimate is still on screen: {}",
+        text
+    );
+}
+
+/// The folder list carries the last completed run's figures, so what a root
+/// holds survives the run that counted it.
+#[test]
+fn a_configured_root_shows_what_the_last_run_counted() {
+    let ctx = egui::Context::default();
+    let mut tab = ManageTab::new();
+
+    let text = frame_text(&ctx, &mut tab, &counted_state(1_234_567, 456_789)).join(" | ");
+    assert!(
+        text.contains("indexed 1,234,567 · extracted 456,789"),
+        "folder row: {}",
+        text
+    );
+}
+
+/// A root with no stored figures says so. Zero would be a claim — that the
+/// folder is empty — where the truth is that nothing has counted it yet.
+#[test]
+fn a_root_the_index_has_never_counted_says_so() {
+    let ctx = egui::Context::default();
+    let mut tab = ManageTab::new();
+
+    let text = frame_text(&ctx, &mut tab, &idle_state()).join(" | ");
+    assert!(text.contains("not yet indexed"), "folder row: {}", text);
+    assert!(
+        !text.contains("indexed 0 · extracted 0"),
+        "an uncounted root must not read as an empty one: {}",
+        text
+    );
+}
+
+/// Figures are matched to the root by the spelling the config uses, so a
+/// root the coordinator has not published anything for keeps the placeholder
+/// rather than borrowing another root's numbers.
+#[test]
+fn figures_belong_to_the_root_they_were_counted_for() {
+    let ctx = egui::Context::default();
+    let mut tab = ManageTab::new();
+    let state = IndexerState {
+        root_counts: Arc::new(vec![RootCount {
+            root: "/somewhere-else".into(),
+            counts: RootCounts { files: 99, fts: 9 },
+        }]),
+        ..idle_state()
+    };
+
+    let text = frame_text(&ctx, &mut tab, &state).join(" | ");
+    assert!(text.contains("not yet indexed"), "folder row: {}", text);
+    assert!(
+        !text.contains("99"),
+        "borrowed another root's count: {}",
         text
     );
 }

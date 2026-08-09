@@ -298,7 +298,20 @@ impl Worker {
             let first = match self.req_rx.recv_timeout(self.idle_release) {
                 Ok(req) => req,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    self.open = None;
+                    // Dropping the connection frees `PRAGMAS_SEARCH`'s 32 MiB
+                    // page cache to glibc, which parks it in an arena rather
+                    // than returning it to the kernel. Without the trim a
+                    // single typing session raises the process floor by ~42 MiB
+                    // for as long as it runs — measured on a 77k-file index,
+                    // where an idle GUI sat at 76 MiB `RssAnon` instead of 34.
+                    // Gated on there having *been* a connection so this is once
+                    // per session→idle transition, never a repeating tick:
+                    // `malloc_trim` walks every arena and costs milliseconds.
+                    // The coordinator's writer settles the same way in
+                    // `go_idle`.
+                    if self.open.take().is_some() {
+                        crate::platform::release_free_heap();
+                    }
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,

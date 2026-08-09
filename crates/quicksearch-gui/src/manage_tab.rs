@@ -295,6 +295,15 @@ impl ManageTab {
                             }
                             ui.label(hint("workers:"));
 
+                            // Unconditional, placeholder and all: egui names a
+                            // widget by how many precede it, so a label that
+                            // came and went would rename the field above and
+                            // cost it any edit in progress. After that field
+                            // for the same reason — in this right-to-left
+                            // layout "after" is to its left.
+                            ui.label(hint(root_counts_text(state, root)))
+                                .tip(&tips::ROOT_COUNTS);
+
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
@@ -547,6 +556,24 @@ fn db_size_tooltip(ui: &mut egui::Ui) {
              the index rather than returned to the disk, until an indexing run's \
              optimize pass compacts it.",
     ));
+}
+
+/// What `root` held when indexing last completed, worded as the live
+/// per-root rows word it (see [`root_row`]) so the list does not rename the
+/// same two figures once the run that produced them is over.
+///
+/// A root the coordinator has no figures for — never indexed to completion,
+/// staged in the draft but not yet applied, or an index that was cleared —
+/// says so rather than claiming zero.
+fn root_counts_text(state: &IndexerState, root: &str) -> String {
+    match state.root_counts.iter().find(|c| c.root == root) {
+        Some(c) => format!(
+            "indexed {} · extracted {}",
+            group_thousands(c.counts.files.max(0) as u64),
+            group_thousands(c.counts.fts.max(0) as u64)
+        ),
+        None => "not yet indexed".to_string(),
+    }
 }
 
 /// Append a root to the draft unless it would duplicate or nest with an

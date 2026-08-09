@@ -104,6 +104,23 @@ pub struct IndexerState {
     /// A run's *own* reconciliation is not here — it reads as
     /// [`IndexingStatus::Preparing`] with a [`PrepStep::Reconciling`].
     pub reconcile: Option<ReconcileState>,
+    /// What each configured root held when indexing last completed. Roots
+    /// never indexed to completion are absent rather than zero.
+    ///
+    /// `Arc` because `state()` is called more than once per frame and this
+    /// changes only when a run ends.
+    pub root_counts: Arc<Vec<RootCount>>,
+}
+
+/// One configured root's stored figures, keyed the way the caller spells it.
+#[derive(Debug, Clone)]
+pub struct RootCount {
+    /// The root exactly as `paths.indexing_paths` gives it, so a frontend can
+    /// match it against the string it already draws. The `schema_info` key
+    /// behind it is the canonicalized spelling, so re-spelling a root in the
+    /// config keeps its figures.
+    pub root: String,
+    pub counts: db::repo::RootCounts,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -161,6 +178,7 @@ struct Shared {
     queued_events: usize,
     watcher: WatcherStatus,
     reconcile: Option<ReconcileState>,
+    root_counts: Arc<Vec<RootCount>>,
 }
 
 impl IndexCoordinator {
@@ -192,6 +210,7 @@ impl IndexCoordinator {
             queued_events: 0,
             watcher: WatcherStatus::Off,
             reconcile: None,
+            root_counts: Arc::new(Vec::new()),
         }));
 
         let reconcile_stop = Arc::new(ReconcileStop::default());
@@ -251,6 +270,7 @@ impl IndexCoordinator {
             queued_events: shared.queued_events,
             watcher: shared.watcher.clone(),
             reconcile: shared.reconcile,
+            root_counts: shared.root_counts.clone(),
         }
     }
 

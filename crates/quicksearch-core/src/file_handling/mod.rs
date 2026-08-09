@@ -11,17 +11,17 @@ mod count_and_extract_tests;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use batch::store_inline_text;
 pub use batch::{
     cleanup_stale_index_entries, extract_scope_prepare, process_batch_inserts,
     process_batch_updates, store_extracted, ExtractCursor, ExtractScope,
 };
-pub(crate) use batch::store_inline_text;
 pub use counting::count_tree_entries_fast;
 pub use paths::{db_key_for_missing_path, filtered_dirs, filtered_walk, UnreadableDirs};
 pub(crate) use paths::{normalize_root_string, path_to_db_string, warn_if_unrepresentable};
 pub use records::{
     classify_by_mtime, classify_for_indexing, content_extractable, decide_content,
-    extract_and_store, fts_finalize_after_text_indexing, hash_failure_counts,
-    prepare_file_record, prepare_file_record_from_path, reset_run_warnings,
-    store_content_outcome, ContentOutcome, DirRows, FileIndexAction, OwnedNewFile,
+    extract_and_store, fts_finalize_after_text_indexing, hash_failure_counts, outcome_body,
+    prepare_file_record, prepare_file_record_from_path, reset_run_warnings, store_content_outcome,
+    ContentOutcome, DirRows, FileIndexAction, OwnedNewFile,
 };

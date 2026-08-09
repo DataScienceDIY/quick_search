@@ -517,6 +517,20 @@ pub static ROOT_WORKERS: Tip = Tip {
     caution: None,
 };
 
+pub static ROOT_COUNTS: Tip = Tip {
+    title: "What this folder holds",
+    body: "How many files under this folder are in the index, and how many of \
+           those had their text extracted and so can be found by their \
+           contents rather than only by name. The gap between the two is the \
+           files nothing could read text from (images, videos, archives, \
+           program binaries) plus anything the extension whitelist \
+           excludes.\n\n\
+           Both are counted when an indexing run finishes, so they do not \
+           move as live updates apply single changes in between.",
+    examples: &[],
+    caution: None,
+};
+
 // --- Manage Index tab: content filters -----------------------------------
 
 pub static EXT_WHITELIST: Tip = Tip {
@@ -610,6 +624,7 @@ mod tests {
         &ADD_ROOT,
         &REMOVE_ROOT,
         &ROOT_WORKERS,
+        &ROOT_COUNTS,
         &EXT_WHITELIST,
         &IGNORE_PATTERNS,
         &APPLY_SAVE,

@@ -251,7 +251,13 @@ fn run(mode: &str, tree: &Path, db: &Path) {
     assert!(done, "indexing did not finish within the timeout");
     service.stop_indexing().expect("stop");
 
-    let total = SMALL_TEXT + LARGE_TEXT + BINARY;
+    // Count what was actually indexed rather than assuming `gen`'s tree.
+    // The constants describe the tree this probe builds; pointing it at any
+    // other one made the rate a fiction.
+    let total = rusqlite::Connection::open(db)
+        .ok()
+        .and_then(|c| quicksearch_core::db::repo::row_count(&c).ok())
+        .unwrap_or(0);
     eprintln!(
         "{}: {:?} ({:.0} files/sec over {} files)",
         mode,

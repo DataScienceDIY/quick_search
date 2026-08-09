@@ -211,6 +211,32 @@ impl TermPattern {
         }
     }
 
+    /// ASCII-case-insensitive [`str::find`], without folding the haystack.
+    ///
+    /// `needle` must already be `to_ascii_lowercase`d — `LiteralPattern`
+    /// stores it that way. This exists because the folding version allocated
+    /// a lowercase copy of its haystack on every call, and the cascade's
+    /// filename pass calls it twice — once on the name, once on the path —
+    /// for every row of a full-table scan.
+    ///
+    /// The candidate index is always a `char` boundary: a `&str`'s first byte
+    /// is either ASCII or a UTF-8 lead byte, never a continuation byte, so a
+    /// first-byte hit cannot land mid-character. Both sides being valid UTF-8
+    /// that differ only in ASCII case then makes the end a boundary too, which
+    /// is what keeps the returned range valid in the unfolded original.
+    fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
+        if needle.is_empty() {
+            return Some(0);
+        }
+        let (h, n) = (hay.as_bytes(), needle.as_bytes());
+        let first = n[0];
+        h.len().checked_sub(n.len()).and_then(|last| {
+            (0..=last).find(|&i| {
+                h[i].to_ascii_lowercase() == first && h[i..i + n.len()].eq_ignore_ascii_case(n)
+            })
+        })
+    }
+
     /// Leftmost match as a byte range. Literal folding is ASCII-only and
     /// byte-length preserving, so folded offsets are valid in the original —
     /// the same invariant the cascade has always relied on.
@@ -219,7 +245,7 @@ impl TermPattern {
             TermPattern::Empty => None,
             TermPattern::Literal(l) => {
                 let pos = if case_insensitive {
-                    text.to_ascii_lowercase().find(&l.folded)?
+                    Self::find_ascii_ci(text, &l.folded)?
                 } else {
                     text.find(&l.text)?
                 };

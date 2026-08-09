@@ -10,6 +10,92 @@ enum RowHit {
     Defer(SearchHit),
 }
 
+/// Reusable decode buffer and decompression context for the passes that read
+/// document text.
+///
+/// `zstd::decode_all` builds and tears down a `ZSTD_DCtx` *and* allocates a
+/// fresh output `Vec` on every call, and it is called once per candidate row.
+/// One context and one buffer, reused across a whole scan, make that a
+/// per-scan cost instead of a per-row one.
+struct DocDecoder {
+    dctx: zstd::bulk::Decompressor<'static>,
+    buf: Vec<u8>,
+}
+
+/// Where [`DocDecoder::decode`]'s buffer starts before it has seen a document.
+/// Most extracted text is well under this, so the doubling below rarely runs.
+const INITIAL_DOC_CAPACITY: usize = 64 * 1024;
+
+/// Where the doubling stops. Stored text is capped at
+/// `processing.maximum_text_size` (256 KiB by default), so this is far above
+/// any legitimate document even if that setting is raised — past it, a failure
+/// is a corrupt frame rather than a buffer that is too small.
+const MAX_DOC_CAPACITY: usize = 64 * 1024 * 1024;
+
+impl DocDecoder {
+    fn new() -> Result<Self, String> {
+        Ok(DocDecoder {
+            dctx: zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?,
+            buf: Vec::new(),
+        })
+    }
+
+    /// Decompress `blob` and borrow the result as text.
+    ///
+    /// Returns `None` for a corrupt frame or non-UTF-8 content. Nothing is
+    /// copied: the indexer stores UTF-8, so the bytes are borrowed in place
+    /// rather than run through `String::from_utf8_lossy(..).into_owned()`,
+    /// which duplicated the whole document even when it was already valid.
+    fn decode(&mut self, blob: &[u8]) -> Option<&str> {
+        self.buf.clear();
+        // `decompress_to_buffer` writes into spare capacity and fails rather
+        // than growing, so the room has to be there first.
+        //
+        // The frame header would say how much is needed, but the indexer
+        // writes with `zstd::encode_all`, which is *stream*-based and so
+        // records no content size — `get_frame_content_size` says `None` for
+        // every row this ever sees. Falling back to `zstd::decode_all` there
+        // looked harmless and was not: it builds a streaming decoder per call,
+        // which measured as one ~2.4 MiB allocation per document and 27 of the
+        // 30 GiB a fuzzy search moved through the allocator.
+        //
+        // So grow this buffer instead and keep reusing it. It settles at the
+        // largest document in the scan within the first few rows, after which
+        // decoding a row allocates nothing at all.
+        if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(blob) {
+            self.buf.reserve(usize::try_from(size).ok()?);
+        }
+        loop {
+            if self.buf.capacity() == 0 {
+                self.buf.reserve(INITIAL_DOC_CAPACITY);
+            }
+            match self.dctx.decompress_to_buffer(blob, &mut self.buf) {
+                Ok(_) => break,
+                // Too small, or corrupt — the bulk API cannot tell us which.
+                // Growing is only worth trying while the buffer is still
+                // smaller than any document could legitimately be.
+                Err(_) if self.buf.capacity() < MAX_DOC_CAPACITY => {
+                    let bigger = self.buf.capacity().saturating_mul(2);
+                    self.buf.clear();
+                    self.buf.reserve(bigger);
+                }
+                Err(_) => return None,
+            }
+        }
+        std::str::from_utf8(&self.buf).ok()
+    }
+}
+
+/// Fold `text` into `dst` in place, reusing its allocation.
+///
+/// The ASCII fold is byte-length preserving, which is what lets the cascade
+/// use offsets found in the folded copy against the unfolded original.
+fn fold_into(dst: &mut String, text: &str) {
+    dst.clear();
+    dst.push_str(text);
+    dst.make_ascii_lowercase();
+}
+
 /// Which [`Deferred`] buffer a scan's held-back hits go to.
 enum DeferSlot {
     /// Ranks 9–10, flushed by [`Pass::Path`]. Shared by passes A and E,
@@ -39,7 +125,10 @@ impl<'a> Cx<'a> {
         mut classify: impl FnMut(&mut Self, &rusqlite::Row<'_>, i64, &str) -> Result<RowHit, String>,
     ) -> Result<bool, String> {
         let conn = self.conn;
-        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        // Cached: a search re-runs the same six statements on every keystroke,
+        // and only the bound term changes between them — the filter SQL each
+        // one interpolates is fixed for the life of the query.
+        let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
         let mut rows = stmt
             .query(rusqlite::params_from_iter(params))
             .map_err(|e| e.to_string())?;
@@ -55,11 +144,18 @@ impl<'a> Cx<'a> {
                 return Ok(false);
             }
             let file_id: i64 = col(row, 0)?;
-            let path: String = col(row, 2)?;
-            if self.skip(file_id, &path) {
+            // Borrowed from the statement rather than `col::<String>`: this
+            // runs for every *scanned* row — a full-table scan on the filename
+            // pass — while only the few that become hits need an owned copy.
+            let path = row
+                .get_ref(2)
+                .map_err(|e| e.to_string())?
+                .as_str()
+                .map_err(|e| e.to_string())?;
+            if self.skip(file_id, path) {
                 continue;
             }
-            match classify(self, row, file_id, &path)? {
+            match classify(self, row, file_id, path)? {
                 RowHit::Skip => {}
                 RowHit::Emit(hit) => {
                     buf.push(hit);
@@ -234,26 +330,33 @@ impl<'a> Cx<'a> {
         let snippet_opts = snippet::Options {
             approx_chars: SNIPPET_WINDOW_CHARS,
         };
+        // One decoder and one fold buffer for the whole scan; both are reused
+        // per row rather than reallocated.
+        let mut doc = DocDecoder::new()?;
+        let mut lower = String::new();
         // Decompression dominates: check cancellation every row.
         self.scan_pass(&sql, params, 1, None, |cx, row, file_id, path| {
-            let blob: Option<Vec<u8>> = col(row, 5)?;
-            let text = blob
-                .and_then(|b| zstd::decode_all(b.as_slice()).ok())
-                .map(|raw| String::from_utf8_lossy(&raw).into_owned());
+            let blob: Option<&[u8]> = row
+                .get_ref(5)
+                .map_err(|e| e.to_string())?
+                .as_blob_or_null()
+                .map_err(|e| e.to_string())?;
+            let text = blob.and_then(|b| doc.decode(b));
 
-            let (rank, stage, snip) = match &text {
+            let (rank, stage, snip) = match text {
                 Some(text) => {
                     // Fold once: the case-insensitive count, the first-match
                     // search and the snippet extraction all need it, and
                     // nearly every candidate takes this path.
-                    let mut folded: Option<String> = None;
+                    let mut folded = false;
                     let (count, stage) = {
                         let count_cs = pattern.count(text, false);
                         if count_cs > 0 {
                             (count_cs, 5)
                         } else {
-                            let lower = folded.insert(text.to_ascii_lowercase());
-                            let count_ci = pattern.count_folded(lower);
+                            fold_into(&mut lower, text);
+                            folded = true;
+                            let count_ci = pattern.count_folded(&lower);
                             if count_ci > 0 {
                                 (count_ci, 6)
                             } else {
@@ -263,9 +366,11 @@ impl<'a> Cx<'a> {
                             }
                         }
                     };
+                    if !folded {
+                        fold_into(&mut lower, text);
+                    }
                     // Literal terms keep the richer multi-occurrence
                     // extract; a wildcard match marks its own first range.
-                    let lower = folded.unwrap_or_else(|| text.to_ascii_lowercase());
                     let snip = match pattern.literal() {
                         Some(term) => Some(snippet::extract_folded(
                             text,
@@ -291,7 +396,7 @@ impl<'a> Cx<'a> {
                     (6.0 + count_frac(1), 6, None)
                 }
             };
-            if !cx.regex_accepts(file_id, path, text.as_deref())? {
+            if !cx.regex_accepts(file_id, path, text)? {
                 return Ok(RowHit::Skip);
             }
 
@@ -416,27 +521,30 @@ impl<'a> Cx<'a> {
         let snippet_opts = snippet::Options {
             approx_chars: SNIPPET_WINDOW_CHARS,
         };
+        // One decoder and one fold buffer for the whole scan, reused per row.
+        let mut doc = DocDecoder::new()?;
+        let mut folded = String::new();
         // Decompression dominates: check cancellation every row.
         self.scan_pass(&sql, params, 1, None, |cx, row, file_id, path| {
-            let blob: Option<Vec<u8>> = col(row, 5)?;
-            let Some(blob) = blob else {
+            let blob: Option<&[u8]> = row
+                .get_ref(5)
+                .map_err(|e| e.to_string())?
+                .as_blob_or_null()
+                .map_err(|e| e.to_string())?;
+            let Some(text) = blob.and_then(|b| doc.decode(b)) else {
                 return Ok(RowHit::Skip);
             };
-            let Ok(raw) = zstd::decode_all(blob.as_slice()) else {
-                return Ok(RowHit::Skip);
-            };
-            let text = String::from_utf8_lossy(&raw).into_owned();
             // ASCII folding is byte-length preserving, so ranges found in
             // the folded buffer are valid in the original.
-            let folded = text.to_ascii_lowercase();
+            fold_into(&mut folded, text);
             let (count, first) = bitap.count_and_first(folded.as_bytes());
             if count == 0 {
                 return Ok(RowHit::Skip);
             }
-            if !cx.regex_accepts(file_id, path, Some(&text))? {
+            if !cx.regex_accepts(file_id, path, Some(text))? {
                 return Ok(RowHit::Skip);
             }
-            let snip = first.map(|range| snippet::window_around(&text, range, &snippet_opts));
+            let snip = first.map(|range| snippet::window_around(text, range, &snippet_opts));
             let (size, mtime) = size_and_mtime(row)?;
             Ok(RowHit::Emit(SearchHit {
                 file_id,
@@ -522,22 +630,27 @@ impl<'a> Cx<'a> {
         let snippet_opts = snippet::Options {
             approx_chars: SNIPPET_WINDOW_CHARS,
         };
+        // One decoder for the whole scan, reused per row.
+        let mut doc = DocDecoder::new()?;
         // Decompression dominates: check cancellation every row.
         self.scan_pass(&sql, params, 1, None, |_cx, row, file_id, path| {
-            let blob: Option<Vec<u8>> = col(row, 5)?;
-            let Some(raw) = blob.and_then(|b| zstd::decode_all(b.as_slice()).ok()) else {
+            let blob: Option<&[u8]> = row
+                .get_ref(5)
+                .map_err(|e| e.to_string())?
+                .as_blob_or_null()
+                .map_err(|e| e.to_string())?;
+            let Some(text) = blob.and_then(|b| doc.decode(b)) else {
                 return Ok(RowHit::Skip);
             };
-            let text = String::from_utf8_lossy(&raw).into_owned();
-            let count = re.count(&text);
+            let count = re.count(text);
             if count == 0 {
                 return Ok(RowHit::Skip);
             }
             // A greedy user regex can match megabytes; clamp the range
             // before the snippet window is cut.
-            let snip = re.find_first(&text).map(|r| {
-                let r = clamp_match_range(&text, r, SNIPPET_WINDOW_CHARS);
-                snippet::window_around(&text, (r.start, r.end), &snippet_opts)
+            let snip = re.find_first(text).map(|r| {
+                let r = clamp_match_range(text, r, SNIPPET_WINDOW_CHARS);
+                snippet::window_around(text, (r.start, r.end), &snippet_opts)
             });
             let (size, mtime) = size_and_mtime(row)?;
             Ok(RowHit::Emit(SearchHit {
