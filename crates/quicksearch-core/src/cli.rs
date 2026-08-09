@@ -221,6 +221,7 @@ mod tests {
     use crate::db::open_or_recreate;
     use crate::db::repo::{insert_file, set_content_done, set_content_failed, NewFile};
     use crate::mime::FileType;
+    use crate::testutil::zstd_of;
 
     fn tmp_path() -> std::path::PathBuf {
         crate::testutil::scratch_dir("cli").join("index.sqlite")
@@ -248,7 +249,7 @@ mod tests {
             )
             .unwrap()
             .expect("unique path");
-            set_content_done(&tx, a, "a.txt", "hello", &[], true).unwrap();
+            set_content_done(&tx, a, "a.txt", "hello", &[], zstd_of("hello").as_deref()).unwrap();
             let b = insert_file(
                 &tx,
                 &NewFile {
@@ -427,7 +428,7 @@ mod tests {
             .unwrap()
             .expect("unique path");
             let prose = "the quick brown fox jumps over the lazy dog. ".repeat(500);
-            set_content_done(&tx, id, "big.txt", &prose, &[], true).unwrap();
+            set_content_done(&tx, id, "big.txt", &prose, &[], zstd_of(&prose).as_deref()).unwrap();
             tx.commit().unwrap();
         }
         drop(conn);

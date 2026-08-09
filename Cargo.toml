@@ -5,8 +5,27 @@ members = [
     "crates/quicksearch-gui",
 ]
 
+# No `[profile.release]` on purpose. Cross-crate inlining looks like it should
+# pay here — the cascade calls into `snippet`/`query`, both into `memchr` and
+# `zstd`, everything into `rusqlite`'s FFI wrappers — so it was measured, and
+# it does not. Against an incremental rebuild of the GUI after touching core
+# (10.2 s at the defaults):
+#
+#   lto=thin           67 s   search cold 29.9 ms  warm best 14.77 ms  index cold 459 ms
+#   lto=thin,cgu=1    152 s   (build cost alone ruled it out)
+#   lto=fat,cgu=1     200 s   search cold 29.2 ms  warm best 14.57 ms  index cold 479 ms
+#   (defaults)         10 s   search cold 30.0 ms  warm best 14.92 ms  index cold 478 ms
+#
+# Every runtime column moves 0-4% and index-cold is not even monotonic, so the
+# gain is at the noise floor while the build is 6.6-19.5x longer — on a CI that
+# builds three targets. Re-measure before concluding otherwise.
+#
+# `panic = "abort"` is separately unavailable: `extract/pdf.rs` runs
+# `pdf-extract` inside `catch_unwind`, so aborting would turn a malformed PDF
+# into a killed process instead of one skipped file.
+
 [workspace.package]
-version = "1.0.5"
+version = "1.0.6"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Jeremy <jeremy@karsttech.com>"]

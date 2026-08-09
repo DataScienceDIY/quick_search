@@ -35,6 +35,7 @@ use quicksearch_core::mime::FileType;
 use quicksearch_core::query::split::split_for_cascade;
 use quicksearch_core::search::{cascade, SearchHit, SearchOptions};
 use quicksearch_core::security::IndexKey;
+use quicksearch_core::testutil::zstd_of;
 use rusqlite::Connection;
 
 mod common;
@@ -137,7 +138,8 @@ fn seed(path: &std::path::Path) {
             let body: Vec<&str> = (0..60)
                 .map(|_| WORDS[(rng.next() as usize) % WORDS.len()])
                 .collect();
-            set_content_done(&tx, id, &name, &body.join(" "), &[], true).unwrap();
+            let body = body.join(" ");
+            set_content_done(&tx, id, &name, &body, &[], zstd_of(&body).as_deref()).unwrap();
         }
     }
     tx.commit().unwrap();
@@ -203,6 +205,15 @@ fn run_matrix(label: &str, path: &std::path::Path) {
     }
 }
 
+/// Serializes the two matrices below.
+///
+/// `set_process_key` is process-global, and libtest runs `#[test]` functions
+/// on concurrent threads within one process — so without this the encrypted
+/// run's key is set while the unencrypted run opens its plain index, and that
+/// open fails with `NotADatabase`. Being separate tests is not enough on its
+/// own; they have to not overlap.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The headline comparison, printed rather than asserted.
 ///
 /// Deliberately not a pass/fail threshold: timings on a shared CI box are not
@@ -215,6 +226,7 @@ fn cache_size_against_search_latency() {
         eprintln!("skipping: set QSB_SEARCH_PERF=1 to run");
         return;
     }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     let plain = scratch_db("searchperf-plain");
     let seeded = Instant::now();
@@ -232,13 +244,14 @@ fn cache_size_against_search_latency() {
 ///
 /// Separate test, and separate process-wide key, because
 /// [`set_process_key`] is global: running both in one test would have the
-/// plain index opened with a key set.
+/// plain index opened with a key set. [`SERIAL`] keeps them from overlapping.
 #[test]
 fn cache_size_against_search_latency_encrypted() {
     if !enabled() {
         eprintln!("skipping: set QSB_SEARCH_PERF=1 to run");
         return;
     }
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
     set_process_key(Some(
         IndexKey::from_hex(&"42".repeat(32)).expect("valid 32-byte key"),

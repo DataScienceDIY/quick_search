@@ -237,7 +237,13 @@ inside that folder.
   restarts until you return to automatic. The index size beside the
   status heading totals the database and its `-wal`/`-shm` sidecars,
   refreshed every ten seconds; hovering it lists the ways to make it
-  smaller.
+  smaller. Each folder in the list carries what it holds — files
+  indexed, and how many of those had text extracted — counted once as
+  each indexing run finishes and stored with the index, so they are
+  there the moment the app opens rather than costing a scan to show. A
+  folder nothing has finished indexing reads "not yet indexed" rather
+  than zero, and because the figures come from completed runs they do
+  not move as live updates apply single changes in between.
 - **Duplicates**: files sharing a content hash, grouped.
 - **Logs**: the lines the app would have printed to a terminal — warnings
   from indexing, folder watching and opening files, newest last, with a
@@ -458,7 +464,14 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   then held — the coordinator's writer, before it learned to let go when idle —
   keeps that memory for the life of the process. Search is the one deliberately
   large one, because it is the only cache reused often enough to pay for
-  itself, and it is released once searching stops.
+  itself, and it is released once searching stops. Dropping the connection is
+  only half of releasing it: glibc hands the freed pages back to its own arena
+  rather than to the kernel, so the search worker calls
+  `platform::release_free_heap` after it lets go, exactly as
+  `coordinator::go_idle` does for the writer. Without that call one typing
+  session left the process 42 MiB heavier for as long as it ran — measured on a
+  77k-file index, where an idle GUI sat at 76 MiB `RssAnon` and stayed there,
+  against 34 MiB before the first search and 42 MiB once the trim runs.
 - **Indexing** (`indexing.rs`, `file_handling.rs`): full runs walk each
   root (`filtered_walk` prunes hidden/ignored subtrees before descending),
   classify files by mtime into insert/update/skip, batch-write metadata,
@@ -467,9 +480,15 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   OLE2 streams are read in `extract/ole.rs` — PDF, audio tags, EXIF; see
   `extract/`) for FTS. PDFs are parsed once, with the text and the `Info`
   dictionary taken off the same document: the two-parse version that preceded
-  it was a run's largest single memory consumer, and it was what pulled a
-  second copy of `lopdf` — and with it rayon's never-torn-down thread pool —
-  into the build. Files whose extension no MIME
+  it was the largest single memory consumer of a run over a PDF-heavy tree, and
+  it was what pulled a second copy of `lopdf` — and with it rayon's
+  never-torn-down thread pool — into the build. That is a claim about PDFs
+  rather than about runs in general, and it is worth knowing which tree a
+  number came from: on one with almost no PDFs, a cold run peaks at 130 MiB
+  against 27 MiB for the same walk with content extraction switched off, and
+  switching off `store_text_for_snippets` moves that peak not at all — so what
+  is left is the extraction workers and FTS5's own index build, not any single
+  parser and not the stored text. Files whose extension no MIME
   table knows — including extensionless ones like `README` or `Makefile` —
   are sniffed from their head bytes and indexed as text only when that head
   is provably text: valid UTF-8, or BOM-marked (`mime.rs`, `textenc.rs`).
@@ -554,6 +573,31 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   flush last, so weaker matches only ever append. All SQL is
   parameterized; structured filters from the query language (`query/`)
   are ANDed onto every pass.
+
+  The passes that read document text share one `zstd::bulk::Decompressor` and
+  one output buffer per scan (`DocDecoder` in `search/cascade/passes.rs`),
+  and the row's path is borrowed from the statement rather than copied — only
+  rows that become hits own one. Both matter more than they look: peak memory
+  during a search never exceeded 14 MiB even before any of this, but a *single*
+  fuzzy query moved 31 GiB through `malloc`, and resident-set sampling is blind
+  to that by construction, because a buffer allocated and freed inside one loop
+  iteration never moves RSS. `DocDecoder` must therefore never fall back to a
+  per-row allocating decode, and there is a trap waiting there:
+  `zstd::encode_all`, which the indexer writes with, is *stream*-based and so
+  records no content size in the frame header, meaning
+  `get_frame_content_size` returns `None` for every row this ever sees. The
+  "cannot happen" branch is the only branch. Sizing the buffer from the header
+  and handing the `None` case to `zstd::decode_all` looks obviously right and
+  costs ~2.4 MiB per document, because `decode_all` builds a streaming decoder
+  per call — 27 of the 30 GiB a fuzzy search moved. Growing this buffer and
+  keeping it is what makes decoding a row allocate nothing at all.
+  Measured over the same 77k-file index, per query:
+  `cascade` 582 → 14 MiB, `function` 6.0 GiB → 29 MiB, `--fuzzy cascade`
+  31 GiB → 57 MiB, `regex:` 31 GiB → 39 MiB, each a little faster rather than
+  slower. `TermPattern::find_first` folds nothing either: its
+  case-insensitive literal branch used to allocate a lowercased copy of its
+  haystack, which the filename pass asked for twice per row of a full-table
+  scan.
 - **Baloo compatibility** (`cli.rs`, `mime.rs`): the read API this repo's
   parent consumes — `status_for_path`, `list_failed`,
   `index_size_breakdown`, `pending_content_count`, `clear_path` — plus a
@@ -612,6 +656,15 @@ microseconds regardless of row count.
   synthesizing clicks and reading back the painted text (`test_ui.rs`) — over
   the search and manage tabs, the options editor, the unlock gate, the logs
   and duplicates tabs, and query highlighting.
+- `cargo bench -p quicksearch-core --bench search` and `--bench index`: divan
+  microbenchmarks over the two hot paths. Each group runs *what the code does
+  today* against *the change being considered*, in one process on one corpus,
+  so the comparison is a measurement rather than an estimate — read the losing
+  arm as documentation of something already tried. Sizes sweep 1 KiB, 16 KiB
+  and 256 KiB, the last being `maximum_text_size` and so the worst a full-text
+  row can present; `benches/corpus/` builds all of it from a fixed seed. This
+  is the harness to extend when a hot path is in question, because it is the
+  only one here that can A/B a single function.
 - `QSB_SNIPPET_PERF=1 cargo test --release -p quicksearch-core --test
   snippet_perf -- --nocapture`: snippet pipeline benchmark.
 - `QSB_SEARCH_PERF=1 cargo test --release -p quicksearch-core --test
@@ -632,6 +685,16 @@ microseconds regardless of row count.
   distinguishable from live data. It reads another process's `/proc`, so it
   measures a build made without knowing it would be measured.
   `indexprobe` and `walkprobe` answer "how fast" rather than "how much".
+
+  All of these read the resident set, and none of them can see allocator
+  *churn*: a buffer allocated and freed within one loop iteration never moves
+  RSS, so a search whose peak is a flat 14 MiB can still be pushing tens of
+  gigabytes a query through `malloc`. Both search-side regressions found so far
+  were invisible to every probe listed above and showed up only under an
+  interposed `malloc` that counted calls and bytes. Until a probe here reports
+  allocation counts, measure that separately before concluding a path is cheap,
+  and measure the GUI rather than a one-shot `quicksearch-cli` run — a
+  short-lived process cannot show what a typing session retains.
 - `.forgejo/workflows/ci.yml`: builds both platforms on every push to `master`
   and every pull request. To cut a release, bump `[workspace.package] version`
   in `Cargo.toml` and push the commit on a branch named `Release...`; CI runs

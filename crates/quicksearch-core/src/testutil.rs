@@ -11,6 +11,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// lets two tests in the same millisecond collide.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
+/// The compressed body [`crate::db::repo::set_content_done`] wants, for tests
+/// that only care that a sidecar row gets written.
+///
+/// Production callers compress a whole batch through one
+/// [`crate::db::repo::DocEncoder`] before taking the connection lock; a test
+/// writing one row has nothing to amortize and wants the one-liner.
+pub fn zstd_of(text: &str) -> Option<Vec<u8>> {
+    crate::db::repo::encode_one(text, true).expect("zstd encode")
+}
+
 /// A fresh, empty directory under the system temp dir, named for `tag`.
 /// Not cleaned up on drop: when a test fails, the tree it built is most of
 /// the evidence. Panics — a test that cannot create a directory has nothing

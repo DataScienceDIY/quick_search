@@ -166,13 +166,22 @@ pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option
 /// result rows can't render snippets). `properties` are stored both as a
 /// structured side-table (exact retrieval) and concatenated into the FTS
 /// `properties` column (MATCH).
+/// `text_zstd` is the already-compressed body for the `documents_text`
+/// sidecar, or `None` to write no sidecar at all (an empty body, or
+/// `store_text_for_snippets` off).
+///
+/// Compression is the caller's job, and deliberately so: it is the expensive
+/// half of a content write, and this runs inside the writer's transaction
+/// with the shared connection held. Callers on the indexing path compress a
+/// whole batch through one [`DocEncoder`] *before* taking the lock, so the
+/// transaction only binds finished blobs.
 pub fn set_content_done(
     tx: &Transaction<'_>,
     file_id: i64,
     name: &str,
     text: &str,
     properties: &[(String, String)],
-    store_text: bool,
+    text_zstd: Option<&[u8]>,
 ) -> Result<(), String> {
     remove_content_for_id(tx, file_id)?;
 
@@ -195,10 +204,8 @@ pub fn set_content_done(
     )?;
 
     // No sidecar row for empty body text (e.g. an image whose extractor
-    // returned only EXIF properties).
-    if store_text && !text.is_empty() {
-        let compressed = zstd::encode_all(text.as_bytes(), ZSTD_LEVEL)
-            .map_err(|e| format!("zstd encode for file {}: {}", file_id, e))?;
+    // returned only EXIF properties) — the caller passes `None` for that.
+    if let Some(compressed) = text_zstd {
         exec(
             tx,
             "INSERT INTO documents_text(file_id, text_zstd, text_len) VALUES (?1, ?2, ?3)",
@@ -214,6 +221,45 @@ pub fn set_content_done(
 /// MB/s); level 9+ would shave a few percent more at 10× the CPU cost, and
 /// readers decompress far faster than writers compress.
 const ZSTD_LEVEL: i32 = 3;
+
+/// Reusable compression context for the `documents_text` sidecar — the write
+/// side's mirror of the cascade's `DocDecoder`.
+///
+/// `zstd::encode_all` builds and tears down a `ZSTD_CCtx` — window, hash and
+/// chain tables — on every call, and the writer calls it once per extracted
+/// document. At 1 KiB, the size most documents actually are, that setup costs
+/// more than the compression: 16.4 µs against 3.4 µs for the same bytes
+/// through a context that already exists (`benches/index.rs`, group
+/// `zstd_encode`). One encoder per batch makes it a per-batch cost.
+pub struct DocEncoder(zstd::bulk::Compressor<'static>);
+
+impl DocEncoder {
+    pub fn new() -> Result<DocEncoder, String> {
+        zstd::bulk::Compressor::new(ZSTD_LEVEL)
+            .map(DocEncoder)
+            .map_err(|e| format!("zstd encoder: {}", e))
+    }
+
+    /// Compress `text` for [`set_content_done`]'s `text_zstd` argument.
+    pub fn encode(&mut self, text: &str) -> Result<Vec<u8>, String> {
+        self.0
+            .compress(text.as_bytes())
+            .map_err(|e| format!("zstd encode: {}", e))
+    }
+}
+
+/// Compress one body, for the writers that handle a single row.
+///
+/// The batch writers reuse one [`DocEncoder`] across a chunk and run it
+/// outside the connection lock. The single-row paths — the watcher, and a
+/// walk-time inline body — write one row per transaction, so there is no
+/// batch to amortize a context over and this builds one for the document.
+pub fn encode_one(text: &str, store_text: bool) -> Result<Option<Vec<u8>>, String> {
+    if !store_text || text.is_empty() {
+        return Ok(None);
+    }
+    DocEncoder::new()?.encode(text).map(Some)
+}
 
 /// Mark a file's content extraction as failed. Keeps the basic row in place.
 pub fn set_content_failed(tx: &Transaction<'_>, file_id: i64, reason: &str) -> Result<(), String> {
@@ -442,6 +488,44 @@ pub fn row_count(conn: &Connection) -> Result<usize, String> {
         .map_err(|e| format!("count indexed files: {}", e))
 }
 
+/// What one root holds: rows under it, and how many of those are searchable
+/// by content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootCounts {
+    pub files: i64,
+    /// Rows carrying a `searchabletext` entry.
+    pub fts: i64,
+}
+
+/// Count the rows in the half-open path range `[lo, hi)` and, in the same
+/// pass, how many of them have a full-text row.
+///
+/// `content_state = STATE_DONE` *is* "has a `searchabletext` row":
+/// [`set_content_done`] holds the only insert into that table and is what
+/// writes the state, and [`remove_content_for_id`] clears the two together.
+/// Asking `files` is what makes both figures one statement — the FTS table is
+/// contentless and keyed by `rowid`, so it has no path to range-scan on.
+///
+/// One statement, but not a cheap one: `content_state` is not carried by the
+/// `UNIQUE(files.path)` index the range seeks on, so every row in the range is
+/// fetched. Call it where a run has just read those rows anyway, not on a
+/// cadence.
+pub fn count_root(conn: &Connection, lo: &str, hi: &str) -> Result<RootCounts, String> {
+    conn.prepare_cached(
+        "SELECT COUNT(*), COALESCE(SUM(content_state = ?3), 0) FROM files
+          WHERE path >= ?1 AND path < ?2",
+    )
+    .and_then(|mut stmt| {
+        stmt.query_row(params![lo, hi, STATE_DONE], |r| {
+            Ok(RootCounts {
+                files: r.get(0)?,
+                fts: r.get(1)?,
+            })
+        })
+    })
+    .map_err(|e| format!("count root {}: {}", lo, e))
+}
+
 /// One page of rows whose path is `> after` and `< hi`, in path order.
 ///
 /// Keyset on `path`: every page is an index walk with no sort step, and a row
@@ -554,14 +638,24 @@ pub fn paths_in_dir(conn: &Connection, parent: &str) -> Result<Vec<String>, Stri
 pub fn remove_content_for_id(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
     // `contentless_delete=1` on the FTS5 table makes this work without
     // re-supplying the old column values (it tombstones the rowid).
-    for (table, key) in [
-        ("searchabletext", "rowid"),
-        ("documents_text", "file_id"),
-        ("properties", "file_id"),
+    //
+    // Spelled out rather than built from a (table, key) table: this runs for
+    // every extracted document and every changed file, and `format!`ing three
+    // constant strings per call also handed `prepare_cached` three freshly
+    // allocated keys to hash.
+    for (what, sql) in [
+        (
+            "searchabletext",
+            "DELETE FROM searchabletext WHERE rowid = ?1",
+        ),
+        (
+            "documents_text",
+            "DELETE FROM documents_text WHERE file_id = ?1",
+        ),
+        ("properties", "DELETE FROM properties WHERE file_id = ?1"),
     ] {
-        let sql = format!("DELETE FROM {} WHERE {} = ?1", table, key);
-        exec(tx, &sql, params![file_id], || {
-            format!("delete {} for {}", table, file_id)
+        exec(tx, sql, params![file_id], || {
+            format!("delete {} for {}", what, file_id)
         })?;
     }
     Ok(())
@@ -705,9 +799,24 @@ pub fn set_last_full_index(conn: &Connection, ts: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// The `schema_info` key prefixes holding per-root figures. Every one of them
+/// is swept by [`prune_root_stats`], so a new prefix belongs in this list or a
+/// de-configured root leaves it behind forever.
+const ROOT_STAT_PREFIXES: [&str; 2] = ["walk_count:", "counts:"];
+
+/// `schema_info` key holding one root's figure of the given kind.
+fn root_key(prefix: &str, root: &str) -> String {
+    format!("{}{}", prefix, root)
+}
+
 /// `schema_info` key holding one root's last known file count.
 fn walk_count_key(root: &str) -> String {
-    format!("walk_count:{}", root)
+    root_key(ROOT_STAT_PREFIXES[0], root)
+}
+
+/// `schema_info` key holding one root's last completed run's [`RootCounts`].
+fn counts_key(root: &str) -> String {
+    root_key(ROOT_STAT_PREFIXES[1], root)
 }
 
 /// How many files the last clean walk of `root` reported — the progress bar's
@@ -741,22 +850,64 @@ pub fn set_root_walk_count(conn: &Connection, root: &str, n: usize) -> Result<()
     Ok(())
 }
 
-/// Forget the stored counts of roots that are no longer configured, so a
-/// root removed and later re-added does not start from a stale count.
-pub fn prune_root_walk_counts(conn: &Connection, keep: &[String]) -> Result<(), String> {
-    let keep: std::collections::HashSet<String> = keep.iter().map(|r| walk_count_key(r)).collect();
+/// What the last completed run counted under `root`, if one has finished
+/// since the root was configured. Absent — never indexed, cleared, or a
+/// value this build cannot parse — reads as `None`, like the walk count.
+pub fn get_root_counts(conn: &Connection, root: &str) -> Option<RootCounts> {
+    let stored: String = conn
+        .query_row(
+            "SELECT value FROM schema_info WHERE key = ?1",
+            params![counts_key(root)],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let (files, fts) = stored.split_once(',')?;
+    Some(RootCounts {
+        files: files.parse().ok()?,
+        fts: fts.parse().ok()?,
+    })
+}
+
+/// Record what `root` holds, for the folder list to show once the run that
+/// counted it is over.
+///
+/// Written only at the end of a run that completed: a stopped one has counted
+/// part of a tree it was still changing, and the previous figure is closer to
+/// the truth than that.
+pub fn set_root_counts(conn: &Connection, root: &str, counts: RootCounts) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_info(key, value) VALUES (?1, ?2)",
+        params![counts_key(root), format!("{},{}", counts.files, counts.fts)],
+    )
+    .map_err(|e| format!("write counts for {}: {}", root, e))?;
+    Ok(())
+}
+
+/// Forget the stored figures of roots that are no longer configured, so a
+/// root removed and later re-added does not start from stale ones.
+pub fn prune_root_stats(conn: &Connection, keep: &[String]) -> Result<(), String> {
+    let keep: std::collections::HashSet<String> = ROOT_STAT_PREFIXES
+        .iter()
+        .flat_map(|prefix| keep.iter().map(move |r| root_key(prefix, r)))
+        .collect();
+    // Filtered here rather than with a `LIKE` per prefix: `schema_info` holds
+    // a handful of keys plus these, and a SQL pattern list would be a second
+    // spelling of `ROOT_STAT_PREFIXES` to keep in step with the first.
     let mut stmt = conn
-        .prepare("SELECT key FROM schema_info WHERE key LIKE 'walk_count:%'")
-        .map_err(|e| format!("read walk counts: {}", e))?;
+        .prepare("SELECT key FROM schema_info")
+        .map_err(|e| format!("read root stats: {}", e))?;
     let stored: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(0))
-        .map_err(|e| format!("read walk counts: {}", e))?
+        .map_err(|e| format!("read root stats: {}", e))?
         .filter_map(|r| r.ok())
+        .filter(|k| ROOT_STAT_PREFIXES.iter().any(|p| k.starts_with(p)))
         .collect();
     drop(stmt);
     for key in stored.iter().filter(|k| !keep.contains(*k)) {
         conn.execute("DELETE FROM schema_info WHERE key = ?1", params![key])
-            .map_err(|e| format!("drop walk count {}: {}", key, e))?;
+            .map_err(|e| format!("drop root stat {}: {}", key, e))?;
     }
     Ok(())
 }

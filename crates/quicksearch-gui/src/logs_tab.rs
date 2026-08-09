@@ -26,6 +26,16 @@ pub struct LogsTab {
     /// (egui unsticks a scroll area the user moves, and re-sticks it when
     /// they return to the bottom); unticking this stops it following at all.
     follow: bool,
+    /// Indices into `lines` that pass both filters.
+    ///
+    /// Cached rather than rebuilt per frame: `keep` lowercases each line to
+    /// compare it, so with a filter typed this was up to [`log::CAPACITY`]
+    /// (5,000) string allocations every frame, on a tab that repaints twice a
+    /// second by itself and on every input frame besides.
+    shown: Vec<usize>,
+    /// What `shown` was computed from — refresh counter, filter text,
+    /// warnings-only — so it can be rebuilt exactly when one of them moves.
+    shown_key: (u64, String, bool),
 }
 
 impl LogsTab {
@@ -37,7 +47,34 @@ impl LogsTab {
             filter: String::new(),
             warnings_only: false,
             follow: true,
+            shown: Vec::new(),
+            // `u64::MAX` so the first frame always counts as stale, whatever
+            // the ring's counter happens to be.
+            shown_key: (u64::MAX, String::new(), false),
         }
+    }
+
+    /// Rebuild [`LogsTab::shown`] if any of its inputs moved.
+    fn resync_shown(&mut self) {
+        if self.shown_key.0 == self.seen
+            && self.shown_key.2 == self.warnings_only
+            && self.shown_key.1 == self.filter
+        {
+            return;
+        }
+        let needle = self.filter.to_lowercase();
+        let warnings_only = self.warnings_only;
+        let mut shown = std::mem::take(&mut self.shown);
+        shown.clear();
+        shown.extend(
+            self.lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| keep(l, &needle, warnings_only))
+                .map(|(i, _)| i),
+        );
+        self.shown = shown;
+        self.shown_key = (self.seen, self.filter.clone(), warnings_only);
     }
 
     fn refresh(&mut self) {
@@ -53,14 +90,11 @@ impl LogsTab {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(REFRESH_MS));
 
-        let needle = self.filter.to_lowercase();
-        let shown: Vec<usize> = self
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| keep(l, &needle, self.warnings_only))
-            .map(|(i, _)| i)
-            .collect();
+        // The filter and warnings-only widgets are drawn below, so a change
+        // lands on the next frame — the same one-frame lag this always had,
+        // and the tab repaints immediately anyway.
+        self.resync_shown();
+        let shown = std::mem::take(&mut self.shown);
 
         let mut cleared = false;
         ui.horizontal(|ui| {
@@ -106,7 +140,10 @@ impl LogsTab {
             });
         });
         if cleared {
-            // `shown` indexes lines that no longer exist.
+            // `shown` indexes lines that no longer exist. Handing the buffer
+            // back keeps its capacity; `refresh` moves `seen`, which is what
+            // makes the next frame rebuild the contents.
+            self.shown = shown;
             self.refresh();
             return;
         }
@@ -131,10 +168,12 @@ impl LogsTab {
                 )
                 .weak(),
             );
+            self.shown = shown;
             return;
         }
         if shown.is_empty() {
             ui.label(egui::RichText::new("No lines match the filter.").weak());
+            self.shown = shown;
             return;
         }
 
@@ -163,6 +202,7 @@ impl LogsTab {
                 }
             });
         crate::ui_util::more_below_hint(ui, &scroll);
+        self.shown = shown;
     }
 }
 

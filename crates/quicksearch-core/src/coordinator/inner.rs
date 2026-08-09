@@ -116,6 +116,9 @@ impl Inner {
                     // restart is cheap and unconditional beats a diff here.
                     self.start_watcher();
                 }
+                // The root list, its spellings, or the database behind it may
+                // all have moved; re-pair them with what is stored.
+                self.refresh_last_full_index();
             }
             CoordCmd::RebuildIndex => {
                 let db = self.db_path();
@@ -127,6 +130,7 @@ impl Inner {
                 if let Err(e) = self.indexing.delete_index_for_rebuild(&db) {
                     crate::log_warn!("coordinator: rebuild: {}", e);
                 }
+                self.clear_root_counts();
                 self.start_full_run();
                 if self.mode != IndexMode::Auto {
                     self.mode = IndexMode::ManualRunning;
@@ -148,6 +152,9 @@ impl Inner {
                 // Zero, not `None`: nothing will rebuild this index, so no
                 // later read corrects a stale figure.
                 shared.files = Some(0);
+                // Per root the empty list reads as "not yet indexed", which is
+                // what every folder now is.
+                shared.root_counts = Arc::new(Vec::new());
                 drop(shared);
                 self.files_at = None;
             }
@@ -717,7 +724,13 @@ impl Inner {
         }
     }
 
-    /// Re-read the stamp the last completed full run left behind.
+    /// Re-read what the last completed full run left behind: its stamp, and
+    /// the per-root figures the folder list shows.
+    ///
+    /// Both off one connection because they are wanted at the same moments —
+    /// startup, a run finishing, a config change. Neither is a scan: the stamp
+    /// and each root's counts are single `schema_info` key lookups, the work of
+    /// counting having been done by the run that stored them.
     ///
     /// A failed open is *not* published as `None`: `periodic_due` reads `None`
     /// as "never indexed" and would start a fresh run every tick for as long
@@ -726,10 +739,43 @@ impl Inner {
         match db::open_existing(&self.db_path(), false) {
             Ok(conn) => {
                 let last = db::repo::get_last_full_index(&conn);
-                crate::lock_ok(&self.shared).last_full_index = last;
+                let counts = self.read_root_counts(&conn);
+                let mut shared = crate::lock_ok(&self.shared);
+                shared.last_full_index = last;
+                shared.root_counts = Arc::new(counts);
             }
             Err(e) => crate::log_warn!("coordinator: last-full-index unreadable: {}", e),
         }
+    }
+
+    /// Pair every configured root with its stored figures, keyed by the
+    /// spelling the config uses so a frontend can match what it draws.
+    ///
+    /// The `schema_info` keys are canonicalized, which is what makes writing
+    /// `~/docs` where the config said `/home/me/docs` keep the figures — the
+    /// same re-keying `indexing::resolved_root_workers` does in the other
+    /// direction.
+    fn read_root_counts(&self, conn: &Connection) -> Vec<RootCount> {
+        self.config
+            .paths
+            .indexing_paths
+            .iter()
+            .zip(self.config.resolved_indexing_paths())
+            .filter_map(|(raw, resolved)| {
+                let root = crate::file_handling::normalize_root_string(&resolved.to_string_lossy());
+                let counts = db::repo::get_root_counts(conn, &root)?;
+                Some(RootCount {
+                    root: raw.clone(),
+                    counts,
+                })
+            })
+            .collect()
+    }
+
+    /// Forget the published figures: the index behind them is gone, and
+    /// nothing will correct them until a run rebuilds it.
+    fn clear_root_counts(&self) {
+        crate::lock_ok(&self.shared).root_counts = Arc::new(Vec::new());
     }
 
     fn publish(&mut self) {

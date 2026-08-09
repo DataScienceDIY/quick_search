@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::db::open_or_recreate;
+use crate::testutil::zstd_of;
 
 fn tmp_path() -> std::path::PathBuf {
     crate::testutil::scratch_dir("repo").join("index.sqlite")
@@ -38,7 +39,7 @@ fn insert_update_delete_round_trip() {
             "a.txt",
             "hello world",
             &[("title".to_string(), "hi".to_string())],
-            true,
+            zstd_of("hello world").as_deref(),
         )
         .unwrap();
         tx.commit().unwrap();
@@ -136,7 +137,15 @@ fn update_writes_content_state_from_needs_content() {
     let id = {
         let tx = conn.transaction().unwrap();
         let id = insert_file(&tx, &row).unwrap().expect("unique path");
-        set_content_done(&tx, id, "a.txt", "old text", &[], true).unwrap();
+        set_content_done(
+            &tx,
+            id,
+            "a.txt",
+            "old text",
+            &[],
+            zstd_of("old text").as_deref(),
+        )
+        .unwrap();
         tx.commit().unwrap();
         id
     };
@@ -265,7 +274,15 @@ fn delete_subtree_clears_every_dependent_table() {
         )
         .unwrap()
         .expect("unique path");
-        set_content_done(tx, id, name, "body text", &[("k".into(), "v".into())], true).unwrap();
+        set_content_done(
+            tx,
+            id,
+            name,
+            "body text",
+            &[("k".into(), "v".into())],
+            zstd_of("body text").as_deref(),
+        )
+        .unwrap();
         id
     };
 
@@ -351,7 +368,7 @@ fn seeded(conn: &mut Connection, paths: &[&str]) -> std::collections::HashMap<St
             name,
             "body text",
             &[("k".into(), "v".into())],
-            true,
+            zstd_of("body text").as_deref(),
         )
         .unwrap();
         ids.insert((*path).to_string(), id);
@@ -765,7 +782,7 @@ fn seed_rows(conn: &mut Connection, range: std::ops::Range<usize>) {
             &name,
             &"lorem ipsum dolor sit amet ".repeat(64),
             &[],
-            true,
+            zstd_of(&"lorem ipsum dolor sit amet ".repeat(64)).as_deref(),
         )
         .unwrap();
     }
@@ -1034,6 +1051,184 @@ fn set_content_failed_writes_failed_table() {
         )
         .unwrap();
     assert_eq!(content_state, STATE_FAILED);
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// Insert one row under `path`, born pending when `needs_content`.
+fn insert_at(tx: &Transaction<'_>, path: &str, needs_content: bool) -> i64 {
+    let name = path.rsplit('/').next().unwrap();
+    let parent = &path[..path.rfind('/').unwrap()];
+    insert_file(
+        tx,
+        &NewFile {
+            name,
+            path,
+            parent,
+            size: 1,
+            mtime: 1,
+            inode: None,
+            device_id: None,
+            mime: Some("text/plain"),
+            ftype: FileType::TEXT,
+            hash: None,
+            needs_content,
+        },
+    )
+    .unwrap()
+    .expect("unique path")
+}
+
+fn fts_rows(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM searchabletext", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// The whole premise of answering both figures from `files`: a row reads
+/// `content_state = DONE` exactly when it has a `searchabletext` row, so the
+/// conditional sum *is* a count of the FTS table restricted to a path range.
+///
+/// Pinned against the FTS table itself rather than against the states that
+/// were written, because the equivalence is what would break if some future
+/// transition wrote one without the other.
+#[test]
+fn count_root_counts_the_fts_rows_it_says_it_does() {
+    let p = tmp_path();
+    let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    {
+        let tx = conn.transaction().unwrap();
+        // Two searchable, and one of each way a row can fail to be.
+        for path in ["/tree/a.txt", "/tree/b.txt"] {
+            let id = insert_at(&tx, path, true);
+            set_content_done(
+                &tx,
+                id,
+                "n",
+                "body text",
+                &[],
+                zstd_of("body text").as_deref(),
+            )
+            .unwrap();
+        }
+        let failed = insert_at(&tx, "/tree/c.bin", true);
+        set_content_failed(&tx, failed, "bad parse").unwrap();
+        let na = insert_at(&tx, "/tree/d.iso", true);
+        set_content_na(&tx, na).unwrap();
+        insert_at(&tx, "/tree/e.txt", true); // still pending
+        tx.commit().unwrap();
+    }
+
+    let counts = count_root(&conn, "/tree/", "/tree0").unwrap();
+    assert_eq!(counts.files, 5, "every row under the root");
+    assert_eq!(
+        counts.fts,
+        fts_rows(&conn),
+        "the root holds everything, so its FTS figure is the whole table"
+    );
+    assert_eq!(counts.fts, 2);
+
+    // A searchable row outside the range moves the table's total and not the
+    // root's figure — otherwise the assertion above would hold for a count
+    // that ignored its bounds.
+    {
+        let tx = conn.transaction().unwrap();
+        let id = insert_at(&tx, "/elsewhere/f.txt", true);
+        set_content_done(
+            &tx,
+            id,
+            "n",
+            "body text",
+            &[],
+            zstd_of("body text").as_deref(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(fts_rows(&conn), 3);
+    assert_eq!(
+        count_root(&conn, "/tree/", "/tree0").unwrap(),
+        counts,
+        "a row outside the range belongs to no root's figures"
+    );
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// An empty range is 0/0, not an error: a configured root nothing has been
+/// walked into yet is a normal state, and `SUM` over no rows is NULL.
+#[test]
+fn count_root_reports_zero_for_an_empty_range() {
+    let p = tmp_path();
+    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    assert_eq!(
+        count_root(&conn, "/nothing/", "/nothing0").unwrap(),
+        RootCounts { files: 0, fts: 0 }
+    );
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+#[test]
+fn root_counts_round_trip() {
+    let p = tmp_path();
+    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    assert_eq!(get_root_counts(&conn, "/tree"), None, "never counted");
+
+    set_root_counts(&conn, "/tree", RootCounts { files: 12, fts: 5 }).unwrap();
+    assert_eq!(
+        get_root_counts(&conn, "/tree"),
+        Some(RootCounts { files: 12, fts: 5 })
+    );
+    // Overwrite, not accumulate.
+    set_root_counts(&conn, "/tree", RootCounts { files: 20, fts: 9 }).unwrap();
+    assert_eq!(
+        get_root_counts(&conn, "/tree"),
+        Some(RootCounts { files: 20, fts: 9 })
+    );
+    // Roots do not read each other's figures.
+    assert_eq!(get_root_counts(&conn, "/other"), None);
+
+    // A value this build cannot parse reads as absent, like a missing one:
+    // the folder list says "not yet indexed" rather than showing a number
+    // that is a guess.
+    for bad in ["", "12", "12,", "a,b", "12,5,3"] {
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_info(key, value) VALUES ('counts:/tree', ?1)",
+            params![bad],
+        )
+        .unwrap();
+        assert_eq!(get_root_counts(&conn, "/tree"), None, "parsed {:?}", bad);
+    }
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// Both kinds of per-root figure are swept together, so a root removed and
+/// later re-added starts from neither a stale denominator nor a stale count.
+#[test]
+fn prune_root_stats_drops_every_figure_of_a_dropped_root() {
+    let p = tmp_path();
+    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    for root in ["/kept", "/dropped"] {
+        set_root_walk_count(&conn, root, 100).unwrap();
+        set_root_counts(&conn, root, RootCounts { files: 90, fts: 40 }).unwrap();
+    }
+    set_last_full_index(&conn, 1_700_000_000).unwrap();
+
+    prune_root_stats(&conn, &["/kept".to_string()]).unwrap();
+
+    assert_eq!(get_root_walk_count(&conn, "/kept"), Some(100));
+    assert_eq!(
+        get_root_counts(&conn, "/kept"),
+        Some(RootCounts { files: 90, fts: 40 })
+    );
+    assert_eq!(get_root_walk_count(&conn, "/dropped"), None);
+    assert_eq!(get_root_counts(&conn, "/dropped"), None);
+    // The sweep reads every `schema_info` key; unrelated ones must survive it.
+    assert_eq!(get_last_full_index(&conn), Some(1_700_000_000));
 
     drop(conn);
     std::fs::remove_file(&p).ok();

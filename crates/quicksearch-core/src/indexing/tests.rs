@@ -163,6 +163,12 @@ fn stored_walk_count(db_path: &str, root: &str) -> Option<usize> {
     crate::db::repo::get_root_walk_count(&conn, root)
 }
 
+/// What the last completed run counted under `root`, if any.
+fn stored_root_counts(db_path: &str, root: &str) -> Option<crate::db::repo::RootCounts> {
+    let conn = db::open_existing(db_path, false).unwrap();
+    crate::db::repo::get_root_counts(&conn, root)
+}
+
 /// A walk that could not read part of its tree must not record its count:
 /// the figure is the next run's progress denominator, and nothing ever
 /// re-derives it.
@@ -230,6 +236,92 @@ fn a_stopped_run_keeps_the_walk_count_unrecorded() {
     // stand-in for a shutdown part-way through a walk.
     run_with(&config, &db_path, &Arc::new(AtomicBool::new(true))).unwrap();
     assert_eq!(stored_walk_count(&db_path, &root), None);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A completed run records what each root holds, so the folder list can show
+/// it once the run's own per-root progress rows are gone.
+///
+/// The extension whitelist is narrowed to `txt` so the split between the two
+/// figures is the test's to decide rather than the default list's.
+#[test]
+fn a_completed_run_records_what_each_root_holds() {
+    let dir = tmp_dir("root-counts");
+    // A subdirectory, so the index and its WAL sidecars are not themselves
+    // files under the root being counted.
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), "alpha body").unwrap();
+    std::fs::write(tree.join("b.txt"), "beta body").unwrap();
+    std::fs::write(tree.join("c.log"), "outside the whitelist").unwrap();
+
+    let db_path = dir.join("index.db").to_string_lossy().into_owned();
+    let mut config = Config::default();
+    config.paths.indexing_paths = vec![tree.to_string_lossy().into_owned()];
+    config.paths.database_path = db_path.clone();
+    config.indexing.content_extensions = vec!["txt".into()];
+    let root = normalize_root_string(&tree.to_string_lossy());
+
+    run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+
+    let stored = stored_root_counts(&db_path, &root).expect("a completed run records them");
+    assert_eq!(
+        stored,
+        crate::db::repo::RootCounts { files: 3, fts: 2 },
+        "every file under the root, and the two the whitelist let through"
+    );
+
+    // And they describe the index rather than the walk: the same two numbers
+    // read straight off the tables the folder list is standing in for.
+    let conn = db::open_existing(&db_path, false).unwrap();
+    let files: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+        .unwrap();
+    let fts: i64 = conn
+        .query_row("SELECT COUNT(*) FROM searchabletext", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!((stored.files, stored.fts), (files, fts));
+    drop(conn);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A stopped run counted part of a tree it was still changing, so the figures
+/// it would store are worse than the ones already there. Pinned in both
+/// directions: a guard that simply never stored anything would satisfy the
+/// negative half on its own.
+#[test]
+fn a_stopped_run_keeps_the_recorded_counts() {
+    let dir = tmp_dir("stopped-root-counts");
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), "alpha body").unwrap();
+
+    let db_path = dir.join("index.db").to_string_lossy().into_owned();
+    let mut config = Config::default();
+    config.paths.indexing_paths = vec![tree.to_string_lossy().into_owned()];
+    config.paths.database_path = db_path.clone();
+    let root = normalize_root_string(&tree.to_string_lossy());
+
+    run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+    let after_run = stored_root_counts(&db_path, &root).expect("recorded");
+    assert_eq!(after_run.files, 1);
+
+    // Two more files, then a run that stops at its first check — the
+    // deterministic stand-in for a shutdown part-way through.
+    std::fs::write(tree.join("b.txt"), "beta body").unwrap();
+    std::fs::write(tree.join("c.txt"), "gamma body").unwrap();
+    run_with(&config, &db_path, &Arc::new(AtomicBool::new(true))).unwrap();
+    assert_eq!(
+        stored_root_counts(&db_path, &root),
+        Some(after_run),
+        "a stopped run leaves the last completed run's figures alone"
+    );
+
+    // The same tree, run to completion, does move them.
+    run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+    assert_eq!(stored_root_counts(&db_path, &root).unwrap().files, 3);
 
     std::fs::remove_dir_all(&dir).ok();
 }

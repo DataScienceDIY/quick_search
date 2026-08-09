@@ -76,13 +76,16 @@ pub fn extract_folded(text: &str, folded: &str, terms: &[&str], opts: &Options) 
         return head_window(text, opts.approx_chars);
     }
 
+    // `memmem` rather than `str::match_indices`: both find non-overlapping
+    // occurrences, but std's Two-Way searcher has no vector prefilter and a
+    // full-text row scans a whole document body. See `benches/search.rs`,
+    // group `substring`.
     let mut matches: Vec<(usize, usize)> = Vec::new();
     for term in &effective_terms {
         let pattern = term.to_ascii_lowercase();
         matches.extend(
-            folded
-                .match_indices(&pattern)
-                .map(|(at, _)| (at, at + pattern.len())),
+            memchr::memmem::find_iter(folded.as_bytes(), pattern.as_bytes())
+                .map(|at| (at, at + pattern.len())),
         );
     }
 
@@ -185,11 +188,13 @@ pub fn count_occurrences(text: &str, term: &str, case_sensitive: bool) -> usize 
         return 0;
     }
     if case_sensitive {
-        text.match_indices(term).count()
+        memchr::memmem::find_iter(text.as_bytes(), term.as_bytes()).count()
     } else {
-        text.to_ascii_lowercase()
-            .match_indices(&term.to_ascii_lowercase())
-            .count()
+        memchr::memmem::find_iter(
+            text.to_ascii_lowercase().as_bytes(),
+            term.to_ascii_lowercase().as_bytes(),
+        )
+        .count()
     }
 }
 
