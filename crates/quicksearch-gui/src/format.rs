@@ -26,8 +26,7 @@ pub fn fmt_mtime(unix_secs: i64) -> String {
 }
 
 /// Relative time for recent events, absolute for old ones: "just now",
-/// "5 min ago", "3 h ago", else `YYYY-MM-DD HH:MM`. Gives instant
-/// feedback that an action (like a fast index run) actually happened.
+/// "5 min ago", "3 h ago", else `YYYY-MM-DD HH:MM`.
 pub fn fmt_ago(unix_secs: u64) -> String {
     let age = quicksearch_core::log::now_unix().saturating_sub(unix_secs);
     if age < 60 {
@@ -42,8 +41,7 @@ pub fn fmt_ago(unix_secs: u64) -> String {
 }
 
 /// A configured interval as a phrase to drop after "every": `90 min`,
-/// `24 h`, `3 days`. Used where the periodic reindex is the only thing
-/// refreshing the index, so the user can judge how stale it may get.
+/// `24 h`, `3 days`.
 pub fn fmt_interval(minutes: u64) -> String {
     if minutes == 0 {
         // The scheduler treats 0 as always-due.
@@ -55,8 +53,7 @@ pub fn fmt_interval(minutes: u64) -> String {
     if minutes.is_multiple_of(1440) {
         let days = minutes / 1440;
         return if days == 1 {
-            // A staleness window reads better in hours than in days: "1 day"
-            // invites rounding to "about a day", "24 h" does not.
+            // "24 h", not "1 day": a staleness window reads better in hours.
             "24 h".to_string()
         } else {
             format!("{} days", days)
@@ -105,12 +102,8 @@ pub fn fmt_elapsed(d: std::time::Duration) -> String {
     }
 }
 
-/// A running clock: `0:07`, `4:32`, `1:04:12`.
-///
-/// For work that is still going, where the question is "how long has this
-/// been like this?" — [`fmt_elapsed`] answers a different one and would
-/// render a twenty-minute wait as `1234.5 s`. Seconds are always two digits
-/// so the text does not change width every tick.
+/// A running clock: `0:07`, `4:32`, `1:04:12`. Seconds are always two
+/// digits so the text does not change width every tick.
 pub fn fmt_duration_clock(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
@@ -121,13 +114,9 @@ pub fn fmt_duration_clock(d: std::time::Duration) -> String {
     }
 }
 
-/// What a finished configuration reconciliation did, in one line.
-///
-/// The counts are the point: a prune of a small index is over in a
-/// millisecond, so this line is the only evidence the user gets that the
-/// setting they changed reached the index at all. A clause whose count is
-/// zero is left out rather than printed as "0", and a pass that found nothing
-/// to change still reports that it ran — that it ran is the answer.
+/// What a finished configuration reconciliation did, in one line. A clause
+/// whose count is zero is left out rather than printed as "0", and a pass
+/// that found nothing to change still reports that it ran.
 pub fn fmt_reconcile_summary(deleted: usize, recontented: usize) -> String {
     let entries = |n: usize| {
         format!(
@@ -149,7 +138,9 @@ pub fn fmt_reconcile_summary(deleted: usize, recontented: usize) -> String {
     format!("Configuration change applied · {}", parts.join(" · "))
 }
 
-/// Middle-truncate a path to at most `max_chars` characters.
+/// Middle-truncate a path to at most `max_chars` characters. Char-count
+/// based and `Ui`-free; rows with a real pixel budget use the width-aware
+/// `ui_util::middle_elide` instead.
 pub fn middle_truncate(s: &str, max_chars: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max_chars || max_chars < 5 {

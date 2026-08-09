@@ -1,22 +1,15 @@
 //! Snippet extraction for search results.
 //!
-//! We store extracted text in the `documents_text` sidecar (zstd-compressed)
-//! rather than in FTS5, so SQLite's built-in `snippet()` / `highlight()`
-//! auxiliary functions aren't available (contentless FTS5 doesn't support
-//! them). This module reproduces the parts we actually need in Rust: find a
-//! window of context around the first match and report every query-term
-//! occurrence inside that window.
+//! Contentless FTS5 doesn't support SQLite's `snippet()` / `highlight()`,
+//! so this module finds a window of context around the first match in the
+//! stored text and reports every query-term occurrence inside it. Output is
+//! *structural* — the window text plus byte ranges of the matches within
+//! it — so any frontend can render highlights natively; nothing here
+//! produces markup.
 //!
-//! Output is *structural* — the window text plus byte ranges of the matches
-//! within it — so any frontend can render highlights natively (egui builds
-//! a `LayoutJob`, the CLI emits ANSI bold). Nothing here produces markup.
-//!
-//! Matching is ASCII-case-insensitive. That aligns with the search path,
-//! which is already case-insensitive via the trigram tokenizer; Unicode
-//! accent folding isn't applied at this layer — a query for `cafe` will
-//! still *find* a file containing `café` (the FTS tokenizer strips
-//! diacritics) but the snippet won't mark the accented occurrence. The
-//! window text is returned verbatim either way.
+//! Matching is ASCII-case-insensitive only: a query for `cafe` still
+//! *finds* a file containing `café` (the FTS tokenizer strips diacritics)
+//! but the snippet won't mark the accented occurrence.
 
 /// Options controlling snippet extraction.
 #[derive(Debug, Clone)]
@@ -67,12 +60,8 @@ pub fn extract(text: &str, terms: &[&str], opts: &Options) -> Snippet {
 }
 
 /// [`extract`] against a haystack the caller has already ASCII-folded.
-///
-/// The search cascade folds each document once per row and then counts,
-/// searches and extracts from that one buffer; folding again here would copy
-/// up to `maximum_text_size` a second time for every hit. `folded` must be
-/// `text.to_ascii_lowercase()` — the fold is byte-length preserving, which is
-/// what lets offsets found in it slice the original.
+/// `folded` must be `text.to_ascii_lowercase()` — the fold is byte-length
+/// preserving, which is what lets offsets found in it slice the original.
 pub fn extract_folded(text: &str, folded: &str, terms: &[&str], opts: &Options) -> Snippet {
     debug_assert_eq!(folded.len(), text.len(), "ASCII folding preserves length");
     if text.is_empty() {
@@ -87,25 +76,14 @@ pub fn extract_folded(text: &str, folded: &str, terms: &[&str], opts: &Options) 
         return head_window(text, opts.approx_chars);
     }
 
-    // All positioning happens on the folded buffer; slices come from the
-    // original. Both have identical byte layout because `to_ascii_lowercase`
-    // only touches ASCII letters.
-    let folded_bytes = folded.as_bytes();
-
     let mut matches: Vec<(usize, usize)> = Vec::new();
     for term in &effective_terms {
         let pattern = term.to_ascii_lowercase();
-        let pbytes = pattern.as_bytes();
-        let mut start = 0;
-        while start + pbytes.len() <= folded_bytes.len() {
-            if let Some(rel) = memfind(&folded_bytes[start..], pbytes) {
-                let at = start + rel;
-                matches.push((at, at + pbytes.len()));
-                start = at + pbytes.len();
-            } else {
-                break;
-            }
-        }
+        matches.extend(
+            folded
+                .match_indices(&pattern)
+                .map(|(at, _)| (at, at + pattern.len())),
+        );
     }
 
     if matches.is_empty() {
@@ -206,26 +184,13 @@ pub fn count_occurrences(text: &str, term: &str, case_sensitive: bool) -> usize 
     if term.is_empty() || text.len() < term.len() {
         return 0;
     }
-    let (hay, needle);
-    let (hay_ref, needle_ref): (&[u8], &[u8]) = if case_sensitive {
-        (text.as_bytes(), term.as_bytes())
+    if case_sensitive {
+        text.match_indices(term).count()
     } else {
-        hay = text.to_ascii_lowercase();
-        needle = term.to_ascii_lowercase();
-        (hay.as_bytes(), needle.as_bytes())
-    };
-    let mut count = 0;
-    let mut start = 0;
-    while start + needle_ref.len() <= hay_ref.len() {
-        match memfind(&hay_ref[start..], needle_ref) {
-            Some(rel) => {
-                count += 1;
-                start += rel + needle_ref.len();
-            }
-            None => break,
-        }
+        text.to_ascii_lowercase()
+            .match_indices(&term.to_ascii_lowercase())
+            .count()
     }
-    count
 }
 
 /// The first `n` bytes of `text` (char-aligned) as a match-less window.
@@ -252,13 +217,13 @@ fn head_window(text: &str, n: usize) -> Snippet {
 
 /// Merge adjacent / overlapping (start, end) ranges. Input must be sorted
 /// by start.
-fn coalesce_overlapping(mut v: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    if v.len() < 2 {
-        return v;
-    }
+fn coalesce_overlapping(v: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     let mut out = Vec::with_capacity(v.len());
-    let mut cur = v.remove(0);
-    for next in v {
+    let mut it = v.into_iter();
+    let Some(mut cur) = it.next() else {
+        return out;
+    };
+    for next in it {
         if next.0 <= cur.1 {
             cur.1 = cur.1.max(next.1);
         } else {
@@ -268,23 +233,6 @@ fn coalesce_overlapping(mut v: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     }
     out.push(cur);
     out
-}
-
-/// Locate the first occurrence of `needle` in `hay`. A byte-level search;
-/// callers have already normalized case where needed.
-fn memfind(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > hay.len() {
-        return None;
-    }
-    let first = needle[0];
-    let mut i = 0;
-    while i + needle.len() <= hay.len() {
-        if hay[i] == first && &hay[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
 }
 
 #[cfg(test)]

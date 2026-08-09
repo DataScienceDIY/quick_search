@@ -8,15 +8,14 @@
 use quicksearch_core::log::{self, Level, LogLine};
 
 use crate::format::group_thousands;
+use crate::ui_util::hint;
 
-/// How often to repaint while the tab is open. Log lines arrive on indexer
-/// and watcher threads, which have no reason to wake the UI, so an idle
-/// window would otherwise sit on a stale list until the mouse moved.
+/// How often to repaint while the tab is open: log lines arrive on threads
+/// that never wake the UI, so an idle window would sit on a stale list.
 const REFRESH_MS: u64 = 500;
 
 pub struct LogsTab {
-    /// Copy of the ring, refreshed only when the recorded count moves —
-    /// cloning a few thousand lines every frame would be silly.
+    /// Copy of the ring, refreshed only when the recorded count moves.
     lines: Vec<LogLine>,
     /// [`log::recorded`] as of the last refresh.
     seen: u64,
@@ -54,10 +53,6 @@ impl LogsTab {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(REFRESH_MS));
 
-        // Indices rather than references: the control row below takes the
-        // filter and follow flags mutably, and a borrow of `self.lines`
-        // held across it would conflict. One frame of lag after a
-        // keystroke, which repaints immediately anyway.
         let needle = self.filter.to_lowercase();
         let shown: Vec<usize> = self
             .lines
@@ -107,7 +102,7 @@ impl LogsTab {
                         group_thousands(self.lines.len() as u64)
                     )
                 };
-                ui.label(egui::RichText::new(count).small().weak());
+                ui.label(hint(count));
             });
         });
         if cleared {
@@ -143,9 +138,8 @@ impl LogsTab {
             return;
         }
 
-        // Long paths extend into a horizontal scroll rather than wrapping:
-        // `show_rows` only draws the visible slice, and that costs nothing
-        // only while every row is exactly one line tall.
+        // `show_rows` assumes every row is exactly one line tall, so long
+        // paths extend into a horizontal scroll rather than wrapping.
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
         let scroll = egui::ScrollArea::both()
@@ -172,9 +166,8 @@ impl LogsTab {
     }
 }
 
-/// Whether a line survives the tab's two filters. `needle` is expected
-/// already lowercased — it is the same for every line, so folding it once
-/// per frame beats folding it per line.
+/// Whether a line survives the tab's two filters. `needle` must already be
+/// lowercased.
 fn keep(line: &LogLine, needle: &str, warnings_only: bool) -> bool {
     if warnings_only && line.level != Level::Warn {
         return false;
@@ -182,14 +175,11 @@ fn keep(line: &LogLine, needle: &str, warnings_only: bool) -> bool {
     needle.is_empty() || line.text.to_lowercase().contains(needle)
 }
 
-/// `HH:MM:SS` local time. The date is deliberately absent: these lines are
-/// read while something is going wrong now, and a full stamp on every row
-/// would crowd out the message.
+/// `HH:MM:SS` local time.
 fn fmt_clock(unix_secs: u64) -> String {
     use chrono::TimeZone;
-    // Saturating rather than `as`: that cast wraps a huge value into a
-    // negative one, which is a perfectly valid 1969 timestamp and would
-    // render as a plausible time instead of falling back.
+    // Not `as`: that cast wraps a huge value into a negative one — a valid
+    // 1969 timestamp that would render as a plausible time.
     let secs = i64::try_from(unix_secs).unwrap_or(i64::MAX);
     match chrono::Local.timestamp_opt(secs, 0) {
         chrono::LocalResult::Single(dt) => dt.format("%H:%M:%S").to_string(),

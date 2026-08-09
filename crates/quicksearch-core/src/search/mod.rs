@@ -1,46 +1,30 @@
 //! Interruptible, streaming search service.
 //!
-//! One dedicated worker thread owns the cascade. The GUI (or any caller)
-//! sends queries via [`SearchService::search`]; results stream back over
-//! an mpsc receiver as [`SearchUpdate`] events tagged with a generation
-//! number. Starting a new search bumps the generation and interrupts the
-//! in-flight SQLite statement, so a keystroke never waits on the previous
-//! query.
+//! One dedicated worker thread owns the cascade. Callers send queries via
+//! [`SearchService::search`]; results stream back over an mpsc receiver as
+//! [`SearchUpdate`] events tagged with a generation number. Starting a new
+//! search bumps the generation and interrupts the in-flight SQLite
+//! statement, so a keystroke never waits on the previous query.
 //!
 //! Cancellation is two-layer:
 //! - **cooperative** — the cascade compares its generation against the
 //!   latest every few hundred rows and stops silently when stale;
 //! - **interrupt** — [`rusqlite::InterruptHandle::interrupt`] kills the
-//!   statement currently executing (covering the "no rows produced yet"
-//!   phases like FTS candidate gathering). An interrupted stale search is
-//!   normal cancellation, not an error.
+//!   statement currently executing. An interrupted stale search is normal
+//!   cancellation, not an error.
 //!
 //! The interrupt handle is stored tagged with the generation that owns it,
-//! and only ever fired at a generation the counter has already moved past.
-//! Interrupting the *current* generation would surface to the user as
-//! "Search failed: interrupted" instead of results, and the window for it
-//! is real: the worker can dequeue and start a request before the caller
-//! that queued it gets back onto the CPU.
+//! and only ever fired at a generation the counter has already moved past:
+//! interrupting the *current* generation would surface as "Search failed:
+//! interrupted" instead of results, and the worker really can dequeue and
+//! start a request before the caller that queued it gets back onto the CPU.
 //!
 //! Consumers that want a plain blocking search (the CLI mode) skip the
 //! service entirely and call [`cascade::run`] with a collecting sink.
 //!
-//! # The worker's connection
-//!
 //! The worker holds one connection across requests and releases it after
-//! [`IDLE_RELEASE`] of quiet. This is not an optimisation of open cost — an
-//! open is microseconds — but of the page cache behind it: a search runs on
-//! every character typed, so reopening per request meant paying to warm a
-//! cache and then discarding it, once per keystroke, forever.
-//!
-//! What the old per-request open bought, and what now has to be arranged
-//! deliberately, is never operating on an index that has been replaced
-//! underneath it. Two things can do that, and only one is visible in the path:
-//! the config can point at a different file, and a rebuild, clear or
-//! schema-drift wipe can put a *new* file at the *same* path. The second is
-//! why [`crate::db::index_epoch`] exists — see [`Worker::take_connection`].
-//! Holding a handle on a replaced index would mean stale results and, on
-//! Linux, its blocks staying allocated until the handle closed.
+//! [`IDLE_RELEASE`] of quiet; [`Worker::take_connection`] covers when it
+//! must be reopened instead of reused.
 
 pub mod cascade;
 pub mod duplicates;
@@ -61,17 +45,9 @@ use crate::snippet::Snippet;
 pub use cascade::Outcome;
 pub use duplicates::{find_duplicate_groups, DuplicateGroup};
 
-/// How long the worker keeps its connection after the last request.
-///
-/// The connection is held across requests so a typing session runs against a
-/// warm page cache (see [`Worker::take_connection`]). It is not held *forever*, for
-/// two reasons that have nothing to do with the cache: an open handle on a
-/// deleted index keeps its blocks allocated on disk, and an open reader stops
-/// SQLite from resetting the WAL, which would then grow toward
-/// `maximum_wal_size` and never come back down.
-///
-/// So: long enough to span the pauses inside a search session, short enough
-/// that an abandoned one is not still holding the index minutes later.
+/// How long the worker keeps its connection after the last request. Not held
+/// forever: an open handle on a deleted index keeps its blocks allocated on
+/// disk, and an open reader stops SQLite from resetting the WAL.
 const IDLE_RELEASE: Duration = Duration::from_secs(30);
 
 /// One search result. `rank` is the sort key (lower = better): integer
@@ -159,9 +135,7 @@ struct SearchRequest {
 }
 
 /// The search the worker is executing right now, and the handle that kills
-/// its statement. Tagged with the generation so a caller can tell whether
-/// the thing it is about to interrupt is the search it means to cancel or
-/// one that has since replaced it.
+/// its statement, tagged with the generation that owns it.
 type InFlight = Arc<Mutex<Option<(u64, rusqlite::InterruptHandle)>>>;
 
 pub struct SearchService {
@@ -184,10 +158,8 @@ impl SearchService {
         Self::new_with_idle_release(db_path, notify, IDLE_RELEASE)
     }
 
-    /// [`Self::new`] with an explicit connection-release window.
-    ///
-    /// Tests use short windows; the default [`IDLE_RELEASE`] is right for real
-    /// use, where the window has to span the pauses inside a typing session.
+    /// [`Self::new`] with an explicit connection-release window (tests use
+    /// short ones).
     pub fn new_with_idle_release(
         db_path: PathBuf,
         notify: Arc<dyn Fn() + Send + Sync>,
@@ -231,8 +203,7 @@ impl SearchService {
     pub fn search(&self, input: &str, options: SearchOptions) -> u64 {
         let generation = self.latest_gen.fetch_add(1, Ordering::SeqCst) + 1;
         // Interrupt before enqueueing: an idle worker can dequeue the new
-        // request and be mid-statement within microseconds, and there is no
-        // point handing it a kill the worker has to survive.
+        // request and be mid-statement within microseconds.
         self.interrupt_stale();
         let _ = self.req_tx.send(SearchRequest {
             generation,
@@ -250,28 +221,20 @@ impl SearchService {
 
     /// Point subsequent searches at a different index file.
     pub fn set_db_path(&self, path: PathBuf) {
-        *self.db_path.lock().unwrap() = path;
+        *crate::lock_ok(&self.db_path) = path;
         self.cancel();
     }
 
     /// Kill the running statement — but only if the generation counter has
-    /// already moved past the search that owns it.
-    ///
-    /// Callers bump `latest_gen` first, so anything still tagged with an
-    /// older generation is stale by definition. The tag is what makes this
-    /// safe rather than merely well-timed: interrupting the *newest* search
-    /// does not cancel anything, it fails it, and the cascade reports that
-    /// as `Search failed: interrupted` because its own generation is still
-    /// current. On a loaded machine the worker really can pick up and start
-    /// a request before the thread that queued it runs again, so "the new
-    /// search cannot have started yet" is not an assumption to build on.
+    /// already moved past the search that owns it. Interrupting the *newest*
+    /// search does not cancel it, it fails it as
+    /// `Search failed: interrupted`; and the worker can pick up a request
+    /// before the thread that queued it runs again.
     fn interrupt_stale(&self) {
         let latest = self.latest_gen.load(Ordering::SeqCst);
-        if let Ok(guard) = self.in_flight.lock() {
-            if let Some((generation, handle)) = guard.as_ref() {
-                if *generation != latest {
-                    handle.interrupt();
-                }
+        if let Some((generation, handle)) = crate::lock_ok(&self.in_flight).as_ref() {
+            if *generation != latest {
+                handle.interrupt();
             }
         }
     }
@@ -291,8 +254,7 @@ impl SearchService {
 /// `DATABASE_CORRUPTED:` drives the GUI's recovery dialog.
 pub fn classify_sql_err(error_msg: &str) -> String {
     if error_msg.starts_with(db::KEY_MISMATCH_PREFIX) {
-        // Wrong or missing encryption key. Already user-legible, and it
-        // must never fall into the corruption bucket — the recovery dialog
+        // Must never fall into the corruption bucket — the recovery dialog
         // would offer to delete an index that is perfectly intact.
         error_msg.to_string()
     } else if error_msg.contains("malformed")
@@ -333,17 +295,12 @@ struct OpenIndex {
 impl Worker {
     fn run(mut self) {
         loop {
-            // `recv_timeout`, not `recv`: a search session is a burst of
-            // requests one keystroke apart, and the connection is worth
-            // keeping for the length of one. Past that it is worth strictly
-            // less than nothing — see [`IDLE_RELEASE`].
             let first = match self.req_rx.recv_timeout(self.idle_release) {
                 Ok(req) => req,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     self.open = None;
                     continue;
                 }
-                // The service was dropped; nothing more is coming.
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             };
             // A fast typist queues several requests; only the newest one
@@ -360,26 +317,15 @@ impl Worker {
     }
 
     /// Take the connection to run this request on, reopening if the one held
-    /// cannot be reused.
+    /// cannot be reused. Reuse is what keeps
+    /// [`crate::db::schema::PRAGMAS_SEARCH`]'s page cache warm across
+    /// keystrokes.
     ///
-    /// Taken out and handed back by the caller, rather than borrowed from
-    /// `self`, for the same reason [`crate::coordinator`]'s writer is: the
-    /// cascade needs the connection for its whole run, and everything else on
-    /// `self` — the update channel, the generation counter, the interrupt slot
-    /// — has to stay reachable while it does.
-    ///
-    /// Reuse is what makes [`crate::db::schema::PRAGMAS_SEARCH`]'s page cache
-    /// worth having: searches run on every character typed, so the second
-    /// query of a session and every one after it finds the b-tree interior
-    /// pages and FTS5 segment tips already resident. Opening per request threw
-    /// that away each time.
-    ///
-    /// It is reopened when either half of what it was opened against has
-    /// changed. The path moves when the user points the config at a different
-    /// index. The epoch moves when the file at the *same* path is replaced —
-    /// a rebuild, a clear, or a schema-drift wipe — which no comparison of
-    /// paths could ever catch, and which would otherwise leave this worker
-    /// querying a deleted inode and pinning its blocks on disk.
+    /// Reopened when either half of what it was opened against has changed:
+    /// the path (config points at a different index) or the epoch (the file
+    /// at the *same* path was replaced — rebuild, clear, schema-drift wipe —
+    /// which no path comparison can catch, and which would leave this worker
+    /// querying a deleted inode and pinning its blocks on disk).
     fn take_connection(&mut self, db_path: &Path) -> Result<OpenIndex, String> {
         let epoch = db::index_epoch();
         if let Some(open) = self.open.take() {
@@ -417,7 +363,7 @@ impl Worker {
             }
         };
 
-        let db_path = self.db_path.lock().unwrap().clone();
+        let db_path = crate::lock_ok(&self.db_path).clone();
         let open = match self.take_connection(&db_path) {
             Ok(c) => c,
             Err(e) => {
@@ -429,9 +375,8 @@ impl Worker {
             }
         };
         // Publish the handle tagged with the generation it kills, before the
-        // first statement runs. Anyone cancelling from here on can tell this
-        // search apart from the one that supersedes it.
-        *self.in_flight.lock().unwrap() = Some((generation, open.conn.get_interrupt_handle()));
+        // first statement runs.
+        *crate::lock_ok(&self.in_flight) = Some((generation, open.conn.get_interrupt_handle()));
 
         let mut sink = |hits: Vec<SearchHit>| {
             self.send(SearchUpdate::Hits { generation, hits });
@@ -445,13 +390,11 @@ impl Worker {
             &mut sink,
         );
 
-        *self.in_flight.lock().unwrap() = None;
+        *crate::lock_ok(&self.in_flight) = None;
 
-        // Kept only if it still works. A failed cascade may have failed
-        // *because* of this connection — a torn file, or an interrupt that
-        // left it unusable — and putting it back would wedge every search
-        // after this one behind the same bad handle. Dropping it costs one
-        // reopen.
+        // Kept only if it still works: a failed cascade may have failed
+        // *because* of this connection, and putting it back would wedge every
+        // later search behind the same bad handle.
         if outcome.is_ok() {
             self.open = Some(open);
         }
@@ -518,9 +461,7 @@ mod tests {
     }
 
     /// Typing the next character must not kill the search that character
-    /// started. The worker can be mid-statement on the newest generation by
-    /// the time the caller gets around to cancelling — on a slow machine that
-    /// is common, not exotic — and killing it there surfaces as
+    /// started: killing the newest generation surfaces as
     /// "Search failed: interrupted" instead of results.
     #[test]
     fn cancelling_spares_the_newest_generation() {
@@ -572,9 +513,7 @@ mod tests {
         assert!(!classified.starts_with("DATABASE_CORRUPTED:"));
 
         // The raw SQLite wording for an undecryptable page must not land in
-        // the corruption bucket either — the GUI recovery dialog offers to
-        // delete the file, which is exactly wrong for an intact encrypted
-        // index. (It doesn't match the corruption needles; pin that.)
+        // the corruption bucket either; pin that.
         let raw = "Failed to read database at /tmp/x.sqlite: file is not a database";
         assert!(!classify_sql_err(raw).starts_with("DATABASE_CORRUPTED:"));
     }

@@ -2,24 +2,18 @@
 //!
 //! A console-subsystem binary, so redirection, pipes, exit codes, and the
 //! shell waiting for the process all behave normally. `src/cli.rs` and
-//! `src/format.rs` are shared with the GUI binary by compiling them into both;
-//! neither touches egui, so there is nothing to split out into a library.
+//! `src/format.rs` are compiled into both binaries.
 
 mod cli;
-// The GUI uses more of this module than the CLI does.
 #[allow(dead_code)]
 mod format;
-// The GUI stores/deletes keychain entries; the CLI only reads them.
 #[allow(dead_code)]
 mod keychain;
-// The GUI also shows the build id in its status bar; --version is all the CLI
-// needs from it.
 #[allow(dead_code)]
 mod version;
 
 fn main() {
-    // `maybe_run_cli` returns `None` for "no query given", which the combined
-    // binary treats as "open the GUI". This one has no GUI to fall back to.
+    // `None` means "no query given"; this binary has no GUI to fall back to.
     let code = cli::maybe_run_cli().unwrap_or_else(|| {
         eprintln!("{}", cli::USAGE);
         2

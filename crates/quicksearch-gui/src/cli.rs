@@ -14,9 +14,9 @@ use zeroize::Zeroizing;
 
 use crate::format::{fmt_mtime, human_size};
 
-/// Scripting escape hatch for password-protected indexes. Documented with
-/// its caveat: other processes of the same user can read this process's
-/// environment, and exported variables end up in shell history.
+/// Scripting escape hatch for password-protected indexes. Caveat: other
+/// processes of the same user can read this process's environment, and
+/// exported variables end up in shell history.
 const PASSWORD_ENV: &str = "QUICKSEARCH_PASSWORD";
 
 pub(crate) const USAGE: &str = "\
@@ -46,20 +46,16 @@ variables are visible to other processes of the same user.";
 /// Parse argv; `Some(exit_code)` when the invocation was CLI-mode (query
 /// or --help), `None` to open the GUI.
 ///
-/// Invariant: terminal mode never builds an [`IndexCoordinator`], so it
-/// starts no filesystem watcher, no background threads, and consumes no
-/// inotify watches — a one-shot query must not leave anything running or
-/// compete for the per-user watch budget with a running GUI. It opens the
-/// database, queries, prints, and exits. Keep it that way: the coordinator
-/// belongs to the GUI path in `backend.rs` alone.
+/// Invariant: terminal mode never builds an [`IndexCoordinator`] — no
+/// watcher, no background threads, no inotify watches consumed. A one-shot
+/// query must not compete for the per-user watch budget with a running GUI.
 ///
 /// [`IndexCoordinator`]: quicksearch_core::coordinator::IndexCoordinator
 pub fn maybe_run_cli() -> Option<i32> {
     run_cli(std::env::args().skip(1).collect())
 }
 
-/// The body of [`maybe_run_cli`], taking argv rather than reading it, so the
-/// flag surface can be exercised from tests.
+/// The body of [`maybe_run_cli`], taking argv for testability.
 fn run_cli(args: Vec<String>) -> Option<i32> {
     let mut fuzzy = false;
     let mut long = false;
@@ -116,10 +112,6 @@ fn run_cli(args: Vec<String>) -> Option<i32> {
 /// whose key doesn't fit fall through (keychain: stale entry) or fail hard
 /// (env var, exhausted prompts). Password buffers are zeroized on drop and
 /// consumed immediately by the KDF; nothing here retains or logs them.
-///
-/// Pure with respect to the terminal and the database — the caller injects
-/// `is_tty`, both secrets, `prompt`, and `try_key` — so the whole decision
-/// table is unit-testable.
 pub(crate) fn resolve_key(
     security: &SecurityConfig,
     is_tty: bool,
@@ -387,9 +379,7 @@ mod tests {
         args.iter().map(|a| a.to_string()).collect()
     }
 
-    /// The flags that answer and exit without touching the index. Each must
-    /// report success, because a shell script asking `quicksearch --version`
-    /// reads the exit code, not the text.
+    /// Informational flags answer and exit 0 without touching the index.
     #[test]
     fn informational_flags_answer_and_succeed() {
         for flag in ["-V", "--version", "-h", "--help"] {
@@ -397,8 +387,7 @@ mod tests {
         }
     }
 
-    /// Nothing to search for means "open the GUI", and that must survive the
-    /// new flag: `quicksearch` with no arguments is how most people start it.
+    /// Nothing to search for means "open the GUI".
     #[test]
     fn nothing_to_search_for_opens_the_gui() {
         assert_eq!(run_cli(argv(&[])), None);

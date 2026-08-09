@@ -1,26 +1,20 @@
 //! Scratch directories for tests.
 //!
 //! Public and `#[doc(hidden)]` rather than `#[cfg(test)]`: the `tests/`
-//! integration binaries and the GUI crate are separate compilation units, so a
-//! test-gated item here would be invisible to them. This is the only reason it
-//! is not private.
+//! integration binaries and the GUI crate are separate compilation units, so
+//! a test-gated item here would be invisible to them.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Distinguishes directories requested within one process. Two tests running
-/// on different threads in the same millisecond would otherwise collide — the
-/// hand-rolled helpers this replaces all keyed off a timestamp, which made
-/// that rare rather than impossible.
+/// Distinguishes directories requested within one process; a timestamp alone
+/// lets two tests in the same millisecond collide.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// A fresh, empty directory under the system temp dir, named for `tag`.
-///
-/// Not cleaned up on drop, deliberately: when a test fails, the tree it built
-/// is most of the evidence. The OS clears the temp dir eventually.
-///
-/// Panics rather than returning a `Result` — a test that cannot create a
-/// directory has nothing left to assert.
+/// Not cleaned up on drop: when a test fails, the tree it built is most of
+/// the evidence. Panics — a test that cannot create a directory has nothing
+/// left to assert.
 #[doc(hidden)]
 pub fn scratch_dir(tag: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -49,6 +43,24 @@ pub fn touch(path: &std::path::Path, body: &[u8]) {
         std::fs::create_dir_all(parent).expect("create parent dir");
     }
     std::fs::write(path, body).expect("write file");
+}
+
+/// Power-of-two bucket, so memory-map sizes group by what allocated them
+/// rather than by their exact size. Shared by the memory probes.
+#[doc(hidden)]
+pub fn size_class(bytes: u64) -> String {
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    if mib < 1.0 {
+        "< 1 MiB".to_string()
+    } else {
+        let bucket = 1u64 << (63 - (bytes / (1024 * 1024)).leading_zeros() as u64);
+        format!("~{} MiB", bucket)
+    }
+}
+
+#[doc(hidden)]
+pub fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 #[cfg(test)]

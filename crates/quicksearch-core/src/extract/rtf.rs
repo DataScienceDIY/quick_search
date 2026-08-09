@@ -35,8 +35,6 @@ impl Extractor for RtfExtractor {
     }
 
     fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError> {
-        // Plain read: RTF files are rare and small enough that plaintext's
-        // sized-read syscall trimming would be tuning without a workload.
         let bytes =
             std::fs::read(path).map_err(|e| format!("rtf read {}: {}", path.display(), e))?;
         parse(bytes, path)

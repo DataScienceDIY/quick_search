@@ -29,8 +29,7 @@ use super::Status;
 /// a desktop's shortcut settings lists the entry under.
 const SHORTCUT_ID: &str = "search";
 
-/// Shown next to the key in the desktop's shortcut settings, so it is written
-/// for someone reading a list of every app's shortcuts at once.
+/// Shown next to the key in the desktop's shortcut settings.
 const SHORTCUT_DESCRIPTION: &str = "Focus the QuickSearch search box";
 
 pub(super) struct Portal {
@@ -52,20 +51,23 @@ impl Portal {
             status: Arc::clone(&status),
         };
         let ctx = ctx.clone();
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("quicksearch-hotkey-portal".to_string())
             .spawn(move || pollster::block_on(run(ctx, status, rx)))
-            // A thread that will not start is a shortcut that will not work,
-            // which is not worth taking the app down for.
-            .map_err(|e| quicksearch_core::log_warn!("global shortcut portal thread: {}", e))
-            .ok();
+        {
+            // Not worth taking the app down for — but the status must say
+            // so, or Options shows "Waiting for your desktop…" forever.
+            quicksearch_core::log_warn!("global shortcut portal thread: {}", e);
+            *lock_ok(&portal.status) =
+                Status::Error(format!("the shortcut thread could not be started: {}", e));
+        }
         portal
     }
 
     /// Ask for a new binding, or for none at all. Returns immediately; the
     /// answer lands in [`Portal::status`] whenever the desktop gets to it.
     pub(super) fn bind(&self, trigger: Option<String>) {
-        *self.status.lock().unwrap() = match trigger {
+        *lock_ok(&self.status) = match trigger {
             Some(_) => Status::Pending,
             None => Status::Disabled,
         };
@@ -73,8 +75,14 @@ impl Portal {
     }
 
     pub(super) fn status(&self) -> Status {
-        self.status.lock().unwrap().clone()
+        lock_ok(&self.status).clone()
     }
+}
+
+/// Lock, ignoring poisoning: the status is a whole-value slot shared with
+/// the portal thread, and a panic there must not take the UI thread with it.
+fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 async fn run(
@@ -82,17 +90,14 @@ async fn run(
     status: Arc<Mutex<Status>>,
     mut commands: mpsc::UnboundedReceiver<Option<String>>,
 ) {
-    // `'static` throughout: the proxy owns its D-Bus connection, so nothing
-    // here borrows from a local, and pinning the lifetime keeps the session
-    // below from being tied to a borrow of `shortcuts` that a rebind would
-    // then have to end.
+    // `'static`: the proxy owns its D-Bus connection, so nothing here
+    // borrows from a local.
     let shortcuts: GlobalShortcuts<'static> = match GlobalShortcuts::new().await {
         Ok(s) => s,
         Err(e) => return fail(&ctx, &status, unavailable(&e)),
     };
-    // Created once and kept for the life of the thread: it is a D-Bus signal
-    // match on the interface, not on a session, so it survives the rebinds
-    // below and is one less thing to get wrong when a session is replaced.
+    // A D-Bus signal match on the interface, not on a session, so it
+    // survives the rebinds below.
     let activated = match shortcuts.receive_activated().await {
         Ok(s) => s,
         Err(e) => return fail(&ctx, &status, unavailable(&e)),
@@ -173,8 +178,6 @@ async fn bind(
 }
 
 /// Turn a portal failure into something worth putting in front of a user.
-/// The distinction that matters is "this desktop cannot do it at all" versus
-/// "it went wrong this time"; the rest is passed through.
 fn unavailable(e: &ashpd::Error) -> String {
     match e {
         ashpd::Error::PortalNotFound(_) => {
@@ -190,7 +193,7 @@ fn unavailable(e: &ashpd::Error) -> String {
 }
 
 fn set(ctx: &egui::Context, status: &Mutex<Status>, next: Status) {
-    *status.lock().unwrap() = next;
+    *lock_ok(status) = next;
     // The Options window may be open and waiting for this.
     ctx.request_repaint();
 }

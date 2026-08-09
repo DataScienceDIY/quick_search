@@ -1,11 +1,9 @@
 //! The system-wide shortcut that raises QuickSearch and focuses the search
 //! box.
 //!
-//! It has to be registered with the operating system rather than handled as
-//! an egui shortcut, because the whole point is that it works when the window
-//! is minimised, behind something else, or not focused — none of which
-//! deliver key events to the app. There are two ways to get one, chosen by
-//! what the session is:
+//! It must be registered with the operating system — an egui shortcut gets
+//! no key events while the window is minimised, behind something else, or
+//! unfocused. Two ways, chosen by what the session is:
 //!
 //! * **Windows and X11** let an application claim a key for itself
 //!   (`RegisterHotKey`, `XGrabKey`), which `global-hotkey` wraps. The key is
@@ -14,20 +12,10 @@
 //!   desktop portal instead and the *desktop* owns the binding. See
 //!   [`portal`].
 //!
-//! Both are driven from here, through one interface, so the rest of the app
-//! only ever deals with "did the shortcut fire" and "what should the Options
-//! window say about it".
-//!
-//! # Why this is a global rather than a field
-//!
-//! The registration is process-wide however it is made, and
-//! `GlobalHotKeyEvent::set_event_handler` is itself a set-once global. On
-//! Windows the manager owns a hidden message window, so it is not `Send` and
-//! has to stay on the thread that runs the winit event loop — the same thread
-//! every caller below is already on. The alternative, threading a handle from
-//! [`crate::main`] through [`crate::unlock::Gate`] into
-//! [`crate::app::QuickSearchApp`], has to survive the app being *built
-//! mid-session* when a password unlocks the index, and buys nothing for it.
+//! Held in a thread-local global rather than a field: the registration is
+//! process-wide, `GlobalHotKeyEvent::set_event_handler` is a set-once
+//! global, and on Windows `GlobalHotKeyManager` owns a hidden message
+//! window, so it is not `Send` and must stay on the winit event-loop thread.
 //!
 //! Every entry point is inert until [`init`] runs, so the headless UI tests
 //! never touch an OS registration.
@@ -56,9 +44,7 @@ thread_local! {
     static REGISTRY: RefCell<Option<Registry>> = const { RefCell::new(None) };
 }
 
-/// What the Options window says about the shortcut. Every variant is
-/// something the user can act on, which is why "registered but the desktop
-/// picked the key" is not folded into [`Status::Active`].
+/// What the Options window says about the shortcut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     /// The setting is empty: no shortcut, by choice.
@@ -101,10 +87,8 @@ enum Backend {
 /// that loop is what dispatches. In practice that means eframe's app-creation
 /// closure, which runs on the main thread with the loop already going.
 pub fn init(ctx: &egui::Context, setting: &str) {
-    // Set once for the process, so it goes here rather than next to the
-    // manager, which comes and goes with the backend.
     // Press only: the crate reports the release as a second event, and
-    // acting on both means every press of the shortcut does its work twice.
+    // acting on both means every press does its work twice.
     let repaint = ctx.clone();
     GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
         if event.state == HotKeyState::Pressed {
@@ -157,10 +141,8 @@ pub fn apply(setting: &str) {
             Ok(()) => Status::Disabled,
             Err(e) => Status::Error(e),
         };
-        // In the Logs tab, because a shortcut that quietly does nothing is
-        // otherwise impossible to tell apart from one that was never asked
-        // for. The Options window says the same thing, but only while it is
-        // open, and only about the state it left behind.
+        // Logged because a shortcut that quietly does nothing is impossible
+        // to tell apart from one that was never asked for.
         match (&registry.status, wanted) {
             (Status::Active, Some(binding)) => {
                 quicksearch_core::log_info!("global shortcut: {} registered", binding)
@@ -191,10 +173,8 @@ pub fn status() -> Status {
     })
 }
 
-/// Record a press and wake the UI. The repaint is the load-bearing half:
-/// with nothing happening on screen the app is idle, and a minimised window
-/// is not drawing at all, so without it the flag would sit unread until
-/// something else asked for a frame.
+/// Record a press and wake the UI: without the repaint an idle or minimised
+/// window would leave the flag unread until something else asked for a frame.
 fn fire(ctx: &egui::Context) {
     FIRED.store(true, Ordering::SeqCst);
     ctx.request_repaint();
@@ -211,8 +191,8 @@ impl Backend {
             } => {
                 if let Some(old) = registered.take() {
                     // A failed unregister leaves a key claimed that nothing
-                    // listens for any more. Worth reporting, but not worth
-                    // refusing the new binding over.
+                    // listens for; worth reporting, not worth refusing the
+                    // new binding over.
                     if let Err(e) = manager.unregister(old) {
                         quicksearch_core::log_warn!("releasing the old global shortcut: {}", e);
                     }
@@ -220,9 +200,8 @@ impl Backend {
                 let Some(binding) = wanted else {
                     return Ok(());
                 };
-                // Infallible in practice: `Binding`'s tokens are held to
-                // being parseable by a test, precisely so this cannot be a
-                // silent runtime failure.
+                // Infallible in practice: a test holds `Binding`'s tokens to
+                // being parseable.
                 let hotkey: HotKey = binding
                     .to_string()
                     .parse()
@@ -246,10 +225,10 @@ impl Backend {
 }
 
 /// Wayland refuses key grabs by design, so a session with a Wayland display
-/// gets the portal and everything else gets a grab. There is deliberately no
-/// falling back from one to the other: an X11 grab made from inside a Wayland
-/// session succeeds and then only ever fires while an XWayland window has
-/// focus, which looks like a broken shortcut rather than an unavailable one.
+/// gets the portal and everything else gets a grab. No falling back from one
+/// to the other: an X11 grab made from inside a Wayland session succeeds and
+/// then only ever fires while an XWayland window has focus, which looks like
+/// a broken shortcut rather than an unavailable one.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn choose_backend(ctx: &egui::Context) -> Result<Backend, String> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {

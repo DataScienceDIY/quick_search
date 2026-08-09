@@ -17,8 +17,7 @@
 //!   blinks. Worse, winit's `focus_window` does nothing at all while the
 //!   window is minimised. So the request is sent here instead, with source
 //!   indication 2, which the EWMH spec defines as a client acting on a direct
-//!   user action and which window managers honour. That is exactly what this
-//!   is, and it is what every hotkey launcher does.
+//!   user action and which window managers honour.
 //! * **Wayland** does not let a client raise itself at all, by design. See
 //!   [`raise`].
 
@@ -28,8 +27,7 @@
 /// token from the compositor, which winit will not issue without its own
 /// `Window`, and eframe does not hand that out. The rest of the shortcut
 /// still works there (the Search tab is selected and the query box gets the
-/// caret), and the desktop's own window-management shortcuts are the way
-/// back to the window. The Options window says so.
+/// caret).
 pub fn raise(ctx: &egui::Context, frame: &eframe::Frame) {
     #[cfg(all(unix, not(target_os = "macos")))]
     if x11_activate(frame) {
@@ -46,11 +44,6 @@ pub fn raise(ctx: &egui::Context, frame: &eframe::Frame) {
 /// Ask the window manager to activate our window, EWMH style. `false` when
 /// this is not an X11 session, or the X server would not take it, so the
 /// caller can fall back to asking winit.
-///
-/// A fresh connection per press rather than a kept one: this runs at most as
-/// often as someone presses a key, the round trip is sub-millisecond, and a
-/// cached connection would be one more thing to notice the X server going
-/// away on.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn x11_activate(frame: &eframe::Frame) -> bool {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};

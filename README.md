@@ -585,21 +585,22 @@ UI thread ──commands──────▶ IndexCoordinator ──state──
 core threads ─────────────▶ ctx.request_repaint() (wake the UI)
 ```
 
-Modules map one-to-one onto what you see: `app.rs` (shell, status bar,
-config routing), `search_tab.rs` (query strip, virtualized results table,
-snippet highlighting via `LayoutJob` byte ranges, ignore dialog),
-`manage_tab.rs` (status detail + `tracker.rs` rate estimation, roots and
-filter editors), `duplicates_tab.rs`, `logs_tab.rs` (a virtualized view of
-the core log ring), `options.rs` (draft-based settings
-editor shared between the window and the Manage tab), `platform.rs`
-(open / reveal-in-file-manager, and the Windows stdio setup a
-window-subsystem process needs before anything prints), `hotkey/` (the
-system-wide search shortcut: one key table feeding both a `RegisterHotKey`
-/ `XGrabKey` registration and, on Wayland, an XDG portal session on its own
-thread), `cli.rs` (terminal
-mode, shared with the `quicksearch-cli` binary). There is no
-pagination: the table is virtualized, so a single scroll list capped at
-`display_limit` renders in microseconds regardless of row count.
+Modules map one-to-one onto what you see: `app.rs` (shell and config
+routing, with `app/` submodules for the status bar, the security flow and
+the confirmation modals), `search_tab.rs` (query strip and virtualized
+results table; snippet rendering via `LayoutJob` byte ranges, the ignore
+dialog and the syntax help live in `search_tab/`), `manage_tab.rs` (status
+detail + `tracker.rs` rate estimation, roots and filter editors),
+`duplicates_tab.rs`, `logs_tab.rs` (a virtualized view of the core log
+ring), `options.rs` (draft-based settings editor shared between the window
+and the Manage tab), `platform.rs` (open / reveal-in-file-manager, and the
+Windows stdio setup a window-subsystem process needs before anything
+prints), `hotkey/` (the system-wide search shortcut: one key table feeding
+both a `RegisterHotKey` / `XGrabKey` registration and, on Wayland, an XDG
+portal session on its own thread), `cli.rs` (terminal mode, shared with the
+`quicksearch-cli` binary). There is no pagination: the table is
+virtualized, so a single scroll list capped at `display_limit` renders in
+microseconds regardless of row count.
 
 ## Development
 

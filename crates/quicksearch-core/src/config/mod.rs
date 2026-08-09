@@ -1,0 +1,577 @@
+//! Configuration: TOML file, resolution rules, filter sets, and live-update
+//! classification.
+//!
+//! File resolution (see [`Config::config_path`]): a `config.toml` sitting
+//! next to the executable wins ("portable mode"); otherwise the per-user
+//! XDG location is used and auto-created on first run. Relative paths
+//! *inside* a config resolve against the config file's own directory, so a
+//! portable folder can be moved wholesale.
+//!
+//! The GUI is the only writer of the file at runtime; external edits take
+//! effect on next start. After editing, callers run [`diff_actions`] to
+//! learn which running services must react (rebuild the index, restart the
+//! watcher, repoint search).
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+mod diff;
+mod ignore;
+#[cfg(test)]
+mod tests;
+
+pub use diff::{diff_actions, nested_roots, ConfigActions, IndexWork};
+pub use ignore::IgnoreSet;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+#[derive(Default)]
+pub struct Config {
+    pub paths: PathConfig,
+    pub indexing: IndexingConfig,
+    pub processing: ProcessingConfig,
+    pub search: SearchConfig,
+    pub ui: UiConfig,
+    pub security: SecurityConfig,
+    /// File this config was loaded from; `save()` writes back to it.
+    /// `None` for hand-built configs (tests), which save to the default
+    /// location.
+    #[serde(skip)]
+    pub source: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct PathConfig {
+    /// One or more directory roots to index. Indexing walks each root
+    /// independently; duplicates and nested roots are de-duplicated by the
+    /// indexer at run time.
+    pub indexing_paths: Vec<String>,
+    /// SQLite index location. Relative values resolve against the config
+    /// file's directory; `~` expands to the home directory.
+    pub database_path: String,
+}
+
+/// What to index and when — the knobs the coordinator and walker consume.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct IndexingConfig {
+    /// The indexing mode, written down: `true` is automatic — filesystem
+    /// watchers apply changes as they happen and a full reindex runs every
+    /// `reindex_interval_minutes` — and `false` is manual, where nothing
+    /// runs until the user asks. The GUI's Stop / Return to Automatic
+    /// controls save it as they switch, so the mode survives a restart.
+    pub auto_index: bool,
+    pub reindex_interval_minutes: u64,
+    pub follow_symlinks: bool,
+    pub include_hidden: bool,
+    /// Empty = extract content from everything the extractor registry
+    /// supports. Non-empty = only files with these extensions get content
+    /// extraction/FTS; everything else is still listed for filename search
+    /// (`content_state = NA`). Entries are case-insensitive, with or
+    /// without a leading dot. The reserved entry [`EXTENSIONLESS`] whitelists
+    /// files that have no extension at all (`Makefile`, `README`, `.bashrc`),
+    /// which are otherwise excluded by any non-empty filter. `#` starts a
+    /// comment — whole-entry or trailing — see [`content_filter_entries`].
+    /// Applied at walk time, when the row is written — which is why changing
+    /// what it matches forces a rebuild (see [`diff_actions`]).
+    pub content_extensions: Vec<String>,
+    /// Excluded from the index entirely — never even listed. A pattern
+    /// without `/` matches any single path component (so `.git` prunes
+    /// whole subtrees); a pattern containing `/` or resembling a path is
+    /// matched against the full path. Glob syntax (`*`, `?`, `[..]`).
+    pub ignore_patterns: Vec<String>,
+    /// Per-root walker thread override, keyed by the root string exactly
+    /// as it appears in `indexing_paths` — the indexer resolves both sides
+    /// to the same canonical path before matching, so a key that spells its
+    /// root as `~/docs`, `/docs/` or a symlink still applies. Absent or
+    /// 0 = auto-detect (4 for local storage, 16 for network mounts). Read
+    /// at run start; a change applies to the next run.
+    pub root_workers: std::collections::HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProcessingConfig {
+    /// Bytes read from the head of each new or changed file. Those bytes do
+    /// four jobs, so this one number sets more than the hash:
+    ///
+    /// 1. with the size, they identify the file (see `get_file_hash`);
+    /// 2. they are the magic-byte window for MIME detection — `infer` reads
+    ///    8 KiB from a path and its longest matcher needs 262 bytes, so the
+    ///    default is exactly as good as opening the file, and a value under
+    ///    262 makes some formats undetectable except by extension;
+    /// 3. they are the text-sniff window (`textenc::looks_like_text`) that
+    ///    decides whether an unknown-extension or extensionless file is
+    ///    valid UTF-8 and so worth extracting — small values judge files on
+    ///    less evidence, and a binary whose first bytes happen to be valid
+    ///    UTF-8 is likelier to slip through a short window than a long one;
+    /// 4. any plaintext file no larger than this is extracted during the
+    ///    walk, sparing the content pass an open/read/close.
+    ///
+    /// Changing it invalidates stored hashes and forces a rebuild.
+    pub hash_length: usize,
+    pub maximum_text_size: usize,
+    pub maximum_text_file_size: u64,
+    pub batch_size: usize,
+    pub fts_update_batch_size: usize,
+    /// How large the write-ahead log may grow during a run before the indexer
+    /// forces a checkpoint, in bytes. `0` disables forced checkpoints;
+    /// anything else is raised to [`MINIMUM_WAL_SIZE`] at the use site.
+    ///
+    /// SQLite's own autocheckpoint copies the log into the index continuously
+    /// but can only *reset* it when no reader is mid-query, and a run keeps a
+    /// reader per root busy from start to finish — so left alone the log grows
+    /// for the whole run and can end up larger than the index itself. This is
+    /// a stall-frequency knob, not a throughput one: by the time a forced
+    /// checkpoint fires there is almost nothing left to copy, so it costs lock
+    /// acquisition and little else.
+    pub maximum_wal_size: u64,
+    pub tokenize: String,
+    /// When `true` (default), extracted text is stored zstd-compressed in
+    /// `documents_text` so search results can render snippet/highlight
+    /// previews without re-reading the source file. When `false` the
+    /// inverted FTS5 index still gets the tokens (so queries return the
+    /// same hits) but nothing is stored alongside; full-text results carry
+    /// no snippets, can't be case-verified or occurrence-ranked, and fuzzy
+    /// full-text search is unavailable. This mode drops the on-disk
+    /// footprint to roughly what stock Baloo uses.
+    pub store_text_for_snippets: bool,
+}
+
+/// Floor on a non-zero [`ProcessingConfig::maximum_wal_size`]. A checkpoint
+/// costs a lock acquisition that can wait on a running search, so a cap set
+/// low enough to fire every round would trade a large log for a stalled
+/// writer. Zero still means "never force one".
+pub const MINIMUM_WAL_SIZE: u64 = 1024 * 1024 * 16;
+
+/// Fuzzy edit distances above this are allowed but warned about: matches
+/// become dominated by coincidence and every fuzzy pass slows down.
+pub const FUZZY_EDITS_WARN_ABOVE: usize = 3;
+
+/// Search-side preferences, shared by the GUI and the CLI mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Whether the fuzzy stages start enabled.
+    pub fuzzy_default: bool,
+    /// Ceiling on the fuzzy stages' Levenshtein budget. The budget grows
+    /// with the term (one edit per three characters) up to this cap, so 2
+    /// means "1 edit for 3–5 character terms, 2 for anything longer".
+    /// 0 disables the fuzzy stages entirely; above
+    /// [`FUZZY_EDITS_WARN_ABOVE`] the GUI and CLI warn.
+    pub fuzzy_max_edits: usize,
+    /// Hard cap on buffered/displayed results per search.
+    pub display_limit: usize,
+    /// Streaming batch size — how many hits per update event.
+    pub results_per_page: usize,
+    /// How long the GUI waits after the last keystroke before searching.
+    pub debounce_ms: u64,
+}
+
+impl SearchConfig {
+    /// The caution to show next to `fuzzy_max_edits`, or `None` when the
+    /// value is sane.
+    pub fn fuzzy_edits_warning(&self) -> Option<String> {
+        if self.fuzzy_max_edits <= FUZZY_EDITS_WARN_ABOVE {
+            return None;
+        }
+        Some(format!(
+            "Fuzzy edit distance {} is above the recommended maximum of {}; \
+             results will be dominated by false matches and every fuzzy pass \
+             gets slower.",
+            self.fuzzy_max_edits, FUZZY_EDITS_WARN_ABOVE
+        ))
+    }
+}
+
+impl Default for PathConfig {
+    fn default() -> Self {
+        PathConfig {
+            indexing_paths: vec![default_home_path()],
+            database_path: default_db_path().to_string_lossy().into_owned(),
+        }
+    }
+}
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        IndexingConfig {
+            auto_index: true,
+            reindex_interval_minutes: 60,
+            follow_symlinks: false,
+            include_hidden: false,
+            content_extensions: Vec::new(),
+            ignore_patterns: default_ignore_patterns(),
+            root_workers: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Default for ProcessingConfig {
+    fn default() -> Self {
+        ProcessingConfig {
+            hash_length: 1024 * 8,
+            maximum_text_size: 1024 * 256,
+            maximum_text_file_size: 1024 * 1024 * 2,
+            batch_size: 500,
+            fts_update_batch_size: 1000,
+            maximum_wal_size: 1024 * 1024 * 512,
+            tokenize: "trigram".to_string(),
+            store_text_for_snippets: true,
+        }
+    }
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        SearchConfig {
+            fuzzy_default: false,
+            fuzzy_max_edits: 2,
+            display_limit: 1000,
+            results_per_page: 100,
+            debounce_ms: 150,
+        }
+    }
+}
+
+/// Index encryption. The password itself is never stored anywhere — only
+/// the KDF salt lives here, and it is not a secret (it makes the derivation
+/// unique per install, nothing more).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Encrypt the index (SQLCipher) with a password asked for at startup.
+    /// Turning this on or off requires deleting and rebuilding the index.
+    pub password_protected: bool,
+    /// KDF salt, exactly 32 lowercase hex digits (16 bytes). Written by the
+    /// app at the moment a password is set — never generated as a default,
+    /// never edited by hand, and never shown in the GUI. Absent until a
+    /// password exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
+    /// Store the derived key in the OS keychain (Secret Service / Windows
+    /// Credential Manager) and skip the startup prompt on this machine.
+    pub use_keychain: bool,
+}
+
+impl SecurityConfig {
+    /// The decoded salt. An error means the config is unusable for
+    /// unlocking: protection is on but no salt was ever written, or the
+    /// value was tampered with — both surfaced to the user, never guessed
+    /// around.
+    pub fn salt_bytes(&self) -> Result<[u8; crate::security::SALT_LEN], String> {
+        match &self.salt {
+            None => Err(
+                "password protection is enabled but the config has no salt; \
+                         disable protection or set the password again"
+                    .to_string(),
+            ),
+            Some(hex) => crate::security::salt_from_hex(hex)
+                .map_err(|e| format!("invalid salt in config: {}", e)),
+        }
+    }
+}
+
+/// Interface preferences.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Zoom factor for the whole GUI — fonts, spacing, and widgets scale
+    /// together. Applied live; also adjustable with Ctrl +/-/0 at runtime
+    /// (keyboard zoom isn't persisted).
+    pub scale: f32,
+    /// Roots the "live updates are disabled" warning has already been shown
+    /// for, as they appear in `indexing_paths`.
+    ///
+    /// Keyed by root rather than a single flag so that adding a folder warns
+    /// again — the trade-off changed — while restarting the app does not.
+    /// Pruned to the current root set whenever the folder list is applied.
+    pub watch_cap_warned_roots: Vec<String>,
+    /// System-wide shortcut that raises the window and puts the caret in the
+    /// search box, as `Ctrl+Shift+F`: modifiers from `Ctrl`, `Alt` and
+    /// `Shift`, then one key, joined by `+`. Empty disables it. An
+    /// unparseable value degrades to "no shortcut" with a message instead of
+    /// refusing to load. On Wayland the desktop, not this value, has the
+    /// final say — see the GUI's `hotkey` module.
+    pub search_hotkey: String,
+    /// `dark` or `light`. Applied live; the desktop's own light/dark setting
+    /// is not consulted (reading it means a D-Bus session). A value nobody
+    /// recognises falls back to dark, where a typed-out enum would fail to
+    /// deserialize and take the whole config file down with it.
+    pub color_scheme: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        UiConfig {
+            scale: 1.1,
+            watch_cap_warned_roots: Vec::new(),
+            search_hotkey: "Ctrl+Shift+F".to_string(),
+            color_scheme: "dark".to_string(),
+        }
+    }
+}
+
+/// Directories and files excluded from a fresh index.
+///
+/// Build artefacts everywhere, plus the things a Windows home directory or
+/// drive root contains that are actively harmful to index:
+///
+/// - `$RECYCLE.BIN` holds *deleted* files. Indexing it puts their contents
+///   back into search results, which is a privacy problem rather than mere
+///   noise. It is Hidden+System, so the walk already skips it by default —
+///   this covers the user who legitimately turns `include_hidden` on. (`$` is
+///   not a glob metacharacter, so the name is matched literally.)
+/// - `System Volume Information` is ACL-denied even to Administrators, so
+///   without it every run logs an unreadable-directory warning per drive.
+/// - The kernel's paging and hibernation files are multi-gigabyte and
+///   permanently locked.
+/// - `Thumbs.db` and `desktop.ini` occur in thousands of folders and carry no
+///   searchable content.
+///
+/// No exclusion for `C:\Windows`: a pattern general enough to catch it would
+/// also catch a user folder named `Windows`; `config_example.toml` documents
+/// it for people who add a drive root.
+fn default_ignore_patterns() -> Vec<String> {
+    let mut patterns = vec![".git", "node_modules", "*.tmp", ".venv", "venv"];
+    if cfg!(windows) {
+        patterns.extend([
+            "$RECYCLE.BIN",
+            "System Volume Information",
+            "pagefile.sys",
+            "hiberfil.sys",
+            "swapfile.sys",
+            "Thumbs.db",
+            "desktop.ini",
+        ]);
+    }
+    patterns.into_iter().map(str::to_string).collect()
+}
+
+/// Platform-sensible default for the first indexing root when no config
+/// exists. `$HOME` on Unix, `%USERPROFILE%` on Windows; falls back to the
+/// current directory.
+fn default_home_path() -> String {
+    if let Some(home) = crate::platform::home_dir() {
+        return home.to_string_lossy().into_owned();
+    }
+    ".".to_string()
+}
+
+/// `config.toml` beside the running executable, if the executable's
+/// location is known. Existence is checked by the caller.
+fn portable_config_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join("config.toml"))
+}
+
+/// Per-user config directory: `$XDG_CONFIG_HOME`/`~/.config` on Unix,
+/// `%APPDATA%` on Windows.
+fn config_base_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(d) = std::env::var_os("APPDATA") {
+            return PathBuf::from(d);
+        }
+    }
+    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME") {
+        let p = PathBuf::from(d);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    if let Some(home) = crate::platform::home_dir() {
+        return PathBuf::from(home).join(".config");
+    }
+    PathBuf::from(".")
+}
+
+/// Per-user data directory: `$XDG_DATA_HOME`/`~/.local/share` on Unix,
+/// `%LOCALAPPDATA%` on Windows.
+fn data_base_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(d) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(d);
+        }
+    }
+    if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
+        let p = PathBuf::from(d);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    if let Some(home) = crate::platform::home_dir() {
+        return PathBuf::from(home).join(".local").join("share");
+    }
+    PathBuf::from(".")
+}
+
+/// Default index location when the config doesn't name one.
+pub fn default_db_path() -> PathBuf {
+    data_base_dir().join("quicksearch").join("index.sqlite")
+}
+
+/// Expand a leading `~`/`~/` to the home directory. Other `~user` forms are
+/// left untouched.
+fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
+        if let Some(home) = crate::platform::home_dir() {
+            let mut p = PathBuf::from(home);
+            if path.len() > 2 {
+                p.push(&path[2..]);
+            }
+            return p;
+        }
+    }
+    PathBuf::from(path)
+}
+
+impl Config {
+    /// The config file this process should use: the portable override next
+    /// to the binary when present, else the XDG location.
+    pub fn config_path() -> PathBuf {
+        if let Some(p) = portable_config_path() {
+            if p.exists() {
+                return p;
+            }
+        }
+        config_base_dir().join("quicksearch").join("config.toml")
+    }
+
+    pub fn load() -> Result<Self, String> {
+        Self::load_from(&Self::config_path())
+    }
+
+    /// Load from an explicit path. A missing file is created with defaults
+    /// (directories included). The loaded config remembers `path` and
+    /// `save()` writes back to it.
+    pub fn load_from(path: &Path) -> Result<Self, String> {
+        if path.exists() {
+            let content = fs::read_to_string(path)
+                .map_err(|e| format!("Failed to read config file {}: {}", path.display(), e))?;
+            let mut cfg: Config = toml::from_str(&content)
+                .map_err(|e| format!("Failed to parse config file {}: {}", path.display(), e))?;
+            cfg.source = Some(path.to_path_buf());
+            Ok(cfg)
+        } else {
+            let cfg = Config {
+                source: Some(path.to_path_buf()),
+                ..Config::default()
+            };
+            cfg.save()?;
+            Ok(cfg)
+        }
+    }
+
+    /// Write back to the file this config was loaded from (or the default
+    /// location), creating parent directories as needed. Raw values are
+    /// written verbatim — relative paths in a portable config stay relative.
+    pub fn save(&self) -> Result<(), String> {
+        let path = self.source.clone().unwrap_or_else(Self::config_path);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("Failed to create config dir {}: {}", dir.display(), e))?;
+        }
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+        fs::write(&path, content)
+            .map_err(|e| format!("Failed to write config file {}: {}", path.display(), e))?;
+        Ok(())
+    }
+
+    /// Directory that relative in-config paths resolve against: the config
+    /// file's own directory, falling back to the CWD for sourceless configs.
+    fn base_dir(&self) -> PathBuf {
+        self.source
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// `database_path` with `~` expanded and relative values resolved
+    /// against the config file's directory.
+    pub fn resolved_database_path(&self) -> PathBuf {
+        let p = expand_tilde(&self.paths.database_path);
+        if p.is_absolute() {
+            p
+        } else {
+            self.base_dir().join(p)
+        }
+    }
+
+    /// `resolved_indexing_paths` canonicalized and spelled the way
+    /// `files.path` prefixes them.
+    ///
+    /// The form roots must be compared in: `~/docs`, `docs` in a portable
+    /// config and `/home/me/docs` are one root under three spellings, and a
+    /// re-spelling is not a configuration change. Duplicates collapse, order
+    /// is not preserved — a caller that needs one uses
+    /// [`Config::resolved_indexing_paths`].
+    pub fn normalized_indexing_paths(&self) -> BTreeSet<String> {
+        self.resolved_indexing_paths()
+            .iter()
+            .map(|p| crate::file_handling::normalize_root_string(&p.to_string_lossy()))
+            .collect()
+    }
+
+    /// `indexing_paths` with the same resolution rules as
+    /// [`Config::resolved_database_path`].
+    pub fn resolved_indexing_paths(&self) -> Vec<PathBuf> {
+        self.paths
+            .indexing_paths
+            .iter()
+            .map(|raw| {
+                let p = expand_tilde(raw);
+                if p.is_absolute() {
+                    p
+                } else {
+                    self.base_dir().join(p)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Reserved `content_extensions` entry standing for "files with no
+/// extension". Matched case-insensitively, and it cannot collide with a real
+/// extension because the parentheses are not part of one.
+pub const EXTENSIONLESS: &str = "(none)";
+
+/// The `content_extensions` entries that actually filter: `#` starts a
+/// comment and runs to the end of the entry, so a whole-line comment drops
+/// out entirely and `md  # notes` filters on `md`. Surrounding space is
+/// trimmed; what is left of a `#` never is.
+pub fn content_filter_entries(list: &[String]) -> impl Iterator<Item = &str> {
+    list.iter().filter_map(|raw| {
+        let entry = raw.split('#').next().unwrap_or_default().trim();
+        (!entry.is_empty()).then_some(entry)
+    })
+}
+
+/// Whether a file's content (text extraction + FTS) should be indexed under
+/// the `content_extensions` filter. Files that fail this are still listed
+/// for filename search. No entries (empty, or nothing but comments) =
+/// everything allowed.
+pub fn content_allowed(path: &Path, cfg: &Config) -> bool {
+    let list = &cfg.indexing.content_extensions;
+    if content_filter_entries(list).next().is_none() {
+        return true;
+    }
+    // `Path::extension` is None for `Makefile` and for dot-only names like
+    // `.bashrc`, so without the sentinel a non-empty filter always skips them.
+    match path.extension().and_then(|e| e.to_str()) {
+        // The sentinel is reserved: it never doubles as an extension, so a
+        // file named `x.(none)` is not whitelisted by it.
+        Some(ext) => content_filter_entries(list)
+            .filter(|allowed| !allowed.eq_ignore_ascii_case(EXTENSIONLESS))
+            .any(|allowed| allowed.trim_start_matches('.').eq_ignore_ascii_case(ext)),
+        None => {
+            content_filter_entries(list).any(|allowed| allowed.eq_ignore_ascii_case(EXTENSIONLESS))
+        }
+    }
+}

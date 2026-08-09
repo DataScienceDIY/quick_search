@@ -18,13 +18,6 @@
 //! surface rather than an internal detail: a search of this repository alone
 //! will not turn up the callers that break when one changes.
 //!
-//! There used to be an `index_counts` here as well, for the GUI's status bar.
-//! It ran three `COUNT(*)` scans — one of them unindexed — of which the
-//! frontend displayed one, on a thread and a connection opened afresh every
-//! five seconds. The surviving figure is published by
-//! [`crate::coordinator::IndexerState::files`] instead, off the connection the
-//! coordinator already has.
-//!
 //! One exception to the "query helpers" framing: [`clear_path`] mutates. It
 //! opens its own writer, which sidesteps the single-writer discipline the
 //! coordinator maintains, so it is safe only against an index no local
@@ -76,14 +69,10 @@ pub struct FailedEntry {
     pub ts: i64,
 }
 
-/// Storage footprint report. "Partitions" correspond to SQL tables for our
-/// SQLite layout (Baloo's LMDB has named sub-DBs; our equivalent is per-table
-/// row/size counts).
-///
-/// `documents_text_*` fields cover the zstd-compressed extracted-text
-/// sidecar that replaced the regular FTS5 stored text in schema v3. Ratio
-/// is `compressed / raw` so a value of ~0.3 means we saved ~70% vs storing
-/// the plaintext verbatim.
+/// Storage footprint report: per-table row/size counts (the equivalent of
+/// Baloo's LMDB sub-DBs). `documents_text_*` fields cover the
+/// zstd-compressed extracted-text sidecar; ratio is `compressed / raw`, so
+/// ~0.3 means ~70% saved vs storing the plaintext verbatim.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SizeReport {
     pub file_size_bytes: u64,
@@ -472,10 +461,9 @@ mod tests {
 
     #[test]
     fn clear_path_on_nondefault_tokenizer_db_removes_only_target() {
-        // Regression: clear_path used to open with a hardcoded "trigram", so on
-        // an index built with a non-default tokenizer the schema-mismatch wipe
-        // destroyed the WHOLE index instead of deleting one row. With
-        // open_existing it must delete only the target and leave the rest.
+        // On an index built with a non-default tokenizer, clear_path must
+        // delete only the target row — never trigger the owner's
+        // schema-mismatch wipe.
         let p = tmp_path();
         let dbp = p.to_str().unwrap();
         {

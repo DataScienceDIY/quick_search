@@ -3,8 +3,7 @@
 //! A term with an unquoted `*` compiles to a small regex (every literal
 //! chunk escaped, stars joined with `.*`), so wildcards and `regex:` share
 //! one linear-time matching engine. Terms without stars stay on the
-//! [`Literal`](TermPattern::Literal) path, which reproduces the cascade's
-//! original `==`/`find`/`count_occurrences` semantics byte for byte.
+//! [`Literal`](TermPattern::Literal) path — plain string operations.
 //!
 //! `.` never matches `\n`, so a star cannot span lines of extracted text —
 //! a `*` bridging a whole document would produce absurd match ranges and
@@ -33,8 +32,7 @@ pub enum TermPattern {
     /// Matches nothing — a bare `*` must not become a scan of everything.
     #[default]
     Empty,
-    /// A star-free term. Kept as plain string operations, not a regex, so
-    /// existing queries keep their exact semantics (and speed).
+    /// A star-free term; plain string operations.
     Literal(LiteralPattern),
     /// A term with at least one active wildcard.
     Wildcard(WildcardPattern),
@@ -125,7 +123,9 @@ impl TermPattern {
             return Ok(TermPattern::Empty);
         }
         if !has_star {
-            let text = segments.into_iter().next().unwrap();
+            let Some(text) = segments.into_iter().next() else {
+                return Ok(TermPattern::Empty);
+            };
             let folded = text.to_ascii_lowercase();
             return Ok(TermPattern::Literal(LiteralPattern { text, folded }));
         }
@@ -237,13 +237,8 @@ impl TermPattern {
     }
 
     /// Case-insensitive [`TermPattern::find_first`] against an already-folded
-    /// haystack.
-    ///
-    /// The literal path would otherwise fold the haystack itself, and the
-    /// cascade's full-text passes need the same fold for counting, searching
-    /// and snippet extraction — three copies of a document that can run to
-    /// `maximum_text_size`. Folding is byte-length preserving, so the returned
-    /// range is valid in the unfolded original too.
+    /// haystack. Folding is byte-length preserving, so the returned range is
+    /// valid in the unfolded original too.
     pub fn find_first_folded(&self, folded: &str) -> Option<Range<usize>> {
         match self {
             TermPattern::Empty => None,
@@ -251,8 +246,7 @@ impl TermPattern {
                 let pos = folded.find(&l.folded)?;
                 Some(pos..pos + l.text.len())
             }
-            // The regex engine folds as it matches, so it needs no help and
-            // allocates nothing either way.
+            // The regex engine folds as it matches, so it needs no help.
             TermPattern::Wildcard(w) => w.search_ci.find(folded).map(|m| m.range()),
         }
     }
@@ -263,7 +257,7 @@ impl TermPattern {
         match self {
             TermPattern::Empty => 0,
             // Both sides are already folded, so an exact scan *is* the
-            // case-insensitive one — and it allocates nothing.
+            // case-insensitive one.
             TermPattern::Literal(l) => snippet::count_occurrences(folded, &l.folded, true),
             TermPattern::Wildcard(w) => w.search_ci.find_iter(folded).take(COUNT_CAP).count(),
         }

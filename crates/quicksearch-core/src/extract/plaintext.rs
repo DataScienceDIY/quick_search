@@ -62,21 +62,13 @@ impl Extractor for PlaintextExtractor {
         mime.starts_with("text/") || EXTRA_TEXT_MIMES.contains(&mime)
     }
 
-    /// Read the whole file, sized from the handle we just opened.
-    ///
-    /// `std::fs::read_to_string` would cost two extra syscalls here: a
-    /// path-based `statx` to size its buffer, and a second `read` returning 0,
-    /// because "read to EOF" can only observe EOF that way — `read_to_end`
-    /// terminates on `Ok(0)` alone, so a short read does not end it. Sizing
-    /// the buffer ourselves lets the loop finish on `filled == size` and issue
-    /// exactly one `read` for a file that fits.
+    /// Read the whole file, sized from the handle we just opened, so a file
+    /// that fits takes exactly one `read`.
     ///
     /// A file that shrank between the `fstat` and the `read` keeps its prefix
     /// rather than failing. A file that grew is read up to the size we saw;
     /// its mtime moved, so the next run reclassifies it as changed and
     /// re-extracts (see [`crate::file_handling::classify_for_indexing`]).
-    /// Neither case was ever atomic — a concurrent writer can tear a file
-    /// across any read sequence, including `read_to_string`'s.
     fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError> {
         let mut f =
             File::open(path).map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
@@ -88,10 +80,13 @@ impl Extractor for PlaintextExtractor {
         // procfs, sysfs and some FUSE mounts report zero for files that do
         // have content, so a sized read would store nothing. Only these pay
         // the read-to-EOF probe — which is what a genuinely empty file cost
-        // before anyway.
+        // before anyway. Capped so a node that streams forever (a FIFO, a
+        // lying filesystem) cannot allocate without bound.
         if size == 0 {
+            const MAX_UNSIZED_READ: u64 = 64 * 1024 * 1024;
             let mut buf = Vec::new();
-            f.read_to_end(&mut buf)
+            f.take(MAX_UNSIZED_READ)
+                .read_to_end(&mut buf)
                 .map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
             return decode(buf, path);
         }

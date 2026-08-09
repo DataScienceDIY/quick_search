@@ -19,31 +19,17 @@
 //! [`crate::config::diff_actions`], which decides which of these applies, and
 //! [`crate::config::IndexWork`], the plan it produces.
 //!
-//! ## Why the scan is per-root
+//! The scan is per-root: [`advance`] walks each root's `[lo, hi)` range
+//! rather than the whole `files` table. With `follow_symlinks` on, a symlink
+//! target is stored under its own canonical path, possibly outside every
+//! root — such a row has no owning root and no filtering rules to apply, and
+//! scanning by range never visits it.
 //!
-//! [`advance`] walks each configured root's `[lo, hi)` range rather than the
-//! whole `files` table. That is not only a matter of using the index: with
-//! `follow_symlinks` on, a symlink target is stored under its own canonical
-//! path, which may lie outside every root. Such a row is legitimately
-//! indexed, has no owning root, and so has no filtering rules that can be
-//! applied to it — scanning by range means it is simply never visited, the
-//! same exemption `aliased_paths` gives it during a full run's stale sweep.
-//!
-//! ## Reporting and giving up
-//!
-//! On a multi-million-row index this pass is minutes of work with no files
-//! moving to show for it, so the cursor counts what it has examined against
-//! the rows in the index and its driver publishes that
-//! ([`crate::indexing::ReconcileProgress`]).
-//!
-//! It can also be abandoned, through the flag-plus-interrupt pair
-//! [`crate::db::InterruptSlot`] describes — before this, closing the window
-//! during a prune waited the prune out. What makes giving up safe is that
-//! nothing here records anything: the stored configuration is stamped by the
-//! *caller*, only once the cursor reports itself finished, so an abandoned
-//! pass leaves the index describing the settings it was last reconciled to and
-//! the next run derives the same plan again. See [`outstanding_work`], which
-//! is that question asked directly.
+//! The pass can be abandoned through the flag-plus-interrupt pair
+//! [`crate::db::InterruptSlot`] describes. That is safe because nothing here
+//! records anything: the *caller* stamps the stored configuration, only once
+//! the cursor reports finished, so an abandoned pass leaves the next run to
+//! derive the same plan again. See [`outstanding_work`].
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,15 +43,12 @@ use crate::extract::Registry;
 use crate::file_handling::{content_extractable, fts_finalize_after_text_indexing, ExtractCursor};
 use crate::indexing::ReconcileProgress;
 
-/// How long [`advance`] may work before handing control back.
+/// How long [`advance`] may work before handing control back — a bound on
+/// how long a Stop, a search or a further config edit waits behind a scan.
 ///
-/// Not a throughput knob — the caller decides when to come back — but a bound
-/// on how long a Stop, a search or a further config edit waits behind a scan
-/// in progress. The same budget the coordinator gives its watcher queue.
-///
-/// It bounds the wait *between* statements only; one statement can outlast the
-/// whole budget, which is why the pass also publishes its connection through
-/// [`crate::db::InterruptGuard`]. See [`crate::db::InterruptSlot`].
+/// It bounds the wait *between* statements only; one statement can outlast
+/// the whole budget, which is why the pass also publishes its connection
+/// through [`crate::db::InterruptGuard`].
 pub const SLICE: Duration = Duration::from_millis(250);
 
 /// One configured root, with the `files.path` range it owns precomputed.
@@ -75,14 +58,9 @@ struct Root {
     hi: String,
 }
 
-/// The set of paths the current configuration would index.
-///
-/// The walker applies these rules on the way down, pruning a directory before
-/// it descends. `Scope` applies the same rules to a path that is already
-/// stored, which is what lets a narrowed filter delete the rows that fell out
-/// of scope instead of rebuilding the whole index. The two must agree exactly,
-/// or every run would re-add what the last prune removed; the tests below pin
-/// that agreement against [`crate::walk`]'s own behaviour.
+/// The set of paths the current configuration would index: the walker's own
+/// filtering rules, applied to a path that is already stored. The two must
+/// agree exactly, or every run would re-add what the last prune removed.
 pub struct Scope {
     roots: Vec<Root>,
     ignore: IgnoreSet,
@@ -122,13 +100,11 @@ impl Scope {
 
     /// Whether the walker would still emit `path` while walking `root`.
     ///
-    /// Mirrors `read_directory`'s three `continue`s. The full-path ignore
-    /// patterns are tested once against the whole path because
-    /// [`IgnoreSet::matches_path_pattern`] already walks every ancestor,
-    /// which is exactly the union of the per-level tests the walker performs
-    /// on its way down. The hidden and component-pattern rules are tested per
-    /// component *below* the root: a root is never filtered, because the user
-    /// chose it (see [`crate::walk::walk_indexable_files`]).
+    /// Mirrors `read_directory`'s three `continue`s. Full-path ignore
+    /// patterns are tested once against the whole path
+    /// ([`IgnoreSet::matches_path_pattern`] walks every ancestor); the hidden
+    /// and component-pattern rules per component *below* the root — a root
+    /// itself is never filtered.
     pub fn covers(&self, root: &Path, path: &Path) -> bool {
         self.covers_cached(root, path, &mut CoverCache::default())
     }
@@ -136,14 +112,11 @@ impl Scope {
     /// [`Scope::covers`], reusing the verdicts already reached for the
     /// directories on the way down.
     ///
-    /// A scan calls this once per stored row, and rows under one root share
-    /// their ancestors densely — every file in `~/src/project/src` asks the same
-    /// four questions before it asks its own. On Unix that repetition is free,
-    /// because `entry_is_hidden` never calls the closure and the whole loop is
-    /// string comparisons. On Windows each component is a `symlink_metadata`,
-    /// which is a `CreateFileW` through the full filter-driver stack: a 3M-row
-    /// index at depth 8 was ~24M file opens where Linux did none. Remembering
-    /// each directory's verdict collapses that to roughly one per directory.
+    /// On Unix the repeated ancestor tests are free string comparisons. On
+    /// Windows each component is a `symlink_metadata` — a `CreateFileW`
+    /// through the full filter-driver stack; a 3M-row index at depth 8 was
+    /// ~24M file opens. The cache collapses that to roughly one per
+    /// directory.
     pub fn covers_cached(&self, root: &Path, path: &Path, cache: &mut CoverCache) -> bool {
         if self.ignore.matches_path_pattern(path) {
             return false;
@@ -160,9 +133,8 @@ impl Scope {
                 return false;
             };
             current.push(name);
-            // Only the ancestors are worth remembering. The last component is
-            // this row's own file name, asked once and never again, so caching
-            // it would grow the map by one entry per row for no hits at all.
+            // Leaves are asked once and never again; caching them grows the
+            // map one entry per row for no hits.
             let is_leaf = i + 1 == depth;
             if !is_leaf {
                 if let Some(allowed) = cache.get(&current) {
@@ -186,14 +158,10 @@ impl Scope {
     /// Whether one path component passes the hidden and component-pattern
     /// rules. `current` is its full path, which the attribute test needs.
     fn component_allowed(&self, current: &Path, name: &str) -> bool {
-        // The metadata closure is only consulted on Windows, where hidden
-        // is an attribute rather than a leading dot; on Unix this stays at
-        // zero syscalls, exactly as it does in the walker.
-        //
-        // `symlink_metadata` for the same reason the walker uses
-        // `DirEntry::metadata`: the component is judged as itself, never as
-        // what it points at. Following here and not there is exactly the
-        // disagreement this whole type exists to avoid.
+        // The metadata closure is only consulted on Windows, where hidden is
+        // an attribute rather than a leading dot; on Unix this is zero
+        // syscalls. `symlink_metadata` because the component is judged as
+        // itself, never as what it points at — the walker does the same.
         if !self.include_hidden
             && crate::platform::entry_is_hidden(name, || std::fs::symlink_metadata(current).ok())
         {
@@ -205,12 +173,10 @@ impl Scope {
 
 /// Directory verdicts already reached by [`Scope::covers_cached`].
 ///
-/// Bounded rather than unbounded: a scan of a multi-million-row index would
-/// otherwise hold every directory under every root at once, and the pass is
-/// already paged precisely so it does not have to. Past the cap the map is
-/// cleared outright instead of evicting one entry — rows arrive in roughly
-/// insertion order, so the entries that matter are the ones just added, and a
-/// clear costs one rebuild of a working set that is small by construction.
+/// Bounded: a multi-million-row scan would otherwise hold every directory
+/// under every root at once. Past the cap the map is cleared outright — rows
+/// arrive in roughly insertion order, so the entries that matter are the
+/// ones just added.
 #[derive(Default)]
 pub struct CoverCache {
     dirs: std::collections::HashMap<PathBuf, bool>,
@@ -233,19 +199,14 @@ impl CoverCache {
     }
 }
 
-/// How far an in-progress [`advance`] has got.
+/// How far an in-progress [`advance`] has got; the caller hands back the
+/// same cursor each tick with a fresh deadline.
 ///
-/// The work is resumable because a multi-million-row index must not hold the
-/// coordinator's command loop for the length of a full scan; the caller hands
-/// back the same cursor each tick with a fresh deadline, the way
-/// `apply_pending` drains the watcher queue.
-///
-/// Resumable within one pass only. A cursor abandoned — cancelled, or dropped
-/// on an error — takes its position with it, and the next attempt starts from
-/// the beginning of a freshly derived plan; every part of the pass is
-/// idempotent precisely so that this costs time and nothing else. A config edit
-/// arriving mid-pass has the same effect (see `Inner::start_work`), which is
-/// why the counters can go backwards between two published snapshots.
+/// Resumable within one pass only: an abandoned cursor takes its position
+/// with it, and the next attempt restarts a freshly derived plan — every
+/// part of the pass is idempotent so that costs time and nothing else. A
+/// config edit arriving mid-pass has the same effect, which is why the
+/// counters can go backwards between two published snapshots.
 pub struct WorkCursor {
     work: IndexWork,
     scope: Scope,
@@ -267,12 +228,9 @@ pub struct WorkCursor {
     pub recontented: usize,
     /// Rows the scan has re-tested against the current configuration.
     examined: usize,
-    /// Rows in the index, counted once when the scan first needs a page and
-    /// then left alone — a denominator that moved would make the display walk
-    /// backwards. `None` until then, and for a plan that reads no rows at all:
-    /// removing a root is one whole-range delete with no intermediate state to
-    /// report, so it gets the indeterminate bar rather than an invented
-    /// percentage.
+    /// Rows in the index, counted once when the scan first needs a page — a
+    /// denominator that moved would walk the display backwards. `None` until
+    /// then, and for a plan that reads no rows at all.
     total: Option<usize>,
 }
 
@@ -298,10 +256,6 @@ impl WorkCursor {
     }
 
     /// A snapshot for the status the caller publishes.
-    ///
-    /// Both places this work runs — a run's prologue and the coordinator's
-    /// between-runs pass — report the same figures from the same counters,
-    /// so the user sees one thing however the reconcile was reached.
     pub fn progress(&self) -> ReconcileProgress {
         ReconcileProgress {
             examined: self.examined,
@@ -333,16 +287,10 @@ impl WorkCursor {
 /// transaction. Returns with the cursor advanced; call again until
 /// [`WorkCursor::done`].
 ///
-/// `cancel` means "do not start another statement": it is read before every
-/// one, and a set flag returns immediately with the cursor un-finished. It is
-/// only half of cutting the pass short — the statement already running answers
-/// to [`crate::db::interrupt`] and nothing else — and it is deliberately not
-/// the same thing as `deadline`, which hands control back to a caller that
-/// intends to come straight back.
-///
-/// A cancelled pass leaves the work owed. Nothing here records what it did:
-/// the stored configuration is stamped only by a caller that saw the cursor
-/// finish, so the next run re-derives the same plan and picks it up.
+/// `cancel` means "do not start another statement" — the statement already
+/// running answers to [`crate::db::interrupt`] and nothing else. A cancelled
+/// pass leaves the work owed: the stored configuration is stamped only by a
+/// caller that saw the cursor finish.
 pub fn advance(
     conn: &mut Connection,
     config: &Config,
@@ -351,8 +299,7 @@ pub fn advance(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    // Whole ranges first: a removed root's rows can never satisfy the scan's
-    // filters anyway, and deleting them by range spares the scan the work.
+    // Whole ranges first: deleting by range spares the scan the work.
     while cursor.drop_idx < cursor.work.drop_roots.len() {
         if cancelled(cancel) {
             return Ok(());
@@ -398,10 +345,8 @@ pub fn advance(
     }
 
     if cursor.work.scans_rows() {
-        // One count, the first time a page is actually needed. The scan it
-        // measures is a keyset walk of every row under every root, so on the
-        // indexes where this matters it is minutes of work against a count of
-        // seconds — and without it the display has no denominator at all.
+        // One count, the first time a page is actually needed; without it
+        // the display has no denominator at all.
         if cursor.total.is_none() {
             if cancelled(cancel) {
                 return Ok(());
@@ -409,8 +354,7 @@ pub fn advance(
             cursor.total = Some(repo::row_count(conn)?);
         }
         let page = config.processing.batch_size.max(1) as i64;
-        // Lives across pages, not per page: consecutive pages walk the same
-        // directories, which is exactly the repetition worth remembering.
+        // Lives across pages: consecutive pages walk the same directories.
         let mut covered = CoverCache::default();
         while cursor.root_idx < cursor.scope.roots.len() {
             if cancelled(cancel) {
@@ -447,11 +391,8 @@ pub fn advance(
         }
     }
 
-    // Deletions leave the FTS index with tombstones and a long segment list;
-    // the same automerge that follows a run's stale cleanup collapses them.
-    // It is one statement that can run for a while, so it is the last thing
-    // the flag can spare the caller — and skipping it costs only tidiness,
-    // since the next run's own automerge collapses the same segments.
+    // Deletions leave FTS tombstones; the automerge collapses them. Skipping
+    // it costs only tidiness — the next run's automerge does the same.
     if cancelled(cancel) {
         return Ok(());
     }
@@ -493,10 +434,9 @@ fn apply_page(
             stale_text.push(row.id);
         }
         if work.reconcile_content || work.restore_text {
-            // The walker's own decision, recomputed from the columns it wrote
-            // it into. Both directions run whenever either flag is set: the
-            // answer comes from the *current* config, so a row that disagrees
-            // with it is wrong however it got that way.
+            // The walker's own decision, recomputed. Both directions run
+            // whenever either flag is set: a row that disagrees with the
+            // current config is wrong however it got that way.
             let wants = row.size <= config.processing.maximum_text_file_size
                 && content_extractable(path, row.mime.as_deref(), config, registry);
             if !wants && row.content_state != repo::STATE_NA {
@@ -535,13 +475,8 @@ fn apply_page(
 
 /// The configuration the index was last built with, as far as
 /// `config_validation` records it: `config` with the recorded fields
-/// substituted back in.
-///
-/// Fields the table does not record keep `config`'s own values, so they never
-/// read as changed — the table is a record of what the walk used, not a second
-/// copy of the config. Feeding this to [`crate::config::diff_actions`] is what
-/// lets a config edited while the app was closed produce exactly the same plan
-/// as one edited live, from one decision table rather than two.
+/// substituted back in. Fields the table does not record keep `config`'s own
+/// values, so they never read as changed.
 pub fn stored_config(conn: &Connection, config: &Config) -> Result<Config, String> {
     let mut stored = config.clone();
     let recorded = crate::indexing::IndexingService::stored_validation(conn)?;
@@ -564,15 +499,12 @@ pub fn stored_config(conn: &Connection, config: &Config) -> Result<Config, Strin
             }
             "hash_length" => match value.parse() {
                 Ok(n) => stored.processing.hash_length = n,
-                // Keeping the caller's value is the safest of bad options,
-                // but it makes the reconciliation diff describe a config the
-                // index was not built under, so it must not pass in silence.
+                // Keeping the caller's value makes the diff describe a config
+                // the index was not built under; don't let it pass in silence.
                 Err(e) => crate::log_warn!("stored hash_length {:?} unreadable: {}", value, e),
             },
             "tokenize" => stored.processing.tokenize = value,
-            // An unrecognized key is a record written by a newer build.
-            // Ignoring it leaves that setting at the caller's value, which is
-            // what a build that does not know the key would have used anyway.
+            // An unrecognized key is a record from a newer build; ignore it.
             _ => {}
         }
     }
@@ -582,16 +514,9 @@ pub fn stored_config(conn: &Connection, config: &Config) -> Result<Config, Strin
 /// The reconciliation the index still owes `config`, derived from its own
 /// record of what it was last brought into line with.
 ///
-/// The one question three callers ask in the same words: a run, to decide what
-/// its prologue must do; a test, to check a pass recorded itself; and the GUI
-/// at startup, to tell the user their settings have not reached the index yet.
-/// Empty is the normal answer — every pass that finishes stamps the record —
-/// so a non-empty one means a pass was abandoned, or the config was edited
-/// while the app was closed. Either way the remedy is the same: run indexing.
-///
-/// The roots are canonicalized first, because that is the spelling the record
-/// holds; comparing raw ones would report a `~` or a trailing slash as a
-/// changed root.
+/// Empty is the normal answer; non-empty means a pass was abandoned or the
+/// config was edited while the app was closed. Roots are canonicalized first
+/// — that is the spelling the record holds.
 pub fn outstanding_work(db_path: &str, config: &Config) -> Result<IndexWork, String> {
     let conn = crate::db::open_existing(db_path, false)?;
     let mut current = config.clone();
@@ -601,354 +526,5 @@ pub fn outstanding_work(db_path: &str, config: &Config) -> Result<IndexWork, Str
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::walk::{walk_indexable_files, WalkEvent};
-    use std::collections::HashSet;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
-
-    fn tmp_tree(tag: &str) -> PathBuf {
-        crate::testutil::scratch_dir_canonical(tag)
-    }
-
-    fn touch(p: &Path) {
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, b"x").unwrap();
-    }
-
-    fn empty_db(dir: &Path) -> PathBuf {
-        let db = dir.join("index.sqlite");
-        crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
-        db
-    }
-
-    /// Every file the walker actually emits under `config`'s single root.
-    fn walked(config: &Config, db: &Path) -> HashSet<PathBuf> {
-        let root = config.paths.indexing_paths[0].clone();
-        walk_indexable_files(
-            &[root],
-            config.indexing.follow_symlinks,
-            config.indexing.include_hidden,
-            IgnoreSet::compile(&config.indexing.ignore_patterns).unwrap(),
-            db.to_str().unwrap(),
-            config.clone(),
-            Arc::new(Registry::default_set()),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            2,
-        )
-        .filter_map(|e| match e {
-            WalkEvent::File(f) => Some(PathBuf::from(f.path)),
-            WalkEvent::Stale(_) => None,
-        })
-        .collect()
-    }
-
-    /// One `files` row per path, which is all the scan reads.
-    fn seed(conn: &mut Connection, paths: &[PathBuf]) {
-        let tx = conn.transaction().unwrap();
-        for path in paths {
-            let path = path.to_string_lossy();
-            let (parent, name) = path.rsplit_once('/').unwrap();
-            repo::insert_file(
-                &tx,
-                &repo::NewFile {
-                    name,
-                    path: &path,
-                    parent,
-                    size: 1,
-                    mtime: 1,
-                    inode: None,
-                    device_id: None,
-                    mime: Some("text/plain"),
-                    ftype: crate::mime::FileType::TEXT,
-                    hash: None,
-                    needs_content: false,
-                },
-            )
-            .unwrap()
-            .expect("unique path");
-        }
-        tx.commit().unwrap();
-    }
-
-    /// Every file that physically exists under `root`, walker or no walker.
-    fn on_disk(root: &Path) -> Vec<PathBuf> {
-        walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|e| e.file_type().is_file())
-            .map(|e| e.into_path())
-            .collect()
-    }
-
-    /// The whole point of `Scope`: it must reach the same verdict the walker
-    /// does for every file on disk. If it is stricter, every prune deletes
-    /// rows the next run puts straight back; if it is laxer, the rows the
-    /// user excluded survive. Either way the index never settles.
-    #[test]
-    fn scope_agrees_with_the_walker() {
-        let root = tmp_tree("agree");
-        touch(&root.join("keep.txt"));
-        touch(&root.join("sub/keep2.txt"));
-        touch(&root.join("sub/skip.tmp"));
-        touch(&root.join("sub/node_modules/dep/index.js"));
-        touch(&root.join(".hidden/inside.txt"));
-        touch(&root.join(".dotfile"));
-        touch(&root.join("build/out/artifact.o"));
-        touch(&root.join("build/keep3.txt"));
-        touch(&root.join("nested/build/also.o"));
-
-        let mut config = Config::default();
-        config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
-        config.indexing.ignore_patterns = vec![
-            "*.tmp".into(),
-            "node_modules".into(),
-            // A full-path pattern: prunes this one directory, not every
-            // directory called `out`.
-            root.join("build/out").to_string_lossy().into_owned(),
-        ];
-
-        for include_hidden in [false, true] {
-            config.indexing.include_hidden = include_hidden;
-            let db = empty_db(&tmp_tree("agree-db"));
-            let emitted = walked(&config, &db);
-            let scope = Scope::from_config(&config).unwrap();
-
-            for path in on_disk(&root) {
-                assert_eq!(
-                    scope.covers(&root, &path),
-                    emitted.contains(&path),
-                    "disagreement on {} (include_hidden = {})",
-                    path.display(),
-                    include_hidden
-                );
-            }
-        }
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// A root is never filtered — the user chose it. A component pattern
-    /// naming the root must not empty it out, but a full-path pattern that
-    /// matches the root still prunes everything below it, because that is
-    /// what the walker's ancestor check does when it reads the children.
-    #[test]
-    fn a_root_is_never_filtered_but_its_children_still_are() {
-        let base = tmp_tree("root-name");
-        let root = base.join("node_modules");
-        touch(&root.join("keep.txt"));
-        touch(&root.join("node_modules/nested.txt"));
-
-        let mut config = Config::default();
-        config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
-        config.indexing.ignore_patterns = vec!["node_modules".into()];
-        let scope = Scope::from_config(&config).unwrap();
-        assert!(scope.covers(&root, &root.join("keep.txt")));
-        assert!(!scope.covers(&root, &root.join("node_modules/nested.txt")));
-
-        let db = empty_db(&tmp_tree("root-name-db"));
-        let emitted = walked(&config, &db);
-        for path in on_disk(&root) {
-            assert_eq!(scope.covers(&root, &path), emitted.contains(&path));
-        }
-
-        // A full-path pattern reaching the root itself takes the whole tree.
-        config.indexing.ignore_patterns = vec![root.to_string_lossy().into_owned()];
-        let scope = Scope::from_config(&config).unwrap();
-        assert!(!scope.covers(&root, &root.join("keep.txt")));
-
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    /// Root ownership compares whole components, so a sibling whose name
-    /// merely starts with a root's is not inside it — a prune that got this
-    /// wrong would delete a neighbouring folder's entire index.
-    #[test]
-    fn owning_root_does_not_match_name_prefixes() {
-        let base = tmp_tree("prefix");
-        let root = base.join("data");
-        let sibling = base.join("database");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&sibling).unwrap();
-
-        let mut config = Config::default();
-        config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
-        let scope = Scope::from_config(&config).unwrap();
-
-        assert_eq!(scope.owning_root(&root.join("f.txt")), Some(root.as_path()));
-        assert_eq!(scope.owning_root(&sibling.join("f.txt")), None);
-        // The root itself is a directory, never a row, and owns nothing.
-        assert_eq!(scope.owning_root(&root), None);
-        std::fs::remove_dir_all(&base).ok();
-    }
-
-    /// The counters the status display reads. A scan that reports nothing is
-    /// indistinguishable from a hang, and on the indexes where this pass takes
-    /// minutes that is exactly what it looked like.
-    #[test]
-    fn the_scan_reports_its_way_through_every_row() {
-        let root = tmp_tree("progress");
-        for i in 0..7 {
-            touch(&root.join(format!("f{}.log", i)));
-        }
-        touch(&root.join("keep.txt"));
-
-        let db_dir = tmp_tree("progress-db");
-        let db = empty_db(&db_dir);
-        let mut conn = crate::db::open_existing(db.to_str().unwrap(), true).unwrap();
-        let mut config = Config::default();
-        config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
-        // One row per page, so the scan takes as many steps as there are rows
-        // and a counter that only moved at the end would be visible.
-        config.processing.batch_size = 1;
-        seed(&mut conn, &on_disk(&root));
-
-        let mut narrowed = config.clone();
-        narrowed.indexing.ignore_patterns = vec!["*.log".into()];
-        let work = crate::config::diff_actions(&config, &narrowed).work;
-        let mut cursor = WorkCursor::new(work, &narrowed).unwrap();
-        assert_eq!(
-            cursor.progress(),
-            ReconcileProgress::default(),
-            "nothing counted before the first slice"
-        );
-
-        let registry = Registry::default_set();
-        let run = AtomicBool::new(false);
-        let mut seen: Vec<usize> = Vec::new();
-        while !cursor.done() {
-            // A deadline already past, so each call does the least it can and
-            // the counters are sampled at their finest granularity.
-            advance(
-                &mut conn,
-                &narrowed,
-                &registry,
-                &mut cursor,
-                Instant::now(),
-                &run,
-            )
-            .unwrap();
-            seen.push(cursor.progress().examined);
-        }
-
-        let end = cursor.progress();
-        assert_eq!(end.total, Some(8), "counted once, before the first page");
-        assert_eq!(end.examined, 8, "every row was re-tested");
-        assert_eq!(end.deleted, 7, "the logs, and only the logs");
-        assert!(
-            seen.windows(2).all(|w| w[0] <= w[1]),
-            "the count never goes backwards: {:?}",
-            seen
-        );
-        assert!(
-            seen.len() > 2 && seen[0] < end.examined,
-            "progress was reported during the scan, not only at its end: {:?}",
-            seen
-        );
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&db_dir).ok();
-    }
-
-    /// Cancelling stops the pass at the next statement boundary and leaves the
-    /// cursor un-finished, so nothing downstream can mistake it for done and
-    /// record the configuration as reconciled. The rows it had already reached
-    /// stay gone — every part of the pass is idempotent, and the next run
-    /// re-derives the same plan and finishes it.
-    #[test]
-    fn cancelling_stops_the_scan_without_finishing_it() {
-        let root = tmp_tree("cancel");
-        for i in 0..6 {
-            touch(&root.join(format!("f{}.log", i)));
-        }
-        touch(&root.join("keep.txt"));
-
-        let db_dir = tmp_tree("cancel-db");
-        let db = empty_db(&db_dir);
-        let mut conn = crate::db::open_existing(db.to_str().unwrap(), true).unwrap();
-        let mut config = Config::default();
-        config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
-        config.processing.batch_size = 1;
-        seed(&mut conn, &on_disk(&root));
-
-        let mut narrowed = config.clone();
-        narrowed.indexing.ignore_patterns = vec!["*.log".into()];
-        let work = crate::config::diff_actions(&config, &narrowed).work;
-        let registry = Registry::default_set();
-
-        // Cancelled from the outset: not one statement runs.
-        let stop = AtomicBool::new(true);
-        let mut cursor = WorkCursor::new(work.clone(), &narrowed).unwrap();
-        advance(
-            &mut conn,
-            &narrowed,
-            &registry,
-            &mut cursor,
-            Instant::now() + SLICE,
-            &stop,
-        )
-        .unwrap();
-        assert!(!cursor.done(), "a cancelled pass is never finished");
-        assert_eq!(
-            cursor.progress(),
-            ReconcileProgress::default(),
-            "a cancelled pass touched the index"
-        );
-
-        // And part-way through: one slice with the flag clear, the rest with
-        // it set. The counters keep what the first slice earned.
-        let stop = AtomicBool::new(false);
-        let mut cursor = WorkCursor::new(work, &narrowed).unwrap();
-        advance(
-            &mut conn,
-            &narrowed,
-            &registry,
-            &mut cursor,
-            Instant::now(),
-            &stop,
-        )
-        .unwrap();
-        let part_way = cursor.progress();
-        assert!(part_way.examined > 0 && !cursor.done(), "nothing to cancel");
-
-        stop.store(true, Ordering::Relaxed);
-        advance(
-            &mut conn,
-            &narrowed,
-            &registry,
-            &mut cursor,
-            Instant::now() + SLICE,
-            &stop,
-        )
-        .unwrap();
-        assert!(!cursor.done(), "the pass finished despite the cancellation");
-        assert_eq!(
-            cursor.progress(),
-            part_way,
-            "the cancelled slice did more work"
-        );
-
-        std::fs::remove_dir_all(&root).ok();
-        std::fs::remove_dir_all(&db_dir).ok();
-    }
-
-    /// A path under no configured root has no rules that could be applied to
-    /// it — a followed symlink's target is the real case. The scan reaches it
-    /// by never visiting it, so `owning_root` returning `None` is what keeps
-    /// it alive.
-    #[test]
-    fn a_path_outside_every_root_has_no_owner() {
-        let base = tmp_tree("outside");
-        let root = base.join("indexed");
-        std::fs::create_dir_all(&root).unwrap();
-
-        let mut config = Config::default();
-        config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
-        config.indexing.ignore_patterns = vec!["*".into()];
-        let scope = Scope::from_config(&config).unwrap();
-
-        assert_eq!(scope.owning_root(Path::new("/elsewhere/target.txt")), None);
-        std::fs::remove_dir_all(&base).ok();
-    }
-}
+#[path = "scope_tests.rs"]
+mod tests;

@@ -47,9 +47,8 @@ fn app_icon() -> egui::IconData {
 }
 
 /// Leftover positional arguments, joined — used to seed the search box.
-///
-/// Flags are dropped rather than parsed: eframe and winit take some of their
-/// own, and a stray `--foo` should not end up in the query.
+/// Flags are dropped rather than parsed: eframe and winit take some of
+/// their own.
 fn seed_query() -> Option<String> {
     let terms: Vec<String> = std::env::args()
         .skip(1)
@@ -82,13 +81,8 @@ fn main() {
     let initial_query = seed_query();
 
     // With protection on, try the keychain before the window opens; a
-    // verified key means no prompt at all. Anything else starts locked —
-    // the unlock screen owns password entry, bad-salt reporting, and the
-    // forgot-password escape hatch. No index is touched until unlocked.
-    //
-    // `None` means "start locked". The two unlocked cases stay distinct
-    // rather than collapsing to a bool, because anything the app later says
-    // *about* the key has to know whether the user typed one.
+    // verified key means no prompt at all. `None` starts locked, and no
+    // index is touched until unlocked.
     let key_source = if !config.security.password_protected {
         Some(unlock::KeySource::Unprotected)
     } else if unlock::try_keychain_unlock(&config) {
@@ -111,15 +105,13 @@ fn main() {
         "QuickSearch",
         native_options,
         Box::new(move |cc| {
-            // Here rather than earlier in `main`: on Windows the registration
-            // owns a hidden window whose messages the event loop has to
-            // dispatch, so it has to be made on that loop's thread with the
-            // loop already running. This closure is the first place that is
-            // true. Registering before the gate also means the shortcut works
-            // while the unlock screen is up.
+            // On Windows the registration owns a hidden window whose messages
+            // the event loop must dispatch, so it must be made on that loop's
+            // thread with the loop running — this closure is the first place
+            // that is true. Before the gate, so the shortcut works while the
+            // unlock screen is up.
             hotkey::init(&cc.egui_ctx, &config.ui.search_hotkey);
-            // Before the gate so the unlock screen is not the one window that
-            // ignores the setting.
+            // Before the gate so the unlock screen honors the setting.
             app::apply_theme(&cc.egui_ctx, &config.ui.color_scheme);
             let gate = match key_source {
                 Some(source) => {

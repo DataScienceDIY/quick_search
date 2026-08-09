@@ -5,13 +5,10 @@
 //! consistent after every commit. The same filters as the full walk apply
 //! ([`IgnoreSet`], hidden components, `content_extensions`, size caps) —
 //! a watcher event for something the walker would have skipped is a no-op.
+//! Renames are handled as remove + re-add.
 //!
-//! Renames are handled as remove + re-add: they're rare, and rewriting
-//! `path`/`parent` strings plus re-tokenizing the FTS `name` column in
-//! place is more machinery than re-extracting one file.
-//!
-//! Scope note: the watcher only reports paths under the configured roots,
-//! so no root containment check is repeated here.
+//! The watcher only reports paths under the configured roots, so no root
+//! containment check is repeated here.
 
 use std::path::Path;
 
@@ -57,10 +54,9 @@ fn upsert_path(
     if ignore.matches_path(path) {
         return Ok(());
     }
-    // Measured from the innermost configured root: the walk never filters the
-    // root it was handed, so a root that is itself hidden (`~/.config/app`, or
-    // anything under `%LOCALAPPDATA%` on Windows) must not be rejected here —
-    // that disagreement is what makes the index churn every cycle.
+    // Measured from the innermost configured root: the walk never filters
+    // the root it was handed, so a root that is itself hidden must not be
+    // rejected here — that disagreement makes the index churn every cycle.
     if !config.indexing.include_hidden
         && path_has_hidden_component_under(path, &config.resolved_indexing_paths())
     {
@@ -74,11 +70,9 @@ fn upsert_path(
         // A moved-in tree surfaces as one directory event; walk it with
         // the same filters as a full run.
         //
-        // `filtered_walk` wants a `&str`, so a path that is not valid UTF-8
-        // cannot be walked here. That is a whole subtree missing from the
-        // index, not one file, so it is an error rather than a quiet `Ok`:
-        // the caller answers it by scheduling a full run, which walks from
-        // the configured root and never needs the path as a `str`.
+        // A non-UTF-8 path is a whole subtree missing from the index, so it
+        // is an error (the caller schedules a full run) rather than a quiet
+        // `Ok`.
         let Some(root) = path.to_str() else {
             return Err(format!("directory path is not valid UTF-8: {:?}", path));
         };
@@ -136,17 +130,13 @@ fn upsert_file(
         },
     };
 
-    // The insert/update above already wrote NA; re-asserting it costs one
-    // indexed UPDATE on a path that handles one file per event, and keeps this
-    // correct on its own terms rather than on `insert_file`'s. It is also the
-    // only size gate on this path — `decide_content` has none, so falling
-    // through would hand a multi-gigabyte `.txt` to the plaintext extractor,
-    // which reads the whole file into memory.
+    // The only size gate on this path — `decide_content` has none, and
+    // falling through would hand a multi-gigabyte `.txt` to the plaintext
+    // extractor, which reads the whole file into memory.
     if !rec.needs_content {
         repo::set_content_na(&tx, file_id)?;
     } else if let Some(text) = rec.inline_text.as_deref() {
-        // Small enough that `prepare_file_record_from_path` already read the
-        // whole file; reopening it here would be the same bytes twice.
+        // `prepare_file_record_from_path` already read the whole file.
         store_inline_text(&tx, file_id, &rec, text, config)?;
     } else {
         extract_and_store(
@@ -170,21 +160,11 @@ fn remove_path(conn: &mut Connection, path: &Path) -> Result<(), String> {
 
 /// Drop removals that a removal of one of their ancestors already covers.
 ///
-/// `rm -rf dir/` reports `dir` *and* every file beneath it. Since removing
-/// `dir` sweeps its whole path range, each descendant event is duplicate work —
-/// 10 000 of them for a 10 000-file tree.
-///
-/// This is for a caller holding a raw removal set. The coordinator is not one:
-/// it collapses as events *arrive*, in `collapse_pending_removals`, because it
-/// has to measure its queue after collapsing rather than before (see
-/// `Inner::drain_events`). Same rule, two entry points, deliberately — a
-/// mass deletion must be one path by the time either of them is done with it.
-///
-/// Ancestor membership is tested against a set rather than by sorting, which
-/// keeps this obviously correct: there is no ordering argument to get wrong.
-/// Containment is component-wise, per
-/// [`crate::file_handling::UnreadableDirs::covers`]. Paths are shallow, so the
-/// cost is linear.
+/// `rm -rf dir/` reports `dir` *and* every file beneath it; removing `dir`
+/// sweeps its whole path range, so each descendant event is duplicate work.
+/// For callers holding a raw removal set — the coordinator collapses on
+/// arrival instead (`collapse_pending_removals`). Containment is
+/// component-wise, per [`crate::file_handling::UnreadableDirs::covers`].
 pub fn collapse_removal_roots(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
     if paths.len() < 2 {
         return paths;
@@ -200,16 +180,10 @@ pub fn collapse_removal_roots(paths: Vec<std::path::PathBuf>) -> Vec<std::path::
 /// Delete `paths` and everything indexed beneath them, in transactions of at
 /// most `chunk` paths.
 ///
-/// Correct for any path set, but a mass deletion is the case it exists for,
-/// and it pays off only if the caller has already reduced that set to its
-/// *roots* — then `rm -rf dir/` is one path here rather than one per file, and
-/// costs a fixed handful of range-driven statements
-/// ([`repo::delete_subtree`]) instead of a full table scan plus five
-/// statements per file. Both callers do: the coordinator collapses on arrival,
-/// and anyone else has [`collapse_removal_roots`].
-///
-/// Chunking bounds how long any single transaction holds the connection, the
-/// same way `process_batch_inserts` bounds the indexer's writes.
+/// Pays off only when the caller has reduced the set to its *roots*: then
+/// `rm -rf dir/` is a fixed handful of range-driven statements
+/// ([`repo::delete_subtree`]) rather than five per file. Chunking bounds how
+/// long any single transaction holds the connection.
 pub fn remove_paths(
     conn: &mut Connection,
     paths: &[std::path::PathBuf],
@@ -226,8 +200,7 @@ pub fn remove_paths(
             let path_str = db_key_for_missing_path(path);
             // The path itself, whether it was a file or a directory...
             repo::delete_file_by_path(&tx, &path_str)?;
-            // ...then everything beneath it, for a directory removal, which
-            // surfaces as a single event for the directory.
+            // ...then everything beneath it, for a directory removal.
             let range = ExtractCursor::for_root(&path_str);
             repo::delete_subtree(&tx, &range.lo, &range.hi)?;
         }
@@ -352,8 +325,6 @@ mod tests {
 
     #[test]
     fn removal_roots_collapse_to_the_shallowest_ancestor() {
-        // `rm -rf dir/` reports the directory and every file beneath it;
-        // removing the directory already sweeps its whole range.
         assert_eq!(
             collapse(&["/dir", "/dir/a.txt", "/dir/b/c.txt", "/dir/b"]),
             vec!["/dir"]
@@ -532,10 +503,8 @@ mod tests {
         assert_eq!(f.counts(), (1, 0, 0));
     }
 
-    /// The third way a file can end up NA — no extractor claims its MIME —
-    /// which the filter and oversize tests either side of this one don't
-    /// cover. A row left pending here would be re-fed to the content pass on
-    /// every subsequent run and counted in the extraction denominator forever.
+    /// The third way a file ends up NA: no extractor claims its MIME. A row
+    /// left pending would be re-fed to the content pass on every run.
     #[test]
     fn an_unclaimed_mime_is_na_in_the_watcher_path() {
         let mut f = Fixture::new();

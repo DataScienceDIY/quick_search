@@ -5,20 +5,12 @@
 //! any failure is surfaced to the caller and marks the file's content state as
 //! failed.
 //!
-//! This used to be two loads of the same file — `pdf_extract::extract_text`,
-//! which parses the document internally, followed by a second parse through a
-//! directly-declared `lopdf` purely to read six `Info` strings. Both object
-//! graphs and the full extracted text were live at once, on the extractor that
-//! `examples/memprobe.rs` already named as a run's largest single consumer.
-//! Naming `lopdf` as a direct dependency also resolved a *second, older* copy
-//! of it, which is what dragged `rayon` — and a global thread pool that is
+//! `lopdf` is reached through `pdf_extract`'s own `pub use lopdf::*` and must
+//! **not** be declared in `Cargo.toml` again: a direct declaration resolved a
+//! *second, older* copy, dragging `rayon` — and a global thread pool that is
 //! never torn down — plus `chrono`, `time`, `md5` and a second `nom` into the
-//! build.
-//!
-//! So `lopdf` is reached through `pdf_extract`'s own `pub use lopdf::*` and
-//! must not be declared in `Cargo.toml` again. The re-export is not a
-//! semver-guaranteed surface, but a break in it is a compile error rather than
-//! a silent behaviour change, and the fixtures below cover the behaviour.
+//! build. The re-export is not a semver-guaranteed surface, but a break in it
+//! is a compile error rather than a silent behaviour change.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -70,11 +62,10 @@ impl Extractor for PdfExtractor {
     }
 
     fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError> {
-        // Catch panics from pdf_extract (some PDFs crash its parser) and keep
-        // the default hook from spamming stderr about them. The whole
-        // operation is inside the guard, document loading included — that used
-        // to sit outside both it and the suppression window, so a panic in the
-        // parser reached the process hook and took the thread with it.
+        // Catch panics from pdf_extract (some PDFs crash its parser). The
+        // whole operation is inside the guard, document loading included — a
+        // panic in the parser outside it would reach the process hook and
+        // take the thread with it.
         install_quiet_panic_hook();
         let path_buf = path.to_path_buf();
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(true));
@@ -90,19 +81,14 @@ const INFO_KEYS: [&str; 6] = [
 ];
 
 /// Load the document once; take the text and the `Info` dictionary off it.
-///
-/// This is `pdf_extract::extract_text` — whose body is load, decrypt,
-/// `output_doc` — with the `Info` read folded in where the document is still
-/// in scope, which is the entire reason it is spelled out here rather than
-/// called.
+/// This is `pdf_extract::extract_text`'s body (load, decrypt, `output_doc`)
+/// spelled out so the `Info` read happens while the document is still in
+/// scope.
 fn extract_one_pass(path: &Path) -> Result<ExtractedContent, ExtractError> {
     let mut doc = Document::load(path).map_err(|e| format!("pdf_extract: {}", e))?;
-    // What `pdf_extract`'s own (private) `maybe_decrypt` does, and it has to
-    // happen before either the content streams or the `Info` strings mean
-    // anything — the previous two-load version never decrypted for the `Info`
-    // half, so those properties were garbage on any encrypted file. Empty
-    // password only: a real one is the user's to supply and nothing on this
-    // path can ask for it.
+    // Decryption must happen before either the content streams or the `Info`
+    // strings mean anything. Empty password only: a real one is the user's
+    // to supply and nothing on this path can ask for it.
     if doc.is_encrypted() {
         doc.decrypt("").map_err(|e| format!("pdf_extract: {}", e))?;
     }
@@ -137,10 +123,7 @@ fn extract_one_pass(path: &Path) -> Result<ExtractedContent, ExtractError> {
 
 fn object_to_string(obj: &Object) -> Option<String> {
     match obj {
-        Object::String(bytes, _) => {
-            // Try UTF-8; fall back to lossy decoding.
-            Some(String::from_utf8_lossy(bytes).into_owned())
-        }
+        Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).into_owned()),
         Object::Name(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
         _ => None,
     }
@@ -176,19 +159,13 @@ mod tests {
     /// Write a one-page PDF drawing `body`, with `info` as its `Info`
     /// dictionary, and return the path.
     ///
-    /// Built here rather than checked in as a blob, following the convention
-    /// [`super::super::ole`] states: a fixture asserted to have a particular
-    /// structure is not reviewable when it is opaque bytes. Everything needed
-    /// is public through `pdf_extract`'s `lopdf` re-export, which is the same
-    /// surface the extractor itself uses — so if that re-export ever moves,
-    /// these fail to compile alongside it rather than silently stopping
-    /// covering anything.
-    ///
-    /// The page is deliberately minimal but complete: `output_doc` walks
-    /// Catalog → Pages → Page and needs `MediaBox`, a `Resources` font it can
-    /// resolve, and a content stream. Helvetica is one of the base-14 fonts,
-    /// for which `pdf_extract` carries built-in encoding tables, so no font
-    /// file is involved.
+    /// Everything needed is public through `pdf_extract`'s `lopdf` re-export
+    /// — the same surface the extractor uses — so if that re-export moves,
+    /// these fail to compile alongside it. The page is minimal but complete:
+    /// `output_doc` walks Catalog → Pages → Page and needs `MediaBox`, a
+    /// resolvable `Resources` font and a content stream; Helvetica is a
+    /// base-14 font with built-in encoding tables, so no font file is
+    /// involved.
     fn write_pdf(tag: &str, body: &str, info: Option<Dictionary>) -> PathBuf {
         let mut doc = Document::with_version("1.5");
         let font = doc.add_object(dictionary! {
@@ -342,9 +319,9 @@ mod tests {
         );
     }
 
-    /// Malformed input must come back as an error, not take the process down.
-    /// This is the case the widened `catch_unwind` exists for: the document
-    /// load now runs inside it, where it used to run outside.
+    /// Malformed input must come back as an error, not take the process
+    /// down — the case the `catch_unwind` around the document load exists
+    /// for.
     #[test]
     fn malformed_pdf_fails_without_panicking_the_process() {
         let path = crate::testutil::scratch_dir("pdf-malformed").join("broken.pdf");

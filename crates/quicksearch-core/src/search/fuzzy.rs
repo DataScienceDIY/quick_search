@@ -2,10 +2,8 @@
 //!
 //! Bitap (shift-and with errors, Wu–Manber): finds occurrences of a
 //! pattern *within* a haystack with at most `k` Levenshtein edits
-//! (insertion / deletion / substitution). Substring semantics are the
-//! right fit for search-as-you-type — users type fragments, not whole
-//! filenames — and the u64 bit-parallel update costs O(k) word ops per
-//! haystack byte with zero allocations.
+//! (insertion / deletion / substitution); the u64 bit-parallel update costs
+//! O(k) word ops per haystack byte with zero allocations.
 //!
 //! Callers fold both sides to ASCII lowercase first (the pipeline-wide
 //! convention). Patterns are limited to 64 bytes by the machine word; the
@@ -52,11 +50,6 @@ impl Bitap {
     /// match of pattern[..=i] with ≤ d errors ends at the current text
     /// position". With d errors the first d pattern bytes can be deleted
     /// before any text is read, hence the pre-set low bits.
-    ///
-    /// Writes into a caller-owned array rather than returning a `Vec`: the
-    /// fuzzy passes call this once per scanned row — millions of them on a
-    /// whole-table sweep — and a heap allocation per row is pure overhead for
-    /// at most [`MAX_REGISTERS`] words.
     fn reset(&self, r: &mut [u64; MAX_REGISTERS]) {
         for (d, reg) in r.iter_mut().enumerate().take(self.k + 1) {
             *reg = if d == 0 { 0 } else { (1u64 << d) - 1 };
@@ -97,11 +90,7 @@ impl Bitap {
     }
 
     /// [`best_distance`](Self::best_distance) plus the first match's
-    /// approximate byte range, from one sweep.
-    ///
-    /// The filename pass needs both — the distance to rank by, the range to
-    /// mark in the snippet — and taking them separately meant a second full
-    /// scan of the same buffer for every hit. The range carries the same
+    /// approximate byte range, from one sweep. The range carries the same
     /// caveat as [`count_and_first`](Self::count_and_first): it assumes a
     /// pattern-length match, so edits can shift the true start by up to `k`.
     pub fn best_distance_and_first(&self, hay: &[u8]) -> Option<(usize, (usize, usize))> {
@@ -298,11 +287,10 @@ mod tests {
     /// Brute-force oracle: minimum Levenshtein distance between `pattern`
     /// and any substring of `hay`, capped at k.
     fn oracle(pattern: &[u8], hay: &[u8], k: usize) -> Option<usize> {
-        // An occurrence must end at some text position; empty text has
-        // none. Without this, k >= pattern-length "matches" empty text by
-        // deleting every pattern byte — a degenerate non-occurrence the
-        // automaton rightly never reports. (Production keeps k < len via
-        // the len/3 budget, so only the oracle ever saw this edge.)
+        // An occurrence must end at some text position; empty text has none.
+        // Without this, k >= pattern-length "matches" empty text by deleting
+        // every pattern byte — a degenerate non-occurrence the automaton
+        // rightly never reports.
         if hay.is_empty() {
             return None;
         }

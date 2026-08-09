@@ -99,16 +99,13 @@ fn classify(bytes: &[u8], truncated: bool) -> TextClass {
 /// Whether `head` — a possibly-truncated prefix of a file — is *provably*
 /// text: valid UTF-8, or BOM-marked.
 ///
-/// This is the sniff behind [`crate::mime::guess_mime_from_head`]'s
-/// `text/plain` catch-all, which fires only when nothing else identified the
-/// file. With no extension and no magic bytes to corroborate it, "not
-/// obviously binary" is too weak a test — see the module docs on why
-/// `TextClass::Legacy` is rejected here but accepted by [`decode_text`].
+/// The sniff behind [`crate::mime::guess_mime_from_head`]'s `text/plain`
+/// catch-all; see the module docs on why `TextClass::Legacy` is rejected
+/// here but accepted by [`decode_text`].
 ///
-/// Cheap: a byte scan plus UTF-8 validation, no charset detection. An empty
-/// head proves nothing and answers `false`; without that guard `classify`
-/// would call it valid UTF-8 (the byte loop never runs, `from_utf8(b"")`
-/// succeeds) and every zero-size procfs file would become `text/plain`.
+/// An empty head proves nothing and answers `false`; without that guard
+/// `classify` would call it valid UTF-8 and every zero-size procfs file
+/// would become `text/plain`.
 pub fn looks_like_text(head: &[u8]) -> bool {
     !head.is_empty() && matches!(classify(head, true), TextClass::Utf8 | TextClass::Bom(_))
 }
@@ -118,11 +115,8 @@ pub fn looks_like_text(head: &[u8]) -> bool {
 /// Accepts every class [`looks_like_text`] does and `Legacy` besides: by the
 /// time this runs, something has already decided the file is text — usually
 /// its extension, which is evidence the sniff does not have — so a
-/// windows-1252 `.txt` or a Shift-JIS `.csv` still decodes here.
-///
-/// Takes ownership so the dominant valid-UTF-8 case is a zero-copy move.
-/// `path` is used only to name the file in the error, matching the
-/// extractor error convention.
+/// windows-1252 `.txt` or a Shift-JIS `.csv` still decodes here. `path` is
+/// used only to name the file in the error.
 pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
     if bytes.is_empty() {
         return Ok(String::new());

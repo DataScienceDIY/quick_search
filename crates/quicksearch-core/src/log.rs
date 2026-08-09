@@ -1,33 +1,21 @@
 //! The process log: every line that would go to the terminal, kept in
-//! memory so a windowed run can show it.
+//! memory so a windowed run — which on Windows has no console at all under
+//! the GUI subsystem — can show it.
 //!
-//! Launched from a desktop launcher — or on Windows, where the GUI binary is
-//! built for the window subsystem and has no console at all — the process has
-//! nowhere to print. The warnings the walker, indexer and watcher emit are
-//! exactly the ones a user needs when something looks wrong, and they were
-//! going nowhere.
-//!
-//! So background reporting goes through [`crate::log_info!`] and
-//! [`crate::log_warn!`]
-//! instead of `println!`/`eprintln!`: each writes the same line to stderr
-//! *and* appends it to a bounded ring the GUI's Logs tab reads. A terminal
-//! run looks exactly as it did; a windowed run gains the tab.
-//!
-//! Command output — search hits from `quicksearch-cli`, usage text, the
-//! errors a command exits with — is not logged. That is a program's answer to
-//! what it was asked, not a background event, and it belongs on stdout.
+//! Background reporting goes through [`crate::log_info!`] and
+//! [`crate::log_warn!`] instead of `println!`/`eprintln!`: each writes the
+//! same line to stderr *and* appends it to a bounded ring the GUI's Logs tab
+//! reads. Command output — search hits, usage text, the errors a command
+//! exits with — is a program's answer, not a background event, and is not
+//! logged.
 
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Lines retained before the oldest are dropped.
-///
-/// A run over a tree full of unreadable files can log per file, so this is
-/// bounded rather than complete: the newest few thousand lines are what
-/// diagnosing anything actually needs, and the ring holds the count it threw
-/// away so the tab can say so instead of quietly lying.
+/// Lines retained before the oldest are dropped. The ring holds the count it
+/// threw away so the tab can say so instead of quietly lying.
 pub const CAPACITY: usize = 5_000;
 
 /// How loud a line is. The GUI colors by this; stderr gets the `Warning:`
@@ -65,16 +53,13 @@ macro_rules! log_warn {
     };
 }
 
-/// Write `message` to stderr and to the ring.
-///
-/// Prefer the [`crate::log_info!`] / [`crate::log_warn!`] macros; this is what
-/// they call.
+/// Write `message` to stderr and to the ring. Prefer the macros; this is
+/// what they call.
 ///
 /// A failed stderr write is ignored rather than propagated: `eprintln!`
 /// *panics* when the handle is unwritable, which on a process launched
 /// without stdio would take down whichever background thread happened to
-/// report something. Losing the terminal copy is acceptable — that is
-/// precisely the case where the in-memory copy is the one that matters.
+/// report something.
 pub fn record(level: Level, message: String) {
     let text = match level {
         Level::Warn => format!("Warning: {}", message),
@@ -86,21 +71,12 @@ pub fn record(level: Level, message: String) {
 
 /// A cap on how many times one *kind* of warning is allowed to speak.
 ///
-/// Some failures are per-file and arrive in the thousands: a directory tree the
-/// user cannot read, or — the case that motivated this — a Windows machine where
-/// `ERROR_SHARING_VIOLATION` from a file some other process holds open is
-/// routine and has no Unix equivalent. Logging each one costs a global mutex and
-/// an unbuffered stderr write on the walk's hottest path, and it evicts the
-/// [`CAPACITY`]-line ring so thoroughly that the warnings worth reading are gone
-/// before the run ends.
-///
-/// So the first few speak and the rest are counted. The count is the part that
-/// actually informs: "3 files could not be hashed" and "31,402 files could not
-/// be hashed" call for very different responses, and neither is legible as a
-/// wall of identical lines.
-///
-/// Declared as a `static` next to the call site it guards, and reset by whoever
-/// owns the run, so the numbers describe one run rather than the process.
+/// Some failures are per-file and arrive in the thousands — on Windows,
+/// `ERROR_SHARING_VIOLATION` from a file another process holds open is
+/// routine and has no Unix equivalent. Logging each one costs a global mutex
+/// and an unbuffered stderr write on the walk's hottest path, and evicts the
+/// ring's warnings worth reading. So the first few speak and the rest are
+/// counted; reset by whoever owns the run, so the numbers describe one run.
 pub struct Throttle {
     limit: u64,
     seen: std::sync::atomic::AtomicU64,
@@ -160,10 +136,9 @@ static LOG: LazyLock<Mutex<Ring>> = LazyLock::new(|| Mutex::new(Ring::new(CAPACI
 
 /// Logging must not turn one panic into a cascade of them: a thread that
 /// died mid-push would otherwise poison the lock and take down every later
-/// logger. The ring is a `VecDeque` of owned strings, so the worst a poisoned
-/// guard can hold is a line that was half-added.
+/// logger. The worst a poisoned guard can hold is a half-added line.
 fn lock() -> MutexGuard<'static, Ring> {
-    LOG.lock().unwrap_or_else(|e| e.into_inner())
+    crate::lock_ok(&LOG)
 }
 
 /// The bounded line buffer. Split from the global so it can be tested on its
@@ -204,16 +179,8 @@ impl Ring {
     }
 }
 
-/// Seconds since the Unix epoch.
-///
-/// Lives here because this is the lowest-level module in the crate and every
-/// layer above it wanted the same four lines — log lines, the `last_full_index`
-/// stamp, `schema_info.created_at`, failure timestamps, and the GUI's
-/// "5 min ago".
-///
-/// A clock set before 1970 yields `0` rather than an error. Every caller is
-/// stamping a record or measuring an age, and none has anything better to do
-/// with a failure than what `0` already does: read as "very long ago".
+/// Seconds since the Unix epoch. A clock set before 1970 yields `0`, which
+/// every caller already reads as "very long ago".
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

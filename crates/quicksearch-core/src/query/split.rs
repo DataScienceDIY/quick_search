@@ -287,8 +287,6 @@ mod tests {
         assert_eq!(q.term, "alpha AND beta OR gamma");
     }
 
-    /// The end-to-end shape of the bug: before the lexer fix this produced
-    /// the filter `parent = "C"` plus a junk term, and returned nothing.
     #[test]
     fn a_windows_drive_path_reaches_the_filter_intact() {
         let q = split_for_cascade(r"path:C:\Users\me\docs").unwrap();

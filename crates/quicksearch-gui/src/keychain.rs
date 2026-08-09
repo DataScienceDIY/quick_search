@@ -33,13 +33,9 @@ pub fn load_key(db_path: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Forget the remembered key. An entry that never existed is a fine outcome
-/// for "forget" and reports success.
-///
-/// A real failure is not: the derived SQLCipher key is still sitting in the
-/// OS keychain, so a caller that goes on to record "not remembered" would be
-/// describing a machine state that isn't true. Callers surface this rather
-/// than assuming the key is gone.
+/// Forget the remembered key; an entry that never existed reports success.
+/// A real failure means the key is still on the keychain, and callers must
+/// surface that rather than record "not remembered".
 pub fn delete_key(db_path: &str) -> Result<(), String> {
     match entry(db_path)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),

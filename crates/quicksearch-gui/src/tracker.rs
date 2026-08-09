@@ -1,26 +1,19 @@
 //! Indexing-rate estimation for the status displays.
 //!
-//! The rate shown is a rolling [`WINDOW`] average, not a run average: what
-//! matters while watching a run is what it is doing *now*, and a run that
-//! spent its first minute on a fast SSD root drags a whole-run mean far
-//! above the rate the slow root it is on is actually achieving.
-//!
-//! The tracker records a point only when the counter *changes*, prunes
-//! points older than the window but never below two (so a rate slower than
-//! one file per window stays computable rather than measuring a genuine
-//! zero), and measures against `now` so the estimate decays during stalls
-//! instead of freezing at the last burst.
+//! The rate shown is a rolling [`WINDOW`] average, not a run average. The
+//! tracker records a point only when the counter *changes*, prunes points
+//! older than the window but never below two (so a rate slower than one
+//! file per window stays computable), and measures against `now` so the
+//! estimate decays during stalls instead of freezing at the last burst.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// The averaging window. Public so the display can name it and stay in
-/// sync with it.
+/// The averaging window; public so the display can name it.
 pub const WINDOW: Duration = Duration::from_secs(30);
 
 pub struct SpeedTracker {
-    /// (when, counter value) — appended only on counter change. A deque
-    /// because pruning drops from the front, which is O(n) on a `Vec`.
+    /// (when, counter value) — appended only on counter change.
     points: VecDeque<(Instant, usize)>,
 }
 
@@ -57,12 +50,9 @@ impl SpeedTracker {
     }
 
     /// Estimated files/sec over the last [`WINDOW`], measured from the
-    /// oldest retained progress point to *now*. `None` until two data
-    /// points exist.
-    ///
-    /// The span is shorter than the window early in a run, and longer than
-    /// it during a stall (nothing is recorded then, so nothing prunes and
-    /// the growing span decays the estimate toward zero).
+    /// oldest retained progress point to *now*; `None` until two data
+    /// points exist. During a stall nothing is recorded, so the growing
+    /// span decays the estimate toward zero.
     pub fn files_per_sec(&self) -> Option<f64> {
         self.files_per_sec_at(Instant::now())
     }
@@ -96,7 +86,7 @@ mod tests {
 
     #[test]
     fn slow_rate_is_measurable_not_zero() {
-        // One file every 2.5 s — the old 1 s window reported 0.0 here.
+        // One file every 2.5 s.
         let mut t = SpeedTracker::new();
         let base = Instant::now();
         for i in 0..4 {

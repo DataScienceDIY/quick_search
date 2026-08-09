@@ -1,0 +1,397 @@
+//! Building one file's index record: classification against stored rows,
+//! hashing, MIME sniffing, and the inline-content decision.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+use std::time::UNIX_EPOCH;
+
+use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+
+use super::paths::{inode_and_device, parent_str};
+use super::*;
+use crate::config::Config;
+use crate::db::repo::{self, NewFile};
+use crate::extract::Registry;
+use crate::mime::{guess_mime_from_head, mime_to_type, FileType};
+
+/// One directory's indexed files, as `name -> mtime`. Produced by
+/// [`crate::db::repo::dir_rows`].
+pub type DirRows = HashMap<String, u64>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileIndexAction {
+    Skip,
+    Update,
+    Insert,
+}
+
+/// Decide what Phase 1 should do with a file, given its name within the
+/// directory being walked and the file's mtime.
+///
+/// A file whose parent is *not* this directory — a resolved symlink target —
+/// must not be classified here: it would miss, read as
+/// [`FileIndexAction::Insert`], and `insert_file`'s `INSERT OR IGNORE` would
+/// then silently not update it. Use [`classify_by_mtime`] for those.
+pub fn classify_for_indexing(name: &str, mtime: u64, rows: &DirRows) -> FileIndexAction {
+    classify_by_mtime(rows.get(name).copied(), mtime)
+}
+
+/// The same decision from an already-resolved stored mtime; used directly for
+/// resolved symlink targets.
+pub fn classify_by_mtime(stored: Option<u64>, mtime: u64) -> FileIndexAction {
+    match stored {
+        Some(known) if known == mtime => FileIndexAction::Skip,
+        Some(_) => FileIndexAction::Update,
+        None => FileIndexAction::Insert,
+    }
+}
+
+/// Truncate to at most `max_bytes` bytes, backing up to a UTF-8 character
+/// boundary. Cuts short of the budget rather than over it.
+fn safe_truncate_string(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    s[..end].to_string()
+}
+
+/// Identify a file as `sha256(size || first hash_length bytes)`, returning
+/// the head bytes alongside the digest so the caller can sniff a MIME type
+/// without opening the file again.
+///
+/// The cost is a collision class: two files of identical size whose first
+/// `hash_length` bytes match hash identically — pre-allocated VM disk images
+/// (fixed-size VHDs keep their unique footer at the *end*; fresh raw/qcow2
+/// images are zeros at the head) are reported as duplicates when they are
+/// not. Duplicate listing is advisory, so this is a display artifact.
+pub(super) fn get_file_hash(
+    size: u64,
+    path: &Path,
+    hash_length: usize,
+) -> Result<(Vec<u8>, Vec<u8>), std::io::Error> {
+    let mut f: File = File::open(path)?;
+    // Files shorter than the window hash whole; `min` keeps the cast sound
+    // for large files on 32-bit targets.
+    let mut head = vec![0u8; size.min(hash_length as u64) as usize];
+    f.read_exact(&mut head)?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(size.to_le_bytes());
+    hasher.update(&head);
+    Ok((hasher.finalize().to_vec(), head))
+}
+
+/// Nudge FTS5 to merge its index segments. Best-effort; failure is logged
+/// and swallowed.
+pub fn fts_finalize_after_text_indexing(conn: &Connection) {
+    if let Err(e) = conn.execute(
+        "INSERT INTO searchabletext(searchabletext, rank) VALUES('automerge', 8)",
+        [],
+    ) {
+        crate::log_warn!("FTS automerge failed (non-fatal): {}", e);
+    }
+}
+
+/// An owned, fully-derived file record: everything needed to insert or
+/// update a `files` row, produced by [`prepare_file_record`].
+#[derive(Debug, Clone)]
+pub struct OwnedNewFile {
+    pub name: String,
+    pub path: String,
+    pub parent: String,
+    pub size: u64,
+    pub mtime: u64,
+    pub inode: Option<u64>,
+    pub device_id: Option<u64>,
+    pub mime: Option<String>,
+    pub ftype: FileType,
+    /// `None` only for a dehydrated cloud placeholder. Stored as SQL NULL,
+    /// which keeps such files out of duplicate detection: an empty or zero
+    /// hash would make every one of them look identical.
+    pub hash: Option<Vec<u8>>,
+    /// Text extracted from the head bytes during the walk, for files small
+    /// enough that the head *was* the whole file. `Some` means the content
+    /// pass never has to open this file; `None` leaves it pending.
+    pub inline_text: Option<String>,
+    /// Whether the content pass has anything to do for this file — see
+    /// [`content_extractable`], plus the `maximum_text_file_size` gate.
+    /// `false` means the row is born `STATE_NA`.
+    pub needs_content: bool,
+}
+
+impl OwnedNewFile {
+    pub fn as_new_file(&self) -> NewFile<'_> {
+        NewFile {
+            name: &self.name,
+            path: &self.path,
+            parent: &self.parent,
+            size: self.size,
+            mtime: self.mtime,
+            inode: self.inode,
+            device_id: self.device_id,
+            mime: self.mime.as_deref(),
+            ftype: self.ftype,
+            hash: self.hash.as_deref(),
+            needs_content: self.needs_content,
+        }
+    }
+}
+
+/// Individual "cannot hash" warnings allowed per run before only the count is
+/// kept. See [`crate::log::Throttle`]; [`reset_run_warnings`] arms it.
+static HASH_FAILURES: crate::log::Throttle = crate::log::Throttle::new(20);
+
+/// Arm the per-run warning throttles; called once at the start of an
+/// indexing run.
+pub fn reset_run_warnings() {
+    HASH_FAILURES.reset();
+}
+
+/// How many files could not be hashed this run, and how many of those went
+/// unlogged. `(0, 0)` when nothing failed.
+pub fn hash_failure_counts() -> (u64, u64) {
+    (HASH_FAILURES.seen(), HASH_FAILURES.suppressed())
+}
+
+/// Build the `files` row for one on-disk file from a `stat` the caller
+/// already holds. The single implementation behind both full-run batches
+/// and incremental watcher updates.
+///
+/// `path` must already be canonical and in `files.path` spelling (see
+/// [`path_to_db_string`]), and must still name the file once parsed back into
+/// a [`Path`] — this opens it by that string. A path that only survived
+/// `to_string_lossy` does not qualify; callers holding the original [`Path`]
+/// screen it with [`warn_if_unrepresentable`] first. Callers holding an
+/// unresolved path want [`prepare_file_record_from_path`] instead.
+///
+/// Returns `None` for anything that isn't a readable regular file, with a
+/// warning when hashing fails.
+pub fn prepare_file_record(
+    path: &str,
+    meta: &std::fs::Metadata,
+    config: &Config,
+    registry: &Registry,
+) -> Option<OwnedNewFile> {
+    if !meta.is_file() {
+        return None;
+    }
+
+    let size = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())?;
+
+    // A dehydrated cloud file is indexed from its metadata alone: reading even
+    // the first byte would block on downloading the whole file, so no hash, no
+    // MIME sniff, no inline extraction. Hydration does not change the mtime,
+    // so a later run picks it up once the attribute clears.
+    let dehydrated = crate::platform::is_cloud_placeholder(meta);
+
+    let (hash, head) = if dehydrated {
+        (None, Vec::new())
+    } else {
+        match get_file_hash(size, Path::new(path), config.processing.hash_length) {
+            Ok((hash, head)) => (Some(hash), head),
+            Err(e) => {
+                // Throttled: on Windows a file another process holds open
+                // fails here as a matter of course.
+                if HASH_FAILURES.allow() {
+                    crate::log_warn!("Skipping file (cannot hash) {}: {}", path, e);
+                }
+                return None;
+            }
+        }
+    };
+
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())?;
+    let parent = parent_str(path);
+    let (inode, device_id) = inode_and_device(meta);
+    // Sniff from the bytes hashing already read; an empty head falls back to
+    // the extension.
+    let mime = guess_mime_from_head(Path::new(path), &head);
+    let ftype = mime.as_deref().map(mime_to_type).unwrap_or(FileType::EMPTY);
+
+    let needs_content = !dehydrated
+        && size <= config.processing.maximum_text_file_size
+        && content_extractable(Path::new(path), mime.as_deref(), config, registry);
+
+    // When the head is the whole file, an extractor that works from bytes can
+    // finish the job now; any condition that does not hold leaves this `None`
+    // and the file stays pending.
+    let inline_text = mime.as_deref().filter(|_| needs_content).and_then(|m| {
+        // Size 0 is excluded: procfs, sysfs and some FUSE mounts report it
+        // for files that do have content, and inlining would store empty
+        // text for them.
+        if size == 0 || size > config.processing.hash_length as u64 {
+            return None;
+        }
+        match registry.extract_complete_head(Path::new(path), m, &head) {
+            Some(Ok(content)) => {
+                let mut text = content.text;
+                if text.len() > config.processing.maximum_text_size {
+                    text = safe_truncate_string(&text, config.processing.maximum_text_size);
+                }
+                Some(text)
+            }
+            // Recording a failure needs a file id the walk does not have;
+            // leaving it pending keeps failure reporting in one place.
+            Some(Err(_)) | None => None,
+        }
+    });
+
+    Some(OwnedNewFile {
+        name,
+        path: path.to_string(),
+        parent,
+        size,
+        mtime,
+        inode,
+        device_id,
+        mime,
+        ftype,
+        hash,
+        inline_text,
+        needs_content,
+    })
+}
+
+/// [`prepare_file_record`] for a path that has not been resolved yet — the
+/// watcher path.
+pub fn prepare_file_record_from_path(
+    path: &Path,
+    config: &Config,
+    registry: &Registry,
+) -> Option<OwnedNewFile> {
+    let canonical = path.canonicalize().ok()?;
+    if warn_if_unrepresentable(&canonical) {
+        return None;
+    }
+    let db_path = path_to_db_string(&canonical);
+    let meta = std::fs::metadata(&canonical).ok()?;
+    prepare_file_record(&db_path, &meta, config, registry)
+}
+
+/// Extract content for one file and record the outcome on its row: text +
+/// properties on success, `NA` when no extractor applies or the
+/// `content_extensions` filter excludes it, `FAILED` with a reason on
+/// extractor errors. The single implementation behind the full text-index
+/// pass and incremental updates.
+///
+/// `mime` is authoritative, including when it is `None`: the head was already
+/// sniffed by [`prepare_file_record`], and re-sniffing gives the same answer.
+pub fn extract_and_store(
+    tx: &rusqlite::Transaction<'_>,
+    file_id: i64,
+    name: &str,
+    path: &str,
+    mime: Option<&str>,
+    registry: &Registry,
+    config: &Config,
+) -> Result<(), String> {
+    let outcome = decide_content(path, mime, registry, config);
+    store_content_outcome(tx, file_id, name, &outcome, config)
+}
+
+/// What should be written for one file's content, decided without touching
+/// the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentOutcome {
+    /// Text (already truncated to `maximum_text_size`) and sorted properties.
+    Done {
+        text: String,
+        properties: Vec<(String, String)>,
+    },
+    /// No extractor claims the MIME, or `content_extensions` excludes it.
+    NotApplicable,
+    /// The extractor ran and failed; the reason goes on the row.
+    Failed(String),
+}
+
+/// Whether extraction will produce anything for this file: the
+/// `content_extensions` filter allows it, and some extractor claims its MIME.
+///
+/// The single predicate behind both the `content_state` a row is born with
+/// and [`decide_content`]'s not-applicable early-out: if they disagreed, a
+/// file the walk wrote off as NA would silently never be full-text indexed.
+/// Size-free — the `maximum_text_file_size` gate lives in the feeder's query.
+pub fn content_extractable(
+    path: &Path,
+    mime: Option<&str>,
+    config: &Config,
+    registry: &Registry,
+) -> bool {
+    crate::config::content_allowed(path, config) && mime.is_some_and(|m| registry.supports(m))
+}
+
+/// Read `path` and decide what its content row should say. No database access,
+/// no locks held — this is the expensive half.
+///
+/// `mime` is authoritative, including when it is `None`: see
+/// [`extract_and_store`].
+pub fn decide_content(
+    path: &str,
+    mime: Option<&str>,
+    registry: &Registry,
+    config: &Config,
+) -> ContentOutcome {
+    let p = Path::new(path);
+    if !content_extractable(p, mime, config, registry) {
+        return ContentOutcome::NotApplicable;
+    }
+    // `content_extractable` established that an extractor claims this MIME,
+    // so the `Ok(None)` arm below is unreachable.
+    let result = match mime {
+        Some(m) => registry.extract(p, m),
+        None => Ok(None),
+    };
+    match result {
+        Ok(Some(mut content)) => {
+            if content.text.len() > config.processing.maximum_text_size {
+                content.text =
+                    safe_truncate_string(&content.text, config.processing.maximum_text_size);
+            }
+            ContentOutcome::Done {
+                properties: content.properties_sorted(),
+                text: content.text,
+            }
+        }
+        Ok(None) => ContentOutcome::NotApplicable,
+        Err(reason) => ContentOutcome::Failed(reason),
+    }
+}
+
+/// Apply a decision from [`decide_content`]. The cheap half: pure database
+/// writes, so this is all that runs with the connection held.
+pub fn store_content_outcome(
+    tx: &rusqlite::Transaction<'_>,
+    file_id: i64,
+    name: &str,
+    outcome: &ContentOutcome,
+    config: &Config,
+) -> Result<(), String> {
+    match outcome {
+        ContentOutcome::Done { text, properties } => repo::set_content_done(
+            tx,
+            file_id,
+            name,
+            text,
+            properties,
+            config.processing.store_text_for_snippets,
+        ),
+        ContentOutcome::NotApplicable => repo::set_content_na(tx, file_id),
+        ContentOutcome::Failed(reason) => repo::set_content_failed(tx, file_id, reason),
+    }
+}

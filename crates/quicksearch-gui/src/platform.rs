@@ -8,12 +8,8 @@ use std::process::Command;
 /// A window-subsystem binary launched from Explorer has NULL standard handles,
 /// and `println!`/`eprintln!` *panic* when the write fails rather than
 /// dropping the output. Pointing the handles at `NUL` makes those writes
-/// succeed and go nowhere.
-///
-/// Background reporting no longer depends on this — it goes through
-/// [`quicksearch_core::log`], which ignores a failed stderr write and keeps
-/// the line for the Logs tab — but the remaining direct prints (a startup
-/// failure, a panic message) still reach a handle that accepts them.
+/// succeed and go nowhere. Direct prints (a startup failure, a panic
+/// message) still need a handle that accepts them.
 ///
 /// Handles inherited from a real console are left alone, so running the binary
 /// from a shell still prints normally.
@@ -31,8 +27,8 @@ pub fn redirect_null_stdio() {
             continue;
         }
         if let Ok(file) = std::fs::OpenOptions::new().write(true).open("NUL") {
-            // Deliberately leaked: the handle has to outlive every later
-            // write, which means the whole process.
+            // Leaked: the handle must outlive every later write, i.e. the
+            // whole process.
             unsafe { SetStdHandle(id, file.into_raw_handle() as _) };
         }
     }

@@ -61,8 +61,6 @@ impl Seeder {
     }
 }
 
-/// Run the cascade synchronously, collecting every batch. Returns
-/// (flattened hits in emission order, outcome).
 /// Run a search and return its hits in rank order.
 ///
 /// The cascade streams batches *while* each pass scans, so arrival order is
