@@ -48,6 +48,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use quicksearch_core::testutil::{mib, size_class};
 
 /// Default gap between samples. One `status` plus one `smaps_rollup` read per
 /// sample, both small; the interval is set by how fine the timeline should be
@@ -325,18 +326,6 @@ fn parse_map_header(line: &str) -> Option<Region> {
     })
 }
 
-/// Power-of-two bucket, so mappings group by what allocated them rather than
-/// by their exact size.
-fn size_class(bytes: u64) -> String {
-    let mib = bytes as f64 / (1024.0 * 1024.0);
-    if mib < 1.0 {
-        "< 1 MiB".to_string()
-    } else {
-        let bucket = 1u64 << (63 - (bytes / (1024 * 1024)).leading_zeros() as u64);
-        format!("~{} MiB", bucket)
-    }
-}
-
 fn report(samples: &[Sample], at_end: &Breakdown, interval: Duration) {
     if samples.len() > 1 {
         // One line per 5% of the run, so the shape is visible at any duration.
@@ -435,8 +424,4 @@ fn range_line(label: &str, samples: &[Sample], get: fn(&Sample) -> u64, note: &s
     } else {
         eprintln!("  {:<16} {:>10}   {}{}", label, mib(last), note, spread);
     }
-}
-
-fn mib(bytes: u64) -> String {
-    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }

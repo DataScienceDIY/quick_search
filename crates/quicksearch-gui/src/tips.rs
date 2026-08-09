@@ -1,17 +1,8 @@
-//! Plain-language tooltips for the configuration controls.
-//!
-//! Every setting in the Options window, and every configuration control on
-//! the Manage Index tab, explains itself on hover: what it does in ordinary
-//! words first, then what changing it costs, then concrete values and when
-//! someone would pick them. The text lives here rather than inline so the
-//! layout code stays readable and the wording can be checked on its own.
-//!
-//! Written for someone who does not know what a tokenizer or a write-ahead
-//! log is, and should not have to.
+//! Plain-language tooltips for the configuration controls: every setting in
+//! the Options window, and every configuration control on the Manage Index
+//! tab, explains itself on hover.
 
-/// How wide a tooltip may get. Matches `manage_tab::db_size_tooltip`: wide
-/// enough that a sentence is not shredded into three lines, narrow enough
-/// that the eye finds the next line.
+/// How wide a tooltip may get; matches `manage_tab::db_size_tooltip`.
 const TIP_WIDTH: f32 = 420.0;
 
 /// One control's tooltip.
@@ -24,8 +15,7 @@ pub struct Tip {
     /// Empty where a setting has nothing to weigh up.
     pub examples: &'static [&'static str],
     /// A consequence worth seeing before the click, rendered small and
-    /// orange. Reserved for rebuilds and deletions, so that it keeps
-    /// meaning something.
+    /// orange. Reserved for rebuilds and deletions.
     pub caution: Option<&'static str>,
 }
 
@@ -51,7 +41,7 @@ impl Tip {
         if let Some(caution) = self.caution {
             ui.add_space(4.0);
             let caution_color = crate::color::palette(ui.visuals().dark_mode).orange;
-            ui.label(egui::RichText::new(caution).small().color(caution_color));
+            ui.label(crate::ui_util::hint_colored(caution, caution_color));
         }
     }
 }
@@ -72,9 +62,6 @@ impl Tipped for egui::Response {
 
 /// One row of a two-column settings grid: the label and the control share a
 /// tooltip, so hovering the name works as well as hovering the widget.
-///
-/// Taking the tip by value rather than as an option is deliberate: a row
-/// added later cannot forget to explain itself.
 pub fn tip_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -642,8 +629,7 @@ mod tests {
         text
     }
 
-    /// House style, and the one rule that is easy to break by pasting from
-    /// the source comments: these tooltips use no em-dashes.
+    /// House style: these tooltips use no em-dashes.
     #[test]
     fn no_tip_uses_an_em_dash() {
         for tip in ALL {
@@ -700,7 +686,7 @@ mod tests {
         }
     }
 
-    /// Descriptive, but a tooltip nobody reads to the end helps nobody.
+    /// A tooltip nobody reads to the end helps nobody.
     #[test]
     fn no_tip_is_a_wall_of_text() {
         for tip in ALL {
@@ -754,10 +740,8 @@ mod tests {
         );
     }
 
-    /// A greyed-out control still explains itself. egui shows nothing on a
-    /// disabled widget unless the *disabled* tooltip is set too, and "why
-    /// can I not click this" is exactly when the answer is wanted: Stop,
-    /// Start indexing now and Return to Automatic are greyed out by turns.
+    /// A greyed-out control still explains itself: egui shows nothing on a
+    /// disabled widget unless the *disabled* tooltip is set too.
     #[test]
     fn a_disabled_control_still_explains_itself() {
         let ctx = egui::Context::default();

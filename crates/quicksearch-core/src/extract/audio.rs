@@ -27,7 +27,6 @@ impl Extractor for AudioExtractor {
 
         let mut out = ExtractedContent::default();
 
-        // Duration in seconds.
         let duration_secs = tagged.properties().duration().as_secs();
         if duration_secs > 0 {
             out.properties

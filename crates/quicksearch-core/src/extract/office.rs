@@ -42,9 +42,7 @@ fn mime_to_ext(mime: &str) -> Option<&'static str> {
     }
 }
 
-// ---------------------------------------------------------------------------
 // The shared XML text walk
-// ---------------------------------------------------------------------------
 
 /// Which elements of a format's XML carry text, and where paragraphs end.
 ///
@@ -92,7 +90,7 @@ const ODF_SHEET: TextSpec = TextSpec {
 ///
 /// `in_text` is a flag rather than a depth count, which means a closing
 /// `</text:span>` ends the run even though its enclosing `<text:p>` is still
-/// open. That is how every one of the six extractors this replaces behaved.
+/// open.
 fn collect_xml_text(xml: &str, spec: &TextSpec, out: &mut String) -> Result<(), Box<dyn Error>> {
     let mut reader = Reader::from_str(xml);
     reader.trim_text(true);
@@ -122,11 +120,8 @@ fn collect_xml_text(xml: &str, spec: &TextSpec, out: &mut String) -> Result<(), 
                 }
             }
             Ok(Event::Eof) => break,
-            // Propagated rather than ignored. Five of the six loops this
-            // replaces had no error arm at all, so a malformed member sent
-            // them round the loop on an error the reader kept re-reporting
-            // without advancing — a hang on a file the user merely happened
-            // to have on disk.
+            // Propagated rather than ignored: the reader re-reports the same
+            // error without advancing, so ignoring it is a hang.
             Err(e) => return Err(format!("Error parsing XML: {}", e).into()),
             _ => {}
         }
@@ -135,9 +130,7 @@ fn collect_xml_text(xml: &str, spec: &TextSpec, out: &mut String) -> Result<(), 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
 // Container access
-// ---------------------------------------------------------------------------
 
 type Archive = ZipArchive<BufReader<File>>;
 
@@ -145,15 +138,35 @@ fn open_container(path: &Path) -> Result<Archive, Box<dyn Error>> {
     Ok(ZipArchive::new(BufReader::new(File::open(path)?))?)
 }
 
-/// One member's bytes as a string.
+/// Cap on one decompressed member, mirroring `ole::MAX_TEXT_BYTES`: the zip
+/// header declares sizes, but the deflate stream is what we actually read, so
+/// a tiny archive can inflate without bound.
+const MAX_XML_BYTES: usize = 64 * 1024 * 1024;
+
+/// One member's bytes as a string. An over-cap member keeps its prefix.
 fn member_text<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     name: &str,
 ) -> Result<String, Box<dyn Error>> {
-    let mut member = archive.by_name(name)?;
-    let mut body = String::new();
-    member.read_to_string(&mut body)?;
-    Ok(body)
+    let mut body = Vec::new();
+    archive
+        .by_name(name)?
+        .take(MAX_XML_BYTES as u64 + 1)
+        .read_to_end(&mut body)?;
+    let truncated = body.len() > MAX_XML_BYTES;
+    body.truncate(MAX_XML_BYTES);
+    match String::from_utf8(body) {
+        Ok(text) => Ok(text),
+        // Only a cut at the cap may split a character; invalid UTF-8 anywhere
+        // else still fails the extraction, as `read_to_string` always did.
+        Err(e) if truncated && e.utf8_error().valid_up_to() >= MAX_XML_BYTES - 3 => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            Ok(String::from_utf8(bytes)?)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Names of the `.xml` members under `prefix`, in archive order.
@@ -195,9 +208,7 @@ fn extract_pptx(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
 // XLSX: shared strings plus cells
-// ---------------------------------------------------------------------------
 
 /// The workbook's shared-string table, in index order. Absent or unreadable
 /// is not an error: a sheet of nothing but numbers has no table at all.
@@ -289,9 +300,7 @@ fn extract_xlsx(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(out)
 }
 
-// ---------------------------------------------------------------------------
 // Dispatch
-// ---------------------------------------------------------------------------
 
 /// Extract text from an office document, chosen by lowercase extension.
 ///
@@ -392,9 +401,7 @@ mod tests {
          <row><c t=\"s\"><v>1</v></c></row>\
          </sheetData></worksheet>";
 
-    // The golden set. These strings were recorded from the six hand-written
-    // extractors this module replaced, so they pin the rewrite to exactly
-    // what shipped rather than to what it ought to have produced.
+    // The golden set: pins the exact extraction shapes.
 
     #[test]
     fn docx() {
@@ -499,13 +506,9 @@ mod tests {
         assert_eq!(extract_document_text(&p, "xlsx").unwrap(), "only \n");
     }
 
-    /// Malformed XML is an error, not a hang. Five of the six extractors this
-    /// replaced had no error arm, so the reader re-reported the same failure
-    /// forever without advancing.
-    ///
-    /// An undefined entity inside a text run is the cheapest way to reach that
-    /// arm, and it is a real shape: a document written by a tool that emitted
-    /// HTML entities into OOXML.
+    /// Malformed XML is an error, not a hang. An undefined entity inside a
+    /// text run is the cheapest way to reach the error arm, and it is a real
+    /// shape: tools do emit HTML entities into OOXML.
     #[test]
     fn malformed_xml_returns_an_error_rather_than_looping() {
         for (ext, member, body) in [
@@ -538,8 +541,7 @@ mod tests {
         }
     }
 
-    /// Mismatched tags are caught too — quick_xml checks closing names, and
-    /// that error now reaches the caller instead of being swallowed.
+    /// Mismatched tags are caught too — quick_xml checks closing names.
     #[test]
     fn mismatched_tags_are_an_error() {
         let p = container(

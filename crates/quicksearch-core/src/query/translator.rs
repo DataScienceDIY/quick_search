@@ -54,9 +54,7 @@ pub fn quote_phrase(s: &str) -> String {
 }
 
 /// A structured-filter fragment over table alias `f`: SQL with anonymous
-/// `?` placeholders plus the values they bind. Anonymous placeholders
-/// compose by simple appending — the search cascade tacks fragments onto
-/// every stage's WHERE clause with `AND (...)`.
+/// `?` placeholders plus the values they bind.
 #[derive(Debug, Clone)]
 pub struct FilterFragment {
     pub sql: String,
@@ -84,8 +82,6 @@ pub fn is_filter_key(key: &str) -> bool {
 ///
 /// `glob` marks a value whose unquoted `*` should act as a wildcard — only
 /// `name:`/`filename:` honor it; every other key treats the star literally.
-/// The caller decides, because only the tokenizer knows whether the value
-/// was quoted (quoted stars are always literal).
 pub fn build_filter(
     key: &str,
     op: Op,
@@ -242,7 +238,6 @@ pub fn like_subtree_pattern(dir: &str) -> String {
 
 /// Parse a date string. Accepts `YYYY-MM-DD`. Returns unix seconds at 00:00 UTC.
 fn parse_date_to_unix(s: &str) -> Option<i64> {
-    // Minimal parser: split on '-' into y/m/d integers.
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 3 {
         return None;
@@ -259,7 +254,6 @@ fn parse_date_to_unix(s: &str) -> Option<i64> {
     if d < 1 || d > days_in_month(y, m) {
         return None;
     }
-    // Compute unix seconds using the days-since-epoch formula.
     Some(civil_to_unix(y, m as i64, d as i64))
 }
 
@@ -290,9 +284,6 @@ fn civil_to_unix(y: i64, m: i64, d: i64) -> i64 {
 mod tests {
     use super::*;
 
-    /// The filter builder is reached through `split_for_cascade`, which is
-    /// where these values come from in production; calling it directly here
-    /// keeps the tests about filter semantics rather than about tokenizing.
     fn frag(key: &str, op: Op, value: &str) -> FilterFragment {
         build_filter(key, op, value, false).expect("builds")
     }

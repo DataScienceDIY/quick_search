@@ -1,13 +1,11 @@
 //! Password → SQLCipher key derivation for the optional index encryption.
 //!
-//! The chain is deliberately small: `key = Argon2id(password, salt)`, used
-//! directly as the SQLCipher raw key. The salt is 16 random bytes generated
-//! once, at the moment a password is set, and stored as hex in the config
-//! file — it exists to make the derivation unique per install, not to be
-//! secret. Argon2id is what makes offline brute-force of the password
-//! expensive; SQLCipher's own KDF is bypassed (raw-key form) because we
-//! open a fresh connection per search request and cannot afford a KDF per
-//! open.
+//! The chain is small: `key = Argon2id(password, salt)`, used directly as
+//! the SQLCipher raw key. The salt is 16 random bytes generated once, when a
+//! password is set, and stored as hex in the config file — it exists to make
+//! the derivation unique per install, not to be secret. Argon2id is what
+//! makes offline brute-force expensive; SQLCipher's own KDF is bypassed
+//! (raw-key form) so the cost is paid once per unlock, not per connection.
 //!
 //! Callers own password hygiene: hold the raw password in a
 //! [`zeroize::Zeroizing`] buffer, call [`derive_key`], and drop the buffer

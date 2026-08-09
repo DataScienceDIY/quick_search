@@ -81,6 +81,7 @@ use std::time::{Duration, Instant};
 
 use quicksearch_core::config::Config;
 use quicksearch_core::indexing::{IndexingService, IndexingStatus, RootPhase};
+use quicksearch_core::testutil::{mib, size_class};
 
 /// Default RSS sampling interval. Cheap (one small `/proc` read), so this is
 /// set by how fine-grained the timeline should be rather than by overhead.
@@ -488,18 +489,6 @@ fn parse_map_header(line: &str) -> Option<String> {
     Some(format!("anon {}", size_class(hi.saturating_sub(lo))))
 }
 
-/// Power-of-two bucket, so mappings group by what allocated them rather
-/// than by their exact size.
-fn size_class(bytes: u64) -> String {
-    let mib = bytes as f64 / (1024.0 * 1024.0);
-    if mib < 1.0 {
-        "< 1 MiB".to_string()
-    } else {
-        let bucket = 1u64 << (63 - (bytes / (1024 * 1024)).leading_zeros() as u64);
-        format!("~{} MiB", bucket)
-    }
-}
-
 /// The kernel's peak RSS for this process, from `/proc/self/status`.
 fn vm_hwm() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -523,8 +512,4 @@ fn db_size(db: &Path) -> u64 {
         .filter_map(|s| std::fs::metadata(format!("{}{}", db.display(), s)).ok())
         .map(|m| m.len())
         .sum()
-}
-
-fn mib(bytes: u64) -> String {
-    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }

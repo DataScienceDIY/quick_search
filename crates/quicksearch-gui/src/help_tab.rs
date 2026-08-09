@@ -1,8 +1,5 @@
-//! The Help tab: a quickstart guide for first-time users.
-//!
-//! Everything technical — building, configuration, the complete query
-//! reference — deliberately stays in README.md; this page only has to get
-//! someone from a fresh install to useful search results.
+//! The Help tab: a quickstart guide for first-time users. The complete
+//! technical reference stays in README.md.
 
 pub fn ui(ui: &mut egui::Ui) {
     let scroll = egui::ScrollArea::vertical()
@@ -113,7 +110,7 @@ pub fn ui(ui: &mut egui::Ui) {
                 // The sentence is assembled from several widgets, so the
                 // spacing between them has to come from the text itself.
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let quiet = |text: &str| egui::RichText::new(text).small().weak();
+                let quiet = |text: &str| crate::ui_util::hint(text);
                 ui.label(quiet(
                     "Building from source, configuration, query structuring and more \
                      are covered in ",

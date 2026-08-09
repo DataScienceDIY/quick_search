@@ -1,18 +1,14 @@
 //! Wiring between the egui thread and the core services.
 //!
-//! All communication is non-blocking from the UI's point of view:
-//! searches stream over an mpsc receiver drained each frame, indexing
-//! state is polled, and the duplicates query runs on a throwaway worker
-//! thread. Core threads wake the UI through `ctx.request_repaint()` — every
-//! one of them, which is what makes polling enough: the frame that starts the
-//! UI's own cadence is the one the waking thread asks for.
+//! All communication is non-blocking from the UI's point of view: searches
+//! stream over an mpsc receiver drained each frame, indexing state is
+//! polled, and the duplicates query runs on a throwaway worker thread.
+//! Every core thread wakes the UI through `ctx.request_repaint()`, which is
+//! what makes polling enough.
 //!
-//! The duplicates scan is the *only* throwaway thread left here, and it fires
-//! on a user action rather than a timer. The status bar's file count used to
-//! spawn one every five seconds, each opening its own connection — a page
-//! cache and a fresh allocator arena per refresh, neither of which glibc gives
-//! back. It now rides on `IndexerState`, published by the coordinator off the
-//! connection it already holds.
+//! The duplicates scan is the only throwaway thread, and it fires on a user
+//! action, not a timer: a thread per refresh opens its own connection — a
+//! page cache and an allocator arena glibc never gives back.
 
 use std::sync::{mpsc, Arc};
 
@@ -30,11 +26,9 @@ pub struct Backend {
 
 impl Backend {
     pub fn start(config: &Config, ctx: egui::Context) -> Result<Backend, String> {
-        // The coordinator gets the same repaint hook the search worker does,
-        // and needs it for the same reason: eframe is reactive, and a run it
-        // schedules on its own — the periodic reindex a launch is already due —
-        // would otherwise sit unseen behind a settled window until the pointer
-        // moved. It calls this on the edge into work, not on a cadence.
+        // eframe is reactive: a run the coordinator schedules on its own
+        // would sit unseen behind a settled window until the pointer moved.
+        // It calls this on the edge into work, not on a cadence.
         let coord_ctx = ctx.clone();
         let coordinator = Arc::new(IndexCoordinator::start(
             config.clone(),
@@ -58,8 +52,9 @@ impl Backend {
         })
     }
 
-    pub fn search(&self) -> &SearchService {
-        self.search.as_ref().expect("search service alive")
+    /// `None` only after [`Backend::shutdown`], i.e. during teardown frames.
+    pub fn search(&self) -> Option<&SearchService> {
+        self.search.as_ref()
     }
 
     /// Kick off (or restart) the duplicates listing on a worker thread.

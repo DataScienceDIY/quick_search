@@ -5,12 +5,9 @@
 //! first registered extractor that accepts the MIME and runs it.
 //!
 //! Dispatch is by MIME only — a file with no detected type is recorded as
-//! "not applicable" rather than guessed at again here. Extensions that
-//! `mime_guess` misses or mistypes are corrected upstream instead, in
-//! [`crate::mime::guess_mime_from_head`], so there is one place where "what is
-//! this file" gets decided, and it is decided once: the walk sniffs the head it
-//! already read, stores the answer, and nothing downstream reopens the file to
-//! ask again.
+//! "not applicable" rather than guessed at again here. "What is this file"
+//! is decided once, upstream in [`crate::mime::guess_mime_from_head`];
+//! nothing downstream reopens the file to ask again.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -81,23 +78,16 @@ pub trait Extractor: Send + Sync {
     fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError>;
 
     /// Extract from bytes the caller already holds, when those bytes are the
-    /// file's *entire* contents.
-    ///
-    /// Indexing hashes the head of every new or changed file, so for anything
-    /// no larger than `hash_length` the whole file is already in memory by the
-    /// time the walk classifies it. An extractor that can work from that buffer
-    /// saves the content pass an open/read/close — several round trips per
-    /// file on a network share — and closes a consistency gap, because the
-    /// text then comes from the same `read` as the size, mtime and hash stored
-    /// alongside it.
+    /// file's *entire* contents. For anything no larger than `hash_length`
+    /// the whole file is already in memory at walk time, so working from the
+    /// buffer saves the content pass an open/read/close and keeps the text
+    /// consistent with the size, mtime and hash read alongside it.
     ///
     /// The default is `None`: "I need the file on disk." Formats that seek,
-    /// or that read a central directory at the end of the file, must keep it.
-    /// Returning `Some(Err(_))` is a real extraction failure, recorded like
-    /// any other; returning `None` simply defers to [`Extractor::extract`].
-    ///
-    /// `path` is passed only so failures name the same file the on-disk path
-    /// would — nothing here may open it.
+    /// or read a central directory at the end of the file, must keep it.
+    /// `Some(Err(_))` is a real extraction failure; `None` defers to
+    /// [`Extractor::extract`]. `path` is passed only so failures name the
+    /// file — nothing here may open it.
     fn extract_from_head(
         &self,
         _path: &Path,
@@ -125,9 +115,8 @@ impl Registry {
         self
     }
 
-    /// The extractor that claims `mime`, if any. The one place dispatch
-    /// happens, so every question about a MIME — "who handles it", "does
-    /// anyone handle it", "handle it from these bytes" — gets the same answer.
+    /// The extractor that claims `mime`, if any — the one place dispatch
+    /// happens.
     fn find(&self, mime: &str) -> Option<&dyn Extractor> {
         let lower = mime.to_ascii_lowercase();
         self.extractors
@@ -136,11 +125,8 @@ impl Registry {
             .map(|e| &**e)
     }
 
-    /// Whether any extractor claims `mime` — the same question
-    /// [`Registry::extract`] answers by returning `Ok(None)`, asked without
-    /// touching the file. This is what lets the walk decide a row's
-    /// `content_state` up front instead of queueing it for a worker that will
-    /// only mark it not-applicable (see
+    /// Whether any extractor claims `mime`, without touching the file — what
+    /// lets the walk decide a row's `content_state` up front (see
     /// [`crate::file_handling::content_extractable`]).
     pub fn supports(&self, mime: &str) -> bool {
         self.find(mime).is_some()
@@ -158,12 +144,9 @@ impl Registry {
     }
 
     /// [`Registry::extract`] for a file whose complete contents the caller
-    /// already holds. `Ok(None)` when no extractor claims the MIME, and
-    /// `None` when the one that does needs the file on disk after all —
-    /// both mean "leave this to the content pass".
-    ///
-    /// Dispatch stays here rather than at the call site so there is still
-    /// exactly one place that decides what an extractor sees for a given MIME.
+    /// already holds. `None` when no extractor claims the MIME or the one
+    /// that does needs the file on disk — both mean "leave this to the
+    /// content pass".
     pub fn extract_complete_head(
         &self,
         path: &Path,

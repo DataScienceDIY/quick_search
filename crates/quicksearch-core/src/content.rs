@@ -4,22 +4,10 @@
 //! a pool of worker threads produces finished work over a bounded channel, and
 //! the single writer drains it round-robin against every other root.
 //!
-//! That shape is the whole point. Extraction used to run *on* the writer
-//! thread, a batch of files at a time, with the database connection held for
-//! the duration — so one root reading a network share or a stack of large PDFs
-//! stopped every other root dead for as long as its batch took, and blocked
-//! the watcher's incremental writes with it. Roots are meant to be
-//! independent; walking already was, and this makes the rest of the pipeline
-//! match.
-//!
-//! The split within the pass mirrors the walk's too: **one feeder thread owns
-//! the only database connection**, paging through the root's pending rows,
-//! while N workers do nothing but filesystem work. A connection per worker
-//! would multiply SQLite's page cache by the pool size, which is exactly what
-//! [`crate::db::schema::PRAGMAS_WALK_READER`] exists to avoid.
-//!
-//! Deliberately std-only (`std::thread` + `std::sync::mpsc`), matching the
-//! house style of [`crate::walk`] and [`crate::watcher`].
+//! **One feeder thread owns the only database connection**, paging through
+//! the root's pending rows, while N workers do nothing but filesystem work. A
+//! connection per worker would multiply SQLite's page cache by the pool size
+//! (see [`crate::db::schema::PRAGMAS_WALK_READER`]).
 
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -33,17 +21,13 @@ use crate::walk::{try_recv_next, TryNext, WorkerStats};
 
 /// Finished rows waiting for the writer.
 ///
-/// Far shallower than the walk's 4096. An [`ExtractedRow`] carries up to
-/// `maximum_text_size` of extracted text — 256 KiB by default, some 32× a
-/// `WalkedFile` — so the walk's depth would put gigabytes in flight. At 32 the
-/// ceiling is ~8 MiB per root, plus whatever the workers hold mid-document.
+/// Far shallower than the walk's 4096: an [`ExtractedRow`] carries up to
+/// `maximum_text_size` of extracted text (256 KiB by default), so the walk's
+/// depth would put gigabytes in flight. At 32 the ceiling is ~8 MiB per root.
 const READY_CAP: usize = 32;
 
-/// Rows fetched but not yet claimed by a worker.
-///
-/// Small for the same reason [`crate::walk`] caps its prefetch: the feeder
-/// must not run arbitrarily far ahead of a pool that is bound by file I/O.
-/// These are only ids and paths, so the cost is the strings, not the text.
+/// Rows fetched but not yet claimed by a worker. Small so the feeder does not
+/// run arbitrarily far ahead of an I/O-bound pool; only ids and paths.
 const QUEUE_AHEAD: usize = 256;
 
 /// How many rows the feeder fetches per query. Large enough that a slow root
@@ -93,7 +77,7 @@ impl Shared {
     /// `None` only when the queue is empty *and* the feeder is finished — at
     /// that instant nobody is left who could add another row.
     fn take(&self) -> Option<Pending> {
-        let mut q = self.queue.lock().unwrap();
+        let mut q = crate::lock_ok(&self.queue);
         loop {
             if q.done {
                 return None;
@@ -108,14 +92,17 @@ impl Shared {
                 self.idle.notify_all();
                 return None;
             }
-            q = self.idle.wait(q).unwrap();
+            q = self
+                .idle
+                .wait(q)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
     /// Claim the right to fetch one page, or `None` once the pass is over.
     /// Parks while the queue is already [`QUEUE_AHEAD`] deep.
     fn take_feed_slot(&self) -> Option<()> {
-        let mut q = self.queue.lock().unwrap();
+        let mut q = crate::lock_ok(&self.queue);
         loop {
             if q.done || q.drained {
                 return None;
@@ -124,14 +111,17 @@ impl Shared {
                 q.feeding = true;
                 return Some(());
             }
-            q = self.idle.wait(q).unwrap();
+            q = self
+                .idle
+                .wait(q)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 
     /// Publish a page and clear the in-flight flag together, under one lock —
     /// the indivisibility [`Shared::take`]'s end-of-pass test relies on.
     fn finish_feed(&self, rows: Vec<Pending>, last_page: bool) {
-        let mut q = self.queue.lock().unwrap();
+        let mut q = crate::lock_ok(&self.queue);
         // Reversed: `take` pops from the back, and rows should reach workers
         // in id order so a partial run leaves a contiguous prefix done.
         q.rows.extend(rows.into_iter().rev());
@@ -143,7 +133,7 @@ impl Shared {
     }
 
     fn shutdown(&self) {
-        let mut q = self.queue.lock().unwrap();
+        let mut q = crate::lock_ok(&self.queue);
         q.done = true;
         q.drained = true;
         self.idle.notify_all();
@@ -167,17 +157,14 @@ impl ContentPass {
     }
 
     /// A cheap, cloneable handle for reading pool activity while the pass is
-    /// mutably borrowed by the writer loop. The sibling of
-    /// [`crate::walk::ParallelWalk::worker_stats`], and for the same reason:
-    /// once a root reaches extraction its walk pool is gone, so the progress
-    /// display has to read this one instead.
+    /// mutably borrowed by the writer loop; the sibling of
+    /// [`crate::walk::ParallelWalk::worker_stats`].
     pub fn worker_stats(&self) -> WorkerStats {
         self.stats.clone()
     }
 
-    /// Join the workers and report whether every one finished cleanly. Needed
-    /// for the same reason as [`crate::walk::ParallelWalk::finish`], which
-    /// states it.
+    /// Join the workers and report whether every one finished cleanly.
+    /// See [`crate::walk::ParallelWalk::finish`].
     pub fn finish(&mut self) -> bool {
         // Dropping the receiver first releases any worker parked in `send`.
         self.rx = None;
@@ -261,8 +248,8 @@ fn worker(
     stats: &WorkerStats,
 ) {
     while let Some(row) = shared.take() {
-        // Held for the whole of `decide_content` — reading and parsing a
-        // document is exactly the work the progress line is reporting.
+        // Held for the whole of `decide_content`; that is the work the
+        // progress line reports.
         let _busy = stats.enter();
         if should_abort(stop_flag, suspend_flag) {
             shared.shutdown();
@@ -283,10 +270,8 @@ fn worker(
 }
 
 /// Extract every pending row under `cursor`'s range, in parallel.
-///
-/// `workers` is the root's own count — the same value its walk uses, because
-/// extraction over a share is round-trip bound for the same reason walking is.
-/// Clamped to 1..=64.
+/// `workers` is the root's own count — the same value its walk uses —
+/// clamped to 1..=64.
 #[allow(clippy::too_many_arguments)]
 pub fn extract_content(
     db_path: &str,
@@ -325,9 +310,8 @@ pub fn extract_content(
             })
         })
         .collect();
-    // The workers must hold the only senders, or `try_recv` never reports the
-    // end of the pass. The feeder deliberately holds none: it produces rows to
-    // extract, not extracted rows.
+    // The workers must hold the only senders, or `try_recv` never reports
+    // the end of the pass.
     drop(tx);
 
     let feeder_handle = {
@@ -350,8 +334,6 @@ pub fn extract_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Only the tests sleep; the pass itself spawns through
-    // `platform::spawn_worker` and blocks on channels rather than polling.
     use std::thread;
 
     use crate::db::open_or_recreate;
@@ -447,9 +429,8 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    /// The pass is scoped by the cursor's path range, so a sibling root's rows
-    /// are never touched. (Moved here with the extraction itself: the scoping
-    /// is now the feeder's query, not the writer's.)
+    /// The pass is scoped by the cursor's path range, so a sibling root's
+    /// rows are never touched.
     #[test]
     fn the_pass_is_scoped_to_its_root_range() {
         let (tree, db) = seed("scope", &[("r1", 3), ("r2", 3)]);
@@ -585,10 +566,8 @@ mod tests {
         let stats = pass.worker_stats();
         assert_eq!(stats.total(), 4);
 
-        // Nothing is drained here, so the ready channel fills and every worker
-        // ends up parked mid-row inside `send` — busy by the definition the
-        // display uses, and there are more rows than the channel holds, so all
-        // four get there.
+        // Nothing is drained, so the channel fills and every worker parks
+        // mid-row inside `send` — busy by the display's definition.
         let mut peak = 0;
         for _ in 0..500 {
             peak = peak.max(stats.active());

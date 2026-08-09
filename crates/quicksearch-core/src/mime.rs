@@ -9,21 +9,14 @@
 //! indexed. Extensions in [`AMBIGUOUS_EXTENSIONS`] invert the order: content
 //! decides, and the extension's MIME is only a fallback.
 //!
-//! That last stage is the only one with no corroborating evidence behind it,
-//! so it demands the most from the bytes. Merely lacking NUL bytes does not
-//! qualify — protobuf and similar `0x80-0xFF` formats clear that bar and
-//! were being stored as mojibake full text. See [`crate::textenc`] for the
-//! measurements.
+//! The last stage has no corroborating evidence behind it, so it demands the
+//! most from the bytes: merely lacking NUL bytes does not qualify — protobuf
+//! and similar `0x80-0xFF` formats clear that bar. See [`crate::textenc`]
+//! for the measurements.
 //!
-//! [`mime_to_type`] then maps a MIME string to a [`FileType`] bitmask so a
+//! [`mime_to_type`] maps a MIME string to a [`FileType`] bitmask so a
 //! single file can belong to multiple categories (e.g. a `.docx` is
 //! Document|Text).
-//!
-//! The head bytes are always ones the caller already holds. Indexing reads
-//! the head of every new or changed file to hash it, and those are the same
-//! bytes `infer` and the text sniff want, so there is no path-based variant
-//! that goes back to disk for them — that was a second open/read/close per
-//! undetectable file.
 
 use std::path::Path;
 
@@ -84,23 +77,11 @@ impl std::ops::BitOrAssign for FileType {
 }
 
 /// Extensions whose MIME is pinned regardless of what `mime_guess` or the
-/// file's bytes say.
-///
-/// Consulted *before* everything else, because for these the table is not a
-/// fallback but a correction or a guarantee:
-///
-/// - `.bat` maps in `mime_guess` to `application/x-msdownload`, i.e. an
-///   executable, and a non-empty `mime_guess` answer would preempt the text
-///   sniff — so without this entry batch files are never content-indexed.
-///   (`.cmd` already resolves to `text/plain`; it is listed so the pair
-///   cannot drift.)
-/// - `.ps1`/`.psm1`/`.psd1`, `.inf` and `.url` are absent from `mime_guess`.
-///   The text sniff would usually catch them, but pinning them costs
-///   nothing and classifies them deterministically, whatever their head
-///   bytes happen to look like.
-///
-/// Platform-neutral on purpose: a `.ps1` copied to a Linux box should classify
-/// the same way.
+/// file's bytes say. `.bat` maps in `mime_guess` to
+/// `application/x-msdownload` — an executable — which would preempt the text
+/// sniff and leave batch files never content-indexed; the rest are absent
+/// from `mime_guess` and pinned so they classify deterministically.
+/// Platform-neutral: a `.ps1` copied to a Linux box classifies the same way.
 const EXTENSION_OVERRIDES: &[(&str, &str)] = &[
     ("bat", "text/plain"),
     ("cmd", "text/plain"),
@@ -111,16 +92,13 @@ const EXTENSION_OVERRIDES: &[(&str, &str)] = &[
     ("url", "text/plain"),
 ];
 
-/// Extensions `mime_guess` maps to a binary format that is, on a modern
-/// disk, at least as often a text file: `.ts`/`.mts` TypeScript vs MPEG
-/// transport stream, `.mod` go.mod vs `video/mpeg`, `.org` Org-mode vs
-/// Lotus Organizer, `.scm` Scheme vs Lotus ScreenCam, `.pot` gettext
-/// template vs PowerPoint template, `.vhd` VHDL source vs VirtualBox disk
-/// image.
-///
-/// For these the content decides: magic bytes first, then the text sniff,
-/// and only if both decline does `mime_guess`'s extension answer stand — so
-/// a real MPEG-TS recording still classifies as video.
+/// Extensions `mime_guess` maps to a binary format that is at least as often
+/// a text file: `.ts`/`.mts` TypeScript vs MPEG transport stream, `.mod`
+/// go.mod vs `video/mpeg`, `.org` Org-mode vs Lotus Organizer, `.scm` Scheme
+/// vs Lotus ScreenCam, `.pot` gettext template vs PowerPoint template,
+/// `.vhd` VHDL source vs VirtualBox disk image. For these the content
+/// decides; only if magic bytes and the text sniff both decline does
+/// `mime_guess`'s extension answer stand.
 const AMBIGUOUS_EXTENSIONS: &[&str] = &["mod", "mts", "org", "pot", "scm", "ts", "vhd"];
 
 /// Whether `path`'s extension is in [`AMBIGUOUS_EXTENSIONS`].
@@ -132,9 +110,7 @@ fn extension_is_ambiguous(path: &Path) -> bool {
         .is_some_and(|e| AMBIGUOUS_EXTENSIONS.contains(&e.as_str()))
 }
 
-/// Look up [`EXTENSION_OVERRIDES`] for `path`. Extension comparison is
-/// ASCII-case-insensitive, which matters more on Windows where `REPORT.BAT` is
-/// as common as the lowercase spelling.
+/// Look up [`EXTENSION_OVERRIDES`] for `path`, ASCII-case-insensitively.
 fn extension_override(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     EXTENSION_OVERRIDES
@@ -238,13 +214,11 @@ pub fn mime_to_type(mime: &str) -> FileType {
         | "vnd.oasis.opendocument.presentation" => {
             t |= FileType::DOCUMENT | FileType::PRESENTATION;
         }
-        // Outlook saved messages and compiled HTML help are documents; both
-        // are ordinary things to find in a Windows home directory.
+        // Outlook saved messages and compiled HTML help are documents.
         "vnd.ms-outlook" | "vnd.ms-htmlhelp" => {
             t |= FileType::DOCUMENT;
         }
-        // Archives. The Windows installer/cabinet formats are containers in
-        // exactly the same sense as the rest of this list.
+        // Archives, including the Windows installer/cabinet formats.
         "zip"
         | "x-tar"
         | "x-7z-compressed"
@@ -501,10 +475,9 @@ mod tests {
         assert!(mime_to_type("application/vnd.ms-htmlhelp").contains(FileType::DOCUMENT));
     }
 
-    /// Every extension fixed by this round of coverage work must reach the
-    /// plaintext extractor through real dispatch — `extract_complete_head`
-    /// rather than `supports` — so the svg/m3u/pls cases prove the
-    /// plaintext-first registration *order*, not just the MIME claim.
+    /// These extensions must reach the plaintext extractor through real
+    /// dispatch — `extract_complete_head` rather than `supports` — so the
+    /// svg/m3u/pls cases prove the plaintext-first registration *order*.
     #[test]
     fn newly_claimed_extensions_reach_the_plaintext_extractor() {
         use crate::extract::Registry;

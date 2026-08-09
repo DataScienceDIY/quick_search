@@ -1,12 +1,5 @@
-//! Process-global SQLCipher key.
-//!
-//! Exactly two processes ever open the index (the GUI and the one-shot
-//! terminal search), and each resolves the key once at startup — before any
-//! connection exists — then never changes it except when the GUI
-//! enables/disables protection (which tears down and rebuilds the index
-//! anyway). A set-once global therefore reaches all open sites, several of
-//! which only hold a `&str` path, without threading a parameter through
-//! every layer.
+//! Process-global SQLCipher key, resolved once at startup before any
+//! connection exists.
 
 use std::sync::RwLock;
 
@@ -28,9 +21,8 @@ pub(crate) fn process_key() -> Option<IndexKey> {
         .clone()
 }
 
-/// Hex form of the installed key, if any. Exists for exactly one consumer:
-/// the GUI's "remember on this device" toggle, which stores the derived
-/// key (never the password) in the OS keychain.
+/// Hex form of the installed key, if any; used by the GUI's keychain
+/// "remember" toggle, which stores the derived key — never the password.
 pub fn process_key_hex() -> Option<String> {
     PROCESS_KEY
         .read()

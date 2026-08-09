@@ -104,12 +104,9 @@ pub fn tokenize_spanned(input: &str) -> (Vec<(Token, std::ops::Range<usize>)>, O
                 }
             }
             b'"' => {
-                // Double-quoted phrase. Supports doubled-quote escape `""`.
-                //
-                // Copied as a UTF-8 slice, not byte by byte: `bytes[j] as char`
-                // decodes Latin-1, so `"José"` came back as `JosÃ©` and matched
-                // nothing. Quoting is also how people write paths containing
-                // spaces, which makes this the more visible of the two.
+                // Double-quoted phrase with doubled-quote escape `""`.
+                // Segments are copied as UTF-8 slices — `bytes[j] as char`
+                // would decode Latin-1 and mangle non-ASCII.
                 let mut j = i + 1;
                 let mut buf = String::new();
                 let mut segment_start = j;
@@ -144,10 +141,8 @@ pub fn tokenize_spanned(input: &str) -> (Vec<(Token, std::ops::Range<usize>)>, O
                 while i < bytes.len() {
                     let c = bytes[i];
                     if c == b':' && is_drive_letter_colon(bytes, start, i) {
-                        // `C:\Users\me` is one word, not `C` `:` `\Users\me`.
-                        // Without this, `path:C:\Users\me` parses as the
-                        // filter `path` = `C` and silently matches nothing —
-                        // the first thing a Windows user types.
+                        // `C:\Users\me` is one word; otherwise `path:C:\Users\me`
+                        // parses as the filter `path` = `C` and matches nothing.
                         i += 1;
                         continue;
                     }

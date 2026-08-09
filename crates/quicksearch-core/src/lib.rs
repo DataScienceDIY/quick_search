@@ -21,3 +21,12 @@ pub mod testutil;
 pub mod textenc;
 pub mod walk;
 pub mod watcher;
+
+/// Lock, ignoring poisoning. Every Mutex in this crate guards whole-value
+/// replacements, so a poisoned guard still holds the last fully-written
+/// value. A panic on a worker thread must not cascade into every thread
+/// that later takes the lock — `coordinator::state()` runs on the GUI's
+/// per-frame path.
+pub(crate) fn lock_ok<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}

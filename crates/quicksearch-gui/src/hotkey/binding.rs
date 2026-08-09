@@ -8,8 +8,8 @@
 //! Wayland portal. All three come out of [`KEYS`], so a key cannot be
 //! spelled correctly for one backend and wrongly for the other.
 //!
-//! The config text and the `global-hotkey` token are deliberately the same
-//! string: every token below is one `global-hotkey`'s parser accepts, which
+//! The config text and the `global-hotkey` token are the same string: every
+//! token below is one `global-hotkey`'s parser accepts, which
 //! [`tokens_are_parseable`](tests::tokens_are_parseable) holds it to.
 
 use std::fmt;
@@ -121,8 +121,8 @@ pub struct Binding {
     key: Key,
 }
 
-/// Why a string or a key press is not a usable shortcut. The wording is what
-/// the Options window shows, so it is written for the person who typed it.
+/// Why a string or a key press is not a usable shortcut; the wording is
+/// shown in the Options window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingError {
     Empty,
@@ -277,9 +277,7 @@ mod tests {
         assert_eq!(binding.portal_trigger(), "CTRL+SHIFT+f");
     }
 
-    /// Round-trips through the text that ends up in `config.toml`. Every row
-    /// has to survive it, since any of them can be captured in the Options
-    /// window and written out.
+    /// Every row round-trips through the text that ends up in `config.toml`.
     #[test]
     fn every_key_round_trips() {
         for (key, token, _) in KEYS {

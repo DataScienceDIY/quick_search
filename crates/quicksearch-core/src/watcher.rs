@@ -1,60 +1,34 @@
 //! Filesystem watcher with per-directory debouncing.
 //!
-//! Wraps the [`notify`] crate with a throttling pipeline patterned after
-//! ffb-server's `ingest::pipeline`: events are bucketed by directory, same-
-//! path events within a window are coalesced, and a tick loop flushes ready
-//! buckets. The caller provides an [`EventSink`] callback that applies
-//! emitted [`FsEvent`]s — typically to the QuickSearch database via the
-//! [`crate::db::repo`] helpers.
+//! Wraps [`notify`]: events bucket by directory, same-path events within a
+//! window coalesce, and a tick loop flushes ready buckets into the caller's
+//! [`EventSink`].
 //!
-//! # Two registration strategies
+//! # Two registration strategies ([`crate::platform::WATCH_ROOTS_RECURSIVELY`])
 //!
-//! Which one applies is [`crate::platform::WATCH_ROOTS_RECURSIVELY`].
-//!
-//! **Per directory (inotify).** inotify has no recursive watch: one watch
-//! descriptor covers exactly one directory's entries.
-//! `RecursiveMode::Recursive` is emulated inside `notify` by walking the tree
-//! and adding one watch per directory — with no way to skip subtrees. That
-//! spent descriptors on `.git`, `node_modules`, and hidden directories whose
-//! events the indexer then discarded, and exhausted
-//! `fs.inotify.max_user_watches` on large roots. So this module walks the
-//! roots itself through [`crate::file_handling::filtered_dirs`] — the same
-//! pruning the indexer uses — and registers each surviving directory
-//! `NonRecursive`. Taking over recursion means also registering directories
-//! created later, which [`register_tree`] does from the event loop.
+//! **Per directory (inotify).** inotify has no recursive watch, and
+//! `notify`'s emulation walks the tree adding one descriptor per directory
+//! with no way to skip subtrees — exhausting `fs.inotify.max_user_watches`
+//! on large roots. This module walks the roots itself through
+//! [`crate::file_handling::filtered_dirs`] and registers each surviving
+//! directory `NonRecursive`; owning recursion means also registering
+//! directories created later, which [`register_tree`] does from the event
+//! loop.
 //!
 //! **Per root (`ReadDirectoryChangesW`).** One handle covers the whole
-//! subtree, including directories created later, so the walk and the
-//! per-directory bookkeeping are skipped entirely. Registering per directory
-//! here would be actively harmful rather than merely wasteful: `notify`
-//! allocates a 16 KiB buffer inline per watch plus a directory handle, so a
-//! large tree would ask for gigabytes of buffers and tens of thousands of
-//! handles. The saving that pruning bought on inotify is unavailable — the
-//! events arrive whether or not we want them — so the same filters run on the
-//! event path instead, in [`is_event_interesting`].
+//! subtree, later directories included. Per-directory registration here would
+//! be actively harmful: `notify` allocates a 16 KiB buffer plus a directory
+//! handle per watch. Pruning cannot save events on this path — they arrive
+//! regardless — so the same filters run per event in
+//! [`is_event_interesting`].
 //!
 //! # The cap
 //!
-//! Registration stops at [`WatcherConfig::max_watched_dirs`] and reports
-//! [`WatchError::TooManyDirectories`]; a kernel refusal reports
-//! [`WatchError::KernelLimit`]. Both are all-or-nothing — the whole
-//! watcher fails and no root gets live updates, leaving the coordinator's
-//! periodic reindex as the only refresh path. Partial registration is
-//! worse than none, because a half-watched root looks live while going
-//! silently stale.
-//!
-//! Only those two are fatal. A single directory the kernel refuses for its
-//! own reasons — an unreadable folder, one deleted mid-walk — is logged and
-//! skipped: it costs its own events, not the tree's, and letting it abort
-//! registration would report that incidental failure as the reason live
-//! updates are off. See [`add_watch`].
-//!
-//! Neither limit is reachable under the per-root strategy, where the watch
-//! count is the number of configured roots.
-//!
-//! This module deliberately stays sync (std::thread + crossbeam-style
-//! channels via `std::sync::mpsc`) so it integrates cleanly with the
-//! existing indexer which is not async.
+//! Registration stops at [`WatcherConfig::max_watched_dirs`]
+//! ([`WatchError::TooManyDirectories`]); a kernel refusal is
+//! [`WatchError::KernelLimit`]. Both fail the whole watcher — a half-watched
+//! root looks live while going silently stale. A single directory the kernel
+//! refuses is logged and skipped instead (see [`add_watch`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -72,14 +46,12 @@ use crate::config::IgnoreSet;
 use crate::file_handling::{filtered_dirs, UnreadableDirs};
 use crate::platform::path_has_hidden_component_under;
 
-/// Directory budget for live updates. Past this, watching costs more than
-/// it returns: the kernel's per-user `max_user_watches` is a shared
-/// resource, and a tree this size is cheaper to rescan on a timer than to
-/// track. Roughly 1 KiB of unswappable kernel memory per watch.
+/// Directory budget for live updates; each inotify watch costs roughly 1 KiB
+/// of unswappable kernel memory out of the shared per-user
+/// `max_user_watches`.
 ///
-/// Applies only where watches are taken per directory. Under a per-root
-/// recursive watch the count is the number of configured roots, so the cap is
-/// unreachable by design rather than by generosity.
+/// Applies only where watches are taken per directory; under a per-root
+/// recursive watch the count is the number of configured roots.
 pub const DEFAULT_MAX_WATCHED_DIRS: usize = 128_000;
 
 /// An event surfaced to the caller after debouncing.
@@ -143,8 +115,7 @@ impl std::fmt::Display for WatchError {
                 f,
                 "the system watch limit was reached after {} directories{}",
                 registered,
-                // Only inotify has a tunable the user can actually raise;
-                // pointing a Windows user at a sysctl would be nonsense.
+                // Only inotify has a tunable the user can raise.
                 if cfg!(target_os = "linux") {
                     " (raise fs.inotify.max_user_watches to watch more)"
                 } else {
@@ -169,18 +140,11 @@ fn fmt_cap(cap: usize) -> String {
 
 /// Tuning for the whole filesystem-event pipeline: the watcher's own
 /// per-directory debounce, and the coordinator's queue on the far side of it.
-/// Both halves are debounce knobs on one path, so they live together and
-/// tests that want a fast pipeline shorten them in one place.
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
     /// How long the coordinator's queue must go quiet before it is applied.
-    ///
-    /// An `rm -rf` arrives as a burst; applying it in waves as it lands means
-    /// no wave sees the whole set to collapse against, and each pays its own
-    /// costs. Waiting for quiet trades a little latency for one pass over the
-    /// complete picture. Creates and modifies benefit too — the queue is
-    /// last-event-wins per path, so a build that rewrites the same files
-    /// repeatedly collapses for free.
+    /// An `rm -rf` arrives as a burst; waiting for quiet lets one pass see
+    /// the whole set to collapse against.
     pub pending_settle: Duration,
     /// Ceiling on how long [`WatcherConfig::pending_settle`] may hold the
     /// queue back. A steady trickle of changes never goes quiet, and must not
@@ -273,14 +237,9 @@ impl WatchRegistry {
     /// anyway keeps notify's internal descriptor map from growing across a long
     /// session of directory churn.
     fn remove_tree(&mut self, dir: &Path) -> usize {
-        // The scan below is O(watched dirs), and the event loop calls this for
-        // every Remove — files included. Deleting a directory of 10k files
-        // would otherwise cost 10k passes over a set capped at 128k entries.
-        //
-        // Exact, not a heuristic: registration always walks top-down (see
-        // `register_tree` and startup), so a watched directory beneath `dir`
-        // implies `dir` itself is watched. An unwatched `dir` therefore has no
-        // watched descendants and there is nothing to find.
+        // Exact, not a heuristic: registration walks top-down, so a watched
+        // directory beneath `dir` implies `dir` itself is watched. This early
+        // return keeps the O(watched dirs) scan off the per-file Remove path.
         if !self.dirs.contains(dir) {
             return 0;
         }
@@ -301,11 +260,7 @@ impl WatchRegistry {
 /// Register `dir` during startup, propagating only the budget limits.
 ///
 /// A directory the kernel refuses on its own terms — most often one the user
-/// cannot read, which the walk still hands us because its *parent* was
-/// readable — costs live updates that one directory, not the tree. Treating
-/// it as fatal used to abort the whole registration and report "permission
-/// denied" as the reason live updates were off, hiding the real, actionable
-/// limit from anyone whose roots also exceeded the directory budget. The
+/// cannot read — costs live updates that one directory, not the tree. The
 /// budget errors stay fatal: those really do mean the tree can't be covered.
 fn add_watch(reg: &mut WatchRegistry, dir: &Path) -> Result<(), WatchError> {
     match reg.add(dir) {
@@ -331,8 +286,7 @@ pub struct Watcher {
 }
 
 /// Set when the watcher runs out of budget *after* starting, carrying which
-/// limit was hit so the UI can say the right thing. A plain flag would force
-/// the coordinator to guess.
+/// limit was hit so the UI can say the right thing.
 type Degraded = Arc<Mutex<Option<WatchError>>>;
 
 impl Watcher {
@@ -364,7 +318,7 @@ impl Watcher {
                     // The limit can also be hit asynchronously, when notify
                     // reacts to a directory appearing.
                     if matches!(e.kind, NotifyErrorKind::MaxFilesWatch) {
-                        let mut slot = degraded_cb.lock().unwrap();
+                        let mut slot = crate::lock_ok(&degraded_cb);
                         slot.get_or_insert(WatchError::KernelLimit { registered: 0 });
                     }
                     crate::log_warn!("watcher: notify error: {}", e);
@@ -393,7 +347,7 @@ impl Watcher {
 
         {
             let failures = UnreadableDirs::default();
-            let mut reg = registry.lock().unwrap();
+            let mut reg = crate::lock_ok(&registry);
             for root in &roots {
                 if crate::platform::WATCH_ROOTS_RECURSIVELY {
                     // One watch covers the subtree. Ignored and hidden
@@ -422,7 +376,7 @@ impl Watcher {
             }
         }
 
-        let dir_count = Arc::new(AtomicUsize::new(registry.lock().unwrap().dirs.len()));
+        let dir_count = Arc::new(AtomicUsize::new(crate::lock_ok(&registry).dirs.len()));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let ctx = LoopCtx {
             sink,
@@ -454,12 +408,12 @@ impl Watcher {
     /// can no longer see the whole tree; the coordinator polls this and
     /// falls back to periodic rescans.
     pub fn degraded_reason(&self) -> Option<WatchError> {
-        self.degraded.lock().unwrap().clone()
+        crate::lock_ok(&self.degraded).clone()
     }
 
     /// Whether the watcher ran out of budget after starting.
     pub fn is_degraded(&self) -> bool {
-        self.degraded.lock().unwrap().is_some()
+        crate::lock_ok(&self.degraded).is_some()
     }
 
     /// Signal the background thread to stop and wait for it to join. Safe to
@@ -478,8 +432,7 @@ impl Drop for Watcher {
     }
 }
 
-/// Hand-written because `RecommendedWatcher` is not `Debug`, and the watch
-/// set behind a mutex is not worth locking to print.
+/// Hand-written because `RecommendedWatcher` is not `Debug`.
 impl std::fmt::Debug for Watcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Watcher")
@@ -489,7 +442,7 @@ impl std::fmt::Debug for Watcher {
     }
 }
 
-/// Everything the event loop needs, bundled to keep signatures readable.
+/// Everything the event loop needs.
 struct LoopCtx {
     sink: EventSink,
     config: WatcherConfig,
@@ -559,7 +512,6 @@ fn run_loop(rx: mpsc::Receiver<NotifyEvent>, ctx: LoopCtx) {
             break;
         }
 
-        // Tick: flush ready directories, up to max_dirs_per_tick.
         flush_ready(&mut throttle, &ctx.sink, &ctx.config);
 
         // Periodic GC of abandoned throttle entries.
@@ -581,7 +533,7 @@ fn register_tree(ctx: &LoopCtx, root: &Path) {
         return;
     };
     let failures = UnreadableDirs::default();
-    let mut reg = ctx.registry.lock().unwrap();
+    let mut reg = crate::lock_ok(&ctx.registry);
     for entry in filtered_dirs(
         root_str,
         ctx.filters.follow_symlinks,
@@ -591,11 +543,10 @@ fn register_tree(ctx: &LoopCtx, root: &Path) {
     ) {
         // Same policy as startup: only the budget limits are fatal.
         if let Err(limit) = add_watch(&mut reg, entry.path()) {
-            // Live updates can no longer cover the tree. Stop here and let
-            // the coordinator tear us down; a partially watched tree would
-            // look live while going silently stale. Keep the first reason —
-            // later ones are consequences of the same exhaustion.
-            let mut slot = ctx.degraded.lock().unwrap();
+            // A partially watched tree would look live while going silently
+            // stale; stop and let the coordinator tear us down. Keep the
+            // first reason.
+            let mut slot = crate::lock_ok(&ctx.degraded);
             slot.get_or_insert(limit);
             break;
         }
@@ -631,7 +582,7 @@ fn unwatch_tree(ctx: &LoopCtx, path: &Path) {
     if crate::platform::WATCH_ROOTS_RECURSIVELY {
         return;
     }
-    let mut reg = ctx.registry.lock().unwrap();
+    let mut reg = crate::lock_ok(&ctx.registry);
     if reg.remove_tree(path) > 0 {
         ctx.dir_count.store(reg.dirs.len(), Ordering::Relaxed);
     }
@@ -640,12 +591,8 @@ fn unwatch_tree(ctx: &LoopCtx, path: &Path) {
 /// Whether an event for `path` is worth queueing at all.
 ///
 /// The same predicate the walk applies, so the watcher and the indexer agree
-/// on which subtrees exist. Where a platform registers watches per directory
-/// this is mostly redundant — those subtrees were never watched — but under a
-/// recursive root watch it is the *only* thing keeping `node_modules` churn
-/// out of the throttle map. Applying it on both keeps one code path and drops
-/// ignored events a debounce window earlier than
-/// [`crate::incremental::apply_fs_event`] would.
+/// on which subtrees exist. Under a recursive root watch it is the *only*
+/// thing keeping `node_modules` churn out of the throttle map.
 fn is_event_interesting(ctx: &LoopCtx, path: &Path) -> bool {
     if ctx.filters.ignore.matches_path(path) {
         return false;
@@ -739,8 +686,6 @@ fn flush_ready(
     config: &WatcherConfig,
 ) {
     let now = Instant::now();
-    // Collect ready dir keys first, up to max_dirs_per_tick. Copying keys
-    // avoids borrow conflicts when we mutate entries below.
     let mut ready: Vec<PathBuf> = Vec::new();
     for (dir, entry) in throttle.iter() {
         let age = now.saturating_duration_since(entry.record_time);
@@ -775,539 +720,13 @@ fn prune_stale(throttle: &mut HashMap<PathBuf, DirThrottleEntry>, max_age: Durat
             || entry.immediate
             || now.saturating_duration_since(entry.record_time) < max_age
     });
-    // `retain` frees the entries but keeps the table sized for the busiest
-    // moment this map has ever seen — and a build or an unpack can put tens of
-    // thousands of directories through it in a burst, once, on a process that
-    // then sits idle for days.
+    // `retain` keeps the table sized for the busiest moment this map has ever
+    // seen; a single unpack burst would otherwise hold that memory for days.
     if throttle.is_empty() {
         throttle.shrink_to_fit();
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Mutex as StdMutex;
-
-    fn sink_to_vec() -> (EventSink, Arc<StdMutex<Vec<FsEvent>>>) {
-        let v: Arc<StdMutex<Vec<FsEvent>>> = Arc::new(StdMutex::new(Vec::new()));
-        let v_clone = v.clone();
-        let s: EventSink = Arc::new(move |e| v_clone.lock().unwrap().push(e));
-        (s, v)
-    }
-
-    /// Filters matching the shipped defaults: hidden excluded, `.git` and
-    /// `node_modules` ignored.
-    fn default_filters() -> WatchFilters {
-        WatchFilters {
-            include_hidden: false,
-            follow_symlinks: false,
-            ignore: Arc::new(
-                IgnoreSet::compile(&[".git".to_string(), "node_modules".to_string()]).unwrap(),
-            ),
-        }
-    }
-
-    fn fast_config() -> WatcherConfig {
-        WatcherConfig {
-            throttle_window: Duration::from_millis(50),
-            tick_interval: Duration::from_millis(20),
-            ..WatcherConfig::default()
-        }
-    }
-
-    fn tmp_dir(tag: &str) -> PathBuf {
-        crate::testutil::scratch_dir(tag)
-    }
-
-    /// A registry with `dirs` seeded directly, so the pure set logic can be
-    /// tested without registering real kernel watches.
-    fn registry_with(dirs: &[&str]) -> WatchRegistry {
-        let raw = RecommendedWatcher::new(|_res| {}, NotifyConfig::default()).unwrap();
-        WatchRegistry {
-            raw,
-            dirs: dirs.iter().map(PathBuf::from).collect(),
-            cap: 64,
-        }
-    }
-
-    /// Most `Remove` events name *files*, which are never watched. Returning
-    /// before the O(watched) scan is what keeps deleting a 10k-file directory
-    /// off 10k passes over a set capped at 128k entries.
-    #[test]
-    fn remove_tree_skips_the_scan_for_a_path_that_is_not_watched() {
-        let mut reg = registry_with(&["/a/b", "/a/b/c", "/a/bc"]);
-
-        // A file inside a watched directory: not watched itself, and nothing
-        // can live beneath it.
-        assert_eq!(reg.remove_tree(Path::new("/a/b/file.txt")), 0);
-        assert_eq!(reg.dirs.len(), 3, "the watch set is untouched");
-
-        // An entirely unrelated path is likewise a no-op.
-        assert_eq!(reg.remove_tree(Path::new("/elsewhere")), 0);
-        assert_eq!(reg.dirs.len(), 3);
-
-        // The watched directory itself still takes its descendants with it —
-        // and only its descendants: /a/bc is a sibling, not a child.
-        assert_eq!(reg.remove_tree(Path::new("/a/b")), 2);
-        assert_eq!(
-            reg.dirs.iter().collect::<Vec<_>>(),
-            vec![&PathBuf::from("/a/bc")]
-        );
-    }
-
-    #[test]
-    fn enqueue_create_then_remove_cancels() {
-        let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-        let p = PathBuf::from("/tmp/a.txt");
-        enqueue(&mut map, p.clone(), QueuedOp::Create);
-        enqueue(&mut map, p.clone(), QueuedOp::Remove);
-        let entry = map.get(p.parent().unwrap()).unwrap();
-        assert!(entry.queue.is_empty(), "Create then Remove should cancel");
-    }
-
-    #[test]
-    fn modify_after_modify_is_one() {
-        let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-        let p = PathBuf::from("/tmp/a.txt");
-        enqueue(&mut map, p.clone(), QueuedOp::Modify);
-        enqueue(&mut map, p.clone(), QueuedOp::Modify);
-        let entry = map.get(p.parent().unwrap()).unwrap();
-        assert_eq!(entry.queue.len(), 1);
-    }
-
-    #[test]
-    fn flush_ready_leading_edge_fires_immediately() {
-        let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-        enqueue(&mut map, PathBuf::from("/tmp/a.txt"), QueuedOp::Create);
-        let (sink, got) = sink_to_vec();
-        let config = WatcherConfig::default();
-        flush_ready(&mut map, &sink, &config);
-        let got = got.lock().unwrap();
-        assert_eq!(got.len(), 1);
-        assert!(matches!(got[0], FsEvent::Create(_)));
-    }
-
-    #[test]
-    fn flush_ready_respects_max_dirs_per_tick() {
-        let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-        for i in 0..10 {
-            enqueue(
-                &mut map,
-                PathBuf::from(format!("/dir{}/a", i)),
-                QueuedOp::Create,
-            );
-        }
-        let (sink, got) = sink_to_vec();
-        let config = WatcherConfig {
-            max_dirs_per_tick: 3,
-            ..WatcherConfig::default()
-        };
-        flush_ready(&mut map, &sink, &config);
-        // Each dir contributes one event because each entry has one path.
-        assert_eq!(got.lock().unwrap().len(), 3);
-    }
-
-    #[test]
-    fn prune_stale_drops_empty_old_entries() {
-        let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-        map.insert(
-            PathBuf::from("/tmp"),
-            DirThrottleEntry {
-                record_time: Instant::now() - Duration::from_secs(3600),
-                queue: HashMap::new(),
-                immediate: false,
-            },
-        );
-        prune_stale(&mut map, Duration::from_secs(1));
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn prune_stale_keeps_active_entries() {
-        let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-        let mut queue = HashMap::new();
-        queue.insert(PathBuf::from("/tmp/a"), QueuedOp::Modify);
-        map.insert(
-            PathBuf::from("/tmp"),
-            DirThrottleEntry {
-                record_time: Instant::now() - Duration::from_secs(3600),
-                queue,
-                immediate: false,
-            },
-        );
-        prune_stale(&mut map, Duration::from_secs(1));
-        assert_eq!(map.len(), 1);
-    }
-
-    /// End-to-end: create files in a tempdir, verify the watcher surfaces
-    /// events via the sink. Short timeouts keep the test fast; if it becomes
-    /// flaky on slow CI, increase the sleeps.
-    #[test]
-    fn e2e_create_modify_remove_surfaces() {
-        let dir = tmp_dir("e2e");
-        let (sink, got) = sink_to_vec();
-
-        let mut w = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            fast_config(),
-            sink,
-        )
-        .unwrap();
-
-        let f = dir.join("hello.txt");
-        std::fs::write(&f, "hi").unwrap();
-        std::thread::sleep(Duration::from_millis(150));
-        std::fs::write(&f, "hi again").unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        std::fs::remove_file(&f).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-
-        w.stop();
-
-        let events = got.lock().unwrap().clone();
-        // Expect at least one Create (or Modify, depending on backend) and one Remove.
-        // Some platforms emit Create+Modify for `write`.
-        let has_create_or_modify = events
-            .iter()
-            .any(|e| matches!(e, FsEvent::Create(_) | FsEvent::Modify(_)));
-        let has_remove = events.iter().any(|e| matches!(e, FsEvent::Remove(_)));
-        assert!(has_create_or_modify, "no create/modify in {:?}", events);
-        assert!(has_remove, "no remove in {:?}", events);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The whole point of the rewrite: descriptors are not spent on
-    /// directories the indexer would discard.
-    #[test]
-    fn ignored_and_hidden_dirs_are_not_registered() {
-        let dir = tmp_dir("filter");
-        for sub in [
-            "keep",
-            "keep/nested",
-            ".git",
-            ".git/objects",
-            "node_modules",
-            "node_modules/pkg",
-            ".hidden",
-        ] {
-            std::fs::create_dir_all(dir.join(sub)).unwrap();
-        }
-
-        let w = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            fast_config(),
-            sink_to_vec().0,
-        )
-        .unwrap();
-
-        // root + keep + keep/nested. The 4 ignored/hidden dirs cost nothing.
-        assert_eq!(w.watched_dirs(), 3, "expected root, keep, keep/nested only");
-        drop(w);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn include_hidden_registers_dotted_dirs() {
-        let dir = tmp_dir("hidden");
-        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
-
-        let filters = WatchFilters {
-            include_hidden: true,
-            ..default_filters()
-        };
-        let w = Watcher::start(
-            std::iter::once(&dir),
-            filters,
-            fast_config(),
-            sink_to_vec().0,
-        )
-        .unwrap();
-
-        assert_eq!(w.watched_dirs(), 2, "root + .hidden");
-        drop(w);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Exceeding the cap fails the whole registration — no root gets
-    /// partial live updates.
-    #[test]
-    fn exceeding_the_cap_fails_all_or_nothing() {
-        let dir = tmp_dir("cap");
-        for sub in ["a", "b", "c", "d"] {
-            std::fs::create_dir_all(dir.join(sub)).unwrap();
-        }
-
-        let config = WatcherConfig {
-            max_watched_dirs: 2,
-            ..fast_config()
-        };
-        let err = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            config,
-            sink_to_vec().0,
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            err,
-            WatchError::TooManyDirectories { dirs: 2, cap: 2 },
-            "5 directories under a cap of 2 must fail"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// One folder the user cannot read is not a reason to switch live
-    /// updates off for every root — it costs its own events only.
-    #[test]
-    #[cfg(unix)]
-    fn an_unreadable_directory_is_skipped_not_fatal() {
-        let dir = tmp_dir("denied");
-        std::fs::create_dir_all(dir.join("open")).unwrap();
-        let locked = dir.join("locked");
-        std::fs::create_dir_all(&locked).unwrap();
-        crate::platform::deny_read(&locked).unwrap();
-
-        let started = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            fast_config(),
-            sink_to_vec().0,
-        );
-        crate::platform::restore_read(&locked).ok();
-        let w = started.expect("an unreadable directory must not fail the watcher");
-
-        assert_eq!(w.watched_dirs(), 2, "root + open; locked is skipped");
-        assert!(!w.is_degraded());
-        drop(w);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// The bug this guards: an unreadable directory aborted registration
-    /// with its own error, so a tree that was *also* over the cap reported
-    /// "permission denied" as the reason live updates were off — hiding the
-    /// one limit the user can actually act on.
-    #[test]
-    #[cfg(unix)]
-    fn the_cap_outranks_an_unreadable_directory() {
-        let dir = tmp_dir("denied-cap");
-        for sub in ["a", "b", "c", "d"] {
-            std::fs::create_dir_all(dir.join(sub)).unwrap();
-        }
-        let locked = dir.join("locked");
-        std::fs::create_dir_all(&locked).unwrap();
-        crate::platform::deny_read(&locked).unwrap();
-
-        let config = WatcherConfig {
-            max_watched_dirs: 2,
-            ..fast_config()
-        };
-        let started = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            config,
-            sink_to_vec().0,
-        );
-        crate::platform::restore_read(&locked).ok();
-
-        // Whichever order the walk visits them in, the cap is what stops us.
-        assert_eq!(
-            started.unwrap_err(),
-            WatchError::TooManyDirectories { dirs: 2, cap: 2 },
-            "the reported reason must be the cap, not the unreadable folder"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_tree_inside_the_cap_registers() {
-        let dir = tmp_dir("undercap");
-        std::fs::create_dir_all(dir.join("a")).unwrap();
-
-        let config = WatcherConfig {
-            max_watched_dirs: 2,
-            ..fast_config()
-        };
-        let w = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            config,
-            sink_to_vec().0,
-        )
-        .unwrap();
-        assert_eq!(w.watched_dirs(), 2);
-        assert!(!w.is_degraded());
-        drop(w);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Regression guard for taking over recursion from notify: a directory
-    /// created after startup must get its own watch, or its contents are
-    /// invisible to live updates.
-    #[test]
-    fn a_directory_created_after_start_is_watched() {
-        let dir = tmp_dir("newdir");
-        let (sink, got) = sink_to_vec();
-        let mut w = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            fast_config(),
-            sink,
-        )
-        .unwrap();
-        assert_eq!(w.watched_dirs(), 1, "only the root to begin with");
-
-        let sub = dir.join("later");
-        std::fs::create_dir(&sub).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(w.watched_dirs(), 2, "the new directory must be watched");
-
-        // A file inside it is only visible if that watch really landed.
-        let f = sub.join("inside.txt");
-        std::fs::write(&f, "hi").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        w.stop();
-
-        let events = got.lock().unwrap().clone();
-        assert!(
-            events.iter().any(|e| matches!(
-                e,
-                FsEvent::Create(p) | FsEvent::Modify(p) if p == &f
-            )),
-            "no event for the file in the new directory: {:?}",
-            events
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A whole tree can arrive in one event; every directory in it needs a
-    /// watch, not just the top.
-    #[test]
-    fn a_moved_in_tree_registers_every_directory() {
-        let staging = tmp_dir("staging");
-        let dir = tmp_dir("movein");
-        std::fs::create_dir_all(staging.join("tree/one/two")).unwrap();
-
-        let mut w = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            fast_config(),
-            sink_to_vec().0,
-        )
-        .unwrap();
-        assert_eq!(w.watched_dirs(), 1);
-
-        std::fs::rename(staging.join("tree"), dir.join("tree")).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-
-        assert_eq!(w.watched_dirs(), 4, "root + tree + tree/one + tree/one/two");
-        w.stop();
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::remove_dir_all(&staging).ok();
-    }
-
-    #[test]
-    fn a_removed_directory_releases_its_watches() {
-        let dir = tmp_dir("rmdir");
-        std::fs::create_dir_all(dir.join("gone/deep")).unwrap();
-
-        let mut w = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            fast_config(),
-            sink_to_vec().0,
-        )
-        .unwrap();
-        assert_eq!(w.watched_dirs(), 3, "root + gone + gone/deep");
-
-        std::fs::remove_dir_all(dir.join("gone")).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-
-        assert_eq!(w.watched_dirs(), 1, "descendants released with the parent");
-        w.stop();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// `Path::starts_with` compares components, so a sibling sharing a name
-    /// prefix must survive its neighbour's removal.
-    #[test]
-    fn remove_tree_does_not_match_name_prefixes() {
-        let dir = tmp_dir("prefix");
-        std::fs::create_dir_all(dir.join("b")).unwrap();
-        std::fs::create_dir_all(dir.join("bc")).unwrap();
-
-        let mut w = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            fast_config(),
-            sink_to_vec().0,
-        )
-        .unwrap();
-        assert_eq!(w.watched_dirs(), 3);
-
-        std::fs::remove_dir_all(dir.join("b")).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-
-        assert_eq!(w.watched_dirs(), 2, "root + bc; /a/bc is not under /a/b");
-        w.stop();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Crossing the cap at runtime (rather than at startup) must record
-    /// *which* limit was hit, so the coordinator doesn't have to guess.
-    #[test]
-    fn running_out_of_budget_later_records_the_reason() {
-        let dir = tmp_dir("degrade");
-        let config = WatcherConfig {
-            max_watched_dirs: 2,
-            ..fast_config()
-        };
-        let mut w = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            config,
-            sink_to_vec().0,
-        )
-        .unwrap();
-        assert!(!w.is_degraded(), "one directory is under the cap of 2");
-
-        // Two more directories: the first fits, the second cannot.
-        std::fs::create_dir(dir.join("fits")).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        std::fs::create_dir(dir.join("overflows")).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-
-        assert_eq!(
-            w.degraded_reason(),
-            Some(WatchError::TooManyDirectories { dirs: 2, cap: 2 }),
-            "the cap, not a kernel limit"
-        );
-        assert_eq!(w.watched_dirs(), 2, "never registers past the cap");
-        w.stop();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_created_ignored_directory_is_not_watched() {
-        let dir = tmp_dir("newignored");
-        let mut w = Watcher::start(
-            std::iter::once(&dir),
-            default_filters(),
-            fast_config(),
-            sink_to_vec().0,
-        )
-        .unwrap();
-
-        std::fs::create_dir(dir.join("node_modules")).unwrap();
-        std::fs::create_dir(dir.join(".cache")).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-
-        assert_eq!(w.watched_dirs(), 1, "neither ignored nor hidden dirs count");
-        w.stop();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
+#[path = "watcher_tests.rs"]
+mod tests;

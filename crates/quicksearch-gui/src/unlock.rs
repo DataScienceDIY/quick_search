@@ -20,12 +20,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::QuickSearchApp;
 use crate::keychain;
+use crate::ui_util::hint;
 
-/// Where this session's index key came from.
-///
-/// The app needs it for anything that *refers* to the key: telling someone
-/// "the password you just entered" is wrong when they never typed one, because
-/// the keychain answered before the window opened.
+/// Where this session's index key came from, for wording that refers to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeySource {
     /// The index is not password-protected.
@@ -38,8 +35,6 @@ pub enum KeySource {
 
 /// The application shell handed to eframe: locked (unlock screen) or
 /// running (the real app).
-// Exactly one of these exists for the lifetime of the process, and it is
-// already boxed on the side that would matter.
 #[allow(clippy::large_enum_variant)]
 pub enum Gate {
     Locked(UnlockScreen),
@@ -70,24 +65,15 @@ impl Gate {
 
     /// Act on the system-wide search shortcut, if it fired since the last
     /// frame: bring the window back to the front and, once past the gate,
-    /// put the caret in the search box.
-    ///
-    /// Handled here rather than inside the app because while the index is
-    /// locked the unlock screen *is* the window, and a shortcut that did
-    /// nothing until the password was typed would be the wrong half of the
-    /// feature.
-    ///
-    /// Getting the window in front of the user is [`crate::hotkey::raise`],
-    /// which is not one line and explains why.
+    /// put the caret in the search box. Handled here because while locked
+    /// the unlock screen *is* the window.
     fn handle_hotkey(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         if !crate::hotkey::take_fired() {
             return;
         }
         if let Gate::Running(app) = self {
-            // The Options window is waiting for a key press to bind. Pressing
-            // the shortcut that is currently held is how someone checks it
-            // still works, and it must not reshuffle the window underneath
-            // the dialog asking for its replacement.
+            // The Options window is waiting for a key press to bind; the
+            // shortcut must not reshuffle the window underneath that dialog.
             if app.capturing_hotkey() {
                 return;
             }
@@ -117,9 +103,8 @@ impl eframe::App for Gate {
     }
 
     /// The scripted capture driver injects keystrokes and harvests
-    /// screenshots here, before egui sees the frame's input. While locked
-    /// there is nothing to drive; capture runs use an unprotected config, so
-    /// the gate is `Running` from the first frame.
+    /// screenshots here, before egui sees the frame's input. Capture runs
+    /// use an unprotected config, so the gate is `Running` from frame one.
     #[cfg(feature = "capture")]
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if let Gate::Running(app) = self {
@@ -163,12 +148,9 @@ enum Mode {
     /// An index exists: the password must open it.
     Unlock,
     /// Protection is on but no index file exists yet, so the typed password
-    /// becomes the one the new index is built under.
-    ///
-    /// Still not a *new* password: this mode is only reachable with a salt
-    /// already in the config, so one was chosen previously and this is the
-    /// user re-entering it. Choosing a genuinely new password happens in the
-    /// Options window, which does its own confirmation.
+    /// becomes the one the new index is built under. Not a *new* password:
+    /// a salt already exists in the config, so this is the user re-entering
+    /// the one chosen previously.
     Create,
     /// `password_protected = true` but the salt is missing or corrupt; no
     /// password can help. Only the reset escape hatch applies.
@@ -184,10 +166,8 @@ pub struct UnlockScreen {
     remember: bool,
     error: Option<String>,
     /// Put the caret in the password field on the next frame. Set once at
-    /// startup and again after a failed attempt, so the user can retype
-    /// straight away — but *not* every frame: re-focusing unconditionally
-    /// traps the caret, and nothing else on the screen can be tabbed to or
-    /// clicked into.
+    /// startup and after a failed attempt — *not* every frame:
+    /// unconditional re-focus traps the caret.
     focus_password: bool,
     /// In-flight Argon2 derivation (+ verification) on a worker thread.
     job: Option<mpsc::Receiver<Result<IndexKey, String>>>,
@@ -236,21 +216,19 @@ impl UnlockScreen {
                     } else {
                         e
                     });
-                    // The field was cleared on submit, so put the caret back
-                    // in it rather than making the user click before retrying.
+                    // The field was cleared on submit; put the caret back
+                    // for the retry.
                     self.focus_password = true;
                 }
             }
         }
 
-        // The lock screen owns the whole window and so has no status bar to
-        // carry the build id. Give it the same corner the unlocked app uses,
-        // so a screenshot of a machine that never got past the password is
-        // still identifiable. Declared before the central panel, as egui
+        // The build id in the corner identifies a machine that never got
+        // past the password. Declared before the central panel, as egui
         // requires.
         egui::TopBottomPanel::bottom("version-bar").show(ctx, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(crate::version::BUILD_ID).small().weak())
+                ui.label(hint(crate::version::BUILD_ID))
                     .on_hover_text(crate::version::BUILD_ID_HINT);
             });
         });
@@ -277,14 +255,10 @@ impl UnlockScreen {
                     }
                     Mode::Create => {
                         ui.label("Password protection is enabled, but no index exists yet.");
-                        ui.label(
-                            egui::RichText::new(
-                                "The new index will be encrypted with the password you \
+                        ui.label(hint(
+                            "The new index will be encrypted with the password you \
                                  enter here.",
-                            )
-                            .small()
-                            .weak(),
-                        );
+                        ));
                     }
                 }
                 ui.add_space(8.0);
@@ -322,7 +296,7 @@ impl UnlockScreen {
                 if busy {
                     ui.add_space(6.0);
                     ui.spinner();
-                    ui.label(egui::RichText::new("Deriving key…").small().weak());
+                    ui.label(hint("Deriving key…"));
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 }
                 if let Some(error) = &self.error {
@@ -407,13 +381,11 @@ impl UnlockScreen {
         let db_path = self.cfg.resolved_database_path();
         if self.remember {
             if let Err(e) = keychain::store_key(&db_path.to_string_lossy(), &key.to_hex()) {
-                // Non-fatal: unlock proceeds, the preference just can't
-                // stick. Surface it in the running app's banner.
+                // Non-fatal: unlock proceeds, the preference just can't stick.
                 self.config_error = Some(e);
             }
         } else if let Err(e) = keychain::delete_key(&db_path.to_string_lossy()) {
-            // Same treatment as the store half above: unlock proceeds, but
-            // the banner says the old key is still on the keychain.
+            // Non-fatal, but the old key is still on the keychain — say so.
             self.config_error = Some(e);
         }
         if self.cfg.security.use_keychain != self.remember {
@@ -427,9 +399,8 @@ impl UnlockScreen {
 
     /// Construct the real app; on failure stay locked and show why.
     fn launch(&mut self, ctx: &egui::Context) -> Option<QuickSearchApp> {
-        // Reaching here means either the password was just typed, or the
-        // "forgot password" path disabled protection on the way. The config
-        // says which, and no caller has to remember to pass it.
+        // Either the password was just typed, or the forgot-password path
+        // disabled protection on the way; the config says which.
         let key_source = if self.cfg.security.password_protected {
             KeySource::Prompt
         } else {
@@ -454,51 +425,41 @@ impl UnlockScreen {
     /// it and disabling protection loses nothing but time. `Some(app)` when
     /// the reset happened and the app launched unprotected.
     fn forgot_confirm_ui(&mut self, ctx: &egui::Context) -> Option<QuickSearchApp> {
-        let mut launched = None;
-        let mut close = false;
-        egui::Window::new("Reset the index?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.set_max_width(420.0);
-                ui.label(
-                    "Without the password the index cannot be read. This deletes \
-                     the index and turns password protection off. Your files are \
-                     not touched; the index is rebuilt by indexing again.",
-                );
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(
-                            egui::RichText::new("Delete index & disable protection")
-                                .color(ui.visuals().error_fg_color),
-                        )
-                        .clicked()
-                    {
-                        let db_path = self.cfg.resolved_database_path();
-                        if let Err(e) = delete_index_files(&db_path) {
-                            self.error = Some(e);
-                        } else {
-                            // The index files are already gone; a surviving
-                            // entry would point at a database that no longer
-                            // exists. Non-fatal, but not silent.
-                            if let Err(e) = keychain::delete_key(&db_path.to_string_lossy()) {
-                                self.config_error = Some(e);
-                            }
-                            db::set_process_key(None);
-                            self.cfg.security = SecurityConfig::default();
-                            if let Err(e) = self.cfg.save() {
-                                self.config_error = Some(e);
-                            }
-                            launched = self.launch(ctx);
+        let result = crate::ui_util::centered_modal(ctx, "Reset the index?", |ui| {
+            ui.set_max_width(420.0);
+            ui.label(
+                "Without the password the index cannot be read. This deletes \
+                 the index and turns password protection off. Your files are \
+                 not touched; the index is rebuilt by indexing again.",
+            );
+            ui.horizontal(|ui| {
+                let mut launched = None;
+                let delete = egui::RichText::new("Delete index & disable protection")
+                    .color(ui.visuals().error_fg_color);
+                if ui.button(delete).clicked() {
+                    let db_path = self.cfg.resolved_database_path();
+                    if let Err(e) = delete_index_files(&db_path) {
+                        self.error = Some(e);
+                    } else {
+                        // A surviving keychain entry would point at a database
+                        // that no longer exists. Non-fatal, but not silent.
+                        if let Err(e) = keychain::delete_key(&db_path.to_string_lossy()) {
+                            self.config_error = Some(e);
                         }
-                        close = true;
+                        db::set_process_key(None);
+                        self.cfg.security = SecurityConfig::default();
+                        if let Err(e) = self.cfg.save() {
+                            self.config_error = Some(e);
+                        }
+                        launched = self.launch(ctx);
                     }
-                    if ui.button("Cancel").clicked() {
-                        close = true;
-                    }
-                });
-            });
+                    return (launched, true);
+                }
+                (launched, ui.button("Cancel").clicked())
+            })
+            .inner
+        });
+        let (launched, close) = result.unwrap_or((None, false));
         if close {
             self.forgot_confirm = false;
         }
@@ -564,18 +525,13 @@ mod tests {
     fn frame(ctx: &egui::Context, screen: &mut UnlockScreen) {
         let input = crate::test_ui::raw_input(SCREEN, Vec::new());
         let _ = ctx.run(input, |ctx| {
-            // `update` only builds the app on a successful unlock, which needs
-            // a derived key — so with nothing submitted this stays on screen.
+            // With nothing submitted the screen stays up.
             assert!(screen.update(ctx).is_none());
         });
     }
 
     /// The caret starts in the password field, and — the regression — can then
     /// leave it.
-    ///
-    /// The screen used to call `request_focus()` on every frame the field did
-    /// not have focus, which yanked the caret back the instant anything else
-    /// took it. Nothing else on the screen could be tabbed to or clicked into.
     #[test]
     fn the_password_field_takes_focus_once_and_then_releases_it() {
         let ctx = egui::Context::default();
@@ -600,9 +556,8 @@ mod tests {
         assert!(!ctx.memory(|m| m.has_focus(pw_field_id())));
     }
 
-    /// A failed attempt is the one case that *should* re-focus: the field was
-    /// cleared on submit, so the user would otherwise have to click before
-    /// retyping.
+    /// A failed attempt is the one case that *should* re-focus: the field
+    /// was cleared on submit.
     #[test]
     fn a_failed_attempt_puts_the_caret_back() {
         let ctx = egui::Context::default();
@@ -617,10 +572,8 @@ mod tests {
         assert!(ctx.memory(|m| m.has_focus(pw_field_id())));
     }
 
-    /// This screen is the whole window on a protected index, so the build id
-    /// in its corner is the only thing identifying a machine that never got
-    /// past the password. Assert it is painted rather than merely laid out —
-    /// a panel declared after the central one would compile and show nothing.
+    /// The build id is painted, not merely laid out — a panel declared after
+    /// the central one would compile and show nothing.
     #[test]
     fn the_lock_screen_shows_the_build_id() {
         let ctx = egui::Context::default();

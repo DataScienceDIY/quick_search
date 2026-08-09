@@ -4,6 +4,7 @@ use quicksearch_core::search::DuplicateGroup;
 
 use crate::format::{group_thousands, human_size};
 use crate::platform;
+use crate::ui_util::hint;
 
 pub enum DupState {
     NotLoaded,
@@ -54,8 +55,7 @@ impl DuplicatesTab {
                         .weak(),
                 );
             }
-            // The spinner and its label are already on the header row above,
-            // so a second progress line here would just repeat them.
+            // The header row above already shows the spinner and its label.
             DupState::Loading => {}
             DupState::Error(e) => {
                 ui.colored_label(ui.visuals().error_fg_color, e);
@@ -66,11 +66,7 @@ impl DuplicatesTab {
                     return actions;
                 }
                 if groups.len() == 500 {
-                    ui.label(
-                        egui::RichText::new("Showing the 500 largest groups.")
-                            .small()
-                            .weak(),
-                    );
+                    ui.label(hint("Showing the 500 largest groups."));
                 }
                 let scroll = egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
