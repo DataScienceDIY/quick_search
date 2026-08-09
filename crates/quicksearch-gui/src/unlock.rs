@@ -67,10 +67,39 @@ impl Gate {
     ) -> Gate {
         Gate::Locked(UnlockScreen::new(cfg, config_error, initial_query))
     }
+
+    /// Act on the system-wide search shortcut, if it fired since the last
+    /// frame: bring the window back to the front and, once past the gate,
+    /// put the caret in the search box.
+    ///
+    /// Handled here rather than inside the app because while the index is
+    /// locked the unlock screen *is* the window, and a shortcut that did
+    /// nothing until the password was typed would be the wrong half of the
+    /// feature.
+    ///
+    /// Getting the window in front of the user is [`crate::hotkey::raise`],
+    /// which is not one line and explains why.
+    fn handle_hotkey(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if !crate::hotkey::take_fired() {
+            return;
+        }
+        if let Gate::Running(app) = self {
+            // The Options window is waiting for a key press to bind. Pressing
+            // the shortcut that is currently held is how someone checks it
+            // still works, and it must not reshuffle the window underneath
+            // the dialog asking for its replacement.
+            if app.capturing_hotkey() {
+                return;
+            }
+            app.activate_search();
+        }
+        crate::hotkey::raise(ctx, frame);
+    }
 }
 
 impl eframe::App for Gate {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.handle_hotkey(ctx, frame);
         match self {
             Gate::Running(app) => app.update(ctx, frame),
             Gate::Locked(screen) => {
@@ -342,11 +371,10 @@ impl UnlockScreen {
     /// UI-side buffers.
     fn submit(&mut self, ctx: &egui::Context) {
         self.error = None;
-        if matches!(self.mode, Mode::Create)
-            && self.password.is_empty() {
-                self.error = Some("The password may not be empty.".to_string());
-                return;
-            }
+        if matches!(self.mode, Mode::Create) && self.password.is_empty() {
+            self.error = Some("The password may not be empty.".to_string());
+            return;
+        }
         let Ok(salt) = self.cfg.security.salt_bytes() else {
             return; // BrokenSalt mode never reaches submit
         };

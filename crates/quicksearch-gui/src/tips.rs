@@ -9,8 +9,6 @@
 //! Written for someone who does not know what a tokenizer or a write-ahead
 //! log is, and should not have to.
 
-use crate::ui_util::ORANGE;
-
 /// How wide a tooltip may get. Matches `manage_tab::db_size_tooltip`: wide
 /// enough that a sentence is not shredded into three lines, narrow enough
 /// that the eye finds the next line.
@@ -52,7 +50,8 @@ impl Tip {
         }
         if let Some(caution) = self.caution {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new(caution).small().color(ORANGE));
+            let caution_color = crate::color::palette(ui.visuals().dark_mode).orange;
+            ui.label(egui::RichText::new(caution).small().color(caution_color));
         }
     }
 }
@@ -359,6 +358,41 @@ pub static UI_SCALE: Tip = Tip {
     caution: None,
 };
 
+pub static SEARCH_HOTKEY: Tip = Tip {
+    title: "Search shortcut",
+    body: "One key combination that brings QuickSearch to the front from \
+           anywhere, whatever you were doing, and puts the cursor in the \
+           search box with the previous search selected, so you can simply \
+           start typing.\n\n\
+           Click the button and press the keys you want. Combine Ctrl, Alt \
+           and Shift with one other key. Clear switches the shortcut off.\n\n\
+           On Wayland the shortcut is registered with your desktop rather \
+           than claimed directly, so your desktop may assign a different key \
+           or ask you to confirm it, and its own keyboard settings are where \
+           to change it afterwards. Wayland also does not let any application \
+           put itself in front of what you are doing, so there the shortcut \
+           selects the Search tab and the search box, but bringing the window \
+           forward is up to your desktop.",
+    examples: &[
+        "Ctrl+Shift+F, the default, which few other programs use.",
+        "Ctrl+Alt+Space if something else on your system already answers to it.",
+    ],
+    caution: None,
+};
+
+pub static COLOR_SCHEME: Tip = Tip {
+    title: "Color scheme",
+    body: "Whether QuickSearch is dark or light. It takes effect as soon as \
+           you apply it, with no restart.\n\n\
+           QuickSearch does not follow your desktop's own light and dark \
+           setting: on Linux the only way to read that is to connect to your \
+           desktop over the message bus and listen to your settings as they \
+           change, which is more of your session than a search tool should \
+           be in. So it is asked here instead, once.",
+    examples: &["Light for a bright room, or to match the rest of a light desktop."],
+    caution: None,
+};
+
 // --- Options: Security ---------------------------------------------------
 
 pub static ENABLE_PASSWORD: Tip = Tip {
@@ -576,6 +610,8 @@ mod tests {
         &RESULTS_PER_PAGE,
         &DEBOUNCE,
         &UI_SCALE,
+        &SEARCH_HOTKEY,
+        &COLOR_SCHEME,
         &ENABLE_PASSWORD,
         &CHANGE_PASSWORD,
         &DISABLE_PASSWORD,

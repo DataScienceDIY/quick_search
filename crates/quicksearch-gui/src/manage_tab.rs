@@ -465,15 +465,12 @@ impl ManageTab {
                 ui.add_space(8.0);
 
                 let dirty = self.is_dirty();
+                let p = crate::color::palette(ui.visuals().dark_mode);
                 ui.horizontal(|ui| {
                     let apply = ui
                         .add(crate::ui_util::bordered_button(
                             "Apply & Save",
-                            if dirty {
-                                crate::ui_util::ORANGE
-                            } else {
-                                crate::ui_util::BLUE
-                            },
+                            if dirty { p.orange } else { p.blue },
                         ))
                         .tip(&tips::APPLY_SAVE);
                     #[cfg(test)]
@@ -485,7 +482,7 @@ impl ManageTab {
                             ui.label(
                                 egui::RichText::new("Unsaved changes")
                                     .small()
-                                    .color(crate::ui_util::ORANGE),
+                                    .color(p.orange),
                             );
                         }
                     });
@@ -842,12 +839,13 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
     let divider = |ui: &mut egui::Ui| {
         ui.label(egui::RichText::new("|").weak());
     };
+    let phase = crate::color::palette(ui.visuals().dark_mode);
     ui.horizontal(|ui| {
         ui.monospace(middle_truncate(&r.root, 48));
         divider(ui);
         match r.phase {
             RootPhase::Walking => {
-                ui.label("indexing");
+                ui.label(egui::RichText::new("indexing").color(phase.yellow));
                 divider(ui);
                 let workers = format!("{}/{} workers", r.active_workers, r.total_workers);
                 match r.walk_denominator() {
@@ -877,7 +875,7 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
                 }
             }
             RootPhase::Extracting => {
-                ui.label("extracting text for search");
+                ui.label(egui::RichText::new("extracting text").color(phase.green));
                 divider(ui);
                 let frac = if r.extract_total > 0 {
                     (r.extracted as f32 / r.extract_total as f32).clamp(0.0, 1.0)
@@ -899,7 +897,7 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
                 // saw (including unchanged, skipped ones) and `extracted`
                 // covers all rows with searchable text, not just this
                 // run's new work.
-                ui.label("done");
+                ui.label(egui::RichText::new("done").color(phase.blue));
                 divider(ui);
                 ui.label(format!(
                     "indexed {}, extracted {}",
@@ -1265,6 +1263,48 @@ mod tests {
             "an overtaken estimate must be raised, not shown: {}",
             overtaken
         );
+    }
+
+    /// Like [`frame_text`], but keeping the color each run of text was
+    /// painted in — the only way to check a hint.
+    fn frame_spans(
+        ctx: &egui::Context,
+        tab: &mut ManageTab,
+        state: &IndexerState,
+    ) -> Vec<(String, egui::Color32)> {
+        WIDGETS.with(|w| w.borrow_mut().clear());
+        let cfg = cfg_with_root();
+        let out = ctx.run(raw_input(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                tab.ui(ui, state, &cfg);
+            });
+        });
+        crate::test_ui::painted_spans(&out)
+    }
+
+    /// The phase word carries a color hint, so a glance at the row says what
+    /// the run is doing without reading it. The hint has to hold up in both
+    /// themes: `[ui] color_scheme` picks one, and changing it repaints the
+    /// running window.
+    #[test]
+    fn every_phase_word_is_painted_in_its_hint_color() {
+        for theme in [egui::Theme::Dark, egui::Theme::Light] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(theme);
+            let mut tab = ManageTab::new();
+            let colors = crate::color::palette(theme == egui::Theme::Dark);
+
+            for (phase, word, want) in [
+                (RootPhase::Walking, "indexing", colors.yellow),
+                (RootPhase::Extracting, "extracting text", colors.green),
+                (RootPhase::Done, "done", colors.blue),
+            ] {
+                let state = state_with(vec![root_progress(phase, 100, Some(1000))]);
+                let spans = frame_spans(&ctx, &mut tab, &state);
+                let hint = spans.iter().find(|(text, _)| text == word).map(|(_, c)| *c);
+                assert_eq!(hint, Some(want), "{:?}: {:?} in {:?}", theme, word, spans);
+            }
+        }
     }
 
     /// No count has landed yet: an indeterminate row, not a fabricated one.

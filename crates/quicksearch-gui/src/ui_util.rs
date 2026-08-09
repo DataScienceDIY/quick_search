@@ -1,17 +1,11 @@
-//! Shared UI helpers: emphasis colors, bordered widgets, ignore-pattern
-//! validation, text eliding, and the "more content below" scroll hint.
+//! Shared UI helpers: bordered widgets, ignore-pattern validation, text
+//! eliding, and the "more content below" scroll hint. The colors they paint
+//! with live in [`crate::color`].
 
 use quicksearch_core::config::IgnoreSet;
 use std::borrow::Cow;
 
-/// Warning/emphasis orange, also used for the fuzzy-edit-distance warning.
-pub const ORANGE: egui::Color32 = egui::Color32::from_rgb(220, 150, 40);
-/// Emphasis blue for the primary commit controls.
-pub const BLUE: egui::Color32 = egui::Color32::from_rgb(90, 150, 250);
-/// Border of a pattern editor holding a valid pattern.
-pub const VALID_GREEN: egui::Color32 = egui::Color32::from_rgb(80, 180, 100);
-/// Border of a pattern editor holding an invalid pattern.
-pub const INVALID_RED: egui::Color32 = egui::Color32::from_rgb(220, 80, 80);
+use crate::color::palette;
 
 /// A standard button with a colored emphasis border.
 pub fn bordered_button(
@@ -79,9 +73,10 @@ pub fn pattern_hint(pattern: &str) -> Option<String> {
 /// Render [`pattern_hint`] as a small orange label inside a stable section,
 /// so its appearance never shifts the ids of widgets below it.
 pub fn pattern_hint_label(ui: &mut egui::Ui, pattern: &str) {
+    let caution = palette(ui.visuals().dark_mode).orange;
     stable_section(ui, |ui| {
         if let Some(hint) = pattern_hint(pattern) {
-            ui.label(egui::RichText::new(hint).small().color(ORANGE));
+            ui.label(egui::RichText::new(hint).small().color(caution));
         }
     });
 }
@@ -89,13 +84,14 @@ pub fn pattern_hint_label(ui: &mut egui::Ui, pattern: &str) {
 /// Border color for a pattern editor holding `text`, or `None` to keep the
 /// theme's own border. A blank box is not wrong yet, just unfilled, so it
 /// stays neutral; only text the user actually typed is judged.
-fn pattern_border(text: &str) -> Option<egui::Color32> {
+fn pattern_border(text: &str, dark_mode: bool) -> Option<egui::Color32> {
+    let p = palette(dark_mode);
     if text.trim().is_empty() {
         None
     } else if ignore_pattern_valid(text) {
-        Some(VALID_GREEN)
+        Some(p.green)
     } else {
-        Some(INVALID_RED)
+        Some(p.red)
     }
 }
 
@@ -110,7 +106,7 @@ pub fn pattern_edit(
     hint: &str,
 ) -> (egui::Response, bool) {
     let mut valid = ignore_pattern_valid(text);
-    let border = pattern_border(text);
+    let border = pattern_border(text, ui.visuals().dark_mode);
     let response = ui
         .scope(|ui| {
             // TextEdit frames with widgets.*.bg_stroke when unfocused and
@@ -338,8 +334,8 @@ pub fn wipe_scrim(ui: &egui::Ui, rect: egui::Rect, wipe: f32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ignore_pattern_valid, middle_elide, pattern_border, pattern_hint, wipe_mesh, Cow,
-        INVALID_RED, VALID_GREEN, WIPE_BAND_MIN,
+        ignore_pattern_valid, middle_elide, palette, pattern_border, pattern_hint, wipe_mesh, Cow,
+        WIPE_BAND_MIN,
     };
     use crate::test_ui::with_ui;
 
@@ -506,19 +502,24 @@ mod tests {
     #[test]
     fn empty_editor_keeps_the_theme_border() {
         // Nothing typed yet is not an error to flag.
-        assert_eq!(pattern_border(""), None);
-        assert_eq!(pattern_border("   "), None);
-        assert_eq!(pattern_border("\t\n"), None);
+        for dark in [true, false] {
+            assert_eq!(pattern_border("", dark), None);
+            assert_eq!(pattern_border("   ", dark), None);
+            assert_eq!(pattern_border("\t\n", dark), None);
+        }
     }
 
     #[test]
     fn typed_text_is_judged() {
-        assert_eq!(pattern_border("*.tmp"), Some(VALID_GREEN));
-        assert_eq!(pattern_border("  node_modules  "), Some(VALID_GREEN));
-        assert_eq!(pattern_border("foo["), Some(INVALID_RED));
-        // Typed, but trims away to nothing under the pattern rules — still
-        // worth flagging, unlike a box the user simply has not filled in.
-        assert_eq!(pattern_border("/"), Some(INVALID_RED));
+        for dark in [true, false] {
+            let p = palette(dark);
+            assert_eq!(pattern_border("*.tmp", dark), Some(p.green));
+            assert_eq!(pattern_border("  node_modules  ", dark), Some(p.green));
+            assert_eq!(pattern_border("foo[", dark), Some(p.red));
+            // Typed, but trims away to nothing under the pattern rules —
+            // still worth flagging, unlike a box the user has not filled in.
+            assert_eq!(pattern_border("/", dark), Some(p.red));
+        }
     }
 
     // --- The results wipe ---------------------------------------------------

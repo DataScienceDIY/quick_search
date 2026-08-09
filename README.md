@@ -247,6 +247,21 @@ inside that folder.
 - **Help**: an in-app quickstart — first indexing run, example queries,
   what each tab does — pointing here for everything technical.
 
+**Ctrl+Shift+F from anywhere** brings QuickSearch to the front, restoring
+it if it was minimized, and puts the cursor in the search box with the
+previous search selected, so the next thing you type is the new one. The
+Options window's Interface section rebinds it — click the button and press
+the keys — or switches it off. It is a system-wide shortcut, registered
+with Windows or with the X server, so it works while another application
+has focus. Wayland does not let an application claim a key, so there the
+shortcut is registered with your desktop through the XDG desktop portal
+instead; your desktop then has the final say over which key it is, and its
+own keyboard settings are where to change it. The Options window says which
+key it settled on. Wayland likewise gives no application a way to put itself
+in front of what you are doing, so under it the shortcut selects the Search
+tab and the search box but leaves raising the window to the desktop; on X11
+and Windows it raises and restores the window itself.
+
 The bottom status bar always shows what the indexer is doing (phase,
 percent, files/sec) or the total indexed file count when idle. Applying a
 settings change to the index counts as something the indexer is doing: it
@@ -374,6 +389,19 @@ config resolve against the config file's own directory, so a folder
 containing the binary, its config, and its index can be moved wholesale.
 
 The GUI edits the config live; external edits apply on next start.
+
+`[ui] search_hotkey` is the system-wide search shortcut, written the way
+the Options window prints it (`Ctrl+Shift+F`): Ctrl, Alt and Shift in any
+combination, plus one key, joined with `+`. An empty string switches it
+off. A value that is not a shortcut is not a config error — the app loads,
+says so in the Options window, and runs without one.
+
+`[ui] color_scheme` is `dark` (the default) or `light`, changeable in the
+Options window and applied without a restart. It does not follow the
+desktop's own light/dark setting: on Linux nothing in the window system
+reports that, so the only way to know is to connect to the session message
+bus and subscribe to the user's settings feed — more of your session than a
+search tool should be in, to decide what color some text is.
 
 **Changing what is indexed** does not throw the index away. Narrowing the
 scope — removing a folder, adding an ignore pattern, turning off hidden
@@ -565,7 +593,10 @@ filter editors), `duplicates_tab.rs`, `logs_tab.rs` (a virtualized view of
 the core log ring), `options.rs` (draft-based settings
 editor shared between the window and the Manage tab), `platform.rs`
 (open / reveal-in-file-manager, and the Windows stdio setup a
-window-subsystem process needs before anything prints), `cli.rs` (terminal
+window-subsystem process needs before anything prints), `hotkey/` (the
+system-wide search shortcut: one key table feeding both a `RegisterHotKey`
+/ `XGrabKey` registration and, on Wayland, an XDG portal session on its own
+thread), `cli.rs` (terminal
 mode, shared with the `quicksearch-cli` binary). There is no
 pagination: the table is virtualized, so a single scroll list capped at
 `display_limit` renders in microseconds regardless of row count.

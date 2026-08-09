@@ -569,20 +569,19 @@ mod tests {
         assert_eq!(count, 0);
         // New columns should exist (just prepare the SELECT — an
         // unknown column name would parse-error here).
-        conn
-            .query_row(
-                "SELECT basic_state, content_state, type, mime FROM files LIMIT 0",
-                [],
-                |_| Ok(()),
-            )
-            .or_else(|e| {
-                if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
-                    Ok(())
-                } else {
-                    Err(e)
-                }
-            })
-            .unwrap();
+        conn.query_row(
+            "SELECT basic_state, content_state, type, mime FROM files LIMIT 0",
+            [],
+            |_| Ok(()),
+        )
+        .or_else(|e| {
+            if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .unwrap();
         drop(conn);
         std::fs::remove_file(&p).ok();
     }

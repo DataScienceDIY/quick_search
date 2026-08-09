@@ -49,6 +49,11 @@ rfd = "0.15"
 open = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# The system-wide search shortcut, where the display server lets an
+# application claim keys for itself: `RegisterHotKey` on Windows, `XGrabKey`
+# on X11. Wayland does not, and is handled by the portal below.
+global-hotkey = "0.8"
+
 # Display backends, which only exist on Linux/BSD. `default-features = false`
 # has to be repeated: feature resolution unions the two stanzas, so a single
 # permissive one would switch defaults back on for every target.
@@ -57,6 +62,25 @@ eframe = { version = "0.32", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+
+# The Wayland half of the search shortcut: `org.freedesktop.portal.GlobalShortcuts`,
+# the only way a Wayland application can be told about a key it does not own.
+# `rfd` already pulls all four in (it uses the file-chooser portal), so the
+# versions here are the ones already resolved and nothing extra is compiled.
+# `default-features = false` matters: ashpd defaults to Tokio, which would add
+# a second async runtime and switch `zbus` over to it underneath `rfd`.
+ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
+futures-channel = "0.3"
+futures-util = "0.3"
+pollster = "0.4"
+
+# Raising the window from the shortcut on X11, which winit cannot do: it asks
+# with a source indication of "application", and every mainstream window
+# manager refuses that from a window that is not already focused. See
+# `hotkey::raise`. Both are already in the tree (winit's own X11 backend, and
+# eframe's window handle), so neither adds a crate.
+x11rb = "0.13"
+raw-window-handle = "0.6"
 
 # Console attachment for the GUI binary (which has no stdio when launched from
 # Explorer) and VT-mode enabling for the CLI binary. 0.59 matches what eframe

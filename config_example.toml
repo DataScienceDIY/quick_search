@@ -156,6 +156,19 @@ scale = 1.1
 # current folder list whenever it is applied. Deleting it just means the
 # warnings come back once each.
 watch_cap_warned_roots = []
+# System-wide shortcut that raises QuickSearch, switches to the Search tab
+# and selects whatever is in the search box, from anywhere. Modifiers are
+# Ctrl, Alt and Shift, joined to one key with "+". Leave it empty ("") for
+# no shortcut. On Wayland this is only a preference: the shortcut is
+# registered with your desktop, which may assign a different key and lets
+# you change it in its own keyboard settings.
+search_hotkey = "Ctrl+Shift+F"
+# 'dark' or 'light'. Applied as soon as it is changed in the Options
+# window. Your desktop's own light/dark setting is not consulted: reading
+# it would mean connecting to your session's message bus and subscribing to
+# your settings, which is more than a search tool should ask for. Anything
+# other than 'light' is dark.
+color_scheme = "dark"
 
 [search]
 # Start with the fuzzy passes enabled.

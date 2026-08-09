@@ -8,6 +8,7 @@ use egui_extras::{Column, TableBuilder};
 use quicksearch_core::search::{SearchHit, SearchUpdate};
 use quicksearch_core::snippet::Snippet;
 
+use crate::color::rank_tier_color;
 use crate::format::{fmt_elapsed, fmt_mtime, human_size};
 use crate::platform;
 use crate::ui_util::middle_elide;
@@ -205,9 +206,10 @@ impl SearchTab {
     }
 
     /// Re-arm the one-shot first-frame focus: tab switches drop egui focus,
-    /// and injected text needs the caret back in the search box.
-    #[cfg(feature = "capture")]
-    pub(crate) fn capture_focus(&mut self) {
+    /// so the caret has to be asked for again by anything that lands the user
+    /// on this tab meaning to type — the system-wide search shortcut, or the
+    /// capture driver injecting text.
+    pub(crate) fn request_focus(&mut self) {
         self.focus_query = true;
     }
 
@@ -471,6 +473,19 @@ impl SearchTab {
                 );
                 if self.focus_query {
                     response.request_focus();
+                    // Select what is already there, so arriving here to
+                    // search for something else means typing it rather than
+                    // clearing the box first. Written straight to the widget
+                    // state because the selection has to be in place for the
+                    // very frame focus lands.
+                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+                        let all = egui::text::CCursorRange::two(
+                            egui::text::CCursor::new(0),
+                            egui::text::CCursor::new(self.query.chars().count()),
+                        );
+                        state.cursor.set_char_range(Some(all));
+                        state.store(ui.ctx(), response.id);
+                    }
                     self.focus_query = false;
                 }
                 if response.changed() {
@@ -833,7 +848,8 @@ impl SearchTab {
     }
 
     fn ignore_dialog_ui(&mut self, ctx: &egui::Context, actions: &mut SearchActions) {
-        use crate::ui_util::{bordered_button, pattern_edit, BLUE, ORANGE};
+        use crate::ui_util::{bordered_button, pattern_edit};
+        let p = crate::color::palette(ctx.style().visuals.dark_mode);
         let Some(dialog) = &mut self.ignore_dialog else {
             return;
         };
@@ -856,7 +872,7 @@ impl SearchTab {
                         ui.monospace(ext);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
-                                .add(bordered_button("Ignore this extension", ORANGE))
+                                .add(bordered_button("Ignore this extension", p.orange))
                                 .clicked()
                             {
                                 chosen = Some(ext.clone());
@@ -875,7 +891,7 @@ impl SearchTab {
                         pattern_edit(ui, &mut dialog.name_pattern, 240.0, "filename or glob");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_enabled(valid, bordered_button("Ignore this filename", ORANGE))
+                            .add_enabled(valid, bordered_button("Ignore this filename", p.orange))
                             .clicked()
                         {
                             chosen = Some(dialog.name_pattern.trim().to_string());
@@ -893,7 +909,7 @@ impl SearchTab {
                         pattern_edit(ui, &mut dialog.dir_pattern, 240.0, "directory glob");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_enabled(valid, bordered_button("Ignore this directory", ORANGE))
+                            .add_enabled(valid, bordered_button("Ignore this directory", p.orange))
                             .clicked()
                         {
                             chosen = Some(dialog.dir_pattern.trim().to_string());
@@ -904,7 +920,7 @@ impl SearchTab {
 
                 // --- Persist + close ---------------------------------------
                 egui::Frame::new()
-                    .stroke(egui::Stroke::new(1.0, BLUE))
+                    .stroke(egui::Stroke::new(1.0, p.blue))
                     .corner_radius(4)
                     .inner_margin(egui::Margin::symmetric(6, 3))
                     .show(ui, |ui| {
@@ -1366,42 +1382,19 @@ fn take_forward(text: &str, from: usize, budget: f32, width_of: impl Fn(char) ->
     end
 }
 
-/// Jet-colormap chip color per cascade stage — the rank reads as a
-/// colorbar: cool blue for the strongest matches, warming through cyan,
-/// green and yellow to red for the weakest path tiers. Pastel rather than
-/// true jet, since every channel stays at or above 127 so the chip's dark
-/// text keeps its contrast in both themes.
-fn rank_tier_color(stage: u8) -> egui::Color32 {
-    match stage {
-        1 => egui::Color32::from_rgb(127, 127, 255), // name exact, exact case
-        2 => egui::Color32::from_rgb(127, 178, 255), // name exact, any case
-        3 => egui::Color32::from_rgb(127, 229, 255), // name substring, exact case
-        4 => egui::Color32::from_rgb(127, 255, 229), // name substring, any case
-        5 => egui::Color32::from_rgb(127, 255, 178), // full text, exact case
-        6 => egui::Color32::from_rgb(127, 255, 127), // full text, any case
-        7 => egui::Color32::from_rgb(178, 255, 127), // fuzzy name
-        8 => egui::Color32::from_rgb(229, 255, 127), // fuzzy full text
-        9 => egui::Color32::from_rgb(255, 229, 127), // path substring, exact case
-        10 => egui::Color32::from_rgb(255, 178, 127), // path substring, any case
-        _ => egui::Color32::from_rgb(255, 127, 127), // fuzzy path
-    }
-}
-
 /// Timestamp color: fresh files get a green tint that fades into the weak
 /// text color over ~2 years on a log scale.
+///
+/// The fade runs through OKLab, so its midpoint looks like a midpoint —
+/// blending sRGB bytes instead dips through a darker, muddier green on the
+/// way to gray.
 fn recency_color(ui: &egui::Ui, mtime: i64) -> egui::Color32 {
     let now = quicksearch_core::log::now_unix() as i64;
     let age_hours = ((now - mtime).max(0) as f32 / 3600.0).max(1.0);
     const HORIZON_HOURS: f32 = 24.0 * 365.0 * 2.0;
     let t = (age_hours.ln() / HORIZON_HOURS.ln()).clamp(0.0, 1.0);
-    let fresh = egui::Color32::from_rgb(87, 187, 122);
-    let old = ui.visuals().weak_text_color();
-    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
-    egui::Color32::from_rgb(
-        lerp(fresh.r(), old.r()),
-        lerp(fresh.g(), old.g()),
-        lerp(fresh.b(), old.b()),
-    )
+    let fresh = crate::color::palette(ui.visuals().dark_mode).green;
+    crate::color::oklab_lerp(fresh, ui.visuals().weak_text_color(), t)
 }
 
 #[cfg(test)]
@@ -2094,41 +2087,21 @@ mod tests {
         }
     }
 
-    /// The rank chips read as a jet colorbar: blue at the best ranks
-    /// warming monotonically to red at the worst, and never so dark that
-    /// the chip's fixed dark text loses its contrast. Stage 12 stands in
-    /// for the catch-all arm.
+    /// The freshness fade ends where the theme's own weak text does, so an
+    /// old file's timestamp is indistinguishable from any other dim label.
+    /// Its colors, and the rank chips' colorbar, are checked in
+    /// [`crate::color`].
     #[test]
-    fn the_rank_ramp_runs_blue_to_red_and_stays_light() {
-        let ramp: Vec<egui::Color32> = (1..=11).map(rank_tier_color).collect();
-        let (first, last) = (ramp[0], ramp[10]);
-        assert!(
-            first.b() > first.r(),
-            "the best rank should be blue: {first:?}"
-        );
-        assert!(
-            last.r() > last.b(),
-            "the worst rank should be red: {last:?}"
-        );
-
-        for pair in ramp.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
-            assert!(a.r() <= b.r(), "red must not cool off: {a:?} then {b:?}");
-            assert!(a.b() >= b.b(), "blue must not warm up: {a:?} then {b:?}");
-        }
-
-        for stage in 1..=12u8 {
-            let c = rank_tier_color(stage);
-            assert!(
-                c.r() >= 127 && c.g() >= 127 && c.b() >= 127,
-                "stage {stage} is too dark for the chip's dark text: {c:?}"
-            );
-        }
-        assert_eq!(
-            rank_tier_color(12),
-            last,
-            "out-of-range stages share the fuzzy-path chip"
-        );
+    fn the_recency_fade_ends_at_the_theme_color() {
+        with_ui(|ui| {
+            let now = quicksearch_core::log::now_unix() as i64;
+            let ancient = recency_color(ui, now - 60 * 60 * 24 * 365 * 20);
+            assert_eq!(ancient, ui.visuals().weak_text_color());
+            // Something written this second is the palette's green, not a
+            // color that merely resembles it.
+            let fresh = recency_color(ui, now);
+            assert_eq!(fresh, crate::color::palette(ui.visuals().dark_mode).green);
+        });
     }
 
     // --- snippet rendering ----------------------------------------------
