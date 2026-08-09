@@ -695,13 +695,26 @@ microseconds regardless of row count.
   allocation counts, measure that separately before concluding a path is cheap,
   and measure the GUI rather than a one-shot `quicksearch-cli` run — a
   short-lived process cannot show what a typing session retains.
-- `.forgejo/workflows/ci.yml`: builds both platforms on every push to `master`
-  and every pull request. To cut a release, bump `[workspace.package] version`
+- `.forgejo/workflows/ci.yml`: builds and tests both platforms on every push to
+  `master` and every pull request. Those runs stop there — packaging (the
+  `.deb`, the AppImage, the tarball, the Windows installer and `.zip`, and the
+  artifact upload) runs only where a release can actually come out, which is a
+  `v*` tag or a `Release...` branch. The Windows non-system-DLL check is
+  deliberately not gated that way: it validates the `.exe` rather than
+  packaging it, so it runs everywhere and catches a regression on `master`
+  rather than at release time.
+
+  To cut a release, bump `[workspace.package] version`
   in `Cargo.toml` and push the commit on a branch named `Release...`; CI runs
   `cargo update -w` first, so a lockfile still pinning the old member versions
   is not something you have to remember. That only re-resolves the workspace
   crates, so the `--locked` build after it still fails on a dependency added or
-  bumped without committing `Cargo.lock`. Once both
+  bumped without committing `Cargo.lock`. Forgetting the version bump is caught
+  in seconds rather than after two full release builds: each release path gets
+  a guard before anything is compiled — a `v*` tag is checked against the
+  workspace version, and a `Release...` branch is checked against the tags that
+  already exist. Both are accelerators, not the authority; the release job
+  re-checks and remains the thing that actually refuses. Once both
   build jobs are green, CI tags that commit `v<version>` and publishes a release
   with the `.deb`, an AppImage and its `.zsync` sidecar, a Linux tarball, the
   Windows installer and a Windows zip attached; pushing a `v*` tag by hand does
