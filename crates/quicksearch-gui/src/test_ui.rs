@@ -101,6 +101,31 @@ pub fn painted_spans(out: &egui::FullOutput) -> Vec<(String, egui::Color32)> {
         .collect()
 }
 
+/// Every styled run painted this frame that has a background behind it, with
+/// that background, in paint order.
+///
+/// The distinguishing mark of a highlighted match: the column headers and the
+/// strong parts of a snippet are painted in the same *text* color, so
+/// [`painted_spans`] alone cannot tell a match from a header.
+pub fn painted_backgrounds(out: &egui::FullOutput) -> Vec<(String, egui::Color32)> {
+    painted_galleys(out)
+        .into_iter()
+        .flat_map(|(g, _)| {
+            g.job
+                .sections
+                .iter()
+                .filter(|s| s.format.background != egui::Color32::TRANSPARENT)
+                .map(|s| {
+                    (
+                        g.job.text[s.byte_range.clone()].to_string(),
+                        s.format.background,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// Every *visible* row of every galley painted this frame, in paint order.
 /// Not the same as [`painted_text`]: a galley's `text()` is the job it was
 /// laid out from, including the rows epaint dropped at `wrap.max_rows` —

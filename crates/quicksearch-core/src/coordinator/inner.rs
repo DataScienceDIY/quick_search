@@ -22,6 +22,12 @@ pub(super) struct Inner {
     pub(super) watcher_rx: Option<mpsc::Receiver<(u64, Result<Watcher, WatchError>)>>,
     pub(super) watcher_gen: u64,
     pub(super) pending: HashMap<PathBuf, FsEvent>,
+    /// Paths a frontend asked for by name — see
+    /// [`IndexCoordinator::update_paths`]. Kept apart from [`Inner::pending`]
+    /// on purpose: this queue survives [`Inner::clear_pending`] and is applied
+    /// in manual mode, because it exists to keep the rows a user is *reading*
+    /// in step with the disk however the indexer is configured.
+    pub(super) targeted: HashMap<PathBuf, FsEvent>,
     /// When the most recent event arrived; the burst is over once this is
     /// `pending_settle` old.
     pub(super) last_event_at: Option<Instant>,
@@ -158,6 +164,36 @@ impl Inner {
                 drop(shared);
                 self.files_at = None;
             }
+            CoordCmd::UpdatePaths(paths) => {
+                // Only paths under an indexed root: the watcher never
+                // delivers anything else, so nothing downstream checks, and
+                // a file renamed *out* of every root would otherwise be
+                // written into the index at its new home. Roots in the same
+                // spelling `files.path` uses — the caller's paths are.
+                let prefixes: Vec<String> = self
+                    .config
+                    .normalized_indexing_paths()
+                    .iter()
+                    .map(|root| crate::file_handling::ExtractCursor::for_root(root).lo)
+                    .collect();
+                for path in paths {
+                    let spelled = path.to_string_lossy();
+                    if !prefixes.iter().any(|lo| spelled.starts_with(lo.as_str())) {
+                        continue;
+                    }
+                    // Existence decides the verb. The caller knows a file
+                    // changed, not what it changed into, and a `Modify` for a
+                    // path that is gone would be silently skipped rather than
+                    // removing the row.
+                    let event = if path.is_file() {
+                        FsEvent::Modify(path)
+                    } else {
+                        FsEvent::Remove(path)
+                    };
+                    enqueue(&mut self.targeted, event);
+                }
+                self.was_busy = true;
+            }
             CoordCmd::Shutdown => unreachable!("handled in run()"),
         }
     }
@@ -196,6 +232,14 @@ impl Inner {
         }
 
         self.refresh_file_count();
+
+        // Ahead of both the reconcile and the mode gate, and ahead of the
+        // settle window the watcher queue waits out: these are rows a user is
+        // looking at right now, there are at most a screenful, and a stopped
+        // indexer is exactly when the frontend most needs them to be current.
+        if !self.targeted.is_empty() {
+            self.apply_targeted();
+        }
 
         // Ahead of the mode gate: a config edit is reconciled in manual mode
         // too.
@@ -467,6 +511,71 @@ impl Inner {
         if self.pending.is_empty() {
             self.pending_since = None;
         }
+    }
+
+    /// Apply the by-name queue: the paths a frontend is displaying.
+    ///
+    /// Shaped like [`Inner::apply_pending`] — removals first, same budget —
+    /// but it never escalates to [`Inner::needs_full_run`]. A frontend reads
+    /// what it shows from the file itself, so a failure here leaves the screen
+    /// correct and only the index behind; reindexing the world over that would
+    /// be wildly out of proportion.
+    fn apply_targeted(&mut self) {
+        self.was_busy = true;
+        let mut conn = match self.ensure_write_conn() {
+            Ok(conn) => conn,
+            Err(e) => {
+                crate::log_warn!("coordinator: targeted update unavailable: {}", e);
+                self.targeted.clear();
+                return;
+            }
+        };
+        let deadline = Instant::now() + APPLY_BUDGET;
+        let chunk = self.config.processing.batch_size.max(1);
+
+        // Removals lead for the same reason they do in `apply_pending`: the
+        // queue is an unordered map, and a rename enqueues both halves.
+        let removals: Vec<PathBuf> = self
+            .targeted
+            .iter()
+            .filter(|(_, ev)| is_removal(ev))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for batch in removals.chunks(chunk) {
+            if let Err(e) = crate::incremental::remove_paths(&mut conn, batch, chunk) {
+                crate::log_warn!("coordinator: targeted remove: {}", e);
+            }
+            for path in batch {
+                self.targeted.remove(path);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+
+        if Instant::now() < deadline {
+            let upserts: Vec<PathBuf> = self
+                .targeted
+                .iter()
+                .filter(|(_, ev)| !is_removal(ev))
+                .map(|(p, _)| p.clone())
+                .collect();
+            for path in upserts {
+                let Some(ev) = self.targeted.remove(&path) else {
+                    continue;
+                };
+                if let Err(e) =
+                    apply_fs_event(&mut conn, &ev, &self.config, &self.ignore, &self.registry)
+                {
+                    crate::log_warn!("coordinator: targeted apply {:?}: {}", ev, e);
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+
+        self.write_conn = Some(conn);
     }
 
     fn ensure_write_conn(&mut self) -> Result<Connection, String> {
@@ -799,7 +908,7 @@ impl Inner {
             );
         let mut shared = crate::lock_ok(&self.shared);
         shared.mode = self.mode;
-        shared.queued_events = self.pending.len();
+        shared.queued_events = self.pending.len() + self.targeted.len();
         shared.reconcile = reconcile;
         drop(shared);
 

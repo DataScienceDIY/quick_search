@@ -41,11 +41,6 @@ impl ExtractedContent {
         }
     }
 
-    pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.properties.insert(key.into(), value.into());
-        self
-    }
-
     /// Convert properties into the `Vec<(String, String)>` shape expected by
     /// [`crate::db::repo::set_content_done`]. Keys are sorted for determinism
     /// in tests and snapshots.
@@ -300,9 +295,9 @@ mod tests {
 
     #[test]
     fn properties_sorted_is_deterministic() {
-        let c = ExtractedContent::with_text("hi")
-            .with_property("b", "2")
-            .with_property("a", "1");
+        let mut c = ExtractedContent::with_text("hi");
+        c.properties.insert("b".into(), "2".into());
+        c.properties.insert("a".into(), "1".into());
         assert_eq!(
             c.properties_sorted(),
             vec![

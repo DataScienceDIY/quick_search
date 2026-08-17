@@ -63,12 +63,6 @@ jobs:
       HOME: /root
       # The highest libc6 version the .deb is allowed to require.
       MAX_GLIBC: '2.35'
-      # full_index.rs asserts a heavy indexing root cannot stall a light one, and
-      # measures that as wall-clock stall. The 100 ms default is calibrated on a
-      # developer machine; this runner measured 188 ms for the same correct
-      # behaviour. 600 ms keeps the check meaningful - the regression it exists to
-      # catch is ~6x the healthy figure, so it would land near 1.2 s here.
-      QSB_STALL_BUDGET_MS: '600'
     steps:
       - uses: actions/checkout@v4
 

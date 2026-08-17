@@ -7,6 +7,7 @@ pub mod extract;
 pub mod file_handling;
 pub mod incremental;
 pub mod indexing;
+pub mod live;
 pub mod log;
 pub mod mime;
 pub mod platform;
@@ -19,6 +20,7 @@ pub mod snippet;
 #[doc(hidden)]
 pub mod testutil;
 pub mod textenc;
+pub mod verify;
 pub mod walk;
 pub mod watcher;
 

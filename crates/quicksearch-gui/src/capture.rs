@@ -82,7 +82,7 @@ pub(crate) struct CaptureDriver {
     /// Screenshot in flight: requested, PNG not yet written.
     shot: Option<PathBuf>,
     rec: Option<Recorder>,
-    /// Match-cell row the pointer is pinned to (`hover_match`), and the
+    /// Content Match cell row the pointer is pinned to (`hover_match`), and the
     /// on-screen position it resolved to on the last rendered frame.
     hover: Option<usize>,
     hover_pos: Option<egui::Pos2>,

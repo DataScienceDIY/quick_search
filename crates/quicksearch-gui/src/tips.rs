@@ -1,5 +1,5 @@
 //! Plain-language tooltips for the configuration controls: every setting in
-//! the Options window, and every configuration control on the Manage Index
+//! the Settings tab, and every configuration control on the Manage Index
 //! tab, explains itself on hover.
 
 /// How wide a tooltip may get; matches `manage_tab::db_size_tooltip`.
@@ -73,7 +73,7 @@ pub fn tip_row(
     ui.end_row();
 }
 
-// --- Options: Paths ------------------------------------------------------
+// --- Settings: Paths ------------------------------------------------------
 
 pub static DATABASE_PATH: Tip = Tip {
     title: "Database file",
@@ -90,7 +90,7 @@ pub static DATABASE_PATH: Tip = Tip {
     caution: None,
 };
 
-// --- Options: Indexing ---------------------------------------------------
+// --- Settings: Indexing ---------------------------------------------------
 
 pub static REINDEX_INTERVAL: Tip = Tip {
     title: "Full reindex every",
@@ -139,7 +139,7 @@ pub static INCLUDE_HIDDEN: Tip = Tip {
     caution: None,
 };
 
-// --- Options: Processing -------------------------------------------------
+// --- Settings: Processing -------------------------------------------------
 
 pub static TOKENIZER: Tip = Tip {
     title: "Tokenizer",
@@ -257,7 +257,7 @@ pub static STORE_TEXT: Tip = Tip {
     caution: None,
 };
 
-// --- Options: Search -----------------------------------------------------
+// --- Settings: Search -----------------------------------------------------
 
 pub static FUZZY_DEFAULT: Tip = Tip {
     title: "Fuzzy search ON by default",
@@ -329,7 +329,43 @@ pub static DEBOUNCE: Tip = Tip {
     caution: None,
 };
 
-// --- Options: Interface --------------------------------------------------
+pub static LIVE_RESULTS: Tip = Tip {
+    title: "Live results",
+    body: "Watches the results currently on screen and updates them as the \
+           files change, so a file you rename or edit in another window does \
+           not sit there showing its old name or its old text.\n\n\
+           Only the rows you can actually see are watched, and every one of \
+           them is dropped the moment you change the search. Nothing is ever \
+           added, removed or re-sorted while you read — a file that stops \
+           matching stays where it is until you search again.",
+    examples: &[
+        "Renames, deletions and edited contents all show up within a second, \
+         whatever the indexer is doing — what a row says is read from the \
+         file, not from the index.",
+        "A row is also checked against the disk as it comes on screen, so one \
+         the index was out of date about puts itself right. That check is all \
+         you get over a network share, where the system does not report other \
+         machines' writes.",
+    ],
+    caution: Some(
+        "The files behind the rows you are looking at are kept up to date in \
+         the index too, even while indexing is stopped. Turn this off if a \
+         stopped index must mean nothing is written at all.",
+    ),
+};
+
+pub static COLUMNS: Tip = Tip {
+    title: "Search columns",
+    body: "Which columns the results table shows. The path is always there — \
+           it is the only column that identifies a result on its own.\n\n\
+           Size and modified date start switched off: the width they take is \
+           usually better spent on the path and the matched text. Turning a \
+           column on also makes it available to sort by.",
+    examples: &["Right-clicking any column header on the Search tab does the same thing."],
+    caution: None,
+};
+
+// --- Settings: Interface --------------------------------------------------
 
 pub static UI_SCALE: Tip = Tip {
     title: "UI scale",
@@ -380,7 +416,7 @@ pub static COLOR_SCHEME: Tip = Tip {
     caution: None,
 };
 
-// --- Options: Security ---------------------------------------------------
+// --- Settings: Security ---------------------------------------------------
 
 pub static ENABLE_PASSWORD: Tip = Tip {
     title: "Enable password protection",
@@ -416,6 +452,21 @@ pub static DISABLE_PASSWORD: Tip = Tip {
     caution: Some(
         "Turning protection off deletes the index and builds it again. Your files are \
          not touched.",
+    ),
+};
+
+pub static SHOW_KEY: Tip = Tip {
+    title: "Show database key",
+    body: "Reveals the raw SQLCipher key the index is encrypted with, once you \
+           have confirmed your password. Tools such as DB Browser for SQLCipher \
+           accept it in the 0x form shown and can then open the index file \
+           directly.\n\n\
+           The key is worked out from your password and the salt in the config \
+           file, so it stays the same until the password changes.",
+    examples: &[],
+    caution: Some(
+        "Anyone holding this key can read the index without the password. Treat a copy \
+         of it as carefully as the password itself.",
     ),
 };
 
@@ -616,6 +667,7 @@ mod tests {
         &ENABLE_PASSWORD,
         &CHANGE_PASSWORD,
         &DISABLE_PASSWORD,
+        &SHOW_KEY,
         &REMEMBER_KEYCHAIN,
         &START_NOW,
         &STOP_INDEXING,

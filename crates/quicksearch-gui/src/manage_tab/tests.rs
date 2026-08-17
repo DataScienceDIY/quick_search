@@ -64,7 +64,7 @@ fn running_state(roots: &[&str], current_file: Option<&str>) -> IndexerState {
                 walked: 100,
                 walk_total: Some(1000),
                 extracted: 0,
-                extract_total: 0,
+                extract_total: None,
                 current_file: current_file.map(str::to_string),
                 active_workers: 4,
                 total_workers: 4,
@@ -304,7 +304,7 @@ fn root_progress(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> 
         walked,
         walk_total,
         extracted: 0,
-        extract_total: 0,
+        extract_total: None,
         current_file: None,
         active_workers: 4,
         total_workers: 4,
@@ -683,7 +683,7 @@ fn the_probe_caches_until_the_refresh_interval_is_up() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A database path edited in Options must not keep showing the old
+/// A database path edited on the Settings tab must not keep showing the old
 /// database's size for the rest of the interval.
 #[test]
 fn the_probe_follows_a_changed_database_path() {
@@ -762,7 +762,7 @@ fn hovering_the_size_explains_how_to_shrink_the_index() {
         "Indexed folders",
         "whitelist",
         "Store text for snippets",
-        "Options",
+        "Settings tab",
     ] {
         assert!(text.contains(lever), "tooltip never mentions {}", lever);
     }

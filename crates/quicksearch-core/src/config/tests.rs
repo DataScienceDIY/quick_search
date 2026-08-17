@@ -985,3 +985,61 @@ fn fuzzy_edits_warning_only_above_the_threshold() {
         assert!(msg.contains(&FUZZY_EDITS_WARN_ABOVE.to_string()));
     }
 }
+
+/// `config_example.toml` is the documentation for every setting, so a key
+/// renamed in the struct and not here would silently ship a config file that
+/// does nothing. Parsing it also proves the `[search.columns]` sub-table is
+/// spelled the way serde expects.
+#[test]
+fn the_documented_example_config_parses_to_the_defaults() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config_example.toml")
+        .canonicalize()
+        .expect("config_example.toml sits at the repository root");
+    let text = std::fs::read_to_string(&path).expect("readable");
+    let parsed: Config = toml::from_str(&text).expect("config_example.toml parses");
+
+    // The example documents the shipped defaults for everything that has one
+    // that does not depend on the machine (paths and the hotkey do).
+    let d = Config::default();
+    assert_eq!(
+        parsed.search, d.search,
+        "[search] drifted from the defaults"
+    );
+    assert_eq!(parsed.processing, d.processing);
+    assert_eq!(parsed.ui.scale, d.ui.scale);
+    assert_eq!(parsed.ui.color_scheme, d.ui.color_scheme);
+    assert_eq!(parsed.ui.tutorial_seen, Some(false));
+}
+
+/// The tour is offered to an installation this version created, and to no
+/// other. A config written before the key existed reads as `None`, which is
+/// how "already found their way around" is distinguished from "brand new".
+#[test]
+fn only_a_freshly_written_config_asks_for_the_tour() {
+    assert_eq!(UiConfig::default().tutorial_seen, Some(false));
+
+    let older: Config = toml::from_str("[ui]\nscale = 1.1\n").expect("parses");
+    assert_eq!(
+        older.ui.tutorial_seen, None,
+        "a config predating the tour must not be offered it"
+    );
+
+    let dismissed: Config = toml::from_str("[ui]\ntutorial_seen = true\n").expect("parses");
+    assert_eq!(dismissed.ui.tutorial_seen, Some(true));
+}
+
+/// Size and modified cost more width than they earn for most searches.
+#[test]
+fn the_search_table_ships_without_size_or_modified() {
+    let cols = ColumnsConfig::default();
+    assert!(cols.name && cols.content_match && cols.rank);
+    assert!(!cols.size, "the size column is on by default");
+    assert!(!cols.modified, "the modified column is on by default");
+
+    // A `[search]` block written before the picker existed still gets them.
+    let older: Config = toml::from_str("[search]\ndisplay_limit = 500\n").expect("parses");
+    assert_eq!(older.search.columns, cols);
+    assert_eq!(older.search.display_limit, 500);
+    assert!(older.search.live_results, "live results default to on");
+}

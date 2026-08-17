@@ -80,6 +80,62 @@ const CANCEL_CHECK_ROWS: usize = 256;
 /// around the match, and the mouseover shows the rest as extended context.
 const SNIPPET_WINDOW_CHARS: usize = 600;
 
+/// The Content Match snippet for one document body, cut exactly as the
+/// full-text passes cut it.
+///
+/// `folded` must be `text` ASCII-lowercased. That fold is byte-length
+/// preserving, which is the whole reason offsets found in it can slice `text`;
+/// the passes hold one reusable fold buffer per scan and hand it in here
+/// rather than paying for a second copy.
+///
+/// Shared so that [`crate::live`], re-cutting a snippet for a file that
+/// changed under a result already on screen, produces the same window the
+/// search itself would — otherwise a row would visibly re-frame its own match
+/// the moment the file was touched.
+pub fn text_snippet(
+    pattern: &crate::query::pattern::TermPattern,
+    text: &str,
+    folded: &str,
+) -> Option<snippet::Snippet> {
+    let opts = snippet::Options {
+        approx_chars: SNIPPET_WINDOW_CHARS,
+    };
+    match pattern.literal() {
+        // Literal terms keep the richer multi-occurrence extract; a wildcard
+        // match marks its own first range.
+        Some(term) => Some(snippet::extract_folded(text, folded, &[term], &opts)),
+        None => pattern.find_first_folded(folded).map(|r| {
+            // A greedy pattern can match megabytes; clamp before the window.
+            let r = clamp_match_range(text, r, SNIPPET_WINDOW_CHARS);
+            snippet::window_around(text, (r.start, r.end), &opts)
+        }),
+    }
+}
+
+/// The fuzzy full-text match in one document body: how many times the term
+/// occurs within the edit budget, and the Content Match window cut around
+/// the first occurrence at the cascade's own width. `None` when it does not
+/// occur at all.
+///
+/// Shared with [`crate::live`] for the same reason as [`text_snippet`]: a
+/// fuzzy row whose file changes has to be re-cut the way it was cut, and
+/// bitap's range is what it was cut around. `bitap` is built once by the
+/// caller — per scan in the pass, per arm in the live watcher — since
+/// building it is the cost, and `folded` must be `text` ASCII-lowercased.
+pub fn fuzzy_snippet(
+    bitap: &crate::search::fuzzy::Bitap,
+    text: &str,
+    folded: &str,
+) -> Option<(usize, snippet::Snippet)> {
+    let opts = snippet::Options {
+        approx_chars: SNIPPET_WINDOW_CHARS,
+    };
+    // `first` is `Some` exactly when `count` is non-zero: it *is* the first
+    // of them.
+    let (count, first) = bitap.count_and_first(folded.as_bytes());
+    first.map(|range| (count, snippet::window_around(text, range, &opts)))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Outcome {
     pub total: usize,

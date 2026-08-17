@@ -2,10 +2,10 @@
 //! produce.
 //!
 //! A shortcut is written in three different vocabularies before it reaches an
-//! operating system: the text in `config.toml` and on the Options button, the
-//! token `global-hotkey` parses for `RegisterHotKey`/`XGrabKey`, and the
-//! xkbcommon keysym name the XDG *shortcuts* specification wants for the
-//! Wayland portal. All three come out of [`KEYS`], so a key cannot be
+//! operating system: the text in `config.toml` and on the Settings tab's
+//! button, the token `global-hotkey` parses for `RegisterHotKey`/`XGrabKey`,
+//! and the xkbcommon keysym name the XDG *shortcuts* specification wants for
+//! the Wayland portal. All three come out of [`KEYS`], so a key cannot be
 //! spelled correctly for one backend and wrongly for the other.
 //!
 //! The config text and the `global-hotkey` token are the same string: every
@@ -103,7 +103,7 @@ const KEYS: &[(Key, &str, &str)] = &[
     (Key::CloseBracket, "BracketRight", "bracketright"),
 ];
 
-/// Escape is reserved: it cancels the Options window's capture, and a
+/// Escape is reserved: it cancels the Settings tab's capture, and a
 /// system-wide Escape would be unusable anyway.
 const RESERVED: &[Key] = &[Key::Escape];
 
@@ -111,7 +111,7 @@ const RESERVED: &[Key] = &[Key::Escape];
 ///
 /// Super/Meta is absent because `egui::Modifiers` has no field for it — egui
 /// reports alt, ctrl, shift and the Mac command key only — so a Super combo
-/// could never be captured in the Options window even if a backend could
+/// could never be captured in the Settings tab even if a backend could
 /// register it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Binding {
@@ -122,7 +122,7 @@ pub struct Binding {
 }
 
 /// Why a string or a key press is not a usable shortcut; the wording is
-/// shown in the Options window.
+/// shown in the Settings tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingError {
     Empty,
@@ -149,7 +149,7 @@ impl fmt::Display for BindingError {
 }
 
 impl Binding {
-    /// Build from a key press egui reported, for the Options window's capture
+    /// Build from a key press egui reported, for the Settings tab's capture
     /// widget. `None` for a press that cannot be a shortcut: a key with no
     /// row in [`KEYS`], a reserved key, or a bare key with no modifier held.
     ///

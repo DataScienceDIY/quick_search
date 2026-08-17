@@ -22,14 +22,15 @@ mod hotkey;
 mod keychain;
 mod logs_tab;
 mod manage_tab;
-mod options;
 mod platform;
 mod query_highlight;
 mod search_tab;
+mod settings_tab;
 #[cfg(test)]
 mod test_ui;
 mod tips;
 mod tracker;
+mod tutorial;
 mod ui_util;
 mod unlock;
 mod version;

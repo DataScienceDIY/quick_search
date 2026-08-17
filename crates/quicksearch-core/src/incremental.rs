@@ -159,25 +159,6 @@ fn remove_path(conn: &mut Connection, path: &Path) -> Result<(), String> {
     remove_paths(conn, std::slice::from_ref(&path.to_path_buf()), 1)
 }
 
-/// Drop removals that a removal of one of their ancestors already covers.
-///
-/// `rm -rf dir/` reports `dir` *and* every file beneath it; removing `dir`
-/// sweeps its whole path range, so each descendant event is duplicate work.
-/// For callers holding a raw removal set — the coordinator collapses on
-/// arrival instead (`collapse_pending_removals`). Containment is
-/// component-wise, per [`crate::file_handling::UnreadableDirs::covers`].
-pub fn collapse_removal_roots(paths: Vec<std::path::PathBuf>) -> Vec<std::path::PathBuf> {
-    if paths.len() < 2 {
-        return paths;
-    }
-    let all: std::collections::HashSet<&Path> = paths.iter().map(|p| p.as_path()).collect();
-    paths
-        .iter()
-        .filter(|p| !p.ancestors().skip(1).any(|a| all.contains(a)))
-        .cloned()
-        .collect()
-}
-
 /// Delete `paths` and everything indexed beneath them, in transactions of at
 /// most `chunk` paths.
 ///
@@ -314,47 +295,6 @@ mod tests {
         }
     }
 
-    fn collapse(paths: &[&str]) -> Vec<String> {
-        let mut out: Vec<String> =
-            collapse_removal_roots(paths.iter().map(std::path::PathBuf::from).collect())
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect();
-        out.sort();
-        out
-    }
-
-    #[test]
-    fn removal_roots_collapse_to_the_shallowest_ancestor() {
-        assert_eq!(
-            collapse(&["/dir", "/dir/a.txt", "/dir/b/c.txt", "/dir/b"]),
-            vec!["/dir"]
-        );
-
-        // Component-wise, so a name-prefix sibling is not swallowed.
-        assert_eq!(
-            collapse(&["/a/b", "/a/bc"]),
-            vec!["/a/b", "/a/bc"],
-            "/a/bc does not live under /a/b"
-        );
-        assert_eq!(
-            collapse(&["/a/b", "/a/b.txt"]),
-            vec!["/a/b", "/a/b.txt"],
-            "a sibling file sorting between a dir and its children survives"
-        );
-
-        // Unrelated removals all survive; order of input does not matter.
-        assert_eq!(
-            collapse(&["/x/deep/f", "/y", "/x"]),
-            vec!["/x", "/y"],
-            "/x/deep/f is covered by /x, /y is independent"
-        );
-
-        // Degenerate inputs.
-        assert!(collapse(&[]).is_empty());
-        assert_eq!(collapse(&["/only"]), vec!["/only"]);
-    }
-
     /// The collapse must not change what ends up deleted — only how much work
     /// it takes to get there.
     #[test]
@@ -378,9 +318,10 @@ mod tests {
             format!("{}/a.txt", canonical_tree).into(),
             format!("{}/deep/b.txt", canonical_tree).into(),
         ];
-        let roots = collapse_removal_roots(reported);
-        assert_eq!(roots.len(), 1, "one range covers the whole tree");
-
+        // Collapsed to its root the way the coordinator collapses an
+        // arriving queue (`collapse_pending_removals`): one range covers the
+        // whole tree, which is what makes `remove_paths` cheap.
+        let roots = vec![reported[0].clone()];
         remove_paths(&mut f.conn, &roots, 200).unwrap();
         assert_eq!(f.counts(), (1, 1, 1), "only tree2 survives");
         let survivor = f.canonical(&f.dir.join("tree2").join("keep.txt"));

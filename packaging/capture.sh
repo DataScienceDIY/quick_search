@@ -68,8 +68,34 @@ auto_index = true
 include_hidden = true
 ignore_patterns = []
 
-# 1.5x zoom + proportionally larger windows (set in the scenario) render the
-# same layout at ~1.5x the pixel density, for crisper website assets.
+[search]
+# Off for the run: on, the watcher arms over the visible rows mid-recording,
+# re-reads them from disk and hands the paths back for reindexing — index
+# writes inside a clip that is supposed to be reproducible.
+live_results = false
+
+[search.columns]
+# Exactly the four the captures are choreographed around: Name, Path, Content
+# Match, Rank. Every one is pinned rather than defaulted — the scenario's
+# window widths are chosen for this column set, and `hover_match` addresses
+# Content Match cells by index, so a shipped default that moved would silently
+# re-frame or break the clips.
+#
+# Path is absent because it is not optional: it is always drawn (see
+# `ColumnsConfig`, which deliberately does not represent it).
+name = true
+content_match = true
+rank = true
+size = false
+modified = false
+
+# 1.25x zoom + proportionally larger windows (set in the scenario) render the
+# same layout at ~1.25x the pixel density, for crisper website assets.
+#
+# No `tutorial_seen` key here, deliberately: absent it deserializes to `None`,
+# which reads as "an installation that upgraded into this version". Writing
+# `false` would open the first-run tour over the first capture and wedge the
+# run.
 [ui]
 scale = 1.25
 EOF

@@ -6,22 +6,48 @@
 //! Every core thread wakes the UI through `ctx.request_repaint()`, which is
 //! what makes polling enough.
 //!
-//! The duplicates scan is the only throwaway thread, and it fires on a user
-//! action, not a timer: a thread per refresh opens its own connection — a
-//! page cache and an allocator arena glibc never gives back.
+//! The duplicates scan and the byte-for-byte verification of one of its
+//! groups are the throwaway threads, and both fire on a user action rather
+//! than a timer: a thread per refresh opens its own connection — a page cache
+//! and an allocator arena glibc never gives back. The verification opens no
+//! connection at all, but it can hold a large group's worth of file handles,
+//! so it carries a cancel flag and shutdown raises it.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use quicksearch_core::config::Config;
 use quicksearch_core::coordinator::IndexCoordinator;
+use quicksearch_core::live::{LiveUpdate, LiveWatcher};
 use quicksearch_core::search::{DuplicateGroup, SearchService, SearchUpdate};
 use quicksearch_core::shutdown;
+use quicksearch_core::verify::{verify_identical, VerifyUpdate};
+
+/// A duplicate group being read through. The thread is detached and owns
+/// nothing the app needs back, so cancelling is just raising the flag: the
+/// worker notices between chunks and drops the receiver's other end.
+pub struct VerifyJob {
+    pub rx: mpsc::Receiver<VerifyUpdate>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl VerifyJob {
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
 
 pub struct Backend {
     pub coordinator: Arc<IndexCoordinator>,
     pub search: Option<SearchService>,
     pub search_rx: mpsc::Receiver<SearchUpdate>,
     pub dup_job: Option<mpsc::Receiver<Result<Vec<DuplicateGroup>, String>>>,
+    pub verify_job: Option<VerifyJob>,
+    /// Watches the results currently on screen; see [`quicksearch_core::live`].
+    /// `None` only after [`Backend::shutdown`].
+    pub live: Option<LiveWatcher>,
+    pub live_rx: mpsc::Receiver<LiveUpdate>,
 }
 
 impl Backend {
@@ -44,12 +70,47 @@ impl Backend {
             Arc::new(move || repaint_ctx.request_repaint()),
         );
 
+        let live_ctx = ctx.clone();
+        let (live, live_rx) = LiveWatcher::start(Arc::new(move || live_ctx.request_repaint()));
+
         Ok(Backend {
             coordinator,
             search: Some(search),
             search_rx,
             dup_job: None,
+            verify_job: None,
+            live: Some(live),
+            live_rx,
         })
+    }
+
+    /// Point the live watcher at the rows currently on screen, or clear it
+    /// with an empty `targets`.
+    pub fn watch_live(
+        &self,
+        query: &str,
+        targets: Vec<quicksearch_core::live::Target>,
+        config: &Config,
+    ) {
+        let Some(live) = &self.live else { return };
+        if targets.is_empty() {
+            live.clear();
+        } else {
+            live.watch(query, targets, config);
+        }
+    }
+
+    /// Ask the coordinator to bring the index in line with these paths — the
+    /// files the live watcher has just read from disk on the frontend's
+    /// behalf, so the index does not drift from what is on screen.
+    pub fn reindex_live_paths(&self, paths: Vec<PathBuf>) {
+        self.coordinator.update_paths(paths);
+    }
+
+    pub fn clear_live(&self) {
+        if let Some(live) = &self.live {
+            live.clear();
+        }
     }
 
     /// `None` only after [`Backend::shutdown`], i.e. during teardown frames.
@@ -70,11 +131,45 @@ impl Backend {
         self.dup_job = Some(rx);
     }
 
+    /// Read a duplicate group through on a worker thread, comparing every
+    /// member against the first byte for byte. Replaces any run already going.
+    pub fn start_verify(&mut self, paths: Vec<PathBuf>, ctx: egui::Context) {
+        if let Some(job) = &self.verify_job {
+            job.cancel();
+        }
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        std::thread::spawn(move || {
+            verify_identical(&paths, &worker_cancel, &mut |update| {
+                // A closed receiver means the app moved on; the cancel flag
+                // is what stops the work, so there is nothing to do here.
+                let _ = tx.send(update);
+                ctx.request_repaint();
+            });
+        });
+        self.verify_job = Some(VerifyJob { rx, cancel });
+    }
+
+    /// Stop a verification and forget it. The worker sees the flag between
+    /// chunks and exits on its own.
+    pub fn cancel_verify(&mut self) {
+        if let Some(job) = self.verify_job.take() {
+            job.cancel();
+        }
+    }
+
     /// Join the search worker and stop the coordinator. Called once from
     /// `on_exit`.
     pub fn shutdown(&mut self) {
+        // Detached and holding open file handles: the flag is what makes a
+        // verification of a slow, large group let go on the way out.
+        self.cancel_verify();
         if let Some(search) = self.search.take() {
             search.shutdown();
+        }
+        if let Some(mut live) = self.live.take() {
+            live.stop();
         }
         self.coordinator.shutdown();
     }

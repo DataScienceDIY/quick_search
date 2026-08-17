@@ -122,8 +122,10 @@ pub fn pattern_edit(
     (response, valid)
 }
 
-/// Middle-elide `text` so it fits `max_width` pixels when laid out in
-/// `font_id`, returning it borrowed and untouched when it already fits.
+/// Where a middle-elide cuts `text` to fit `max_width` pixels in `font_id`:
+/// the byte offset the head keeps up to, and the one the tail resumes from,
+/// with a single `…` standing for everything between. `None` when the whole
+/// string fits and nothing is dropped.
 ///
 /// The budget is in pixels, summed from the font's own glyph advances (the
 /// same numbers egui's layout adds up), not a character count scaled by one
@@ -131,18 +133,20 @@ pub fn pattern_edit(
 /// directions: overshoot and egui elides the result a *second* time,
 /// painting two ellipses; undershoot and the column sits visibly short.
 ///
-/// The borrowed/owned distinction is the caller's signal that something was
-/// dropped, which is what a "full text on hover" tooltip keys off.
-pub fn middle_elide<'a>(
+/// Split out from [`middle_elide`] because a caller that also has *ranges* to
+/// highlight needs the cut itself, not just the shortened string: it renders
+/// the two surviving ends separately so its marks keep the offsets they had
+/// (see `snippet_render::path_cell_job`).
+pub fn middle_elide_cut(
     ui: &egui::Ui,
-    text: &'a str,
+    text: &str,
     max_width: f32,
     font_id: &egui::FontId,
-) -> Cow<'a, str> {
+) -> Option<(usize, usize)> {
     ui.fonts(|f| {
         let width_of = |c: char| f.glyph_width(font_id, c);
         if text.chars().map(width_of).sum::<f32>() <= max_width {
-            return Cow::Borrowed(text);
+            return None;
         }
         let budget = max_width - width_of('…');
 
@@ -178,15 +182,33 @@ pub fn middle_elide<'a>(
         }
         if head >= tail {
             // The two halves met without dropping anything.
-            return Cow::Borrowed(text);
+            return None;
         }
-
-        let mut out = String::with_capacity(head + '…'.len_utf8() + (text.len() - tail));
-        out.push_str(&text[..head]);
-        out.push('…');
-        out.push_str(&text[tail..]);
-        Cow::Owned(out)
+        Some((head, tail))
     })
+}
+
+/// Middle-elide `text` so it fits `max_width` pixels when laid out in
+/// `font_id`, returning it borrowed and untouched when it already fits.
+///
+/// The borrowed/owned distinction is the caller's signal that something was
+/// dropped, which is what a "full text on hover" tooltip keys off.
+pub fn middle_elide<'a>(
+    ui: &egui::Ui,
+    text: &'a str,
+    max_width: f32,
+    font_id: &egui::FontId,
+) -> Cow<'a, str> {
+    match middle_elide_cut(ui, text, max_width, font_id) {
+        None => Cow::Borrowed(text),
+        Some((head, tail)) => {
+            let mut out = String::with_capacity(head + '…'.len_utf8() + (text.len() - tail));
+            out.push_str(&text[..head]);
+            out.push('…');
+            out.push_str(&text[tail..]);
+            Cow::Owned(out)
+        }
+    }
 }
 
 /// Paint a semitransparent down-arrow near the bottom edge of a scroll

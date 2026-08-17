@@ -1,7 +1,9 @@
 //! The Help tab: a quickstart guide for first-time users. The complete
 //! technical reference stays in README.md.
 
-pub fn ui(ui: &mut egui::Ui) {
+/// Returns true when the "Show the introduction again" button was clicked.
+pub fn ui(ui: &mut egui::Ui) -> bool {
+    let mut replay = false;
     let scroll = egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show(ui, |ui| {
@@ -15,6 +17,11 @@ pub fn ui(ui: &mut egui::Ui) {
                 "QuickSearch keeps an index of the folders you choose and finds \
                  files by name and by what is inside them, as you type.",
             );
+
+            ui.add_space(6.0);
+            if ui.button("Show the introduction again").clicked() {
+                replay = true;
+            }
 
             ui.add_space(12.0);
             ui.heading(egui::RichText::new("Getting started").strong());
@@ -44,23 +51,26 @@ pub fn ui(ui: &mut egui::Ui) {
                  words:",
             );
             ui.monospace("type:Document modified:>=2024-01-01 report");
-            ui.label("The ? button next to the search box shows the full query syntax.");
+            ui.label("The ? button left of the search box shows the full query syntax.");
             ui.add_space(6.0);
             ui.label(
                 "•  Tick Fuzzy to also find matches with typos in them, at some \
                  cost in speed.",
             );
             ui.label(
-                "•  Click a column header — Name, Path, Size, Modified, Rank — to \
-                 sort the results; click it again to reverse the order.",
+                "•  Click a column header to sort the results; click it again to \
+                 reverse the order. Right-click any header to choose which \
+                 columns are shown — size and modified date start hidden.",
             );
             ui.label(
                 "•  Right-click a result to open it, open its containing folder, \
                  or hide files like it from the results.",
             );
             ui.label(
-                "•  Matches inside a file's contents show a snippet of the \
-                 surrounding text under the file name.",
+                "•  A match in a file's name or path is highlighted in that \
+                 column; a match in its contents shows a snippet of the \
+                 surrounding text in the Content Match column, with the rest on \
+                 hover.",
             );
 
             ui.add_space(12.0);
@@ -92,7 +102,12 @@ pub fn ui(ui: &mut egui::Ui) {
                         "warnings from indexing and folder watching that a \
                          terminal would have shown",
                     );
-                    row(ui, "⚙ (top right)", "application options");
+                    row(
+                        ui,
+                        "Settings",
+                        "everything QuickSearch can be told to do, in one \
+                         place; hover any control for what it means",
+                    );
                 });
 
             ui.add_space(12.0);
@@ -131,6 +146,7 @@ pub fn ui(ui: &mut egui::Ui) {
             });
         });
     crate::ui_util::more_below_hint(ui, &scroll);
+    replay
 }
 
 /// Where this build left the README: under the install prefix's `share/doc`

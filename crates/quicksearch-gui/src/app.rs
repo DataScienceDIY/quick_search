@@ -1,6 +1,7 @@
 //! Application shell: tab strip, per-frame event drains, debounce,
 //! status bar, and config-change routing.
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -22,8 +23,8 @@ use crate::format::{fmt_interval, group_thousands};
 use crate::keychain;
 use crate::logs_tab::LogsTab;
 use crate::manage_tab::ManageTab;
-use crate::options::{OptionsWindow, SecurityAction};
 use crate::search_tab::SearchTab;
+use crate::settings_tab::{SecurityAction, SettingsTab};
 use crate::unlock::KeySource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,17 @@ pub(crate) enum Tab {
     Duplicates,
     Logs,
     Help,
+    Settings,
+}
+
+/// The editor a tab holds, if it stages its edits on a draft rather than
+/// saving them the moment they change.
+fn tab_editor(tab: Tab) -> Option<UnsavedSource> {
+    match tab {
+        Tab::Manage => Some(UnsavedSource::Manage),
+        Tab::Settings => Some(UnsavedSource::Settings),
+        Tab::Search | Tab::Duplicates | Tab::Logs | Tab::Help => None,
+    }
 }
 
 /// A navigation the unsaved-changes guard put on hold; once nothing relevant
@@ -40,7 +52,6 @@ pub(crate) enum Tab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NavIntent {
     SwitchTab(Tab),
-    CloseOptions,
     Quit,
 }
 
@@ -48,21 +59,30 @@ enum NavIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnsavedSource {
     Manage,
-    Options,
+    Settings,
 }
 
-/// Which editor the guard must ask about for `intent`, if any. Quit asks
-/// about Options before Manage, one prompt at a time: each draft is a full
-/// `Config` snapshot, so applying both at once would revert the first.
+/// The editor `from` holds, if it has one and it is holding unapplied edits.
+fn dirty_editor(from: Tab, manage_dirty: bool, settings_dirty: bool) -> Option<UnsavedSource> {
+    match tab_editor(from)? {
+        UnsavedSource::Manage => manage_dirty.then_some(UnsavedSource::Manage),
+        UnsavedSource::Settings => settings_dirty.then_some(UnsavedSource::Settings),
+    }
+}
+
+/// Which editor the guard must ask about for `intent` while sitting on
+/// `from`, if any. A tab switch asks only about the tab being left; Quit asks
+/// about Settings before Manage, one prompt at a time, because each draft is
+/// a full `Config` snapshot and applying both at once would revert the first.
 fn guard_source(
     intent: NavIntent,
+    from: Tab,
     manage_dirty: bool,
-    options_dirty: bool,
+    settings_dirty: bool,
 ) -> Option<UnsavedSource> {
     match intent {
-        NavIntent::SwitchTab(_) => manage_dirty.then_some(UnsavedSource::Manage),
-        NavIntent::CloseOptions => options_dirty.then_some(UnsavedSource::Options),
-        NavIntent::Quit if options_dirty => Some(UnsavedSource::Options),
+        NavIntent::SwitchTab(_) => dirty_editor(from, manage_dirty, settings_dirty),
+        NavIntent::Quit if settings_dirty => Some(UnsavedSource::Settings),
         NavIntent::Quit if manage_dirty => Some(UnsavedSource::Manage),
         NavIntent::Quit => None,
     }
@@ -78,8 +98,13 @@ fn quit_needs_reconcile_warning(intent: NavIntent, reconciling: bool) -> bool {
 /// Whether leaving the current tab has to go through the unsaved-changes
 /// guard. A navigation already on hold wins: a second intent would replace
 /// the answer the guard is waiting for.
-fn switch_needs_guard(from: Tab, manage_dirty: bool, nav_pending: bool) -> bool {
-    from == Tab::Manage && manage_dirty && !nav_pending
+fn switch_needs_guard(
+    from: Tab,
+    manage_dirty: bool,
+    settings_dirty: bool,
+    nav_pending: bool,
+) -> bool {
+    !nav_pending && dirty_editor(from, manage_dirty, settings_dirty).is_some()
 }
 
 pub struct QuickSearchApp {
@@ -90,9 +115,12 @@ pub struct QuickSearchApp {
     manage: ManageTab,
     dups: DuplicatesTab,
     logs: LogsTab,
-    options: OptionsWindow,
+    settings: SettingsTab,
     /// Set when applying a config that invalidates the stored index.
     rebuild_prompt: Option<Vec<ConfigChange>>,
+    /// The first-start tour, while it is open. Only ever `Some` for a config
+    /// file this version created — see [`crate::tutorial`].
+    tutorial: Option<crate::tutorial::Tutorial>,
     /// Set while the "delete the index?" confirmation is open.
     clear_prompt: bool,
     /// Nested roots found in the loaded config; shown as a modal over the
@@ -112,8 +140,12 @@ pub struct QuickSearchApp {
     /// Set when the watcher gave up on the directory budget and live
     /// updates are off.
     watch_cap_prompt: Option<WatchError>,
+    /// The byte-for-byte check of one duplicate group, while its modal is up.
+    verify: Option<VerifyModal>,
     /// In-flight security flow (enable/disable/change password).
     security_prompt: Option<SecurityPrompt>,
+    /// In-flight show-key flow (confirm password, then reveal).
+    key_prompt: Option<KeyPrompt>,
     /// A navigation held by the unsaved-changes guard; see [`NavIntent`].
     pending_nav: Option<NavIntent>,
     /// The guard resolved a Quit: let the next close request through.
@@ -129,8 +161,10 @@ mod security;
 mod status_bar;
 #[cfg(test)]
 mod tests;
+mod verify;
 
-use security::SecurityPrompt;
+use security::{KeyPrompt, SecurityPrompt};
+use verify::VerifyModal;
 
 impl QuickSearchApp {
     /// `initial_query` pre-fills the search box and fires a search on the
@@ -178,7 +212,12 @@ impl QuickSearchApp {
         } else {
             (Tab::Manage, Some(nested))
         };
-        let mut search = SearchTab::new(fuzzy);
+        // `Some(false)` means a config file *this version wrote*, which is
+        // the only thing that counts as a first start. A key that is absent
+        // (`None`) belongs to an installation that upgraded into this version
+        // and has already found its way around.
+        let tutorial = (cfg.ui.tutorial_seen == Some(false)).then(crate::tutorial::Tutorial::new);
+        let mut search = SearchTab::new(fuzzy, cfg.search.columns.clone(), cfg.search.live_results);
         if let Some(query) = initial_query {
             search.seed(query);
         }
@@ -190,8 +229,9 @@ impl QuickSearchApp {
             manage: ManageTab::new(),
             dups: DuplicatesTab::new(),
             logs: LogsTab::new(),
-            options: OptionsWindow::new(),
+            settings: SettingsTab::new(),
             rebuild_prompt: None,
+            tutorial,
             clear_prompt: false,
             nested_prompt,
             key_source,
@@ -199,7 +239,9 @@ impl QuickSearchApp {
             reconcile_owed,
             reconcile_owed_since,
             watch_cap_prompt: None,
+            verify: None,
             security_prompt: None,
+            key_prompt: None,
             pending_nav: None,
             quit_confirmed: false,
             config_error,
@@ -222,6 +264,10 @@ impl QuickSearchApp {
         let Some(search) = self.backend.search() else {
             return;
         };
+        // The single funnel every search goes through — the debounce, `seed`,
+        // and every `actions.rerun` producer — so it is the one place the old
+        // results' watches have to be dropped.
+        self.backend.clear_live();
         let generation = search.search(&self.search.query, self.search_options());
         self.search.on_search_started(generation);
     }
@@ -230,6 +276,32 @@ impl QuickSearchApp {
         self.dups.state = DupState::Loading;
         let cfg = self.cfg.clone();
         self.backend.start_duplicates(&cfg, ctx.clone());
+    }
+
+    /// Move to another tab, running what leaving one tab and arriving at the
+    /// other owe. Every switch goes through here — including the ones the
+    /// unsaved-changes guard completes a frame later, which is why this is a
+    /// funnel rather than a comparison against the previous frame's tab.
+    fn switch_tab(&mut self, ctx: &egui::Context, to: Tab) {
+        if self.tab == to {
+            return;
+        }
+        match self.tab {
+            // Watching rows nobody is looking at costs descriptors for
+            // nothing.
+            Tab::Search => {
+                self.backend.clear_live();
+                self.search.reset_live();
+            }
+            // A draft kept while the config is edited elsewhere would go
+            // stale, and applying it later would revert those edits.
+            Tab::Settings => self.settings.discard(),
+            _ => {}
+        }
+        self.tab = to;
+        if to == Tab::Duplicates {
+            self.start_duplicates_scan(ctx);
+        }
     }
 
     /// Save + route an edited config to the running services. Reports
@@ -290,6 +362,16 @@ impl QuickSearchApp {
                 self.rebuild_prompt = Some(changes);
             }
         }
+        self.search.live_enabled = new.search.live_results;
+        if new.search.live_results {
+            // The watcher holds a copy of the config for its extraction
+            // limits and filters, so a config edit has to re-arm; dropping
+            // the tab-side state is what makes the next frame do it.
+            self.search.reset_live();
+        } else {
+            self.backend.clear_live();
+            self.search.reset_live();
+        }
         self.cfg = new;
         true
     }
@@ -297,18 +379,23 @@ impl QuickSearchApp {
     /// What the system-wide search shortcut does once the window is up:
     /// show the Search tab with the caret in the query box and any existing
     /// text selected.
-    pub(crate) fn activate_search(&mut self) {
-        if switch_needs_guard(self.tab, self.manage.is_dirty(), self.pending_nav.is_some()) {
+    pub(crate) fn activate_search(&mut self, ctx: &egui::Context) {
+        if switch_needs_guard(
+            self.tab,
+            self.manage.is_dirty(),
+            self.settings.is_dirty(&self.cfg),
+            self.pending_nav.is_some(),
+        ) {
             self.pending_nav = Some(NavIntent::SwitchTab(Tab::Search));
         } else {
-            self.tab = Tab::Search;
+            self.switch_tab(ctx, Tab::Search);
         }
         self.search.request_focus();
     }
 
-    /// Whether the Options window is currently reading a key press to bind.
+    /// Whether the Settings tab is currently reading a key press to bind.
     pub(crate) fn capturing_hotkey(&self) -> bool {
-        self.options.capturing_hotkey()
+        self.tab == Tab::Settings && self.settings.capturing_hotkey()
     }
 
     /// Switch the indexing mode and write it to the config immediately: a
@@ -334,6 +421,21 @@ impl QuickSearchApp {
             self.search
                 .apply_update(update, self.cfg.search.display_limit);
         }
+        // Every live update is something the watcher read off the disk that
+        // the index has not been told about. Handing the paths back keeps the
+        // index from drifting away from the rows on screen — and it is the
+        // only thing that does so while indexing is stopped.
+        let mut touched: Vec<PathBuf> = Vec::new();
+        while let Ok(update) = self.backend.live_rx.try_recv() {
+            touched.push(PathBuf::from(update.path()));
+            // A rename has two sides: the old path leaves the index and the
+            // new one enters it.
+            if let quicksearch_core::live::LiveUpdate::Renamed { to, .. } = &update {
+                touched.push(PathBuf::from(to));
+            }
+            self.search.apply_live(update);
+        }
+        self.backend.reindex_live_paths(touched);
         // Duplicates worker.
         if let Some(rx) = &self.backend.dup_job {
             use std::sync::mpsc::TryRecvError;
@@ -350,6 +452,7 @@ impl QuickSearchApp {
                 self.backend.dup_job = None;
             }
         }
+        self.drain_verify();
     }
 
     fn tick_debounce(&mut self, ctx: &egui::Context) {
@@ -389,7 +492,7 @@ impl QuickSearchApp {
     }
 
     pub(crate) fn capture_search_settled(&self) -> bool {
-        self.search.capture_settled()
+        self.search.settled()
     }
 
     pub(crate) fn capture_dups_done(&self) -> bool {
@@ -419,6 +522,12 @@ impl QuickSearchApp {
 pub(crate) fn pin_live_fields(new: &mut Config, live: &Config) {
     new.security = live.security.clone();
     new.indexing.auto_index = live.indexing.auto_index;
+    // The column picker writes straight to the live config the moment a
+    // checkbox moves — from the table header *or* from the Settings tab,
+    // which is why the Settings controls for it are not draft-backed. Pinning
+    // here is what stops a draft taken before a header-menu change from
+    // undoing it on Apply.
+    new.search.columns = live.search.columns.clone();
 }
 
 /// Keep the configured UI scale within sane, recoverable bounds.
@@ -448,7 +557,8 @@ pub(crate) fn apply_theme(ctx: &egui::Context, setting: &str) {
 
 impl eframe::App for QuickSearchApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // First, so `previous_tab` below sees pre-navigation state.
+        // First, so a scripted navigation is held before the tab strip reads
+        // this frame's state.
         #[cfg(feature = "capture")]
         self.capture_tick(ctx);
 
@@ -461,7 +571,7 @@ impl eframe::App for QuickSearchApp {
         if ctx.input(|i| i.viewport().close_requested())
             && !self.quit_confirmed
             && (self.manage.is_dirty()
-                || self.options.is_dirty(&self.cfg)
+                || self.settings.is_dirty(&self.cfg)
                 || self.backend.coordinator.reconciling())
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -471,7 +581,6 @@ impl eframe::App for QuickSearchApp {
 
         self.status_bar(ctx);
 
-        let previous_tab = self.tab;
         // Tab clicks land on a local first so the unsaved-changes guard can
         // hold them.
         let mut requested = self.tab;
@@ -482,30 +591,20 @@ impl eframe::App for QuickSearchApp {
                 ui.selectable_value(&mut requested, Tab::Duplicates, "Duplicates");
                 ui.selectable_value(&mut requested, Tab::Logs, "Logs");
                 ui.selectable_value(&mut requested, Tab::Help, "Help");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⚙").on_hover_text("Options").clicked() {
-                        if !self.options.open {
-                            self.options.open_with(&self.cfg);
-                        } else if self.options.is_dirty(&self.cfg) {
-                            if self.pending_nav.is_none() {
-                                self.pending_nav = Some(NavIntent::CloseOptions);
-                            }
-                        } else {
-                            self.options.close_discard();
-                        }
-                    }
-                });
+                ui.selectable_value(&mut requested, Tab::Settings, "Settings");
             });
         });
         if requested != self.tab {
-            if switch_needs_guard(self.tab, self.manage.is_dirty(), self.pending_nav.is_some()) {
+            if switch_needs_guard(
+                self.tab,
+                self.manage.is_dirty(),
+                self.settings.is_dirty(&self.cfg),
+                self.pending_nav.is_some(),
+            ) {
                 self.pending_nav = Some(NavIntent::SwitchTab(requested));
             } else {
-                self.tab = requested;
+                self.switch_tab(ctx, requested);
             }
-        }
-        if self.tab == Tab::Duplicates && previous_tab != Tab::Duplicates {
-            self.start_duplicates_scan(ctx);
         }
 
         if let Some(err) = &self.config_error {
@@ -533,12 +632,27 @@ impl eframe::App for QuickSearchApp {
                         self.config_error = Some(e);
                     }
                 }
+                // Live state, saved the moment it changes — like the fuzzy
+                // default above, and unlike anything edited through the
+                // Settings draft. The Settings tab's own column controls take
+                // this same path, so the two editors cannot disagree and a
+                // stale draft cannot revert either of them.
+                if let Some(columns) = actions.save_columns {
+                    self.cfg.search.columns = columns;
+                    if let Err(e) = self.cfg.save() {
+                        self.config_error = Some(e);
+                    }
+                }
                 if let Some(pattern) = actions.persist_ignore {
                     let mut new_cfg = self.cfg.clone();
                     if !new_cfg.indexing.ignore_patterns.contains(&pattern) {
                         new_cfg.indexing.ignore_patterns.push(pattern);
                         self.apply_new_config(ctx, new_cfg);
                     }
+                }
+                if let Some(targets) = actions.live_targets {
+                    self.backend
+                        .watch_live(&self.search.query, targets, &self.cfg);
                 }
                 if actions.rerun {
                     self.start_search();
@@ -571,32 +685,54 @@ impl eframe::App for QuickSearchApp {
                 }
             }
             Tab::Duplicates => {
-                let actions = self.dups.ui(ui);
+                let actions = self.dups.ui(ui, self.verify.is_some());
                 if actions.refresh {
                     self.start_duplicates_scan(ctx);
                 }
+                if let Some(paths) = actions.verify {
+                    let paths: Vec<std::path::PathBuf> =
+                        paths.into_iter().map(std::path::PathBuf::from).collect();
+                    self.backend.start_verify(paths.clone(), ctx.clone());
+                    self.verify = Some(VerifyModal::new(paths));
+                }
             }
             Tab::Logs => self.logs.ui(ui),
-            Tab::Help => crate::help_tab::ui(ui),
+            Tab::Help => {
+                if crate::help_tab::ui(ui) {
+                    self.show_tutorial();
+                }
+            }
+            Tab::Settings => {
+                let out = self.settings.ui(ui, &self.cfg);
+                if let Some(new_cfg) = out.applied {
+                    self.apply_new_config(ctx, new_cfg);
+                }
+                if let Some(action) = out.security {
+                    self.handle_security_action(action);
+                }
+                // Same live path the table header's picker takes, so the two
+                // controls stay in step and neither needs an Apply.
+                if let Some(columns) = out.columns {
+                    self.cfg.search.columns = columns.clone();
+                    self.search.columns = columns;
+                    self.search.mark_sort_dirty();
+                    if let Err(e) = self.cfg.save() {
+                        self.config_error = Some(e);
+                    }
+                }
+            }
         });
 
-        let options_out = self.options.ui(ctx, &self.cfg);
-        if let Some(new_cfg) = options_out.applied {
-            self.apply_new_config(ctx, new_cfg);
-        }
-        if let Some(action) = options_out.security {
-            self.handle_security_action(action);
-        }
-        if options_out.close_requested && self.pending_nav.is_none() {
-            self.pending_nav = Some(NavIntent::CloseOptions);
-        }
         self.rebuild_prompt_ui(ctx);
         self.security_prompt_ui(ctx);
+        self.key_prompt_ui(ctx);
         self.clear_prompt_ui(ctx);
         self.nested_prompt_ui(ctx);
         // Ahead of the watch-cap warning: on a fresh upgrade both can be true.
         self.stale_index_prompt_ui(ctx);
         self.watch_cap_prompt_ui(ctx);
+        self.verify_modal_ui(ctx);
+        self.tutorial_ui(ctx);
         // Last: the guard must sit above everything else on screen.
         self.unsaved_prompt_ui(ctx);
     }

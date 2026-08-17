@@ -490,26 +490,6 @@ pub fn release_free_heap() {
     // spans to the kernel on free.
 }
 
-/// Live and free-but-retained heap bytes, as `(in_use, free)`: `free` is
-/// memory already given back to the allocator that glibc still charges the
-/// process for. `None` where the platform has no way to answer.
-pub fn heap_stats() -> Option<(u64, u64)> {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        // `mallinfo2`, not `mallinfo`: the older struct is `int`-typed and
-        // silently wraps past 2 GiB, which is exactly the size where the
-        // answer starts to matter.
-        //
-        // SAFETY: no arguments, returns a plain struct by value.
-        let info = unsafe { libc::mallinfo2() };
-        Some((info.uordblks as u64, info.fordblks as u64))
-    }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-    {
-        None
-    }
-}
-
 /// How long to keep retrying a delete that fails because something else holds
 /// the file open.
 #[cfg(windows)]

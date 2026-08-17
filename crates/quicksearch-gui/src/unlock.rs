@@ -72,12 +72,12 @@ impl Gate {
             return;
         }
         if let Gate::Running(app) = self {
-            // The Options window is waiting for a key press to bind; the
-            // shortcut must not reshuffle the window underneath that dialog.
+            // The Settings tab is waiting for a key press to bind; the
+            // shortcut must not reshuffle the window underneath it.
             if app.capturing_hotkey() {
                 return;
             }
-            app.activate_search();
+            app.activate_search(ctx);
         }
         crate::hotkey::raise(ctx, frame);
     }

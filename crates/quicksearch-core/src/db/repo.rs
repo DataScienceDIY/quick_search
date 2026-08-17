@@ -217,6 +217,85 @@ pub fn set_content_done(
     set_state_clearing_failure(tx, file_id, STATE_DONE, "update DONE")
 }
 
+/// Reusable decode buffer and decompression context for the readers of
+/// `documents_text` — the read side's mirror of [`DocEncoder`].
+///
+/// Shared by the cascade's full-text passes and by [`crate::live`], which
+/// re-reads one row's body when a file under a visible result changes.
+///
+/// `zstd::decode_all` builds and tears down a `ZSTD_DCtx` *and* allocates a
+/// fresh output `Vec` on every call, and it is called once per candidate row.
+/// One context and one buffer, reused across a whole scan, make that a
+/// per-scan cost instead of a per-row one.
+pub struct DocDecoder {
+    dctx: zstd::bulk::Decompressor<'static>,
+    buf: Vec<u8>,
+}
+
+/// Where [`DocDecoder::decode`]'s buffer starts before it has seen a document.
+/// Most extracted text is well under this, so the doubling below rarely runs.
+const INITIAL_DOC_CAPACITY: usize = 64 * 1024;
+
+/// Where the doubling stops. Stored text is capped at
+/// `processing.maximum_text_size` (256 KiB by default), so this is far above
+/// any legitimate document even if that setting is raised — past it, a failure
+/// is a corrupt frame rather than a buffer that is too small.
+const MAX_DOC_CAPACITY: usize = 64 * 1024 * 1024;
+
+impl DocDecoder {
+    pub fn new() -> Result<Self, String> {
+        Ok(DocDecoder {
+            dctx: zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?,
+            buf: Vec::new(),
+        })
+    }
+
+    /// Decompress `blob` and borrow the result as text.
+    ///
+    /// Returns `None` for a corrupt frame or non-UTF-8 content. Nothing is
+    /// copied: the indexer stores UTF-8, so the bytes are borrowed in place
+    /// rather than run through `String::from_utf8_lossy(..).into_owned()`,
+    /// which duplicated the whole document even when it was already valid.
+    pub fn decode(&mut self, blob: &[u8]) -> Option<&str> {
+        self.buf.clear();
+        // `decompress_to_buffer` writes into spare capacity and fails rather
+        // than growing, so the room has to be there first.
+        //
+        // The frame header would say how much is needed, but the indexer
+        // writes with `zstd::encode_all`, which is *stream*-based and so
+        // records no content size — `get_frame_content_size` says `None` for
+        // every row this ever sees. Falling back to `zstd::decode_all` there
+        // looked harmless and was not: it builds a streaming decoder per call,
+        // which measured as one ~2.4 MiB allocation per document and 27 of the
+        // 30 GiB a fuzzy search moved through the allocator.
+        //
+        // So grow this buffer instead and keep reusing it. It settles at the
+        // largest document in the scan within the first few rows, after which
+        // decoding a row allocates nothing at all.
+        if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(blob) {
+            self.buf.reserve(usize::try_from(size).ok()?);
+        }
+        loop {
+            if self.buf.capacity() == 0 {
+                self.buf.reserve(INITIAL_DOC_CAPACITY);
+            }
+            match self.dctx.decompress_to_buffer(blob, &mut self.buf) {
+                Ok(_) => break,
+                // Too small, or corrupt — the bulk API cannot tell us which.
+                // Growing is only worth trying while the buffer is still
+                // smaller than any document could legitimately be.
+                Err(_) if self.buf.capacity() < MAX_DOC_CAPACITY => {
+                    let bigger = self.buf.capacity().saturating_mul(2);
+                    self.buf.clear();
+                    self.buf.reserve(bigger);
+                }
+                Err(_) => return None,
+            }
+        }
+        std::str::from_utf8(&self.buf).ok()
+    }
+}
+
 /// Level 3 hits ~3-5× on English prose at high throughput (hundreds of
 /// MB/s); level 9+ would shave a few percent more at 10× the CPU cost, and
 /// readers decompress far faster than writers compress.

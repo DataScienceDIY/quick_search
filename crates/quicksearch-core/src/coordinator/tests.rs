@@ -505,6 +505,149 @@ fn a_run_it_schedules_itself_wakes_the_frontend() {
     coord.shutdown();
 }
 
+// --- targeted updates (see `IndexCoordinator::update_paths`) --------------
+
+impl Fixture {
+    /// The `mtime` the index holds for one path, or `None` if it has no row.
+    fn stored_mtime(&self, path: &std::path::Path) -> Option<i64> {
+        let conn = db::open_existing(&self.db.to_string_lossy(), false).ok()?;
+        conn.query_row(
+            "SELECT mtime FROM files WHERE path = ?1",
+            [path.to_string_lossy().as_ref()],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+}
+
+/// The point of the whole thing: the frontend has just read a file the user is
+/// looking at, and the index catches up even though indexing is stopped — with
+/// no watcher running and no full run scheduled.
+#[test]
+fn update_paths_indexes_one_file_with_indexing_stopped() {
+    let f = Fixture::new(false);
+    std::fs::write(f.dir.join("seed.txt"), "initial content").unwrap();
+    f.seed_index();
+    assert_eq!(f.file_count(), 1);
+
+    let coord = start_coord(f.config.clone());
+    let added = f.dir.join("added.txt");
+    std::fs::write(&added, "written while indexing was stopped").unwrap();
+    coord.update_paths(vec![added.clone()]);
+
+    wait_for("targeted insert", Duration::from_secs(20), || {
+        f.stored_mtime(&added).is_some()
+    });
+    assert_eq!(
+        coord.state().mode,
+        IndexMode::ManualStopped,
+        "a targeted update started a run"
+    );
+    assert!(
+        coord.state().last_full_index.is_some(),
+        "the seed stamp was disturbed"
+    );
+    coord.shutdown();
+}
+
+/// The same call is how a row is *validated*: submitting a path the index
+/// already agrees with must not rewrite it, which is what makes it cheap
+/// enough for the frontend to submit whatever it just looked at.
+#[test]
+fn update_paths_leaves_a_row_that_already_agrees_alone() {
+    let f = Fixture::new(false);
+    let file = f.dir.join("steady.txt");
+    std::fs::write(&file, "unchanged").unwrap();
+    f.seed_index();
+    let before = f.stored_mtime(&file).expect("seeded");
+
+    let coord = start_coord(f.config.clone());
+    coord.update_paths(vec![file.clone()]);
+    // No state change to wait on, so wait out a few ticks instead.
+    std::thread::sleep(Duration::from_secs(3));
+
+    assert_eq!(f.stored_mtime(&file), Some(before));
+    assert_eq!(f.file_count(), 1);
+    coord.shutdown();
+}
+
+/// A path outside every indexed root is not the index's to hold, however it
+/// was submitted: a result renamed into an un-indexed folder must not follow
+/// the row into the index at its new home.
+#[test]
+fn update_paths_ignores_a_path_outside_every_root() {
+    let f = Fixture::new(false);
+    std::fs::write(f.dir.join("seed.txt"), "initial content").unwrap();
+    f.seed_index();
+    assert_eq!(f.file_count(), 1);
+
+    // A sibling of the indexed tree, under the same scratch parent.
+    let outside = f.dir.parent().unwrap().join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    let stray = outside.join("moved-here.txt");
+    std::fs::write(&stray, "renamed out of the index").unwrap();
+
+    let coord = start_coord(f.config.clone());
+    coord.update_paths(vec![stray.clone()]);
+    std::thread::sleep(Duration::from_secs(3));
+
+    assert_eq!(
+        f.stored_mtime(&stray),
+        None,
+        "an un-indexed folder gained a row"
+    );
+    assert_eq!(f.file_count(), 1);
+    coord.shutdown();
+    std::fs::remove_dir_all(&outside).ok();
+}
+
+/// A row whose file has gone leaves the index too — the frontend hands over
+/// the path, not a verb, so the coordinator decides from what is on disk.
+#[test]
+fn update_paths_removes_a_row_whose_file_is_gone() {
+    let f = Fixture::new(false);
+    let file = f.dir.join("doomed.txt");
+    std::fs::write(&file, "not for long").unwrap();
+    f.seed_index();
+    assert!(f.stored_mtime(&file).is_some());
+
+    let coord = start_coord(f.config.clone());
+    std::fs::remove_file(&file).unwrap();
+    coord.update_paths(vec![file.clone()]);
+
+    wait_for("targeted remove", Duration::from_secs(20), || {
+        f.stored_mtime(&file).is_none()
+    });
+    coord.shutdown();
+}
+
+/// The single-writer rule still holds: a targeted update submitted while a
+/// full run owns the database waits for it rather than opening a second
+/// writer beside it.
+#[test]
+fn update_paths_waits_for_a_full_run_rather_than_racing_it() {
+    let f = Fixture::new(false);
+    for i in 0..400 {
+        std::fs::write(f.dir.join(format!("f{i}.txt")), "body").unwrap();
+    }
+    let coord = start_coord(f.config.clone());
+    coord.reindex_now();
+
+    let added = f.dir.join("late.txt");
+    std::fs::write(&added, "submitted mid-run").unwrap();
+    coord.update_paths(vec![added.clone()]);
+
+    wait_for("run finished", Duration::from_secs(60), || {
+        coord.state().last_full_index.is_some()
+    });
+    wait_for(
+        "targeted insert after the run",
+        Duration::from_secs(20),
+        || f.stored_mtime(&added).is_some(),
+    );
+    coord.shutdown();
+}
+
 #[test]
 fn auto_mode_runs_initial_index_and_applies_watcher_events() {
     let f = Fixture::new(true);

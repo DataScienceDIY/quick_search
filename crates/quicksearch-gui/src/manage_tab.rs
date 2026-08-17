@@ -434,7 +434,7 @@ impl ManageTab {
 
                 ui.label(hint(
                     "Reindex interval, symlinks, hidden files, tokenizer, and size \
-                     limits are in Options (⚙ in the toolbar).",
+                     limits are on the Settings tab.",
                 ));
                 ui.add_space(8.0);
 
@@ -542,10 +542,10 @@ fn db_size_tooltip(ui: &mut egui::Ui) {
         "Remove indexed folders you do not need, in Indexed folders above.",
         "Narrow the full-text extension whitelist, so text is only extracted \
          from the file types you actually search.",
-        "Turn off \"Store text for snippets\" in Options: full-text search keeps \
-         working, but without previews, occurrence ranking or fuzzy matching \
+        "Turn off \"Store text for snippets\" on the Settings tab: full-text search \
+         keeps working, but without previews, occurrence ranking or fuzzy matching \
          inside file contents.",
-        "Lower \"Max text file size\" and \"Max stored text\" in Options.",
+        "Lower \"Max text file size\" and \"Max stored text\", both on the Settings tab.",
     ] {
         ui.label(format!("•  {}", lever));
     }
@@ -809,20 +809,34 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
             RootPhase::Extracting => {
                 ui.label(egui::RichText::new("extracting text").color(phase.green));
                 divider(ui);
-                let frac = if r.extract_total > 0 {
-                    (r.extracted as f32 / r.extract_total as f32).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                ui.label(format!(
-                    "{} / {} ({:.0}%) · {}/{} workers",
-                    group_thousands(r.extracted as u64),
-                    group_thousands(r.extract_total as u64),
-                    frac * 100.0,
-                    r.active_workers,
-                    r.total_workers
-                ));
-                crate::ui_util::progress_bar(ui, Some(frac), 160.0);
+                let workers = format!("{}/{} workers", r.active_workers, r.total_workers);
+                match r.extract_total {
+                    Some(total) => {
+                        let frac = if total > 0 {
+                            (r.extracted as f32 / total as f32).clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        ui.label(format!(
+                            "{} / {} ({:.0}%) · {}",
+                            group_thousands(r.extracted as u64),
+                            group_thousands(total as u64),
+                            frac * 100.0,
+                            workers
+                        ));
+                        crate::ui_util::progress_bar(ui, Some(frac), 160.0);
+                    }
+                    // The pass is still counting its range — the same shape
+                    // as a walk without a denominator yet.
+                    None => {
+                        ui.label(format!(
+                            "{} files · {}",
+                            group_thousands(r.extracted as u64),
+                            workers
+                        ));
+                        crate::ui_util::progress_bar(ui, None, 160.0);
+                    }
+                }
             }
             RootPhase::Done => {
                 // Whole-root totals: `walked` counts every file the walk saw

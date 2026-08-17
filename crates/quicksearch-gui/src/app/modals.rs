@@ -84,7 +84,7 @@ impl QuickSearchApp {
         });
         if close == Some(true) {
             self.nested_prompt = None;
-            self.tab = Tab::Manage;
+            self.switch_tab(ctx, Tab::Manage);
         }
     }
 
@@ -187,6 +187,29 @@ impl QuickSearchApp {
         }
     }
 
+    /// The first-start tour. Dismissal is written straight to the config, the
+    /// way the fuzzy default is — not through the Settings draft, which this
+    /// has nothing to do with.
+    pub(super) fn tutorial_ui(&mut self, ctx: &egui::Context) {
+        let Some(tour) = &mut self.tutorial else {
+            return;
+        };
+        let roots = self.cfg.paths.indexing_paths.clone();
+        if tour.ui(ctx, &roots) {
+            self.tutorial = None;
+            self.cfg.ui.tutorial_seen = Some(true);
+            if let Err(e) = self.cfg.save() {
+                self.config_error = Some(e);
+            }
+        }
+    }
+
+    /// Re-open the tour from the Help tab. Nothing is written until it is
+    /// dismissed again, so a re-read costs the config nothing.
+    pub(crate) fn show_tutorial(&mut self) {
+        self.tutorial = Some(crate::tutorial::Tutorial::new());
+    }
+
     pub(super) fn clear_prompt_ui(&mut self, ctx: &egui::Context) {
         if !self.clear_prompt {
             return;
@@ -225,8 +248,10 @@ impl QuickSearchApp {
         let Some(intent) = self.pending_nav else {
             return;
         };
-        let dirty = (self.manage.is_dirty(), self.options.is_dirty(&self.cfg));
-        let Some(source) = guard_source(intent, dirty.0, dirty.1) else {
+        let dirty = (self.manage.is_dirty(), self.settings.is_dirty(&self.cfg));
+        // `self.tab` is the tab being left: the switch itself is what the
+        // intent is holding back.
+        let Some(source) = guard_source(intent, self.tab, dirty.0, dirty.1) else {
             // Inside the guard: the Discard-then-quit path sets
             // `quit_confirmed` and never returns to the close-request check,
             // so a warning living only there would be skipped.
@@ -249,7 +274,7 @@ impl QuickSearchApp {
             Some(UnsavedChoice::Cancel) => self.pending_nav = None,
             Some(UnsavedChoice::Discard) => match source {
                 UnsavedSource::Manage => self.manage.discard(),
-                UnsavedSource::Options => self.options.close_discard(),
+                UnsavedSource::Settings => self.settings.discard(),
             },
             Some(UnsavedChoice::Apply) => {
                 let ok = match source {
@@ -263,11 +288,11 @@ impl QuickSearchApp {
                         }
                         None => true,
                     },
-                    UnsavedSource::Options => match self.options.draft_config() {
+                    UnsavedSource::Settings => match self.settings.draft_config() {
                         Some(cfg) => {
                             let ok = self.apply_new_config(ctx, cfg);
                             if ok {
-                                self.options.close_discard();
+                                self.settings.discard();
                             }
                             ok
                         }
@@ -287,14 +312,7 @@ impl QuickSearchApp {
     pub(super) fn complete_nav(&mut self, ctx: &egui::Context, intent: NavIntent) {
         self.pending_nav = None;
         match intent {
-            NavIntent::SwitchTab(tab) => {
-                let was = self.tab;
-                self.tab = tab;
-                if tab == Tab::Duplicates && was != Tab::Duplicates {
-                    self.start_duplicates_scan(ctx);
-                }
-            }
-            NavIntent::CloseOptions => self.options.close_discard(),
+            NavIntent::SwitchTab(tab) => self.switch_tab(ctx, tab),
             NavIntent::Quit => {
                 self.quit_confirmed = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -308,7 +326,7 @@ impl QuickSearchApp {
 ///
 /// Unlike the centered `egui::Window` the other prompts use, `egui::Modal`'s
 /// backdrop blocks input to everything behind it — a click landing on the
-/// tab strip or the Options ✕ would re-trigger or bypass the guard.
+/// tab strip would re-trigger or bypass the guard.
 fn unsaved_changes_modal(ctx: &egui::Context, source: UnsavedSource) -> Option<UnsavedChoice> {
     let mut choice = None;
     let modal = egui::Modal::new(egui::Id::new("unsaved-guard")).show(ctx, |ui| {
@@ -316,7 +334,7 @@ fn unsaved_changes_modal(ctx: &egui::Context, source: UnsavedSource) -> Option<U
         ui.heading("Unsaved changes");
         ui.label(match source {
             UnsavedSource::Manage => "The Manage Index tab has edits that have not been applied.",
-            UnsavedSource::Options => "The Options window has edits that have not been applied.",
+            UnsavedSource::Settings => "The Settings tab has edits that have not been applied.",
         });
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -527,7 +545,7 @@ mod tests {
     /// buttons fire, Esc cancels, and an untouched frame decides nothing.
     #[test]
     fn the_unsaved_modal_reports_each_choice() {
-        for source in [UnsavedSource::Manage, UnsavedSource::Options] {
+        for source in [UnsavedSource::Manage, UnsavedSource::Settings] {
             let ctx = egui::Context::default();
             assert_eq!(
                 modal_frame(&ctx, source, Vec::new()),
