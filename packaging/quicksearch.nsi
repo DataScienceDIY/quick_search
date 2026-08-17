@@ -61,6 +61,18 @@ VIAddVersionKey "FileDescription" "${APP} ${VERSION} installer"
 !insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
+; The payload is two binaries and three documents, so this install finishes in
+; about a second - fast enough that people reported it as a failure. The finish
+; page is the only place that can say otherwise, so it lists what was installed
+; and where instead of the stock "Setup was completed successfully."
+; Kept to six lines: the finish page's text field is a fixed height, and MUI
+; clips rather than scrolls what does not fit.
+!define MUI_FINISHPAGE_TITLE "${APP} ${VERSION} is installed"
+!define MUI_FINISHPAGE_TEXT "Installed into $INSTDIR:$\r$\n\
+    quicksearch.exe (the app), quicksearch-cli.exe (terminal search),$\r$\n\
+    README.md, LICENSE.txt and config_example.toml.$\r$\n$\r$\n\
+    Your settings and search index are created on first run, under your \
+    own account. Upgrading and uninstalling leave both alone."
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "Run ${APP}"
 !define MUI_FINISHPAGE_RUN_FUNCTION LaunchAsUser

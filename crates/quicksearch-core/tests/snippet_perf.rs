@@ -289,7 +289,8 @@ fn snippet_paths_perf_comparison() {
                     }
                     None => String::new(),
                 };
-                let _snip = snippet::extract(&text, &[q], &opts);
+                let folded = text.to_ascii_lowercase();
+                let _snip = snippet::extract_folded(&text, &folded, &[q], &opts);
                 rows_b_total += 1;
             }
         }

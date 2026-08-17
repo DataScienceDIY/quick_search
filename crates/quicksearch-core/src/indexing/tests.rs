@@ -4,6 +4,7 @@ use crate::extract::Registry;
 use crate::file_handling::ExtractCursor;
 use crate::walk::walk_indexable_files;
 use std::sync::atomic::AtomicUsize;
+use std::time::Duration;
 
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
     // Canonical: the temp dir itself may sit behind a symlink
@@ -86,7 +87,6 @@ fn worker_counts_follow_the_phase() {
 
     let root = dir.to_string_lossy().into_owned();
     let stop = Arc::new(AtomicBool::new(false));
-    let suspend = Arc::new(AtomicBool::new(false));
     let walk = walk_indexable_files(
         std::slice::from_ref(&root),
         false,
@@ -96,7 +96,6 @@ fn worker_counts_follow_the_phase() {
         Config::default(),
         Arc::new(Registry::default_set()),
         stop.clone(),
-        suspend.clone(),
         3,
     );
     // An empty range, so the pass ends immediately — but its pool size is
@@ -107,7 +106,6 @@ fn worker_counts_follow_the_phase() {
         Arc::new(Registry::default_set()),
         Config::default(),
         stop,
-        suspend,
         2,
     );
 
@@ -123,8 +121,9 @@ fn worker_counts_follow_the_phase() {
         phase: RootPhase::Walking,
         phase_started: Instant::now(),
         content: Some(content),
-        extract_total: 0,
-        extracted: 0,
+        ready: Vec::new(),
+        written: 0,
+        totals: None,
         current_file: None,
     };
 
@@ -138,6 +137,157 @@ fn worker_counts_follow_the_phase() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The writer's extraction turn is bounded by its slice, not by what is
+/// ready: rows the slice does not reach are carried to the next turn, and the
+/// root is not `Done` until they have all landed. Pinned with a zero slice,
+/// under which every turn writes exactly one row.
+#[test]
+fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
+    use super::pipeline::RunCx;
+    use crate::content::ExtractedRow;
+    use crate::db::repo::{insert_file, NewFile};
+    use crate::file_handling::ContentOutcome;
+    use crate::mime::FileType;
+
+    let dir = tmp_dir("slice-leftovers");
+    let db_path = dir.join("index.db").to_string_lossy().into_owned();
+    let mut conn = db::open_or_recreate(&db_path, "trigram").unwrap();
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    // Five rows the walk would have written, whose extracted text is
+    // hand-built below rather than read back — the pass is not the subject.
+    let mut ready: Vec<ExtractedRow> = Vec::new();
+    {
+        let tx = conn.transaction().unwrap();
+        for i in 0..5 {
+            let path = tree.join(format!("f{}.txt", i));
+            std::fs::write(&path, "sphinx of black quartz").unwrap();
+            let file_id = insert_file(
+                &tx,
+                &NewFile {
+                    name: &format!("f{}.txt", i),
+                    path: &path.to_string_lossy(),
+                    parent: &tree.to_string_lossy(),
+                    size: 22,
+                    mtime: 1,
+                    inode: None,
+                    device_id: None,
+                    mime: Some("text/plain"),
+                    ftype: FileType::TEXT,
+                    hash: None,
+                    needs_content: true,
+                },
+            )
+            .unwrap()
+            .expect("unique path");
+            ready.push(ExtractedRow {
+                file_id,
+                name: format!("f{}.txt", i),
+                outcome: ContentOutcome::Done {
+                    text: format!("sphinx of black quartz {}", i),
+                    properties: Vec::new(),
+                },
+            });
+        }
+        tx.commit().unwrap();
+    }
+    let conn_mutex = Arc::new(Mutex::new(conn));
+
+    let root = dir.to_string_lossy().into_owned();
+    let stop = Arc::new(AtomicBool::new(false));
+    let config = Config::default();
+    let walk = walk_indexable_files(
+        std::slice::from_ref(&root),
+        false,
+        false,
+        crate::config::IgnoreSet::compile(&[]).unwrap(),
+        &db_path,
+        config.clone(),
+        Arc::new(Registry::default_set()),
+        stop.clone(),
+        1,
+    );
+    // An empty range: the pass reports `Finished` on its own, and the turn
+    // has to keep going past that until `ready` is empty.
+    let content = crate::content::extract_content(
+        &db_path,
+        &ExtractCursor::for_root(&dir.join("nothing").to_string_lossy()),
+        Arc::new(Registry::default_set()),
+        config.clone(),
+        stop.clone(),
+        1,
+    );
+    let mut p = RootPipeline {
+        root,
+        walk,
+        count_total: Arc::new(AtomicUsize::new(0)),
+        workers: 1,
+        pending_updates: Vec::new(),
+        pending_inserts: Vec::new(),
+        walked: 0,
+        walk_clean: true,
+        phase: RootPhase::Extracting,
+        phase_started: Instant::now(),
+        content: Some(content),
+        ready,
+        written: 0,
+        totals: None,
+        current_file: None,
+    };
+    let mut cx = RunCx::new(conn_mutex.clone(), &config, &db_path, &stop);
+    cx.slice = Duration::ZERO;
+
+    let mut turns = 0;
+    while p.phase == RootPhase::Extracting {
+        turns += 1;
+        assert!(
+            turns < 200,
+            "the root never finished: {} written",
+            p.written
+        );
+        let before = p.written;
+        let progressed = p.service_extracting(&mut cx).unwrap();
+        assert!(
+            p.written - before <= 1,
+            "a zero slice wrote {} rows in one turn",
+            p.written - before
+        );
+        assert!(
+            p.phase != RootPhase::Done || p.ready.is_empty(),
+            "Done with {} rows still to write",
+            p.ready.len()
+        );
+        if !progressed {
+            // The empty pass has not reported `Finished` yet.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    assert_eq!(p.written, 5);
+    assert!(p.ready.is_empty());
+    assert!(
+        turns >= 5,
+        "five rows cannot land in {} zero-slice turns",
+        turns
+    );
+    let done: i64 = conn_mutex
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE content_state = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(done, 5, "every row reached the index");
+    // The empty pass counted its (empty) range, so the totals are known and
+    // the snapshot reports this run's rows on top of the range's zero.
+    assert_eq!(p.snapshot().extracted, 5);
+    assert_eq!(p.snapshot().extract_total, Some(0));
+
+    drop(p);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// One full run over `config`'s roots, driven directly so the caller owns
 /// the stop flag. Returns when the run does.
 fn run_with(config: &Config, db_path: &str, stop: &Arc<AtomicBool>) -> Result<(), String> {
@@ -146,7 +296,6 @@ fn run_with(config: &Config, db_path: &str, stop: &Arc<AtomicBool>) -> Result<()
         &config.paths.indexing_paths,
         db_path,
         stop,
-        &Arc::new(AtomicBool::new(false)),
         config,
         &Arc::new(Mutex::new(None)),
         &db::InterruptSlot::default(),
@@ -374,7 +523,7 @@ fn progress(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> RootP
         walked,
         walk_total,
         extracted: 0,
-        extract_total: 0,
+        extract_total: None,
         current_file: None,
         active_workers: 0,
         total_workers: 0,
@@ -426,13 +575,26 @@ fn overall_progress_sums_both_halves_of_every_root() {
     let mut walking = progress(RootPhase::Walking, 100, Some(1000));
     let mut extracting = progress(RootPhase::Extracting, 500, Some(9999));
     extracting.extracted = 200;
-    extracting.extract_total = 400;
+    extracting.extract_total = Some(400);
     walking.extracted = 0;
 
     let o = overall_progress(&[walking, extracting]);
     assert_eq!(o.processed, 100 + 500 + 200);
     // 1000 (estimate) + 500 (exact) + 400 (extraction scope).
     assert_eq!(o.total, Some(1900));
+}
+
+/// A root whose content pass has not counted its range yet contributes only
+/// its walk — to both halves, so processed and total stay in step and the
+/// bar cannot jump when the count lands.
+#[test]
+fn an_uncounted_extraction_contributes_only_its_walk() {
+    let mut counting = progress(RootPhase::Extracting, 500, None);
+    counting.extracted = 7;
+    counting.extract_total = None;
+    let o = overall_progress(&[counting]);
+    assert_eq!(o.processed, 500);
+    assert_eq!(o.total, Some(500));
 }
 
 #[test]
@@ -472,7 +634,7 @@ fn a_finished_run_reaches_exactly_one_hundred_percent() {
     .map(|&(walked, extracted)| {
         let mut p = progress(RootPhase::Done, walked, Some(walked * 2));
         p.extracted = extracted;
-        p.extract_total = extracted;
+        p.extract_total = Some(extracted);
         p
     })
     .collect();
@@ -496,6 +658,9 @@ fn a_run_with_nothing_to_do_has_no_fraction_to_show() {
 fn the_fraction_never_exceeds_one() {
     let mut p = progress(RootPhase::Done, 10, None);
     p.extracted = 100;
+    // A counted scope the writes then overran; an uncounted one would be
+    // left out of both halves and prove nothing here.
+    p.extract_total = Some(0);
     let o = overall_progress(&[p]);
     assert_eq!(o.processed, 110);
     assert_eq!(o.total, Some(10));

@@ -130,6 +130,7 @@ enum CoordCmd {
     ConfigChanged(Config),
     RebuildIndex,
     ClearIndex,
+    UpdatePaths(Vec<PathBuf>),
     Shutdown,
 }
 
@@ -228,6 +229,7 @@ impl IndexCoordinator {
             watcher_rx: None,
             watcher_gen: 0,
             pending: HashMap::new(),
+            targeted: HashMap::new(),
             last_event_at: None,
             pending_since: None,
             needs_full_run: false,
@@ -301,6 +303,26 @@ impl IndexCoordinator {
     /// resurrect what the user just deleted.
     pub fn clear_index(&self) {
         let _ = self.cmd_tx.send(CoordCmd::ClearIndex);
+    }
+
+    /// Bring the index up to date for these paths and nothing else.
+    ///
+    /// For [`crate::live`]: a frontend that has just read a displayed file
+    /// from disk hands the path here so the index agrees with what the user
+    /// is looking at. Deliberately **not** gated on [`IndexMode`] — the whole
+    /// point is that the rows on screen stay honest with indexing stopped —
+    /// but still applied on the coordinator's own thread, so the
+    /// single-writer rule holds and a full run is never raced.
+    ///
+    /// Each path is re-read and rewritten only if its modified time has moved
+    /// (see [`crate::incremental::apply_fs_event`]), so submitting a path that
+    /// is already current costs a `stat` and a row lookup. A path that no
+    /// longer exists is removed from the index.
+    pub fn update_paths(&self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let _ = self.cmd_tx.send(CoordCmd::UpdatePaths(paths));
     }
 
     /// Compare `config` against what the index was built with. Read-only.

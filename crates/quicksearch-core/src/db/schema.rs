@@ -22,7 +22,7 @@
 //! | [`PRAGMAS_SEARCH`] | search worker | held across a typing session | 32 MiB |
 //! | [`PRAGMAS_READONLY`] | one-shot readers | a single query | 4 MiB |
 //! | [`PRAGMAS_MAINTENANCE`] | VACUUM | one bulk copy | 8 MiB |
-//! | [`PRAGMAS_WALK_READER`] | per-root row prefetch | the walk | 1 MiB |
+//! | [`PRAGMAS_WALK_READER`] | per-root walk prefetch and content feeder | the run | 1 MiB |
 //!
 //! `PRAGMA mmap_size` is absent from all of them: SQLCipher's codec disables
 //! mmap at runtime only when a key is set, mapped pages still count in
@@ -124,12 +124,19 @@ pub const PRAGMAS_READONLY: &str = "
     PRAGMA foreign_keys = ON;
 ";
 
-/// Pragmas for a walk's row-prefetch connection.
+/// Pragmas for a root's own reader: the walk's row prefetch, and then the
+/// content pass's feeder ([`crate::content`]), which reuses this profile for
+/// the rest of the run.
 ///
-/// One of these exists per indexing root, so the cache size is multiplied by
-/// the root count. 1 MiB holds the upper levels of `idx_files_parent` hot,
-/// which is all these queries touch: each is a single index range lookup,
-/// and the pages under it are read once and not revisited.
+/// Two of these can exist per indexing root, so the cache size is multiplied
+/// by the root count. 1 MiB is sized for the walk's queries, which each read
+/// one range of `idx_files_parent` once and never revisit it. The feeder's
+/// paging is the same shape, but its one-off `count_extract_scope` at pass
+/// start is not: that scans the root's whole path range fetching a row per
+/// entry, so on a large root it is a cold read all the way through. It is
+/// deliberately here rather than on the writer — the writer holding still for
+/// it stopped every other root's walk — and this is the connection that pays
+/// for that, once per root.
 pub const PRAGMAS_WALK_READER: &str = "
     PRAGMA busy_timeout = 5000;
     PRAGMA cache_size = -1024;

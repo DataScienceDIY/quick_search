@@ -30,61 +30,96 @@ fn a_stale_draft_cannot_revert_the_indexing_mode_or_security() {
 }
 
 /// The guard decision table for leaving a tab, however it is asked for.
+/// Both draft-backed tabs guard their own departure, and neither answers for
+/// the other.
 #[test]
-fn leaving_a_dirty_manage_tab_is_guarded_however_it_is_asked_for() {
-    assert!(switch_needs_guard(Tab::Manage, true, false));
-    assert!(
-        !switch_needs_guard(Tab::Manage, false, false),
-        "a clean editor has nothing to ask about"
-    );
-    assert!(
-        !switch_needs_guard(Tab::Manage, true, true),
-        "one held navigation at a time"
-    );
+fn leaving_a_dirty_editor_tab_is_guarded_however_it_is_asked_for() {
+    // (the tab, whether *its* editor is the dirty one in the pair below)
+    for (tab, manage_dirty, settings_dirty) in
+        [(Tab::Manage, true, false), (Tab::Settings, false, true)]
+    {
+        assert!(
+            switch_needs_guard(tab, manage_dirty, settings_dirty, false),
+            "{tab:?} must guard its own unapplied edits"
+        );
+        assert!(
+            !switch_needs_guard(tab, false, false, false),
+            "{tab:?}: a clean editor has nothing to ask about"
+        );
+        assert!(
+            !switch_needs_guard(tab, manage_dirty, settings_dirty, true),
+            "{tab:?}: one held navigation at a time"
+        );
+        assert!(
+            !switch_needs_guard(tab, !manage_dirty, !settings_dirty, false),
+            "{tab:?} must not answer for the other editor"
+        );
+    }
     for tab in [Tab::Search, Tab::Duplicates, Tab::Logs, Tab::Help] {
         assert!(
-            !switch_needs_guard(tab, true, false),
+            !switch_needs_guard(tab, true, true, false),
             "{tab:?} holds no unapplied edits of its own"
         );
     }
 }
 
 #[test]
-fn guard_source_orders_quit_prompts_options_first() {
+fn guard_source_orders_quit_prompts_settings_first() {
     use super::NavIntent::*;
-    let tab = SwitchTab(Tab::Search);
+    let leave = SwitchTab(Tab::Search);
 
-    assert_eq!(guard_source(tab, true, true), Some(UnsavedSource::Manage));
-    assert_eq!(guard_source(tab, true, false), Some(UnsavedSource::Manage));
+    // A switch asks about the tab being left, and only about that one.
     assert_eq!(
-        guard_source(tab, false, true),
+        guard_source(leave, Tab::Manage, true, true),
+        Some(UnsavedSource::Manage)
+    );
+    assert_eq!(
+        guard_source(leave, Tab::Manage, true, false),
+        Some(UnsavedSource::Manage)
+    );
+    assert_eq!(
+        guard_source(leave, Tab::Manage, false, true),
         None,
-        "options guard its own close"
-    );
-    assert_eq!(guard_source(tab, false, false), None);
-
-    assert_eq!(
-        guard_source(CloseOptions, true, true),
-        Some(UnsavedSource::Options)
+        "the Settings draft is not what leaving Manage disturbs"
     );
     assert_eq!(
-        guard_source(CloseOptions, false, true),
-        Some(UnsavedSource::Options)
+        guard_source(leave, Tab::Settings, true, true),
+        Some(UnsavedSource::Settings)
     );
     assert_eq!(
-        guard_source(CloseOptions, true, false),
+        guard_source(leave, Tab::Settings, false, true),
+        Some(UnsavedSource::Settings)
+    );
+    assert_eq!(
+        guard_source(leave, Tab::Settings, true, false),
         None,
-        "manage guards tab switches"
+        "the Manage draft is not what leaving Settings disturbs"
     );
-    assert_eq!(guard_source(CloseOptions, false, false), None);
+    for tab in [Tab::Search, Tab::Duplicates, Tab::Logs, Tab::Help] {
+        assert_eq!(
+            guard_source(leave, tab, true, true),
+            None,
+            "{tab:?} stages nothing, so leaving it asks nothing"
+        );
+    }
 
-    assert_eq!(guard_source(Quit, true, true), Some(UnsavedSource::Options));
-    assert_eq!(
-        guard_source(Quit, false, true),
-        Some(UnsavedSource::Options)
-    );
-    assert_eq!(guard_source(Quit, true, false), Some(UnsavedSource::Manage));
-    assert_eq!(guard_source(Quit, false, false), None);
+    // Quit asks about both, Settings first.
+    for from in [Tab::Search, Tab::Manage, Tab::Settings] {
+        assert_eq!(
+            guard_source(Quit, from, true, true),
+            Some(UnsavedSource::Settings),
+            "{from:?}: quitting asks about Settings before Manage"
+        );
+        assert_eq!(
+            guard_source(Quit, from, false, true),
+            Some(UnsavedSource::Settings)
+        );
+        assert_eq!(
+            guard_source(Quit, from, true, false),
+            Some(UnsavedSource::Manage)
+        );
+        assert_eq!(guard_source(Quit, from, false, false), None);
+    }
 }
 
 /// Only a Quit during a running reconcile warns; a tab switch does not end
@@ -95,10 +130,25 @@ fn only_quitting_during_a_reconcile_warns() {
     assert!(quit_needs_reconcile_warning(Quit, true));
     assert!(!quit_needs_reconcile_warning(Quit, false));
     assert!(!quit_needs_reconcile_warning(SwitchTab(Tab::Search), true));
-    assert!(!quit_needs_reconcile_warning(CloseOptions, true));
+    assert!(!quit_needs_reconcile_warning(
+        SwitchTab(Tab::Settings),
+        true
+    ));
 }
 
-/// The two values the Options window writes, plus hand-edited variants.
+/// Every tab is placed on exactly one side of the guard, so a tab added
+/// later cannot quietly inherit "stages nothing".
+#[test]
+fn only_the_two_draft_backed_tabs_have_an_editor() {
+    assert_eq!(tab_editor(Tab::Manage), Some(UnsavedSource::Manage));
+    assert_eq!(tab_editor(Tab::Settings), Some(UnsavedSource::Settings));
+    for tab in [Tab::Search, Tab::Duplicates, Tab::Logs, Tab::Help] {
+        assert_eq!(tab_editor(tab), None, "{tab:?} saves as it goes");
+    }
+}
+
+/// The two values the Settings tab's color-scheme box writes, plus
+/// hand-edited variants.
 #[test]
 fn only_light_is_light() {
     assert_eq!(theme_for("light"), egui::Theme::Light);

@@ -169,6 +169,47 @@ pub struct SearchConfig {
     pub results_per_page: usize,
     /// How long the GUI waits after the last keystroke before searching.
     pub debounce_ms: u64,
+    /// Watch the search results currently on screen and show renames,
+    /// deletions and content changes as they happen. Only the rows actually
+    /// visible are watched, and any edit to the query drops the watches.
+    /// What a row shows is read from the file itself, so this holds whether
+    /// or not indexing is running; the files it reads are then brought up to
+    /// date in the index, so what is stored cannot drift from what is on
+    /// screen. See [`crate::live`].
+    pub live_results: bool,
+    /// Which columns the Search tab shows.
+    pub columns: ColumnsConfig,
+}
+
+/// Which columns the Search tab shows, as picked from the right-click menu on
+/// any column header or from the Settings tab.
+///
+/// The path column is deliberately not represented: it is always shown, so
+/// "no columns at all" is not a state this can hold. Size and modified are off
+/// by default — the width they cost is better spent on the path and the match,
+/// and both are one click away.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ColumnsConfig {
+    pub name: bool,
+    /// The matched excerpt from a file's contents. Rows that matched on their
+    /// name or path instead show a dash there.
+    pub content_match: bool,
+    pub size: bool,
+    pub modified: bool,
+    pub rank: bool,
+}
+
+impl Default for ColumnsConfig {
+    fn default() -> Self {
+        ColumnsConfig {
+            name: true,
+            content_match: true,
+            size: false,
+            modified: false,
+            rank: true,
+        }
+    }
 }
 
 impl SearchConfig {
@@ -233,6 +274,8 @@ impl Default for SearchConfig {
             display_limit: 1000,
             results_per_page: 100,
             debounce_ms: 150,
+            live_results: true,
+            columns: ColumnsConfig::default(),
         }
     }
 }
@@ -302,6 +345,21 @@ pub struct UiConfig {
     /// recognises falls back to dark, where a typed-out enum would fail to
     /// deserialize and take the whole config file down with it.
     pub color_scheme: String,
+    /// Whether the first-start tour has been dismissed.
+    ///
+    /// Three-valued on purpose. `None` means the key predates the tour — an
+    /// installation that upgraded into this version, which has already found
+    /// its way around — so only a config file this version *created* (which
+    /// gets `Some(false)` from [`UiConfig::default`]) is ever offered the tour.
+    /// A plain `bool` could not tell those apart.
+    ///
+    /// The field-level `default` is load-bearing and not redundant with the
+    /// `#[serde(default)]` on the struct: that one fills a missing field from
+    /// `UiConfig::default()`, which says `Some(false)` — and would hand every
+    /// upgrading installation the tour. This one fills it from
+    /// `Option::default()`, which is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tutorial_seen: Option<bool>,
 }
 
 impl Default for UiConfig {
@@ -311,6 +369,10 @@ impl Default for UiConfig {
             watch_cap_warned_roots: Vec::new(),
             search_hotkey: "Ctrl+Shift+F".to_string(),
             color_scheme: "dark".to_string(),
+            // Not `None`: a config built from these defaults is a config being
+            // written for the first time, and that is exactly who the tour is
+            // for. `None` is reserved for a file that predates the key.
+            tutorial_seen: Some(false),
         }
     }
 }

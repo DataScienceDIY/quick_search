@@ -89,15 +89,6 @@ impl Scope {
         })
     }
 
-    /// The configured root `path` lives under, if any. Containment is
-    /// component-wise, per [`crate::file_handling::UnreadableDirs::covers`].
-    pub fn owning_root(&self, path: &Path) -> Option<&Path> {
-        self.roots
-            .iter()
-            .map(|r| r.path.as_path())
-            .find(|root| path.starts_with(root) && path != *root)
-    }
-
     /// Whether the walker would still emit `path` while walking `root`.
     ///
     /// Mirrors `read_directory`'s three `continue`s. Full-path ignore

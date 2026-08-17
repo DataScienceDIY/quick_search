@@ -187,7 +187,9 @@ The install is per-machine and asks for elevation. Into
 | `uninstall.exe` | written by the installer; Add/Remove Programs runs it |
 
 The components page offers a Start menu shortcut (on) and a desktop shortcut
-(off); both are created for all users. No `config.toml` is installed, for the
+(off); both are created for all users. The final page lists what was installed
+and where — the install itself takes about a second, which without saying so
+reads as a failure — and offers to start QuickSearch, ticked. No `config.toml` is installed, for the
 same reason the `.deb` ships none — one next to the binaries is portable mode
 (see [Configuration](#configuration)) and would override the personal config
 of every account. The app writes `%APPDATA%\quicksearch\config.toml` on first
@@ -224,12 +226,32 @@ inside that folder.
 `quicksearch` with no query arguments opens the app:
 
 - **Search**: results appear as you type; every keystroke cancels the
-  previous search. One checkbox enables the two fuzzy passes. Sort by
-  rank, name, path, size, or modified. Double-click a result to open it;
+  previous search. One checkbox enables the two fuzzy passes, and once a
+  search has finished a button inside the right of the search box re-runs
+  it. Click a column heading to sort by it; **right-click any heading to
+  choose which columns are shown** — the path is always there, and size
+  and modified date start hidden, which is what buys the width the path
+  and the match get instead. The choice is saved (`[search.columns]`,
+  also in Settings → Search) and applies immediately. Sorting by a column
+  you then hide falls back to rank. Double-click a result to open it;
   right-click it to reveal it in the file manager, open it, copy its
   path, or build an ignore filter from it (session-only by default,
   optionally persisted to the config). Result text can be selected and
-  copied in place. Matches in file contents show highlighted snippets.
+  copied in place. A match in a file's **name** or **path** is
+  highlighted in that column; a match in its **contents** shows a
+  highlighted snippet in the Content Match column, with more of the
+  surrounding text on hover. Rows matched on name or path show a dash
+  there instead. With `[search] live_results` on (the default) the rows
+  actually on screen are watched, and what they show is read from the
+  files themselves: a rename, a deletion or an edit lands within a
+  second, whether or not indexing is running. The rows coming on screen
+  are also checked against the disk as they are watched, so one the index
+  was already out of date about corrects itself; the index is then
+  brought back in line for those files alone. Over a network share, where
+  the system reports no events, that check is all you get — the row is
+  right when it comes on screen and then holds still. Nothing is ever
+  added, removed or re-ordered underneath you; a file that disappears is
+  struck through where it sits. Editing the query drops every watch.
 - **Manage Index**: full indexing status, Start/Stop/Automatic controls,
   indexed folder list, full-text extension filters, ignore patterns, and
   the indexing options. Stopping switches to manual mode and saves that
@@ -244,25 +266,45 @@ inside that folder.
   folder nothing has finished indexing reads "not yet indexed" rather
   than zero, and because the figures come from completed runs they do
   not move as live updates apply single changes in between.
-- **Duplicates**: files sharing a content hash, grouped.
+- **Duplicates**: files sharing a content hash, grouped. That hash covers
+  each file's size and its first `processing.hash_length` bytes and nothing
+  else, which is the whole reason indexing is affordable — and the reason a
+  group is a strong suspicion rather than a fact. Right-click a group, or any
+  file in one, to settle it: every member is read through and compared byte
+  for byte, with progress and a Cancel button in a modal that then names each
+  file as identical, differing at a given byte, a different size, or
+  unreadable. Nothing is deleted or changed either way; the point is to know
+  before you delete something yourself.
 - **Logs**: the lines the app would have printed to a terminal — warnings
   from indexing, folder watching and opening files, newest last, with a
   filter box and Copy button. Launched from a desktop launcher (or on
   Windows, where the app has no console at all) this is the only place
   they are visible.
 - **Help**: an in-app quickstart — first indexing run, example queries,
-  what each tab does — pointing here for everything technical.
+  what each tab does — pointing here for everything technical. A brand-new
+  installation is shown a short click-through introduction covering the
+  same ground on its first launch; the Help tab brings it back. Upgrading
+  into this version does not raise it (see `[ui] tutorial_seen`).
+- **Settings**: every configuration control in one place — the database
+  path, indexing and processing limits, search behaviour, the interface
+  (scale, shortcut, color scheme) and password protection. Each row
+  explains itself on hover. Edits are staged and applied together by
+  **Apply & Save**; leaving the tab with unapplied edits asks first. The
+  column choices and the password controls are the exceptions, acting the
+  moment they are used, since the Search tab's own header menu writes the
+  same settings. The indexed folder list and the indexing mode live on
+  Manage Index instead, next to the controls that act on them.
 
 **Ctrl+Shift+F from anywhere** brings QuickSearch to the front, restoring
 it if it was minimized, and puts the cursor in the search box with the
 previous search selected, so the next thing you type is the new one. The
-Options window's Interface section rebinds it — click the button and press
+Settings tab's Interface section rebinds it — click the button and press
 the keys — or switches it off. It is a system-wide shortcut, registered
 with Windows or with the X server, so it works while another application
 has focus. Wayland does not let an application claim a key, so there the
 shortcut is registered with your desktop through the XDG desktop portal
 instead; your desktop then has the final say over which key it is, and its
-own keyboard settings are where to change it. The Options window says which
+own keyboard settings are where to change it. The Settings tab says which
 key it settled on. Wayland likewise gives no application a way to put itself
 in front of what you are doing, so under it the shortcut selects the Search
 tab and the search box but leaves raising the window to the desktop; on X11
@@ -301,7 +343,7 @@ processing; Windows Terminal has it, and older consoles get plain text.
 
 The index contains the names and (by default) the full text of everything
 it indexes — for most setups, your entire home directory. That is a lot of
-concentrated risk in one file. **Options → Security → Enable password
+concentrated risk in one file. **Settings → Security → Enable password
 protection** encrypts the index on disk with SQLCipher; from then on
 QuickSearch asks for the password every time it starts, in the GUI (an
 unlock screen before anything opens the index) and in the terminal (a
@@ -315,6 +357,10 @@ rebuilds the index — there is no in-place conversion.
   in the OS keychain — Secret Service/KWallet on Linux, Credential Manager
   on Windows — and skips the prompt. Without a keychain daemon the option
   quietly falls back to prompting.
+- **Show database key** asks for the password, then shows the raw SQLCipher
+  key as `0x…` (64 hex digits) with a copy button, for opening the index in
+  other SQLCipher tools. That key alone reads the index, so treat a copy of
+  it as carefully as the password.
 - Scripts can set `QUICKSEARCH_PASSWORD` for non-interactive terminal
   search. Environment variables are readable by other processes of the
   same user (`/proc/<pid>/environ`) — prefer the keychain.
@@ -397,13 +443,13 @@ containing the binary, its config, and its index can be moved wholesale.
 The GUI edits the config live; external edits apply on next start.
 
 `[ui] search_hotkey` is the system-wide search shortcut, written the way
-the Options window prints it (`Ctrl+Shift+F`): Ctrl, Alt and Shift in any
+the Settings tab prints it (`Ctrl+Shift+F`): Ctrl, Alt and Shift in any
 combination, plus one key, joined with `+`. An empty string switches it
 off. A value that is not a shortcut is not a config error — the app loads,
-says so in the Options window, and runs without one.
+says so on the Settings tab, and runs without one.
 
-`[ui] color_scheme` is `dark` (the default) or `light`, changeable in the
-Options window and applied without a restart. It does not follow the
+`[ui] color_scheme` is `dark` (the default) or `light`, changeable on the
+Settings tab and applied without a restart. It does not follow the
 desktop's own light/dark setting: on Linux nothing in the window system
 reports that, so the only way to know is to connect to the session message
 bus and subscribe to the user's settings feed — more of your session than a
@@ -499,7 +545,25 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   bigger index — `indexing.content_extensions` remains the throttle. Files no larger than `processing.hash_length` skip that second
   pass entirely: the head the walk reads to hash them is already their
   whole content, so a plaintext body is extracted in the same `read` and
-  stored complete. Every run ends — whether
+  stored complete. Every root runs its own pipeline — its own walker pool
+  and, once the walk ends, its own extraction pool — but every root's
+  *writes* go through one thread and one connection
+  (`indexing/pipeline.rs`), because that is what a single SQLite file
+  allows. That thread is where FTS5 tokenizes, up to `maximum_text_size`
+  of text per document inside the insert, and it is the run's dominant
+  cost. So its loop is scheduled around the walk, the disk-bound phase and
+  the one whose stall shows: each round serves every walking root first,
+  then one extracting root, and no turn runs past a 100 ms slice — an
+  extraction turn commits at the slice and carries the rows it did not
+  reach to its next turn. A walk therefore waits at most one slice per
+  round, which its walkers' channel absorbs, so a root walking a large tree
+  runs at its own rate while another root tokenizes big documents beside
+  it. What a root has left to extract is counted by its own content pass,
+  on that pass's read connection, rather than on the writer: on a large
+  root the count is seconds, and seconds of writer time is every other
+  root's walk standing still. Total write throughput is what one connection
+  tokenizing can do; the scheduling shares it fairly and keeps the walk
+  first, it does not raise it. Every run ends — whether
   it completed or was stopped — with an optimize pass on its own connection:
   checkpoint, VACUUM if the file has at least 10% slack to reclaim, `PRAGMA
   optimize`, checkpoint again. Progress streams through a polled
@@ -555,6 +619,26 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   handle and takes a single watch per root, filtering the events instead.
   Either way a tree too large to watch degrades to periodic reindexing
   rather than going silently stale.
+- **Live results** (`live.rs`): a second, much smaller watcher, owned by the
+  frontend rather than the coordinator, pointed at the parent directories of
+  the result rows *currently on screen* once they have held still for a
+  moment. It watches directories, not the result files: editors save by
+  writing a temporary file and renaming it over the target, so the event
+  lands on the directory and a watch on the file is left holding an orphaned
+  inode. What a row shows is read from the **file**, never from the index —
+  metadata from `stat`, and for a content match the same MIME sniffing and
+  extractors the indexer uses, re-cut through the same `cascade::text_snippet`
+  the search itself does. That is what makes it work with indexing stopped.
+  Arming also sweeps each target once against the size and modified time the
+  row is displaying, which on a fresh result is what the index said: so
+  bringing a row on screen *is* a check of the index against the disk, and it
+  is the only thing that reports anything where the platform sends no events.
+  It still writes nothing itself; the paths it has just read go to
+  `IndexCoordinator::update_paths`, which applies them on the coordinator's
+  own thread — in any mode, so a stopped index does not drift from the screen
+  — leaving the single-writer rule intact. Caps at 64 directories and 256
+  rows, rate-limited per path, and dropped wholesale the moment the query is
+  edited.
 - **Search** (`search/`): `SearchService` runs one worker thread; each
   query is a *generation*. New queries interrupt the in-flight SQLite
   statement (`InterruptHandle`) and stale generations stop cooperatively,
@@ -598,6 +682,21 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   case-insensitive literal branch used to allocate a lowercased copy of its
   haystack, which the filename pass asked for twice per row of a full-table
   scan.
+- **Duplicate verification** (`verify.rs`): the second opinion on a group from
+  `search/duplicates.rs`, which groups by `sha256(size ‖ head)` and so cannot
+  tell two pre-allocated disk images apart — same size, same zeroes at the
+  front, everything that distinguishes them in a footer. One lockstep pass:
+  open every member, drop the ones whose length already disagrees without
+  reading them, then read a chunk from the first that opened and the same
+  span from each of the others, reporting the offset of the first byte that
+  differs and dropping that file from the walk. Deliberately not a hash —
+  "the same digest" is a probabilistic answer, and a probabilistic answer is
+  what the head hash already gave. The reference is the first member that
+  *opens*, so one unreadable file costs its own verdict and nobody else's,
+  and termination follows what that file actually reads rather than the
+  length it claimed, so a file truncated mid-run degrades to a short
+  comparison. The read buffers share a fixed 8 MiB between them however many
+  members a group has, because a hardlink farm's group runs to thousands.
 - **Baloo compatibility** (`cli.rs`, `mime.rs`): the read API this repo's
   parent consumes — `status_for_path`, `list_failed`,
   `index_size_breakdown`, `pending_content_count`, `clear_path` — plus a
@@ -630,14 +729,17 @@ core threads ─────────────▶ ctx.request_repaint() (w
 ```
 
 Modules map one-to-one onto what you see: `app.rs` (shell and config
-routing, with `app/` submodules for the status bar, the security flow and
-the confirmation modals), `search_tab.rs` (query strip and virtualized
+routing, with `app/` submodules for the status bar, the security flow, the
+confirmation modals and the duplicate-verification modal — the one place a
+worker's progress is shown in a window rather than the status bar),
+`search_tab.rs` (query strip and virtualized
 results table; snippet rendering via `LayoutJob` byte ranges, the ignore
 dialog and the syntax help live in `search_tab/`), `manage_tab.rs` (status
 detail + `tracker.rs` rate estimation, roots and filter editors),
 `duplicates_tab.rs`, `logs_tab.rs` (a virtualized view of the core log
-ring), `options.rs` (draft-based settings editor shared between the window
-and the Manage tab), `platform.rs` (open / reveal-in-file-manager, and the
+ring), `settings_tab.rs` (the draft-based config editor, the second of the
+two tabs that stage their edits behind an Apply & Save), `platform.rs`
+(open / reveal-in-file-manager, and the
 Windows stdio setup a window-subsystem process needs before anything
 prints), `hotkey/` (the system-wide search shortcut: one key table feeding
 both a `RegisterHotKey` / `XGrabKey` registration and, on Wayland, an XDG
@@ -650,12 +752,26 @@ microseconds regardless of row count.
 
 - `cargo test -p quicksearch-core`: unit + integration suites (cascade
   ranking, cancellation, incremental indexing, coordinator modes, config
-  resolution, fuzzy matcher vs. brute-force oracle).
+  resolution, fuzzy matcher vs. brute-force oracle, `verify.rs`'s byte-for-byte
+  comparison — the shared-head-different-tail case the head hash cannot see, an
+  unreadable first member, a difference past the first chunk, cancellation —
+  and `live.rs`'s event
+  classification, where the platform-specific rename and atomic-save shapes are
+  synthesized rather than provoked, so they are checked on every platform).
 - `cargo test -p quicksearch-gui`: formatter/tracker/CLI-parsing units plus
   headless egui tests that drive the real widgets — building an input frame,
   synthesizing clicks and reading back the painted text (`test_ui.rs`) — over
-  the search and manage tabs, the options editor, the unlock gate, the logs
-  and duplicates tabs, and query highlighting.
+  the search, manage and settings tabs, the unlock gate, the logs
+  and duplicates tabs, the first-start tour, and query highlighting. The search
+  tab's cover the column picker (including that the path column survives all
+  32 combinations of the others), which column a match is highlighted in, and
+  that the repeat-search button appearing inside the query box does not cost it
+  keyboard focus. The duplicates tab's open the real context menus and click
+  the entries inside them, so "the verification asks for the whole group, from
+  either menu, and not at all while one is running" is checked rather than
+  assumed; the verification modal is rendered in each of its states, and the
+  tour's footer is probed for where its three buttons actually landed rather
+  than for the numbers they were expected to land on.
 - `cargo bench -p quicksearch-core --bench search` and `--bench index`: divan
   microbenchmarks over the two hot paths. Each group runs *what the code does
   today* against *the change being considered*, in one process on one corpus,

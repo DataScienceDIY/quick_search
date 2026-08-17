@@ -44,7 +44,7 @@ thread_local! {
     static REGISTRY: RefCell<Option<Registry>> = const { RefCell::new(None) };
 }
 
-/// What the Options window says about the shortcut.
+/// What the Settings tab says about the shortcut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     /// The setting is empty: no shortcut, by choice.
@@ -256,7 +256,7 @@ mod tests {
     use super::*;
 
     /// Nothing may touch an OS registration before `init`, so that the
-    /// headless UI tests can render the Options row.
+    /// headless UI tests can render the Settings row.
     #[test]
     fn an_uninitialised_registry_is_inert() {
         apply("Ctrl+Shift+F");
