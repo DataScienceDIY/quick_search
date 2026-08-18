@@ -25,7 +25,7 @@ pub const KEY_MISMATCH_PREFIX: &str = "KEY_MISMATCH: ";
 /// values go stale: `files.mime`, `files.type` and `content_state` are
 /// computed at walk time and never re-derived for unchanged files, so a
 /// classification change needs the wipe to apply everywhere.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// Open `db_path` and ensure the on-disk schema matches this build; if it
 /// doesn't (including a changed `tokenizer`), delete the file and recreate it

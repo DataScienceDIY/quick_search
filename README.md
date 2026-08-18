@@ -492,11 +492,15 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   log, because SQLite's own autocheckpoint can only reset the log at an
   instant no reader holds it — and a run keeps a reader per root querying
   throughout, so left alone the log grows for the whole run. `files` holds
-  metadata (name, path, size, mtime, hash, MIME/type bitmask, per-row
-  index state); `searchabletext` is a *contentless* FTS5 table (postings
-  only, configurable tokenizer, trigram by default); canonical extracted
+  metadata (name, path, size, mtime, hash, MIME/type bitmask, content
+  state); `searchabletext` is a *contentless* FTS5 table over one column,
+  the document body (postings only, configurable tokenizer, trigram by
+  default) — filename ranks come from scanning `files.name`, so a `name`
+  column there would only index the same strings twice; canonical extracted
   text lives zstd-compressed in `documents_text`, which powers snippets,
-  occurrence ranking, and fuzzy full-text search. Schema changes wipe and
+  occurrence ranking, and fuzzy full-text search, and whose uncompressed
+  length is read back from the zstd frame header rather than stored beside
+  it. Schema changes wipe and
   rebuild by policy; the indexer (`open_or_recreate`) is the only code
   allowed to do that; every consumer uses `open_existing`, which treats
   drift as an error, never data loss. With password protection on, every
@@ -523,11 +527,14 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   classify files by mtime into insert/update/skip, batch-write metadata,
   sweep stale rows, then extract content (plaintext, RTF, Office — both the
   OOXML/ODF zip formats and the pre-2007 binary `.doc`/`.xls`/`.ppt`, whose
-  OLE2 streams are read in `extract/ole.rs` — PDF, audio tags, EXIF; see
-  `extract/`) for FTS. PDFs are parsed once, with the text and the `Info`
-  dictionary taken off the same document: the two-parse version that preceded
-  it was the largest single memory consumer of a run over a PDF-heavy tree, and
-  it was what pulled a second copy of `lopdf` — and with it rayon's
+  OLE2 streams are read in `extract/ole.rs` — PDF, audio tags; see
+  `extract/`) for FTS. Images are claimed by no extractor: the EXIF reader
+  produced structured properties and never text, and with properties parked
+  (see `extract::ExtractedContent`) leaving `image/*` unclaimed is what keeps
+  the content pass from opening every image on disk. PDFs are parsed once:
+  the two-parse version that preceded it was the largest single memory
+  consumer of a run over a PDF-heavy tree, and it was what pulled a second
+  copy of `lopdf` — and with it rayon's
   never-torn-down thread pool — into the build. That is a claim about PDFs
   rather than about runs in general, and it is worth knowing which tree a
   number came from: on one with almost no PDFs, a cold run peaks at 130 MiB

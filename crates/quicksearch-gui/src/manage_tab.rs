@@ -631,7 +631,7 @@ fn watch_contents(ui: &mut egui::Ui, state: &IndexerState, config: &Config) {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
                 format!(
-                    "⚠ Live updates off; reindexing every {}",
+                    "Live updates off; reindexing every {}",
                     fmt_interval(config.indexing.reindex_interval_minutes)
                 ),
             )

@@ -125,7 +125,7 @@ pub fn process_batch_updates(
 
             if let (Some(id), Some(text)) = (id, rec.inline_text.as_deref()) {
                 let zstd = body_or_skip!(bodies, i, rec.path);
-                store_inline_text(&tx, id, rec, text, zstd)?;
+                repo::set_content_done(&tx, id, text, zstd)?;
             }
         }
 
@@ -134,19 +134,6 @@ pub fn process_batch_updates(
     }
 
     Ok(())
-}
-
-/// Store text the walk already extracted, so the content pass skips this row.
-/// Same [`repo::set_content_done`] the content pass calls, so a row finished
-/// here is indistinguishable from one finished there.
-pub(crate) fn store_inline_text(
-    tx: &rusqlite::Transaction<'_>,
-    file_id: i64,
-    rec: &OwnedNewFile,
-    text: &str,
-    text_zstd: Option<&[u8]>,
-) -> Result<(), String> {
-    repo::set_content_done(tx, file_id, &rec.name, text, &[], text_zstd)
 }
 
 /// Write already-prepared records for newly discovered files. Silent, like
@@ -184,7 +171,7 @@ pub fn process_batch_inserts(
                 .map_err(|e| format!("Failed to insert file record: {}", e))?;
             if let (Some(id), Some(text)) = (id, rec.inline_text.as_deref()) {
                 let zstd = body_or_skip!(bodies, i, rec.path);
-                store_inline_text(&tx, id, rec, text, zstd)?;
+                repo::set_content_done(&tx, id, text, zstd)?;
             }
         }
 
@@ -410,16 +397,12 @@ pub fn store_extracted(
             done.consumed += 1;
             match &bodies[i] {
                 Err(e) => crate::log_warn!("compress text for {}: {}", row.name, e),
-                Ok(zstd) => match store_content_outcome(
-                    &tx,
-                    row.file_id,
-                    &row.name,
-                    &row.outcome,
-                    zstd.as_deref(),
-                ) {
-                    Ok(()) => done.written += 1,
-                    Err(e) => crate::log_warn!("content indexing for {}: {}", row.name, e),
-                },
+                Ok(zstd) => {
+                    match store_content_outcome(&tx, row.file_id, &row.outcome, zstd.as_deref()) {
+                        Ok(()) => done.written += 1,
+                        Err(e) => crate::log_warn!("content indexing for {}: {}", row.name, e),
+                    }
+                }
             }
             if stop_flag.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
                 cut = true;

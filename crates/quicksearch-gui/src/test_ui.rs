@@ -27,10 +27,57 @@ pub fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
     vec![egui::Event::PointerMoved(pos), button(true), button(false)]
 }
 
+/// A context carrying the fonts the app installs.
+///
+/// Not `egui::Context::default()`, which every test here used to call: egui is
+/// built without `default_fonts`, so a default context has *no* faces. That
+/// does not fail loudly — epaint hands back a font of `row_height` 0.0 and
+/// zero-advance glyphs — so every measurement, every wrap and every click
+/// target below would quietly stop meaning anything.
+pub fn ctx() -> egui::Context {
+    let ctx = egui::Context::default();
+    crate::fonts::install(&ctx);
+    ctx
+}
+
+/// Assert that every character painted this frame has a real glyph in the
+/// installed fonts — that nothing on screen is a `◻`.
+///
+/// The `FontId` comes from each layout section, so a monospace run is checked
+/// against the monospace family and a proportional run against the
+/// proportional one, exactly as epaint resolved them. Whitespace and controls
+/// are skipped: epaint maps those to space-derived or invisible glyphs on
+/// purpose, and `\n` is documented to report as the replacement.
+///
+/// Only sees what this frame actually painted, so its reach is the reach of
+/// the test that calls it.
+pub fn assert_no_tofu(ctx: &egui::Context, out: &egui::FullOutput) {
+    let mut missing: Vec<(char, String, egui::FontId)> = Vec::new();
+    ctx.fonts(|fonts| {
+        for (galley, _) in painted_galleys(out) {
+            for section in &galley.job.sections {
+                for c in galley.job.text[section.byte_range.clone()].chars() {
+                    if c.is_whitespace() || c.is_control() {
+                        continue;
+                    }
+                    if !fonts.has_glyph(&section.format.font_id, c) {
+                        missing.push((
+                            c,
+                            galley.text().to_string(),
+                            section.format.font_id.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    });
+    assert!(missing.is_empty(), "no glyph for: {missing:#?}");
+}
+
 /// A `Ui` from a real (headless) egui pass, so measuring helpers see the
 /// same fonts the app paints with.
 pub fn with_ui<R>(f: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let ctx = egui::Context::default();
+    let ctx = ctx();
     let mut f = Some(f);
     let mut out = None;
     let _ = ctx.run(egui::RawInput::default(), |ctx| {

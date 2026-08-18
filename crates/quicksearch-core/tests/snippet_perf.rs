@@ -157,15 +157,14 @@ fn snippet_paths_perf_comparison() {
     // measured against the same DB layout production runs against.
     conn.execute_batch(
         "CREATE VIRTUAL TABLE st_contentless USING fts5(
-            name, text,
+            text,
             tokenize='trigram remove_diacritics 1',
             content='',
             contentless_delete=1
          );
          CREATE TABLE documents_text (
             file_id    INTEGER PRIMARY KEY,
-            text_zstd  BLOB NOT NULL,
-            text_len   INTEGER NOT NULL
+            text_zstd  BLOB NOT NULL
          );",
     )
     .unwrap();
@@ -180,23 +179,19 @@ fn snippet_paths_perf_comparison() {
                 .prepare("INSERT INTO st_regular(rowid, name, text) VALUES (?1, ?2, ?3)")
                 .unwrap();
             let mut ins_con = tx
-                .prepare("INSERT INTO st_contentless(rowid, name, text) VALUES (?1, ?2, ?3)")
+                .prepare("INSERT INTO st_contentless(rowid, text) VALUES (?1, ?2)")
                 .unwrap();
             let mut ins_blob = tx
-                .prepare(
-                    "INSERT INTO documents_text(file_id, text_zstd, text_len) VALUES (?1, ?2, ?3)",
-                )
+                .prepare("INSERT INTO documents_text(file_id, text_zstd) VALUES (?1, ?2)")
                 .unwrap();
             for i in 1..=NUM_DOCS {
                 let target = 50 + ((rng as usize) % 400);
                 let text = seed_text(&mut rng, target);
                 let name = format!("doc_{:05}.txt", i);
                 ins_reg.execute(params![i as i64, &name, &text]).unwrap();
-                ins_con.execute(params![i as i64, &name, &text]).unwrap();
+                ins_con.execute(params![i as i64, &text]).unwrap();
                 let compressed = zstd::encode_all(text.as_bytes(), 3).unwrap();
-                ins_blob
-                    .execute(params![i as i64, &compressed, text.len() as i64])
-                    .unwrap();
+                ins_blob.execute(params![i as i64, &compressed]).unwrap();
             }
         }
         tx.commit().expect("seed commit");

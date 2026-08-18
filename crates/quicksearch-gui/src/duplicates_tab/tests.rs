@@ -39,6 +39,7 @@ fn frame(
             actions = tab.ui(ui, busy);
         });
     });
+    crate::test_ui::assert_no_tofu(ctx, &out);
     (out, actions)
 }
 
@@ -92,7 +93,7 @@ const PATHS: [&str; 3] = ["/a/img.raw", "/b/img.raw", "/c/img.raw"];
 
 #[test]
 fn a_group_header_offers_the_verification() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = loaded(&PATHS);
     let header = header_of(&ctx, &mut tab);
     let (menu, _) = context_menu_on(&ctx, &mut tab, false, &header);
@@ -105,7 +106,7 @@ fn a_group_header_offers_the_verification() {
 /// Clicking it asks for the whole group, not the one row it was asked from.
 #[test]
 fn verifying_asks_for_every_member_of_the_group() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = loaded(&PATHS);
     let header = header_of(&ctx, &mut tab);
     context_menu_on(&ctx, &mut tab, false, &header);
@@ -128,7 +129,7 @@ fn verifying_asks_for_every_member_of_the_group() {
 /// asked for rather than replacing what someone is reading.
 #[test]
 fn a_second_verification_is_refused_while_the_window_is_open() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = loaded(&PATHS);
     let header = header_of(&ctx, &mut tab);
     context_menu_on(&ctx, &mut tab, true, &header);
@@ -148,7 +149,7 @@ fn a_second_verification_is_refused_while_the_window_is_open() {
 /// thing: the rows are what someone is looking at when the question occurs.
 #[test]
 fn a_member_row_offers_the_verification_too() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = loaded(&PATHS);
     let header = header_of(&ctx, &mut tab);
 
@@ -174,7 +175,7 @@ fn a_member_row_offers_the_verification_too() {
 
 #[test]
 fn an_empty_result_says_so_rather_than_showing_an_empty_list() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = DuplicatesTab {
         state: DupState::Loaded(Vec::new()),
     };

@@ -124,8 +124,6 @@ fn seed(path: &std::path::Path) {
                 parent: &dir,
                 size: 4096,
                 mtime: 1_700_000_000 + i as u64,
-                inode: None,
-                device_id: None,
                 mime: Some("text/plain"),
                 ftype: FileType::TEXT,
                 hash: None,
@@ -139,7 +137,7 @@ fn seed(path: &std::path::Path) {
                 .map(|_| WORDS[(rng.next() as usize) % WORDS.len()])
                 .collect();
             let body = body.join(" ");
-            set_content_done(&tx, id, &name, &body, &[], zstd_of(&body).as_deref()).unwrap();
+            set_content_done(&tx, id, &body, zstd_of(&body).as_deref()).unwrap();
         }
     }
     tx.commit().unwrap();

@@ -102,7 +102,7 @@ fn legacy_layout_db_is_wiped_and_recreated() {
     // New columns should exist (just prepare the SELECT — an
     // unknown column name would parse-error here).
     conn.query_row(
-        "SELECT basic_state, content_state, type, mime FROM files LIMIT 0",
+        "SELECT content_state, type, mime FROM files LIMIT 0",
         [],
         |_| Ok(()),
     )
@@ -172,8 +172,8 @@ fn open_existing_reads_nondefault_tokenizer_without_wiping() {
         // Seed the FTS index (rowid = the files row we just inserted) so a
         // MATCH query can be exercised against the on-disk tokenizer.
         conn.execute(
-            "INSERT INTO searchabletext (rowid, name, text, properties) \
-             VALUES (last_insert_rowid(), 'note', 'hello world', '')",
+            "INSERT INTO searchabletext (rowid, text) \
+             VALUES (last_insert_rowid(), 'hello world')",
             [],
         )
         .unwrap();

@@ -42,8 +42,6 @@ impl Seeder {
                 parent: dir,
                 size: 42,
                 mtime,
-                inode: None,
-                device_id: None,
                 mime: Some("text/plain"),
                 ftype: FileType::TEXT,
                 hash: None,
@@ -54,7 +52,7 @@ impl Seeder {
         .expect("unique path");
         if let Some(text) = text {
             let zstd = self.store_text.then(|| zstd_of(text)).flatten();
-            set_content_done(&tx, id, name, text, &[], zstd.as_deref()).unwrap();
+            set_content_done(&tx, id, text, zstd.as_deref()).unwrap();
         }
         tx.commit().unwrap();
         id

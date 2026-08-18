@@ -1,9 +1,8 @@
 //! PDF text extraction.
 //!
-//! One `Document::load` per file, then both the text and the `Info` dictionary
-//! are taken off it. `pdf_extract` can panic or hard-error on malformed files;
-//! any failure is surfaced to the caller and marks the file's content state as
-//! failed.
+//! One `Document::load` per file, then the text is taken off it.
+//! `pdf_extract` can panic or hard-error on malformed files; any failure is
+//! surfaced to the caller and marks the file's content state as failed.
 //!
 //! `lopdf` is reached through `pdf_extract`'s own `pub use lopdf::*` and must
 //! **not** be declared in `Cargo.toml` again: a direct declaration resolved a
@@ -16,7 +15,7 @@ use std::cell::Cell;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use pdf_extract::{Document, Object, PlainTextOutput};
+use pdf_extract::{Document, PlainTextOutput};
 
 use super::{ExtractError, ExtractedContent, Extractor};
 
@@ -75,15 +74,18 @@ impl Extractor for PdfExtractor {
     }
 }
 
-/// The six `Info` keys worth keeping, in the order they are written.
-const INFO_KEYS: [&str; 6] = [
-    "Title", "Author", "Subject", "Keywords", "Creator", "Producer",
-];
+// properties (parked) — the `Info` dictionary read. See
+// `super::ExtractedContent`; reviving this also needs the `Object` import
+// above and `object_to_string` below.
+//
+// /// The six `Info` keys worth keeping, in the order they are written.
+// const INFO_KEYS: [&str; 6] = [
+//     "Title", "Author", "Subject", "Keywords", "Creator", "Producer",
+// ];
 
-/// Load the document once; take the text and the `Info` dictionary off it.
-/// This is `pdf_extract::extract_text`'s body (load, decrypt, `output_doc`)
-/// spelled out so the `Info` read happens while the document is still in
-/// scope.
+/// Load the document once and take the text off it. This is
+/// `pdf_extract::extract_text`'s body (load, decrypt, `output_doc`) spelled
+/// out, which is also what kept the document in scope for the `Info` read.
 fn extract_one_pass(path: &Path) -> Result<ExtractedContent, ExtractError> {
     let mut doc = Document::load(path).map_err(|e| format!("pdf_extract: {}", e))?;
     // Decryption must happen before either the content streams or the `Info`
@@ -98,35 +100,35 @@ fn extract_one_pass(path: &Path) -> Result<ExtractedContent, ExtractError> {
         let mut sink = PlainTextOutput::new(&mut text);
         pdf_extract::output_doc(&doc, &mut sink).map_err(|e| format!("pdf_extract: {}", e))?;
     }
-    let mut out = ExtractedContent::with_text(text);
-
-    // Soft-fail, unchanged: a document with no readable `Info` dictionary
-    // still has its text, and the text is the half that matters.
-    let info = doc
-        .trailer
-        .get(b"Info")
-        .ok()
-        .and_then(|o| o.as_reference().ok())
-        .and_then(|id| doc.get_object(id).ok())
-        .and_then(|o| o.as_dict().ok());
-    if let Some(dict) = info {
-        for key in INFO_KEYS {
-            if let Some(s) = dict.get(key.as_bytes()).ok().and_then(object_to_string) {
-                if !s.is_empty() {
-                    out.properties.insert(key.to_ascii_lowercase(), s);
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn object_to_string(obj: &Object) -> Option<String> {
-    match obj {
-        Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).into_owned()),
-        Object::Name(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-        _ => None,
-    }
+    // properties (parked): the `Info` dictionary was read here, soft-failing
+    // when absent because the text is the half that matters. It is all that
+    // held `doc` open past `output_doc`.
+    //
+    //  let info = doc
+    //      .trailer
+    //      .get(b"Info")
+    //      .ok()
+    //      .and_then(|o| o.as_reference().ok())
+    //      .and_then(|id| doc.get_object(id).ok())
+    //      .and_then(|o| o.as_dict().ok());
+    //  if let Some(dict) = info {
+    //      for key in INFO_KEYS {
+    //          if let Some(s) = dict.get(key.as_bytes()).ok().and_then(object_to_string) {
+    //              if !s.is_empty() {
+    //                  out.properties.insert(key.to_ascii_lowercase(), s);
+    //              }
+    //          }
+    //      }
+    //  }
+    //
+    //  fn object_to_string(obj: &Object) -> Option<String> {
+    //      match obj {
+    //          Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).into_owned()),
+    //          Object::Name(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+    //          _ => None,
+    //      }
+    //  }
+    Ok(ExtractedContent::with_text(text))
 }
 
 #[cfg(test)]
@@ -153,7 +155,7 @@ mod tests {
         assert!(!PdfExtractor.supports("application/zip"));
     }
 
-    use pdf_extract::{dictionary, Dictionary, Stream, StringFormat};
+    use pdf_extract::{dictionary, Dictionary, Object, Stream, StringFormat};
     use std::path::PathBuf;
 
     /// Write a one-page PDF drawing `body`, with `info` as its `Info`
@@ -213,8 +215,10 @@ mod tests {
         Object::String(s.as_bytes().to_vec(), StringFormat::Literal)
     }
 
+    /// A document *with* an `Info` dictionary still extracts its text — the
+    /// dictionary is no longer read, and must not get in the way.
     #[test]
-    fn extracts_text_and_info_properties() {
+    fn extracts_text_from_a_document_with_an_info_dictionary() {
         let path = write_pdf(
             "pdf-full",
             "Hello QuickSearch",
@@ -234,32 +238,6 @@ mod tests {
             "drawn text missing from {:?}",
             out.text
         );
-        // Lowercased keys, which is the contract the rest of the pipeline
-        // stores under.
-        assert_eq!(
-            out.properties.get("title").map(String::as_str),
-            Some("The Title")
-        );
-        assert_eq!(
-            out.properties.get("author").map(String::as_str),
-            Some("An Author")
-        );
-        assert_eq!(
-            out.properties.get("subject").map(String::as_str),
-            Some("A Subject")
-        );
-        assert_eq!(
-            out.properties.get("keywords").map(String::as_str),
-            Some("alpha beta")
-        );
-        assert_eq!(
-            out.properties.get("creator").map(String::as_str),
-            Some("A Creator")
-        );
-        assert_eq!(
-            out.properties.get("producer").map(String::as_str),
-            Some("A Producer")
-        );
     }
 
     /// The soft-fail path: no `Info` dictionary is not an extraction failure,
@@ -269,54 +247,6 @@ mod tests {
         let path = write_pdf("pdf-noinfo", "Body Only", None);
         let out = PdfExtractor.extract(&path).expect("extract");
         assert!(out.text.contains("Body Only"));
-        assert!(
-            out.properties.is_empty(),
-            "unexpected properties: {:?}",
-            out.properties
-        );
-    }
-
-    /// An empty `Info` value is absence, not an empty property.
-    #[test]
-    fn empty_info_values_are_not_stored() {
-        let path = write_pdf(
-            "pdf-emptyinfo",
-            "Body",
-            Some(dictionary! {
-                "Title" => text_string(""),
-                "Author" => text_string("Real Author"),
-            }),
-        );
-        let out = PdfExtractor.extract(&path).expect("extract");
-        assert!(!out.properties.contains_key("title"), "empty title stored");
-        assert_eq!(
-            out.properties.get("author").map(String::as_str),
-            Some("Real Author")
-        );
-    }
-
-    /// `Info` values that are not strings or names are skipped rather than
-    /// rendered — pins `object_to_string`'s catch-all arm.
-    #[test]
-    fn non_string_info_values_are_skipped() {
-        let path = write_pdf(
-            "pdf-badinfo",
-            "Body",
-            Some(dictionary! {
-                "Producer" => 42,
-                "Title" => text_string("Kept"),
-            }),
-        );
-        let out = PdfExtractor.extract(&path).expect("extract");
-        assert!(
-            !out.properties.contains_key("producer"),
-            "integer Info value was rendered: {:?}",
-            out.properties
-        );
-        assert_eq!(
-            out.properties.get("title").map(String::as_str),
-            Some("Kept")
-        );
     }
 
     /// Malformed input must come back as an error, not take the process

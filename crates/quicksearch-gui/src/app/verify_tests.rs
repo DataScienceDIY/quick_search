@@ -44,7 +44,7 @@ fn frame(
 
 #[test]
 fn a_run_in_progress_says_what_it_is_doing_and_offers_a_way_out() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let m = modal(
         VerifyState::Running {
             bytes_read: 5 * 1024 * 1024,
@@ -68,7 +68,7 @@ fn a_run_in_progress_says_what_it_is_doing_and_offers_a_way_out() {
 /// reports what it has rather than dividing by zero.
 #[test]
 fn a_run_with_no_denominator_yet_still_reports() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let m = modal(
         VerifyState::Running {
             bytes_read: 0,
@@ -85,7 +85,7 @@ fn a_run_with_no_denominator_yet_still_reports() {
 
 #[test]
 fn a_clean_result_says_so_and_lists_what_was_read() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let m = modal(report(vec![Identical, Identical, Identical], 300), 3);
     let painted = painted_text(&frame(&ctx, &m, Vec::new()).0);
     assert!(
@@ -103,7 +103,7 @@ fn a_clean_result_says_so_and_lists_what_was_read() {
 /// The case the feature exists for: same size, same head, different bytes.
 #[test]
 fn a_mismatch_names_the_file_and_the_offset() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let m = modal(report(vec![Identical, DiffersAt(1_234_567)], 2), 2);
     let painted = painted_text(&frame(&ctx, &m, Vec::new()).0);
     assert!(
@@ -119,7 +119,7 @@ fn a_mismatch_names_the_file_and_the_offset() {
 
 #[test]
 fn a_cancelled_run_says_so_rather_than_showing_a_verdict() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let m = modal(VerifyState::Cancelled, 2);
     let painted = painted_text(&frame(&ctx, &m, Vec::new()).0);
     assert!(
@@ -146,7 +146,7 @@ fn both_dismiss_buttons_report_the_dismissal() {
         ("Close", VerifyState::Cancelled),
         ("Close", report(vec![Identical, Identical], 8)),
     ] {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let m = modal(state, 2);
         let (out, _) = frame(&ctx, &m, Vec::new());
         let pos =

@@ -777,7 +777,7 @@ mod tests {
     /// caution. Written against the tip with all four.
     #[test]
     fn show_paints_every_part() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let input = crate::test_ui::raw_input(egui::vec2(800.0, 600.0), vec![]);
         let full = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| TOKENIZER.show(ui));
@@ -795,7 +795,7 @@ mod tests {
     /// A lone example reads as a sentence rather than a one-item list.
     #[test]
     fn a_single_example_is_prefixed_with_example() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let input = crate::test_ui::raw_input(egui::vec2(800.0, 600.0), vec![]);
         let full = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| INCLUDE_HIDDEN.show(ui));
@@ -811,7 +811,7 @@ mod tests {
     /// disabled widget unless the *disabled* tooltip is set too.
     #[test]
     fn a_disabled_control_still_explains_itself() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         ctx.style_mut(|s| {
             s.interaction.tooltip_delay = 0.0;
             s.interaction.show_tooltips_only_when_still = false;

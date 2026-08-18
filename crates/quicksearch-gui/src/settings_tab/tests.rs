@@ -81,11 +81,13 @@ fn run_hotkey_edit(
     events: Vec<egui::Event>,
 ) -> egui::FullOutput {
     let input = crate::test_ui::raw_input(egui::vec2(600.0, 200.0), events);
-    ctx.run(input, |ctx| {
+    let out = ctx.run(input, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             hotkey_edit(ui, setting, capturing);
         });
-    })
+    });
+    crate::test_ui::assert_no_tofu(ctx, &out);
+    out
 }
 
 /// One frame of the color scheme control on its own, for the same reason
@@ -96,18 +98,20 @@ fn run_color_scheme_edit(
     events: Vec<egui::Event>,
 ) -> egui::FullOutput {
     let input = crate::test_ui::raw_input(egui::vec2(600.0, 200.0), events);
-    ctx.run(input, |ctx| {
+    let out = ctx.run(input, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             color_scheme_edit(ui, setting);
         });
-    })
+    });
+    crate::test_ui::assert_no_tofu(ctx, &out);
+    out
 }
 
 /// The dropdown says which scheme is in force and writes the one that is
 /// picked; what it shows and what it stores are not the same string.
 #[test]
 fn the_color_scheme_box_shows_and_sets_the_scheme() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut setting = "dark".to_string();
 
     let closed = run_color_scheme_edit(&ctx, &mut setting, vec![]);
@@ -163,7 +167,7 @@ const CTRL_ALT: egui::Modifiers = egui::Modifiers {
 /// pressed.
 #[test]
 fn the_shortcut_button_binds_what_was_pressed() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut setting = "Ctrl+Shift+F".to_string();
     let mut capturing = false;
 
@@ -195,7 +199,7 @@ fn the_shortcut_button_binds_what_was_pressed() {
 /// through rather than treated as one.
 #[test]
 fn capture_ignores_what_it_cannot_bind_and_escape_cancels() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut setting = "Ctrl+Shift+F".to_string();
     let mut capturing = true;
 
@@ -221,7 +225,7 @@ fn capture_ignores_what_it_cannot_bind_and_escape_cancels() {
 
 #[test]
 fn clear_switches_the_shortcut_off() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut setting = "Ctrl+Shift+F".to_string();
     let mut capturing = false;
 
@@ -240,7 +244,7 @@ fn clear_switches_the_shortcut_off() {
 /// app is actually holding, and until Apply they can disagree.
 #[test]
 fn an_unapplied_shortcut_says_it_is_not_in_force_yet() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let run = |draft: &str, live: &str| {
         let input = crate::test_ui::raw_input(egui::vec2(600.0, 200.0), vec![]);
         let out = ctx.run(input, |ctx| {
@@ -315,7 +319,7 @@ const ROWS: &[(Section, &str, &tips::Tip)] = &[
 #[test]
 fn every_row_shows_its_own_tip() {
     for (section, label, tip) in ROWS {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         ctx.style_mut(|s| {
             s.interaction.tooltip_delay = 0.0;
             s.interaction.show_tooltips_only_when_still = false;
@@ -355,7 +359,7 @@ fn every_row_shows_its_own_tip() {
 /// wiring is under test, so tooltip timing is turned off.
 #[test]
 fn hovering_a_setting_label_explains_it() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     ctx.style_mut(|s| {
         s.interaction.tooltip_delay = 0.0;
         s.interaction.show_tooltips_only_when_still = false;
@@ -394,7 +398,7 @@ fn hovering_a_setting_label_explains_it() {
 /// Apply & Save click comes back out as `applied`.
 #[test]
 fn the_tab_renders_and_apply_reports_the_draft() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let cfg = Config::default();
     let mut w = SettingsTab::new();
     w.stage(&cfg);
@@ -406,6 +410,7 @@ fn the_tab_renders_and_apply_reports_the_draft() {
         let full = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| out = w.ui(ui, &cfg));
         });
+        crate::test_ui::assert_no_tofu(&ctx, &full);
         (out, full)
     };
 
@@ -445,6 +450,7 @@ fn run_columns(
             picked = columns_ui(ui, current);
         });
     });
+    crate::test_ui::assert_no_tofu(ctx, &full);
     (picked, full)
 }
 
@@ -454,7 +460,7 @@ fn run_columns(
 /// the moment a box moves, with no Apply.
 #[test]
 fn the_columns_block_reports_a_change_immediately() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let current = ColumnsConfig::default();
     assert!(!current.size, "the fixture assumes Size ships off");
 
@@ -480,7 +486,7 @@ fn the_columns_block_reports_a_change_immediately() {
 /// question "why can I not remove it?" has an answer on screen.
 #[test]
 fn the_columns_block_offers_every_column_but_the_path() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let (_, full) = run_columns(&ctx, &ColumnsConfig::default(), vec![]);
     let painted = painted_text(&full);
     for label in ["Name", "Path", "Content Match", "Size", "Modified", "Rank"] {
@@ -511,6 +517,7 @@ fn run_security(
             action = security_ui(ui, current, false);
         });
     });
+    crate::test_ui::assert_no_tofu(ctx, &full);
     (action, full)
 }
 
@@ -518,7 +525,7 @@ fn run_security(
 /// could show and it is left out rather than shown dead.
 #[test]
 fn the_key_button_appears_only_while_the_index_is_encrypted() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut cfg = Config::default();
     assert!(
         !cfg.security.password_protected,
@@ -545,7 +552,7 @@ fn the_key_button_appears_only_while_the_index_is_encrypted() {
 /// both live in the app, so nothing about the key is decided here.
 #[test]
 fn clicking_the_key_button_reports_show_key() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let cfg = Config {
         security: quicksearch_core::config::SecurityConfig {
             password_protected: true,

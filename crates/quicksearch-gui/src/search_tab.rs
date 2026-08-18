@@ -1007,7 +1007,7 @@ impl SearchTab {
                         // loses focus and its in-progress edit. Nothing follows the
                         // button here, so the ordering alone is the fix.
                         if ui
-                            .place(slot, egui::Button::new("⟳").frame_when_inactive(false))
+                            .place(slot, egui::Button::new("↻").frame_when_inactive(false))
                             .on_hover_text("Run this search again")
                             .clicked()
                         {
@@ -1025,7 +1025,7 @@ impl SearchTab {
                 let mut remove: Option<usize> = None;
                 for (i, pattern) in self.session_ignores.iter().enumerate() {
                     if ui
-                        .small_button(format!("{} 🗙", pattern))
+                        .small_button(format!("{} ×", pattern))
                         .on_hover_text("Remove this session filter")
                         .clicked()
                     {

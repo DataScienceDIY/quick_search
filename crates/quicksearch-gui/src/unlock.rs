@@ -534,7 +534,7 @@ mod tests {
     /// leave it.
     #[test]
     fn the_password_field_takes_focus_once_and_then_releases_it() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let mut screen = UnlockScreen::new(locked_config(), None, None);
 
         frame(&ctx, &mut screen);
@@ -560,7 +560,7 @@ mod tests {
     /// was cleared on submit.
     #[test]
     fn a_failed_attempt_puts_the_caret_back() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let mut screen = UnlockScreen::new(locked_config(), None, None);
         frame(&ctx, &mut screen);
         ctx.memory_mut(|m| m.surrender_focus(pw_field_id()));
@@ -576,7 +576,7 @@ mod tests {
     /// the central one would compile and show nothing.
     #[test]
     fn the_lock_screen_shows_the_build_id() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let mut screen = UnlockScreen::new(locked_config(), None, None);
         let input = crate::test_ui::raw_input(SCREEN, Vec::new());
 
