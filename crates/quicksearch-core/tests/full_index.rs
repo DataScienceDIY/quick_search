@@ -1253,12 +1253,22 @@ struct Overlap {
     /// The heavy root's `extract_total` and pool size, for the fixture guards.
     heavy_pending: usize,
     heavy_pool: usize,
-    /// Distinct published states seen inside the window, counted by the
-    /// counters changing rather than by polls — the watcher polls far faster
-    /// than the writer publishes, so poll count would say nothing. One is a
-    /// window that was raced past, not a window that was measured, and the
-    /// deltas either side of it are meaningless.
-    samples: usize,
+    /// Publications in which the heavy root's row count moved — how many
+    /// separate writer rounds its rows arrived over, counted by the counter
+    /// changing rather than by polls (the watcher polls far faster than the
+    /// writer publishes, so poll count would say nothing).
+    ///
+    /// Reported, never asserted on. It reads as granularity but it is really
+    /// `min(writer rounds, watcher polls)`: at a 1 ms slice the writer
+    /// published faster than the 500 µs poll could see and twelve rows read
+    /// as two steps. Coverage (`heavy_stored`) and the ratio are the verdict;
+    /// this is here to make a surprising run legible.
+    heavy_steps: usize,
+    /// Longest this watcher itself went between polls. A short window has two
+    /// very different causes — a writer that gulped the pass in one turn, or a
+    /// watcher that was descheduled past it — and on a loaded two-core box the
+    /// second is real. Without this the two are indistinguishable in a failure.
+    worst_gap: Duration,
 }
 
 /// Watch a two-root run until the heavy root has finished extracting and
@@ -1268,6 +1278,18 @@ struct Overlap {
 /// Deltas across the overlap, never durations. Sparse samples cost only the
 /// window's edges, and they trim both counters together. Panics if the window
 /// never opened — a fixture that does not exercise the case proves nothing.
+///
+/// The window **opens** on the first published snapshot holding both roots in
+/// flight, and **closes when the heavy root leaves `Extracting`** — not when
+/// the light root finishes walking. Closing it with the light walk is what CI
+/// caught: it makes the measurement depend on a race between the light root's
+/// per-file rate and the heavy root's bandwidth, two things that keep no fixed
+/// ratio across hosts. A starved runner ran the light root's whole 16,000-file
+/// walk while one heavy row landed, and the pass the deltas were supposed to
+/// describe was 1/12th sampled. Ending with the heavy root's own pass makes
+/// the measured interval one unit of work — that pass, all of it, whatever the
+/// light root does meanwhile. If the light walk ends early its counter simply
+/// stops, which understates the interleaving and can never overstate it.
 ///
 /// What can only be seen here is what the writer *published*, once a round
 /// (`publish_status` in `indexing/pipeline.rs`). A caller whose heavy root
@@ -1281,8 +1303,10 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
     let mut last = (0usize, 0usize);
     let mut heavy_pending = 0usize;
     let mut heavy_pool = 0usize;
-    let mut samples = 0usize;
-    let mut counted: Option<(usize, usize)> = None;
+    let mut heavy_steps = 0usize;
+    let mut stepped_at = 0usize;
+    let mut worst_gap = Duration::ZERO;
+    let mut polled_at = Instant::now();
     // Every (heavy, light) phase pair published, in order and without repeats.
     // Only the diagnosis uses it: both phases are monotone, so this is at most
     // a handful of entries and it says exactly which phase went missing.
@@ -1290,6 +1314,8 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         let mut in_window = false;
+        worst_gap = worst_gap.max(polled_at.elapsed());
+        polled_at = Instant::now();
         match service.get_status() {
             IndexingStatus::Running { roots, .. } => {
                 let heavy_p = roots.iter().find(|r| r.root.contains(heavy_tag));
@@ -1298,18 +1324,27 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
                     if phases.last() != Some(&(h.phase, l.phase)) {
                         phases.push((h.phase, l.phase));
                     }
-                    // The light root's *walk* is what used to be starved, so the
-                    // window closes with it — past that there is no drain left
-                    // to observe, and `walked` is the only counter in play.
-                    in_window = h.phase == RootPhase::Extracting && l.phase == RootPhase::Walking;
+                    // Opening takes both roots in flight; staying open takes
+                    // only the heavy root's pass, which is the work the deltas
+                    // describe. See this function's docs for why the light
+                    // root's walk is not allowed to end the measurement.
+                    in_window = if opened.is_none() {
+                        h.phase == RootPhase::Extracting && l.phase == RootPhase::Walking
+                    } else {
+                        h.phase == RootPhase::Extracting
+                    };
                     if in_window {
                         last = (l.walked, h.extracted);
-                        opened.get_or_insert(last);
-                        // A new publication, not a new poll: the counters only
-                        // move when the writer has published a fresh round.
-                        if counted != Some(last) {
-                            counted = Some(last);
-                            samples += 1;
+                        if opened.is_none() {
+                            opened = Some(last);
+                            stepped_at = h.extracted;
+                        }
+                        // A fresh publication, not a fresh poll: the row count
+                        // only moves when the writer has finished a round with
+                        // rows in it.
+                        if h.extracted > stepped_at {
+                            stepped_at = h.extracted;
+                            heavy_steps += 1;
                         }
                         if let Some(total) = h.extract_total {
                             heavy_pending = total;
@@ -1329,7 +1364,10 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
         if opened.is_some() && !in_window {
             break;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        // Finer than a writer round, or the window's edges are set by this
+        // loop instead of by the phase it is watching. One mutex and a small
+        // clone per poll, so 2000/s costs the run nothing measurable.
+        std::thread::sleep(Duration::from_micros(500));
     }
     service.stop_indexing().unwrap();
 
@@ -1349,7 +1387,8 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
         heavy_stored: last.1 - heavy_open,
         heavy_pending,
         heavy_pool,
-        samples,
+        heavy_steps,
+        worst_gap,
     }
 }
 
@@ -1400,32 +1439,45 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     const QUANTUM: usize = 16;
     // HEAVY: few files, each big enough that reading one is real work, with a
     // small `maximum_text_size` so the cost lands in extraction rather than in
-    // the writer's tokenising. Few and large rather than many and small, and
-    // more so than it first looks. What the light root manages to drain
-    // depends only on the heavy root's *total* bytes — that is what sets how
-    // long the pass runs — while the bound it must beat, `3 × (rows +
-    // quantum)`, grows with the row count. So for a fixture of a given size on
-    // disk, every file it is split into costs margin. These are as large as
-    // `maximum_text_file_size` below allows and there are as few of them as
-    // the half-the-rows guard tolerates.
+    // the writer's tokenising. Few and large rather than many and small: the
+    // bound the light root must beat, `3 × (rows + quantum)`, grows with the
+    // row count, while what it drains does not.
+    //
+    // Total bytes are the runtime, and this is one starved thread reading them
+    // — a loaded two-core runner has measured under 2 MB/s for exactly this
+    // work. So the fixture is sized for the *guards*, not for margin: 24 MB is
+    // enough that the rows arrive over separate writer rounds (`heavy_steps`
+    // below) and cheap enough that a bad runner still finishes in seconds. The
+    // margin is a rate ratio and needs no help — CI has measured it in the
+    // hundreds.
     const HEAVY_FILES: usize = 12;
-    // LIGHT: a wide tree of tiny files, so its walk outlasts the heavy root's
-    // extraction and its counter moves finely. Each is inlined by its walk
-    // worker, so this root has no extraction phase of its own to confuse the
-    // window with. Sized for a walk the writer never holds up: at 6000 it was
-    // over before half the heavy rows had landed.
+    // LIGHT: a wide tree of tiny files, so its counter moves finely. Each is
+    // inlined by its walk worker, so this root has no extraction phase of its
+    // own to confuse the window with.
+    //
+    // It no longer has to outlast the heavy root's pass — the window ends with
+    // that pass, and a light walk that finishes first just stops contributing.
+    // What it does have to do is still be walking when the pass *starts*, and
+    // supply more than `3 × (rows + quantum)` files before it ends.
     const LIGHT_FILES: usize = 16_000;
     // Light files drained per (heavy row + quantum). Three times a bound the
-    // serialised design provably cannot reach, and roughly a ninth of what the
-    // built one reaches here.
+    // serialised design provably cannot reach: with turns bounded by rows
+    // rather than time it managed one quantum of each per round, or 1x. The
+    // built one floors at `QUANTUM`:1 and measures well above that.
     const MIN_INTERLEAVE: usize = 3;
+    // Fewest heavy rows a window has to contain for the ratio to be evidence.
+    // From the bound itself: a window of `n` rows drains `QUANTUM × n` light
+    // files at the floor and must beat `MIN_INTERLEAVE × (n + QUANTUM)`, so
+    // `n ≥ MIN_INTERLEAVE × QUANTUM / (QUANTUM - MIN_INTERLEAVE)` — under four
+    // rows the constant term decides the comparison instead of the design.
+    const MIN_ROWS_SAMPLED: usize = 4;
 
     let heavy = tmp_dir("stall-heavy");
-    // 36 bytes a repeat, so just under the 8 MiB that `maximum_text_file_size`
-    // has to stay above; twelve of them is the same ~96 MB of fixture this
-    // always built, redistributed into files that discriminate better.
+    // 36 bytes a repeat, so just under 2 MiB: twelve of them is 24 MB of
+    // fixture against the 92 MB this used to build, and a quarter of the
+    // reading for the runner to get through.
     let body: Vec<u8> = "sphinx of black quartz judge my vow "
-        .repeat(233_000)
+        .repeat(58_000)
         .into_bytes();
     for i in 0..HEAVY_FILES {
         touch(&heavy.join(format!("d{}/big{:04}.txt", i % 4, i)), &body);
@@ -1446,17 +1498,29 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     config.processing.maximum_text_size = 1024;
     // Above the heavy files, or `mark_oversize_pending_na` writes them off as
     // N/A before the pass starts and there is no extraction phase at all.
-    config.processing.maximum_text_file_size = 16 * 1024 * 1024;
+    config.processing.maximum_text_file_size = 4 * 1024 * 1024;
     config.processing.batch_size = QUANTUM;
-    // The window is only as long as one worker takes to read the heavy root —
-    // a tenth of a second or so, and on a host whose /tmp is a tmpfs rather
-    // less. Published once a round, the default 100 ms slice makes a round of
-    // the same order as the whole phase, and the watcher then sees the heavy
-    // root go Walking → Done having never once been published as Extracting.
-    // At 2 ms the round is bounded by the work in it, so the pass spans tens
-    // of publications on any host. This is the fix for a CI failure that was
-    // pure sampling: nothing about the run was unhealthy.
-    config.processing.writer_turn_slice_ms = 2;
+    // Zero, which is what makes this test's verdict arithmetic rather than a
+    // measurement of the host. It is the whole answer to two CI failures that
+    // were both really the same thing: a bound in files-per-second compared
+    // against one in bytes-per-second, on a container that slows the first and
+    // not the second.
+    //
+    // With no time in a turn, a writer round is exactly one bounded piece of
+    // work per root. `service_walking` runs one `batch_size` quantum and then
+    // meets its already-expired deadline; `store_extracted` consumes exactly
+    // one row ("the deadline is checked after every row... at least one row is
+    // always consumed"). So the round, not the second, is the unit, and the
+    // interleave floor is `quantum : 1` — 16:1 here — by construction on any
+    // host. Load can only raise it: a slow reader means rounds where the heavy
+    // root has nothing ready and the light root drains anyway.
+    //
+    // It also makes the ratio *uniform across the pass*, which is what lets the
+    // sample below be a partial one. This watcher is one thread among the
+    // suite's on a two-core runner and can be descheduled through a chunk of a
+    // 40 ms pass; when every round contributes the same ratio, the part it does
+    // see answers the same question as the whole.
+    config.processing.writer_turn_slice_ms = 0;
     // One extraction thread for the heavy root, so its pass costs about what
     // the broken design's inline read would and the two differ only in *which*
     // thread pays for it. `root_workers` is keyed by the `indexing_paths`
@@ -1486,15 +1550,6 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     // The fixture is as configured. Each of these silently costs a factor of
     // the margin below if it stops holding, so they are checked before the
     // ratio is read as a verdict on the design.
-    assert!(
-        seen.samples >= 8,
-        "the overlap was published {} time(s); the deltas either side of a window \
-         that thin are noise, not a measurement. A writer round has to be much \
-         shorter than the heavy root's content pass — lower writer_turn_slice_ms \
-         (currently {} ms) or give the heavy root more bytes to read",
-        seen.samples,
-        config.processing.writer_turn_slice_ms
-    );
     assert_eq!(
         seen.heavy_pool, 1,
         "the heavy root must extract on the single worker root_workers asked for; \
@@ -1505,22 +1560,35 @@ fn a_heavy_root_does_not_stall_a_light_one() {
         "every heavy file must reach the content pass; one inlined by its walk \
          worker never produces an extraction phase to overlap with"
     );
+    // Four rows, not half of them. With a zero slice every round contributes
+    // the same `quantum : 1`, so the window is allowed to be a sub-sample of
+    // the pass — it answers the same question either way, and both counters
+    // are trimmed by the same edge. What it cannot be is degenerate: below
+    // four rows the bound's `+ QUANTUM` term dominates and a passing ratio
+    // would be arithmetic rather than evidence.
     assert!(
-        seen.heavy_stored * 2 >= HEAVY_FILES,
-        "only {} of {} heavy rows landed inside the observed window; the sample \
-         did not cover the pass",
+        seen.heavy_stored >= MIN_ROWS_SAMPLED,
+        "only {} of {} heavy rows landed inside the observed window, fewer than \
+         the {} a verdict needs (worst watcher gap {:?}, rows seen over {} \
+         rounds) — a gap near the pass's own length means this watcher was \
+         descheduled past it, not that the writer gulped it",
         seen.heavy_stored,
-        HEAVY_FILES
+        HEAVY_FILES,
+        MIN_ROWS_SAMPLED,
+        seen.worst_gap,
+        seen.heavy_steps
     );
 
     eprintln!(
         "light files drained while the heavy root extracted: {} against {} heavy \
-         rows (quantum {}, {} publications) — {}x the {}x required; the \
+         rows (quantum {}) landing over {} rounds, worst watcher gap {:?} — \
+         {}x the {}x required; the \
          serialised design cannot exceed 1x",
         seen.light_drained,
         seen.heavy_stored,
         QUANTUM,
-        seen.samples,
+        seen.heavy_steps,
+        seen.worst_gap,
         seen.light_drained / (seen.heavy_stored + QUANTUM),
         MIN_INTERLEAVE
     );
@@ -1564,6 +1632,12 @@ fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
     const LIGHT_FILES: usize = 16_000;
     // As in the sibling: three times a bound the unsliced writer cannot reach.
     const MIN_INTERLEAVE: usize = 3;
+    // Fewest heavy rows a window has to contain for the ratio to be evidence.
+    // From the bound itself: a window of `n` rows drains `QUANTUM × n` light
+    // files at the floor and must beat `MIN_INTERLEAVE × (n + QUANTUM)`, so
+    // `n ≥ MIN_INTERLEAVE × QUANTUM / (QUANTUM - MIN_INTERLEAVE)` — under four
+    // rows the constant term decides the comparison instead of the design.
+    const MIN_ROWS_SAMPLED: usize = 4;
 
     let heavy = tmp_dir("stall-writer-heavy");
     let body: Vec<u8> = "sphinx of black quartz judge my vow "
@@ -1586,13 +1660,12 @@ fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
 
     let mut config = test_config();
     config.processing.batch_size = QUANTUM;
-    // As in the sibling, and for the same reason: the status is published once
-    // a writer round, so a round has to be short against the phase being
-    // watched or the window is a race rather than a measurement. This one's
-    // pass is long — the writer tokenises 256 KiB a row — but nothing about
-    // the fixture guarantees that on a host whose FTS5 is faster than this
-    // one's, and it costs nothing to not depend on it.
-    config.processing.writer_turn_slice_ms = 2;
+    // As in the sibling, and for the same reason: at zero the round is the
+    // unit of measurement and the interleave floor is `quantum : 1` whatever
+    // the host does. This one's pass is long on its own account — the writer
+    // tokenises 256 KiB a row — but nothing in the fixture guarantees that on
+    // a host whose FTS5 is quicker than this one's.
+    config.processing.writer_turn_slice_ms = 0;
     config.paths.indexing_paths = roots.clone();
     // Four readers, so the heavy rows reach the writer faster than it can
     // tokenise them and the ready channel is full when its turn comes.
@@ -1609,13 +1682,6 @@ fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
     std::fs::remove_dir_all(&light).ok();
     std::fs::remove_dir_all(&db_dir).ok();
 
-    assert!(
-        seen.samples >= 8,
-        "the overlap was published {} time(s); the deltas either side of a window \
-         that thin are noise, not a measurement (writer_turn_slice_ms {})",
-        seen.samples,
-        config.processing.writer_turn_slice_ms
-    );
     assert_eq!(
         seen.heavy_pool, 4,
         "the heavy root must extract on four workers"
@@ -1624,24 +1690,31 @@ fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
         seen.heavy_pending, HEAVY_FILES,
         "every heavy file must reach the content pass"
     );
-    // A quarter, not the sibling's half: the light walk now outruns the heavy
-    // pass by design, and a window over eight 256 KiB rows is evidence enough
-    // that the writer yielded between them.
+    // As in the sibling: a partial window answers the same question when every
+    // round contributes the same ratio, so this asks only that it was not
+    // degenerate.
     assert!(
-        seen.heavy_stored * 4 >= HEAVY_FILES,
-        "only {} of {} heavy rows landed inside the observed window; the sample \
-         did not cover the pass",
+        seen.heavy_stored >= MIN_ROWS_SAMPLED,
+        "only {} of {} heavy rows landed inside the observed window, fewer than \
+         the {} a verdict needs (worst watcher gap {:?}, rows seen over {} \
+         rounds) — a gap near the pass's own length means this watcher was \
+         descheduled past it, not that the writer gulped it",
         seen.heavy_stored,
-        HEAVY_FILES
+        HEAVY_FILES,
+        MIN_ROWS_SAMPLED,
+        seen.worst_gap,
+        seen.heavy_steps
     );
 
     eprintln!(
         "light files drained while the heavy root tokenised: {} against {} heavy \
-         rows (quantum {}, {} publications) — {}x the {}x required",
+         rows (quantum {}) landing over {} rounds, worst watcher gap {:?} — \
+         {}x the {}x required",
         seen.light_drained,
         seen.heavy_stored,
         QUANTUM,
-        seen.samples,
+        seen.heavy_steps,
+        seen.worst_gap,
         seen.light_drained / (seen.heavy_stored + QUANTUM),
         MIN_INTERLEAVE
     );
