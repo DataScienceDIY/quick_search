@@ -31,11 +31,15 @@ fn run_frame(
     events: Vec<egui::Event>,
 ) -> egui::FullOutput {
     let input = crate::test_ui::raw_input(egui::vec2(1000.0, 700.0), events);
-    ctx.run(input, |ctx| {
+    let out = ctx.run(input, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             tab.ui(ui);
         });
-    })
+    });
+    // Every test in this file paints through here, so the glyph check rides
+    // along on all of them rather than being a test of its own.
+    crate::test_ui::assert_no_tofu(ctx, &out);
+    out
 }
 
 /// Walk the pointer down the name column until it sits on `row`'s label
@@ -71,7 +75,7 @@ fn deep_path() -> String {
 /// sits on and the directories right above it both stay on screen.
 #[test]
 fn long_paths_elide_from_the_middle_of_the_path_column() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     let path = deep_path();
     tab.results[0].path = path.clone();
@@ -97,7 +101,7 @@ fn long_paths_elide_from_the_middle_of_the_path_column() {
 /// appears while *it* did the eliding, so pre-shortened text brings its own.
 #[test]
 fn an_elided_path_still_shows_the_whole_thing_on_hover() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     // Testing that the tooltip is wired up, not egui's hover timing.
     ctx.style_mut(|s| {
         s.interaction.tooltip_delay = 0.0;
@@ -534,7 +538,7 @@ fn solid_from(ramp: &[(f32, u8)]) -> f32 {
 /// Clearing the old results paints no scrim: it is a plain dip to nothing.
 #[test]
 fn clearing_results_paints_no_scrim() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(20);
 
     let settled = run_frame(&ctx, &mut tab, vec![]);
@@ -572,7 +576,7 @@ fn clearing_results_paints_no_scrim() {
 /// section opacity, which is exactly zero on this frame.
 #[test]
 fn new_results_start_completely_covered() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(20);
     run_frame(&ctx, &mut tab, vec![]);
 
@@ -617,7 +621,7 @@ fn new_results_start_completely_covered() {
 /// The reveal uncovers the table from the top down, first rows early.
 #[test]
 fn new_results_are_uncovered_from_the_top_down() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(20);
     run_frame(&ctx, &mut tab, vec![]);
 
@@ -680,7 +684,7 @@ fn the_selection_follows_its_file_across_batches() {
 
 #[test]
 fn rows_respond_over_selectable_label_text() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(3);
     run_frame(&ctx, &mut tab, Vec::new());
 
@@ -849,7 +853,7 @@ fn the_content_match_cell_stays_inside_its_column() {
 /// the match once, so the tooltip is the *second* appearance.
 #[test]
 fn hovering_the_content_match_cell_shows_the_match_in_the_tooltip() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     // Testing that the tooltip carries the match, not egui's hover timing.
     ctx.style_mut(|s| {
         s.interaction.tooltip_delay = 0.0;
@@ -954,7 +958,7 @@ fn highlight_runs(out: &egui::FullOutput, ctx: &egui::Context) -> Vec<String> {
 /// table ships without them; both are one click away in the header menu.
 #[test]
 fn size_and_modified_are_off_by_default_and_can_be_switched_on() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
 
     let painted = painted_text(&run_frame(&ctx, &mut tab, vec![]));
@@ -1190,7 +1194,7 @@ fn refitting_without_a_measurement_splits_the_budget_evenly() {
 /// past the edge, unreachable and looking switched off.
 #[test]
 fn the_columns_follow_the_window_when_it_is_resized() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(3);
     tab.columns = ColumnsConfig {
         name: true,
@@ -1280,7 +1284,7 @@ fn a_column_cannot_be_dragged_wider_than_the_slack_that_is_left() {
 fn dragging_a_column_cannot_push_the_table_off_the_edge() {
     const W: f32 = 900.0;
     const STEP: f32 = 400.0;
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(3);
     tab.columns = ColumnsConfig {
         name: true,
@@ -1483,7 +1487,7 @@ fn the_ceiling_is_what_the_columns_to_the_right_can_give() {
 #[test]
 fn a_dragged_divider_widens_its_column_and_stays_under_the_cursor() {
     const W: f32 = 1000.0;
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(3);
     tab.columns = ColumnsConfig {
         name: true,
@@ -1571,7 +1575,7 @@ fn a_dragged_divider_widens_its_column_and_stays_under_the_cursor() {
 /// where everything else is switched off.
 #[test]
 fn the_path_column_survives_every_column_combination() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     for bits in 0..32u8 {
         let mut tab = tab_with_results(1);
         tab.columns = ColumnsConfig {
@@ -1601,7 +1605,7 @@ fn the_path_column_survives_every_column_combination() {
 /// was taken for.
 #[test]
 fn the_content_match_column_follows_only_its_checkbox() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(2);
     assert!(
         tab.results
@@ -1639,7 +1643,7 @@ fn the_content_match_column_follows_only_its_checkbox() {
 #[test]
 fn right_clicking_any_header_opens_the_column_picker() {
     for header in ["Name", "Path", "Rank"] {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let mut tab = tab_with_results(1);
         let out = run_frame(&ctx, &mut tab, vec![]);
         let pos = painted_text_center(&out, header)
@@ -1656,7 +1660,7 @@ fn right_clicking_any_header_opens_the_column_picker() {
 /// says — because there is no content match to show.
 #[test]
 fn a_filename_match_is_highlighted_in_the_name_column() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     tab.results[0] = name_hit("quarterly_budget.txt", (10, 16));
 
@@ -1676,7 +1680,7 @@ fn a_filename_match_is_highlighted_in_the_name_column() {
 /// the truth.
 #[test]
 fn hiding_the_name_column_skips_its_highlight() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     tab.results[0] = name_hit("quarterly_budget.txt", (10, 16));
     tab.columns.name = false;
@@ -1694,7 +1698,7 @@ fn hiding_the_name_column_skips_its_highlight() {
 /// answer, and this holds even if core regresses to windowing name snippets.
 #[test]
 fn a_name_snippet_that_is_not_the_name_paints_no_highlight() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     let mut hit = name_hit("a_very_long_quarterly_budget_report.txt", (0, 6));
     // What `window_around` used to hand back: a suffix, with rebased ranges.
@@ -1720,7 +1724,7 @@ fn a_name_snippet_that_is_not_the_name_paints_no_highlight() {
 /// switch off — so this highlight is always available.
 #[test]
 fn a_path_match_is_highlighted_in_the_path_column() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     let path = "/qs-test/reports/alpha_widget_0.txt";
     tab.results[0].path = path.to_string();
@@ -1741,7 +1745,7 @@ fn a_path_match_is_highlighted_in_the_path_column() {
 /// whatever glyphs happen to sit at those offsets in the shortened string.
 #[test]
 fn a_path_match_lost_to_elision_paints_no_stray_highlight() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     let path = deep_path();
     tab.results[0].path = path.clone();
@@ -1767,7 +1771,7 @@ fn a_path_match_lost_to_elision_paints_no_stray_highlight() {
 /// weak part: it is punctuation the renderer added, not part of the path.
 #[test]
 fn the_path_column_paints_at_full_strength_but_marks_its_elision_weak() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     let path = deep_path();
     tab.results[0].path = path.clone();
@@ -1799,7 +1803,7 @@ fn the_path_column_paints_at_full_strength_but_marks_its_elision_weak() {
 /// mark to place and paints the cell in one run.
 #[test]
 fn a_path_that_fits_is_painted_whole_at_full_strength() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     let path = tab.results[0].path.clone();
 
@@ -1817,9 +1821,9 @@ fn a_path_that_fits_is_painted_whole_at_full_strength() {
 /// what is on screen.
 #[test]
 fn the_repeat_button_tracks_the_search_it_would_repeat() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
-    let has_button = |out: &egui::FullOutput| painted_text(out).contains(&"⟳".to_string());
+    let has_button = |out: &egui::FullOutput| painted_text(out).contains(&"↻".to_string());
 
     assert!(
         !has_button(&run_frame(&ctx, &mut tab, vec![])),
@@ -1869,10 +1873,10 @@ fn completed_tab(ctx: &egui::Context) -> SearchTab {
 
 #[test]
 fn clicking_the_repeat_button_asks_for_a_rerun() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = completed_tab(&ctx);
     let out = run_frame(&ctx, &mut tab, vec![]);
-    let pos = painted_text_center(&out, "⟳").expect("no repeat button painted");
+    let pos = painted_text_center(&out, "↻").expect("no repeat button painted");
     let (_, actions) = run_frame_actions(&ctx, &mut tab, click_at(pos));
     assert!(actions.rerun, "the repeat button reported nothing");
 }
@@ -1884,7 +1888,7 @@ fn clicking_the_repeat_button_asks_for_a_rerun() {
 /// even if focus had been dropped and handed back.
 #[test]
 fn the_repeat_button_does_not_steal_the_query_box() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     tab.query = "alpha".into();
     tab.focus_query = true;
@@ -1901,7 +1905,7 @@ fn the_repeat_button_does_not_steal_the_query_box() {
         1000,
     );
     let out = run_frame(&ctx, &mut tab, vec![]);
-    assert!(painted_text(&out).contains(&"⟳".to_string()));
+    assert!(painted_text(&out).contains(&"↻".to_string()));
 
     run_frame(&ctx, &mut tab, vec![egui::Event::Text("x".into())]);
     assert!(
@@ -1915,7 +1919,7 @@ fn the_repeat_button_does_not_steal_the_query_box() {
 /// from jumping sideways every time a search finishes.
 #[test]
 fn the_query_text_does_not_shift_when_the_repeat_button_appears() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     tab.query = "alpha".into();
 
@@ -1938,14 +1942,14 @@ fn the_query_text_does_not_shift_when_the_repeat_button_appears() {
         1000,
     );
     let out = run_frame(&ctx, &mut tab, vec![]);
-    assert!(painted_text(&out).contains(&"⟳".to_string()));
+    assert!(painted_text(&out).contains(&"↻".to_string()));
     assert_eq!(without, rect_of(&out), "the query text moved");
 }
 
 /// Left to right: syntax help, the box, how long the search took, then Fuzzy.
 #[test]
 fn the_query_strip_reads_help_box_duration_fuzzy() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = completed_tab(&ctx);
     let out = run_frame(&ctx, &mut tab, vec![]);
 
@@ -1971,7 +1975,7 @@ fn the_query_strip_reads_help_box_duration_fuzzy() {
 /// `ui.checkbox` had.
 #[test]
 fn the_fuzzy_label_is_left_of_its_box_and_still_toggles() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = completed_tab(&ctx);
     let out = run_frame(&ctx, &mut tab, vec![]);
     let label = painted(&out)
@@ -2026,7 +2030,7 @@ fn a_capped_count_says_so_without_the_word_truncated() {
 /// removing the status bar's wording must not take it with it.
 #[test]
 fn the_in_tab_notice_still_explains_the_cap() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(3);
     tab.limited = true;
     let painted = painted_text(&run_frame(&ctx, &mut tab, vec![]));
@@ -2042,7 +2046,7 @@ fn the_in_tab_notice_still_explains_the_cap() {
 /// it is the visible set, not everything the search returned.
 #[test]
 fn only_the_rendered_rows_are_offered_for_watching() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     // A settled tab: no search running, nothing pending, no reveal underway.
     let mut tab = tab_with_results(500);
     run_frame(&ctx, &mut tab, vec![]);
@@ -2064,7 +2068,7 @@ fn only_the_rendered_rows_are_offered_for_watching() {
 /// debounce to fire the next search.
 #[test]
 fn editing_the_query_drops_the_watches() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     tab.live_armed = vec![live_target("/qs-test/alpha_widget_0.txt")];
     tab.focus_query = true;
@@ -2152,7 +2156,7 @@ fn the_watch_set_is_the_paths_and_the_tier_and_not_the_baseline() {
 /// leave the watcher pointed at a file that is no longer there.
 #[test]
 fn a_renamed_row_is_re_armed_at_its_new_path() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(2);
     run_frame(&ctx, &mut tab, vec![]);
     std::thread::sleep(LIVE_ARM_DELAY);
@@ -2181,7 +2185,7 @@ fn a_renamed_row_is_re_armed_at_its_new_path() {
 /// into a check of the index against the disk.
 #[test]
 fn a_target_carries_what_the_row_is_displaying() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(2);
     tab.results[0].size = 4242;
     tab.results[0].mtime = 1_710_000_000;
@@ -2231,7 +2235,7 @@ fn a_rename_updates_the_row_in_place() {
 /// it would shift everything below while someone is reading.
 #[test]
 fn a_vanished_file_is_struck_through_and_comes_back() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     let path = tab.results[0].path.clone();
 
@@ -2267,7 +2271,7 @@ fn a_vanished_file_is_struck_through_and_comes_back() {
 /// Content Match column on if it was not already.
 #[test]
 fn a_content_change_repaints_the_highlight() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     tab.results[0].stage = 6;
     let path = tab.results[0].path.clone();
@@ -2297,7 +2301,7 @@ fn a_content_change_repaints_the_highlight() {
 /// fall back to its dash rather than keep showing text that is no longer a hit.
 #[test]
 fn an_edit_that_removes_the_match_clears_the_content_cell() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     tab.results[0].stage = 6;
     tab.results[0].snippet = Some(Snippet {
@@ -2347,7 +2351,7 @@ fn a_content_change_leaves_a_name_hit_s_snippet_alone() {
 /// says so. With it hidden, the path — which is always shown — carries it.
 #[test]
 fn a_vanished_file_is_legible_with_the_name_column_hidden() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     tab.columns.name = false;
     let path = tab.results[0].path.clone();

@@ -749,26 +749,22 @@ fn a_directory_that_becomes_unreadable_deletes_nothing() {
 // ---------------------------------------------------------------------------
 
 /// Everything about a file's indexed content that a user can observe: its
-/// state, the stored snippet body, and its property rows.
-type ContentRow = (String, i64, Option<String>, Option<i64>, String);
+/// state, its failure reason, and the compressed size of its stored body.
+type ContentRow = (String, i64, Option<String>, Option<i64>);
 
 fn content_rows(db: &Path) -> Vec<ContentRow> {
     let conn = rusqlite::Connection::open(db).unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT f.path, f.content_state, f.failure_msg, d.text_len,
-                    COALESCE(GROUP_CONCAT(p.key || '=' || p.value, ','), '')
+            "SELECT f.path, f.content_state, ff.reason, LENGTH(d.text_zstd)
                FROM files f
                LEFT JOIN documents_text d ON d.file_id = f.id
-               LEFT JOIN properties p ON p.file_id = f.id
-              GROUP BY f.id
+               LEFT JOIN failed_files ff ON ff.file_id = f.id
               ORDER BY f.path",
         )
         .unwrap();
     let out = stmt
-        .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
@@ -902,7 +898,9 @@ fn undecodable_small_files_are_reported_as_failures_not_silently_skipped() {
     let conn = rusqlite::Connection::open(&db).unwrap();
     let (state, msg): (i64, Option<String>) = conn
         .query_row(
-            "SELECT content_state, failure_msg FROM files WHERE path LIKE '%bad.txt'",
+            "SELECT f.content_state, ff.reason FROM files f \
+               LEFT JOIN failed_files ff ON ff.file_id = f.id \
+              WHERE f.path LIKE '%bad.txt'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -943,7 +941,9 @@ fn an_unreadable_legacy_office_file_fails_with_a_reason() {
     let conn = rusqlite::Connection::open(&db).unwrap();
     let (state, msg): (i64, Option<String>) = conn
         .query_row(
-            "SELECT content_state, failure_msg FROM files WHERE path LIKE '%broken.doc'",
+            "SELECT f.content_state, ff.reason FROM files f \
+               LEFT JOIN failed_files ff ON ff.file_id = f.id \
+              WHERE f.path LIKE '%broken.doc'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -1253,6 +1253,12 @@ struct Overlap {
     /// The heavy root's `extract_total` and pool size, for the fixture guards.
     heavy_pending: usize,
     heavy_pool: usize,
+    /// Distinct published states seen inside the window, counted by the
+    /// counters changing rather than by polls — the watcher polls far faster
+    /// than the writer publishes, so poll count would say nothing. One is a
+    /// window that was raced past, not a window that was measured, and the
+    /// deltas either side of it are meaningless.
+    samples: usize,
 }
 
 /// Watch a two-root run until the heavy root has finished extracting and
@@ -1262,11 +1268,25 @@ struct Overlap {
 /// Deltas across the overlap, never durations. Sparse samples cost only the
 /// window's edges, and they trim both counters together. Panics if the window
 /// never opened — a fixture that does not exercise the case proves nothing.
+///
+/// What can only be seen here is what the writer *published*, once a round
+/// (`publish_status` in `indexing/pipeline.rs`). A caller whose heavy root
+/// finishes its content pass inside one round leaves no snapshot holding both
+/// phases at once and lands on the panic below however healthy the run was —
+/// which is why the callers set `writer_turn_slice_ms` small enough that a
+/// round is far shorter than the pass, and why the panic prints what the
+/// phases actually did.
 fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) -> Overlap {
     let mut opened: Option<(usize, usize)> = None; // (light.walked, heavy.extracted)
     let mut last = (0usize, 0usize);
     let mut heavy_pending = 0usize;
     let mut heavy_pool = 0usize;
+    let mut samples = 0usize;
+    let mut counted: Option<(usize, usize)> = None;
+    // Every (heavy, light) phase pair published, in order and without repeats.
+    // Only the diagnosis uses it: both phases are monotone, so this is at most
+    // a handful of entries and it says exactly which phase went missing.
+    let mut phases: Vec<(RootPhase, RootPhase)> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
         let mut in_window = false;
@@ -1275,6 +1295,9 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
                 let heavy_p = roots.iter().find(|r| r.root.contains(heavy_tag));
                 let light_p = roots.iter().find(|r| r.root.contains(light_tag));
                 if let (Some(h), Some(l)) = (heavy_p, light_p) {
+                    if phases.last() != Some(&(h.phase, l.phase)) {
+                        phases.push((h.phase, l.phase));
+                    }
                     // The light root's *walk* is what used to be starved, so the
                     // window closes with it — past that there is no drain left
                     // to observe, and `walked` is the only counter in play.
@@ -1282,6 +1305,12 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
                     if in_window {
                         last = (l.walked, h.extracted);
                         opened.get_or_insert(last);
+                        // A new publication, not a new poll: the counters only
+                        // move when the writer has published a fresh round.
+                        if counted != Some(last) {
+                            counted = Some(last);
+                            samples += 1;
+                        }
                         if let Some(total) = h.extract_total {
                             heavy_pending = total;
                         }
@@ -1306,8 +1335,13 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
 
     let Some((light_open, heavy_open)) = opened else {
         panic!(
-            "never observed the heavy root extracting while the light root walked; \
-             the fixture is not exercising the case"
+            "never observed the heavy root extracting while the light root walked. \
+             Published (heavy, light) phases: {:?}. An empty list means neither \
+             root matched the tags {:?}/{:?}; a list with no heavy Extracting in \
+             it means the heavy root's content pass began and ended between two \
+             status publications, so lower `writer_turn_slice_ms` until a writer \
+             round is shorter than that pass.",
+            phases, heavy_tag, light_tag
         );
     };
     Overlap {
@@ -1315,6 +1349,7 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
         heavy_stored: last.1 - heavy_open,
         heavy_pending,
         heavy_pool,
+        samples,
     }
 }
 
@@ -1365,12 +1400,15 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     const QUANTUM: usize = 16;
     // HEAVY: few files, each big enough that reading one is real work, with a
     // small `maximum_text_size` so the cost lands in extraction rather than in
-    // the writer's tokenising. Few and large rather than many and small: the
-    // margin is set by the cost of *one* heavy file against one light one,
-    // while the fixture's size on disk is their product — so for a given number
-    // of bytes, bigger files discriminate better. If a host ever comes in
-    // short, raise this size; raising the count only lengthens the window.
-    const HEAVY_FILES: usize = 32;
+    // the writer's tokenising. Few and large rather than many and small, and
+    // more so than it first looks. What the light root manages to drain
+    // depends only on the heavy root's *total* bytes — that is what sets how
+    // long the pass runs — while the bound it must beat, `3 × (rows +
+    // quantum)`, grows with the row count. So for a fixture of a given size on
+    // disk, every file it is split into costs margin. These are as large as
+    // `maximum_text_file_size` below allows and there are as few of them as
+    // the half-the-rows guard tolerates.
+    const HEAVY_FILES: usize = 12;
     // LIGHT: a wide tree of tiny files, so its walk outlasts the heavy root's
     // extraction and its counter moves finely. Each is inlined by its walk
     // worker, so this root has no extraction phase of its own to confuse the
@@ -1383,11 +1421,14 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     const MIN_INTERLEAVE: usize = 3;
 
     let heavy = tmp_dir("stall-heavy");
+    // 36 bytes a repeat, so just under the 8 MiB that `maximum_text_file_size`
+    // has to stay above; twelve of them is the same ~96 MB of fixture this
+    // always built, redistributed into files that discriminate better.
     let body: Vec<u8> = "sphinx of black quartz judge my vow "
-        .repeat(80_000)
+        .repeat(233_000)
         .into_bytes();
     for i in 0..HEAVY_FILES {
-        touch(&heavy.join(format!("d{}/big{:04}.txt", i % 8, i)), &body);
+        touch(&heavy.join(format!("d{}/big{:04}.txt", i % 4, i)), &body);
     }
     let light = tmp_dir("stall-light");
     for i in 0..LIGHT_FILES {
@@ -1403,8 +1444,19 @@ fn a_heavy_root_does_not_stall_a_light_one() {
 
     let mut config = test_config();
     config.processing.maximum_text_size = 1024;
-    config.processing.maximum_text_file_size = 8 * 1024 * 1024;
+    // Above the heavy files, or `mark_oversize_pending_na` writes them off as
+    // N/A before the pass starts and there is no extraction phase at all.
+    config.processing.maximum_text_file_size = 16 * 1024 * 1024;
     config.processing.batch_size = QUANTUM;
+    // The window is only as long as one worker takes to read the heavy root —
+    // a tenth of a second or so, and on a host whose /tmp is a tmpfs rather
+    // less. Published once a round, the default 100 ms slice makes a round of
+    // the same order as the whole phase, and the watcher then sees the heavy
+    // root go Walking → Done having never once been published as Extracting.
+    // At 2 ms the round is bounded by the work in it, so the pass spans tens
+    // of publications on any host. This is the fix for a CI failure that was
+    // pure sampling: nothing about the run was unhealthy.
+    config.processing.writer_turn_slice_ms = 2;
     // One extraction thread for the heavy root, so its pass costs about what
     // the broken design's inline read would and the two differ only in *which*
     // thread pays for it. `root_workers` is keyed by the `indexing_paths`
@@ -1434,6 +1486,15 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     // The fixture is as configured. Each of these silently costs a factor of
     // the margin below if it stops holding, so they are checked before the
     // ratio is read as a verdict on the design.
+    assert!(
+        seen.samples >= 8,
+        "the overlap was published {} time(s); the deltas either side of a window \
+         that thin are noise, not a measurement. A writer round has to be much \
+         shorter than the heavy root's content pass — lower writer_turn_slice_ms \
+         (currently {} ms) or give the heavy root more bytes to read",
+        seen.samples,
+        config.processing.writer_turn_slice_ms
+    );
     assert_eq!(
         seen.heavy_pool, 1,
         "the heavy root must extract on the single worker root_workers asked for; \
@@ -1454,11 +1515,12 @@ fn a_heavy_root_does_not_stall_a_light_one() {
 
     eprintln!(
         "light files drained while the heavy root extracted: {} against {} heavy \
-         rows (quantum {}) — {}x the {}x required; the serialised design cannot \
-         exceed 1x",
+         rows (quantum {}, {} publications) — {}x the {}x required; the \
+         serialised design cannot exceed 1x",
         seen.light_drained,
         seen.heavy_stored,
         QUANTUM,
+        seen.samples,
         seen.light_drained / (seen.heavy_stored + QUANTUM),
         MIN_INTERLEAVE
     );
@@ -1487,7 +1549,8 @@ fn a_heavy_root_does_not_stall_a_light_one() {
 /// Before turns had a slice, an extraction turn wrote everything it found —
 /// half a second to two seconds of tokenising — and the light root's walk got
 /// one quantum in between: the ratio below came in under one. With turns
-/// bounded by `TURN_SLICE` and walks served first, the light root drains at
+/// bounded by `writer_turn_slice_ms` and walks served first, the light root
+/// drains at
 /// its own rate while the heavy root lands a row or two per round.
 #[test]
 fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
@@ -1523,6 +1586,13 @@ fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
 
     let mut config = test_config();
     config.processing.batch_size = QUANTUM;
+    // As in the sibling, and for the same reason: the status is published once
+    // a writer round, so a round has to be short against the phase being
+    // watched or the window is a race rather than a measurement. This one's
+    // pass is long — the writer tokenises 256 KiB a row — but nothing about
+    // the fixture guarantees that on a host whose FTS5 is faster than this
+    // one's, and it costs nothing to not depend on it.
+    config.processing.writer_turn_slice_ms = 2;
     config.paths.indexing_paths = roots.clone();
     // Four readers, so the heavy rows reach the writer faster than it can
     // tokenise them and the ready channel is full when its turn comes.
@@ -1539,6 +1609,13 @@ fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
     std::fs::remove_dir_all(&light).ok();
     std::fs::remove_dir_all(&db_dir).ok();
 
+    assert!(
+        seen.samples >= 8,
+        "the overlap was published {} time(s); the deltas either side of a window \
+         that thin are noise, not a measurement (writer_turn_slice_ms {})",
+        seen.samples,
+        config.processing.writer_turn_slice_ms
+    );
     assert_eq!(
         seen.heavy_pool, 4,
         "the heavy root must extract on four workers"
@@ -1560,10 +1637,11 @@ fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
 
     eprintln!(
         "light files drained while the heavy root tokenised: {} against {} heavy \
-         rows (quantum {}) — {}x the {}x required",
+         rows (quantum {}, {} publications) — {}x the {}x required",
         seen.light_drained,
         seen.heavy_stored,
         QUANTUM,
+        seen.samples,
         seen.light_drained / (seen.heavy_stored + QUANTUM),
         MIN_INTERLEAVE
     );

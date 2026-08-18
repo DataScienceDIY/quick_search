@@ -10,7 +10,7 @@ use std::time::UNIX_EPOCH;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use super::paths::{inode_and_device, parent_str};
+use super::paths::parent_str;
 use super::*;
 use crate::config::Config;
 use crate::db::repo::{self, NewFile};
@@ -110,8 +110,6 @@ pub struct OwnedNewFile {
     pub parent: String,
     pub size: u64,
     pub mtime: u64,
-    pub inode: Option<u64>,
-    pub device_id: Option<u64>,
     pub mime: Option<String>,
     pub ftype: FileType,
     /// `None` only for a dehydrated cloud placeholder. Stored as SQL NULL,
@@ -136,8 +134,6 @@ impl OwnedNewFile {
             parent: &self.parent,
             size: self.size,
             mtime: self.mtime,
-            inode: self.inode,
-            device_id: self.device_id,
             mime: self.mime.as_deref(),
             ftype: self.ftype,
             hash: self.hash.as_deref(),
@@ -218,7 +214,6 @@ pub fn prepare_file_record(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())?;
     let parent = parent_str(path);
-    let (inode, device_id) = inode_and_device(meta);
     // Sniff from the bytes hashing already read; an empty head falls back to
     // the extension.
     let mime = guess_mime_from_head(Path::new(path), &head);
@@ -258,8 +253,6 @@ pub fn prepare_file_record(
         parent,
         size,
         mtime,
-        inode,
-        device_id,
         mime,
         ftype,
         hash,
@@ -284,10 +277,9 @@ pub fn prepare_file_record_from_path(
     prepare_file_record(&db_path, &meta, config, registry)
 }
 
-/// Extract content for one file and record the outcome on its row: text +
-/// properties on success, `NA` when no extractor applies or the
-/// `content_extensions` filter excludes it, `FAILED` with a reason on
-/// extractor errors. The single implementation behind the full text-index
+/// Extract content for one file and record the outcome on its row: text on
+/// success, `NA` when no extractor applies or the `content_extensions`
+/// filter excludes it, `FAILED` with a reason on extractor errors. The single implementation behind the full text-index
 /// pass and incremental updates.
 ///
 /// `mime` is authoritative, including when it is `None`: the head was already
@@ -295,7 +287,6 @@ pub fn prepare_file_record_from_path(
 pub fn extract_and_store(
     tx: &rusqlite::Transaction<'_>,
     file_id: i64,
-    name: &str,
     path: &str,
     mime: Option<&str>,
     registry: &Registry,
@@ -306,18 +297,15 @@ pub fn extract_and_store(
         Some(text) => repo::encode_one(text, config.processing.store_text_for_snippets)?,
         None => None,
     };
-    store_content_outcome(tx, file_id, name, &outcome, zstd.as_deref())
+    store_content_outcome(tx, file_id, &outcome, zstd.as_deref())
 }
 
 /// What should be written for one file's content, decided without touching
 /// the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentOutcome {
-    /// Text (already truncated to `maximum_text_size`) and sorted properties.
-    Done {
-        text: String,
-        properties: Vec<(String, String)>,
-    },
+    /// Text, already truncated to `maximum_text_size`.
+    Done { text: String },
     /// No extractor claims the MIME, or `content_extensions` excludes it.
     NotApplicable,
     /// The extractor ran and failed; the reason goes on the row.
@@ -367,10 +355,7 @@ pub fn decide_content(
                 content.text =
                     safe_truncate_string(&content.text, config.processing.maximum_text_size);
             }
-            ContentOutcome::Done {
-                properties: content.properties_sorted(),
-                text: content.text,
-            }
+            ContentOutcome::Done { text: content.text }
         }
         Ok(None) => ContentOutcome::NotApplicable,
         Err(reason) => ContentOutcome::Failed(reason),
@@ -385,14 +370,11 @@ pub fn decide_content(
 pub fn store_content_outcome(
     tx: &rusqlite::Transaction<'_>,
     file_id: i64,
-    name: &str,
     outcome: &ContentOutcome,
     text_zstd: Option<&[u8]>,
 ) -> Result<(), String> {
     match outcome {
-        ContentOutcome::Done { text, properties } => {
-            repo::set_content_done(tx, file_id, name, text, properties, text_zstd)
-        }
+        ContentOutcome::Done { text } => repo::set_content_done(tx, file_id, text, text_zstd),
         ContentOutcome::NotApplicable => repo::set_content_na(tx, file_id),
         ContentOutcome::Failed(reason) => repo::set_content_failed(tx, file_id, reason),
     }
@@ -402,7 +384,7 @@ pub fn store_content_outcome(
 /// to its [`repo::DocEncoder`] ahead of the lock.
 pub fn outcome_body(outcome: &ContentOutcome) -> Option<&str> {
     match outcome {
-        ContentOutcome::Done { text, .. } => Some(text),
+        ContentOutcome::Done { text } => Some(text),
         _ => None,
     }
 }

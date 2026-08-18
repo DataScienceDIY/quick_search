@@ -163,13 +163,9 @@ CREATE TABLE files (
     parent        TEXT    NOT NULL,
     size          INTEGER NOT NULL,
     mtime         INTEGER NOT NULL,
-    inode         INTEGER,
-    device_id     INTEGER,
     mime          TEXT,
     type          INTEGER NOT NULL DEFAULT 0,
-    basic_state   INTEGER NOT NULL DEFAULT 0,   -- 0=pending 1=done 2=failed
     content_state INTEGER NOT NULL DEFAULT 0,   -- 0=pending 1=done 2=failed 3=n/a
-    failure_msg   TEXT,
     hash          BLOB
 );
 
@@ -188,13 +184,6 @@ CREATE INDEX idx_files_mime   ON files(mime);
 CREATE INDEX idx_files_hash   ON files(hash);
 CREATE INDEX idx_files_content_pending ON files(id) WHERE content_state = 0;
 
-CREATE TABLE properties (
-    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    key     TEXT    NOT NULL,
-    value   TEXT    NOT NULL,
-    PRIMARY KEY (file_id, key)
-);
-
 CREATE TABLE failed_files (
     file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
     reason  TEXT,
@@ -204,11 +193,16 @@ CREATE TABLE failed_files (
 -- Canonical extracted text for every successfully content-indexed file.
 -- Compressed with zstd (see `crate::db::repo::set_content_done`). Only
 -- written when the extractor produced text; absent rows mean "no body
--- text" (e.g. an image with only EXIF properties).
+-- text" (e.g. an audio file whose tags are all empty). "Has a row here" is
+-- therefore *not* the same as "content indexed" — `files.content_state` is
+-- the authority on that.
+--
+-- The uncompressed length is not stored: zstd records it in the frame
+-- header, so `crate::db::repo::raw_text_len` reads it back for the one
+-- caller (the size report) that wants it.
 CREATE TABLE documents_text (
     file_id    INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-    text_zstd  BLOB    NOT NULL,
-    text_len   INTEGER NOT NULL   -- original byte length pre-compression
+    text_zstd  BLOB    NOT NULL
 );
 
 CREATE TABLE config_validation (
@@ -224,11 +218,17 @@ CREATE TABLE config_validation (
 /// rowid=?` without replaying the original row text, at the cost of a modest
 /// tombstone bitmap. Built-in `snippet()` is unavailable in contentless
 /// mode — snippets are rendered in Rust from `documents_text` instead.
+///
+/// **One column, deliberately.** Document bodies are the only thing anything
+/// ever MATCHes: the cascade pins its query to the body
+/// (`crate::search::cascade::passes`) and filename ranks come from scanning
+/// `files.name`, which the trigram index of a `name` column here would only
+/// duplicate — at (len − 2) postings per file indexed.
 pub fn fts_create_sql(tokenizer: &str) -> String {
     let effective = effective_tokenizer(tokenizer);
     format!(
         "CREATE VIRTUAL TABLE searchabletext USING fts5(\
-            name, text, properties, \
+            text, \
             tokenize='{}', \
             content='', \
             contentless_delete=1\

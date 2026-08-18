@@ -109,6 +109,12 @@ maximum_text_size = 262144
 maximum_text_file_size = 2097152
 # Files per batch during walks / inserts / extraction.
 batch_size = 500
+# Writer time one indexing root's turn may take before the round-robin moves
+# on (milliseconds). The time half of the knob whose row half is batch_size:
+# it bounds how long one root can hold up the others, so a root extracting
+# large documents cannot leave another root's walkers parked behind it. 0
+# gives each turn one batch_size quantum and no more.
+writer_turn_slice_ms = 100
 # Files per transaction for incremental FTS updates.
 fts_update_batch_size = 1000
 # How large the write-ahead log (index.sqlite-wal) may grow during an

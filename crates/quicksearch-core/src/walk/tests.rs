@@ -16,9 +16,8 @@ fn db_with(tag: &str, rows: &[(String, u64)]) -> PathBuf {
     for (path, mtime) in rows {
         let as_path = Path::new(path);
         conn.execute(
-            "INSERT INTO files (name, path, parent, size, mtime, type, \
-                                basic_state, content_state)
-             VALUES (?1, ?2, ?3, 0, ?4, 0, 1, 3)",
+            "INSERT INTO files (name, path, parent, size, mtime, type, content_state)
+             VALUES (?1, ?2, ?3, 0, ?4, 0, 3)",
             rusqlite::params![
                 as_path.file_name().unwrap().to_string_lossy(),
                 path,

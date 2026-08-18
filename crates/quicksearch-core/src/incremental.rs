@@ -19,7 +19,7 @@ use crate::db::repo;
 use crate::extract::Registry;
 use crate::file_handling::{
     db_key_for_missing_path, extract_and_store, filtered_walk, prepare_file_record_from_path,
-    store_inline_text, ExtractCursor, UnreadableDirs,
+    ExtractCursor, UnreadableDirs,
 };
 use crate::platform::path_has_hidden_component_under;
 use crate::watcher::FsEvent;
@@ -138,12 +138,11 @@ fn upsert_file(
     } else if let Some(text) = rec.inline_text.as_deref() {
         // `prepare_file_record_from_path` already read the whole file.
         let zstd = repo::encode_one(text, config.processing.store_text_for_snippets)?;
-        store_inline_text(&tx, file_id, &rec, text, zstd.as_deref())?;
+        repo::set_content_done(&tx, file_id, text, zstd.as_deref())?;
     } else {
         extract_and_store(
             &tx,
             file_id,
-            &rec.name,
             &rec.path,
             rec.mime.as_deref(),
             registry,

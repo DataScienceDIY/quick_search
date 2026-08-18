@@ -400,8 +400,6 @@ mod tests {
                         parent: d.to_str().unwrap(),
                         size: std::fs::metadata(&f).unwrap().len(),
                         mtime: 1,
-                        inode: None,
-                        device_id: None,
                         mime: Some("text/plain"),
                         ftype: FileType::TEXT,
                         hash: None,

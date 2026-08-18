@@ -145,7 +145,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(from_disk.text, from_head.text);
-        assert_eq!(from_disk.properties, from_head.properties);
         std::fs::remove_file(&p).ok();
     }
 

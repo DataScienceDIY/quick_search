@@ -54,8 +54,6 @@ fn seed(conn: &mut Connection, paths: &[PathBuf]) {
                 parent,
                 size: 1,
                 mtime: 1,
-                inode: None,
-                device_id: None,
                 mime: Some("text/plain"),
                 ftype: crate::mime::FileType::TEXT,
                 hash: None,

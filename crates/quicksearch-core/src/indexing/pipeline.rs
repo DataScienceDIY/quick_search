@@ -84,15 +84,6 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// Writer time one root's turn may take before the round moves on.
-///
-/// This is the bound on how long any root can hold up the others. Before
-/// there was one, an extraction turn ran to the end of whatever was ready —
-/// half a second to two seconds of FTS5 trigram tokenization for a batch of
-/// large documents — while a walking root's rows sat in its channel and its
-/// walkers parked behind them. Reads as "4/4 workers busy, no progress".
-const TURN_SLICE: Duration = Duration::from_millis(100);
-
 /// Most extracted rows a root holds back between turns. Not `quantum`: a row
 /// carries up to `maximum_text_size` of text, and 500 of those would be
 /// 128 MiB per root. At 64 it is 16 MiB.
@@ -485,7 +476,9 @@ pub(super) struct RunCx<'a> {
     /// text files without handing them to the content pass.
     pub(super) registry: Arc<Registry>,
     pub(super) quantum: usize,
-    /// See [`TURN_SLICE`]; a field so tests can shrink it.
+    /// Writer time one root's turn may take before the round moves on; see
+    /// [`crate::config::ProcessingConfig::writer_turn_slice_ms`], which is
+    /// where the default and the reasoning live. Zero is one quantum a turn.
     pub(super) slice: Duration,
     /// 128-bit path digests, not paths: at millions of files, owning every
     /// path string again was the single largest allocation in a run. See
@@ -514,7 +507,7 @@ impl<'a> RunCx<'a> {
             stop_flag,
             registry: Arc::new(Registry::default_set()),
             quantum: config.processing.batch_size.max(1),
-            slice: TURN_SLICE,
+            slice: Duration::from_millis(config.processing.writer_turn_slice_ms),
             seen_paths: HashSet::new(),
             stale_candidates: Vec::new(),
             aliased_paths: HashSet::new(),
@@ -817,6 +810,15 @@ impl IndexingService {
                     progressed |= p.service_walking(&mut cx)?;
                 }
             }
+            // Between the stages, not only at the end of the round: a root
+            // enters `Extracting` in the walk stage above, and the stage
+            // below can finish its pass in the same round. Published once a
+            // round, the whole phase falls between two snapshots whenever a
+            // root's content pass is short — a small root reads as
+            // `Walking → Done`, having never reported the phase it spent its
+            // extraction in.
+            publish_status(status, run_start, &pipelines);
+
             for k in 0..n {
                 let p = &mut pipelines[(rr + k) % n];
                 if p.phase == RootPhase::Extracting {

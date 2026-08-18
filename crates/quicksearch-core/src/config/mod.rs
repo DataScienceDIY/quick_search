@@ -116,6 +116,22 @@ pub struct ProcessingConfig {
     pub maximum_text_size: usize,
     pub maximum_text_file_size: u64,
     pub batch_size: usize,
+    /// Writer time one root's turn may take before the round moves on, in
+    /// milliseconds. The time half of the round-robin whose row half is
+    /// `batch_size`, and so the bound on how long any one root can hold up
+    /// the others.
+    ///
+    /// Before there was one, an extraction turn ran to the end of whatever
+    /// was ready — half a second to two seconds of FTS5 trigram tokenization
+    /// for a batch of large documents — while a walking root's rows sat in
+    /// its channel and its walkers parked behind them. Reads as "4/4 workers
+    /// busy, no progress".
+    ///
+    /// `0` gives each turn one `batch_size` quantum and no more, which is
+    /// the finest the round-robin goes; the tests that count work per round
+    /// use small values here so a phase cannot begin and end between two
+    /// status snapshots.
+    pub writer_turn_slice_ms: u64,
     pub fts_update_batch_size: usize,
     /// How large the write-ahead log may grow during a run before the indexer
     /// forces a checkpoint, in bytes. `0` disables forced checkpoints;
@@ -258,6 +274,7 @@ impl Default for ProcessingConfig {
             maximum_text_size: 1024 * 256,
             maximum_text_file_size: 1024 * 1024 * 2,
             batch_size: 500,
+            writer_turn_slice_ms: 100,
             fts_update_batch_size: 1000,
             maximum_wal_size: 1024 * 1024 * 512,
             tokenize: "trigram".to_string(),

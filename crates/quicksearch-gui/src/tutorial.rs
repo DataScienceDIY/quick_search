@@ -240,7 +240,7 @@ mod tests {
     #[test]
     fn every_page_paints_its_own_title_and_body() {
         for (page, spec) in PAGES.iter().enumerate() {
-            let ctx = egui::Context::default();
+            let ctx = crate::test_ui::ctx();
             let mut tour = Tutorial { page };
             let (out, _) = frame(&ctx, &mut tour, Vec::new());
             let painted = painted_text(&out);
@@ -262,7 +262,7 @@ mod tests {
     /// generic example.
     #[test]
     fn the_indexing_page_lists_the_configured_folders() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let mut tour = Tutorial { page: 1 };
         let roots = ["/srv/projects".to_string()];
         let _ = ctx.run(raw_input(SCREEN, Vec::new()), |ctx| {
@@ -344,7 +344,7 @@ mod tests {
     /// have to come out the same size.
     #[test]
     fn the_footer_runs_back_then_skip_then_next_at_the_same_size() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let [back, skip, next] = footer_spans(&ctx, 1);
         let back = back.expect("no Back button in the footer");
         let skip = skip.expect("no Skip button in the footer");
@@ -377,7 +377,7 @@ mod tests {
     /// the tour off the front.
     #[test]
     fn the_first_page_cannot_go_back() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let y = footer_y(&ctx, 0);
         for x in (150..850).step_by(4) {
             let mut t = Tutorial { page: 0 };
@@ -411,7 +411,7 @@ mod tests {
     /// confirmation modals' tests take.
     #[test]
     fn skip_and_finish_both_dismiss() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
 
         // Skip is on every page.
         let mut tour = Tutorial { page: 0 };
@@ -428,7 +428,7 @@ mod tests {
             !sweep(&ctx, &mut tour).is_empty(),
             "Finish never fired on the last page"
         );
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let mut tour = Tutorial {
             page: PAGES.len() - 1,
         };

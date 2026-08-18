@@ -378,7 +378,7 @@ fn reconcile_owed_banner(ctx: &egui::Context) -> Option<ReconcileOwedChoice> {
         ui.horizontal(|ui| {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                "⚠ Your indexing settings have not been applied to the index yet.",
+                "Your indexing settings have not been applied to the index yet.",
             );
             if ui.small_button("Start indexing now").clicked() {
                 choice = Some(ReconcileOwedChoice::StartIndexing);
@@ -505,7 +505,7 @@ mod tests {
             KeySource::Prompt,
             KeySource::Keychain,
         ] {
-            let ctx = egui::Context::default();
+            let ctx = crate::test_ui::ctx();
             assert!(
                 !frame(&ctx, source, Vec::new()),
                 "an untouched frame must not request a rebuild"
@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn the_unsaved_modal_reports_each_choice() {
         for source in [UnsavedSource::Manage, UnsavedSource::Settings] {
-            let ctx = egui::Context::default();
+            let ctx = crate::test_ui::ctx();
             assert_eq!(
                 modal_frame(&ctx, source, Vec::new()),
                 None,
@@ -598,7 +598,7 @@ mod tests {
     /// Both ways out of the quit warning work, and neither is the default.
     #[test]
     fn the_quit_warning_reports_both_answers() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         assert_eq!(
             reconcile_modal_frame(&ctx, Vec::new()),
             None,
@@ -641,7 +641,7 @@ mod tests {
     /// Both banner buttons report their clicks.
     #[test]
     fn the_reconcile_banner_reports_both_buttons() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         assert_eq!(banner_frame(&ctx, Vec::new()), None);
 
         let mut seen = std::collections::HashSet::new();

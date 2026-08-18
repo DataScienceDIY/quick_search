@@ -8,20 +8,6 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::config::IgnoreSet;
 
-/// Derive (inode, device_id) from a `std::fs::Metadata` on platforms that
-/// expose them. Returns `(None, None)` on Windows and other non-Unix targets.
-pub(super) fn inode_and_device(_meta: &std::fs::Metadata) -> (Option<u64>, Option<u64>) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        (Some(_meta.ino()), Some(_meta.dev()))
-    }
-    #[cfg(not(unix))]
-    {
-        (None, None)
-    }
-}
-
 /// Render a path as the string stored in `files.path`.
 ///
 /// `Path::canonicalize` on Windows hands back extended-length paths; the

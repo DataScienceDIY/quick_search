@@ -48,7 +48,7 @@ fn confirm_frame(
 /// dead button says so more clearly than a rejected attempt would.
 #[test]
 fn the_confirmation_will_not_submit_an_empty_password() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut pw = String::new();
     let (out, buttons) = confirm_frame(&ctx, &mut pw, false, Vec::new());
     assert_eq!(buttons, (false, false));
@@ -60,7 +60,7 @@ fn the_confirmation_will_not_submit_an_empty_password() {
 
 #[test]
 fn the_confirmation_submits_a_typed_password_and_cancels_on_request() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut pw = "hunter2".to_string();
     let (out, _) = confirm_frame(&ctx, &mut pw, false, Vec::new());
     assert!(
@@ -82,7 +82,7 @@ fn the_confirmation_submits_a_typed_password_and_cancels_on_request() {
 /// having ignored the first attempt.
 #[test]
 fn a_retry_says_the_password_was_wrong() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut pw = String::new();
     let (quiet, _) = confirm_frame(&ctx, &mut pw, false, Vec::new());
     assert!(
@@ -124,7 +124,7 @@ fn a_password_that_derives_another_key_reveals_nothing() {
 
 #[test]
 fn the_reveal_shows_the_key_and_what_holding_it_means() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let display = format!("0x{KEY}");
     let painted = painted_text(&frame(&ctx, &display, Vec::new()).0);
 
@@ -146,7 +146,7 @@ fn the_reveal_shows_the_key_and_what_holding_it_means() {
 fn both_of_the_reveal_buttons_report_their_click() {
     let display = format!("0x{KEY}");
     for (label, expected) in [("Copy", (true, false)), ("Close", (false, true))] {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let (out, _) = frame(&ctx, &display, Vec::new());
         let pos =
             painted_text_center(&out, label).unwrap_or_else(|| panic!("no {label} button painted"));

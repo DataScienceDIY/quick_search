@@ -11,8 +11,8 @@
 //!   stopped being followed. The rows to drop are picked out by a predicate
 //!   no SQL range can express, so [`Scope::covers`] re-runs the walker's own
 //!   filtering rules against each stored path.
-//! * The content filter moved. The rows stay; only their extracted text,
-//!   properties and FTS entry are re-decided.
+//! * The content filter moved. The rows stay; only their extracted text
+//!   and FTS entry are re-decided.
 //!
 //! Only settings that make stored data unreadable or incomparable — the FTS
 //! tokenizer, the hash length, the encryption key — still force a wipe. See

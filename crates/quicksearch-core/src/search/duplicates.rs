@@ -100,8 +100,6 @@ mod tests {
                     parent: "/d",
                     size,
                     mtime: 1_700_000_000,
-                    inode: None,
-                    device_id: None,
                     mime: None,
                     ftype: FileType::TEXT,
                     hash,

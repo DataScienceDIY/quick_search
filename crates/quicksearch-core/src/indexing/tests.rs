@@ -170,8 +170,6 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
                     parent: &tree.to_string_lossy(),
                     size: 22,
                     mtime: 1,
-                    inode: None,
-                    device_id: None,
                     mime: Some("text/plain"),
                     ftype: FileType::TEXT,
                     hash: None,
@@ -185,7 +183,6 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
                 name: format!("f{}.txt", i),
                 outcome: ContentOutcome::Done {
                     text: format!("sphinx of black quartz {}", i),
-                    properties: Vec::new(),
                 },
             });
         }
