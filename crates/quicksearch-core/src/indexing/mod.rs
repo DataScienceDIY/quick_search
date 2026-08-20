@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::config::Config;
 use crate::db;
@@ -84,16 +84,12 @@ pub struct IndexingService {
     status: Arc<Mutex<IndexingStatus>>,
     command_tx: mpsc::Sender<IndexingCommand>,
     db_connection: Arc<Mutex<Option<Arc<Mutex<Connection>>>>>,
-    suspend_flag: Arc<AtomicBool>,
     /// The long single statement a run is inside, if any: the prologue's
     /// reconcile scan or the epilogue's VACUUM — never both, so one slot
     /// serves and [`IndexingService::cancel_db_work`] reaches either.
     interrupt: Arc<db::InterruptSlot>,
     _handle: thread::JoinHandle<()>,
 }
-
-/// Polling interval for `should_abort` while suspended.
-const SUSPEND_POLL_MS: u64 = 100;
 
 /// `indexing.root_workers` rekeyed from the spellings the user typed to the
 /// canonical roots the indexer walks, so an override survives a `~`, a
@@ -112,39 +108,21 @@ fn resolved_root_workers(config: &Config) -> HashMap<String, usize> {
         .collect()
 }
 
-/// Combined stop/suspend check used by worker loops; `true` iff the caller
-/// should abort. While suspended (and not stopped) it parks the thread in
-/// short sleeps until `resume()`.
-pub(crate) fn should_abort(stop: &Arc<AtomicBool>, suspend: &Arc<AtomicBool>) -> bool {
-    loop {
-        if stop.load(Ordering::Relaxed) {
-            return true;
-        }
-        if !suspend.load(Ordering::Relaxed) {
-            return false;
-        }
-        thread::sleep(Duration::from_millis(SUSPEND_POLL_MS));
-    }
-}
-
 impl IndexingService {
     pub fn new() -> Self {
         let status = Arc::new(Mutex::new(IndexingStatus::Idle));
         let (command_tx, command_rx) = mpsc::channel();
         let db_connection = Arc::new(Mutex::new(None));
-        let suspend_flag = Arc::new(AtomicBool::new(false));
         let interrupt: Arc<db::InterruptSlot> = Arc::new(db::InterruptSlot::default());
 
         let status_clone = status.clone();
         let db_connection_clone = db_connection.clone();
-        let suspend_clone = suspend_flag.clone();
         let interrupt_clone = interrupt.clone();
         let handle = thread::spawn(move || {
             Self::indexing_thread(
                 status_clone,
                 command_rx,
                 db_connection_clone,
-                suspend_clone,
                 interrupt_clone,
             );
         });
@@ -153,7 +131,6 @@ impl IndexingService {
             status,
             command_tx,
             db_connection,
-            suspend_flag,
             interrupt,
             _handle: handle,
         }
@@ -169,22 +146,6 @@ impl IndexingService {
     /// statement rolls back.
     pub fn cancel_db_work(&self) {
         db::interrupt(&self.interrupt)
-    }
-
-    /// Pause the indexer: worker loops calling [`should_abort`] block until
-    /// [`resume`](Self::resume). Does not stop the worker.
-    pub fn suspend(&self) {
-        self.suspend_flag.store(true, Ordering::Relaxed);
-    }
-
-    /// Resume indexing after [`suspend`](Self::suspend). No-op if not
-    /// suspended.
-    pub fn resume(&self) {
-        self.suspend_flag.store(false, Ordering::Relaxed);
-    }
-
-    pub fn is_suspended(&self) -> bool {
-        self.suspend_flag.load(Ordering::Relaxed)
     }
 
     /// Start indexing one or more roots; all walk concurrently, funnelling
@@ -301,11 +262,6 @@ impl IndexingService {
         }
     }
 
-    /// Force graceful shutdown - used for signal handling
-    pub fn graceful_shutdown(&self) -> Result<(), String> {
-        self.stop_indexing()
-    }
-
     /// Check if configuration changes require index recreation. A pure
     /// *read* check that never wipes; a missing or incompatible DB means
     /// there is nothing to validate.
@@ -367,7 +323,6 @@ impl IndexingService {
         status: Arc<Mutex<IndexingStatus>>,
         command_rx: mpsc::Receiver<IndexingCommand>,
         db_connection: Arc<Mutex<Option<Arc<Mutex<Connection>>>>>,
-        suspend_flag: Arc<AtomicBool>,
         interrupt: Arc<db::InterruptSlot>,
     ) {
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -396,7 +351,6 @@ impl IndexingService {
                     let config_owned = config.clone();
 
                     let db_connection_clone = db_connection.clone();
-                    let suspend_clone = suspend_flag.clone();
                     let interrupt_clone = interrupt.clone();
                     indexing_handle = Some(thread::spawn(move || {
                         // The writer thread: every DB write and every text
@@ -407,7 +361,6 @@ impl IndexingService {
                             &paths_owned,
                             &db_path_owned,
                             &stop_flag_clone,
-                            &suspend_clone,
                             &config_owned,
                             &db_connection_clone,
                             &interrupt_clone,

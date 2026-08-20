@@ -63,12 +63,6 @@ jobs:
       HOME: /root
       # The highest libc6 version the .deb is allowed to require.
       MAX_GLIBC: '2.35'
-      # full_index.rs asserts a heavy indexing root cannot stall a light one, and
-      # measures that as wall-clock stall. The 100 ms default is calibrated on a
-      # developer machine; this runner measured 188 ms for the same correct
-      # behaviour. 600 ms keeps the check meaningful - the regression it exists to
-      # catch is ~6x the healthy figure, so it would land near 1.2 s here.
-      QSB_STALL_BUDGET_MS: '600'
     steps:
       - uses: actions/checkout@v4
 
@@ -99,6 +93,10 @@ jobs:
           # for before it will run.
           # libcap2-bin provides capsh, which the Test step uses to drop the two
           # DAC capabilities so root obeys permission bits.
+          # jq parses the tags API for the releasable check below. Named rather
+          # than assumed: the release job gets it from its image, and a base
+          # image change that dropped it would turn that check into a silent
+          # pass rather than a failure.
           # zsync and appstream are for build-appimage.sh: appimagetool shells
           # out to zsyncmake rather than bundling it, and reports success while
           # writing nothing when it is absent, so the script checks for it up
@@ -107,7 +105,44 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential perl pkg-config \
             binutils dpkg-dev desktop-file-utils gzip libcap2-bin \
-            zsync appstream
+            zsync appstream jq
+
+      - name: Check the release tag is free
+        # The other half of the guard above, for the path that actually cuts
+        # most releases: pushing a Release* branch. There the tag comes from
+        # [workspace.package] rather than the ref, so the mistake is not a
+        # mismatched tag but a *forgotten bump* — the version still points at a
+        # release that already shipped.
+        #
+        # The release job checks this too and remains the authority; it just
+        # cannot check it until both build jobs are green, so forgetting the
+        # bump used to cost two full release builds, packaging and an artifact
+        # upload before anything said so. This says so in seconds.
+        #
+        # Deliberately as lenient as the release job: a tag at *this* commit is
+        # a re-run and fine, and an unreachable API reads as "not found" and
+        # lets the build proceed rather than failing on a network hiccup. An
+        # early check that blocks a good release is worse than one that misses
+        # a bad one, because the late check still catches it.
+        if: >-
+          startsWith(github.ref, 'refs/heads/Release')
+          || startsWith(github.ref, 'refs/heads/release')
+        env:
+          RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
+          [ -n "$version" ] || { echo "could not read the version from Cargo.toml" >&2; exit 1; }
+          tag="v$version"
+          api="${GITHUB_API_URL:-$GITHUB_SERVER_URL/api/v1}"
+          at=$(curl -sS -H "Authorization: token $RELEASE_TOKEN" \
+                 "$api/repos/$GITHUB_REPOSITORY/tags/$tag" | jq -r '.commit.sha // empty')
+          if [ -n "$at" ] && [ "$at" != "$GITHUB_SHA" ]; then
+              echo "ERROR: $tag already exists at $at, not $GITHUB_SHA." >&2
+              echo "Bump [workspace.package] version in Cargo.toml, refresh Cargo.lock" >&2
+              echo "with 'cargo update -w', commit and push again." >&2
+              exit 1
+          fi
+          echo "OK: $tag is free (or already at this commit)"
 
       - name: Trust the workspace
         # checkout writes as root into a directory git then considers dubiously
@@ -168,7 +203,23 @@ jobs:
             echo "capabilities in test shell: $(grep CapEff /proc/self/status | tr -d "\t")"
             cargo test --release --locked --workspace'
 
+      # Everything from here down produces release assets, so it runs only
+      # where a release can actually come out: a v* tag or a Release* branch.
+      # On master and pull requests the job stops after Build and Test, which
+      # is what those runs are for — the packaging that used to follow built a
+      # .deb, an AppImage, a tarball and a 14-day artifact upload that nothing
+      # would ever download, because the release job is skipped there anyway.
+      #
+      # The condition is repeated rather than hoisted into an env var: Actions
+      # has no workflow-level expression alias, YAML anchors are not supported,
+      # and `env.X` inside `if:` would fail *closed* on a runner that did not
+      # populate it — silently skipping packaging on a real release. Spelled
+      # out, it is the same form the release job's own gate uses.
       - name: Build the .deb
+        if: >-
+          startsWith(github.ref, 'refs/tags/v')
+          || startsWith(github.ref, 'refs/heads/Release')
+          || startsWith(github.ref, 'refs/heads/release')
         # --no-build reuses the binaries from the Build step rather than
         # recompiling. SOURCE_DATE_EPOCH pins the generated changelog date so
         # repeat builds of the same commit are byte-identical.
@@ -177,8 +228,14 @@ jobs:
             ./packaging/build-deb.sh --no-build
 
       - name: Check the glibc floor
+        if: >-
+          startsWith(github.ref, 'refs/tags/v')
+          || startsWith(github.ref, 'refs/heads/Release')
+          || startsWith(github.ref, 'refs/heads/release')
         # The whole point of pinning the container. If someone bumps the image,
         # this fails loudly instead of quietly shipping an uninstallable package.
+        # Gated with the .deb it inspects — there is no package to read without
+        # the step above.
         run: |
           deb=$(ls dist/*.deb)
           depends=$(dpkg-deb -f "$deb" Depends)
@@ -194,6 +251,10 @@ jobs:
           echo "OK: glibc floor $floor <= $MAX_GLIBC"
 
       - name: Build the AppImage
+        if: >-
+          startsWith(github.ref, 'refs/tags/v')
+          || startsWith(github.ref, 'refs/heads/Release')
+          || startsWith(github.ref, 'refs/heads/release')
         # After the glibc gate, so the cheaper check still fails first. --no-build
         # reuses the binaries from the Build step, as the .deb step does, and
         # SOURCE_DATE_EPOCH pins the date substituted into the AppStream release
@@ -207,6 +268,10 @@ jobs:
             ./packaging/build-appimage.sh --no-build
 
       - name: Package the binaries
+        if: >-
+          startsWith(github.ref, 'refs/tags/v')
+          || startsWith(github.ref, 'refs/heads/Release')
+          || startsWith(github.ref, 'refs/heads/release')
         # A tarball for anyone not installing the .deb, stripped to match what
         # build-deb.sh ships.
         run: |
@@ -231,6 +296,12 @@ jobs:
       # node16, which current Forgejo runner images no longer ship; the
       # -node20 tags are Forgejo's builds for precisely this combination.
       - uses: actions/upload-artifact@v3-node20
+        # `if-no-files-found: error` below would fail every master push once the
+        # packaging steps above are gated, so this carries the same gate.
+        if: >-
+          startsWith(github.ref, 'refs/tags/v')
+          || startsWith(github.ref, 'refs/heads/Release')
+          || startsWith(github.ref, 'refs/heads/release')
         with:
           name: linux-x86_64
           # The .zsync is not optional: the update URL baked into every AppImage
@@ -322,7 +393,16 @@ jobs:
               fi
           done
 
+      # As in the linux job, the asset-producing steps run only where a release
+      # can come out. The DLL check above deliberately stays ungated: it
+      # validates the .exe itself rather than packaging it, costs an objdump,
+      # and is exactly the kind of regression worth catching on master rather
+      # than at release time.
       - name: Build the installer
+        if: >-
+          startsWith(github.ref, 'refs/tags/v')
+          || startsWith(github.ref, 'refs/heads/Release')
+          || startsWith(github.ref, 'refs/heads/release')
         # --no-build reuses the binaries from the Build step rather than
         # cross-compiling them a second time. The installer and the .zip below
         # are alternatives, not a two-step download: the installer puts the app
@@ -332,6 +412,10 @@ jobs:
         run: ./packaging/build-installer.sh --no-build
 
       - name: Package the binaries
+        if: >-
+          startsWith(github.ref, 'refs/tags/v')
+          || startsWith(github.ref, 'refs/heads/Release')
+          || startsWith(github.ref, 'refs/heads/release')
         run: |
           version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
           [ -n "$version" ] || { echo "could not read the version from Cargo.toml" >&2; exit 1; }
@@ -354,6 +438,12 @@ jobs:
       # node16, which current Forgejo runner images no longer ship; the
       # -node20 tags are Forgejo's builds for precisely this combination.
       - uses: actions/upload-artifact@v3-node20
+        # Same gate as the packaging steps, for the same `if-no-files-found`
+        # reason as the linux job.
+        if: >-
+          startsWith(github.ref, 'refs/tags/v')
+          || startsWith(github.ref, 'refs/heads/Release')
+          || startsWith(github.ref, 'refs/heads/release')
         with:
           name: windows-x86_64
           path: |

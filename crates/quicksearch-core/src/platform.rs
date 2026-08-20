@@ -490,24 +490,87 @@ pub fn release_free_heap() {
     // spans to the kernel on free.
 }
 
-/// Live and free-but-retained heap bytes, as `(in_use, free)`: `free` is
-/// memory already given back to the allocator that glibc still charges the
-/// process for. `None` where the platform has no way to answer.
-pub fn heap_stats() -> Option<(u64, u64)> {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+/// Create `dir` and its parents, readable only by their owner.
+///
+/// `create_dir_all` leaves the mode to the umask, which is 022 nearly
+/// everywhere and so grants the world `+rx`. The two directories this is
+/// called for hold the index and the config, i.e. the names and text of
+/// everything under the configured roots, plus the salt.
+///
+/// Only directories *created here* are narrowed: an existing one keeps its
+/// mode, because a user who chose `~/Documents` as their data directory did
+/// not ask for it to be locked down.
+pub fn create_dir_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
     {
-        // `mallinfo2`, not `mallinfo`: the older struct is `int`-typed and
-        // silently wraps past 2 GiB, which is exactly the size where the
-        // answer starts to matter.
-        //
-        // SAFETY: no arguments, returns a plain struct by value.
-        let info = unsafe { libc::mallinfo2() };
-        Some((info.uordblks as u64, info.fordblks as u64))
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
     }
-    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    #[cfg(not(unix))]
     {
-        None
+        // Windows: a file created under the user's profile inherits an ACL
+        // that already excludes other users.
+        std::fs::create_dir_all(dir)
     }
+}
+
+/// Narrow `path` to owner-only access, best effort.
+///
+/// SQLite creates its database 0644 (`SQLITE_DEFAULT_FILE_PERMISSIONS`, which
+/// the bundled build does not override) and then copies that mode to the
+/// `-wal` and `-shm` it derives from it, so narrowing the main file before
+/// anything else is opened covers all three. The index is a strictly larger
+/// secret than any single file it was read from: it holds the full text of
+/// documents whose own permissions may be far tighter.
+///
+/// Failure is ignored: on a filesystem with no Unix permissions (a FAT stick,
+/// a network share) there is nothing to set and nothing to report.
+pub fn restrict_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Open `path` for reading, refusing anything that is not a regular file.
+///
+/// Every caller has already decided the path *was* a regular file, from a
+/// `stat` taken earlier — during the walk, or when a result row was put on
+/// screen. A rename can put a FIFO, a tty or a character device at that name
+/// in between, and `open` on one of those blocks in the kernel until a writer
+/// or a carrier appears: uninterruptibly, past any stop flag, and for as long
+/// as the process lives. One such open strands a walk worker while it still
+/// holds its job slot, which parks the whole pool behind it.
+///
+/// `O_NONBLOCK` makes the open itself return, and the handle is then asked
+/// what it actually is — `fstat` on the descriptor, so nothing can swap the
+/// name again underneath the answer. Both are free on a regular file, which
+/// is the only case that matters for speed: the flag is ignored for ordinary
+/// files and the `fstat` hits the inode already in hand.
+pub fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 /// How long to keep retrying a delete that fails because something else holds

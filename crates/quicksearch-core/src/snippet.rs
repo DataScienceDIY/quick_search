@@ -52,13 +52,6 @@ impl Snippet {
     }
 }
 
-/// Extract a snippet from `text` marking every occurrence of any term in
-/// `terms` (ASCII-case-insensitive). With no terms or no matches, returns
-/// the head of the text as the window with no ranges.
-pub fn extract(text: &str, terms: &[&str], opts: &Options) -> Snippet {
-    extract_folded(text, &text.to_ascii_lowercase(), terms, opts)
-}
-
 /// [`extract`] against a haystack the caller has already ASCII-folded.
 /// `folded` must be `text.to_ascii_lowercase()` — the fold is byte-length
 /// preserving, which is what lets offsets found in it slice the original.
@@ -139,6 +132,48 @@ pub fn extract_folded(text: &str, folded: &str, terms: &[&str], opts: &Options) 
     }
 }
 
+/// Clamp `range` into `text` and widen it to the nearest char boundaries.
+///
+/// Both callers below take ranges from matchers that work on bytes — bitap
+/// over an ASCII-folded copy — so an endpoint can land inside a multi-byte
+/// character. Slicing there panics, and `Snippet::ranges` promises boundaries.
+fn aligned_range(text: &str, range: (usize, usize)) -> (usize, usize) {
+    let (mut start, mut end) = range;
+    start = start.min(text.len());
+    end = end.clamp(start, text.len());
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// The whole of `text` as the window, with `range` marked.
+///
+/// This is the shape [`crate::search::SearchHit::snippet`] documents for the
+/// name and path tiers, and what lets a frontend highlight the matched span
+/// inside its own Name or Path column: `window` is that field verbatim, so the
+/// ranges index the field the column is already painting. A filename or a path
+/// is short enough to carry whole, so there is nothing to gain by windowing it.
+pub fn whole_field(text: &str, range: (usize, usize)) -> Snippet {
+    if text.is_empty() {
+        return Snippet::empty();
+    }
+    let (start, end) = aligned_range(text, range);
+    Snippet {
+        window: text.to_string(),
+        ranges: if end > start {
+            vec![(start, end)]
+        } else {
+            Vec::new()
+        },
+        truncated_start: false,
+        truncated_end: false,
+    }
+}
+
 /// Build a snippet window around one known match range in `text` (byte
 /// offsets into `text`). Used by fuzzy full-text search, where the match
 /// was located by the fuzzy matcher rather than exact term search. The
@@ -147,15 +182,7 @@ pub fn window_around(text: &str, range: (usize, usize), opts: &Options) -> Snipp
     if text.is_empty() {
         return Snippet::empty();
     }
-    let (mut ms, mut me) = range;
-    ms = ms.min(text.len());
-    me = me.clamp(ms, text.len());
-    while ms > 0 && !text.is_char_boundary(ms) {
-        ms -= 1;
-    }
-    while me < text.len() && !text.is_char_boundary(me) {
-        me += 1;
-    }
+    let (ms, me) = aligned_range(text, range);
 
     let pre_pad = opts.approx_chars / 3;
     let mut win_start = ms.saturating_sub(pre_pad);
@@ -243,6 +270,13 @@ fn coalesce_overlapping(v: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tests were written against a since-removed `extract` wrapper.
+    /// Production always holds a fold buffer already, so the wrapper earned
+    /// nothing; folding here keeps its coverage of the window logic.
+    fn extract(text: &str, terms: &[&str], opts: &Options) -> Snippet {
+        extract_folded(text, &text.to_ascii_lowercase(), terms, opts)
+    }
 
     fn opts_small() -> Options {
         Options { approx_chars: 40 }

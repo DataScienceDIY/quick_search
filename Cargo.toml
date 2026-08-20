@@ -4,29 +4,117 @@ members = [
     "crates/quicksearch-core",
     "crates/quicksearch-gui",
 ]
+# `vendor/pdf-extract` is deliberately NOT a member: it is a third-party crate
+# carried here for one patch, not part of this workspace's lints, tests or
+# release profile. `[patch.crates-io]` below is what makes the dependency graph
+# resolve to it.
+exclude = ["vendor/pdf-extract"]
 
-# No `[profile.release]` on purpose. Cross-crate inlining looks like it should
-# pay here — the cascade calls into `snippet`/`query`, both into `memchr` and
-# `zstd`, everything into `rusqlite`'s FFI wrappers — so it was measured, and
-# it does not. Against an incremental rebuild of the GUI after touching core
-# (10.2 s at the defaults):
+# pdf-extract 0.12.0, with the two unbounded recursions in it bounded.
+#
+# `get_inherited` follows `/Parent` and `process_stream`'s `Do` arm follows
+# Form XObjects, neither with a depth counter or a visited set. A page whose
+# `/Parent` is itself, or an XObject whose content stream draws itself, walks
+# the stack until it hits the guard page — and a stack overflow is not a panic
+# that `catch_unwind` can contain (`extract/pdf.rs` has one, for the parser's
+# ordinary panics): Rust's handler calls `abort()`, so a ~600-byte file kills
+# the process. It recurs on every run, because the row keeps
+# `content_state = 0` and the feeder selects exactly those; and the live
+# watcher re-extracts on-screen rows on the GUI thread, so such a file crashes
+# the app when it merely appears in a result list.
+#
+# Vendored rather than forked-by-URL so the build stays offline, `--locked`
+# keeps meaning what it means, and the cross-compile job needs no new host.
+# The patch is marked LOCAL PATCH in the source and is upstreamable; the crate
+# is MIT and the copy is recorded in `packaging/copyright`.
+[patch.crates-io]
+pdf-extract = { path = "vendor/pdf-extract" }
+
+[workspace.package]
+version = "1.1.1"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["Jeremy <jeremy@karsttech.com>"]
+repository = "https://code.karsttech.com/jeremy/quick_search.git"
+
+# Fat LTO, one codegen unit. This reverses an earlier decision, so both
+# measurements are kept: the old one was right about what it measured, and it
+# measured the wrong axis on the wrong kind of build.
+#
+# WHAT WAS MEASURED BEFORE, against an *incremental* rebuild of the GUI after
+# touching core (10.2 s at the defaults):
 #
 #   lto=thin           67 s   search cold 29.9 ms  warm best 14.77 ms  index cold 459 ms
 #   lto=thin,cgu=1    152 s   (build cost alone ruled it out)
 #   lto=fat,cgu=1     200 s   search cold 29.2 ms  warm best 14.57 ms  index cold 479 ms
 #   (defaults)         10 s   search cold 30.0 ms  warm best 14.92 ms  index cold 478 ms
 #
-# Every runtime column moves 0-4% and index-cold is not even monotonic, so the
-# gain is at the noise floor while the build is 6.6-19.5x longer — on a CI that
-# builds three targets. Re-measure before concluding otherwise.
+# It concluded that the runtime gain was at the noise floor against a 6.6-19.5x
+# longer build. Two things were wrong with that as a decision:
 #
-# `panic = "abort"` is separately unavailable: `extract/pdf.rs` runs
-# `pdf-extract` inside `catch_unwind`, so aborting would turn a malformed PDF
-# into a killed process instead of one skipped file.
-
-[workspace.package]
-version = "1.0.6"
-edition = "2021"
-license = "GPL-3.0-or-later"
-authors = ["Jeremy <jeremy@karsttech.com>"]
-repository = "https://code.karsttech.com/jeremy/quick_search.git"
+#   * It never weighed SIZE, which turns out to be where the effect is.
+#   * A 10 s incremental rebuild is the worst possible denominator for a
+#     link-time optimization, because the LTO link is nearly the whole cost and
+#     there is no compile phase to amortize it against. CI never builds that
+#     way; it builds clean.
+#
+# RE-MEASURED CLEAN, on 6 cores, stripped `target/*/quicksearch`:
+#
+#                     stripped     vs def   search cold  warm best  index cold
+#   (defaults)      28,248,272          -      28.2 ms    14.7 ms     445 ms
+#   cgu=1           25,909,616      -8.3%      28.6 ms    14.8 ms     452 ms
+#   lto=thin        28,233,296      -0.1%      (not run: no size effect)
+#   lto=thin,cgu=1  25,991,536      -8.0%      (not run: worse than cgu=1 alone)
+#   lto=fat,cgu=1   24,284,912     -14.0%      27.3 ms    14.1 ms     443 ms
+#
+# Search is best of three runs; the spreads overlap, so read fat as "3-4%
+# faster or even", never as a regression. It is both the fastest and by far the
+# smallest, which is why it wins outright.
+#
+# Two surprises worth keeping. `codegen-units = 1` ALONE is worth 2.3 MB - the
+# old table never isolated it, because every cgu=1 row there also carried LTO.
+# And `lto = "thin"` alone is worth nothing at all (0.1%), while thin+cgu=1 is
+# slightly *worse* than cgu=1 by itself. Thin is not a cheaper fat here; it is
+# a different, useless thing.
+#
+# BUILD COST, clean, 6 cores. The second column is what CI actually pays on top
+# of the binaries, since `cargo test --release --workspace` links every test,
+# example and bin target - `--release` is `--profile=release`, so this profile
+# is theirs too:
+#
+#                      bins    + all test targets     total
+#   (defaults)         143 s          28 s            171 s
+#   cgu=1              158 s          41 s            199 s
+#   lto=fat,cgu=1      198 s         100 s            298 s
+#
+# So +127 s on a clean CI run, not the tens of minutes the incremental figure
+# above implies. Test targets link cheaply because they are small; it is the
+# 320-crate dependency compile that dominates, and cgu=1 spreads across cores.
+#
+# WHAT IS DELIBERATELY NOT SET:
+#
+# `strip` would save nothing shipped. The packaging scripts and ci.yml strip the
+# staged *copy*, which keeps `target/release/` symbolised for `perf` and for the
+# RUST_BACKTRACE=1 release-test backtraces CI prints, and keeps `--no-strip` on
+# build-deb.sh and build-appimage.sh meaning something. Setting it here would
+# move the same 6.5 MB saving to a place where it costs debuggability.
+#
+# `panic = "abort"` is the largest win left - it would delete `.gcc_except_table`
+# (428 KB after LTO) and most of `.eh_frame` (1.33 MB) - and is unavailable for
+# two independent reasons. `extract/pdf.rs` runs `pdf-extract` inside
+# `catch_unwind`, so aborting would turn a malformed PDF into a killed process
+# instead of one skipped file. And cargo forces every dependency to rebuild with
+# unwind when building tests under an abort profile, so `cargo test --release`
+# would compile the whole graph a second time.
+#
+# Non-PIE would remove most of `.rela.dyn` (1.37 MB) and is rejected on
+# hardening grounds: this program parses arbitrary user PDFs with a crate known
+# to panic on malformed input, which is the last place to give up ASLR.
+#
+# The vendored OpenSSL (~1.3 MB of `.text`, via SQLCipher) is unreachable by any
+# profile knob - `openssl-src` pins its own `-O2` - and dropping it would add a
+# runtime `libcrypto` dependency, which is exactly what the AppImage's
+# bundles-no-libraries invariant forbids.
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -116,6 +116,22 @@ pub struct ProcessingConfig {
     pub maximum_text_size: usize,
     pub maximum_text_file_size: u64,
     pub batch_size: usize,
+    /// Writer time one root's turn may take before the round moves on, in
+    /// milliseconds. The time half of the round-robin whose row half is
+    /// `batch_size`, and so the bound on how long any one root can hold up
+    /// the others.
+    ///
+    /// Before there was one, an extraction turn ran to the end of whatever
+    /// was ready — half a second to two seconds of FTS5 trigram tokenization
+    /// for a batch of large documents — while a walking root's rows sat in
+    /// its channel and its walkers parked behind them. Reads as "4/4 workers
+    /// busy, no progress".
+    ///
+    /// `0` gives each turn one `batch_size` quantum and no more, which is
+    /// the finest the round-robin goes; the tests that count work per round
+    /// use small values here so a phase cannot begin and end between two
+    /// status snapshots.
+    pub writer_turn_slice_ms: u64,
     pub fts_update_batch_size: usize,
     /// How large the write-ahead log may grow during a run before the indexer
     /// forces a checkpoint, in bytes. `0` disables forced checkpoints;
@@ -169,6 +185,47 @@ pub struct SearchConfig {
     pub results_per_page: usize,
     /// How long the GUI waits after the last keystroke before searching.
     pub debounce_ms: u64,
+    /// Watch the search results currently on screen and show renames,
+    /// deletions and content changes as they happen. Only the rows actually
+    /// visible are watched, and any edit to the query drops the watches.
+    /// What a row shows is read from the file itself, so this holds whether
+    /// or not indexing is running; the files it reads are then brought up to
+    /// date in the index, so what is stored cannot drift from what is on
+    /// screen. See [`crate::live`].
+    pub live_results: bool,
+    /// Which columns the Search tab shows.
+    pub columns: ColumnsConfig,
+}
+
+/// Which columns the Search tab shows, as picked from the right-click menu on
+/// any column header or from the Settings tab.
+///
+/// The path column is deliberately not represented: it is always shown, so
+/// "no columns at all" is not a state this can hold. Size and modified are off
+/// by default — the width they cost is better spent on the path and the match,
+/// and both are one click away.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ColumnsConfig {
+    pub name: bool,
+    /// The matched excerpt from a file's contents. Rows that matched on their
+    /// name or path instead show a dash there.
+    pub content_match: bool,
+    pub size: bool,
+    pub modified: bool,
+    pub rank: bool,
+}
+
+impl Default for ColumnsConfig {
+    fn default() -> Self {
+        ColumnsConfig {
+            name: true,
+            content_match: true,
+            size: false,
+            modified: false,
+            rank: true,
+        }
+    }
 }
 
 impl SearchConfig {
@@ -217,6 +274,7 @@ impl Default for ProcessingConfig {
             maximum_text_size: 1024 * 256,
             maximum_text_file_size: 1024 * 1024 * 2,
             batch_size: 500,
+            writer_turn_slice_ms: 100,
             fts_update_batch_size: 1000,
             maximum_wal_size: 1024 * 1024 * 512,
             tokenize: "trigram".to_string(),
@@ -233,6 +291,8 @@ impl Default for SearchConfig {
             display_limit: 1000,
             results_per_page: 100,
             debounce_ms: 150,
+            live_results: true,
+            columns: ColumnsConfig::default(),
         }
     }
 }
@@ -302,6 +362,21 @@ pub struct UiConfig {
     /// recognises falls back to dark, where a typed-out enum would fail to
     /// deserialize and take the whole config file down with it.
     pub color_scheme: String,
+    /// Whether the first-start tour has been dismissed.
+    ///
+    /// Three-valued on purpose. `None` means the key predates the tour — an
+    /// installation that upgraded into this version, which has already found
+    /// its way around — so only a config file this version *created* (which
+    /// gets `Some(false)` from [`UiConfig::default`]) is ever offered the tour.
+    /// A plain `bool` could not tell those apart.
+    ///
+    /// The field-level `default` is load-bearing and not redundant with the
+    /// `#[serde(default)]` on the struct: that one fills a missing field from
+    /// `UiConfig::default()`, which says `Some(false)` — and would hand every
+    /// upgrading installation the tour. This one fills it from
+    /// `Option::default()`, which is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tutorial_seen: Option<bool>,
 }
 
 impl Default for UiConfig {
@@ -311,6 +386,10 @@ impl Default for UiConfig {
             watch_cap_warned_roots: Vec::new(),
             search_hotkey: "Ctrl+Shift+F".to_string(),
             color_scheme: "dark".to_string(),
+            // Not `None`: a config built from these defaults is a config being
+            // written for the first time, and that is exactly who the tour is
+            // for. `None` is reserved for a file that predates the key.
+            tutorial_seen: Some(false),
         }
     }
 }
@@ -470,16 +549,31 @@ impl Config {
     /// Write back to the file this config was loaded from (or the default
     /// location), creating parent directories as needed. Raw values are
     /// written verbatim — relative paths in a portable config stay relative.
+    ///
+    /// Atomic: see the comment on the rename below.
     pub fn save(&self) -> Result<(), String> {
         let path = self.source.clone().unwrap_or_else(Self::config_path);
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)
+            crate::platform::create_dir_private(dir)
                 .map_err(|e| format!("Failed to create config dir {}: {}", dir.display(), e))?;
         }
         let content = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
-        fs::write(&path, content)
-            .map_err(|e| format!("Failed to write config file {}: {}", path.display(), e))?;
+        // Written beside the target and renamed over it, rather than
+        // truncate-then-write. `[security].salt` exists *only* in this file:
+        // it is not derivable from the index and not stored anywhere else, so
+        // a config truncated by a crash, a full disk or a power cut in the
+        // middle of `write` is an encrypted index that no password can ever
+        // open again. `rename` is atomic on both platforms, and the `sync_all`
+        // before it means the bytes are on the disk before the name points at
+        // them.
+        let tmp = path.with_extension("toml.tmp");
+        write_private(&tmp, content.as_bytes())
+            .map_err(|e| format!("Failed to write config file {}: {}", tmp.display(), e))?;
+        fs::rename(&tmp, &path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("Failed to replace config file {}: {}", path.display(), e)
+        })?;
         Ok(())
     }
 
@@ -535,6 +629,32 @@ impl Config {
             })
             .collect()
     }
+}
+
+/// Write `bytes` to `path`, owner-readable only, and flush them to the disk
+/// before returning.
+///
+/// `O_NOFOLLOW` on Unix: the config directory is not always somewhere only
+/// this user can write — a portable install can sit in a shared or removable
+/// directory — and a symlink left at the config's name would otherwise
+/// redirect this write onto whatever it points at.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    // The rename that follows is atomic with respect to the *directory*, not
+    // to the file's contents: without this, a crash can leave the new name
+    // pointing at a block of zeroes.
+    f.sync_all()
 }
 
 /// Reserved `content_extensions` entry standing for "files with no

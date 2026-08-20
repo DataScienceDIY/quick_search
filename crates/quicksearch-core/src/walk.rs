@@ -29,7 +29,6 @@ use crate::file_handling::{
     classify_by_mtime, classify_for_indexing, path_to_db_string, prepare_file_record,
     warn_if_unrepresentable, DirRows, FileIndexAction, OwnedNewFile, UnreadableDirs,
 };
-use crate::indexing::should_abort;
 
 mod pool;
 #[cfg(test)]
@@ -170,7 +169,6 @@ struct Ctx {
     registry: Arc<Registry>,
     unreadable: UnreadableDirs,
     stop_flag: Arc<AtomicBool>,
-    suspend_flag: Arc<AtomicBool>,
 }
 
 /// Individual unreadable-directory warnings allowed per run before only the
@@ -422,7 +420,7 @@ fn prepare(file: PendingFile, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
 fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
     while let Some((job, slot)) = shared.take() {
         let _busy = shared.stats.enter();
-        if should_abort(&ctx.stop_flag, &ctx.suspend_flag) {
+        if ctx.stop_flag.load(Ordering::Relaxed) {
             shared.shutdown();
             return;
         }
@@ -459,7 +457,7 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
         }
 
         for file in files {
-            if should_abort(&ctx.stop_flag, &ctx.suspend_flag) {
+            if ctx.stop_flag.load(Ordering::Relaxed) {
                 shared.shutdown();
                 return;
             }
@@ -703,7 +701,6 @@ pub fn walk_indexable_files(
     config: Config,
     registry: Arc<Registry>,
     stop_flag: Arc<AtomicBool>,
-    suspend_flag: Arc<AtomicBool>,
     workers: usize,
 ) -> ParallelWalk {
     let mut queue = Queue::default();
@@ -746,7 +743,6 @@ pub fn walk_indexable_files(
         registry,
         unreadable: UnreadableDirs::default(),
         stop_flag,
-        suspend_flag,
     });
 
     for root in unresolvable {

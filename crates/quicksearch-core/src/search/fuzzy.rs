@@ -21,6 +21,10 @@ const MAX_REGISTERS: usize = 22;
 pub struct Bitap {
     /// `masks[c]` has bit `i` set iff `pattern[i] == c`.
     masks: [u64; 256],
+    /// The same table for the *reversed* pattern, which is what lets
+    /// [`Bitap::match_start`] find where a match began by scanning backwards
+    /// from where it ended.
+    rev_masks: [u64; 256],
     /// Pattern length in bytes (1..=64).
     len: usize,
     /// Maximum edit distance.
@@ -36,11 +40,14 @@ impl Bitap {
             return None;
         }
         let mut masks = [0u64; 256];
+        let mut rev_masks = [0u64; 256];
         for (i, &b) in pattern.iter().enumerate() {
             masks[b as usize] |= 1u64 << i;
+            rev_masks[b as usize] |= 1u64 << (pattern.len() - 1 - i);
         }
         Some(Bitap {
             masks,
+            rev_masks,
             len: pattern.len(),
             k,
         })
@@ -58,9 +65,14 @@ impl Bitap {
 
     /// Advance all registers by one haystack byte. Returns the smallest
     /// error count d for which the full pattern just matched, if any.
+    ///
+    /// `masks` selects the direction: [`Bitap::masks`] to scan forwards,
+    /// [`Bitap::rev_masks`] to scan backwards. Everything else — `len`, `k`,
+    /// the `done` bit, `reset` — is the same either way, since a reversed
+    /// pattern is still a pattern of the same length.
     #[inline]
-    fn step(&self, r: &mut [u64], byte: u8) -> Option<usize> {
-        let mask = self.masks[byte as usize];
+    fn step(&self, masks: &[u64; 256], r: &mut [u64], byte: u8) -> Option<usize> {
+        let mask = masks[byte as usize];
         let done = 1u64 << (self.len - 1);
         let mut hit = None;
         let mut prev_old = r[0]; // R_old[d-1] for the d-th iteration
@@ -83,52 +95,127 @@ impl Bitap {
         hit
     }
 
-    /// Minimum edit distance (≤ k) of any occurrence of the pattern in
-    /// `hay`, or `None` if nothing matches within k edits.
-    pub fn best_distance(&self, hay: &[u8]) -> Option<usize> {
-        self.best_distance_and_first(hay).map(|(d, _)| d)
-    }
-
-    /// [`best_distance`](Self::best_distance) plus the first match's
-    /// approximate byte range, from one sweep. The range carries the same
-    /// caveat as [`count_and_first`](Self::count_and_first): it assumes a
-    /// pattern-length match, so edits can shift the true start by up to `k`.
-    pub fn best_distance_and_first(&self, hay: &[u8]) -> Option<(usize, (usize, usize))> {
+    /// Where the match that ended at `end` with `errors` edits began.
+    ///
+    /// The forward scan knows an occurrence's *end* exactly — that is the bit
+    /// it tests — but not its start, and with an insertion or a deletion the
+    /// match is not `len` bytes long, so `end - len` is simply the wrong
+    /// offset. Highlighting it put the marks a byte or two off the match and
+    /// over whatever preceded it: `repot` against `1Reporter` marked `1Repo`.
+    ///
+    /// So the same automaton runs over the *reversed* pattern, backwards from
+    /// `end`. The first position it accepts **within `errors` edits** is the
+    /// start. That bound is what makes this correct rather than merely
+    /// plausible: the reversed pattern will also accept far shorter spans by
+    /// spending its whole budget on deletions — against `xabc` with a 2-edit
+    /// budget it accepts `c` alone on the very first byte — and taking that
+    /// would mark one letter of an exact three-letter match. The true
+    /// alignment costs the same read either way, so requiring `≤ errors`
+    /// rejects the cheap wrong answers and is still guaranteed to fire at or
+    /// before the real start.
+    ///
+    /// Which occurrence gets marked is settled elsewhere — see
+    /// [`Bitap::refine_end`]. The rule both producers land on is *the earliest
+    /// alignment at the smallest edit distance*, so a mark is never longer
+    /// than the term and never shorter by more than the budget.
+    fn match_start(&self, hay: &[u8], end: usize, errors: usize) -> usize {
+        // A ≤k-edit alignment of a len-byte pattern is at most len+k long,
+        // so nothing before this can be the start.
+        let floor = end.saturating_sub(self.len + self.k);
         let mut r = [0u64; MAX_REGISTERS];
         self.reset(&mut r);
-        let mut best: Option<(usize, (usize, usize))> = None;
-        for (i, &b) in hay.iter().enumerate() {
-            if let Some(d) = self.step(&mut r, b) {
-                let end = i + 1;
-                let range = (end.saturating_sub(self.len), end);
-                if d == 0 {
-                    return Some((0, range));
-                }
-                if best.is_none_or(|(cur, _)| d < cur) {
-                    best = Some((d, range));
+        for (back, &b) in hay[floor..end].iter().rev().enumerate() {
+            if self
+                .step(&self.rev_masks, &mut r, b)
+                .is_some_and(|d| d <= errors)
+            {
+                return end - (back + 1);
+            }
+        }
+        // Unreachable: the forward scan proved an alignment ends here, and
+        // reversed it costs the same. Falling back to the floor keeps a
+        // hypothetical miss inside the haystack.
+        floor
+    }
+
+    /// Improve on the *earliest* accepting end by looking a little past it.
+    ///
+    /// The automaton accepts as soon as a leading part of the pattern has
+    /// matched, paying for the rest with trailing deletions — so the first
+    /// end it reports is systematically short. Searching `abcdef` over
+    /// `zzabcdefzz` accepts after `abcd`, two deletions, with the whole word
+    /// sitting right there.
+    ///
+    /// Each further byte can turn one of those deletions into a match, so a
+    /// better alignment ends at most `errors` bytes later and never more.
+    /// Stepping a *copy* of the registers that far finds it without
+    /// disturbing the caller's scan, or its count.
+    fn refine_end(
+        &self,
+        hay: &[u8],
+        r: &[u64; MAX_REGISTERS],
+        end: usize,
+        errors: usize,
+    ) -> (usize, usize) {
+        let mut best = (errors, end);
+        let mut probe = *r;
+        for (ahead, &b) in hay[end..].iter().take(errors).enumerate() {
+            if let Some(d) = self.step(&self.masks, &mut probe, b) {
+                if d < best.0 {
+                    best = (d, end + ahead + 1);
                 }
             }
         }
         best
     }
 
-    /// Count non-overlapping occurrences (at ≤ k edits) and report the
-    /// first match's approximate byte range in `hay`. After each hit the
-    /// automaton resets, so an exact match followed by trailing bytes
-    /// counts once, and overlapping suffix matches don't inflate counts.
-    /// The reported range assumes pattern-length matches — edits can shift
-    /// the true start by up to k bytes, which is fine for snippet windows.
+    /// The smallest edit distance (≤ k) at which the pattern occurs in `hay`,
+    /// and that occurrence's byte range — the span a frontend marks.
+    ///
+    /// This one sweeps the whole haystack, so it finds the best alignment
+    /// without help; [`Bitap::count_and_first`] resets after every hit and
+    /// needs [`Bitap::refine_end`] instead.
+    pub fn best_distance_and_first(&self, hay: &[u8]) -> Option<(usize, (usize, usize))> {
+        let mut r = [0u64; MAX_REGISTERS];
+        self.reset(&mut r);
+        // (errors, end). The start is resolved once, at the end, rather than
+        // per improvement — `match_start` is a second scan, however short.
+        let mut best: Option<(usize, usize)> = None;
+        for (i, &b) in hay.iter().enumerate() {
+            if let Some(d) = self.step(&self.masks, &mut r, b) {
+                let end = i + 1;
+                if d == 0 {
+                    best = Some((0, end));
+                    break;
+                }
+                if best.is_none_or(|(cur, _)| d < cur) {
+                    best = Some((d, end));
+                }
+            }
+        }
+        best.map(|(d, end)| (d, (self.match_start(hay, end, d), end)))
+    }
+
+    /// Count non-overlapping occurrences (at ≤ k edits) and report the first
+    /// one's byte range in `hay`. After each hit the automaton resets, so an
+    /// exact match followed by trailing bytes counts once, and overlapping
+    /// suffix matches don't inflate counts.
+    ///
+    /// The range is the occurrence itself: [`Bitap::refine_end`] settles which
+    /// end, then [`Bitap::match_start`] finds where it began. Both run for the
+    /// first hit only, and both are bounded by the edit budget, so the cost is
+    /// O(len + k) per row rather than per byte.
     pub fn count_and_first(&self, hay: &[u8]) -> (usize, Option<(usize, usize)>) {
         let mut r = [0u64; MAX_REGISTERS];
         self.reset(&mut r);
         let mut count = 0usize;
         let mut first: Option<(usize, usize)> = None;
         for (i, &b) in hay.iter().enumerate() {
-            if self.step(&mut r, b).is_some() {
+            if let Some(d) = self.step(&self.masks, &mut r, b) {
                 count += 1;
                 if first.is_none() {
-                    let end = i + 1;
-                    first = Some((end.saturating_sub(self.len), end));
+                    let (errors, end) = self.refine_end(hay, &r, i + 1, d);
+                    first = Some((self.match_start(hay, end, errors), end));
                 }
                 self.reset(&mut r);
             }
@@ -158,7 +245,28 @@ mod tests {
     fn best(pattern: &str, hay: &str, k: usize) -> Option<usize> {
         Bitap::new(pattern.as_bytes(), k)
             .unwrap()
-            .best_distance(hay.as_bytes())
+            .best_distance_and_first(hay.as_bytes())
+            .map(|(d, _)| d)
+    }
+
+    /// The slice of `hay` that a pattern's first occurrence marks — what a
+    /// frontend highlights.
+    fn marked<'h>(pattern: &str, hay: &'h str, k: usize) -> &'h str {
+        let (_, first) = Bitap::new(pattern.as_bytes(), k)
+            .unwrap()
+            .count_and_first(hay.as_bytes());
+        let (s, e) = first.expect("the pattern occurs");
+        &hay[s..e]
+    }
+
+    /// [`marked`] through the other range producer, which shares
+    /// `match_start` but reaches it by a different route.
+    fn marked_best<'h>(pattern: &str, hay: &'h str, k: usize) -> &'h str {
+        let (_, (s, e)) = Bitap::new(pattern.as_bytes(), k)
+            .unwrap()
+            .best_distance_and_first(hay.as_bytes())
+            .expect("the pattern occurs");
+        &hay[s..e]
     }
 
     #[test]
@@ -223,19 +331,136 @@ mod tests {
     }
 
     #[test]
-    fn count_fuzzy_and_range_sane() {
+    fn count_fuzzy_and_range_is_the_occurrence_itself() {
         let b = Bitap::new(b"hello", 1).unwrap();
         let hay = b"say helo and hxllo again";
         let (count, first) = b.count_and_first(hay);
         assert_eq!(count, 2);
-        let (s, e) = first.unwrap();
-        assert!(s < e && e <= hay.len());
-        let window = &hay[s..e];
-        assert!(
-            std::str::from_utf8(window).unwrap().contains("hel"),
-            "first range should cover the first hit, got {:?}",
-            std::str::from_utf8(window)
-        );
+        // The occurrence, not a five-byte window ending where it ends: that
+        // reached back over the space and marked " helo".
+        assert_eq!(first, Some((4, 8)));
+        assert_eq!(&hay[4..8], b"helo");
+    }
+
+    /// The reported bug, exactly: `repot` marked `1Repo` in `1Reporter`.
+    ///
+    /// The match is `repo` — one deletion, dropping the `t` — so it is four
+    /// bytes where the term is five, and a range assumed to be term-length
+    /// reached one byte too far left, over the `1`. Both producers, since
+    /// they share `match_start`.
+    #[test]
+    fn a_match_shorter_than_the_term_is_still_marked_exactly() {
+        assert_eq!(marked("repot", "1reporter", 1), "repo");
+        assert_eq!(marked_best("repot", "1reporter", 1), "repo");
+
+        // Substitution keeps the length, which is the case that always
+        // worked — worth holding, since it is the one the old arithmetic got
+        // right by accident.
+        assert_eq!(marked("hello", "xx hxllo xx", 1), "hxllo");
+        assert_eq!(marked_best("hello", "xx hxllo xx", 1), "hxllo");
+    }
+
+    /// Text with a byte inserted into the term marks up to the insertion, not
+    /// across it: `abxc` is a one-edit alignment of `abc`, but so is the `ab`
+    /// that ends two bytes earlier, and the rule is the *earliest* alignment
+    /// at the best distance. Nothing longer than the term can win — spanning
+    /// an inserted byte costs an edit, and deleting instead costs the same and
+    /// ends sooner.
+    #[test]
+    fn an_insertion_marks_up_to_it_rather_than_over_it() {
+        assert_eq!(marked("abc", "abxcd", 1), "ab");
+        assert_eq!(marked_best("abc", "zzabxczz", 1), "ab");
+    }
+
+    /// The trap in resolving the start backwards: the reversed pattern will
+    /// happily accept a much shorter span by spending its budget on
+    /// deletions, so taking its *first* acceptance marks one letter of an
+    /// exact match. `abc` occurs verbatim in `xabc`, and a 2-edit budget lets
+    /// the reverse pass accept `c` alone one byte in.
+    ///
+    /// Only the whole-haystack producer can reach the trap — it is the one
+    /// that reports an exact match while the budget is still generous, so
+    /// `errors` is 0 where `k` is 2.
+    #[test]
+    fn a_generous_budget_does_not_shrink_an_exact_match() {
+        assert_eq!(marked_best("abc", "xabc", 2), "abc");
+        assert_eq!(marked_best("abcdef", "zzabcdefzz", 2), "abcdef");
+        assert_eq!(marked("hello", "say hello world", 2), "hello");
+    }
+
+    /// The automaton accepts as soon as a leading part of the term has
+    /// matched, spending the rest of the budget on trailing deletions — so
+    /// the earliest end is short, and marking it highlighted `abcd` for a
+    /// search for `abcdef` with the whole word right there. `refine_end`
+    /// looks the budget's worth of bytes past the first acceptance.
+    ///
+    /// Checked against a brute-force Levenshtein oracle over every span.
+    #[test]
+    fn the_mark_is_not_truncated_to_a_leading_part_of_the_term() {
+        assert_eq!(marked("abcdef", "zzabcdefzz", 2), "abcdef");
+        assert_eq!(marked("abc", "xabc", 1), "abc");
+        assert_eq!(marked("reports", "the report went out", 2), "report");
+
+        // Not every term can be extended: `repot` against `1reporter` stops
+        // at `repo` because the next byte (`r`) costs an edit of its own, so
+        // one is the best it does either way.
+        assert_eq!(marked("repot", "1reporter", 1), "repo");
+        // And an alignment already at zero errors has nothing to improve.
+        assert_eq!(marked("hello", "say hello world", 0), "hello");
+    }
+
+    /// However the span is chosen it is a real alignment at the best distance,
+    /// so it is never longer than the term and never shorter by more than the
+    /// budget. That bound is what keeps a mark recognisable: at the production
+    /// ladder of one edit per three characters, a mark is always at least two
+    /// thirds of the term.
+    #[test]
+    fn the_marked_span_is_within_the_budget_of_the_terms_length() {
+        for (term, hay) in [
+            ("repot", "1reporter"),
+            ("abcdef", "zzabcdefzz"),
+            ("quarterly", "the quartrly budget"),
+            ("hello", "say helo and hxllo again"),
+            ("reports", "the report went out"),
+        ] {
+            let k = edit_budget(term.len(), 2).expect("a real budget");
+            let span = marked(term, hay, k).len();
+            assert!(
+                span <= term.len() && term.len() - span <= k,
+                "{term:?} in {hay:?} (k={k}) marked {span} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_budget_marks_exactly_the_term() {
+        assert_eq!(marked("hello", "say hello world", 0), "hello");
+        assert_eq!(marked("ab", "ab ab", 0), "ab");
+    }
+
+    /// A match at the very start, and one whose end is inside the term's own
+    /// length, are where the offset arithmetic can underflow.
+    #[test]
+    fn a_match_at_the_start_of_the_haystack_stays_in_bounds() {
+        assert_eq!(marked("repot", "reporter", 1), "repo");
+        // The haystack is shorter than the term: "ab" matches "abc" with one
+        // deletion, ending at 2.
+        let (_, first) = Bitap::new(b"abc", 1).unwrap().count_and_first(b"ab");
+        assert_eq!(first, Some((0, 2)));
+    }
+
+    /// Bitap works on bytes over an ASCII-folded copy, so a range can land
+    /// inside a multi-byte character. `snippet::aligned_range` is what widens
+    /// it before anything slices; this only pins that the range stays inside
+    /// the haystack so that alignment has something valid to work from.
+    #[test]
+    fn a_range_over_multibyte_text_stays_within_the_haystack() {
+        let hay = "café notes — le rapport";
+        let (_, first) = Bitap::new(b"raport", 1)
+            .unwrap()
+            .count_and_first(hay.as_bytes());
+        let (s, e) = first.expect("one deletion from 'rapport'");
+        assert!(s < e && e <= hay.len(), "({s}, {e}) outside {}", hay.len());
     }
 
     #[test]
@@ -335,7 +560,10 @@ mod tests {
             let pattern: Vec<u8> = (0..plen).map(|_| alphabet[rng() % 4]).collect();
             let hay: Vec<u8> = (0..hlen).map(|_| alphabet[rng() % 4]).collect();
             for k in 0..=4 {
-                let got = Bitap::new(&pattern, k).unwrap().best_distance(&hay);
+                let got = Bitap::new(&pattern, k)
+                    .unwrap()
+                    .best_distance_and_first(&hay)
+                    .map(|(d, _)| d);
                 let want = oracle(&pattern, &hay, k);
                 assert_eq!(
                     got,

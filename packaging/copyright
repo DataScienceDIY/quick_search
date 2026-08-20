@@ -11,6 +11,25 @@ Files: crates/quicksearch-gui/assets/icons/*
 Copyright: 2026 Jeremy <jeremy@karsttech.com>
 License: GPL-3.0-or-later
 
+Files: crates/quicksearch-gui/assets/fonts/Ubuntu-Light.ttf
+Copyright: 2010-2011 Canonical Ltd.
+License: Ubuntu-font-1.0
+ The full text is shipped beside the font as
+ crates/quicksearch-gui/assets/fonts/UFL.txt. The file is redistributed
+ unmodified, so the licence's naming conditions on Modified Versions do not
+ arise.
+
+Files: crates/quicksearch-gui/assets/fonts/Hack-Regular.ttf
+Copyright: 2018 Source Foundry Authors
+           2003 Bitstream, Inc.
+License: MIT and Bitstream-Vera
+ Hack is MIT-licensed work over the public-domain DejaVu project, which is in
+ turn derived from Bitstream Vera Sans Mono under the Bitstream Vera License
+ with Reserved Font Names "Bitstream" and "Vera". The full text of both is
+ shipped beside the font as
+ crates/quicksearch-gui/assets/fonts/Hack-Regular.txt. The file is
+ redistributed unmodified, so the Bitstream renaming condition does not arise.
+
 License: GPL-3.0-or-later
  This program is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
@@ -32,7 +51,7 @@ Comment:
  /usr/bin/quicksearch and /usr/bin/quicksearch-cli are statically linked Rust
  binaries built from the same crates. Their third-party components are not
  shipped as separate files, so they are summarised here
- rather than given individual stanzas. Every one of the 512 crates in
+ rather than given individual stanzas. Every one of the 525 crates in
  Cargo.lock is under a permissive licence, all of which are compatible with
  GPL-3.0-or-later:
  .
@@ -50,12 +69,20 @@ Comment:
  rusqlite), Zstandard (BSD-3-Clause arm of its BSD/GPL-2.0 dual licence,
  via zstd-sys) and bzip2 (BSD-style, via bzip2-sys).
  .
- The binary also embeds egui's default fonts (crate epaint_default_fonts,
- "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0"). The FSF regards
- OFL-1.1 and the Ubuntu Font Licence as free but GPL-incompatible; they are
- included here as font data rather than as linked program code, which is
- the same basis on which Debian ships these fonts and other egui-based
- applications.
+ The binary also embeds the two font files under
+ crates/quicksearch-gui/assets/fonts/, which have their own stanzas above.
+ egui is built with default-features = false so that it bundles no fonts of
+ its own; the OFL-1.1 emoji faces it would otherwise embed are not shipped,
+ and OFL-1.1 accordingly no longer applies to this package. The FSF regards
+ the Ubuntu Font Licence as free but GPL-incompatible; it is included here as
+ font data rather than as linked program code, which is the same basis on
+ which Debian ships these fonts and other egui-based applications.
+ .
+ One dependency is carried in-tree rather than fetched: vendor/pdf-extract
+ is pdf-extract 0.12.0 (MIT, Jeff Muizelaar,
+ https://github.com/jrmuizel/pdf-extract) with two unbounded recursions
+ given a depth limit, marked "LOCAL PATCH" in the source. Its licence is
+ unchanged and is the MIT stanza below.
  .
  Run `cargo metadata --all-features` against the source tree to reproduce
  the per-crate licence list.

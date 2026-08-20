@@ -26,12 +26,15 @@ pub struct RootProgress {
     /// counts tree *entries* and so reads high. Read it through
     /// [`RootProgress::walk_denominator`].
     pub walk_total: Option<usize>,
-    /// Rows with searchable text: extracted in earlier runs plus this one.
+    /// Rows with searchable text: this run's, plus earlier runs' once
+    /// `extract_total` is known.
     pub extracted: usize,
     /// The root's whole searchable set: pending + already-extracted rows when
     /// the walk finished — the count of files that have or will have text,
-    /// not of files under the root.
-    pub extract_total: usize,
+    /// not of files under the root. `None` until the root's content pass has
+    /// counted its range: a scan that takes seconds on a large root, and one
+    /// that used to run on the writer thread with every other root waiting.
+    pub extract_total: Option<usize>,
     pub current_file: Option<String>,
     /// Threads busy right now / pool size, for the pool this root's current
     /// phase is running. Both zero once the root is done: its threads are
@@ -80,14 +83,22 @@ impl OverallProgress {
 }
 
 /// Aggregate every root's progress into the one pair the status bar shows.
-/// `extract_total` is exact the moment a root's walk ends; before that a
-/// root contributes only its walk.
+///
+/// A root contributes its extraction half only once `extract_total` is known
+/// — both to `processed` and to `total`, so the two stay in step. Until then
+/// (during the walk, and for the moments after it while the pass counts) it
+/// contributes its walk alone.
 pub fn overall_progress(roots: &[RootProgress]) -> OverallProgress {
-    let processed = roots.iter().map(|r| r.walked + r.extracted).sum();
+    let processed = roots
+        .iter()
+        .map(|r| r.walked + r.extract_total.map_or(0, |_| r.extracted))
+        .sum();
     let mut total = Some(0usize);
     for r in roots {
         match (total, r.walk_denominator()) {
-            (Some(acc), Some(walk)) => total = Some(acc + walk + r.extract_total),
+            (Some(acc), Some(walk)) => {
+                total = Some(acc + walk + r.extract_total.unwrap_or(0));
+            }
             _ => {
                 total = None;
                 break;

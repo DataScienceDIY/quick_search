@@ -1,7 +1,7 @@
 //! Row-level write helpers that keep the FTS5 contentless table in sync with
-//! `files`/`documents`/`properties`.
+//! `files`/`documents_text`.
 //!
-//! States (mirrors `basic_state` / `content_state` columns):
+//! States (mirrors the `content_state` column):
 //!
 //! | value | meaning |
 //! |------:|---------|
@@ -45,7 +45,7 @@ fn set_state_clearing_failure(
 ) -> Result<(), String> {
     exec(
         tx,
-        "UPDATE files SET content_state = ?1, failure_msg = NULL WHERE id = ?2",
+        "UPDATE files SET content_state = ?1 WHERE id = ?2",
         params![state, file_id],
         || format!("{} content_state {}", transition, file_id),
     )?;
@@ -66,8 +66,6 @@ pub struct NewFile<'a> {
     pub parent: &'a str,
     pub size: u64,
     pub mtime: u64,
-    pub inode: Option<u64>,
-    pub device_id: Option<u64>,
     pub mime: Option<&'a str>,
     pub ftype: FileType,
     pub hash: Option<&'a [u8]>,
@@ -76,17 +74,16 @@ pub struct NewFile<'a> {
     pub needs_content: bool,
 }
 
-/// Insert a new file row, returning its id. `basic_state` is set to DONE
-/// (the row existing *is* the basic-index state); `content_state` comes from
-/// `needs_content`. `INSERT OR IGNORE`: a UNIQUE(path) collision returns
-/// `None` rather than aborting the batch.
+/// Insert a new file row, returning its id. `content_state` comes from
+/// `needs_content`; there is no separate basic state, because the row
+/// existing *is* the basic-index state. `INSERT OR IGNORE`: a UNIQUE(path)
+/// collision returns `None` rather than aborting the batch.
 pub fn insert_file(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option<i64>, String> {
     let rows = tx
         .prepare_cached(
             "INSERT OR IGNORE INTO files (
-                name, path, parent, size, mtime, inode, device_id,
-                mime, type, basic_state, content_state, hash
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                name, path, parent, size, mtime, mime, type, content_state, hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .and_then(|mut stmt| {
             stmt.execute(params![
@@ -95,11 +92,8 @@ pub fn insert_file(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option<i64>,
                 f.parent,
                 f.size as i64,
                 f.mtime as i64,
-                f.inode.map(|x| x as i64),
-                f.device_id.map(|x| x as i64),
                 f.mime,
                 f.ftype.bits() as i64,
-                STATE_DONE,
                 initial_content_state(f),
                 f.hash,
             ])
@@ -125,14 +119,14 @@ fn initial_content_state(f: &NewFile<'_>) -> i64 {
 /// Update a file's metadata in place (same path, changed size/mtime/hash) and
 /// reset its content state from `f.needs_content`, clearing any extracted
 /// content so the text-indexing pass re-processes it. Writes `size`, `mtime`,
-/// `hash`, `mime`, `type`, `content_state` and `failure_msg` — and only
-/// those; `name`, `parent`, `inode` and `device_id` are not refreshed here.
+/// `hash`, `mime`, `type` and `content_state` — and only those; `name` and
+/// `parent` are not refreshed here.
 pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option<i64>, String> {
     let id: Option<i64> = tx
         .prepare_cached(
             "UPDATE files
                 SET size = ?1, mtime = ?2, hash = ?3, mime = ?4, type = ?5,
-                    content_state = ?6, failure_msg = NULL
+                    content_state = ?6
               WHERE path = ?7
           RETURNING id",
         )
@@ -159,13 +153,11 @@ pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option
     Ok(Some(id))
 }
 
-/// Mark a file's content indexing as complete and write the extracted text +
-/// properties atomically. The plaintext feeds the contentless FTS5 tokenizer;
-/// when `store_text` is `true` it is also stored zstd-compressed in
+/// Mark a file's content indexing as complete and write the extracted text
+/// atomically. The plaintext feeds the contentless FTS5 tokenizer; when
+/// `store_text` is `true` it is also stored zstd-compressed in
 /// `documents_text` for snippet rendering (`false`: matches still work, but
-/// result rows can't render snippets). `properties` are stored both as a
-/// structured side-table (exact retrieval) and concatenated into the FTS
-/// `properties` column (MATCH).
+/// result rows can't render snippets).
 /// `text_zstd` is the already-compressed body for the `documents_text`
 /// sidecar, or `None` to write no sidecar at all (an empty body, or
 /// `store_text_for_snippets` off).
@@ -178,43 +170,112 @@ pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option
 pub fn set_content_done(
     tx: &Transaction<'_>,
     file_id: i64,
-    name: &str,
     text: &str,
-    properties: &[(String, String)],
     text_zstd: Option<&[u8]>,
 ) -> Result<(), String> {
     remove_content_for_id(tx, file_id)?;
 
-    for (k, v) in properties {
-        exec(
-            tx,
-            "INSERT INTO properties(file_id, key, value) VALUES (?1, ?2, ?3)",
-            params![file_id, k, v],
-            || format!("insert property {}={}", k, v),
-        )?;
-    }
-    let props_blob = encode_properties_for_fts(properties);
     // Contentless FTS5 still accepts values on INSERT — the tokenizer needs
     // them — it simply doesn't persist the raw column values.
     exec(
         tx,
-        "INSERT INTO searchabletext(rowid, name, text, properties) VALUES (?1, ?2, ?3, ?4)",
-        params![file_id, name, text, props_blob],
+        "INSERT INTO searchabletext(rowid, text) VALUES (?1, ?2)",
+        params![file_id, text],
         || format!("insert FTS row {}", file_id),
     )?;
 
-    // No sidecar row for empty body text (e.g. an image whose extractor
-    // returned only EXIF properties) — the caller passes `None` for that.
+    // No sidecar row for empty body text (an audio file whose tags are all
+    // empty, say) — the caller passes `None` for that.
     if let Some(compressed) = text_zstd {
         exec(
             tx,
-            "INSERT INTO documents_text(file_id, text_zstd, text_len) VALUES (?1, ?2, ?3)",
-            params![file_id, compressed, text.len() as i64],
+            "INSERT INTO documents_text(file_id, text_zstd) VALUES (?1, ?2)",
+            params![file_id, compressed],
             || format!("insert documents_text {}", file_id),
         )?;
     }
 
     set_state_clearing_failure(tx, file_id, STATE_DONE, "update DONE")
+}
+
+/// Reusable decode buffer and decompression context for the readers of
+/// `documents_text` — the read side's mirror of [`DocEncoder`].
+///
+/// Shared by the cascade's full-text passes and by [`crate::live`], which
+/// re-reads one row's body when a file under a visible result changes.
+///
+/// `zstd::decode_all` builds and tears down a `ZSTD_DCtx` *and* allocates a
+/// fresh output `Vec` on every call, and it is called once per candidate row.
+/// One context and one buffer, reused across a whole scan, make that a
+/// per-scan cost instead of a per-row one.
+pub struct DocDecoder {
+    dctx: zstd::bulk::Decompressor<'static>,
+    buf: Vec<u8>,
+}
+
+/// Where [`DocDecoder::decode`]'s buffer starts before it has seen a document.
+/// Most extracted text is well under this, so the doubling below rarely runs.
+const INITIAL_DOC_CAPACITY: usize = 64 * 1024;
+
+/// Where the doubling stops. Stored text is capped at
+/// `processing.maximum_text_size` (256 KiB by default), so this is far above
+/// any legitimate document even if that setting is raised — past it, a failure
+/// is a corrupt frame rather than a buffer that is too small.
+const MAX_DOC_CAPACITY: usize = 64 * 1024 * 1024;
+
+impl DocDecoder {
+    pub fn new() -> Result<Self, String> {
+        Ok(DocDecoder {
+            dctx: zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?,
+            buf: Vec::new(),
+        })
+    }
+
+    /// Decompress `blob` and borrow the result as text.
+    ///
+    /// Returns `None` for a corrupt frame or non-UTF-8 content. Nothing is
+    /// copied: the indexer stores UTF-8, so the bytes are borrowed in place
+    /// rather than run through `String::from_utf8_lossy(..).into_owned()`,
+    /// which duplicated the whole document even when it was already valid.
+    pub fn decode(&mut self, blob: &[u8]) -> Option<&str> {
+        self.buf.clear();
+        // `decompress_to_buffer` writes into spare capacity and fails rather
+        // than growing, so the room has to be there first.
+        //
+        // [`DocEncoder`] compresses through `ZSTD_compress2`, which knows the
+        // whole input up front and records its length in the frame header, so
+        // this reservation is normally exact and the loop below runs once.
+        //
+        // The loop is still the fallback, and it is not optional: a frame
+        // written by a *stream*-based encoder carries no content size, and
+        // falling back to `zstd::decode_all` for those looked harmless and was
+        // not — it builds a streaming decoder per call, which measured as one
+        // ~2.4 MiB allocation per document and 27 of the 30 GiB a fuzzy search
+        // moved through the allocator. Growing and reusing this buffer instead
+        // settles at the largest document in the scan within the first few
+        // rows, after which decoding a row allocates nothing at all.
+        if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(blob) {
+            self.buf.reserve(usize::try_from(size).ok()?);
+        }
+        loop {
+            if self.buf.capacity() == 0 {
+                self.buf.reserve(INITIAL_DOC_CAPACITY);
+            }
+            match self.dctx.decompress_to_buffer(blob, &mut self.buf) {
+                Ok(_) => break,
+                // Too small, or corrupt — the bulk API cannot tell us which.
+                // Growing is only worth trying while the buffer is still
+                // smaller than any document could legitimately be.
+                Err(_) if self.buf.capacity() < MAX_DOC_CAPACITY => {
+                    let bigger = self.buf.capacity().saturating_mul(2);
+                    self.buf.clear();
+                    self.buf.reserve(bigger);
+                }
+                Err(_) => return None,
+            }
+        }
+        std::str::from_utf8(&self.buf).ok()
+    }
 }
 
 /// Level 3 hits ~3-5× on English prose at high throughput (hundreds of
@@ -261,13 +322,31 @@ pub fn encode_one(text: &str, store_text: bool) -> Result<Option<Vec<u8>>, Strin
     DocEncoder::new()?.encode(text).map(Some)
 }
 
+/// The uncompressed size of a stored `documents_text` blob, read out of the
+/// zstd frame header instead of from a column beside it.
+///
+/// [`DocEncoder`] compresses through `ZSTD_compress2`, which is handed the
+/// whole document at once and writes its length into the frame header. A
+/// `text_len` column would have stored that same number a second time for
+/// every row, to serve one figure in the size report.
+///
+/// `None` for a frame that carries no content size — nothing this writer
+/// produces — or a corrupt one. The caller only needs the frame *header*, so
+/// `blob` may be a prefix of the stored value.
+pub fn raw_text_len(blob: &[u8]) -> Option<u64> {
+    zstd::zstd_safe::get_frame_content_size(blob).ok().flatten()
+}
+
 /// Mark a file's content extraction as failed. Keeps the basic row in place.
+///
+/// The reason is written once, to `failed_files` — which also carries the
+/// timestamp, and which `list-failed` and `status` both read.
 pub fn set_content_failed(tx: &Transaction<'_>, file_id: i64, reason: &str) -> Result<(), String> {
     let now = crate::log::now_unix() as i64;
     exec(
         tx,
-        "UPDATE files SET content_state = ?1, failure_msg = ?2 WHERE id = ?3",
-        params![STATE_FAILED, reason, file_id],
+        "UPDATE files SET content_state = ?1 WHERE id = ?2",
+        params![STATE_FAILED, file_id],
         || format!("update content_state FAILED {}", file_id),
     )?;
     exec(
@@ -369,10 +448,9 @@ pub fn delete_outside_ranges(
 /// keyed to `files.id` first, then `files` itself. Not left to `ON DELETE
 /// CASCADE`: `searchabletext` is an FTS5 virtual table with no foreign key at
 /// all, and cascade only fires on connections with `PRAGMA foreign_keys` on.
-const DEPENDENT_TABLES: [(&str, &str); 4] = [
+const DEPENDENT_TABLES: [(&str, &str); 3] = [
     ("searchabletext", "rowid"),
     ("documents_text", "file_id"),
-    ("properties", "file_id"),
     ("failed_files", "file_id"),
 ];
 
@@ -446,7 +524,22 @@ pub fn pending_content_page(
 ) -> Result<Vec<PendingContentRow>, String> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT id, name, path, mime FROM files
+            // `INDEXED BY` rather than a hint, because the planner gets this
+            // one wrong exactly when it costs most. Left to itself it takes
+            // `UNIQUE(path)` for the range and then sorts the survivors into a
+            // temp b-tree to satisfy `ORDER BY id` — which means every page
+            // walks the whole root's range and fetches each row's heap entry
+            // to test `content_state`. At `FEED_PAGE` rows per page that is
+            // quadratic over a run. The partial index below is already
+            // id-ordered, so it answers `id > ?` and the ORDER BY together and
+            // holds only pending rows. Measured on 500k rows with everything
+            // pending — the first index of a tree, i.e. the case that matters:
+            // 127 ms/page against 0.1 ms/page.
+            //
+            // The planner only prefers it once pending rows are a small
+            // minority, and never before ANALYZE has run at all, which is why
+            // this cannot be left to statistics.
+            "SELECT id, name, path, mime FROM files INDEXED BY idx_files_content_pending
               WHERE content_state = 0 AND size <= ?1 AND id > ?2
                 AND path >= ?3 AND path < ?4
               ORDER BY id
@@ -632,16 +725,15 @@ pub fn paths_in_dir(conn: &Connection, parent: &str) -> Result<Vec<String>, Stri
         .map_err(|e| format!("read path under {}: {}", parent, e))
 }
 
-/// Remove the FTS row, compressed text blob, and any `properties` rows for
-/// a given file id. Does not touch the `files` row itself. Idempotent — a
-/// missing row is fine.
+/// Remove the FTS row and the compressed text blob for a given file id. Does
+/// not touch the `files` row itself. Idempotent — a missing row is fine.
 pub fn remove_content_for_id(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
     // `contentless_delete=1` on the FTS5 table makes this work without
     // re-supplying the old column values (it tombstones the rowid).
     //
     // Spelled out rather than built from a (table, key) table: this runs for
-    // every extracted document and every changed file, and `format!`ing three
-    // constant strings per call also handed `prepare_cached` three freshly
+    // every extracted document and every changed file, and `format!`ing two
+    // constant strings per call also handed `prepare_cached` two freshly
     // allocated keys to hash.
     for (what, sql) in [
         (
@@ -652,23 +744,12 @@ pub fn remove_content_for_id(tx: &Transaction<'_>, file_id: i64) -> Result<(), S
             "documents_text",
             "DELETE FROM documents_text WHERE file_id = ?1",
         ),
-        ("properties", "DELETE FROM properties WHERE file_id = ?1"),
     ] {
         exec(tx, sql, params![file_id], || {
             format!("delete {} for {}", what, file_id)
         })?;
     }
     Ok(())
-}
-
-/// Serialize properties for the FTS `properties` column. `key:value` pairs
-/// separated by spaces so `MATCH 'properties:artist:beatles'` works.
-fn encode_properties_for_fts(props: &[(String, String)]) -> String {
-    props
-        .iter()
-        .map(|(k, v)| format!("{}:{}", k, v))
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// Free pages, as a percentage of the file, that make a [`maintain`] VACUUM

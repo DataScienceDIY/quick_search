@@ -43,8 +43,19 @@ eframe = { version = "0.32", default-features = false, features = [
     "glow",
     "persistence",
 ] }
-egui = "0.32"
-egui_extras = "0.32"
+# `default-features = false` for one feature, `default_fonts`, which embeds
+# four TTFs totalling 1,407,752 bytes - 38% of `.rodata`. The
+# `default-features = false` on eframe above does not cover it: feature
+# resolution unions the two declarations, so naming egui plainly here switched
+# it back on for the whole graph. `src/fonts.rs` installs the two faces the app
+# actually paints with; the two emoji faces, 736,668 bytes of it, are gone.
+# `persistence`/`serde` still reach egui through eframe, so nothing else moves.
+egui = { version = "0.32", default-features = false }
+# Only `Column`/`TableBuilder` are used. The lone default feature is
+# `dep:mime_guess2`, for an image loader that is never registered - the linker
+# already dropped every byte of it, so this compiles one crate less and ships
+# the same bytes.
+egui_extras = { version = "0.32", default-features = false }
 rfd = "0.15"
 open = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

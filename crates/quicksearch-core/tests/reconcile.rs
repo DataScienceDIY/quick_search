@@ -110,7 +110,6 @@ fn orphans(db: &Path) -> i64 {
     [
         ("searchabletext", "rowid"),
         ("documents_text", "file_id"),
-        ("properties", "file_id"),
         ("failed_files", "file_id"),
     ]
     .iter()

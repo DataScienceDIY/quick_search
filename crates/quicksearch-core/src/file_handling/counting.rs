@@ -104,12 +104,20 @@ fn count_find_pipe_wc(
 
 /// Count tree entries with a plain directory walk — the oracle
 /// [`count_tree_entries_win32`] is tested against.
-#[cfg(windows)]
+///
+/// Gated on `test` as well as `windows` because its only caller is a
+/// Windows-only test: under plain `cargo build --target …-windows-gnu` it
+/// would otherwise compile as dead code. The `walkdir` import is local for the
+/// same reason the rest of this module's platform imports are — a file-level
+/// one is invisible to the host that cannot compile the branch using it, which
+/// is exactly how it went missing when this module was split out.
+#[cfg(all(windows, test))]
 fn count_tree_entries_walkdir(
     path: &str,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<usize, String> {
     use std::sync::atomic::Ordering;
+    use walkdir::WalkDir;
 
     let mut n = 0usize;
     // Unreadable subtrees are skipped rather than fatal: this is a progress

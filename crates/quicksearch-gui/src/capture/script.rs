@@ -11,9 +11,11 @@ use crate::app::Tab;
 /// window INT INT                   # resize to width x height, in the same
 ///                                  # logical points as the startup size
 /// hover_match INT                  # pin the pointer over the Nth visible
-///                                  # Match cell (0-based) until hover_off
+///                                  # Content Match cell (0-based) until
+///                                  # hover_off. Counts every visible row,
+///                                  # including those showing a dash.
 /// hover_off                        # release the pinned pointer
-/// tab (search|manage|duplicates|logs|help)
+/// tab (search|manage|duplicates|logs|help|settings)
 /// wait_index_running [max INT]     # caps in ms; a capped wait cannot fail
 /// wait_index_idle    [max INT]
 /// wait_search_done   [max INT]
@@ -187,9 +189,11 @@ fn parse_line(tokens: &[Token], line_no: usize) -> Result<Option<Cmd>, ParseErro
             "duplicates" => Tab::Duplicates,
             "logs" => Tab::Logs,
             "help" => Tab::Help,
+            "settings" => Tab::Settings,
             other => {
                 return Err(err(format!(
-                    "unknown tab {other:?}: expected search, manage, duplicates, logs or help"
+                    "unknown tab {other:?}: expected search, manage, duplicates, \
+                     logs, help or settings"
                 )));
             }
         }),
@@ -302,6 +306,7 @@ mod tests {
             tab duplicates
             tab logs
             tab help
+            tab settings
             wait_index_running
             wait_index_running max 15000
             wait_index_idle max 13000
@@ -335,6 +340,7 @@ mod tests {
                 Cmd::Tab(Tab::Duplicates),
                 Cmd::Tab(Tab::Logs),
                 Cmd::Tab(Tab::Help),
+                Cmd::Tab(Tab::Settings),
                 Cmd::WaitIndexRunning { max_ms: None },
                 Cmd::WaitIndexRunning {
                     max_ms: Some(15000)
@@ -447,7 +453,7 @@ mod tests {
 
     #[test]
     fn unknown_tab_and_bad_cps_are_rejected() {
-        assert!(parse_err("tab settings").msg.contains("unknown tab"));
+        assert!(parse_err("tab preferences").msg.contains("unknown tab"));
         assert!(parse_err(r#"type "x" cps 0"#).msg.contains("positive"));
         assert!(parse_err(r#"type "x" cps -3"#).msg.contains("positive"));
     }

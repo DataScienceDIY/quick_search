@@ -13,9 +13,9 @@ use crate::db;
 use crate::db::repo;
 use crate::extract::Registry;
 use crate::file_handling::{
-    cleanup_stale_index_entries, count_tree_entries_fast, extract_scope_prepare,
-    fts_finalize_after_text_indexing, normalize_root_string, process_batch_inserts,
-    process_batch_updates, store_extracted, ExtractCursor, FileIndexAction, OwnedNewFile,
+    cleanup_stale_index_entries, count_tree_entries_fast, fts_finalize_after_text_indexing,
+    mark_oversize_pending_na, normalize_root_string, process_batch_inserts, process_batch_updates,
+    store_extracted, ExtractCursor, ExtractScope, FileIndexAction, OwnedNewFile,
 };
 use crate::walk::{thread_count_for, walk_indexable_files, ParallelWalk, TryNext, WalkEvent};
 
@@ -84,6 +84,11 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Most extracted rows a root holds back between turns. Not `quantum`: a row
+/// carries up to `maximum_text_size` of text, and 500 of those would be
+/// 128 MiB per root. At 64 it is 16 MiB.
+const READY_TOPUP: usize = 64;
+
 /// One root's in-flight indexing state, owned by the writer loop.
 pub(super) struct RootPipeline {
     pub(super) root: String,
@@ -100,8 +105,14 @@ pub(super) struct RootPipeline {
     pub(super) phase: RootPhase,
     /// The running content pass, once this root's walk has finished.
     pub(super) content: Option<crate::content::ContentPass>,
-    pub(super) extract_total: usize,
-    pub(super) extracted: usize,
+    /// Extracted rows pulled off the pass and not yet written. A turn writes
+    /// for its slice, not for its batch, so it may leave some behind.
+    pub(super) ready: Vec<crate::content::ExtractedRow>,
+    /// Rows this run's content pass has written for this root.
+    pub(super) written: usize,
+    /// The pass's range counts, cached once known so a `Done` root still has
+    /// them after its pass is gone.
+    pub(super) totals: Option<ExtractScope>,
     pub(super) current_file: Option<String>,
     /// When this root's current phase began, for the one line each phase logs
     /// when it ends.
@@ -173,8 +184,16 @@ impl RootPipeline {
         stats.map_or((0, 0), |s| (s.active(), s.total()))
     }
 
-    fn snapshot(&self) -> RootProgress {
+    /// The pass's counts, from the cache or — until the cache is filled — from
+    /// the pass itself.
+    fn extract_totals(&self) -> Option<ExtractScope> {
+        self.totals
+            .or_else(|| self.content.as_ref().and_then(|p| p.totals()))
+    }
+
+    pub(super) fn snapshot(&self) -> RootProgress {
         let (active_workers, total_workers) = self.worker_counts();
+        let totals = self.extract_totals();
         RootProgress {
             root: self.root.clone(),
             phase: self.phase,
@@ -183,30 +202,58 @@ impl RootPipeline {
                 0 => None,
                 n => Some(n),
             },
-            extracted: self.extracted,
-            extract_total: self.extract_total,
+            // Earlier runs' rows count once the pass has counted them; until
+            // then only this run's, so the figure never goes backwards.
+            extracted: totals.map_or(self.written, |t| t.already_done + self.written),
+            extract_total: totals.map(|t| t.pending + t.already_done),
             current_file: self.current_file.clone(),
             active_workers,
             total_workers,
         }
     }
 
-    /// Drain up to one quantum of walk events into the pending batches,
+    /// Drain walk events into the pending batches for up to one slice,
     /// finishing the walk if it ends. Returns whether anything happened.
-    fn service_walking(&mut self, cx: &mut RunCx<'_>) -> Result<bool, String> {
+    ///
+    /// Batches still land per quantum; the slice only decides how many of
+    /// them one turn may write. A walk slower than the writer ends its turn at
+    /// `Empty` well inside the slice; only a walk that has the writer
+    /// saturated uses all of it.
+    pub(super) fn service_walking(&mut self, cx: &mut RunCx<'_>) -> Result<bool, String> {
+        let deadline = Instant::now() + cx.slice;
         let mut took = 0usize;
         let mut finished = false;
-        while took < cx.quantum {
+        while !finished {
+            let quantum_end = took + cx.quantum;
+            let more = self.walk_quantum(cx, &mut took, quantum_end, &mut finished)?;
+            if !more || Instant::now() >= deadline {
+                break;
+            }
+        }
+        Ok(finished || took > 0)
+    }
+
+    /// One quantum of [`RootPipeline::service_walking`]. Returns whether the
+    /// channel still had events when the quantum ended — false on `Empty` or
+    /// on the walk finishing.
+    fn walk_quantum(
+        &mut self,
+        cx: &mut RunCx<'_>,
+        took: &mut usize,
+        quantum_end: usize,
+        finished: &mut bool,
+    ) -> Result<bool, String> {
+        while *took < quantum_end {
             match self.walk.try_next() {
                 TryNext::Item(WalkEvent::Stale(paths)) => {
-                    took += 1;
+                    *took += 1;
                     // Applied at the end of the run: deleting mid-walk would
                     // break "a stopped run deletes nothing", and an aliased
                     // sighting that exempts a path may still be ahead.
                     cx.stale_candidates.extend(paths);
                 }
                 TryNext::Item(WalkEvent::File(file)) => {
-                    took += 1;
+                    *took += 1;
                     self.walked += 1;
                     if self.walked.is_multiple_of(64) {
                         self.current_file = Some(file.path.clone());
@@ -247,15 +294,15 @@ impl RootPipeline {
                         }
                     }
                 }
-                TryNext::Empty => break,
+                TryNext::Empty => return Ok(false),
                 TryNext::Finished => {
                     self.finish_walk(cx)?;
-                    finished = true;
-                    break;
+                    *finished = true;
+                    return Ok(false);
                 }
             }
         }
-        Ok(finished || took > 0)
+        Ok(true)
     }
 
     /// The walk ended: land the buffered batches, then either hand the root
@@ -314,55 +361,89 @@ impl RootPipeline {
                 }
             }
             let cursor = ExtractCursor::for_root(&self.root);
-            let scope = extract_scope_prepare(&cx.conn_mutex, &cursor, cx.config)?;
-            // Progress counts the root's whole searchable set: files extracted
-            // in earlier runs start the counter, so an unchanged root shows
-            // "X of X" rather than "0 of 0".
-            self.extract_total = scope.pending + scope.already_done;
-            self.extracted = scope.already_done;
-            if scope.pending == 0 {
-                self.phase = RootPhase::Done;
-            } else {
-                // Starts only now: the rows have to exist before the feeder
-                // can page over them.
-                self.content = Some(crate::content::extract_content(
-                    cx.db_path,
-                    &cursor,
-                    cx.registry.clone(),
-                    cx.config.clone(),
-                    cx.stop_flag.clone(),
-                    cx.suspend_flag.clone(),
-                    self.workers,
-                ));
-                self.phase = RootPhase::Extracting;
+            // Only the sweep runs on the writer. Counting the range is the
+            // pass's own job, on its own connection: on a large root it is
+            // seconds, and here that was seconds of every other root's walk
+            // standing still.
+            {
+                let conn = crate::lock_ok(&cx.conn_mutex);
+                mark_oversize_pending_na(&conn, &cursor, cx.config)?;
             }
+            self.totals = None;
+            self.written = 0;
+            self.ready.clear();
+            // Starts only now: the rows have to exist before the feeder can
+            // page over them. Started even when nothing may be pending — the
+            // count that would say so is the pass's — and an empty range
+            // finishes on its own next turn.
+            self.content = Some(crate::content::extract_content(
+                cx.db_path,
+                &cursor,
+                cx.registry.clone(),
+                cx.config.clone(),
+                cx.stop_flag.clone(),
+                self.workers,
+            ));
+            self.phase = RootPhase::Extracting;
         }
         Ok(())
     }
 
-    /// Drain up to a quantum of finished extraction work, then write it;
-    /// extraction runs on this root's own pool. Returns whether anything
-    /// happened.
-    fn service_extracting(&mut self, cx: &mut RunCx<'_>) -> Result<bool, String> {
-        let pass = self.content.as_mut().expect("extracting root has a pass");
-        let mut batch: Vec<crate::content::ExtractedRow> = Vec::new();
+    /// Write finished extraction work for up to one slice; extraction itself
+    /// runs on this root's own pool. Returns whether anything happened.
+    ///
+    /// Rows the slice does not reach stay in `ready` for the next turn, and
+    /// the pass is not declared done until they have all landed.
+    pub(super) fn service_extracting(&mut self, cx: &mut RunCx<'_>) -> Result<bool, String> {
+        let deadline = Instant::now() + cx.slice;
         let mut finished = false;
-        while batch.len() < cx.quantum {
-            match pass.try_next() {
-                TryNext::Item(row) => batch.push(row),
-                TryNext::Empty => break,
-                TryNext::Finished => {
-                    finished = true;
-                    break;
+        let mut consumed = 0usize;
+        // Disjoint borrows: the pass is held across the store.
+        let Self {
+            content,
+            ready,
+            written,
+            totals,
+            current_file,
+            ..
+        } = self;
+        let pass = content.as_mut().expect("extracting root has a pass");
+        if totals.is_none() {
+            *totals = pass.totals();
+        }
+        loop {
+            while ready.len() < READY_TOPUP {
+                match pass.try_next() {
+                    TryNext::Item(row) => ready.push(row),
+                    TryNext::Empty => break,
+                    TryNext::Finished => {
+                        finished = true;
+                        break;
+                    }
                 }
             }
+            if ready.is_empty() {
+                break;
+            }
+            let stored = store_extracted(&cx.conn_mutex, ready, cx.stop_flag, cx.config, deadline)?;
+            if stored.consumed > 0 {
+                // The last row *written*, not the last fetched: with leftovers
+                // the two can be a slice apart.
+                *current_file = Some(ready[stored.consumed - 1].name.clone());
+            }
+            ready.drain(..stored.consumed);
+            *written += stored.written;
+            consumed += stored.consumed;
+            // Stopped, out of time, or still holding rows the deadline cut
+            // short — the next turn takes it from here.
+            if stored.consumed == 0 || !ready.is_empty() || Instant::now() >= deadline {
+                break;
+            }
         }
-        if let Some(row) = batch.last() {
-            self.current_file = Some(row.name.clone());
-        }
-        let took = batch.len();
-        self.extracted += store_extracted(&cx.conn_mutex, &batch, cx.stop_flag, cx.config)?;
-        if finished {
+        if finished && ready.is_empty() {
+            if totals.is_none() {
+                *totals = pass.totals();
+            }
             // Join before deciding; see `ParallelWalk::finish`.
             if !pass.finish() {
                 crate::log_warn!("a content worker for {} terminated abnormally", self.root);
@@ -370,39 +451,69 @@ impl RootPipeline {
             self.content = None;
             self.phase = RootPhase::Done;
             let extract_time = self.phase_elapsed();
-            crate::log_info!(
-                "{}: content done — {}",
-                self.root,
-                phase_summary(self.extracted, "files with text", extract_time)
-            );
+            // Quiet for the pass that found nothing to do: every root passes
+            // through here now, changed or not.
+            if self.written > 0 {
+                crate::log_info!(
+                    "{}: content done — {}",
+                    self.root,
+                    phase_summary(self.written, "files with text", extract_time)
+                );
+            }
         }
-        Ok(finished || took > 0)
+        Ok(finished || consumed > 0)
     }
 }
 
 /// One run's shared environment and cross-root state, threaded through the
 /// per-phase [`RootPipeline`] service methods.
-struct RunCx<'a> {
-    conn_mutex: Arc<Mutex<Connection>>,
-    config: &'a Config,
-    db_path: &'a str,
-    stop_flag: &'a Arc<AtomicBool>,
-    suspend_flag: &'a Arc<AtomicBool>,
+pub(super) struct RunCx<'a> {
+    pub(super) conn_mutex: Arc<Mutex<Connection>>,
+    pub(super) config: &'a Config,
+    pub(super) db_path: &'a str,
+    pub(super) stop_flag: &'a Arc<AtomicBool>,
     /// Shared with every root's walk workers, which use it to finish small
     /// text files without handing them to the content pass.
-    registry: Arc<Registry>,
-    quantum: usize,
+    pub(super) registry: Arc<Registry>,
+    pub(super) quantum: usize,
+    /// Writer time one root's turn may take before the round moves on; see
+    /// [`crate::config::ProcessingConfig::writer_turn_slice_ms`], which is
+    /// where the default and the reasoning live. Zero is one quantum a turn.
+    pub(super) slice: Duration,
     /// 128-bit path digests, not paths: at millions of files, owning every
     /// path string again was the single largest allocation in a run. See
     /// `walk::path_digest`.
-    seen_paths: HashSet<u128>,
+    pub(super) seen_paths: HashSet<u128>,
     /// Rows the per-directory reconciliation found no file behind, plus
     /// whatever the vanished-directory sweep adds once the walks end.
-    stale_candidates: Vec<String>,
+    pub(super) stale_candidates: Vec<String>,
     /// Paths reached by resolving a symlink, whose row lives under a parent
     /// that may be outside every root.
-    aliased_paths: HashSet<String>,
-    stale_cleanup_ok: bool,
+    pub(super) aliased_paths: HashSet<String>,
+    pub(super) stale_cleanup_ok: bool,
+}
+
+impl<'a> RunCx<'a> {
+    pub(super) fn new(
+        conn_mutex: Arc<Mutex<Connection>>,
+        config: &'a Config,
+        db_path: &'a str,
+        stop_flag: &'a Arc<AtomicBool>,
+    ) -> RunCx<'a> {
+        RunCx {
+            conn_mutex,
+            config,
+            db_path,
+            stop_flag,
+            registry: Arc::new(Registry::default_set()),
+            quantum: config.processing.batch_size.max(1),
+            slice: Duration::from_millis(config.processing.writer_turn_slice_ms),
+            seen_paths: HashSet::new(),
+            stale_candidates: Vec::new(),
+            aliased_paths: HashSet::new(),
+            stale_cleanup_ok: true,
+        }
+    }
 }
 
 /// Publish a status snapshot. Never clobbers Stopping — the command thread
@@ -447,7 +558,6 @@ fn build_pipeline(
         cx.config.clone(),
         cx.registry.clone(),
         cx.stop_flag.clone(),
-        cx.suspend_flag.clone(),
         workers,
     );
 
@@ -491,8 +601,9 @@ fn build_pipeline(
         phase: RootPhase::Walking,
         workers,
         content: None,
-        extract_total: 0,
-        extracted: 0,
+        ready: Vec::new(),
+        written: 0,
+        totals: None,
         current_file: None,
         phase_started: Instant::now(),
     })
@@ -557,7 +668,6 @@ fn cleanup_stale(pipelines: &mut [RootPipeline], cx: &mut RunCx<'_>) -> Result<(
             &cx.conn_mutex,
             stale_paths.as_slice(),
             cx.stop_flag,
-            cx.suspend_flag,
             cx.config,
         )?;
         crate::log_info!(
@@ -575,7 +685,6 @@ impl IndexingService {
         paths: &[String],
         db_path: &str,
         stop_flag: &Arc<AtomicBool>,
-        suspend_flag: &Arc<AtomicBool>,
         config: &Config,
         db_connection: &Arc<Mutex<Option<Arc<Mutex<Connection>>>>>,
         interrupt: &db::InterruptSlot,
@@ -637,19 +746,7 @@ impl IndexingService {
         let count_cancel = Arc::new(AtomicBool::new(false));
         let _count_guard = CancelOnDrop(count_cancel.clone());
 
-        let mut cx = RunCx {
-            conn_mutex,
-            config,
-            db_path,
-            stop_flag,
-            suspend_flag,
-            registry: Arc::new(Registry::default_set()),
-            quantum: config.processing.batch_size.max(1),
-            seen_paths: HashSet::new(),
-            stale_candidates: Vec::new(),
-            aliased_paths: HashSet::new(),
-            stale_cleanup_ok: true,
-        };
+        let mut cx = RunCx::new(conn_mutex, config, db_path, stop_flag);
 
         // Read stored counts up front, under one lock, before the walks
         // compete for the connection.
@@ -689,10 +786,19 @@ impl IndexingService {
         };
         let mut checkpoint_at = wal_cap;
 
-        // Round-robin with skipping: each round takes at most one quantum
-        // from every root that has work ready.
+        // Walks first, one slice each, then a single extraction slice.
+        //
+        // The walk is the disk-bound phase and the one whose stall shows: its
+        // workers can only run as far ahead as their channel, so a writer that
+        // does not come back to it soon enough parks a whole pool behind one
+        // root's tokenizing. Serving every walking root before any extraction
+        // caps a walk's wait at one slice per round; taking one extraction
+        // slice per round, not one per root, keeps that cap independent of
+        // how many roots are extracting — while still handing extraction a
+        // slice every round, so it is never starved either. Any root's turn
+        // ends early the moment it has nothing ready.
         loop {
-            if should_abort(stop_flag, suspend_flag) {
+            if stop_flag.load(Ordering::Relaxed) {
                 aborted = true;
                 break;
             }
@@ -700,11 +806,25 @@ impl IndexingService {
             let n = pipelines.len();
             for k in 0..n {
                 let p = &mut pipelines[(rr + k) % n];
-                progressed |= match p.phase {
-                    RootPhase::Walking => p.service_walking(&mut cx)?,
-                    RootPhase::Extracting => p.service_extracting(&mut cx)?,
-                    RootPhase::Done => false,
-                };
+                if p.phase == RootPhase::Walking {
+                    progressed |= p.service_walking(&mut cx)?;
+                }
+            }
+            // Between the stages, not only at the end of the round: a root
+            // enters `Extracting` in the walk stage above, and the stage
+            // below can finish its pass in the same round. Published once a
+            // round, the whole phase falls between two snapshots whenever a
+            // root's content pass is short — a small root reads as
+            // `Walking → Done`, having never reported the phase it spent its
+            // extraction in.
+            publish_status(status, run_start, &pipelines);
+
+            for k in 0..n {
+                let p = &mut pipelines[(rr + k) % n];
+                if p.phase == RootPhase::Extracting {
+                    progressed |= p.service_extracting(&mut cx)?;
+                    break;
+                }
             }
             rr = rr.wrapping_add(1);
 
@@ -766,15 +886,19 @@ impl IndexingService {
         }
 
         if aborted {
-            // Buffered records are valid work — land them before leaving.
-            for p in &mut pipelines {
-                process_batch_updates(&cx.conn_mutex, &p.pending_updates, stop_flag, config)?;
-                p.pending_updates.clear();
-                process_batch_inserts(&cx.conn_mutex, &p.pending_inserts, stop_flag, config)?;
-                p.pending_inserts.clear();
-            }
-            // No stale cleanup: a partial walk's seen set would delete most
-            // of the index.
+            // Nothing is landed on the way out, and there used to be a loop
+            // here that looked as though it did: `aborted` implies the stop
+            // flag is set, and both batch writers return on it before their
+            // first chunk, so it wrote nothing. What a stop drops is each
+            // root's part-filled insert/update batch (under `batch_size`
+            // rows) and whatever extraction had ready — all of it still
+            // `content_state = 0` or absent, so the next run finds it again.
+            // That is what "a stopped run promises nothing" already means,
+            // and it is cheaper than tokenizing a slice's worth of documents
+            // while someone waits for the window to close.
+            //
+            // No stale cleanup either: a partial walk's seen set would delete
+            // most of the index.
             report_run_warnings();
             crate::log_info!(
                 "indexing stopped after {:.1}s",

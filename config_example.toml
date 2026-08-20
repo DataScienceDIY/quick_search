@@ -109,6 +109,12 @@ maximum_text_size = 262144
 maximum_text_file_size = 2097152
 # Files per batch during walks / inserts / extraction.
 batch_size = 500
+# Writer time one indexing root's turn may take before the round-robin moves
+# on (milliseconds). The time half of the knob whose row half is batch_size:
+# it bounds how long one root can hold up the others, so a root extracting
+# large documents cannot leave another root's walkers parked behind it. 0
+# gives each turn one batch_size quantum and no more.
+writer_turn_slice_ms = 100
 # Files per transaction for incremental FTS updates.
 fts_update_batch_size = 1000
 # How large the write-ahead log (index.sqlite-wal) may grow during an
@@ -133,7 +139,7 @@ store_text_for_snippets = true
 [security]
 # Encrypt the index with a password (SQLCipher). The password is asked
 # for every time QuickSearch starts; turning this on or off deletes and
-# rebuilds the index. Change it from the GUI (Options → Security), not by
+# rebuilds the index. Change it from the GUI (Settings → Security), not by
 # hand: enabling protection also generates the KDF salt below.
 password_protected = false
 # Store the derived key in the OS keychain (Secret Service / KWallet on
@@ -163,12 +169,18 @@ watch_cap_warned_roots = []
 # registered with your desktop, which may assign a different key and lets
 # you change it in its own keyboard settings.
 search_hotkey = "Ctrl+Shift+F"
-# 'dark' or 'light'. Applied as soon as it is changed in the Options
-# window. Your desktop's own light/dark setting is not consulted: reading
+# 'dark' or 'light'. Applied as soon as it is changed on the Settings
+# tab. Your desktop's own light/dark setting is not consulted: reading
 # it would mean connecting to your session's message bus and subscribing to
 # your settings, which is more than a search tool should ask for. Anything
 # other than 'light' is dark.
 color_scheme = "dark"
+# Written by QuickSearch, not by you: whether the short introduction shown
+# on a brand-new installation has been dismissed. Absent means this config
+# predates that introduction - an installation that upgraded into this
+# version, which is not offered it. The Help tab can show it again at any
+# time.
+tutorial_seen = false
 
 [search]
 # Start with the fuzzy passes enabled.
@@ -185,3 +197,32 @@ display_limit = 1000
 results_per_page = 100
 # How long the GUI waits after the last keystroke before searching (ms).
 debounce_ms = 150
+# Watch the search results on screen and show renames, deletions and
+# content changes as they happen. Only the rows actually visible are
+# watched, and editing the query drops the watches. What a row shows is
+# read from the file itself, so this works whether or not indexing is
+# running — and the files it reads are then brought up to date in the
+# index, so what is stored cannot drift from what you are looking at.
+# Rows are also checked against the disk as they come on screen, which is
+# all you get over a network share, where the system does not report other
+# machines' writes. Nothing is ever added, removed or re-ordered while you
+# read.
+live_results = true
+
+# Which columns the Search tab shows. The same choices are on the
+# right-click menu of any column header, and in Settings → Search; both
+# write here immediately, without an Apply.
+#
+# There is deliberately no 'path' key: the path is always shown, because
+# it is the only column that identifies a result on its own.
+[search.columns]
+name = true
+# The excerpt of a file's contents around the match. Rows that matched on
+# their name or path show a dash there instead.
+content_match = true
+# Off by default: the width these take is usually better spent on the path
+# and the matched text. Turning one on also makes it available to sort by;
+# sorting by a column that is hidden falls back to sorting by rank.
+size = false
+modified = false
+rank = true

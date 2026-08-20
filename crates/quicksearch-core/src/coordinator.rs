@@ -36,7 +36,7 @@ use rusqlite::Connection;
 use crate::config::{diff_actions, Config, IgnoreSet, IndexWork};
 use crate::db;
 use crate::extract::Registry;
-use crate::incremental::apply_fs_event;
+use crate::incremental::{apply_fs_event, Applied, Budget};
 use crate::indexing::{ConfigChange, IndexingService, IndexingStatus, PrepStep, ReconcileProgress};
 use crate::scope::WorkCursor;
 use crate::watcher::{FsEvent, WatchError, WatchFilters, Watcher, WatcherConfig};
@@ -130,6 +130,7 @@ enum CoordCmd {
     ConfigChanged(Config),
     RebuildIndex,
     ClearIndex,
+    UpdatePaths(Vec<PathBuf>),
     Shutdown,
 }
 
@@ -228,6 +229,8 @@ impl IndexCoordinator {
             watcher_rx: None,
             watcher_gen: 0,
             pending: HashMap::new(),
+            targeted: HashMap::new(),
+            resume_from: HashMap::new(),
             last_event_at: None,
             pending_since: None,
             needs_full_run: false,
@@ -303,6 +306,26 @@ impl IndexCoordinator {
         let _ = self.cmd_tx.send(CoordCmd::ClearIndex);
     }
 
+    /// Bring the index up to date for these paths and nothing else.
+    ///
+    /// For [`crate::live`]: a frontend that has just read a displayed file
+    /// from disk hands the path here so the index agrees with what the user
+    /// is looking at. Deliberately **not** gated on [`IndexMode`] — the whole
+    /// point is that the rows on screen stay honest with indexing stopped —
+    /// but still applied on the coordinator's own thread, so the
+    /// single-writer rule holds and a full run is never raced.
+    ///
+    /// Each path is re-read and rewritten only if its modified time has moved
+    /// (see [`crate::incremental::apply_fs_event`]), so submitting a path that
+    /// is already current costs a `stat` and a row lookup. A path that no
+    /// longer exists is removed from the index.
+    pub fn update_paths(&self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let _ = self.cmd_tx.send(CoordCmd::UpdatePaths(paths));
+    }
+
     /// Compare `config` against what the index was built with. Read-only.
     pub fn check_config_validation(
         &self,
@@ -353,6 +376,35 @@ impl IndexCoordinator {
 impl Drop for IndexCoordinator {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// The verb a path submitted through [`IndexCoordinator::update_paths`]
+/// deserves, or `None` to leave the index alone.
+///
+/// The caller knows a file changed, not what it changed into. `is_file()` is
+/// the fast answer and almost always the right one — one `stat`, and this runs
+/// while results are on screen — but it folds every stat error into `false`,
+/// and a `Remove` costs the row *and everything beneath it*. So the negative
+/// answer, and only it, is confirmed with a second `stat` that can tell "gone"
+/// from "cannot see it just now": a share that dropped, a drive pulled while
+/// its rows were displayed, a parent another process chmod'd.
+///
+/// In doubt the index wins. A stale row is a wrong line on screen until the
+/// next full run; a deleted live one is data no run brings back until the file
+/// is walked again — and if the reason it could not be read was that its whole
+/// tree went away, that walk will not reach it either.
+fn verb_for(path: PathBuf) -> Option<FsEvent> {
+    if path.is_file() {
+        return Some(FsEvent::Modify(path));
+    }
+    // `metadata`, not `symlink_metadata`: it has to agree with `is_file()`
+    // above about following links, or the two can disagree about the verb.
+    match std::fs::metadata(&path) {
+        // There, but no longer something the walk would index.
+        Ok(_) => Some(FsEvent::Remove(path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(FsEvent::Remove(path)),
+        Err(_) => None,
     }
 }
 

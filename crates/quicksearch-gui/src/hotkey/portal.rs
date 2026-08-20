@@ -7,7 +7,7 @@
 //! `preferred_trigger`, and the compositor is free to bind something else, to
 //! ask the user first, or to let them change it later in its own settings.
 //! What it actually bound comes back as a human-readable
-//! `trigger_description`, which is what the Options window shows.
+//! `trigger_description`, which is what the Settings tab shows.
 //!
 //! All of this lives on its own thread. The portal is D-Bus, so every call
 //! is a round trip that could block for as long as a dialog stays on screen,
@@ -56,7 +56,7 @@ impl Portal {
             .spawn(move || pollster::block_on(run(ctx, status, rx)))
         {
             // Not worth taking the app down for — but the status must say
-            // so, or Options shows "Waiting for your desktop…" forever.
+            // so, or the Settings tab shows "Waiting for your desktop…" forever.
             quicksearch_core::log_warn!("global shortcut portal thread: {}", e);
             *lock_ok(&portal.status) =
                 Status::Error(format!("the shortcut thread could not be started: {}", e));
@@ -194,7 +194,7 @@ fn unavailable(e: &ashpd::Error) -> String {
 
 fn set(ctx: &egui::Context, status: &Mutex<Status>, next: Status) {
     *lock_ok(status) = next;
-    // The Options window may be open and waiting for this.
+    // The Settings tab may be on screen and waiting for this.
     ctx.request_repaint();
 }
 
