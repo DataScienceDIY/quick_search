@@ -28,6 +28,11 @@ pub(super) struct Inner {
     /// in manual mode, because it exists to keep the rows a user is *reading*
     /// in step with the disk however the indexer is configured.
     pub(super) targeted: HashMap<PathBuf, FsEvent>,
+    /// How far a directory event got before its turn's budget ran out, so the
+    /// next turn resumes rather than re-walking what it already applied. Keyed
+    /// by the same path as the queue the event went back into, and removed
+    /// when the event completes or is dropped.
+    pub(super) resume_from: HashMap<PathBuf, usize>,
     /// When the most recent event arrived; the burst is over once this is
     /// `pending_settle` old.
     pub(super) last_event_at: Option<Instant>,
@@ -181,14 +186,10 @@ impl Inner {
                     if !prefixes.iter().any(|lo| spelled.starts_with(lo.as_str())) {
                         continue;
                     }
-                    // Existence decides the verb. The caller knows a file
-                    // changed, not what it changed into, and a `Modify` for a
-                    // path that is gone would be silently skipped rather than
-                    // removing the row.
-                    let event = if path.is_file() {
-                        FsEvent::Modify(path)
-                    } else {
-                        FsEvent::Remove(path)
+                    // Existence decides the verb; `verb_for` also decides when
+                    // it cannot be decided at all, and says so with `None`.
+                    let Some(event) = verb_for(path) else {
+                        continue;
                     };
                     enqueue(&mut self.targeted, event);
                 }
@@ -421,6 +422,11 @@ impl Inner {
         // `clear` keeps the map's capacity — up to 100k slots after a storm;
         // shrinking is the point.
         self.pending.shrink_to_fit();
+        // Resume points describe events that no longer exist. Entries for
+        // `targeted` events survive, which is why this filters rather than
+        // clearing: that queue deliberately outlives this call.
+        self.resume_from
+            .retain(|p, _| self.targeted.contains_key(p));
         self.last_event_at = None;
         self.pending_since = None;
     }
@@ -490,13 +496,35 @@ impl Inner {
                 let Some(ev) = self.pending.remove(&path) else {
                     continue;
                 };
-                if let Err(e) =
-                    apply_fs_event(&mut conn, &ev, &self.config, &self.ignore, &self.registry)
-                {
-                    // As above: the event is out of `pending`, so only a full
-                    // run still picks the file up.
-                    crate::log_warn!("coordinator: apply {:?}: {}; scheduling full run", ev, e);
-                    self.needs_full_run = true;
+                match apply_fs_event(
+                    &mut conn,
+                    &ev,
+                    &self.config,
+                    &self.ignore,
+                    &self.registry,
+                    &Budget {
+                        deadline,
+                        cancel: &self.reconcile_stop.cancel,
+                        resume_from: self.resume_from.remove(&path).unwrap_or(0),
+                    },
+                ) {
+                    // A directory event can cover a whole moved-in tree. Put
+                    // it back, with a note of how far it got, and let the next
+                    // tick continue it — so one `mv` cannot hold this loop, or
+                    // the shutdown queued behind it, for as long as the tree
+                    // takes.
+                    Ok(Applied::Unfinished { done }) => {
+                        self.resume_from.insert(path.clone(), done);
+                        self.pending.insert(path, ev);
+                        break;
+                    }
+                    Ok(Applied::Done) => {}
+                    Err(e) => {
+                        // As above: the event is out of `pending`, so only a
+                        // full run still picks the file up.
+                        crate::log_warn!("coordinator: apply {:?}: {}; scheduling full run", ev, e);
+                        self.needs_full_run = true;
+                    }
                 }
                 if Instant::now() >= deadline {
                     break;
@@ -564,10 +592,27 @@ impl Inner {
                 let Some(ev) = self.targeted.remove(&path) else {
                     continue;
                 };
-                if let Err(e) =
-                    apply_fs_event(&mut conn, &ev, &self.config, &self.ignore, &self.registry)
-                {
-                    crate::log_warn!("coordinator: targeted apply {:?}: {}", ev, e);
+                match apply_fs_event(
+                    &mut conn,
+                    &ev,
+                    &self.config,
+                    &self.ignore,
+                    &self.registry,
+                    &Budget {
+                        deadline,
+                        cancel: &self.reconcile_stop.cancel,
+                        resume_from: self.resume_from.remove(&path).unwrap_or(0),
+                    },
+                ) {
+                    Ok(Applied::Unfinished { done }) => {
+                        self.resume_from.insert(path.clone(), done);
+                        self.targeted.insert(path, ev);
+                        break;
+                    }
+                    Ok(Applied::Done) => {}
+                    Err(e) => {
+                        crate::log_warn!("coordinator: targeted apply {:?}: {}", ev, e);
+                    }
                 }
                 if Instant::now() >= deadline {
                     break;

@@ -546,3 +546,55 @@ fn open_existing_rw_allows_delete() {
     drop(conn);
     std::fs::remove_file(&p).ok();
 }
+
+/// The index, and the WAL and SHM it hands its mode to, must not be readable
+/// by other users on the machine.
+///
+/// SQLite creates its database file 0644 and copies that mode to `-wal` and
+/// `-shm`; with the near-universal umask 022 that leaves the names and full
+/// text of everything under the configured roots — including documents whose
+/// own files are 0600 — readable by every account on a shared machine. The
+/// README's carve-out is about other *processes of the same user*, not other
+/// users, so nothing else covers this.
+#[cfg(unix)]
+#[test]
+fn a_fresh_index_and_its_sidecars_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // A directory that does not exist yet, so the creation path is the one
+    // under test: an existing directory keeps whatever mode its owner chose.
+    let p = tmp_db_path()
+        .parent()
+        .unwrap()
+        .join("data")
+        .join("index.sqlite");
+    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    // A write, so the WAL and SHM exist to be checked.
+    conn.execute(
+        "INSERT INTO files (name, path, parent, size, mtime) \
+         VALUES ('a', '/perm-a', '/', 0, 0)",
+        [],
+    )
+    .unwrap();
+
+    let mode_of = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode_of(&p), 0o600, "index at {}", p.display());
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = std::path::PathBuf::from(format!("{}{}", p.display(), suffix));
+        if sidecar.exists() {
+            assert_eq!(mode_of(&sidecar), 0o600, "sidecar {}", sidecar.display());
+        }
+    }
+    // And the directory created for it, which would otherwise take the umask
+    // and let any account list what is indexed.
+    assert_eq!(mode_of(p.parent().unwrap()), 0o700);
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}

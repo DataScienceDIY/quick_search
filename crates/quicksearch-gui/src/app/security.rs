@@ -349,9 +349,18 @@ impl QuickSearchApp {
             .resolved_database_path()
             .to_string_lossy()
             .into_owned();
+        let previous_security = self.cfg.security.clone();
         self.cfg.security = new_security;
         if let Err(e) = self.cfg.save() {
+            // Fail closed, exactly as `SecurityAction::SetKeychain` does: the
+            // salt this change depends on lives only in that file. Carrying on
+            // would install the new key and rebuild the index under it while
+            // the config on disk still describes the old state — an index
+            // encrypted with a salt that reached no disk, which no password
+            // can open afterwards. Put the config back and stop.
+            self.cfg.security = previous_security;
             self.config_error = Some(e);
+            return;
         }
         match (&new_key, self.cfg.security.use_keychain) {
             (Some(key), true) => {

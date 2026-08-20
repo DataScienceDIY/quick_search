@@ -4,9 +4,34 @@ members = [
     "crates/quicksearch-core",
     "crates/quicksearch-gui",
 ]
+# `vendor/pdf-extract` is deliberately NOT a member: it is a third-party crate
+# carried here for one patch, not part of this workspace's lints, tests or
+# release profile. `[patch.crates-io]` below is what makes the dependency graph
+# resolve to it.
+exclude = ["vendor/pdf-extract"]
+
+# pdf-extract 0.12.0, with the two unbounded recursions in it bounded.
+#
+# `get_inherited` follows `/Parent` and `process_stream`'s `Do` arm follows
+# Form XObjects, neither with a depth counter or a visited set. A page whose
+# `/Parent` is itself, or an XObject whose content stream draws itself, walks
+# the stack until it hits the guard page — and a stack overflow is not a panic
+# that `catch_unwind` can contain (`extract/pdf.rs` has one, for the parser's
+# ordinary panics): Rust's handler calls `abort()`, so a ~600-byte file kills
+# the process. It recurs on every run, because the row keeps
+# `content_state = 0` and the feeder selects exactly those; and the live
+# watcher re-extracts on-screen rows on the GUI thread, so such a file crashes
+# the app when it merely appears in a result list.
+#
+# Vendored rather than forked-by-URL so the build stays offline, `--locked`
+# keeps meaning what it means, and the cross-compile job needs no new host.
+# The patch is marked LOCAL PATCH in the source and is upstreamable; the crate
+# is MIT and the copy is recorded in `packaging/copyright`.
+[patch.crates-io]
+pdf-extract = { path = "vendor/pdf-extract" }
 
 [workspace.package]
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Jeremy <jeremy@karsttech.com>"]

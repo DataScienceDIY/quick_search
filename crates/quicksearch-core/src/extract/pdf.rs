@@ -266,4 +266,100 @@ mod tests {
             err
         );
     }
+
+    /// A page whose `/Parent` is itself must be skipped, not fatal.
+    ///
+    /// `get_inherited` walks `/Parent` looking for `Resources` and `MediaBox`,
+    /// and upstream did so without a depth bound — a cycle recursed until the
+    /// guard page. That is *not* a panic `catch_unwind` can hold: Rust's
+    /// handler aborts, so this test could not even be written before
+    /// `vendor/pdf-extract` bounded the walk; it would have taken the test
+    /// binary down with it. What arrives now is an ordinary contained failure.
+    #[test]
+    fn a_self_referential_page_parent_is_contained() {
+        let mut doc = Document::with_version("1.5");
+        let contents = doc.add_object(Stream::new(dictionary! {}, b"BT ET".to_vec()));
+        let page_id = doc.new_object_id();
+        // Neither `Resources` nor `MediaBox` here, so both lookups have to
+        // follow `/Parent` — which points back at this same dictionary.
+        doc.objects.insert(
+            page_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Page",
+                "Parent" => page_id,
+                "Contents" => contents,
+            }),
+        );
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        });
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog);
+
+        let path = crate::testutil::scratch_dir("pdf-parent-cycle").join("cycle.pdf");
+        doc.save(&path).expect("write fixture pdf");
+
+        // The verdict that matters is that we reach this line at all.
+        let _ = PdfExtractor.extract(&path);
+    }
+
+    /// A Form XObject whose content stream draws itself must be skipped, not
+    /// fatal — the second unbounded recursion, in `process_stream`'s `Do` arm.
+    /// The same bound also caps the branching shape, where each level draws
+    /// the next twice and a shallow document costs 2^depth calls.
+    #[test]
+    fn a_self_drawing_form_xobject_is_contained() {
+        let mut doc = Document::with_version("1.5");
+        let form_id = doc.new_object_id();
+        // Its own resources name it, so `/X0 Do` inside it re-enters itself.
+        doc.objects.insert(
+            form_id,
+            Object::Stream(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! {
+                        "XObject" => dictionary! { "X0" => form_id },
+                    },
+                },
+                b"/X0 Do".to_vec(),
+            )),
+        );
+        let resources = doc.add_object(dictionary! {
+            "XObject" => dictionary! { "X0" => form_id },
+        });
+        let contents = doc.add_object(Stream::new(dictionary! {}, b"/X0 Do".to_vec()));
+        let pages_id = doc.new_object_id();
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => contents,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page.into()],
+                "Count" => 1,
+                "Resources" => resources,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog);
+
+        let path = crate::testutil::scratch_dir("pdf-xobject-cycle").join("cycle.pdf");
+        doc.save(&path).expect("write fixture pdf");
+
+        let _ = PdfExtractor.extract(&path);
+    }
 }

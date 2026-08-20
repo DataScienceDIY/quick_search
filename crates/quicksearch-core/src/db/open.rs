@@ -42,12 +42,18 @@ pub(crate) fn open_or_recreate_keyed(
     let path = Path::new(db_path).to_path_buf();
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
-            std::fs::create_dir_all(dir)
+            crate::platform::create_dir_private(dir)
                 .map_err(|e| format!("Failed to create database dir {}: {}", dir.display(), e))?;
         }
     }
     let conn = Connection::open(db_path)
         .map_err(|e| format!("Failed to open database at {}: {}", db_path, e))?;
+    // Before a single row is written. SQLite creates the file 0644 and hands
+    // that mode on to `-wal` and `-shm`, so on a default umask every other
+    // user on the machine could read the index — which holds the names and
+    // full text of everything under the configured roots, including files
+    // whose own permissions are 0600.
+    crate::platform::restrict_to_owner(&path);
     key_and_probe(&conn, db_path, key)?;
     conn.execute_batch(PRAGMAS_FAST)
         .map_err(|e| format!("Failed to apply pragmas: {}", e))?;
@@ -345,6 +351,9 @@ fn wipe_and_reopen(
     }
     let conn = Connection::open(path)
         .map_err(|e| format!("Failed to reopen database after rebuild: {}", e))?;
+    // A rebuild creates the file afresh, so it needs narrowing again for the
+    // same reason the first open does.
+    crate::platform::restrict_to_owner(path);
     key_and_probe(&conn, &path.to_string_lossy(), key)?;
     conn.execute_batch(PRAGMAS_FAST)
         .map_err(|e| format!("Failed to apply pragmas after rebuild: {}", e))?;

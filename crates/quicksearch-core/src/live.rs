@@ -643,7 +643,10 @@ impl Loop {
 /// The first `limit` bytes of a file, for MIME sniffing. A short read is the
 /// whole file and is not an error; an unreadable file simply has no MIME.
 fn read_head(path: &Path, limit: usize) -> Option<Vec<u8>> {
-    let file = std::fs::File::open(path).ok()?;
+    // The row's own `stat` decided this was a file; by now it may be a FIFO,
+    // and a blocking open on this thread costs every live row for the rest of
+    // the session — and hangs exit, since `LiveWatcher::stop` joins here.
+    let file = crate::platform::open_regular_file(path).ok()?;
     let mut head = Vec::new();
     file.take(limit as u64).read_to_end(&mut head).ok()?;
     Some(head)
