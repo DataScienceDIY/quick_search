@@ -37,6 +37,11 @@ const SNIPPET_LEAD: &str = "… ";
 
 /// Append `window[range]` to `job`, highlighting whatever parts of `ranges`
 /// (byte offsets into `window`) fall inside it.
+///
+/// Ranges are clipped to the slice, so a caller rendering a string in pieces
+/// can hand each piece the *whole* set: a range inside this one survives, one
+/// straddling an edge survives as the part that is here, and one wholly
+/// outside disappears.
 fn append_marked(
     job: &mut LayoutJob,
     fmt: &SnippetFormats,
@@ -59,6 +64,18 @@ fn append_marked(
     if cursor < range.end {
         job.append(&window[cursor..range.end], 0.0, fmt.normal.clone());
     }
+}
+
+/// A whole field — a filename — with its matched spans marked.
+///
+/// Wrapping is left at the job's defaults on purpose: `egui::Label` overwrites
+/// only `wrap.max_width`, so this is laid out exactly like the plain string it
+/// replaces, and the cell keeps the height and clipping it had before.
+pub(super) fn marked_field_job(ui: &egui::Ui, text: &str, ranges: &[(usize, usize)]) -> LayoutJob {
+    let fmt = snippet_formats(ui);
+    let mut job = LayoutJob::default();
+    append_marked(&mut job, &fmt, text, ranges, 0..text.len());
+    job
 }
 
 /// The byte offset in `snip.window` that rendering has to start at for the
@@ -159,16 +176,14 @@ pub(super) fn snippet_job(ui: &egui::Ui, snip: &Snippet, max_rows: usize) -> Lay
     job
 }
 
-/// The Match column cell: one line with the (first) matched span centered
-/// and an equal amount of context on both sides, trimmed to what fits the
-/// column width. Matches on a whole field — a filename or a path — are
-/// wrapped in brackets: `[name]`.
-pub(super) fn centered_match_job(
-    ui: &egui::Ui,
-    snip: &Snippet,
-    width_px: f32,
-    whole_field: bool,
-) -> LayoutJob {
+/// The Content Match column cell: one line with the (first) matched span
+/// centered and an equal amount of context on both sides, trimmed to what fits
+/// the column width.
+///
+/// Only ever called with a content snippet. Name and path matches are
+/// highlighted in their own columns and leave a dash here, so the bracketed
+/// `[whole field]` rendering this used to carry is gone.
+pub(super) fn centered_match_job(ui: &egui::Ui, snip: &Snippet, width_px: f32) -> LayoutJob {
     let fmt = snippet_formats(ui);
 
     // Newlines force line breaks even in a one-row LayoutJob; flatten them
@@ -189,11 +204,6 @@ pub(super) fn centered_match_job(
         let font_id = &fmt.normal.font_id;
         let width_of = |c: char| f.glyph_width(font_id, c);
         let ellipsis = width_of('…');
-        let brackets = if whole_field {
-            width_of('[') + width_of(']')
-        } else {
-            0.0
-        };
         let mut marks = 0.0;
         if snip.truncated_start {
             marks += ellipsis;
@@ -201,13 +211,13 @@ pub(super) fn centered_match_job(
         if snip.truncated_end {
             marks += ellipsis;
         }
-        if fits_within(window, width_px - brackets - marks, width_of) {
+        if fits_within(window, width_px - marks, width_of) {
             return (0, window.len(), true);
         }
 
         // Something has to go, so either end may gain a mark; reserve for
         // both so a cut never overflows the column.
-        let budget = width_px - brackets - 2.0 * ellipsis;
+        let budget = width_px - 2.0 * ellipsis;
         let Some(&(a, b)) = snip.ranges.first() else {
             // No ranges (shouldn't happen for match cells) — head trim.
             return (0, take_forward(window, 0, budget.max(0.0), width_of), true);
@@ -261,20 +271,50 @@ pub(super) fn centered_match_job(
     let mut job = LayoutJob::default();
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
-    if whole_field && decorate {
-        job.append("[", 0.0, fmt.weak.clone());
-    }
     if decorate && (start > 0 || snip.truncated_start) {
         job.append("…", 0.0, fmt.weak.clone());
     }
     append_marked(&mut job, &fmt, window, &snip.ranges, start..end);
     if decorate && (end < window.len() || snip.truncated_end) {
-        job.append("…", 0.0, fmt.weak.clone());
-    }
-    if whole_field && decorate {
-        job.append("]", 0.0, fmt.weak);
+        job.append("…", 0.0, fmt.weak);
     }
     job
+}
+
+/// The Path column cell: middle-elided to `width_px`, with whatever of a
+/// path-tier match survives the cut highlighted.
+///
+/// The path reads at full strength — it is the one column that identifies a
+/// result on its own. Only the elision mark is weak, since it is punctuation
+/// this renderer added rather than anything the file is named.
+///
+/// Returns the job and whether anything was actually elided — the caller's
+/// trigger for a full-path tooltip, since egui offers one only when *it* did
+/// the eliding and it is handed an already-shortened string.
+pub(super) fn path_cell_job(
+    ui: &egui::Ui,
+    path: &str,
+    ranges: &[(usize, usize)],
+    width_px: f32,
+    font_id: &egui::FontId,
+) -> (LayoutJob, bool) {
+    let fmt = snippet_formats(ui);
+    let mut job = LayoutJob::default();
+    match crate::ui_util::middle_elide_cut(ui, path, width_px, font_id) {
+        // It fits: the whole path, marked — which is exactly
+        // [`marked_field_job`].
+        None => (marked_field_job(ui, path, ranges), false),
+        // The two surviving ends are appended straight from `path` at their
+        // original offsets: `append_marked` clips the ranges to each end, so a
+        // match that fell in the dropped middle drops with it rather than
+        // landing on whatever glyphs moved into those offsets.
+        Some((head, tail)) => {
+            append_marked(&mut job, &fmt, path, ranges, 0..head);
+            job.append("…", 0.0, fmt.weak.clone());
+            append_marked(&mut job, &fmt, path, ranges, tail..path.len());
+            (job, true)
+        }
+    }
 }
 
 /// Whether the whole of `text` fits in `budget` pixels; stops at the first

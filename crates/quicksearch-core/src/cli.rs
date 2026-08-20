@@ -77,7 +77,6 @@ pub struct FailedEntry {
 pub struct SizeReport {
     pub file_size_bytes: u64,
     pub files_row_count: i64,
-    pub properties_row_count: i64,
     pub failed_files_row_count: i64,
     pub searchabletext_row_count: i64,
     pub documents_text_row_count: i64,
@@ -98,13 +97,20 @@ impl SizeReport {
 
 /// Query the per-file indexing status. Returns `FileStatus` with
 /// `basic == NotIndexed` if the path isn't in the database.
+///
+/// There is no stored basic state: a `files` row exists only once its
+/// metadata has been read, so the row *is* the basic-indexed state. The
+/// failure reason comes from `failed_files`, the one place it is written.
 pub fn status_for_path(db_path: &str, path: &str) -> Result<FileStatus, String> {
     let conn = open_existing(db_path, false)?;
-    let row: Option<(i64, i64, Option<String>)> = conn
+    let row: Option<(i64, Option<String>)> = conn
         .query_row(
-            "SELECT basic_state, content_state, failure_msg FROM files WHERE path = ?1",
+            "SELECT f.content_state, ff.reason \
+               FROM files f \
+               LEFT JOIN failed_files ff ON ff.file_id = f.id \
+              WHERE f.path = ?1",
             params![path],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .map_err(|e| format!("status_for_path({}): {}", path, e))?;
@@ -115,9 +121,9 @@ pub fn status_for_path(db_path: &str, path: &str) -> Result<FileStatus, String> 
             content: IndexState::NotIndexed,
             failure_reason: None,
         },
-        Some((basic, content, reason)) => FileStatus {
+        Some((content, reason)) => FileStatus {
             path: path.to_string(),
-            basic: IndexState::from(basic),
+            basic: IndexState::Done,
             content: IndexState::from(content),
             failure_reason: reason,
         },
@@ -164,18 +170,29 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
             .map_err(|e| format!("count {}: {}", table, e))
     };
     let dt_row_count: i64 = count("documents_text")?;
-    let (dt_raw, dt_compressed): (i64, i64) = conn
-        .query_row(
-            "SELECT COALESCE(SUM(text_len), 0), COALESCE(SUM(LENGTH(text_zstd)), 0) FROM documents_text",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    // The uncompressed length is not a column: zstd records it in each frame's
+    // header, so this reads it back (see `repo::raw_text_len`). Only the
+    // header is wanted, and 18 bytes is the most one can occupy — projecting
+    // the prefix keeps this off the document bodies themselves.
+    let mut stmt = conn
+        .prepare("SELECT substr(text_zstd, 1, 18), LENGTH(text_zstd) FROM documents_text")
+        .map_err(|e| format!("documents_text size sum prepare: {}", e))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)))
         .map_err(|e| format!("documents_text size sum: {}", e))?;
+    let (mut dt_raw, mut dt_compressed) = (0i64, 0i64);
+    for row in rows {
+        let (header, compressed) = row.map_err(|e| format!("documents_text size row: {}", e))?;
+        // A frame with no recorded content size contributes nothing rather
+        // than skewing the ratio with a guess.
+        dt_raw += crate::db::repo::raw_text_len(&header).unwrap_or(0) as i64;
+        dt_compressed += compressed;
+    }
+    drop(stmt);
 
     Ok(SizeReport {
         file_size_bytes,
         files_row_count: count("files")?,
-        properties_row_count: count("properties")?,
         failed_files_row_count: count("failed_files")?,
         searchabletext_row_count: count("searchabletext")?,
         documents_text_row_count: dt_row_count,
@@ -203,7 +220,7 @@ pub fn pending_content_count(db_path: &str) -> Result<i64, String> {
 }
 
 /// Remove a single file from the index. Returns whether a row was deleted.
-/// Keeps FTS/documents/properties in sync via the repo helpers.
+/// Keeps FTS and `documents_text` in sync via the repo helpers.
 pub fn clear_path(db_path: &str, path: &str) -> Result<bool, String> {
     let mut conn = open_existing(db_path, true)?;
     let tx = conn
@@ -239,8 +256,6 @@ mod tests {
                     parent: "/tmp",
                     size: 1,
                     mtime: 1,
-                    inode: None,
-                    device_id: None,
                     mime: Some("text/plain"),
                     ftype: FileType::TEXT,
                     hash: None,
@@ -249,7 +264,7 @@ mod tests {
             )
             .unwrap()
             .expect("unique path");
-            set_content_done(&tx, a, "a.txt", "hello", &[], zstd_of("hello").as_deref()).unwrap();
+            set_content_done(&tx, a, "hello", zstd_of("hello").as_deref()).unwrap();
             let b = insert_file(
                 &tx,
                 &NewFile {
@@ -258,8 +273,6 @@ mod tests {
                     parent: "/tmp",
                     size: 1,
                     mtime: 1,
-                    inode: None,
-                    device_id: None,
                     mime: None,
                     ftype: FileType::EMPTY,
                     hash: None,
@@ -334,8 +347,6 @@ mod tests {
                     parent: "/tmp",
                     size: 1,
                     mtime: 1,
-                    inode: None,
-                    device_id: None,
                     mime: Some("text/plain"),
                     ftype: FileType::TEXT,
                     hash: None,
@@ -354,8 +365,6 @@ mod tests {
                     parent: "/tmp",
                     size: 1,
                     mtime: 1,
-                    inode: None,
-                    device_id: None,
                     mime: None,
                     ftype: FileType::EMPTY,
                     hash: None,
@@ -417,8 +426,6 @@ mod tests {
                     parent: "/tmp",
                     size: 1,
                     mtime: 1,
-                    inode: None,
-                    device_id: None,
                     mime: Some("text/plain"),
                     ftype: FileType::TEXT,
                     hash: None,
@@ -428,7 +435,7 @@ mod tests {
             .unwrap()
             .expect("unique path");
             let prose = "the quick brown fox jumps over the lazy dog. ".repeat(500);
-            set_content_done(&tx, id, "big.txt", &prose, &[], zstd_of(&prose).as_deref()).unwrap();
+            set_content_done(&tx, id, &prose, zstd_of(&prose).as_deref()).unwrap();
             tx.commit().unwrap();
         }
         drop(conn);
@@ -479,8 +486,6 @@ mod tests {
                         parent: "/tmp",
                         size: 1,
                         mtime: 1,
-                        inode: None,
-                        device_id: None,
                         mime: Some("text/plain"),
                         ftype: FileType::TEXT,
                         hash: None,

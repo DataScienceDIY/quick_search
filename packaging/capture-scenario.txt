@@ -3,7 +3,7 @@
 # "capture"). Edit this file to re-choreograph the captures; timings are in
 # milliseconds and `max` caps bound clip length without failing the run.
 
-# The demo config sets [ui] scale = 1.5, so every window size here is 1.5x
+# The demo config sets [ui] scale = 1.25, so every window size here is 1.25x
 # the layout it shows: high-resolution captures of an unchanged layout.
 
 # --- 1. manage-indexing.webm: the fresh auto-index in progress -------------
@@ -26,8 +26,12 @@ focus_search                      # tab switches drop egui focus; re-arm it
 clear_query
 window 1200 600                   # compact clip: the smallest layout at
                                   # which every results column still fits
-                                  # (any narrower clips the Match column
-                                  # away, defeating the demo), at 1.5x
+                                  # (any narrower clips the Content Match
+                                  # column away, defeating the demo), at
+                                  # 1.25x. Sized for the four columns the
+                                  # demo config pins — Name, Path, Content
+                                  # Match, Rank — so turning another one on
+                                  # there means revisiting this width.
 wait_ms 800                       # the resize lands asynchronously
 record_start search
 # The query is typed in quick bursts with human hesitations; each pause
@@ -42,8 +46,8 @@ wait_ms 300
 type "ition" cps 10
 wait_search_done max 8000
 wait_ms 1000
-hover_match 2                     # pin the pointer on the 3rd result's Match
-                                  # cell: the tooltip expands the snippet
+hover_match 2                     # pin the pointer on the 3rd result's Content
+                                  # Match cell: the tooltip expands the snippet
                                   # with surrounding file content
 wait_ms 2500                      # tooltip delay, then linger on it
 record_stop                       # end the clip with the tooltip on screen

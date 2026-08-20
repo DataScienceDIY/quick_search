@@ -11,10 +11,11 @@ mod count_and_extract_tests;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use batch::store_inline_text;
+pub(crate) use batch::max_text_file_size;
 pub use batch::{
-    cleanup_stale_index_entries, extract_scope_prepare, process_batch_inserts,
-    process_batch_updates, store_extracted, ExtractCursor, ExtractScope,
+    cleanup_stale_index_entries, count_extract_scope, mark_oversize_pending_na,
+    process_batch_inserts, process_batch_updates, store_extracted, ExtractCursor, ExtractScope,
+    Stored,
 };
 pub use counting::count_tree_entries_fast;
 pub use paths::{db_key_for_missing_path, filtered_dirs, filtered_walk, UnreadableDirs};

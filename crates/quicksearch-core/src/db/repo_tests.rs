@@ -9,6 +9,34 @@ fn tmp_path() -> std::path::PathBuf {
     crate::testutil::scratch_dir("repo").join("index.sqlite")
 }
 
+/// The size report reads each body's uncompressed length out of its zstd
+/// frame header instead of from a stored column, which works only because
+/// [`DocEncoder`] compresses through `ZSTD_compress2` — the API that is
+/// handed the whole input up front and records its length. A switch back to
+/// a streaming encoder would silently zero that figure, so pin it here.
+#[test]
+fn a_compressed_body_carries_its_uncompressed_length() {
+    let mut enc = DocEncoder::new().unwrap();
+    let long = "lorem ipsum dolor sit amet ".repeat(4096);
+    for text in ["", "hello world", &long] {
+        let blob = enc.encode(text).unwrap();
+        assert_eq!(
+            raw_text_len(&blob),
+            Some(text.len() as u64),
+            "frame header lost the content size for a {}-byte body",
+            text.len()
+        );
+        // The size report projects only a prefix, never the whole body — the
+        // header fits in 18 bytes and that has to be enough.
+        let prefix = &blob[..blob.len().min(18)];
+        assert_eq!(
+            raw_text_len(prefix),
+            Some(text.len() as u64),
+            "the first 18 bytes must be enough to read the length"
+        );
+    }
+}
+
 #[test]
 fn insert_update_delete_round_trip() {
     let p = tmp_path();
@@ -23,8 +51,6 @@ fn insert_update_delete_round_trip() {
                 parent: "/tmp",
                 size: 42,
                 mtime: 1_700_000_000,
-                inode: Some(7),
-                device_id: Some(64768),
                 mime: Some("text/plain"),
                 ftype: FileType::TEXT,
                 hash: Some(&[1, 2, 3]),
@@ -33,15 +59,7 @@ fn insert_update_delete_round_trip() {
         )
         .unwrap()
         .expect("unique path");
-        set_content_done(
-            &tx,
-            id,
-            "a.txt",
-            "hello world",
-            &[("title".to_string(), "hi".to_string())],
-            zstd_of("hello world").as_deref(),
-        )
-        .unwrap();
+        set_content_done(&tx, id, "hello world", zstd_of("hello world").as_deref()).unwrap();
         tx.commit().unwrap();
     }
 
@@ -87,8 +105,6 @@ fn insert_writes_content_state_from_needs_content() {
         parent: "/tmp",
         size: 1,
         mtime: 1,
-        inode: None,
-        device_id: None,
         mime: Some("text/plain"),
         ftype: FileType::TEXT,
         hash: None,
@@ -127,8 +143,6 @@ fn update_writes_content_state_from_needs_content() {
         parent: "/tmp",
         size: 10,
         mtime: 1,
-        inode: None,
-        device_id: None,
         mime: None,
         ftype: FileType::EMPTY,
         hash: None,
@@ -137,15 +151,7 @@ fn update_writes_content_state_from_needs_content() {
     let id = {
         let tx = conn.transaction().unwrap();
         let id = insert_file(&tx, &row).unwrap().expect("unique path");
-        set_content_done(
-            &tx,
-            id,
-            "a.txt",
-            "old text",
-            &[],
-            zstd_of("old text").as_deref(),
-        )
-        .unwrap();
+        set_content_done(&tx, id, "old text", zstd_of("old text").as_deref()).unwrap();
         tx.commit().unwrap();
         id
     };
@@ -172,14 +178,6 @@ fn update_writes_content_state_from_needs_content() {
         assert_eq!(got, Some(id));
         tx.commit().unwrap();
     }
-    let basic: i64 = conn
-        .query_row(
-            "SELECT basic_state FROM files WHERE id = ?1",
-            params![id],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(basic, STATE_DONE);
     assert_eq!(content_state(&conn), STATE_PENDING);
 
     let fts_hits: i64 = conn
@@ -222,8 +220,6 @@ fn insert_file_twice_on_same_path_is_idempotent() {
         parent: "/tmp",
         size: 1,
         mtime: 1,
-        inode: None,
-        device_id: None,
         mime: Some("text/plain"),
         ftype: FileType::TEXT,
         hash: None,
@@ -264,8 +260,6 @@ fn delete_subtree_clears_every_dependent_table() {
                 parent,
                 size: 1,
                 mtime: 1,
-                inode: None,
-                device_id: None,
                 mime: Some("text/plain"),
                 ftype: FileType::TEXT,
                 hash: None,
@@ -274,15 +268,7 @@ fn delete_subtree_clears_every_dependent_table() {
         )
         .unwrap()
         .expect("unique path");
-        set_content_done(
-            tx,
-            id,
-            name,
-            "body text",
-            &[("k".into(), "v".into())],
-            zstd_of("body text").as_deref(),
-        )
-        .unwrap();
+        set_content_done(tx, id, "body text", zstd_of("body text").as_deref()).unwrap();
         id
     };
 
@@ -312,7 +298,6 @@ fn delete_subtree_clears_every_dependent_table() {
     assert_eq!(count("SELECT COUNT(*) FROM files"), 2, "siblings survive");
     assert_eq!(count("SELECT COUNT(*) FROM searchabletext"), 2);
     assert_eq!(count("SELECT COUNT(*) FROM documents_text"), 2);
-    assert_eq!(count("SELECT COUNT(*) FROM properties"), 2);
     assert_eq!(
         count("SELECT COUNT(*) FROM failed_files"),
         0,
@@ -352,8 +337,6 @@ fn seeded(conn: &mut Connection, paths: &[&str]) -> std::collections::HashMap<St
                 parent,
                 size: 1,
                 mtime: 1,
-                inode: None,
-                device_id: None,
                 mime: Some("text/plain"),
                 ftype: FileType::TEXT,
                 hash: None,
@@ -362,15 +345,7 @@ fn seeded(conn: &mut Connection, paths: &[&str]) -> std::collections::HashMap<St
         )
         .unwrap()
         .expect("unique path");
-        set_content_done(
-            &tx,
-            id,
-            name,
-            "body text",
-            &[("k".into(), "v".into())],
-            zstd_of("body text").as_deref(),
-        )
-        .unwrap();
+        set_content_done(&tx, id, "body text", zstd_of("body text").as_deref()).unwrap();
         ids.insert((*path).to_string(), id);
     }
     tx.commit().unwrap();
@@ -487,7 +462,6 @@ fn delete_ids_clears_every_dependent_table() {
     assert_eq!(count("SELECT COUNT(*) FROM files"), 2);
     assert_eq!(count("SELECT COUNT(*) FROM searchabletext"), 2);
     assert_eq!(count("SELECT COUNT(*) FROM documents_text"), 2);
-    assert_eq!(count("SELECT COUNT(*) FROM properties"), 2);
     assert_eq!(count("SELECT COUNT(*) FROM failed_files"), 0);
 
     // The FTS index really lost them, not just the `files` row: a
@@ -563,7 +537,6 @@ fn drop_stored_text_keeps_the_file_searchable() {
         2,
         "both files still match on content"
     );
-    assert_eq!(count("SELECT COUNT(*) FROM properties"), 2);
 
     drop(conn);
     std::fs::remove_file(&p).ok();
@@ -590,22 +563,20 @@ fn reset_content_pending_clears_the_last_extraction() {
         tx.commit().unwrap();
     }
 
-    let row: (i64, i64, Option<String>) = conn
+    let row: (i64, i64) = conn
         .query_row(
-            "SELECT content_state, mtime, failure_msg FROM files WHERE id = ?1",
+            "SELECT content_state, mtime FROM files WHERE id = ?1",
             params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     assert_eq!(row.0, STATE_PENDING);
     assert_eq!(row.1, 1, "metadata untouched — the file did not change");
-    assert_eq!(row.2, None);
 
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     assert_eq!(count("SELECT COUNT(*) FROM files"), 2, "rows stay");
     assert_eq!(count("SELECT COUNT(*) FROM searchabletext"), 0);
     assert_eq!(count("SELECT COUNT(*) FROM documents_text"), 0);
-    assert_eq!(count("SELECT COUNT(*) FROM properties"), 0);
     assert_eq!(
         count("SELECT COUNT(*) FROM failed_files"),
         0,
@@ -726,8 +697,6 @@ fn checkpoint_and_close_truncates_wal() {
                 parent: "/tmp",
                 size: 1,
                 mtime: 1,
-                inode: None,
-                device_id: None,
                 mime: None,
                 ftype: FileType::EMPTY,
                 hash: None,
@@ -766,8 +735,6 @@ fn seed_rows(conn: &mut Connection, range: std::ops::Range<usize>) {
                 parent: "/tmp/bulk",
                 size: 1,
                 mtime: 1,
-                inode: None,
-                device_id: None,
                 mime: Some("text/plain"),
                 ftype: FileType::TEXT,
                 hash: None,
@@ -779,9 +746,7 @@ fn seed_rows(conn: &mut Connection, range: std::ops::Range<usize>) {
         set_content_done(
             &tx,
             id,
-            &name,
             &"lorem ipsum dolor sit amet ".repeat(64),
-            &[],
             zstd_of(&"lorem ipsum dolor sit amet ".repeat(64)).as_deref(),
         )
         .unwrap();
@@ -860,8 +825,6 @@ fn a_busy_reader_defeats_the_autocheckpoint_but_not_a_forced_one() {
                     parent: "/tmp/bare",
                     size: i as u64,
                     mtime: 1,
-                    inode: None,
-                    device_id: None,
                     mime: None,
                     ftype: FileType::TEXT,
                     hash: Some(&[0u8; 32]),
@@ -1020,8 +983,6 @@ fn set_content_failed_writes_failed_table() {
                 parent: "/tmp",
                 size: 0,
                 mtime: 1,
-                inode: None,
-                device_id: None,
                 mime: None,
                 ftype: FileType::EMPTY,
                 hash: None,
@@ -1068,8 +1029,6 @@ fn insert_at(tx: &Transaction<'_>, path: &str, needs_content: bool) -> i64 {
             parent,
             size: 1,
             mtime: 1,
-            inode: None,
-            device_id: None,
             mime: Some("text/plain"),
             ftype: FileType::TEXT,
             hash: None,
@@ -1101,15 +1060,7 @@ fn count_root_counts_the_fts_rows_it_says_it_does() {
         // Two searchable, and one of each way a row can fail to be.
         for path in ["/tree/a.txt", "/tree/b.txt"] {
             let id = insert_at(&tx, path, true);
-            set_content_done(
-                &tx,
-                id,
-                "n",
-                "body text",
-                &[],
-                zstd_of("body text").as_deref(),
-            )
-            .unwrap();
+            set_content_done(&tx, id, "body text", zstd_of("body text").as_deref()).unwrap();
         }
         let failed = insert_at(&tx, "/tree/c.bin", true);
         set_content_failed(&tx, failed, "bad parse").unwrap();
@@ -1134,15 +1085,7 @@ fn count_root_counts_the_fts_rows_it_says_it_does() {
     {
         let tx = conn.transaction().unwrap();
         let id = insert_at(&tx, "/elsewhere/f.txt", true);
-        set_content_done(
-            &tx,
-            id,
-            "n",
-            "body text",
-            &[],
-            zstd_of("body text").as_deref(),
-        )
-        .unwrap();
+        set_content_done(&tx, id, "body text", zstd_of("body text").as_deref()).unwrap();
         tx.commit().unwrap();
     }
     assert_eq!(fts_rows(&conn), 3);

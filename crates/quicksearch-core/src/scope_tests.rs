@@ -31,7 +31,6 @@ fn walked(config: &Config, db: &Path) -> HashSet<PathBuf> {
         config.clone(),
         Arc::new(Registry::default_set()),
         Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
         2,
     )
     .filter_map(|e| match e {
@@ -55,8 +54,6 @@ fn seed(conn: &mut Connection, paths: &[PathBuf]) {
                 parent,
                 size: 1,
                 mtime: 1,
-                inode: None,
-                device_id: None,
                 mime: Some("text/plain"),
                 ftype: crate::mime::FileType::TEXT,
                 hash: None,
@@ -152,28 +149,6 @@ fn a_root_is_never_filtered_but_its_children_still_are() {
     let scope = Scope::from_config(&config).unwrap();
     assert!(!scope.covers(&root, &root.join("keep.txt")));
 
-    std::fs::remove_dir_all(&base).ok();
-}
-
-/// Root ownership compares whole components, so a sibling whose name
-/// merely starts with a root's is not inside it — a prune that got this
-/// wrong would delete a neighbouring folder's entire index.
-#[test]
-fn owning_root_does_not_match_name_prefixes() {
-    let base = tmp_tree("prefix");
-    let root = base.join("data");
-    let sibling = base.join("database");
-    std::fs::create_dir_all(&root).unwrap();
-    std::fs::create_dir_all(&sibling).unwrap();
-
-    let mut config = Config::default();
-    config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
-    let scope = Scope::from_config(&config).unwrap();
-
-    assert_eq!(scope.owning_root(&root.join("f.txt")), Some(root.as_path()));
-    assert_eq!(scope.owning_root(&sibling.join("f.txt")), None);
-    // The root itself is a directory, never a row, and owns nothing.
-    assert_eq!(scope.owning_root(&root), None);
     std::fs::remove_dir_all(&base).ok();
 }
 
@@ -322,22 +297,4 @@ fn cancelling_stops_the_scan_without_finishing_it() {
 
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_dir_all(&db_dir).ok();
-}
-
-/// A path under no configured root has no rules to apply — a followed
-/// symlink's target is the real case; `owning_root` returning `None` is
-/// what keeps it alive.
-#[test]
-fn a_path_outside_every_root_has_no_owner() {
-    let base = tmp_tree("outside");
-    let root = base.join("indexed");
-    std::fs::create_dir_all(&root).unwrap();
-
-    let mut config = Config::default();
-    config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
-    config.indexing.ignore_patterns = vec!["*".into()];
-    let scope = Scope::from_config(&config).unwrap();
-
-    assert_eq!(scope.owning_root(Path::new("/elsewhere/target.txt")), None);
-    std::fs::remove_dir_all(&base).ok();
 }

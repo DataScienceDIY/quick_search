@@ -9,7 +9,9 @@ use quicksearch_core::db::open_or_recreate;
 use quicksearch_core::db::repo::{insert_file, set_content_done, NewFile};
 use quicksearch_core::mime::FileType;
 use quicksearch_core::query::split::split_for_cascade;
-use quicksearch_core::search::{cascade, SearchHit, SearchOptions, SearchService, SearchUpdate};
+use quicksearch_core::search::{
+    cascade, MatchField, SearchHit, SearchOptions, SearchService, SearchUpdate,
+};
 use quicksearch_core::testutil::zstd_of;
 
 mod common;
@@ -40,8 +42,6 @@ impl Seeder {
                 parent: dir,
                 size: 42,
                 mtime,
-                inode: None,
-                device_id: None,
                 mime: Some("text/plain"),
                 ftype: FileType::TEXT,
                 hash: None,
@@ -52,7 +52,7 @@ impl Seeder {
         .expect("unique path");
         if let Some(text) = text {
             let zstd = self.store_text.then(|| zstd_of(text)).flatten();
-            set_content_done(&tx, id, name, text, &[], zstd.as_deref()).unwrap();
+            set_content_done(&tx, id, text, zstd.as_deref()).unwrap();
         }
         tx.commit().unwrap();
         id
@@ -350,6 +350,39 @@ fn fuzzy_max_edits_widens_and_narrows_the_budget() {
 
     let (off, _) = run_collect(&conn, "quarterly", &fuzzy_options_with_edits(0));
     assert!(off.is_empty(), "a cap of 0 disables the fuzzy stages");
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// Regression: the fuzzy filename tier stamps stage 7 rather than truncating
+/// its own rank. `7.0 + 0.1 * distance` reaches 8.0 at ten edits — the fuzzy
+/// *full-text* tier — and every frontend reads `match_field()`, so a filename
+/// hit would have been rendered as a match on the file's contents.
+#[test]
+fn a_distant_fuzzy_filename_hit_stays_a_name_hit() {
+    let p = tmp_db("fuzzystage");
+    let mut s = Seeder::new(&p, true);
+    // Ten substitutions against a 30-character term, whose budget is ten.
+    let far = s.add("abcdefghijklmnopqrst##########", "/d", 1, None);
+    let conn = s.done();
+
+    let (hits, _) = run_collect(
+        &conn,
+        "abcdefghijklmnopqrstuvwxyz0123",
+        &fuzzy_options_with_edits(10),
+    );
+    assert_eq!(
+        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        vec![far]
+    );
+    assert!(
+        (hits[0].rank - 8.0).abs() < 1e-9,
+        "rank {} is not the 8.0 that used to truncate into the next stage",
+        hits[0].rank
+    );
+    assert_eq!(hits[0].stage, 7, "the name tier is stage 7 at any distance");
+    assert_eq!(hits[0].match_field(), MatchField::Name);
 
     drop(conn);
     std::fs::remove_file(&p).ok();
@@ -1399,4 +1432,139 @@ fn streaming_does_not_change_the_result_set() {
         );
         assert_eq!(outcome.total, 3, "batch size {}", batch);
     }
+}
+
+/// `SearchHit::snippet` is documented as "the filename for name stages, the
+/// full path for path stages", and a frontend relies on it to highlight the
+/// match inside the Name or Path column it is already painting: the ranges
+/// index that field, so they only line up if the window *is* that field.
+///
+/// The fuzzy tiers used to window it instead, which silently broke the
+/// contract whenever the match landed past two thirds of the way through a
+/// long name — the ranges then indexed a suffix, and a column that trusted
+/// them would mark the wrong glyphs.
+#[test]
+fn fuzzy_name_and_path_snippets_carry_the_whole_field() {
+    let p = tmp_db("fuzzy-whole-field");
+    let mut s = Seeder::new(&p, true);
+    // The match sits in the last third of the name, which is what used to
+    // push the window's start off zero.
+    s.add(
+        "a_long_and_deliberately_padded_out_quarterly_repot.txt",
+        "/home/me/documents/archive",
+        1,
+        None,
+    );
+    let conn = s.done();
+
+    let (hits, _) = run_collect(&conn, "report", &fuzzy_options());
+    let hit = hits
+        .iter()
+        .find(|h| h.stage == 7)
+        .expect("a fuzzy filename hit");
+
+    let snip = hit.snippet.as_ref().expect("a name hit carries a snippet");
+    assert_eq!(snip.window, hit.name, "the window is not the whole name");
+    assert!(!snip.truncated_start, "the name was windowed");
+    assert!(!snip.truncated_end, "the name was windowed");
+    for &(a, b) in &snip.ranges {
+        assert!(b <= hit.name.len(), "range {a}..{b} runs past the name");
+        assert!(
+            hit.name.is_char_boundary(a) && hit.name.is_char_boundary(b),
+            "range {a}..{b} is not on char boundaries"
+        );
+    }
+}
+
+/// A fuzzy tier's marks have to cover the *matched* text and nothing else.
+///
+/// The bug this pins: bitap reports where a match ends, and the range took
+/// its start to be `end - term.len()`, which is only right when the match
+/// happens to be as long as the term. Searching `repot` marked `1Repo` inside
+/// `1Reporter` — one byte too far left, over a character that matched nothing.
+///
+/// Asserted on the *text* rather than on offsets, so it reads as the symptom
+/// and survives the fixture being reworded.
+#[test]
+fn a_fuzzy_mark_covers_the_matched_text_and_nothing_else() {
+    let p = tmp_db("fuzzy-mark-span");
+    let mut s = Seeder::new(&p, true);
+    // The leading digit is the point: it is what the old range reached back
+    // over. In the body too, for the full-text tier.
+    s.add("1Reporter.txt", "/home/me/docs", 1, None);
+    s.add(
+        "body.txt",
+        "/home/me/docs",
+        2,
+        Some("filed under 1Reporter last week"),
+    );
+    let conn = s.done();
+
+    let (hits, _) = run_collect(&conn, "repot", &fuzzy_options());
+
+    // Stage 7 — fuzzy filename, marked inside the whole name.
+    let name_hit = hits
+        .iter()
+        .find(|h| h.stage == 7)
+        .expect("a fuzzy filename hit");
+    let snip = name_hit.snippet.as_ref().expect("name tiers carry one");
+    let (a, b) = snip.ranges[0];
+    assert_eq!(
+        &snip.window[a..b],
+        "Repo",
+        "the mark is {:?}; it must cover the match and not the leading digit",
+        &snip.window[a..b]
+    );
+
+    // Stage 8 — fuzzy full text, marked inside the snippet window.
+    let body_hit = hits
+        .iter()
+        .find(|h| h.stage == 8)
+        .expect("a fuzzy full-text hit");
+    let snip = body_hit.snippet.as_ref().expect("content tiers carry one");
+    let (a, b) = snip.ranges[0];
+    assert_eq!(
+        &snip.window[a..b],
+        "Repo",
+        "the mark is {:?}; it must cover the match and not the leading digit",
+        &snip.window[a..b]
+    );
+}
+
+/// The other half of the same defect: the automaton accepts the moment a
+/// leading part of the term has matched, paying for the term's tail with
+/// deletions — so the mark stopped short of the text that actually matched.
+///
+/// `quarterly` against a body holding `quartrly` accepts after `quartrl`,
+/// spending both edits on the missing `y` and the dropped `e`. One byte
+/// further is a *better* alignment (one edit) covering the whole word, which
+/// is what a reader expects to see lit up.
+#[test]
+fn a_fuzzy_mark_is_not_truncated_to_a_leading_part_of_the_term() {
+    let p = tmp_db("fuzzy-mark-full");
+    let mut s = Seeder::new(&p, true);
+    // The name must not match at all: a row the filename tier claims never
+    // reaches the full-text tier. And the body must hold a fuzzy *variant* —
+    // the term verbatim would be an exact content match, stage 5 or 6.
+    s.add(
+        "notes.txt",
+        "/home/me/docs",
+        1,
+        Some("the quartrly budget was revised"),
+    );
+    let conn = s.done();
+
+    let (hits, _) = run_collect(&conn, "quarterly", &fuzzy_options());
+    let hit = hits
+        .iter()
+        .find(|h| h.stage == 8)
+        .expect("a fuzzy full-text hit");
+    let snip = hit.snippet.as_ref().expect("content tiers carry one");
+    let (a, b) = snip.ranges[0];
+    assert_eq!(
+        &snip.window[a..b],
+        "quartrly",
+        "the mark is {:?}, a leading part of what matched",
+        &snip.window[a..b]
+    );
 }

@@ -16,20 +16,22 @@ mod capture;
 mod cli;
 mod color;
 mod duplicates_tab;
+mod fonts;
 mod format;
 mod help_tab;
 mod hotkey;
 mod keychain;
 mod logs_tab;
 mod manage_tab;
-mod options;
 mod platform;
 mod query_highlight;
 mod search_tab;
+mod settings_tab;
 #[cfg(test)]
 mod test_ui;
 mod tips;
 mod tracker;
+mod tutorial;
 mod ui_util;
 mod unlock;
 mod version;
@@ -105,6 +107,11 @@ fn main() {
         "QuickSearch",
         native_options,
         Box::new(move |cc| {
+            // First: egui is built without its bundled fonts, so a context
+            // starts with no faces at all and lays every string out at zero
+            // height. `set_fonts` is applied in the next `begin_pass`, and
+            // this closure is the last place that is still ahead of frame 1.
+            fonts::install(&cc.egui_ctx);
             // On Windows the registration owns a hidden window whose messages
             // the event loop must dispatch, so it must be made on that loop's
             // thread with the loop running — this closure is the first place

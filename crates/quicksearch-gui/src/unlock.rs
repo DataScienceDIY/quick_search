@@ -72,12 +72,12 @@ impl Gate {
             return;
         }
         if let Gate::Running(app) = self {
-            // The Options window is waiting for a key press to bind; the
-            // shortcut must not reshuffle the window underneath that dialog.
+            // The Settings tab is waiting for a key press to bind; the
+            // shortcut must not reshuffle the window underneath it.
             if app.capturing_hotkey() {
                 return;
             }
-            app.activate_search();
+            app.activate_search(ctx);
         }
         crate::hotkey::raise(ctx, frame);
     }
@@ -211,10 +211,20 @@ impl UnlockScreen {
             match result {
                 Ok(key) => return self.unlocked(ctx, key),
                 Err(e) => {
-                    self.error = Some(if e.starts_with(db::KEY_MISMATCH_PREFIX) {
-                        "Wrong password.".to_string()
-                    } else {
-                        e
+                    // A tagged mismatch has three distinct causes and
+                    // `key_mismatch_message` already told them apart. Only one
+                    // of them is a wrong password; the others are "the config
+                    // says protected but the index on disk is not" (a crash
+                    // between saving the config and rebuilding) and "this
+                    // index wants a password at all". Collapsing them all into
+                    // "Wrong password." tells a user with the right password
+                    // that it is wrong, and the only button on this screen
+                    // deletes their index and turns protection off. The detail
+                    // names the database path and nothing secret.
+                    self.error = Some(match e.strip_prefix(db::KEY_MISMATCH_PREFIX) {
+                        Some(_) if e.contains("wrong password") => "Wrong password.".to_string(),
+                        Some(detail) => detail.to_string(),
+                        None => e,
                     });
                     // The field was cleared on submit; put the caret back
                     // for the retry.
@@ -534,7 +544,7 @@ mod tests {
     /// leave it.
     #[test]
     fn the_password_field_takes_focus_once_and_then_releases_it() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let mut screen = UnlockScreen::new(locked_config(), None, None);
 
         frame(&ctx, &mut screen);
@@ -560,7 +570,7 @@ mod tests {
     /// was cleared on submit.
     #[test]
     fn a_failed_attempt_puts_the_caret_back() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let mut screen = UnlockScreen::new(locked_config(), None, None);
         frame(&ctx, &mut screen);
         ctx.memory_mut(|m| m.surrender_focus(pw_field_id()));
@@ -576,7 +586,7 @@ mod tests {
     /// the central one would compile and show nothing.
     #[test]
     fn the_lock_screen_shows_the_build_id() {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         let mut screen = UnlockScreen::new(locked_config(), None, None);
         let input = crate::test_ui::raw_input(SCREEN, Vec::new());
 

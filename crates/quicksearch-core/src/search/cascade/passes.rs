@@ -10,82 +10,6 @@ enum RowHit {
     Defer(SearchHit),
 }
 
-/// Reusable decode buffer and decompression context for the passes that read
-/// document text.
-///
-/// `zstd::decode_all` builds and tears down a `ZSTD_DCtx` *and* allocates a
-/// fresh output `Vec` on every call, and it is called once per candidate row.
-/// One context and one buffer, reused across a whole scan, make that a
-/// per-scan cost instead of a per-row one.
-struct DocDecoder {
-    dctx: zstd::bulk::Decompressor<'static>,
-    buf: Vec<u8>,
-}
-
-/// Where [`DocDecoder::decode`]'s buffer starts before it has seen a document.
-/// Most extracted text is well under this, so the doubling below rarely runs.
-const INITIAL_DOC_CAPACITY: usize = 64 * 1024;
-
-/// Where the doubling stops. Stored text is capped at
-/// `processing.maximum_text_size` (256 KiB by default), so this is far above
-/// any legitimate document even if that setting is raised — past it, a failure
-/// is a corrupt frame rather than a buffer that is too small.
-const MAX_DOC_CAPACITY: usize = 64 * 1024 * 1024;
-
-impl DocDecoder {
-    fn new() -> Result<Self, String> {
-        Ok(DocDecoder {
-            dctx: zstd::bulk::Decompressor::new().map_err(|e| e.to_string())?,
-            buf: Vec::new(),
-        })
-    }
-
-    /// Decompress `blob` and borrow the result as text.
-    ///
-    /// Returns `None` for a corrupt frame or non-UTF-8 content. Nothing is
-    /// copied: the indexer stores UTF-8, so the bytes are borrowed in place
-    /// rather than run through `String::from_utf8_lossy(..).into_owned()`,
-    /// which duplicated the whole document even when it was already valid.
-    fn decode(&mut self, blob: &[u8]) -> Option<&str> {
-        self.buf.clear();
-        // `decompress_to_buffer` writes into spare capacity and fails rather
-        // than growing, so the room has to be there first.
-        //
-        // The frame header would say how much is needed, but the indexer
-        // writes with `zstd::encode_all`, which is *stream*-based and so
-        // records no content size — `get_frame_content_size` says `None` for
-        // every row this ever sees. Falling back to `zstd::decode_all` there
-        // looked harmless and was not: it builds a streaming decoder per call,
-        // which measured as one ~2.4 MiB allocation per document and 27 of the
-        // 30 GiB a fuzzy search moved through the allocator.
-        //
-        // So grow this buffer instead and keep reusing it. It settles at the
-        // largest document in the scan within the first few rows, after which
-        // decoding a row allocates nothing at all.
-        if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(blob) {
-            self.buf.reserve(usize::try_from(size).ok()?);
-        }
-        loop {
-            if self.buf.capacity() == 0 {
-                self.buf.reserve(INITIAL_DOC_CAPACITY);
-            }
-            match self.dctx.decompress_to_buffer(blob, &mut self.buf) {
-                Ok(_) => break,
-                // Too small, or corrupt — the bulk API cannot tell us which.
-                // Growing is only worth trying while the buffer is still
-                // smaller than any document could legitimately be.
-                Err(_) if self.buf.capacity() < MAX_DOC_CAPACITY => {
-                    let bigger = self.buf.capacity().saturating_mul(2);
-                    self.buf.clear();
-                    self.buf.reserve(bigger);
-                }
-                Err(_) => return None,
-            }
-        }
-        std::str::from_utf8(&self.buf).ok()
-    }
-}
-
 /// Fold `text` into `dst` in place, reusing its allocation.
 ///
 /// The ASCII fold is byte-length preserving, which is what lets the cascade
@@ -142,6 +66,18 @@ impl<'a> Cx<'a> {
             scanned += 1;
             if scanned.is_multiple_of(cancel_every) && self.cancelled() {
                 return Ok(false);
+            }
+            // The display limit is already full, and holding a row proves at
+            // least one more match exists than will be shown — so `limited` is
+            // exactly true here, and everything below is work whose result
+            // `flush_pass` would throw away. That work is not small: the
+            // full-text passes decompress the document, fold a copy of it, and
+            // cut a snippet, per row. `cascade::run` makes the same test
+            // between passes; without this one a single pass over a common
+            // term runs to the end of the candidate set.
+            if self.remaining() == 0 {
+                self.limited = true;
+                break;
             }
             let file_id: i64 = col(row, 0)?;
             // Borrowed from the statement rather than `col::<String>`: this
@@ -242,16 +178,10 @@ impl<'a> Cx<'a> {
                 let is_path_tier = rank >= 9.0;
                 // The "snippet" of a name or path hit is that field itself
                 // with the matched span marked.
-                let snip = snippet::Snippet {
-                    ranges: vec![match_range],
-                    window: if is_path_tier {
-                        path.to_string()
-                    } else {
-                        name.clone()
-                    },
-                    truncated_start: false,
-                    truncated_end: false,
-                };
+                let snip = snippet::whole_field(
+                    if is_path_tier { path } else { name.as_str() },
+                    match_range,
+                );
                 let (size, mtime) = size_and_mtime(row)?;
                 let hit = SearchHit {
                     file_id,
@@ -327,12 +257,9 @@ impl<'a> Cx<'a> {
                 self.params_with_filters(Vec::new()),
             ),
         };
-        let snippet_opts = snippet::Options {
-            approx_chars: SNIPPET_WINDOW_CHARS,
-        };
         // One decoder and one fold buffer for the whole scan; both are reused
         // per row rather than reallocated.
-        let mut doc = DocDecoder::new()?;
+        let mut doc = crate::db::repo::DocDecoder::new()?;
         let mut lower = String::new();
         // Decompression dominates: check cancellation every row.
         self.scan_pass(&sql, params, 1, None, |cx, row, file_id, path| {
@@ -369,20 +296,7 @@ impl<'a> Cx<'a> {
                     if !folded {
                         fold_into(&mut lower, text);
                     }
-                    // Literal terms keep the richer multi-occurrence
-                    // extract; a wildcard match marks its own first range.
-                    let snip = match pattern.literal() {
-                        Some(term) => Some(snippet::extract_folded(
-                            text,
-                            &lower,
-                            &[term],
-                            &snippet_opts,
-                        )),
-                        None => pattern.find_first_folded(&lower).map(|r| {
-                            let r = clamp_match_range(text, r, SNIPPET_WINDOW_CHARS);
-                            snippet::window_around(text, (r.start, r.end), &snippet_opts)
-                        }),
-                    };
+                    let snip = super::text_snippet(pattern, text, &lower);
                     (stage as f64 + count_frac(count), stage as u8, snip)
                 }
                 // No stored text: can't case-verify or count. On the
@@ -465,15 +379,14 @@ impl<'a> Cx<'a> {
                 if !cx.regex_accepts(file_id, path, None)? {
                     return Ok(RowHit::Skip);
                 }
-                // Mark the approximate matched span in the matched field;
-                // window_around clamps and aligns.
-                let snip = Some(snippet::window_around(
-                    field,
-                    range,
-                    &snippet::Options {
-                        approx_chars: field.len().saturating_mul(2).max(8),
-                    },
-                ));
+                // The matched field itself with the fuzzy span marked — the
+                // same shape pass A emits, and what `SearchHit::snippet`
+                // documents for the name and path tiers. Windowing it here
+                // used to hand back a *suffix* whenever the match sat past
+                // two thirds of the way through, which broke that contract
+                // and left a frontend unable to line the ranges up against
+                // the field it paints.
+                let snip = Some(snippet::whole_field(field, range));
                 let is_path_tier = rank >= 11.0;
                 let (size, mtime) = size_and_mtime(row)?;
                 let hit = SearchHit {
@@ -483,7 +396,14 @@ impl<'a> Cx<'a> {
                     size,
                     mtime,
                     rank,
-                    stage: rank as u8,
+                    // Stamped, not truncated from `rank`: this is the one pass
+                    // whose ranks carry a fraction large enough to reach the
+                    // next integer. `edit_budget` is only warned about above
+                    // 3, so a distance of 10 makes rank 8.0 — and truncating
+                    // that would file a *filename* hit under stage 8, the
+                    // fuzzy full-text tier, telling every frontend to render
+                    // it as a content match.
+                    stage: if is_path_tier { 11 } else { 7 },
                     snippet: snip,
                 };
                 Ok(if is_path_tier {
@@ -518,11 +438,8 @@ impl<'a> Cx<'a> {
             HIT_COLUMNS, self.query.filter_sql
         );
         let params = self.params_with_filters(Vec::new());
-        let snippet_opts = snippet::Options {
-            approx_chars: SNIPPET_WINDOW_CHARS,
-        };
         // One decoder and one fold buffer for the whole scan, reused per row.
-        let mut doc = DocDecoder::new()?;
+        let mut doc = crate::db::repo::DocDecoder::new()?;
         let mut folded = String::new();
         // Decompression dominates: check cancellation every row.
         self.scan_pass(&sql, params, 1, None, |cx, row, file_id, path| {
@@ -537,14 +454,12 @@ impl<'a> Cx<'a> {
             // ASCII folding is byte-length preserving, so ranges found in
             // the folded buffer are valid in the original.
             fold_into(&mut folded, text);
-            let (count, first) = bitap.count_and_first(folded.as_bytes());
-            if count == 0 {
+            let Some((count, snip)) = super::fuzzy_snippet(&bitap, text, &folded) else {
                 return Ok(RowHit::Skip);
-            }
+            };
             if !cx.regex_accepts(file_id, path, Some(text))? {
                 return Ok(RowHit::Skip);
             }
-            let snip = first.map(|range| snippet::window_around(text, range, &snippet_opts));
             let (size, mtime) = size_and_mtime(row)?;
             Ok(RowHit::Emit(SearchHit {
                 file_id,
@@ -554,7 +469,7 @@ impl<'a> Cx<'a> {
                 mtime,
                 rank: 8.0 + count_frac(count),
                 stage: 8,
-                snippet: snip,
+                snippet: Some(snip),
             }))
         })
     }
@@ -587,16 +502,10 @@ impl<'a> Cx<'a> {
                         None => return Ok(RowHit::Skip),
                     },
                 };
-                let snip = snippet::Snippet {
-                    ranges: vec![match_range],
-                    window: if is_path_tier {
-                        path.to_string()
-                    } else {
-                        name.clone()
-                    },
-                    truncated_start: false,
-                    truncated_end: false,
-                };
+                let snip = snippet::whole_field(
+                    if is_path_tier { path } else { name.as_str() },
+                    match_range,
+                );
                 let (size, mtime) = size_and_mtime(row)?;
                 let hit = SearchHit {
                     file_id,
@@ -631,7 +540,7 @@ impl<'a> Cx<'a> {
             approx_chars: SNIPPET_WINDOW_CHARS,
         };
         // One decoder for the whole scan, reused per row.
-        let mut doc = DocDecoder::new()?;
+        let mut doc = crate::db::repo::DocDecoder::new()?;
         // Decompression dominates: check cancellation every row.
         self.scan_pass(&sql, params, 1, None, |_cx, row, file_id, path| {
             let blob: Option<&[u8]> = row

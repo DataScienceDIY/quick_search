@@ -143,6 +143,18 @@ fn open_container(path: &Path) -> Result<Archive, Box<dyn Error>> {
 /// a tiny archive can inflate without bound.
 const MAX_XML_BYTES: usize = 64 * 1024 * 1024;
 
+/// Cap on the text taken from one *container*, mirroring [`ole::MAX_TEXT_BYTES`].
+///
+/// [`MAX_XML_BYTES`] bounds each member on its own, which is not the same
+/// thing: a workbook or a deck holds one member per sheet or per slide, and
+/// nothing stops a small archive from carrying dozens that each inflate to
+/// that cap. The truncation to `maximum_text_size` happens only after the
+/// whole string is built and handed back, so without a running total the peak
+/// is members × 64 MiB — gigabytes from a file measured in megabytes, on every
+/// extraction worker at once, and an allocation failure aborts rather than
+/// unwinding.
+const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
+
 /// One member's bytes as a string. An over-cap member keeps its prefix.
 fn member_text<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
@@ -201,6 +213,12 @@ fn extract_pptx(path: &Path) -> Result<String, Box<dyn Error>> {
     let mut archive = open_container(path)?;
     let mut out = String::new();
     for name in xml_members_under(&mut archive, "ppt/slides/slide")? {
+        // Per-container budget: see `MAX_TEXT_BYTES`. Whole slides are kept or
+        // dropped rather than cut mid-way, which is why the test is here
+        // rather than inside the collector.
+        if out.len() >= MAX_TEXT_BYTES {
+            break;
+        }
         let xml = member_text(&mut archive, &name)?;
         collect_xml_text(&xml, &PPTX, &mut out)?;
         out.push_str("\n--- New Slide ---\n");
@@ -251,10 +269,20 @@ fn collect_sheet(xml: &str, strings: &[String], out: &mut String) -> Result<(), 
             Ok(Event::Start(ref e)) if e.name().as_ref() == b"c" => {
                 in_cell = true;
                 cell_type.clear();
-                for attr in e.attributes() {
+                // `with_checks(false)`: the default duplicate-attribute-name
+                // check compares each name against every name already seen on
+                // the tag, which is quadratic in the count and has no bound
+                // but the tag's own size (RUSTSEC-2026-0194). A member may be
+                // 64 MiB of inflated XML, so one crafted `<c>` can hold
+                // millions of attributes and hold this worker for hours —
+                // uncancellably, since the stop flag is only read between
+                // files. Rejecting duplicate names was never this extractor's
+                // job; it wants one attribute and stops at it.
+                for attr in e.attributes().with_checks(false) {
                     let attr = attr?;
                     if attr.key.as_ref() == b"t" {
                         cell_type = String::from_utf8_lossy(&attr.value).to_string();
+                        break;
                     }
                 }
             }
@@ -294,6 +322,10 @@ fn extract_xlsx(path: &Path) -> Result<String, Box<dyn Error>> {
     let strings = shared_strings(&mut archive);
     let mut out = String::new();
     for name in xml_members_under(&mut archive, "xl/worksheets/sheet")? {
+        // Per-container budget: see `MAX_TEXT_BYTES`.
+        if out.len() >= MAX_TEXT_BYTES {
+            break;
+        }
         let xml = member_text(&mut archive, &name)?;
         collect_sheet(&xml, &strings, &mut out)?;
     }

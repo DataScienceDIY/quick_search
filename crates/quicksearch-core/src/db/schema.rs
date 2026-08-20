@@ -22,7 +22,7 @@
 //! | [`PRAGMAS_SEARCH`] | search worker | held across a typing session | 32 MiB |
 //! | [`PRAGMAS_READONLY`] | one-shot readers | a single query | 4 MiB |
 //! | [`PRAGMAS_MAINTENANCE`] | VACUUM | one bulk copy | 8 MiB |
-//! | [`PRAGMAS_WALK_READER`] | per-root row prefetch | the walk | 1 MiB |
+//! | [`PRAGMAS_WALK_READER`] | per-root walk prefetch and content feeder | the run | 1 MiB |
 //!
 //! `PRAGMA mmap_size` is absent from all of them: SQLCipher's codec disables
 //! mmap at runtime only when a key is set, mapped pages still count in
@@ -124,12 +124,19 @@ pub const PRAGMAS_READONLY: &str = "
     PRAGMA foreign_keys = ON;
 ";
 
-/// Pragmas for a walk's row-prefetch connection.
+/// Pragmas for a root's own reader: the walk's row prefetch, and then the
+/// content pass's feeder ([`crate::content`]), which reuses this profile for
+/// the rest of the run.
 ///
-/// One of these exists per indexing root, so the cache size is multiplied by
-/// the root count. 1 MiB holds the upper levels of `idx_files_parent` hot,
-/// which is all these queries touch: each is a single index range lookup,
-/// and the pages under it are read once and not revisited.
+/// Two of these can exist per indexing root, so the cache size is multiplied
+/// by the root count. 1 MiB is sized for the walk's queries, which each read
+/// one range of `idx_files_parent` once and never revisit it. The feeder's
+/// paging is the same shape, but its one-off `count_extract_scope` at pass
+/// start is not: that scans the root's whole path range fetching a row per
+/// entry, so on a large root it is a cold read all the way through. It is
+/// deliberately here rather than on the writer — the writer holding still for
+/// it stopped every other root's walk — and this is the connection that pays
+/// for that, once per root.
 pub const PRAGMAS_WALK_READER: &str = "
     PRAGMA busy_timeout = 5000;
     PRAGMA cache_size = -1024;
@@ -156,13 +163,9 @@ CREATE TABLE files (
     parent        TEXT    NOT NULL,
     size          INTEGER NOT NULL,
     mtime         INTEGER NOT NULL,
-    inode         INTEGER,
-    device_id     INTEGER,
     mime          TEXT,
     type          INTEGER NOT NULL DEFAULT 0,
-    basic_state   INTEGER NOT NULL DEFAULT 0,   -- 0=pending 1=done 2=failed
     content_state INTEGER NOT NULL DEFAULT 0,   -- 0=pending 1=done 2=failed 3=n/a
-    failure_msg   TEXT,
     hash          BLOB
 );
 
@@ -181,13 +184,6 @@ CREATE INDEX idx_files_mime   ON files(mime);
 CREATE INDEX idx_files_hash   ON files(hash);
 CREATE INDEX idx_files_content_pending ON files(id) WHERE content_state = 0;
 
-CREATE TABLE properties (
-    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    key     TEXT    NOT NULL,
-    value   TEXT    NOT NULL,
-    PRIMARY KEY (file_id, key)
-);
-
 CREATE TABLE failed_files (
     file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
     reason  TEXT,
@@ -197,11 +193,16 @@ CREATE TABLE failed_files (
 -- Canonical extracted text for every successfully content-indexed file.
 -- Compressed with zstd (see `crate::db::repo::set_content_done`). Only
 -- written when the extractor produced text; absent rows mean "no body
--- text" (e.g. an image with only EXIF properties).
+-- text" (e.g. an audio file whose tags are all empty). "Has a row here" is
+-- therefore *not* the same as "content indexed" — `files.content_state` is
+-- the authority on that.
+--
+-- The uncompressed length is not stored: zstd records it in the frame
+-- header, so `crate::db::repo::raw_text_len` reads it back for the one
+-- caller (the size report) that wants it.
 CREATE TABLE documents_text (
     file_id    INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
-    text_zstd  BLOB    NOT NULL,
-    text_len   INTEGER NOT NULL   -- original byte length pre-compression
+    text_zstd  BLOB    NOT NULL
 );
 
 CREATE TABLE config_validation (
@@ -217,11 +218,17 @@ CREATE TABLE config_validation (
 /// rowid=?` without replaying the original row text, at the cost of a modest
 /// tombstone bitmap. Built-in `snippet()` is unavailable in contentless
 /// mode — snippets are rendered in Rust from `documents_text` instead.
+///
+/// **One column, deliberately.** Document bodies are the only thing anything
+/// ever MATCHes: the cascade pins its query to the body
+/// (`crate::search::cascade::passes`) and filename ranks come from scanning
+/// `files.name`, which the trigram index of a `name` column here would only
+/// duplicate — at (len − 2) postings per file indexed.
 pub fn fts_create_sql(tokenizer: &str) -> String {
     let effective = effective_tokenizer(tokenizer);
     format!(
         "CREATE VIRTUAL TABLE searchabletext USING fts5(\
-            name, text, properties, \
+            text, \
             tokenize='{}', \
             content='', \
             contentless_delete=1\

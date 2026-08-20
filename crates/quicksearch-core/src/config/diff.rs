@@ -31,8 +31,8 @@ pub struct IndexWork {
     pub drop_aliases: bool,
     /// The `content_extensions` filter changed. Kept rows are re-tested
     /// against it in both directions: newly-included files go back to
-    /// pending, newly-excluded ones give up their text, properties and FTS
-    /// row but keep the name/path row that filename search needs.
+    /// pending, newly-excluded ones give up their text and FTS row but keep
+    /// the name/path row that filename search needs.
     pub reconcile_content: bool,
     /// `store_text_for_snippets` turned on. Rows that finished extraction
     /// under the old setting kept no text, so they must run again.

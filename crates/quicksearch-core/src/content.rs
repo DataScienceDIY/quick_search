@@ -1,22 +1,24 @@
 //! Parallel content extraction for one indexing root.
 //!
 //! The second half of a root's pipeline, and the sibling of [`crate::walk`]:
-//! a pool of worker threads produces finished work over a bounded channel, and
-//! the single writer drains it round-robin against every other root.
+//! a pool of worker threads produces finished work over a bounded channel,
+//! and the single writer drains it in time-bounded turns. Walking roots are
+//! served first and only one extracting root per round, so a pass that is
+//! producing faster than the writer can tokenize waits rather than holding up
+//! anyone's walk — see `indexing::pipeline`.
 //!
 //! **One feeder thread owns the only database connection**, paging through
 //! the root's pending rows, while N workers do nothing but filesystem work. A
 //! connection per worker would multiply SQLite's page cache by the pool size
 //! (see [`crate::db::schema::PRAGMAS_WALK_READER`]).
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use crate::config::Config;
 use crate::extract::Registry;
-use crate::file_handling::{decide_content, ContentOutcome, ExtractCursor};
-use crate::indexing::should_abort;
+use crate::file_handling::{decide_content, ContentOutcome, ExtractCursor, ExtractScope};
 use crate::walk::{try_recv_next, TryNext, WorkerStats};
 
 /// Finished rows waiting for the writer.
@@ -69,6 +71,11 @@ struct Queue {
 struct Shared {
     queue: Mutex<Queue>,
     idle: Condvar,
+    /// What the range held when the pass began: rows still to extract and
+    /// rows already done. Set by the feeder before it pages anything, so
+    /// `already_done + rows written this pass` stays exact; never set if the
+    /// feeder could not count.
+    totals: std::sync::OnceLock<ExtractScope>,
 }
 
 impl Shared {
@@ -163,6 +170,16 @@ impl ContentPass {
         self.stats.clone()
     }
 
+    /// The range's pending and already-done counts as they stood when the
+    /// pass began.
+    ///
+    /// `None` until the feeder has counted — a scan that takes seconds on a
+    /// large root, which is why it happens here on the pass's own connection
+    /// and not on the indexer's writer — and forever if it could not.
+    pub fn totals(&self) -> Option<ExtractScope> {
+        self.shared.totals.get().copied()
+    }
+
     /// Join the workers and report whether every one finished cleanly.
     /// See [`crate::walk::ParallelWalk::finish`].
     pub fn finish(&mut self) -> bool {
@@ -197,7 +214,7 @@ impl Drop for ContentPass {
 /// A failed query ends the pass rather than retrying: the rows stay
 /// `content_state = 0` and the next run picks them up, which is the same
 /// outcome as being interrupted.
-fn feeder(shared: &Shared, db_path: &str, mut cursor: ExtractCursor, max_size: i64) {
+fn feeder(shared: &Shared, db_path: &str, mut cursor: ExtractCursor, config: &Config) {
     let conn = match crate::db::open::open_walk_reader(db_path) {
         Ok(conn) => conn,
         Err(e) => {
@@ -207,6 +224,18 @@ fn feeder(shared: &Shared, db_path: &str, mut cursor: ExtractCursor, max_size: i
         }
     };
 
+    // Before the first page, so nothing this pass writes is inside the count.
+    // The workers cannot run ahead of this: they block in `take` until the
+    // first page lands. A failure here costs the progress figure, not the
+    // pass.
+    match crate::file_handling::count_extract_scope(&conn, &cursor, config) {
+        Ok(totals) => {
+            let _ = shared.totals.set(totals);
+        }
+        Err(e) => crate::log_warn!("content reader: {}", e),
+    }
+
+    let max_size = crate::file_handling::max_text_file_size(config);
     while shared.take_feed_slot().is_some() {
         let page =
             match crate::db::repo::pending_content_page(&conn, &cursor, max_size, FEED_PAGE as i64)
@@ -244,14 +273,13 @@ fn worker(
     registry: &Registry,
     config: &Config,
     stop_flag: &Arc<AtomicBool>,
-    suspend_flag: &Arc<AtomicBool>,
     stats: &WorkerStats,
 ) {
     while let Some(row) = shared.take() {
         // Held for the whole of `decide_content`; that is the work the
         // progress line reports.
         let _busy = stats.enter();
-        if should_abort(stop_flag, suspend_flag) {
+        if stop_flag.load(Ordering::Relaxed) {
             shared.shutdown();
             return;
         }
@@ -279,14 +307,13 @@ pub fn extract_content(
     registry: Arc<Registry>,
     config: Config,
     stop_flag: Arc<AtomicBool>,
-    suspend_flag: Arc<AtomicBool>,
     workers: usize,
 ) -> ContentPass {
     let shared = Arc::new(Shared {
         queue: Mutex::new(Queue::default()),
         idle: Condvar::new(),
+        totals: std::sync::OnceLock::new(),
     });
-    let max_size = i64::try_from(config.processing.maximum_text_file_size).unwrap_or(i64::MAX);
 
     let (tx, rx) = mpsc::sync_channel(READY_CAP);
     let stats = WorkerStats::new(workers.clamp(1, 64));
@@ -294,19 +321,11 @@ pub fn extract_content(
         .map(|_| {
             let (shared, tx) = (shared.clone(), tx.clone());
             let (registry, config) = (registry.clone(), config.clone());
-            let (stop_flag, suspend_flag) = (stop_flag.clone(), suspend_flag.clone());
+            let stop_flag = stop_flag.clone();
             let stats = stats.clone();
             crate::platform::spawn_worker("qs-extract", move || {
                 crate::platform::set_background_priority();
-                worker(
-                    &shared,
-                    &tx,
-                    &registry,
-                    &config,
-                    &stop_flag,
-                    &suspend_flag,
-                    &stats,
-                )
+                worker(&shared, &tx, &registry, &config, &stop_flag, &stats)
             })
         })
         .collect();
@@ -318,7 +337,7 @@ pub fn extract_content(
         let (shared, db_path, cursor) = (shared.clone(), db_path.to_string(), cursor.clone());
         crate::platform::spawn_worker("qs-feeder", move || {
             crate::platform::set_background_priority();
-            feeder(&shared, &db_path, cursor, max_size)
+            feeder(&shared, &db_path, cursor, &config)
         })
     };
 
@@ -338,9 +357,23 @@ mod tests {
 
     use crate::db::open_or_recreate;
     use crate::db::repo::{self, insert_file, NewFile};
-    use crate::file_handling::{extract_scope_prepare, store_extracted};
+    use crate::file_handling::{store_extracted, ExtractScope, Stored};
     use crate::mime::FileType;
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// The removed `extract_scope_prepare`: the sweep on the writer, then the
+    /// count the content pass now does on its own connection. Composed here
+    /// because these tests want both halves in one call.
+    fn extract_scope_prepare(
+        conn_mutex: &Arc<Mutex<rusqlite::Connection>>,
+        cursor: &ExtractCursor,
+        config: &Config,
+    ) -> Result<ExtractScope, String> {
+        let conn = crate::lock_ok(conn_mutex);
+        crate::file_handling::mark_oversize_pending_na(&conn, cursor, config)?;
+        crate::file_handling::count_extract_scope(&conn, cursor, config)
+    }
     /// A path that does not exist yet — the caller builds the tree under it.
     fn tmp(tag: &str) -> PathBuf {
         crate::testutil::scratch_dir(tag).join("tree")
@@ -367,8 +400,6 @@ mod tests {
                         parent: d.to_str().unwrap(),
                         size: std::fs::metadata(&f).unwrap().len(),
                         mtime: 1,
-                        inode: None,
-                        device_id: None,
                         mime: Some("text/plain"),
                         ftype: FileType::TEXT,
                         hash: None,
@@ -390,7 +421,6 @@ mod tests {
             &ExtractCursor::for_root(tree.join(sub).to_str().unwrap()),
             Arc::new(Registry::default_set()),
             Config::default(),
-            Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             workers,
         )
@@ -450,9 +480,13 @@ mod tests {
         assert_eq!(rows.len(), 3);
 
         let stop = Arc::new(AtomicBool::new(false));
+        let far = Instant::now() + Duration::from_secs(60);
         assert_eq!(
-            store_extracted(&conn_mutex, &rows, &stop, &config).unwrap(),
-            3
+            store_extracted(&conn_mutex, &rows, &stop, &config, far).unwrap(),
+            Stored {
+                consumed: 3,
+                written: 3
+            }
         );
 
         let state = |p: &Path| -> i64 {
@@ -501,6 +535,93 @@ mod tests {
         let mut pass = pass_for(&tree, &db, "nonexistent", 4);
         assert!(drain(&mut pass).is_empty());
         assert!(pass.finish());
+        // The pass still counted: an empty range is a known zero, not an
+        // unknown.
+        assert_eq!(
+            pass.totals(),
+            Some(ExtractScope {
+                pending: 0,
+                already_done: 0
+            })
+        );
+        std::fs::remove_dir_all(&tree).ok();
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// The pass counts its range on its own connection, before it pages —
+    /// which is what lets the writer thread stop doing it. The count is what
+    /// stood at the start: rows this pass writes are not inside it.
+    #[test]
+    fn the_pass_counts_its_range_before_it_starts() {
+        let (tree, db) = seed("totals", &[("r1", 3), ("r2", 2)]);
+        let mut pass = pass_for(&tree, &db, "r1", 2);
+        let rows = drain(&mut pass);
+        assert!(pass.finish());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            pass.totals(),
+            Some(ExtractScope {
+                pending: 3,
+                already_done: 0
+            }),
+            "only r1's rows, all of them pending when the pass began"
+        );
+        std::fs::remove_dir_all(&tree).ok();
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// The writer's turn is bounded by time, not by batch: `store_extracted`
+    /// stops at its deadline, tells the caller how far it got, and always
+    /// gets at least one row down so a caller looping on it cannot spin.
+    #[test]
+    fn store_extracted_honours_its_deadline_but_always_makes_progress() {
+        let (tree, db) = seed("deadline", &[("r1", 5)]);
+        let conn_mutex = Arc::new(Mutex::new(
+            open_or_recreate(db.to_str().unwrap(), "trigram").unwrap(),
+        ));
+        let config = Config::default();
+        let mut pass = pass_for(&tree, &db, "r1", 2);
+        let rows = drain(&mut pass);
+        assert!(pass.finish());
+        assert_eq!(rows.len(), 5);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // A deadline already gone by: one row, then out.
+        let past = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            store_extracted(&conn_mutex, &rows, &stop, &config, past).unwrap(),
+            Stored {
+                consumed: 1,
+                written: 1
+            }
+        );
+        // Plenty of time: the rest, in one call.
+        let far = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            store_extracted(&conn_mutex, &rows[1..], &stop, &config, far).unwrap(),
+            Stored {
+                consumed: 4,
+                written: 4
+            }
+        );
+        let done: i64 = conn_mutex
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE content_state = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done, 5, "every row landed across the two calls");
+
+        // Stopped before it starts: nothing consumed, and the caller can tell.
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            store_extracted(&conn_mutex, &rows, &stop, &config, far).unwrap(),
+            Stored::default()
+        );
+
         std::fs::remove_dir_all(&tree).ok();
         std::fs::remove_file(&db).ok();
     }
@@ -514,7 +635,6 @@ mod tests {
             Arc::new(Registry::default_set()),
             Config::default(),
             Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(false)),
             4,
         );
         assert!(drain(&mut pass).len() < 400);

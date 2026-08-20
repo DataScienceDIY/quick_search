@@ -8,6 +8,17 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A path that does not exist yet — these tests build the tree themselves.
+/// The removed `extract_scope_prepare`: the oversize sweep, then the count.
+fn extract_scope_prepare(
+    conn_mutex: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    cursor: &ExtractCursor,
+    config: &Config,
+) -> Result<ExtractScope, String> {
+    let conn = crate::lock_ok(conn_mutex);
+    super::mark_oversize_pending_na(&conn, cursor, config)?;
+    super::count_extract_scope(&conn, cursor, config)
+}
+
 fn tmp(tag: &str) -> std::path::PathBuf {
     crate::testutil::scratch_dir(tag).join("tree")
 }

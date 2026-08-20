@@ -261,7 +261,7 @@ mod tests {
             walked,
             walk_total,
             extracted: 0,
-            extract_total: 0,
+            extract_total: None,
             current_file: None,
             active_workers: 2,
             total_workers: 4,
@@ -299,11 +299,11 @@ mod tests {
 
         let mut extracting = root(RootPhase::Extracting, 1_000, None);
         extracting.extracted = 200;
-        extracting.extract_total = 800;
+        extracting.extract_total = Some(800);
         extracting.active_workers = 3;
         let mut done = root(RootPhase::Done, 500, None);
         done.extracted = 500;
-        done.extract_total = 500;
+        done.extract_total = Some(500);
         done.active_workers = 0;
         done.total_workers = 0;
         assert_eq!(

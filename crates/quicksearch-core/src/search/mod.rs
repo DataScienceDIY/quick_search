@@ -69,6 +69,55 @@ pub struct SearchHit {
     pub snippet: Option<Snippet>,
 }
 
+/// Which field a hit's [`SearchHit::snippet`] excerpts, derived from the
+/// cascade stage. See the rank table at the top of [`crate::search::cascade`].
+///
+/// Frontends branch on this rather than on the raw stage number, so a new tier
+/// is classified in one place instead of in every renderer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchField {
+    Name,
+    Contents,
+    Path,
+}
+
+/// How a [`MatchField::Contents`] hit matched its body — what has to be
+/// re-run to cut its snippet again from the file as it now stands.
+///
+/// The two are not interchangeable: an exact tier's snippet is cut around the
+/// literal term, and a fuzzy tier's around a bitap match the literal is
+/// usually *absent* from. Re-cutting a fuzzy hit as if it were exact finds
+/// nothing and reads as "the file no longer matches".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentTier {
+    /// Stages 5 and 6: the body contains the term as written.
+    Exact,
+    /// Stage 8: the body contains something within the fuzzy edit budget of
+    /// the term.
+    Fuzzy,
+}
+
+impl SearchHit {
+    pub fn match_field(&self) -> MatchField {
+        match self.stage {
+            1..=4 | 7 => MatchField::Name,
+            5 | 6 | 8 => MatchField::Contents,
+            // 9..=11, and whatever a later tier adds: the path is the safe
+            // reading, since it is the one field every hit carries in full.
+            _ => MatchField::Path,
+        }
+    }
+
+    /// `Some` for a hit whose snippet is a window on the file's body.
+    pub fn content_tier(&self) -> Option<ContentTier> {
+        match self.stage {
+            5 | 6 => Some(ContentTier::Exact),
+            8 => Some(ContentTier::Fuzzy),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SearchUpdate {
     Started {

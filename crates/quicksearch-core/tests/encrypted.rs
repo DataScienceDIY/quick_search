@@ -91,11 +91,11 @@ fn encrypted_index_lifecycle() {
     {
         let conn = db::open_existing(&db_path.to_string_lossy(), true).unwrap();
         conn.execute_batch(
-            "INSERT INTO files (name, path, parent, size, mtime, type, basic_state, content_state)
+            "INSERT INTO files (name, path, parent, size, mtime, type, content_state)
              WITH RECURSIVE n(i) AS (
                  SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20000
              )
-             SELECT 'p' || i, '/pad/' || i, '/pad', 0, 0, 0, 1, 3 FROM n;
+             SELECT 'p' || i, '/pad/' || i, '/pad', 0, 0, 0, 3 FROM n;
              DELETE FROM files WHERE parent = '/pad';",
         )
         .unwrap();

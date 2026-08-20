@@ -122,7 +122,6 @@ fn parallel(root: &str, config: &Config, db_path: &str) -> (usize, usize) {
         config.clone(),
         Arc::new(Registry::default_set()),
         Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
         4,
     ) {
         let WalkEvent::File(file) = event else {

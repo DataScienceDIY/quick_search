@@ -16,9 +16,8 @@ fn db_with(tag: &str, rows: &[(String, u64)]) -> PathBuf {
     for (path, mtime) in rows {
         let as_path = Path::new(path);
         conn.execute(
-            "INSERT INTO files (name, path, parent, size, mtime, type, \
-                                basic_state, content_state)
-             VALUES (?1, ?2, ?3, 0, ?4, 0, 1, 3)",
+            "INSERT INTO files (name, path, parent, size, mtime, type, content_state)
+             VALUES (?1, ?2, ?3, 0, ?4, 0, 3)",
             rusqlite::params![
                 as_path.file_name().unwrap().to_string_lossy(),
                 path,
@@ -53,7 +52,6 @@ fn walk_with(
         db.to_str().unwrap(),
         Config::default(),
         Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
         4,
     ))
@@ -304,7 +302,6 @@ fn unreadable_directory_is_recorded_not_silently_empty() {
             Config::default(),
             Arc::new(Registry::default_set()),
             Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
             4,
         );
         let files: Vec<WalkedFile> = w
@@ -462,7 +459,6 @@ fn hidden_and_ignored_entries_are_pruned() {
         Config::default(),
         Arc::new(Registry::default_set()),
         Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
         4,
     ));
     assert_eq!(names(&files), vec!["keep.txt", "keep2.txt"]);
@@ -507,7 +503,6 @@ fn pruned_entries_are_counted_by_reason() {
         empty_db("prune-counts").to_str().unwrap(),
         Config::default(),
         Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
         4,
     );
@@ -557,7 +552,6 @@ fn a_tree_with_nothing_pruned_reports_no_summary() {
         Config::default(),
         Arc::new(Registry::default_set()),
         Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
         4,
     );
     let files: Vec<WalkedFile> = (&mut walk)
@@ -603,7 +597,6 @@ fn a_directory_reports_rows_with_no_file_behind_them() {
         Config::default(),
         Arc::new(Registry::default_set()),
         Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
         4,
     ));
     stale.sort();
@@ -642,7 +635,6 @@ fn an_unreadable_directory_reports_nothing_stale() {
         db.to_str().unwrap(),
         Config::default(),
         Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
         4,
     ));
@@ -684,7 +676,6 @@ fn stop_flag_ends_the_walk_without_hanging() {
         Config::default(),
         Arc::new(Registry::default_set()),
         stop,
-        Arc::new(AtomicBool::new(false)),
         4,
     ));
 
@@ -713,7 +704,6 @@ fn dropping_the_walk_early_does_not_hang() {
         Config::default(),
         Arc::new(Registry::default_set()),
         Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
         4,
     );
     assert!(w.next().is_some());
@@ -738,7 +728,6 @@ fn overlapping_roots_yield_each_file_once() {
         empty_db("overlap").to_str().unwrap(),
         Config::default(),
         Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
         4,
     ));
@@ -786,7 +775,6 @@ fn finish_reports_a_clean_walk_and_is_idempotent() {
         empty_db("finish").to_str().unwrap(),
         Config::default(),
         Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
         Arc::new(AtomicBool::new(false)),
         4,
     );

@@ -64,7 +64,7 @@ fn running_state(roots: &[&str], current_file: Option<&str>) -> IndexerState {
                 walked: 100,
                 walk_total: Some(1000),
                 extracted: 0,
-                extract_total: 0,
+                extract_total: None,
                 current_file: current_file.map(str::to_string),
                 active_workers: 4,
                 total_workers: 4,
@@ -112,11 +112,12 @@ fn frame(
 ) -> ManageActions {
     WIDGETS.with(|w| w.borrow_mut().clear());
     let mut actions = ManageActions::default();
-    let _ = ctx.run(raw_input(events), |ctx| {
+    let out = ctx.run(raw_input(events), |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
             actions = tab.ui(ui, state, cfg);
         });
     });
+    crate::test_ui::assert_no_tofu(ctx, &out);
     actions
 }
 
@@ -171,7 +172,7 @@ fn staged_workers(tab: &ManageTab) -> Option<usize> {
 /// that id, so a field that is renamed mid-run silently drops the edit.
 #[test]
 fn the_worker_field_keeps_its_identity_as_the_status_changes() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let cfg = cfg_with_root();
 
@@ -213,7 +214,7 @@ fn the_worker_field_keeps_its_identity_as_the_status_changes() {
 /// reporting progress the whole time.
 #[test]
 fn a_typed_worker_count_reaches_the_applied_config() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let cfg = cfg_with_root();
 
@@ -259,7 +260,7 @@ fn a_typed_worker_count_reaches_the_applied_config() {
 /// The other way to set the field: drag it.
 #[test]
 fn a_dragged_worker_count_is_staged() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let cfg = cfg_with_root();
     let busy = running_state(&["/data"], None);
@@ -304,7 +305,7 @@ fn root_progress(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> 
         walked,
         walk_total,
         extracted: 0,
-        extract_total: 0,
+        extract_total: None,
         current_file: None,
         active_workers: 4,
         total_workers: 4,
@@ -315,7 +316,7 @@ fn root_progress(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> 
 /// the files a walk emits; a finished root must show the exact count.
 #[test]
 fn a_finished_root_reports_its_exact_count_not_the_estimate() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let mut done = root_progress(RootPhase::Done, 261_088, Some(6_677_062));
     done.extracted = 238_929;
@@ -339,7 +340,7 @@ fn a_finished_root_reports_its_exact_count_not_the_estimate() {
 /// holds survives the run that counted it.
 #[test]
 fn a_configured_root_shows_what_the_last_run_counted() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
 
     let text = frame_text(&ctx, &mut tab, &counted_state(1_234_567, 456_789)).join(" | ");
@@ -354,7 +355,7 @@ fn a_configured_root_shows_what_the_last_run_counted() {
 /// folder is empty — where the truth is that nothing has counted it yet.
 #[test]
 fn a_root_the_index_has_never_counted_says_so() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
 
     let text = frame_text(&ctx, &mut tab, &idle_state()).join(" | ");
@@ -371,7 +372,7 @@ fn a_root_the_index_has_never_counted_says_so() {
 /// rather than borrowing another root's numbers.
 #[test]
 fn figures_belong_to_the_root_they_were_counted_for() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let state = IndexerState {
         root_counts: Arc::new(vec![RootCount {
@@ -394,7 +395,7 @@ fn figures_belong_to_the_root_they_were_counted_for() {
 /// already been walked, or the row would read as a hang at 100%.
 #[test]
 fn a_walking_root_shows_the_estimate_raised_to_what_it_has_walked() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
 
     let honest = frame_text(
@@ -440,7 +441,7 @@ fn frame_spans(
 #[test]
 fn every_phase_word_is_painted_in_its_hint_color() {
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
-        let ctx = egui::Context::default();
+        let ctx = crate::test_ui::ctx();
         ctx.set_theme(theme);
         let mut tab = ManageTab::new();
         let colors = crate::color::palette(theme == egui::Theme::Dark);
@@ -461,7 +462,7 @@ fn every_phase_word_is_painted_in_its_hint_color() {
 /// No count has landed yet: an indeterminate row, not a fabricated one.
 #[test]
 fn a_walking_root_without_a_count_shows_no_denominator() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let text = frame_text(
         &ctx,
@@ -476,7 +477,7 @@ fn a_walking_root_without_a_count_shows_no_denominator() {
 /// Every step of the prologue names itself and carries a clock.
 #[test]
 fn each_prologue_step_says_what_it_is_waiting_on() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
 
     for (step, expected) in [
@@ -494,7 +495,7 @@ fn each_prologue_step_says_what_it_is_waiting_on() {
 /// something to count. It reports its position in the scan.
 #[test]
 fn a_reconcile_reports_how_far_through_the_index_it_is() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let text = frame_text(
         &ctx,
@@ -521,7 +522,7 @@ fn a_reconcile_reports_how_far_through_the_index_it_is() {
 /// with nothing to divide by; it must not invent a denominator.
 #[test]
 fn a_reconcile_without_a_row_count_shows_no_denominator() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let text = frame_text(
         &ctx,
@@ -537,7 +538,7 @@ fn a_reconcile_without_a_row_count_shows_no_denominator() {
 /// `Idle` while the thread scans every row.
 #[test]
 fn a_prune_between_runs_is_reported_instead_of_idle() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let state = IndexerState {
         reconcile: Some(ReconcileState::Running(ReconcileProgress {
@@ -567,7 +568,7 @@ fn a_prune_between_runs_is_reported_instead_of_idle() {
 /// is the only evidence it happened.
 #[test]
 fn a_finished_prune_reports_what_it_did() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let state = IndexerState {
         reconcile: Some(ReconcileState::Finished(ReconcileProgress {
@@ -597,7 +598,7 @@ fn a_finished_prune_reports_what_it_did() {
 /// The static "Starting…" placeholder must not reappear.
 #[test]
 fn the_starting_placeholder_is_gone() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     for state in [
         preparing_state(PrepStep::PreviousRun),
@@ -683,7 +684,7 @@ fn the_probe_caches_until_the_refresh_interval_is_up() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A database path edited in Options must not keep showing the old
+/// A database path edited on the Settings tab must not keep showing the old
 /// database's size for the rest of the interval.
 #[test]
 fn the_probe_follows_a_changed_database_path() {
@@ -714,7 +715,7 @@ fn the_status_row_shows_the_total_index_size() {
     write_bytes(&dir.join("index.sqlite-wal"), 200_000);
     write_bytes(&dir.join("index.sqlite-shm"), 32_768);
 
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let text = frame_text_with(&ctx, &mut tab, &cfg_with_db(&db), &idle_state()).join(" | ");
     assert!(
@@ -733,7 +734,7 @@ fn hovering_the_size_explains_how_to_shrink_the_index() {
     let db = dir.join("index.sqlite");
     write_bytes(&db, 2048);
 
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     // egui holds tooltips back for a third of a second, and frames here
     // are only 1/60 s of simulated time apart.
     ctx.style_mut(|s| s.interaction.tooltip_delay = 0.0);
@@ -762,7 +763,7 @@ fn hovering_the_size_explains_how_to_shrink_the_index() {
         "Indexed folders",
         "whitelist",
         "Store text for snippets",
-        "Options",
+        "Settings tab",
     ] {
         assert!(text.contains(lever), "tooltip never mentions {}", lever);
     }
@@ -993,7 +994,7 @@ fn a_rejected_apply_keeps_the_draft() {
 /// which egui hangs interaction state off.
 #[test]
 fn the_unsaved_label_appears_without_renaming_the_apply_button() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let cfg = cfg_with_root();
 
@@ -1024,7 +1025,7 @@ fn the_unsaved_label_appears_without_renaming_the_apply_button() {
 /// changes mid-edit loses its buffer.
 #[test]
 fn the_prune_rows_come_and_go_without_renaming_anything_below() {
-    let ctx = egui::Context::default();
+    let ctx = crate::test_ui::ctx();
     let mut tab = ManageTab::new();
     let cfg = cfg_with_root();
     let progress = ReconcileProgress {
