@@ -62,41 +62,72 @@ impl<'a> Cx<'a> {
         let mut deferred = Deferred::default();
         let mut scanned = 0usize;
         let mut clock = FlushClock::new();
+        // Set when the loop stops on the display limit rather than on the end
+        // of the candidate set — rows were left unexamined, so the result set
+        // is cut whatever the final flush happens to hold.
+        let mut cut_short = false;
+        // The reassembled path for the row in hand. One buffer for the whole
+        // scan, refilled per row: `files` stores `parent` and `name` and no
+        // longer a third column holding their concatenation, so this is where
+        // the concatenation happens. Reused rather than allocated because it
+        // runs for every *scanned* row — a full-table scan on three of the
+        // passes — while only the few that become hits keep an owned copy.
+        //
+        // A local, not a field on `self`: the classifiers take `&mut Self`, and
+        // a buffer borrowed out of `self` could not be handed to them.
+        let mut path = String::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             scanned += 1;
             if scanned.is_multiple_of(cancel_every) && self.cancelled() {
                 return Ok(false);
             }
-            // The display limit is already full, and holding a row proves at
-            // least one more match exists than will be shown — so `limited` is
-            // exactly true here, and everything below is work whose result
-            // `flush_pass` would throw away. That work is not small: the
-            // full-text passes decompress the document, fold a copy of it, and
-            // cut a snippet, per row. `cascade::run` makes the same test
-            // between passes; without this one a single pass over a common
-            // term runs to the end of the candidate set.
-            if self.remaining() == 0 {
-                self.limited = true;
-                break;
-            }
             let file_id: i64 = col(row, 0)?;
-            // Borrowed from the statement rather than `col::<String>`: this
-            // runs for every *scanned* row — a full-table scan on the filename
-            // pass — while only the few that become hits need an owned copy.
-            let path = row
-                .get_ref(2)
-                .map_err(|e| e.to_string())?
-                .as_str()
-                .map_err(|e| e.to_string())?;
-            if self.skip(file_id, path) {
+            let borrowed = |idx| -> Result<&str, String> {
+                row.get_ref(idx)
+                    .map_err(|e| e.to_string())?
+                    .as_str()
+                    .map_err(|e| e.to_string())
+            };
+            path.clear();
+            // Parent first, and no separator between them: every stored parent
+            // already ends in one. See `file_handling::dir_to_db_parent`.
+            path.push_str(borrowed(2)?);
+            path.push_str(borrowed(1)?);
+            if self.skip(file_id, &path) {
                 continue;
             }
-            match classify(self, row, file_id, path)? {
+            match classify(self, row, file_id, &path)? {
                 RowHit::Skip => {}
                 RowHit::Emit(hit) => {
                     buf.push(hit);
                     overflowed |= self.enforce_cap(&mut buf);
                     self.flush_if_due(&mut buf, &mut clock);
+                    // Stop once the display limit is full. Everything past
+                    // this point is work `flush_pass` would throw away, and it
+                    // is not small: the full-text passes decompress the
+                    // document, fold a copy of it and cut a snippet, per row.
+                    // `cascade::run` makes the same test between passes;
+                    // without this one a single pass over a common term runs
+                    // to the end of its candidate set.
+                    //
+                    // Tested *here* rather than at the top of the loop, where
+                    // it is tempting: a scanned row is not a match. It may be
+                    // one an earlier pass already emitted, or one `classify`
+                    // rejects — the filename pass's SQL is deliberately a
+                    // superset feeding both the name and the path tier — so
+                    // stopping on one would end the pass over a row that was
+                    // never going to be shown.
+                    //
+                    // The break is recorded rather than turned into `limited`
+                    // on the spot. `flush_pass` decides that, because it knows
+                    // how much it had to truncate; claiming it here would say
+                    // a set was cut whenever it happened to end exactly at the
+                    // limit. But leaving the scan *unfinished* silently is the
+                    // opposite error — see the flush below.
+                    if self.remaining() == 0 {
+                        cut_short = true;
+                        break;
+                    }
                 }
                 RowHit::Defer(hit) => {
                     deferred.hits.push(hit);
@@ -114,6 +145,15 @@ impl<'a> Cx<'a> {
             None => debug_assert!(deferred.hits.is_empty(), "deferred hits with no slot"),
         }
         self.flush_pass(buf, overflowed);
+        // After the flush, so it cannot be undone by one that truncated
+        // nothing. A scan that broke on the limit left rows unexamined, and
+        // the two places that would otherwise notice both miss the boundary
+        // case: `flush_pass` compares `buf.len() > room`, which is `0 > 0`
+        // when a mid-scan flush landed exactly on the limit, and
+        // `cascade::run` tests `remaining()` at the top of the *next* pass,
+        // of which the last pass has none. Without this a cut result set can
+        // report itself complete.
+        self.limited |= cut_short;
         Ok(true)
     }
 
@@ -123,26 +163,57 @@ impl<'a> Cx<'a> {
         let query = self.query;
         let pattern = &query.pattern;
         let with_paths = path_tiers_enabled(pattern);
-        // A path always ends in its own name, so `path LIKE` is the
-        // superset that feeds both the name and the path tiers.
-        let sql = format!(
-            "SELECT {} FROM files f \
-             WHERE {} LIKE ? ESCAPE '\\'{}",
-            HIT_COLUMNS,
-            if with_paths { "f.path" } else { "f.name" },
-            query.filter_sql
-        );
         // Wildcard patterns turn each star into an unescaped `%`; the
         // substring wrap absorbs leading/trailing stars. User `%`/`_`
         // remain escaped literals either way.
-        let like = pattern
-            .segments()
-            .iter()
-            .map(|s| escape_like(s))
-            .collect::<Vec<_>>()
-            .join("%");
-        let params =
-            self.params_with_filters(vec![rusqlite::types::Value::Text(format!("%{}%", like))]);
+        let like = format!(
+            "%{}%",
+            pattern
+                .segments()
+                .iter()
+                .map(|s| escape_like(s))
+                .collect::<Vec<_>>()
+                .join("%")
+        );
+        // There is no `path` column to `LIKE` against any more, and the
+        // prefilter has to stay a *superset* of what the classifier accepts or
+        // real hits vanish. Three cases:
+        //
+        // * Name tier only — unchanged, `name LIKE`.
+        // * Path tiers, and the pattern is a single segment containing no
+        //   separator: `name LIKE ? OR parent LIKE ?` is then exactly
+        //   equivalent to the old `path LIKE ?`. A match inside `parent || name`
+        //   either sits wholly in one or straddles the boundary, and the
+        //   boundary character is a separator the pattern does not contain. This
+        //   is ordinary typing, so it is the case worth keeping cheap.
+        // * Anything else — a multi-segment wildcard whose `%` can span the
+        //   boundary (`doc*q3` over `/x/docs/q3.txt`), or a term with a
+        //   separator in it. No SQL predicate on one column covers those, so
+        //   scan and let the classifier decide, exactly as passes C and E do.
+        let straddles = pattern.segments().len() > 1
+            || pattern
+                .segments()
+                .iter()
+                .any(|s| s.contains(std::path::MAIN_SEPARATOR));
+        let (predicate, terms) = match (with_paths, straddles) {
+            (false, _) => (
+                "f.name LIKE ? ESCAPE '\\'".to_string(),
+                vec![rusqlite::types::Value::Text(like)],
+            ),
+            (true, false) => (
+                "(f.name LIKE ? ESCAPE '\\' OR f.parent LIKE ? ESCAPE '\\')".to_string(),
+                vec![
+                    rusqlite::types::Value::Text(like.clone()),
+                    rusqlite::types::Value::Text(like),
+                ],
+            ),
+            (true, true) => ("1=1".to_string(), Vec::new()),
+        };
+        let sql = format!(
+            "SELECT {} FROM files f WHERE {}{}",
+            HIT_COLUMNS, predicate, query.filter_sql
+        );
+        let params = self.params_with_filters(terms);
         self.scan_pass(
             &sql,
             params,

@@ -57,16 +57,25 @@ pub fn find_duplicate_groups(
         }
     }
 
+    // `ORDER BY parent, name` rather than by path: it is the stored key, so
+    // the sort is free, and it groups a directory's copies together — which is
+    // what the tab shows anyway.
     let mut member_stmt = conn
-        .prepare("SELECT id, name, path, size, mtime FROM files WHERE hash = ?1 ORDER BY path")
+        .prepare(
+            "SELECT id, name, parent, size, mtime FROM files \
+             WHERE hash = ?1 ORDER BY parent, name",
+        )
         .map_err(|e| e.to_string())?;
     for group in &mut groups {
         let rows = member_stmt
             .query_map(params![group.hash], |r| {
+                let name: String = r.get(1)?;
+                let parent: String = r.get(2)?;
+                let path = format!("{}{}", parent, name);
                 Ok((
                     r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
+                    name,
+                    path,
                     r.get::<_, i64>(3)?.max(0) as u64,
                     r.get::<_, i64>(4)?,
                 ))
@@ -91,13 +100,12 @@ mod tests {
         let p = crate::testutil::scratch_dir("dups").join("index.sqlite");
         let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         let tx = conn.transaction().unwrap();
-        let add = |name: &str, path: &str, size: u64, hash: Option<&[u8]>| {
+        let add = |name: &str, size: u64, hash: Option<&[u8]>| {
             insert_file(
                 &tx,
                 &NewFile {
                     name,
-                    path,
-                    parent: "/d",
+                    parent: "/d/",
                     size,
                     mtime: 1_700_000_000,
                     mime: None,
@@ -110,20 +118,20 @@ mod tests {
             .expect("unique path");
         };
         // Triple group of small files: redundant = 10 × 2 = 20.
-        add("a1.txt", "/d/a1.txt", 10, Some(b"AAA"));
-        add("a2.txt", "/d/a2.txt", 10, Some(b"AAA"));
-        add("a3.txt", "/d/a3.txt", 10, Some(b"AAA"));
+        add("a1.txt", 10, Some(b"AAA"));
+        add("a2.txt", 10, Some(b"AAA"));
+        add("a3.txt", 10, Some(b"AAA"));
         // Pair of large files: redundant = 100 × 1 = 100 — sorts first
         // despite the smaller member count.
-        add("b1.txt", "/d/b1.txt", 100, Some(b"BBB"));
-        add("b2.txt", "/d/b2.txt", 100, Some(b"BBB"));
+        add("b1.txt", 100, Some(b"BBB"));
+        add("b2.txt", 100, Some(b"BBB"));
         // Singletons and NULL hashes never appear.
-        add("c.txt", "/d/c.txt", 30, Some(b"CCC"));
-        add("n1.txt", "/d/n1.txt", 40, None);
-        add("n2.txt", "/d/n2.txt", 40, None);
+        add("c.txt", 30, Some(b"CCC"));
+        add("n1.txt", 40, None);
+        add("n2.txt", 40, None);
         // Zero-size files are trivially identical — excluded outright.
-        add("z1.txt", "/d/z1.txt", 0, Some(b"ZZZ"));
-        add("z2.txt", "/d/z2.txt", 0, Some(b"ZZZ"));
+        add("z1.txt", 0, Some(b"ZZZ"));
+        add("z2.txt", 0, Some(b"ZZZ"));
         tx.commit().unwrap();
         drop(conn);
         p

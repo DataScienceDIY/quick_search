@@ -121,6 +121,56 @@ pub fn touch(path: &std::path::Path, body: &[u8]) {
     std::fs::write(path, body).expect("write file");
 }
 
+/// A filename that is legal on disk but cannot round-trip through the index,
+/// spelled so that `to_string_lossy` yields exactly `{stem}\u{FFFD}{suffix}` —
+/// which is itself a perfectly ordinary filename, and so a name a *different*
+/// file can really have. That collision is what the screens in
+/// `crate::walk::read_directory` and `crate::watcher` exist to prevent, and
+/// pairing this with [`lossy_twin`] is how the tests reproduce it.
+///
+/// The two platforms fail in different ways and both are real:
+///
+/// * On Unix an `OsStr` is arbitrary bytes, so any invalid UTF-8 byte does it.
+///   `0xFF` can never appear in well-formed UTF-8.
+/// * On Windows a path is UTF-16 code units and NTFS does not check that they
+///   are well-*formed*, so an unpaired surrogate is storable. Rust models this
+///   with WTF-8, and `to_str()` returns `None` for precisely that case. Far
+///   from theoretical: WSL's DrvFs encodes non-UTF-8 Linux names this way by
+///   design, and Samba shares of Linux servers produce them from legacy
+///   encodings.
+///
+/// Some filesystems (FAT, exFAT, some network redirectors) refuse the name —
+/// tests that put one on disk must tolerate the creation failing rather than
+/// asserting on it.
+#[doc(hidden)]
+pub fn unrepresentable_name(stem: &str, suffix: &str) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let mut bytes = stem.as_bytes().to_vec();
+        bytes.push(0xFF);
+        bytes.extend_from_slice(suffix.as_bytes());
+        std::ffi::OsString::from_vec(bytes)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        let mut units: Vec<u16> = stem.encode_utf16().collect();
+        // A high surrogate with nothing after it to pair with.
+        units.push(0xD800);
+        units.extend(suffix.encode_utf16());
+        std::ffi::OsString::from_wide(&units)
+    }
+}
+
+/// The name [`unrepresentable_name`] collapses to under `to_string_lossy`, as
+/// a name that is genuinely representable — so a test can put both on disk and
+/// assert the real one survives what happens to the other.
+#[doc(hidden)]
+pub fn lossy_twin(stem: &str, suffix: &str) -> String {
+    format!("{}\u{FFFD}{}", stem, suffix)
+}
+
 /// Power-of-two bucket, so memory-map sizes group by what allocated them
 /// rather than by their exact size. Shared by the memory probes.
 #[doc(hidden)]
@@ -160,6 +210,32 @@ mod tests {
         let deep = dir.join("a/b/c.txt");
         touch(&deep, b"hi");
         assert_eq!(std::fs::read(&deep).unwrap(), b"hi");
+    }
+
+    /// The premise every collision test rests on, pinned per platform: the
+    /// name really is unrepresentable, and its lossy image really is a name
+    /// another file could have. If this ever stops holding, those tests would
+    /// silently start asserting nothing.
+    #[test]
+    fn the_unrepresentable_name_collapses_onto_its_twin() {
+        let bad = unrepresentable_name("x", ".txt");
+        assert!(
+            bad.to_str().is_none(),
+            "the name must not be representable: {:?}",
+            bad
+        );
+        assert_eq!(
+            bad.to_string_lossy(),
+            lossy_twin("x", ".txt"),
+            "the two names must collide under to_string_lossy"
+        );
+        assert!(
+            std::path::Path::new(&lossy_twin("x", ".txt"))
+                .as_os_str()
+                .to_str()
+                .is_some(),
+            "the twin must itself be a perfectly ordinary name"
+        );
     }
 
     /// The sweep runs against a shared temp directory, so what it matches is

@@ -110,11 +110,17 @@ fn upsert_path(
         // A moved-in tree surfaces as one directory event; walk it with
         // the same filters as a full run.
         //
-        // A non-UTF-8 path is a whole subtree missing from the index, so it
-        // is an error (the caller schedules a full run) rather than a quiet
-        // `Ok`.
+        // A path the index cannot spell, alongside the ignore and hidden
+        // short-circuits above: a genuine "nothing indexable here", not a
+        // failure.
+        //
+        // It reads as a whole subtree missing from the index, which it is —
+        // but reporting that as an error would set `needs_full_run`
+        // (`coordinator::inner::apply_pending`), and a full run screens the
+        // same subtree out for the same reason. The reindex could not fix it,
+        // so every write inside such a directory would buy another one.
         let Some(root) = path.to_str() else {
-            return Err(format!("directory path is not valid UTF-8: {:?}", path));
+            return Ok(Applied::Done);
         };
         // Streamed, not collected: `mv` of a large tree is one event, and
         // materialising its entries first is a `DirEntry` per file resident
@@ -124,10 +130,18 @@ fn upsert_path(
         //
         // `skip` rather than re-testing every entry: `upsert_file` on an
         // unchanged file is cheap but not free, and paying it again for
-        // everything already done would make a large tree quadratic in the
-        // number of turns it takes. The walk order is deterministic for an
-        // unchanged tree; if the tree does change under us the count is only
-        // an optimisation, and the next full run is what makes it exact.
+        // everything already done would cost a transaction and a hash per
+        // already-indexed file on every turn.
+        //
+        // Two honest limits on that. The walk itself is *not* skipped — the
+        // iterator still reads every directory it passes over (and on Windows
+        // stats every entry), so the traversal cost stays quadratic in the
+        // number of turns even though the writes do not. And the count is a
+        // position, not an identity: if the tree changes under us the entries
+        // shift, so `skip(n)` skips the wrong files and those get no row until
+        // the next full run. Both are acceptable for a moved-in tree, which is
+        // finite and static in the usual case; if either ever matters, resume
+        // by last-path rather than by count.
         let mut done = budget.resume_from;
         for entry in filtered_walk(
             root,
@@ -166,12 +180,12 @@ fn upsert_file(
 
     let existing: Option<(i64, i64)> = tx
         .query_row(
-            "SELECT id, mtime FROM files WHERE path = ?1",
-            rusqlite::params![rec.path],
+            "SELECT id, mtime FROM files WHERE parent = ?1 AND name = ?2",
+            rusqlite::params![rec.parent, rec.name],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
-        .map_err(|e| format!("lookup {}: {}", rec.path, e))?;
+        .map_err(|e| format!("lookup {}: {}", rec.path(), e))?;
 
     let file_id = match existing {
         Some((_, mtime)) if mtime.max(0) as u64 == rec.mtime => return Ok(()),
@@ -200,7 +214,7 @@ fn upsert_file(
         extract_and_store(
             &tx,
             file_id,
-            &rec.path,
+            &rec.path(),
             rec.mime.as_deref(),
             registry,
             config,
@@ -232,6 +246,14 @@ pub fn remove_paths(
             .transaction()
             .map_err(|e| format!("begin incremental tx: {}", e))?;
         for path in batch {
+            // A path the index cannot spell was never indexed, so there is
+            // nothing here to delete — and `db_key_for_missing_path` is lossy,
+            // so going ahead would key the row of whichever *different* file
+            // owns the lossy spelling and delete it, plus its whole subtree
+            // range below.
+            if path.to_str().is_none() {
+                continue;
+            }
             // The insert side stores a canonicalized path, so the raw event
             // spelling is not a usable key — but the file is already gone, so
             // `canonicalize` cannot be called on it directly either.
@@ -327,7 +349,7 @@ mod tests {
         fn row(&self, path: &str) -> Option<(i64, i64, i64)> {
             self.conn
                 .query_row(
-                    "SELECT id, mtime, content_state FROM files WHERE path = ?1",
+                    "SELECT id, mtime, content_state FROM files WHERE parent || name = ?1",
                     rusqlite::params![path],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
@@ -371,6 +393,48 @@ mod tests {
 
     /// The collapse must not change what ends up deleted — only how much work
     /// it takes to get there.
+    /// A resume point must not outlive the event it describes.
+    ///
+    /// The coordinator prunes `resume_from` alongside the queues; this is the
+    /// half of that contract the module itself can state — resuming from a
+    /// count that belonged to some earlier walk skips real files, and they get
+    /// no row until the next full run.
+    #[test]
+    fn resuming_past_the_end_indexes_nothing_rather_than_the_wrong_files() {
+        let mut f = Fixture::new();
+        for i in 0..3 {
+            f.write(&format!("sub/f{i}.txt"), "body");
+        }
+        let sub = f.dir.join("sub");
+
+        // A count larger than the tree: every entry is skipped, and the result
+        // is an empty index rather than an arbitrary subset.
+        let outcome =
+            f.apply_resuming(&FsEvent::Create(sub.clone()), Duration::from_secs(3600), 99);
+        assert_eq!(outcome, Applied::Done);
+        assert_eq!(f.counts().0, 0);
+
+        // From zero — what a pruned resume point gives the next turn — the
+        // whole tree lands.
+        f.apply(&FsEvent::Create(sub));
+        assert_eq!(f.counts().0, 3);
+    }
+
+    /// `batch_size = 0` must not panic the writer.
+    ///
+    /// `chunks(0)` panics, and this one runs on the indexing thread above the
+    /// arm that would publish `IndexingStatus::Error` — so before the clamp a
+    /// hand-edited zero wedged indexing for the session while the UI went on
+    /// reading "Running". Every sibling call site already had `.max(1)`.
+    #[test]
+    fn a_zero_batch_size_does_not_panic_the_writer() {
+        let mut f = Fixture::new();
+        f.config.processing.batch_size = 0;
+        f.write("a.txt", "body");
+        f.apply(&FsEvent::Create(f.dir.join("a.txt")));
+        assert_eq!(f.counts().0, 1, "the file should still be indexed");
+    }
+
     /// A directory event is applied in slices, and a slice resumes where the
     /// last one stopped instead of re-walking what it already did.
     ///
@@ -633,6 +697,76 @@ mod tests {
         assert_eq!(f.counts().0, 1, "`_` must not match `x`");
         let survivor = f.canonical(&f.dir.join("axb").join("other.txt"));
         assert!(f.row(&survivor).is_some());
+    }
+
+    /// A `Remove` for a path the index cannot spell must delete nothing.
+    ///
+    /// `db_key_for_missing_path` ends in `path_to_db_string`, which is lossy,
+    /// and the key it returns is used twice: to delete a row by path, and as
+    /// the low end of a range that deletes everything beneath it. For an
+    /// unrepresentable path that key names a *different*, real file — so the
+    /// event would take that file's row and its whole subtree, for a file that
+    /// was never indexed in the first place.
+    #[test]
+    fn removing_an_unrepresentable_path_spares_its_lossy_twin() {
+        let mut f = Fixture::new();
+        let twin = crate::testutil::lossy_twin("report", ".txt");
+        let kept = f.write(&twin, "the file that must survive");
+        f.apply(&FsEvent::Create(kept.clone()));
+        let canonical = f.canonical(&kept);
+        assert!(f.row(&canonical).is_some(), "seeded");
+
+        // Never written to disk: the event alone is enough, and a Remove is
+        // for a path that is already gone in any case.
+        let bad = f
+            .dir
+            .join(crate::testutil::unrepresentable_name("report", ".txt"));
+        f.apply(&FsEvent::Remove(bad));
+
+        assert!(
+            f.row(&canonical).is_some(),
+            "the real file's row was deleted by an event for a different file"
+        );
+        assert_eq!(f.counts().0, 1);
+    }
+
+    /// A directory event for a path the index cannot spell is a quiet `Ok`,
+    /// not an error.
+    ///
+    /// `coordinator::inner::apply_pending` turns any `Err` here into
+    /// `needs_full_run`. A full run screens the same subtree out for the same
+    /// reason, so the reindex could not fix anything — it would just run
+    /// again on the next write into that directory, forever. Live on Windows,
+    /// where a `\\wsl.localhost\` or Samba tree can hold such a directory and
+    /// the root watch is recursive.
+    #[test]
+    fn a_directory_event_for_an_unrepresentable_path_is_not_an_error() {
+        let mut f = Fixture::new();
+        let bad = f.dir.join(crate::testutil::unrepresentable_name("dir", ""));
+        if std::fs::create_dir_all(&bad).is_err() {
+            eprintln!("skipped: this filesystem will not store an unrepresentable name");
+            return;
+        }
+        std::fs::write(bad.join("inside.txt"), "body").unwrap();
+
+        let outcome = apply_fs_event(
+            &mut f.conn,
+            &FsEvent::Create(bad),
+            &f.config,
+            &f.ignore,
+            &f.registry,
+            &Budget {
+                deadline: Instant::now() + Duration::from_secs(3600),
+                cancel: &AtomicBool::new(false),
+                resume_from: 0,
+            },
+        );
+        assert_eq!(
+            outcome,
+            Ok(Applied::Done),
+            "an unindexable subtree is not a failure"
+        );
+        assert_eq!(f.counts().0, 0, "and nothing under it is indexed");
     }
 
     #[test]

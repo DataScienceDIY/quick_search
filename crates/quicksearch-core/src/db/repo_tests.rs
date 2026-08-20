@@ -47,8 +47,7 @@ fn insert_update_delete_round_trip() {
             &tx,
             &NewFile {
                 name: "a.txt",
-                path: "/tmp/a.txt",
-                parent: "/tmp",
+                parent: "/tmp/",
                 size: 42,
                 mtime: 1_700_000_000,
                 mime: Some("text/plain"),
@@ -101,8 +100,7 @@ fn insert_writes_content_state_from_needs_content() {
     let tx = conn.transaction().unwrap();
     let mut row = NewFile {
         name: "claimed.txt",
-        path: "/tmp/claimed.txt",
-        parent: "/tmp",
+        parent: "/tmp/",
         size: 1,
         mtime: 1,
         mime: Some("text/plain"),
@@ -112,7 +110,6 @@ fn insert_writes_content_state_from_needs_content() {
     };
     let claimed = insert_file(&tx, &row).unwrap().expect("unique path");
     row.name = "unclaimed.mp4";
-    row.path = "/tmp/unclaimed.mp4";
     row.mime = Some("video/mp4");
     row.needs_content = false;
     let unclaimed = insert_file(&tx, &row).unwrap().expect("unique path");
@@ -139,8 +136,7 @@ fn update_writes_content_state_from_needs_content() {
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let mut row = NewFile {
         name: "a.txt",
-        path: "/tmp/a.txt",
-        parent: "/tmp",
+        parent: "/tmp/",
         size: 10,
         mtime: 1,
         mime: None,
@@ -216,8 +212,7 @@ fn insert_file_twice_on_same_path_is_idempotent() {
     let tx = conn.transaction().unwrap();
     let row = NewFile {
         name: "dup.txt",
-        path: "/tmp/dup.txt",
-        parent: "/tmp",
+        parent: "/tmp/",
         size: 1,
         mtime: 1,
         mime: Some("text/plain"),
@@ -234,8 +229,8 @@ fn insert_file_twice_on_same_path_is_idempotent() {
     assert_eq!(count, 1);
     let (id_read,): (i64,) = tx
         .query_row(
-            "SELECT id FROM files WHERE path = ?1",
-            params!["/tmp/dup.txt"],
+            "SELECT id FROM files WHERE parent = ?1 AND name = ?2",
+            params!["/tmp/", "dup.txt"],
             |r| Ok((r.get(0)?,)),
         )
         .unwrap();
@@ -250,13 +245,11 @@ fn delete_subtree_clears_every_dependent_table() {
     let p = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let add = |tx: &Transaction<'_>, path: &str| -> i64 {
-        let name = path.rsplit('/').next().unwrap();
-        let parent = &path[..path.rfind('/').unwrap()];
+        let (parent, name) = crate::file_handling::split_db_path(path).expect("a file's path");
         let id = insert_file(
             tx,
             &NewFile {
                 name,
-                path,
                 parent,
                 size: 1,
                 mtime: 1,
@@ -306,7 +299,7 @@ fn delete_subtree_clears_every_dependent_table() {
 
     let survivors: Vec<String> = {
         let mut stmt = conn
-            .prepare("SELECT path FROM files ORDER BY path")
+            .prepare("SELECT parent || name FROM files ORDER BY parent, name")
             .unwrap();
         let v = stmt
             .query_map([], |r| r.get::<_, String>(0))
@@ -327,13 +320,12 @@ fn seeded(conn: &mut Connection, paths: &[&str]) -> std::collections::HashMap<St
     let tx = conn.transaction().unwrap();
     let mut ids = std::collections::HashMap::new();
     for path in paths {
-        let name = path.rsplit('/').next().unwrap();
-        let parent = &path[..path.rfind('/').unwrap()];
+        // The indexer's own split, so the separator stays with the parent.
+        let (parent, name) = crate::file_handling::split_db_path(path).expect("a file's path");
         let id = insert_file(
             &tx,
             &NewFile {
                 name,
-                path,
                 parent,
                 size: 1,
                 mtime: 1,
@@ -387,7 +379,7 @@ fn delete_outside_ranges_keeps_exactly_the_configured_roots() {
 
     let survivors: Vec<String> = {
         let mut stmt = conn
-            .prepare("SELECT path FROM files ORDER BY path")
+            .prepare("SELECT parent || name FROM files ORDER BY parent, name")
             .unwrap();
         let v = stmt
             .query_map([], |r| r.get::<_, String>(0))
@@ -607,40 +599,47 @@ fn rows_in_range_page_walks_the_range_once() {
 
     let range = crate::file_handling::ExtractCursor::for_root("/t");
     let mut seen = Vec::new();
-    let mut after = range.lo.clone();
+    // `(lo, "")`: no stored name is empty, so this sorts just below the
+    // range's first row.
+    let mut after = (range.lo.clone(), String::new());
     loop {
-        let page = rows_in_range_page(&conn, &after, &range.hi, 2).unwrap();
+        let page = rows_in_range_page(&conn, &after.0, &after.1, &range.hi, 2).unwrap();
         let Some(last) = page.last() else { break };
-        after = last.path.clone();
+        after = (last.parent.clone(), last.name.clone());
         seen.extend(page.into_iter().map(|r| r.path));
     }
     assert_eq!(
         seen,
         vec!["/t/a.txt", "/t/deep/b.txt", "/t/deep/deeper/c.txt"],
-        "in path order, once each, and the prefix siblings are outside"
+        "in (parent, name) order, once each, and the prefix siblings are outside"
     );
 
     drop(conn);
     std::fs::remove_file(&p).ok();
 }
 
-/// `idx_files_parent` carries `name` and `mtime` so `dir_rows` never touches
-/// the table heap; trimming it back to `(parent)` would silently reintroduce
-/// a row fetch per entry.
+/// `dir_rows` must *seek* on `idx_files_parent`, never scan the table.
+///
+/// It is deliberately not index-only any more: the index stopped carrying
+/// `mtime` when `UNIQUE(parent, name)` took over as the row key, so the plan
+/// is a seek plus a row fetch per entry. See the index's own comment in
+/// `schema.rs` for why that trade was taken — and note the thing this test
+/// guards is the seek, which is what keeps the cost per *directory* rather
+/// than per *tree*.
 #[test]
-fn dir_rows_is_served_entirely_from_the_index() {
+fn dir_rows_seeks_the_parent_index() {
     let p = tmp_path();
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let plan: String = conn
         .query_row(
             "EXPLAIN QUERY PLAN SELECT name, mtime FROM files WHERE parent = ?1",
-            params!["/some/dir"],
+            params!["/some/dir/"],
             |r| r.get(3),
         )
         .unwrap();
     assert!(
-        plan.contains("COVERING INDEX idx_files_parent"),
-        "dir_rows must be index-only, got: {}",
+        plan.contains("SEARCH") && plan.contains("idx_files_parent"),
+        "dir_rows must seek the parent index, got: {}",
         plan
     );
     drop(conn);
@@ -655,7 +654,7 @@ fn the_subtree_range_is_an_index_seek_not_a_scan() {
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let plan: String = conn
         .query_row(
-            "EXPLAIN QUERY PLAN DELETE FROM files WHERE path >= ?1 AND path < ?2",
+            "EXPLAIN QUERY PLAN DELETE FROM files WHERE parent >= ?1 AND parent < ?2",
             params!["/tree/", "/tree0"],
             |r| r.get(3),
         )
@@ -665,6 +664,43 @@ fn the_subtree_range_is_an_index_seek_not_a_scan() {
         "range delete must seek, got: {}",
         plan
     );
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// The keyset page must be one index walk: the row-value comparison against
+/// `(parent, name)` is what lets SQLite seek straight to the cursor and read
+/// forward, with no temp b-tree to satisfy the `ORDER BY`.
+#[test]
+fn the_reconcile_page_seeks_and_does_not_sort() {
+    let p = tmp_path();
+    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    let mut stmt = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN
+             SELECT id, parent, name, size, mime, content_state FROM files
+              WHERE (parent, name) > (?1, ?2) AND parent < ?3
+              ORDER BY parent, name
+              LIMIT ?4",
+        )
+        .unwrap();
+    let plan: Vec<String> = stmt
+        .query_map(params!["/tree/", "", "/tree0", 2], |r| r.get(3))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let plan = plan.join(" | ");
+    assert!(
+        plan.contains("SEARCH") && plan.contains("idx_files_parent"),
+        "keyset page must seek the parent index, got: {}",
+        plan
+    );
+    assert!(
+        !plan.contains("TEMP B-TREE"),
+        "the index order must satisfy the ORDER BY outright, got: {}",
+        plan
+    );
+    drop(stmt);
     drop(conn);
     std::fs::remove_file(&p).ok();
 }
@@ -693,8 +729,7 @@ fn checkpoint_and_close_truncates_wal() {
             &tx,
             &NewFile {
                 name: "w.txt",
-                path: "/tmp/w.txt",
-                parent: "/tmp",
+                parent: "/tmp/",
                 size: 1,
                 mtime: 1,
                 mime: None,
@@ -725,14 +760,12 @@ fn checkpoint_and_close_truncates_wal() {
 fn seed_rows(conn: &mut Connection, range: std::ops::Range<usize>) {
     let tx = conn.transaction().unwrap();
     for i in range {
-        let path = format!("/tmp/bulk/{}.txt", i);
         let name = format!("{}.txt", i);
         let id = insert_file(
             &tx,
             &NewFile {
                 name: &name,
-                path: &path,
-                parent: "/tmp/bulk",
+                parent: "/tmp/bulk/",
                 size: 1,
                 mtime: 1,
                 mime: Some("text/plain"),
@@ -815,14 +848,12 @@ fn a_busy_reader_defeats_the_autocheckpoint_but_not_a_forced_one() {
     fn seed_bare(conn: &mut Connection, range: std::ops::Range<usize>) {
         let tx = conn.transaction().unwrap();
         for i in range {
-            let path = format!("/tmp/bare/{}.txt", i);
             let name = format!("{}.txt", i);
             insert_file(
                 &tx,
                 &NewFile {
                     name: &name,
-                    path: &path,
-                    parent: "/tmp/bare",
+                    parent: "/tmp/bare/",
                     size: i as u64,
                     mtime: 1,
                     mime: None,
@@ -979,8 +1010,7 @@ fn set_content_failed_writes_failed_table() {
             &tx,
             &NewFile {
                 name: "oops.bin",
-                path: "/tmp/oops.bin",
-                parent: "/tmp",
+                parent: "/tmp/",
                 size: 0,
                 mtime: 1,
                 mime: None,
@@ -1019,13 +1049,11 @@ fn set_content_failed_writes_failed_table() {
 
 /// Insert one row under `path`, born pending when `needs_content`.
 fn insert_at(tx: &Transaction<'_>, path: &str, needs_content: bool) -> i64 {
-    let name = path.rsplit('/').next().unwrap();
-    let parent = &path[..path.rfind('/').unwrap()];
+    let (parent, name) = crate::file_handling::split_db_path(path).expect("a file's path");
     insert_file(
         tx,
         &NewFile {
             name,
-            path,
             parent,
             size: 1,
             mtime: 1,
@@ -1172,6 +1200,43 @@ fn prune_root_stats_drops_every_figure_of_a_dropped_root() {
     assert_eq!(get_root_counts(&conn, "/dropped"), None);
     // The sweep reads every `schema_info` key; unrelated ones must survive it.
     assert_eq!(get_last_full_index(&conn), Some(1_700_000_000));
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// The vanished-directory sweep walks `for_each_parent_in_range`, and its
+/// range has to include the root's *own* directory or the files sitting
+/// directly in a root are never reconciled.
+///
+/// It does now only because every stored parent ends in a separator: the root's
+/// parent is spelled `/tree/`, which is the range's `lo` exactly. With the bare
+/// `/tree` an older schema stored, it sorted *below* `lo` and the sweep skipped
+/// it — harmless then only because a readable root is always in `seen_dirs`.
+#[test]
+fn the_parent_scan_reaches_the_roots_own_directory() {
+    let p = tmp_path();
+    let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    seeded(
+        &mut conn,
+        &[
+            "/tree/top.txt",           // directly in the root
+            "/tree/deep/b.txt",        // a subdirectory
+            "/tree/deep/deeper/c.txt", // deeper still
+            "/tree2/outside.txt",      // prefix sibling: outside
+            "/treeX/outside.txt",      // and the LIKE-metacharacter neighbour
+        ],
+    );
+
+    let range = crate::file_handling::ExtractCursor::for_root("/tree");
+    let mut seen = Vec::new();
+    for_each_parent_in_range(&conn, &range.lo, &range.hi, |parent| seen.push(parent)).unwrap();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec!["/tree/", "/tree/deep/", "/tree/deep/deeper/"],
+        "the root's own directory is in range, and the siblings are not"
+    );
 
     drop(conn);
     std::fs::remove_file(&p).ok();

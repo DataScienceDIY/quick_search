@@ -62,7 +62,8 @@ fn set_state_clearing_failure(
 #[derive(Debug, Clone)]
 pub struct NewFile<'a> {
     pub name: &'a str,
-    pub path: &'a str,
+    /// The containing directory, ending in the platform separator — see
+    /// [`crate::file_handling::split_db_path`], which produces the pair.
     pub parent: &'a str,
     pub size: u64,
     pub mtime: u64,
@@ -74,21 +75,29 @@ pub struct NewFile<'a> {
     pub needs_content: bool,
 }
 
+impl NewFile<'_> {
+    /// The file's path, for a log or error message. Not stored; see
+    /// [`super::schema::SCHEMA_CURRENT`].
+    fn path(&self) -> String {
+        format!("{}{}", self.parent, self.name)
+    }
+}
+
 /// Insert a new file row, returning its id. `content_state` comes from
 /// `needs_content`; there is no separate basic state, because the row
-/// existing *is* the basic-index state. `INSERT OR IGNORE`: a UNIQUE(path)
-/// collision returns `None` rather than aborting the batch.
+/// existing *is* the basic-index state. `INSERT OR IGNORE`: a
+/// `UNIQUE(parent, name)` collision returns `None` rather than aborting the
+/// batch.
 pub fn insert_file(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option<i64>, String> {
     let rows = tx
         .prepare_cached(
             "INSERT OR IGNORE INTO files (
-                name, path, parent, size, mtime, mime, type, content_state, hash
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                name, parent, size, mtime, mime, type, content_state, hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .and_then(|mut stmt| {
             stmt.execute(params![
                 f.name,
-                f.path,
                 f.parent,
                 f.size as i64,
                 f.mtime as i64,
@@ -98,7 +107,7 @@ pub fn insert_file(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option<i64>,
                 f.hash,
             ])
         })
-        .map_err(|e| format!("insert file {}: {}", f.path, e))?;
+        .map_err(|e| format!("insert file {}: {}", f.path(), e))?;
     if rows == 0 {
         return Ok(None);
     }
@@ -120,14 +129,14 @@ fn initial_content_state(f: &NewFile<'_>) -> i64 {
 /// reset its content state from `f.needs_content`, clearing any extracted
 /// content so the text-indexing pass re-processes it. Writes `size`, `mtime`,
 /// `hash`, `mime`, `type` and `content_state` — and only those; `name` and
-/// `parent` are not refreshed here.
+/// `parent` are the key it matches on, so they cannot change here.
 pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option<i64>, String> {
     let id: Option<i64> = tx
         .prepare_cached(
             "UPDATE files
                 SET size = ?1, mtime = ?2, hash = ?3, mime = ?4, type = ?5,
                     content_state = ?6
-              WHERE path = ?7
+              WHERE parent = ?7 AND name = ?8
           RETURNING id",
         )
         .and_then(|mut stmt| {
@@ -139,13 +148,14 @@ pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option
                     f.mime,
                     f.ftype.bits() as i64,
                     initial_content_state(f),
-                    f.path,
+                    f.parent,
+                    f.name,
                 ],
                 |r| r.get(0),
             )
             .optional()
         })
-        .map_err(|e| format!("update file {}: {}", f.path, e))?;
+        .map_err(|e| format!("update file {}: {}", f.path(), e))?;
     let Some(id) = id else {
         return Ok(None);
     };
@@ -365,29 +375,38 @@ pub fn set_content_na(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> 
 }
 
 /// Delete a file row by path, keeping FTS in sync. Returns whether a row was
-/// removed.
+/// removed — including `false` for a string that cannot be a file's path at
+/// all, which is not in the index by construction.
 pub fn delete_file_by_path(tx: &Transaction<'_>, path: &str) -> Result<bool, String> {
+    let Some((parent, name)) = crate::file_handling::split_db_path(path) else {
+        return Ok(false);
+    };
     let id: Option<i64> = tx
-        .prepare_cached("DELETE FROM files WHERE path = ?1 RETURNING id")
-        .and_then(|mut stmt| stmt.query_row(params![path], |r| r.get(0)).optional())
+        .prepare_cached("DELETE FROM files WHERE parent = ?1 AND name = ?2 RETURNING id")
+        .and_then(|mut stmt| {
+            stmt.query_row(params![parent, name], |r| r.get(0))
+                .optional()
+        })
         .map_err(|e| format!("delete file {}: {}", path, e))?;
     let Some(id) = id else { return Ok(false) };
     remove_content_for_id(tx, id)?;
     Ok(true)
 }
 
-/// Delete every row whose path falls in the half-open range `[lo, hi)`,
+/// Delete every row whose parent falls in the half-open range `[lo, hi)`,
 /// keeping the dependent tables in step. Returns how many `files` rows went.
 ///
-/// Five statements regardless of how many files the range holds, and the
-/// range is an index seek on `UNIQUE(files.path)`. Build the bounds with
-/// [`crate::file_handling::ExtractCursor::for_root`], which is what makes
-/// them separator-correct.
+/// Four statements regardless of how many files the range holds, and the
+/// range is an index seek on `UNIQUE(files.parent, files.name)`. Build the
+/// bounds with [`crate::file_handling::ExtractCursor::for_root`], which is
+/// what makes them separator-correct — and note the range covers the root's
+/// *own* files only because every stored parent ends in a separator (see
+/// `dir_to_db_parent`).
 pub fn delete_subtree(tx: &Transaction<'_>, lo: &str, hi: &str) -> Result<usize, String> {
     for (table, key) in DEPENDENT_TABLES {
         let sql = format!(
             "DELETE FROM {} WHERE {} IN \
-             (SELECT id FROM files WHERE path >= ?1 AND path < ?2)",
+             (SELECT id FROM files WHERE parent >= ?1 AND parent < ?2)",
             table, key
         );
         exec(tx, &sql, params![lo, hi], || {
@@ -396,13 +415,13 @@ pub fn delete_subtree(tx: &Transaction<'_>, lo: &str, hi: &str) -> Result<usize,
     }
     exec(
         tx,
-        "DELETE FROM files WHERE path >= ?1 AND path < ?2",
+        "DELETE FROM files WHERE parent >= ?1 AND parent < ?2",
         params![lo, hi],
         || format!("delete files under {}", lo),
     )
 }
 
-/// Delete every row whose path falls in *none* of `ranges`. Returns how many
+/// Delete every row whose parent falls in *none* of `ranges`. Returns how many
 /// `files` rows went.
 ///
 /// A scan of `files` rather than a seek, reserved for the one transition that
@@ -423,7 +442,7 @@ pub fn delete_outside_ranges(
             predicate.push_str(" AND ");
         }
         predicate.push_str(&format!(
-            "NOT (path >= ?{} AND path < ?{})",
+            "NOT (parent >= ?{} AND parent < ?{})",
             i * 2 + 1,
             i * 2 + 2
         ));
@@ -485,8 +504,12 @@ pub fn delete_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<usize, String> {
     Ok(removed)
 }
 
-/// Every indexed file directly inside `parent`, as `name -> mtime`. Served by
-/// `idx_files_parent`: one index range lookup.
+/// Every indexed file directly inside `parent`, as `name -> mtime`.
+///
+/// `parent` must be in stored spelling — trailing separator and all; build it
+/// with [`crate::file_handling::dir_to_db_parent`]. One `idx_files_parent`
+/// range lookup for the names, then a row fetch each for the mtimes; see the
+/// index's own comment for why that is the shape it is.
 pub fn dir_rows(
     conn: &Connection,
     parent: &str,
@@ -507,7 +530,9 @@ pub fn dir_rows(
     Ok(out)
 }
 
-/// A row the content pass has yet to extract: `(id, name, path, mime)`.
+/// A row the content pass has yet to extract: `(id, name, path, mime)`. The
+/// path is reassembled here rather than stored — see
+/// [`super::schema::SCHEMA_CURRENT`] — because the pass opens the file by it.
 pub type PendingContentRow = (i64, String, String, Option<String>);
 
 /// One page of rows still awaiting content extraction under `cursor`'s range,
@@ -526,11 +551,11 @@ pub fn pending_content_page(
         .prepare_cached(
             // `INDEXED BY` rather than a hint, because the planner gets this
             // one wrong exactly when it costs most. Left to itself it takes
-            // `UNIQUE(path)` for the range and then sorts the survivors into a
-            // temp b-tree to satisfy `ORDER BY id` — which means every page
-            // walks the whole root's range and fetches each row's heap entry
-            // to test `content_state`. At `FEED_PAGE` rows per page that is
-            // quadratic over a run. The partial index below is already
+            // `idx_files_parent` for the range and then sorts the survivors
+            // into a temp b-tree to satisfy `ORDER BY id` — which means every
+            // page walks the whole root's range and fetches each row's heap
+            // entry to test `content_state`. At `FEED_PAGE` rows per page that
+            // is quadratic over a run. The partial index below is already
             // id-ordered, so it answers `id > ?` and the ORDER BY together and
             // holds only pending rows. Measured on 500k rows with everything
             // pending — the first index of a tree, i.e. the case that matters:
@@ -539,9 +564,9 @@ pub fn pending_content_page(
             // The planner only prefers it once pending rows are a small
             // minority, and never before ANALYZE has run at all, which is why
             // this cannot be left to statistics.
-            "SELECT id, name, path, mime FROM files INDEXED BY idx_files_content_pending
+            "SELECT id, parent, name, mime FROM files INDEXED BY idx_files_content_pending
               WHERE content_state = 0 AND size <= ?1 AND id > ?2
-                AND path >= ?3 AND path < ?4
+                AND parent >= ?3 AND parent < ?4
               ORDER BY id
               LIMIT ?5",
         )
@@ -550,10 +575,13 @@ pub fn pending_content_page(
         .query_map(
             params![max_size, cursor.last_id, cursor.lo, cursor.hi, limit],
             |row| {
+                let parent: String = row.get(1)?;
+                let name: String = row.get(2)?;
+                let path = format!("{}{}", parent, name);
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    name,
+                    path,
                     row.get::<_, Option<String>>(3)?,
                 ))
             },
@@ -565,10 +593,16 @@ pub fn pending_content_page(
 
 /// A stored row as the scope reconciler sees it: enough to decide both
 /// whether the path is still in scope and whether its content still is.
+///
+/// `path` is `parent` and `name` joined, kept alongside them because the
+/// reconciler tests it as a [`std::path::Path`] while the cursor resumes from
+/// the key.
 #[derive(Debug, Clone)]
 pub struct ScopeRow {
     pub id: i64,
     pub path: String,
+    pub parent: String,
+    pub name: String,
     pub size: u64,
     pub mime: Option<String>,
     pub content_state: i64,
@@ -590,7 +624,7 @@ pub struct RootCounts {
     pub fts: i64,
 }
 
-/// Count the rows in the half-open path range `[lo, hi)` and, in the same
+/// Count the rows in the half-open parent range `[lo, hi)` and, in the same
 /// pass, how many of them have a full-text row.
 ///
 /// `content_state = STATE_DONE` *is* "has a `searchabletext` row":
@@ -600,13 +634,13 @@ pub struct RootCounts {
 /// contentless and keyed by `rowid`, so it has no path to range-scan on.
 ///
 /// One statement, but not a cheap one: `content_state` is not carried by the
-/// `UNIQUE(files.path)` index the range seeks on, so every row in the range is
+/// `idx_files_parent` index the range seeks on, so every row in the range is
 /// fetched. Call it where a run has just read those rows anyway, not on a
 /// cadence.
 pub fn count_root(conn: &Connection, lo: &str, hi: &str) -> Result<RootCounts, String> {
     conn.prepare_cached(
         "SELECT COUNT(*), COALESCE(SUM(content_state = ?3), 0) FROM files
-          WHERE path >= ?1 AND path < ?2",
+          WHERE parent >= ?1 AND parent < ?2",
     )
     .and_then(|mut stmt| {
         stmt.query_row(params![lo, hi, STATE_DONE], |r| {
@@ -619,37 +653,46 @@ pub fn count_root(conn: &Connection, lo: &str, hi: &str) -> Result<RootCounts, S
     .map_err(|e| format!("count root {}: {}", lo, e))
 }
 
-/// One page of rows whose path is `> after` and `< hi`, in path order.
+/// One page of rows sorting after `(after_parent, after_name)` and inside the
+/// parent range ending at `hi`, in `(parent, name)` order.
 ///
-/// Keyset on `path`: every page is an index walk with no sort step, and a row
-/// is served at most once even though the caller is deleting behind the
-/// reader. Seed `after` with the range's `lo` bound, which is
-/// `root + separator` and so can never equal a stored path.
+/// Keyset on the `idx_files_parent` key itself: every page is an index walk
+/// with no sort step, and a row is served at most once even though the caller
+/// is deleting behind the reader. Seed the cursor with `(lo, "")` — no name is
+/// empty, so that lands exactly on the first row of the range.
+///
+/// The row-value comparison is what keeps it one seek; spelled out as
+/// `parent > ? OR (parent = ? AND name > ?)` the planner is free to scan.
 pub fn rows_in_range_page(
     conn: &Connection,
-    after: &str,
+    after_parent: &str,
+    after_name: &str,
     hi: &str,
     limit: i64,
 ) -> Result<Vec<ScopeRow>, String> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT id, path, size, mime, content_state FROM files
-              WHERE path > ?1 AND path < ?2
-              ORDER BY path
-              LIMIT ?3",
+            "SELECT id, parent, name, size, mime, content_state FROM files
+              WHERE (parent, name) > (?1, ?2) AND parent < ?3
+              ORDER BY parent, name
+              LIMIT ?4",
         )
         .map_err(|e| format!("prepare range page: {}", e))?;
     let rows = stmt
-        .query_map(params![after, hi, limit], |row| {
+        .query_map(params![after_parent, after_name, hi, limit], |row| {
+            let parent: String = row.get(1)?;
+            let name: String = row.get(2)?;
             Ok(ScopeRow {
                 id: row.get(0)?,
-                path: row.get(1)?,
-                size: row.get::<_, i64>(2)?.max(0) as u64,
-                mime: row.get(3)?,
-                content_state: row.get(4)?,
+                path: format!("{}{}", parent, name),
+                name,
+                parent,
+                size: row.get::<_, i64>(3)?.max(0) as u64,
+                mime: row.get(4)?,
+                content_state: row.get(5)?,
             })
         })
-        .map_err(|e| format!("query range page after {}: {}", after, e))?;
+        .map_err(|e| format!("query range page after {}: {}", after_parent, e))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read range page row: {}", e))
 }
@@ -683,18 +726,26 @@ pub fn reset_content_pending(tx: &Transaction<'_>, file_id: i64) -> Result<(), S
 /// files whose parent isn't the directory being read (a resolved symlink
 /// target), where [`dir_rows`] would not have them.
 pub fn mtime_for_path(conn: &Connection, path: &str) -> Result<Option<u64>, String> {
+    let Some((parent, name)) = crate::file_handling::split_db_path(path) else {
+        return Ok(None);
+    };
     let mut stmt = conn
-        .prepare_cached("SELECT mtime FROM files WHERE path = ?1")
+        .prepare_cached("SELECT mtime FROM files WHERE parent = ?1 AND name = ?2")
         .map_err(|e| format!("prepare mtime lookup for {}: {}", path, e))?;
-    stmt.query_row(params![path], |r| r.get::<_, i64>(0))
+    stmt.query_row(params![parent, name], |r| r.get::<_, i64>(0))
         .optional()
         .map(|o| o.map(|m| m.max(0) as u64))
         .map_err(|e| format!("mtime lookup for {}: {}", path, e))
 }
 
-/// Distinct `parent` values within the half-open path range `[lo, hi)`,
-/// streamed to `f` so nothing proportional to the tree is materialized.
-/// `idx_files_parent` makes this an index-only scan.
+/// Distinct `parent` values within the half-open range `[lo, hi)`, streamed to
+/// `f` so nothing proportional to the tree is materialized. `idx_files_parent`
+/// makes this an index-only scan.
+///
+/// The root's own directory is included: its stored parent is `root + SEP`,
+/// which is exactly `lo`. It was not, back when the same bounds were applied
+/// to a `path` column and the root's parent was spelled without the trailing
+/// separator.
 pub fn for_each_parent_in_range<F: FnMut(String)>(
     conn: &Connection,
     lo: &str,
@@ -713,13 +764,17 @@ pub fn for_each_parent_in_range<F: FnMut(String)>(
     Ok(())
 }
 
-/// Paths of every file directly inside `parent`.
+/// Paths of every file directly inside `parent`, which must carry its trailing
+/// separator — so the join below is a concatenation.
 pub fn paths_in_dir(conn: &Connection, parent: &str) -> Result<Vec<String>, String> {
     let mut stmt = conn
-        .prepare_cached("SELECT path FROM files WHERE parent = ?1")
+        .prepare_cached("SELECT name FROM files WHERE parent = ?1")
         .map_err(|e| format!("prepare paths in {}: {}", parent, e))?;
     let rows = stmt
-        .query_map(params![parent], |r| r.get::<_, String>(0))
+        .query_map(params![parent], |r| {
+            r.get::<_, String>(0)
+                .map(|name| format!("{}{}", parent, name))
+        })
         .map_err(|e| format!("query paths in {}: {}", parent, e))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read path under {}: {}", parent, e))
@@ -795,6 +850,33 @@ pub fn checkpoint_and_close(conn: Connection) {
     drop(conn);
 }
 
+/// Read a `PRAGMA` that reports a number.
+///
+/// Not simply `r.get::<i64>(0)`, because SQLCipher does not always answer with
+/// one. On a **keyed** connection it intercepts `PRAGMA page_size`, answers
+/// with `cipher_page_size` instead, and returns that as TEXT — so asking for an
+/// integer fails with a type error. Unencrypted it is an INTEGER as usual,
+/// which is why this only ever broke protected installs, and only in
+/// [`maintain`]: every index with a password set skipped its VACUUM *and* its
+/// `PRAGMA optimize` from the moment the free-space check was added.
+///
+/// A value that is neither is an error rather than a guess — the callers here
+/// size a disk-space check with it.
+pub(super) fn pragma_number(conn: &Connection, pragma: &str) -> Result<i64, String> {
+    use rusqlite::types::ValueRef;
+    conn.query_row(&format!("PRAGMA {}", pragma), [], |r| {
+        Ok(match r.get_ref(0)? {
+            ValueRef::Integer(n) => Some(n),
+            ValueRef::Text(t) => std::str::from_utf8(t)
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
+            _ => None,
+        })
+    })
+    .map_err(|e| format!("read {}: {}", pragma, e))?
+    .ok_or_else(|| format!("read {}: not a number", pragma))
+}
+
 /// Land the log, reclaim the file's slack, and refresh the query planner's
 /// statistics. Returns whether it vacuumed.
 ///
@@ -822,14 +904,33 @@ pub fn maintain(conn: &Connection, db_dir: &str) -> Result<bool, String> {
         crate::log_warn!("{}", e);
     }
 
-    let page_count: i64 = conn
-        .query_row("PRAGMA page_count", [], |r| r.get(0))
-        .map_err(|e| format!("read page_count: {}", e))?;
-    let freelist: i64 = conn
-        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
-        .map_err(|e| format!("read freelist_count: {}", e))?;
+    let page_count = pragma_number(conn, "page_count")?;
+    let freelist = pragma_number(conn, "freelist_count")?;
 
-    let vacuumed = freelist * 100 >= page_count * VACUUM_MIN_SLACK_PERCENT;
+    let worth_it = freelist * 100 >= page_count * VACUUM_MIN_SLACK_PERCENT;
+    // The doc comment above puts VACUUM's peak transient need at roughly three
+    // times the index. Checking first turns "the volume filled up mid-rebuild"
+    // into a skipped compaction: a rollback is the *good* outcome there, and
+    // the bad one is that writes to the `-shm` mmap on a full filesystem come
+    // back as SIGBUS rather than as an error — see
+    // `indexing::pipeline::DISK_FLOOR`. Unknown free space is not a reason to
+    // skip.
+    let page_size = pragma_number(conn, "page_size")?;
+    let needed = (page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64) * 3;
+    let room = match crate::platform::available_space(std::path::Path::new(db_dir)) {
+        Some(free) if free < needed => {
+            crate::log_warn!(
+                "skipping VACUUM: it needs about {} MiB free in {} and there is {} MiB",
+                needed / (1024 * 1024),
+                db_dir,
+                free / (1024 * 1024)
+            );
+            false
+        }
+        _ => true,
+    };
+
+    let vacuumed = worth_it && room;
     if vacuumed {
         // `temp_store_directory` is a deprecated pragma that writes a global,
         // so it is set for the VACUUM and cleared straight after rather than

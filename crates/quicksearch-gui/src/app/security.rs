@@ -377,7 +377,7 @@ impl QuickSearchApp {
             }
         }
         db::set_process_key(new_key);
-        self.backend.coordinator.rebuild_index();
+        self.backend.rebuild_index();
         self.dups.state = DupState::NotLoaded;
     }
 }

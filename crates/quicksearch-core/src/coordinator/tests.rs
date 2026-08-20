@@ -512,7 +512,7 @@ impl Fixture {
     fn stored_mtime(&self, path: &std::path::Path) -> Option<i64> {
         let conn = db::open_existing(&self.db.to_string_lossy(), false).ok()?;
         conn.query_row(
-            "SELECT mtime FROM files WHERE path = ?1",
+            "SELECT mtime FROM files WHERE parent || name = ?1",
             [path.to_string_lossy().as_ref()],
             |r| r.get(0),
         )

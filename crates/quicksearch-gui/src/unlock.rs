@@ -211,19 +211,23 @@ impl UnlockScreen {
             match result {
                 Ok(key) => return self.unlocked(ctx, key),
                 Err(e) => {
-                    // A tagged mismatch has three distinct causes and
-                    // `key_mismatch_message` already told them apart. Only one
-                    // of them is a wrong password; the others are "the config
-                    // says protected but the index on disk is not" (a crash
-                    // between saving the config and rebuilding) and "this
-                    // index wants a password at all". Collapsing them all into
-                    // "Wrong password." tells a user with the right password
-                    // that it is wrong, and the only button on this screen
-                    // deletes their index and turns protection off. The detail
-                    // names the database path and nothing secret.
-                    self.error = Some(match e.strip_prefix(db::KEY_MISMATCH_PREFIX) {
-                        Some(_) if e.contains("wrong password") => "Wrong password.".to_string(),
-                        Some(detail) => detail.to_string(),
+                    // A tagged mismatch has three distinct causes and the
+                    // opener already told them apart. Only one is a wrong
+                    // password; the others are "the config says protected but
+                    // the index on disk is not" (a crash between saving the
+                    // config and rebuilding) and "this index wants a password
+                    // at all". Collapsing them all into "Wrong password."
+                    // tells a user with the right password that it is wrong,
+                    // and the only button on this screen deletes their index
+                    // and turns protection off.
+                    //
+                    // Matched on the cause rather than on the wording: the
+                    // message carries the database path, so a path that
+                    // happens to contain the phrase would otherwise decide
+                    // this. The detail names the path and nothing secret.
+                    self.error = Some(match db::key_mismatch_parts(&e) {
+                        Some((db::KeyMismatch::WrongPassword, _)) => "Wrong password.".to_string(),
+                        Some((_, detail)) => detail.to_string(),
                         None => e,
                     });
                     // The field was cleared on submit; put the caret back

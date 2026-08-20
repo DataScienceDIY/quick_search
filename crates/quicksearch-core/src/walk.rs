@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 use crate::config::{Config, IgnoreSet};
 use crate::extract::Registry;
 use crate::file_handling::{
-    classify_by_mtime, classify_for_indexing, path_to_db_string, prepare_file_record,
-    warn_if_unrepresentable, DirRows, FileIndexAction, OwnedNewFile, UnreadableDirs,
+    classify_by_mtime, classify_for_indexing, dir_to_db_parent, path_to_db_string,
+    prepare_file_record, DirRows, FileIndexAction, OwnedNewFile, UnreadableDirs,
 };
 
 mod pool;
@@ -53,7 +53,8 @@ const NETWORK_THREADS: usize = 16;
 /// One file the walk found, with everything the DB writer needs.
 #[derive(Debug)]
 pub struct WalkedFile {
-    /// Canonical path, and the `files.path` key.
+    /// Canonical path. The row it keys is `(parent, name)`; see
+    /// [`crate::file_handling::split_db_path`].
     pub path: String,
     pub action: FileIndexAction,
     /// `None` when there is nothing to write: unchanged, or the record could
@@ -164,6 +165,13 @@ struct Ctx {
     follow_symlinks: bool,
     include_hidden: bool,
     ignore: IgnoreSet,
+    /// The index's own files, which this walk must never so much as open.
+    /// See [`crate::file_handling::index_file_set`] for why opening one is
+    /// fatal rather than merely wasteful.
+    ///
+    /// Precomputed rather than derived per entry: it is one canonicalize, and
+    /// the alternative is a syscall against every file in the tree.
+    index_files: HashSet<PathBuf>,
     pruned: PruneCounts,
     config: Config,
     registry: Arc<Registry>,
@@ -175,9 +183,16 @@ struct Ctx {
 /// count is kept. Reset by [`reset_run_warnings`].
 static UNREADABLE_WARNINGS: crate::log::Throttle = crate::log::Throttle::new(20);
 
-/// Arm this module's per-run warning throttle.
+/// The same, for names that cannot round-trip through the index. Throttled
+/// because a share can hold thousands of them: one legacy-encoded directory on
+/// a Samba mount, or a `\\wsl.localhost\` tree, and every entry under it is a
+/// separate occurrence.
+static UNREPRESENTABLE_WARNINGS: crate::log::Throttle = crate::log::Throttle::new(20);
+
+/// Arm this module's per-run warning throttles.
 pub fn reset_run_warnings() {
     UNREADABLE_WARNINGS.reset();
+    UNREPRESENTABLE_WARNINGS.reset();
 }
 
 /// Read one directory, apply the hidden/ignore rules, and split the result:
@@ -204,7 +219,19 @@ fn read_directory(
             if UNREADABLE_WARNINGS.allow() {
                 crate::log_warn!("cannot read {}: {}", dir.display(), e);
             }
-            ctx.unreadable.record(dir.to_path_buf());
+            // "Gone" is not "could not look", and only the second one is a
+            // reason to distrust the walk. A directory deleted while the walk
+            // was in flight — a build tree, a browser cache — is a fact about
+            // the filesystem: its rows *should* fall to the stale sweep, and
+            // recording it here would both spare them and cost this root its
+            // stored walk count, which is what makes every later run pay for
+            // a second `find | wc` traversal of the whole tree.
+            //
+            // The same distinction the coordinator draws in `verb_for`:
+            // `NotFound` is unambiguous, every other errno is not.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                ctx.unreadable.record(dir.to_path_buf());
+            }
             return Vec::new();
         }
     };
@@ -231,13 +258,49 @@ fn read_directory(
         };
 
         let name = entry.file_name();
-        let name = name.to_string_lossy();
+        // **The screen for names the index cannot spell, and the only one.**
+        //
+        // `files.name` and `files.parent` are TEXT, so a name that is not valid
+        // UTF-8 has no representation there; `to_string_lossy` would give one,
+        // but it is many-to-one, and every use of a path in this walk is a
+        // database *key*. A lossy name collides with the real name of a
+        // different file — U+FFFD is an ordinary filename character — and the
+        // collision is not a cosmetic one: the lossy parent makes the
+        // prefetcher hand this directory another directory's rows, and the diff
+        // below then reports all of them stale. Screening here, before any
+        // string is built, is what keeps that from being possible at all.
+        //
+        // On Unix this is any invalid byte sequence; on Windows it is an
+        // unpaired UTF-16 surrogate, which NTFS stores happily and WSL's DrvFs
+        // emits by design for non-UTF-8 Linux names.
+        //
+        // A directory is pruned whole and at its root: the join below would
+        // carry the bad component into every path beneath it, so nothing under
+        // it could be indexed either way, and stopping here costs one warning
+        // instead of one per descendant.
+        //
+        // Leaving the entry out of `present` is safe, despite the rule above
+        // that every `continue` must be a genuine "not indexable". No stored
+        // row can carry a name that is not valid UTF-8, so this entry has no
+        // row to protect; and a row whose name happens to *equal* the lossy
+        // spelling belongs to some other, representable entry, which this same
+        // listing yields separately and which marks itself present.
+        let Some(name) = name.to_str() else {
+            if UNREPRESENTABLE_WARNINGS.allow() {
+                crate::log_warn!(
+                    "Skipping {:?} (name is not valid UTF-8, so it cannot be stored, hashed \
+                     or text-indexed)",
+                    entry.path()
+                );
+            }
+            continue;
+        };
         // The closure runs only on Windows, where `entry.metadata()` is free —
         // the attributes came back with the directory read, and it reports the
         // entry itself rather than a link target.
         if !ctx.include_hidden {
             if let Some(reason) =
-                crate::platform::entry_hidden_reason(&name, || entry.metadata().ok())
+                crate::platform::entry_hidden_reason(name, || entry.metadata().ok())
             {
                 match reason {
                     crate::platform::HiddenReason::DotPrefix => {
@@ -260,12 +323,26 @@ fn read_directory(
                 continue;
             }
         }
-        if ctx.ignore.matches_component(&name) {
+        if ctx.ignore.matches_component(name) {
             ctx.pruned.ignored.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         let path = entry.path();
         if ctx.ignore.matches_path_pattern(&path) {
+            ctx.pruned.ignored.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        // The index's own database and sidecars. Not a user preference and
+        // not overridable, because hashing one is not a slow row, it is a
+        // process-wide cancellation of SQLite's locks on a file we are in the
+        // middle of writing — see `file_handling::index_file_set`.
+        //
+        // `continue` rather than a `WalkedFile::skipped`, deliberately: this
+        // leaves the name out of `present`, so any row an earlier run wrote
+        // for the index — before this pruning existed, or from a spell when
+        // `database_path` pointed elsewhere — falls to the stale sweep and is
+        // deleted. `skipped` would keep it forever.
+        if ctx.index_files.contains(&path) {
             ctx.pruned.ignored.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -291,7 +368,33 @@ fn read_directory(
                 // which full-path ignore patterns would never match and
                 // `seen_dirs` could not dedup against an overlapping root.
                 if let Ok(target) = path.canonicalize() {
+                    // The link's own name passed the screen above; the target
+                    // is a different path and gets its own. Without this, a
+                    // link to an unrepresentable path would be resolved to its
+                    // *lossy* spelling — a path naming some other file
+                    // entirely, which would then be walked or indexed in its
+                    // place.
+                    if target.to_str().is_none() {
+                        if UNREPRESENTABLE_WARNINGS.allow() {
+                            crate::log_warn!(
+                                "Skipping {} (its target {:?} is not valid UTF-8, so it cannot \
+                                 be stored, hashed or text-indexed)",
+                                path.display(),
+                                target
+                            );
+                        }
+                        continue;
+                    }
                     let target = PathBuf::from(path_to_db_string(&target));
+                    // Again on the resolved target: the check above tested the
+                    // link's own name, and a symlink pointing at the index
+                    // would otherwise walk straight past it into an `open`.
+                    // Harmless for a directory target — the set holds only
+                    // files — which is why one check covers both arms.
+                    if ctx.index_files.contains(&target) {
+                        ctx.pruned.ignored.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     match fs::metadata(&target) {
                         Ok(m) if m.is_dir() => found.push(Found::Dir(target)),
                         // The target's row belongs to its own directory, so
@@ -302,7 +405,7 @@ fn read_directory(
                 }
             }
             Ok(_) => {
-                present.insert(name.into_owned());
+                present.insert(name.to_string());
                 // `None` on Unix and on any reparse point: see
                 // `entry_cached_metadata`.
                 let cached = crate::platform::entry_cached_metadata(|| entry.metadata().ok());
@@ -310,7 +413,7 @@ fn read_directory(
             }
             // Type unknown: mark it present so an existing row survives.
             Err(_) => {
-                present.insert(name.into_owned());
+                present.insert(name.to_string());
             }
         }
     }
@@ -318,7 +421,7 @@ fn read_directory(
     if !unreadable_entry {
         // Rebuild each stored path the way `prepare` does, by joining onto
         // the canonical directory, so separators and roots match the
-        // `files.path` spelling exactly.
+        // stored spelling exactly.
         stale.extend(
             rows.keys()
                 .filter(|name| !present.contains(name.as_str()))
@@ -365,15 +468,22 @@ pub fn path_digest(path: &str) -> u128 {
 /// see [`crate::platform::metadata_or_stat`].
 fn prepare(file: PendingFile, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
     let PendingFile { path, cached } = file;
+    // Every route here has already screened the path: a root is screened after
+    // canonicalizing (which can resolve onto a name the config string was
+    // not), `Job::Files` comes from a listing `read_directory` filtered, and
+    // `Job::Alias` from a target the symlink arm checked. That
+    // matters because `path_to_db_string` is lossy, and the string below is
+    // used as a database key *and* hashed into the run's duplicate-visit set —
+    // a lossy one would key another file's row and could consume its digest,
+    // silently dropping it from the index.
+    debug_assert!(
+        path.to_str().is_some(),
+        "an unrepresentable path reached prepare(): {:?}",
+        path
+    );
     let db_path = path_to_db_string(&path);
     let digest = path_digest(&db_path);
     let aliased = matches!(known, Known::Exact(_));
-
-    // A name that is not valid UTF-8 cannot be stored in `files.path`. Emitted
-    // as `Skip` because the caller reads a missing path as "deleted".
-    if warn_if_unrepresentable(&path) {
-        return WalkedFile::skipped(db_path, digest, aliased);
-    }
 
     let Ok(meta) = crate::platform::metadata_or_stat(&path, cached) else {
         // Seen but unreadable: a transient stat failure must not read as
@@ -391,11 +501,15 @@ fn prepare(file: PendingFile, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
 
     let action = match known {
         Known::InDir(rows) => {
+            // `to_str`, not `to_string_lossy`: this name is looked up in the
+            // directory's stored rows, and the lossy spelling of one file is a
+            // valid name for another. The screen in `read_directory` is what
+            // makes it always `Some`.
             let name = path
                 .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
+                .and_then(|n| n.to_str())
                 .unwrap_or_default();
-            classify_for_indexing(&name, mtime, rows)
+            classify_for_indexing(name, mtime, rows)
         }
         Known::Exact(stored) => classify_by_mtime(stored, mtime),
     };
@@ -494,7 +608,7 @@ fn prefetcher(shared: &Shared, db_path: &str) {
     while let Some(work) = shared.take_prefetch() {
         match work {
             PrefetchWork::Dir(dir) => {
-                match crate::db::repo::dir_rows(&conn, &path_to_db_string(&dir)) {
+                match crate::db::repo::dir_rows(&conn, &dir_to_db_parent(&dir)) {
                     Ok(rows) => shared.finish_prefetch(Job::Dir(dir, Arc::new(rows))),
                     Err(e) => {
                         crate::log_warn!("{}", e);
@@ -551,7 +665,7 @@ impl ParallelWalk {
         crate::lock_ok(&self.shared.queue)
             .seen_dirs
             .iter()
-            .map(|d| path_to_db_string(d))
+            .map(|d| dir_to_db_parent(d))
             .collect()
     }
 
@@ -712,6 +826,22 @@ pub fn walk_indexable_files(
         //
         // Roots themselves are never filtered — the user chose them.
         match fs::canonicalize(root) {
+            // A root string is UTF-8 by construction — it came from the config
+            // — but `canonicalize` resolves symlinks, so what it resolves *to*
+            // need not be: `~/docs` can be a link to a directory whose real
+            // name the index cannot spell. Stored lossily, the root would be
+            // walked under a parent string that names some other directory
+            // entirely. Treated exactly like a root that would not resolve at
+            // all, which is what it amounts to: yields nothing, and is recorded
+            // so stale cleanup does not read that as "everything was deleted".
+            Ok(dir) if dir.to_str().is_none() => {
+                crate::log_warn!(
+                    "cannot index root {}: it resolves to {:?}, whose name is not valid UTF-8",
+                    root,
+                    dir
+                );
+                unresolvable.push(PathBuf::from(root));
+            }
             Ok(dir) => {
                 let dir = PathBuf::from(path_to_db_string(&dir));
                 if queue.seen_dirs.insert(dir.clone()) {
@@ -738,6 +868,7 @@ pub fn walk_indexable_files(
         follow_symlinks,
         include_hidden,
         ignore,
+        index_files: crate::file_handling::index_file_set(Path::new(db_path)),
         pruned: PruneCounts::default(),
         config,
         registry,

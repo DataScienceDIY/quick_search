@@ -62,14 +62,22 @@ fn conn(db: &Path) -> rusqlite::Connection {
     rusqlite::Connection::open(db).unwrap()
 }
 
+/// Every indexed path, in **path** order.
+///
+/// Sorted here rather than in SQL: the index's own order is `(parent, name)`,
+/// which groups by directory and is not the same sequence — `/r/keep.txt`
+/// sorts *before* `/r/sub/k2.txt` there and after it by path. These assertions
+/// are about which rows survived, so they read best in the order a person
+/// would list them.
 fn paths(db: &Path) -> Vec<String> {
     let c = conn(db);
-    let mut stmt = c.prepare("SELECT path FROM files ORDER BY path").unwrap();
-    let out = stmt
+    let mut stmt = c.prepare("SELECT parent || name FROM files").unwrap();
+    let mut out: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(0))
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
+    out.sort();
     out
 }
 

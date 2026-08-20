@@ -223,7 +223,16 @@ inside that folder.
 
 ### GUI
 
-`quicksearch` with no query arguments opens the app:
+`quicksearch` with no query arguments opens the app. **One window at a
+time**: a second launch reports that QuickSearch is already running and
+exits, because two processes indexing one database corrupt it. Terminal
+search (`quicksearch <query>`) only reads and keeps working while the
+window is open. The guard is a kernel lock on `<database_path>.lock`, held
+by the running process — so a crash or a power cut releases it, and the
+leftover file never locks you out. The lock follows `database_path`: point
+Settings at a different index and it moves with you, and if that index
+belongs to another instance the change is refused rather than written, so a
+path you cannot open can never end up in the config file.
 
 - **Search**: results appear as you type; every keystroke cancels the
   previous search. One checkbox enables the two fuzzy passes, and once a
@@ -491,7 +500,14 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   `wal_checkpoint(TRUNCATE)` every `processing.maximum_wal_size` bytes of
   log, because SQLite's own autocheckpoint can only reset the log at an
   instant no reader holds it — and a run keeps a reader per root querying
-  throughout, so left alone the log grows for the whole run. `files` holds
+  throughout, so left alone the log grows for the whole run. That threshold
+  is lowered to fit the volume when free space is short, and a run stops
+  with an error rather than fill the disk: SQLite reaches the wal-index
+  through an mmap, and a page fault the filesystem cannot back arrives as
+  **SIGBUS**, which no `Result` can catch. The index's own files are, for
+  the same reason, never walked into — hashing one means opening it, and on
+  POSIX closing any descriptor on an inode cancels every advisory lock the
+  process holds on it, SQLite's documented corruption hazard. `files` holds
   metadata (name, path, size, mtime, hash, MIME/type bitmask, content
   state); `searchabletext` is a *contentless* FTS5 table over one column,
   the document body (postings only, configurable tokenizer, trigram by
@@ -572,7 +588,7 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   tokenizing can do; the scheduling shares it fairly and keeps the walk
   first, it does not raise it. Every run ends — whether
   it completed or was stopped — with an optimize pass on its own connection:
-  checkpoint, VACUUM if the file has at least 10% slack to reclaim, `PRAGMA
+  checkpoint, VACUUM if the file has at least 20% slack to reclaim, `PRAGMA
   optimize`, checkpoint again. Progress streams through a polled
   `IndexingStatus`, which reads `Optimizing` for the duration of that pass —
   and `Preparing` for everything a run does before its first file is walked:
@@ -674,13 +690,15 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   to that by construction, because a buffer allocated and freed inside one loop
   iteration never moves RSS. `DocDecoder` must therefore never fall back to a
   per-row allocating decode, and there is a trap waiting there:
-  `zstd::encode_all`, which the indexer writes with, is *stream*-based and so
-  records no content size in the frame header, meaning
-  `get_frame_content_size` returns `None` for every row this ever sees. The
-  "cannot happen" branch is the only branch. Sizing the buffer from the header
-  and handing the `None` case to `zstd::decode_all` looks obviously right and
-  costs ~2.4 MiB per document, because `decode_all` builds a streaming decoder
-  per call — 27 of the 30 GiB a fuzzy search moved. Growing this buffer and
+  the indexer writes through `DocEncoder`, i.e. `zstd::bulk::Compressor` and
+  so `ZSTD_compress2`, which is handed the whole document at once and records
+  its length in the frame header. `get_frame_content_size` therefore returns
+  `Some` for every row this writer produced, the reservation is normally
+  exact, and the growth loop below it is the fallback for a frame written by
+  a *stream* encoder rather than the only branch. What must not come back is
+  handing the `None` case to `zstd::decode_all`, which looks obviously right
+  and costs ~2.4 MiB per document because it builds a streaming decoder per
+  call — 27 of the 30 GiB a fuzzy search moved. Growing this buffer and
   keeping it is what makes decoding a row allocate nothing at all.
   Measured over the same 77k-file index, per query:
   `cascade` 582 → 14 MiB, `function` 6.0 GiB → 29 MiB, `--fuzzy cascade`

@@ -31,15 +31,18 @@ impl Seeder {
     }
 
     /// Insert a file; `text: Some(..)` also content-indexes it.
+    ///
+    /// `dir` is spelled without a trailing separator, as a caller naturally
+    /// would; the stored parent always carries one, because that is what makes
+    /// the path `parent || name` (see `file_handling::dir_to_db_parent`).
     fn add(&mut self, name: &str, dir: &str, mtime: u64, text: Option<&str>) -> i64 {
-        let path = format!("{}/{}", dir, name);
+        let parent = format!("{}/", dir);
         let tx = self.conn.transaction().unwrap();
         let id = insert_file(
             &tx,
             &NewFile {
                 name,
-                path: &path,
-                parent: dir,
+                parent: &parent,
                 size: 42,
                 mtime,
                 mime: Some("text/plain"),
@@ -556,6 +559,45 @@ fn limit_truncates_and_flags() {
     assert!(outcome.limited);
     // Best-ranked (here: name-ordered within rank 3) survive.
     assert_eq!(hits[0].name, "match-00.txt");
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// Stopping at the limit must not cost a result that belongs in it.
+///
+/// The scan breaks out as soon as the display limit is full, which is what
+/// keeps a common term from decompressing its whole candidate set. The break
+/// sits after classification for a reason: a *scanned* row is not a match —
+/// the filename pass's SQL is a superset feeding two rank tiers — so breaking
+/// on one would end the pass early over a row that was never going to be
+/// shown, and the hits below it would be lost.
+#[test]
+fn stopping_at_the_limit_keeps_the_best_ranked_hits() {
+    let p = tmp_db("limit-break");
+    let mut s = Seeder::new(&p, true);
+    // Exact-name matches rank above substring matches, and are seeded last so
+    // that a pass which stopped too early would miss them.
+    for i in 0..20 {
+        s.add(&format!("zz-match-{:02}.txt", i), "/d", 1, None);
+    }
+    s.add("match", "/d", 1, None);
+    let conn = s.done();
+
+    let options = SearchOptions {
+        limit: 2,
+        ..SearchOptions::default()
+    };
+    let (hits, outcome) = run_collect(&conn, "match", &options);
+    assert_eq!(hits.len(), 2);
+    assert!(
+        outcome.limited,
+        "21 matches under a limit of 2 is a cut set"
+    );
+    assert_eq!(
+        hits[0].name, "match",
+        "the exact match must survive the break"
+    );
 
     drop(conn);
     std::fs::remove_file(&p).ok();
@@ -1318,12 +1360,60 @@ fn the_connection_is_released_once_searching_stops() {
     std::fs::remove_file(&p).ok();
 }
 
+/// An explicit release must actually leave the file closed — including when a
+/// search was queued a moment before it.
+///
+/// The worker coalesces its request queue, so a release found behind a search
+/// is handled where it sits and the search then runs. Without a cancel it
+/// would run *after* the acknowledgement, reopening the index while the caller
+/// — `Backend::rebuild_index` — is on its way to delete it. `release_connection`
+/// therefore bumps the generation first, which is what this asserts: the
+/// request made before the release is stale afterwards, so the worker drops it
+/// instead of serving it.
+///
+/// The generation is checked rather than the descriptor because the race is
+/// won or lost in microseconds; an fd assertion here would pass with the bug
+/// in place most of the time and fail the rest, which is worse than no test.
+#[test]
+fn a_release_supersedes_a_search_queued_before_it() {
+    let p = tmp_db("relcancel");
+    let mut s = Seeder::new(&p, true);
+    s.add("held.txt", "/d", 1, Some("shared body"));
+    drop(s.done());
+
+    let (service, updates) = SearchService::new_with_idle_release(
+        p.clone(),
+        Arc::new(|| {}),
+        std::time::Duration::from_secs(60),
+    );
+
+    let queued = service.search("shared", SearchOptions::default());
+    service.release_connection();
+    let after = service.search("shared", SearchOptions::default());
+    assert!(
+        after > queued + 1,
+        "the release must advance the generation past {}, got {}",
+        queued,
+        after
+    );
+
+    // The service still works: cancelling is how the release is made safe, not
+    // a way of shutting the worker down.
+    assert_eq!(
+        search_names(&service, &updates, "shared").unwrap(),
+        vec!["held.txt"]
+    );
+    service.shutdown();
+
+    std::fs::remove_file(&p).ok();
+}
+
 /// The point of the whole change: a pass hands hits over *while* it scans, so
 /// the UI has something to show long before the scan ends.
 ///
 /// Proven by ordering rather than by batch count — `flush_pass` has always
 /// chunked its output, so counting sink calls proves nothing. Pass A scans in
-/// `files.path` order, so seeding a *worse* match at an early path and a
+/// stored `(parent, name)` order, so seeding a *worse* match early and a
 /// *better* one at a late path separates the two designs: emitting at the end
 /// sorts them and leads with rank 1, while streaming hands over the rank-3 hit
 /// before the scan has even reached the rank-1 one.
@@ -1567,4 +1657,88 @@ fn a_fuzzy_mark_is_not_truncated_to_a_leading_part_of_the_term() {
         "the mark is {:?}, a leading part of what matched",
         &snip.window[a..b]
     );
+}
+
+/// A path-tier match that straddles the directory/name boundary must still be
+/// found.
+///
+/// `files` stores `parent` and `name` and no concatenation of the two, so the
+/// filename pass cannot prefilter with a single `path LIKE`. For a one-piece
+/// term it uses `name LIKE ? OR parent LIKE ?`, which is exactly equivalent —
+/// a term with no separator in it cannot span the boundary. A multi-segment
+/// wildcard *can*: `doc*q3` matches `/x/docs/q3.txt` with `doc` in the parent
+/// and `q3` in the name, and neither half of that OR would fire. Those fall
+/// back to scanning and letting the classifier decide, and this is the fixture
+/// that fails if that fallback is ever "optimised" away.
+#[test]
+fn a_wildcard_spanning_the_directory_boundary_is_still_found() {
+    let p = tmp_db("pathstraddle");
+    let mut s = Seeder::new(&p, true);
+    let straddling = s.add("q3.txt", "/x/docs", 1, None);
+    // Same two pieces, both inside the name: found either way, so it proves
+    // the query ran rather than that the fallback was reached.
+    let in_name = s.add("doc-q3.txt", "/other", 2, None);
+    let _miss = s.add("q3.txt", "/x/plans", 3, None);
+    let conn = s.done();
+
+    let (hits, _) = run_collect(&conn, "doc*q3", &SearchOptions::default());
+    let mut ids: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
+    ids.sort();
+    let mut want = vec![straddling, in_name];
+    want.sort();
+    assert_eq!(ids, want, "the straddling path match must not be dropped");
+
+    // And it is a path-tier hit carrying the whole path as its snippet.
+    let hit = hits.iter().find(|h| h.file_id == straddling).unwrap();
+    assert_eq!(hit.stage, 9);
+    assert_eq!(hit.path, "/x/docs/q3.txt", "parent and name rejoined");
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// The one-piece prefilter's other half: a term that is a whole directory
+/// component matches through `parent LIKE`, with nothing in the name.
+#[test]
+fn a_term_matching_only_the_directory_is_found_through_the_parent() {
+    let p = tmp_db("pathparent");
+    let mut s = Seeder::new(&p, true);
+    let dir_hit = s.add("z.bin", "/srv/invoices", 1, None);
+    let _miss = s.add("z.bin", "/srv/other", 2, None);
+    let conn = s.done();
+
+    let (hits, _) = run_collect(&conn, "invoices", &SearchOptions::default());
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].file_id, dir_hit);
+    assert_eq!(hits[0].stage, 9);
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// `folder:` must reach the folder's own files, not just its subdirectories'.
+///
+/// The filter is a single `parent LIKE 'dir/%'`, which covers both only
+/// because every stored parent ends in a separator — the folder's own files
+/// have parent `dir/`, and `%` matches nothing. It used to need a second
+/// `parent = ?` term to catch them.
+#[test]
+fn the_folder_filter_covers_the_folder_itself_and_its_subtree() {
+    let p = tmp_db("folderself");
+    let mut s = Seeder::new(&p, true);
+    let own = s.add("top.txt", "/srv/data", 1, None);
+    let nested = s.add("deep.txt", "/srv/data/2024", 2, None);
+    let _sibling = s.add("other.txt", "/srv/data-archive", 3, None);
+    let _outside = s.add("far.txt", "/srv", 4, None);
+    let conn = s.done();
+
+    let (hits, _) = run_collect(&conn, "txt folder:/srv/data", &SearchOptions::default());
+    let mut ids: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
+    ids.sort();
+    let mut want = vec![own, nested];
+    want.sort();
+    assert_eq!(ids, want, "the folder's own files count as inside it");
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
 }

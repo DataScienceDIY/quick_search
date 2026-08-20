@@ -37,6 +37,7 @@ mod unlock;
 mod version;
 
 use quicksearch_core::config::Config;
+use quicksearch_core::platform::{IndexLock, LockError};
 
 /// The window icon, shown in the titlebar, taskbar and alt-tab switcher.
 ///
@@ -81,6 +82,45 @@ fn main() {
         Err(e) => (Config::default(), Some(e)),
     };
     let initial_query = seed_query();
+
+    // After the CLI early-exit above, deliberately: `quicksearch <query>` only
+    // reads, and must keep working from a terminal while the window is open.
+    // Two *windows* on one index are the problem — two indexers writing, and,
+    // once either has cancelled the other's SQLite locks, an attach that
+    // truncates the wal-index under a live mapping.
+    //
+    // Held for the life of the process in `platform`'s own slot, so the
+    // settings handler can move it when `database_path` changes; the kernel
+    // releases it on exit, however that exit happens.
+    match IndexLock::hold(&config.resolved_database_path()) {
+        Ok(()) => {}
+        Err(LockError::Held { pid }) => {
+            let who = match pid {
+                Some(pid) => format!(" (process {})", pid),
+                None => String::new(),
+            };
+            let msg = format!(
+                "QuickSearch is already running{}.\n\nOnly one window can use \
+                 the index at a time. Switch to the running window, or close \
+                 it and try again.",
+                who
+            );
+            eprintln!("{}", msg);
+            // The app is normally launched from a desktop icon or a hotkey,
+            // where nothing is watching stderr.
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Info)
+                .set_title("QuickSearch")
+                .set_description(&msg)
+                .show();
+            std::process::exit(1);
+        }
+        // Not "the lock is taken" — the filesystem could not answer. A
+        // convenience guard is never a good enough reason to refuse to open.
+        Err(LockError::Unsupported(why)) => {
+            eprintln!("warning: cannot lock the index ({}); starting anyway", why);
+        }
+    }
 
     // With protection on, try the keychain before the window opens; a
     // verified key means no prompt at all. `None` starts locked, and no

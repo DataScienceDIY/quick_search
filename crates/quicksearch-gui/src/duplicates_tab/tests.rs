@@ -23,7 +23,7 @@ fn group(paths: &[&str]) -> DuplicateGroup {
 
 fn loaded(paths: &[&str]) -> DuplicatesTab {
     DuplicatesTab {
-        state: DupState::Loaded(vec![group(paths)]),
+        state: DupState::Loaded(LoadedGroups::new(vec![group(paths)])),
     }
 }
 
@@ -177,7 +177,7 @@ fn a_member_row_offers_the_verification_too() {
 fn an_empty_result_says_so_rather_than_showing_an_empty_list() {
     let ctx = crate::test_ui::ctx();
     let mut tab = DuplicatesTab {
-        state: DupState::Loaded(Vec::new()),
+        state: DupState::Loaded(LoadedGroups::new(Vec::new())),
     };
     let painted = painted_text(&frame(&ctx, &mut tab, false, Vec::new()).0);
     assert!(

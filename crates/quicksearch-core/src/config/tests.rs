@@ -1043,3 +1043,55 @@ fn the_search_table_ships_without_size_or_modified() {
     assert_eq!(older.search.display_limit, 500);
     assert!(older.search.live_results, "live results default to on");
 }
+
+/// The guard the live watcher and duplicate verification consult before
+/// opening a path that came from a `files` row. See
+/// [`crate::file_handling::index_file_set`] for what opening one costs.
+#[test]
+fn the_index_and_every_sidecar_are_recognised() {
+    let mut c = Config::default();
+    c.paths.database_path = "/var/lib/qs/index.sqlite".to_string();
+
+    for name in [
+        "index.sqlite",
+        "index.sqlite-wal",
+        "index.sqlite-shm",
+        "index.sqlite-journal",
+        "index.sqlite.lock",
+    ] {
+        let p = PathBuf::from(format!("/var/lib/qs/{}", name));
+        assert!(c.is_index_file(&p), "{} should be recognised", name);
+    }
+
+    // A near miss on the name, and the right name in the wrong directory.
+    for p in [
+        "/var/lib/qs/index.sqlite-walrus",
+        "/var/lib/qs/notes-wal",
+        "/var/lib/qs/index.sqlite2",
+        "/var/lib/other/index.sqlite-wal",
+        "/var/lib/qs/sub/index.sqlite",
+    ] {
+        assert!(
+            !c.is_index_file(Path::new(p)),
+            "{} is not part of the index",
+            p
+        );
+    }
+}
+
+/// `database_path` is resolved the same way everywhere else resolves it, so a
+/// `~` or a relative spelling has to compare equal to the absolute file.
+#[test]
+fn a_tilde_database_path_still_matches_the_real_file() {
+    let Some(home) = crate::platform::home_dir() else {
+        return;
+    };
+    let mut c = Config::default();
+    c.paths.database_path = "~/.local/share/quicksearch/index.sqlite".to_string();
+
+    let absolute = PathBuf::from(home).join(".local/share/quicksearch/index.sqlite");
+    assert!(c.is_index_file(&absolute));
+    let wal = absolute.with_file_name("index.sqlite-wal");
+    assert!(c.is_index_file(&wal));
+    assert!(!c.is_index_file(&absolute.with_file_name("other.sqlite")));
+}

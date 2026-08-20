@@ -1,6 +1,7 @@
-//! Path ↔ `files.path` string normalization and the filtered walkdir
-//! wrappers the reconcile passes use.
+//! Path ↔ `files.parent`/`files.name` string normalization and the filtered
+//! walkdir wrappers the reconcile passes use.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -8,7 +9,8 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::config::IgnoreSet;
 
-/// Render a path as the string stored in `files.path`.
+/// Render a path in the spelling the index stores it in, which
+/// [`split_db_path`] then splits into the `(parent, name)` key.
 ///
 /// `Path::canonicalize` on Windows hands back extended-length paths; the
 /// index stores plain ones. A UNC share canonicalizes to
@@ -34,11 +36,55 @@ pub(crate) fn path_to_db_string(path: &Path) -> String {
     }
 }
 
+/// What SQLite and we hang off the index's own filename.
+///
+/// `-wal`, `-shm` and `-journal` are SQLite's, spelled exactly as
+/// `db::open` and the unlock screen already delete them; `.lock` is
+/// [`crate::platform::IndexLock`]'s.
+pub(crate) const INDEX_SIDECAR_SUFFIXES: [&str; 4] = ["-wal", "-shm", "-journal", ".lock"];
+
+/// Every file belonging to the index at `db_path`, spelled the way the walk
+/// spells the files it visits.
+///
+/// **Nothing may ever open one of these.** On POSIX, closing *any* descriptor
+/// on an inode cancels every advisory lock the whole process holds on it, so a
+/// walk worker that opens `index.sqlite-shm` to hash it destroys the DMS lock
+/// SQLite took on that file — after which the next connection to attach, from
+/// any process, truncates the wal-index to 3 bytes under our live mapping and
+/// the next commit dies with SIGBUS. The same close cancels the main
+/// database's own locks, which is SQLite's documented corruption hazard
+/// (howtocorrupt.html §2.2). See [`crate::walk`], which prunes these before an
+/// entry can become a candidate.
+///
+/// The *directory* is canonicalized rather than the files: `-wal`, `-shm` and
+/// the lock come and go across a run, and `canonicalize` fails on a path that
+/// is not there at the instant it is called. The directory outlives all of
+/// them, so resolving it once and joining the names gives a stable answer that
+/// does not depend on which sidecars happen to exist.
+pub(crate) fn index_file_set(db_path: &Path) -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    // An empty filename means `database_path` names a directory, not a file.
+    // Joining "" onto the parent would yield the directory itself and prune
+    // the entire tree below it.
+    let Some(name) = db_path.file_name().and_then(|s| s.to_str()) else {
+        return set;
+    };
+    let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = PathBuf::from(path_to_db_string(
+        &dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()),
+    ));
+    set.insert(dir.join(name));
+    for suffix in INDEX_SIDECAR_SUFFIXES {
+        set.insert(dir.join(format!("{}{}", name, suffix)));
+    }
+    set
+}
+
 /// Canonicalize a root string for storage/comparison. Multi-root strings
 /// (newline-joined) fail canonicalize and pass through verbatim, which still
 /// compares consistently.
 ///
-/// This is the spelling `files.path` rows are prefixed with, so it is also the
+/// This is the spelling stored parents are prefixed with, so it is also the
 /// form roots must be compared in: `~/docs` and `/home/me/docs` name one root
 /// and must not read as a change.
 pub(crate) fn normalize_root_string(indexing_path: &str) -> String {
@@ -49,11 +95,20 @@ pub(crate) fn normalize_root_string(indexing_path: &str) -> String {
 }
 
 /// Warn and report `true` for a path that cannot round-trip through
-/// `files.path`.
+/// the index.
 ///
 /// Everything downstream reopens the file by that TEXT column, and
-/// [`path_to_db_string`] is lossy: a non-UTF-8 name would be stored as a
-/// path naming a file that does not exist. Such a file is skipped whole.
+/// [`path_to_db_string`] is lossy: a non-UTF-8 name would be stored as a path
+/// naming a *different* file — U+FFFD is an ordinary filename character, so
+/// the lossy spelling is somebody's real name. Such a file is skipped whole.
+///
+/// This is the check for callers that arrive with a single path and no
+/// listing to prune: [`prepare_file_record_from_path`] on the incremental
+/// route. The full walk screens far earlier, on the directory entry itself
+/// (`crate::walk::read_directory`), because by the time a path exists a bad
+/// *directory* component has already been joined into every path beneath it.
+///
+/// [`prepare_file_record_from_path`]: super::prepare_file_record_from_path
 pub(crate) fn warn_if_unrepresentable(path: &Path) -> bool {
     if path.to_str().is_some() {
         return false;
@@ -73,13 +128,21 @@ fn starts_with_drive_letter(s: &str) -> bool {
     matches!((it.next(), it.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic())
 }
 
-/// The `files.path` key for a path that may no longer exist.
+/// The stored spelling of a path that may no longer exist.
 ///
 /// The insert side canonicalizes before storing, and plain `canonicalize`
 /// fails on a path already gone — so this canonicalizes the deepest ancestor
 /// that still resolves and re-joins the missing tail. On Linux a root reached
 /// through a symlinked parent (`/home` → `/mnt/home`) makes every removal a
 /// no-op without this.
+///
+/// **The caller must have screened `path` for representability.** This ends in
+/// [`path_to_db_string`], which is lossy, and the answer is used to *delete* —
+/// a row by path and then a whole subtree range beneath it. For a path that is
+/// not valid UTF-8 the key returned names some other, real file, and deleting
+/// by it takes that file's row and everything under it. There is nothing to
+/// delete for such a path in any case: it could never have been indexed. See
+/// [`crate::incremental::remove_paths`], which skips them.
 pub fn db_key_for_missing_path(path: &Path) -> String {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = path;
@@ -104,12 +167,42 @@ pub fn db_key_for_missing_path(path: &Path) -> String {
     }
 }
 
-/// Parent directory of a path as a UTF-8 string, empty if root.
-pub(super) fn parent_str(path: &str) -> String {
-    Path::new(path)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
+/// Render a directory as the string stored in `files.parent`.
+///
+/// **`files.parent` always ends in the platform separator**, and that is the
+/// invariant the whole schema rests on:
+///
+/// * A file's path is `parent` concatenated with `name` — no separator logic
+///   at the join, and so no special case for `/` or `C:\`, whose children
+///   would otherwise be spelled `//x` and `C:\\x`.
+/// * A root's subtree is the single range `[root + SEP, root + succ(SEP))`,
+///   because the root's *own* parent is `root + SEP` rather than `root`. With
+///   a bare `root` there is no such range: strings between `root` and
+///   `root + SEP` are siblings (`/a-b` sorts inside `["/a", "/a0")`), so it
+///   would take two predicates and a sibling would sneak in through either.
+///
+/// See [`crate::db::schema::SCHEMA_CURRENT`] for what that buys.
+pub(crate) fn dir_to_db_parent(dir: &Path) -> String {
+    let mut s = path_to_db_string(dir);
+    // The platform's own separator only. On Unix `\` is an ordinary filename
+    // character, so a directory genuinely named `weird\` must still get its
+    // `/` — testing both separators would leave that row unjoinable.
+    if !s.ends_with(std::path::MAIN_SEPARATOR) {
+        s.push(std::path::MAIN_SEPARATOR);
+    }
+    s
+}
+
+/// Split a stored path into the `(parent, name)` pair the index keys on.
+///
+/// The separator stays with the parent, so `parent` + `name` is the original
+/// string back — see [`dir_to_db_parent`]. `None` for anything that cannot be
+/// a file's path: a bare relative name with no separator at all, or a string
+/// that ends in one and so names a directory rather than a file.
+pub fn split_db_path(path: &str) -> Option<(&str, &str)> {
+    let cut = path.rfind(std::path::MAIN_SEPARATOR)?;
+    let (parent, name) = path.split_at(cut + 1);
+    (!name.is_empty()).then_some((parent, name))
 }
 
 /// Paths a walk could not read, collected as it runs.

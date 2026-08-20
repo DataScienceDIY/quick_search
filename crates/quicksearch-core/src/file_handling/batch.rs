@@ -104,7 +104,8 @@ pub fn process_batch_updates(
             let updated = repo::update_file_basic(&tx, &rec.as_new_file()).map_err(|e| {
                 format!(
                     "Failed to update file record + clear stale content for {}: {}",
-                    rec.path, e
+                    rec.path(),
+                    e
                 )
             })?;
 
@@ -115,7 +116,7 @@ pub fn process_batch_updates(
                 None => {
                     crate::log_warn!(
                         "no indexed row matched {} during update; inserting instead",
-                        rec.path
+                        rec.path()
                     );
                     repo::insert_file(&tx, &rec.as_new_file())
                         .map_err(|e| format!("Failed to insert file record: {}", e))?
@@ -124,7 +125,7 @@ pub fn process_batch_updates(
             };
 
             if let (Some(id), Some(text)) = (id, rec.inline_text.as_deref()) {
-                let zstd = body_or_skip!(bodies, i, rec.path);
+                let zstd = body_or_skip!(bodies, i, rec.path());
                 repo::set_content_done(&tx, id, text, zstd)?;
             }
         }
@@ -149,7 +150,11 @@ pub fn process_batch_inserts(
         return Ok(());
     }
 
-    for batch in files_to_insert.chunks(config.processing.batch_size) {
+    // `.max(1)`, as at every other use of this field: `chunks(0)` panics,
+    // and a panic here is on the indexing thread, before the arm that would
+    // publish `IndexingStatus::Error` — so a hand-edited `batch_size = 0`
+    // wedges indexing for the session while the UI still reads "Running".
+    for batch in files_to_insert.chunks(config.processing.batch_size.max(1)) {
         if stop_flag.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -170,7 +175,7 @@ pub fn process_batch_inserts(
             let id = repo::insert_file(&tx, &rec.as_new_file())
                 .map_err(|e| format!("Failed to insert file record: {}", e))?;
             if let (Some(id), Some(text)) = (id, rec.inline_text.as_deref()) {
-                let zstd = body_or_skip!(bodies, i, rec.path);
+                let zstd = body_or_skip!(bodies, i, rec.path());
                 repo::set_content_done(&tx, id, text, zstd)?;
             }
         }
@@ -236,13 +241,19 @@ pub fn cleanup_stale_index_entries(
 
 /// Keyset cursor bounding everything stored beneath one directory.
 ///
-/// `lo`/`hi` are the half-open path range `[dir + SEP, dir + (SEP + 1))`, so
-/// the pair is a pure index range on `UNIQUE(files.path)`.
+/// `lo`/`hi` are the half-open range `[dir + SEP, dir + (SEP + 1))` over
+/// `files.parent`, so the pair is a pure index range on `idx_files_parent`.
 ///
-/// The separator must be the platform's own: `files.path` stores native
-/// separators, and the successor of `/` (`0x2F`) is `'0'` while the successor
-/// of `\` (`0x5C`) is `']'` — the Unix pair on Windows yields
-/// `hi = "C:\Users\me0"`, which every stored path sorts *above*, silently
+/// It covers `dir`'s own files as well as its subdirectories' because every
+/// stored parent ends in a separator (see `dir_to_db_parent`): the files
+/// directly in `dir` have parent `dir + SEP`, which is `lo` exactly. Without
+/// that invariant `lo` would have to be the bare `dir`, and the range would
+/// swallow siblings — `/a-b` sorts inside `["/a", "/a0")`.
+///
+/// The separator must be the platform's own: parents store native separators,
+/// and the successor of `/` (`0x2F`) is `'0'` while the successor of `\`
+/// (`0x5C`) is `']'` — the Unix pair on Windows yields
+/// `hi = "C:\Users\me0"`, which every stored parent sorts *above*, silently
 /// disabling content extraction and the vanished-directory sweep.
 #[derive(Debug, Clone)]
 pub struct ExtractCursor {
@@ -299,7 +310,7 @@ pub fn mark_oversize_pending_na(
 ) -> Result<(), String> {
     conn.execute(
         "UPDATE files SET content_state = 3 \
-         WHERE content_state = 0 AND size > ?1 AND path >= ?2 AND path < ?3",
+         WHERE content_state = 0 AND size > ?1 AND parent >= ?2 AND parent < ?3",
         rusqlite::params![max_text_file_size(config), cursor.lo, cursor.hi],
     )
     .map_err(|e| format!("mark oversize files NA: {}", e))?;
@@ -322,7 +333,7 @@ pub fn count_extract_scope(
         .query_row(
             "SELECT COALESCE(SUM(content_state = 0 AND size <= ?1), 0), \
                     COALESCE(SUM(content_state = 1), 0) \
-             FROM files WHERE path >= ?2 AND path < ?3",
+             FROM files WHERE parent >= ?2 AND parent < ?3",
             rusqlite::params![max_text_file_size(config), cursor.lo, cursor.hi],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )

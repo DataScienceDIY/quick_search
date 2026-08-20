@@ -145,6 +145,31 @@ pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
     }
 }
 
+/// Replace control characters with `U+FFFD`, borrowing when there are none.
+///
+/// Filenames may contain any byte but NUL and the separator, and extracted
+/// text is whatever was in the file — so both can carry terminal escape
+/// sequences. Printed raw they rewrite the line, retitle the window, or on a
+/// terminal with OSC 52 enabled put text of the writer's choosing on the
+/// user's clipboard. `ls` has scrubbed for this reason for decades.
+///
+/// Tab survives: it is a legitimate part of a filename and harmless. So does
+/// everything above C1 — this is not a general sanitiser, and the point is to
+/// stay byte-for-byte faithful wherever there is nothing dangerous to remove.
+pub fn scrub_controls(s: &str) -> std::borrow::Cow<'_, str> {
+    fn dangerous(c: char) -> bool {
+        (c.is_control() && c != '\t') || ('\u{80}'..='\u{9f}').contains(&c)
+    }
+    if !s.chars().any(dangerous) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| if dangerous(c) { '\u{fffd}' } else { c })
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

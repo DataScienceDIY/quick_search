@@ -10,7 +10,6 @@ use std::time::UNIX_EPOCH;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use super::paths::parent_str;
 use super::*;
 use crate::config::Config;
 use crate::db::repo::{self, NewFile};
@@ -109,7 +108,9 @@ pub fn fts_finalize_after_text_indexing(conn: &Connection) {
 #[derive(Debug, Clone)]
 pub struct OwnedNewFile {
     pub name: String,
-    pub path: String,
+    /// The containing directory, ending in the platform separator. With
+    /// [`OwnedNewFile::name`] it is both the row's key and, concatenated, its
+    /// path — see [`super::paths::dir_to_db_parent`].
     pub parent: String,
     pub size: u64,
     pub mtime: u64,
@@ -130,10 +131,15 @@ pub struct OwnedNewFile {
 }
 
 impl OwnedNewFile {
+    /// The file's path, rebuilt. Callers that only want it for a message
+    /// should say so — nothing stores this.
+    pub fn path(&self) -> String {
+        format!("{}{}", self.parent, self.name)
+    }
+
     pub fn as_new_file(&self) -> NewFile<'_> {
         NewFile {
             name: &self.name,
-            path: &self.path,
             parent: &self.parent,
             size: self.size,
             mtime: self.mtime,
@@ -165,12 +171,15 @@ pub fn hash_failure_counts() -> (u64, u64) {
 /// already holds. The single implementation behind both full-run batches
 /// and incremental watcher updates.
 ///
-/// `path` must already be canonical and in `files.path` spelling (see
+/// `path` must already be canonical and in stored spelling (see
 /// [`path_to_db_string`]), and must still name the file once parsed back into
 /// a [`Path`] — this opens it by that string. A path that only survived
-/// `to_string_lossy` does not qualify; callers holding the original [`Path`]
-/// screen it with [`warn_if_unrepresentable`] first. Callers holding an
-/// unresolved path want [`prepare_file_record_from_path`] instead.
+/// `to_string_lossy` does not qualify: the lossy spelling of one name is the
+/// real name of another, so it would hash and index the wrong file. The walk
+/// screens for that on the directory entry, before the path is even built
+/// (`crate::walk::read_directory`); [`prepare_file_record_from_path`], which
+/// is what callers holding an unresolved path want, screens with
+/// [`warn_if_unrepresentable`].
 ///
 /// Returns `None` for anything that isn't a readable regular file, with a
 /// warning when hashing fails.
@@ -213,10 +222,11 @@ pub fn prepare_file_record(
         }
     };
 
-    let name = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())?;
-    let parent = parent_str(path);
+    // One split for both halves of the key, and the separator stays with the
+    // parent so the two concatenate back into `path`. `None` here means the
+    // caller handed us something that cannot be a file's path at all.
+    let (parent, name) = split_db_path(path)?;
+    let (parent, name) = (parent.to_string(), name.to_string());
     // Sniff from the bytes hashing already read; an empty head falls back to
     // the extension.
     let mime = guess_mime_from_head(Path::new(path), &head);
@@ -255,7 +265,6 @@ pub fn prepare_file_record(
 
     Some(OwnedNewFile {
         name,
-        path: path.to_string(),
         parent,
         size,
         mtime,

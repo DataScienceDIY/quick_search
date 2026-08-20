@@ -187,11 +187,34 @@ struct SearchRequest {
 /// its statement, tagged with the generation that owns it.
 type InFlight = Arc<Mutex<Option<(u64, rusqlite::InterruptHandle)>>>;
 
+/// One-shot channel the worker answers a release request on.
+type ReleaseAck = Arc<Mutex<Option<mpsc::Sender<()>>>>;
+
+/// How long [`SearchService::release_connection`] waits for the worker to
+/// answer. Long enough for it to finish a statement and drop the handle,
+/// short enough that a wedged worker cannot hold up a rebuild.
+const RELEASE_WAIT: Duration = Duration::from_secs(2);
+
+/// What the worker thread accepts. A search is the overwhelming majority;
+/// the release exists because dropping the held connection is something only
+/// the worker can do, and it is parked in a 30-second `recv_timeout` where a
+/// flag would not reach it.
+enum WorkerMsg {
+    Search(SearchRequest),
+    /// Drop the held connection now, so whoever asked can delete or replace
+    /// the index file. On Windows an open handle makes that fail outright;
+    /// everywhere else it keeps the deleted inode's blocks pinned.
+    ReleaseConnection,
+}
+
 pub struct SearchService {
-    req_tx: mpsc::Sender<SearchRequest>,
+    req_tx: mpsc::Sender<WorkerMsg>,
     latest_gen: Arc<AtomicU64>,
     in_flight: InFlight,
     db_path: Arc<Mutex<PathBuf>>,
+    /// Where the worker reports that it has let the connection go; see
+    /// [`SearchService::release_connection`].
+    release_ack: ReleaseAck,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -214,11 +237,12 @@ impl SearchService {
         notify: Arc<dyn Fn() + Send + Sync>,
         idle_release: Duration,
     ) -> (SearchService, mpsc::Receiver<SearchUpdate>) {
-        let (req_tx, req_rx) = mpsc::channel::<SearchRequest>();
+        let (req_tx, req_rx) = mpsc::channel::<WorkerMsg>();
         let (update_tx, update_rx) = mpsc::channel::<SearchUpdate>();
         let latest_gen = Arc::new(AtomicU64::new(0));
         let in_flight: InFlight = Arc::new(Mutex::new(None));
         let db_path = Arc::new(Mutex::new(db_path));
+        let release_ack: ReleaseAck = Arc::new(Mutex::new(None));
 
         let worker = Worker {
             req_rx,
@@ -227,6 +251,7 @@ impl SearchService {
             latest_gen: latest_gen.clone(),
             in_flight: in_flight.clone(),
             db_path: db_path.clone(),
+            release_ack: release_ack.clone(),
             open: None,
             idle_release,
         };
@@ -241,6 +266,7 @@ impl SearchService {
                 latest_gen,
                 in_flight,
                 db_path,
+                release_ack,
                 handle: Some(handle),
             },
             update_rx,
@@ -254,12 +280,40 @@ impl SearchService {
         // Interrupt before enqueueing: an idle worker can dequeue the new
         // request and be mid-statement within microseconds.
         self.interrupt_stale();
-        let _ = self.req_tx.send(SearchRequest {
+        let _ = self.req_tx.send(WorkerMsg::Search(SearchRequest {
             generation,
             input: input.to_string(),
             options,
-        });
+        }));
         generation
+    }
+
+    /// Drop the connection the worker is holding, and wait briefly for it.
+    ///
+    /// The worker keeps its connection for [`IDLE_RELEASE`] after the last
+    /// query so a typing session runs against a warm page cache. That is the
+    /// right default and the wrong thing to be holding when the index file is
+    /// about to be deleted: on Windows the delete fails outright, and a
+    /// "Rebuild index" that silently did not rebuild is worse than a slow one.
+    ///
+    /// Cancelled first, and not merely as a courtesy. The worker coalesces its
+    /// queue, so a search enqueued just before this — a keystroke, then a
+    /// click on *Rebuild index* — is still current when the release is found,
+    /// and the worker would acknowledge the release and then **reopen** the
+    /// connection to serve it. Bumping the generation makes that request stale,
+    /// so it is dropped at the generation check instead. Results against a file
+    /// about to be deleted are worth nothing anyway.
+    ///
+    /// Best-effort past that — it returns once the worker acknowledges or the
+    /// wait elapses, and the caller proceeds either way.
+    pub fn release_connection(&self) {
+        self.cancel();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        *crate::lock_ok(&self.release_ack) = Some(ack_tx);
+        if self.req_tx.send(WorkerMsg::ReleaseConnection).is_err() {
+            return;
+        }
+        let _ = ack_rx.recv_timeout(RELEASE_WAIT);
     }
 
     /// Cancel without starting anything new.
@@ -320,12 +374,13 @@ pub fn classify_sql_err(error_msg: &str) -> String {
 }
 
 struct Worker {
-    req_rx: mpsc::Receiver<SearchRequest>,
+    req_rx: mpsc::Receiver<WorkerMsg>,
     update_tx: mpsc::Sender<SearchUpdate>,
     notify: Arc<dyn Fn() + Send + Sync>,
     latest_gen: Arc<AtomicU64>,
     in_flight: InFlight,
     db_path: Arc<Mutex<PathBuf>>,
+    release_ack: ReleaseAck,
     /// The connection, and the index generation and path it was opened
     /// against. See [`Worker::take_connection`].
     open: Option<OpenIndex>,
@@ -345,7 +400,11 @@ impl Worker {
     fn run(mut self) {
         loop {
             let first = match self.req_rx.recv_timeout(self.idle_release) {
-                Ok(req) => req,
+                Ok(WorkerMsg::ReleaseConnection) => {
+                    self.release();
+                    continue;
+                }
+                Ok(WorkerMsg::Search(req)) => req,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // Dropping the connection frees `PRAGMAS_SEARCH`'s 32 MiB
                     // page cache to glibc, which parks it in an arena rather
@@ -366,15 +425,37 @@ impl Worker {
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             };
             // A fast typist queues several requests; only the newest one
-            // matters.
+            // matters. A release queued behind them is *not* superseded — it
+            // is the one message that must not be coalesced away, so it is
+            // handled where it is found. Whether the search below still runs
+            // is then the generation check's business:
+            // `release_connection` cancels before it sends, so anything
+            // enqueued ahead of the release is stale and drops out rather than
+            // reopening the connection that was just let go of.
             let mut req = first;
             while let Ok(newer) = self.req_rx.try_recv() {
-                req = newer;
+                match newer {
+                    WorkerMsg::Search(newer) => req = newer,
+                    WorkerMsg::ReleaseConnection => self.release(),
+                }
             }
             if req.generation != self.latest_gen.load(Ordering::SeqCst) {
                 continue;
             }
             self.handle(req);
+        }
+    }
+
+    /// Drop the held connection and tell whoever asked.
+    ///
+    /// The same trim `run`'s idle path does, for the same reason: glibc parks
+    /// `PRAGMAS_SEARCH`'s page cache in an arena rather than returning it.
+    fn release(&mut self) {
+        if self.open.take().is_some() {
+            crate::platform::release_free_heap();
+        }
+        if let Some(ack) = crate::lock_ok(&self.release_ack).take() {
+            let _ = ack.send(());
         }
     }
 

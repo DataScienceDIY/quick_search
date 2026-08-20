@@ -103,17 +103,23 @@ impl SizeReport {
 /// failure reason comes from `failed_files`, the one place it is written.
 pub fn status_for_path(db_path: &str, path: &str) -> Result<FileStatus, String> {
     let conn = open_existing(db_path, false)?;
-    let row: Option<(i64, Option<String>)> = conn
-        .query_row(
-            "SELECT f.content_state, ff.reason \
+    let split = crate::file_handling::split_db_path(path);
+    let row: Option<(i64, Option<String>)> = match split {
+        // Not a path a row could ever have been stored under, so it is not
+        // indexed — the same answer as a miss.
+        None => None,
+        Some((parent, name)) => conn
+            .query_row(
+                "SELECT f.content_state, ff.reason \
                FROM files f \
                LEFT JOIN failed_files ff ON ff.file_id = f.id \
-              WHERE f.path = ?1",
-            params![path],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(|e| format!("status_for_path({}): {}", path, e))?;
+              WHERE f.parent = ?1 AND f.name = ?2",
+                params![parent, name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("status_for_path({}): {}", path, e))?,
+    };
     Ok(match row {
         None => FileStatus {
             path: path.to_string(),
@@ -138,7 +144,7 @@ pub fn list_failed(db_path: &str, limit: Option<u32>) -> Result<Vec<FailedEntry>
         None => String::new(),
     };
     let sql = format!(
-        "SELECT ff.file_id, f.path, ff.reason, ff.ts \
+        "SELECT ff.file_id, f.parent, f.name, ff.reason, ff.ts \
          FROM failed_files ff \
          JOIN files f ON f.id = ff.file_id \
          ORDER BY ff.ts DESC{}",
@@ -149,11 +155,13 @@ pub fn list_failed(db_path: &str, limit: Option<u32>) -> Result<Vec<FailedEntry>
         .map_err(|e| format!("list_failed prepare: {}", e))?;
     let rows = stmt
         .query_map([], |r| {
+            let parent: String = r.get(1)?;
+            let name: String = r.get(2)?;
             Ok(FailedEntry {
                 file_id: r.get(0)?,
-                path: r.get(1)?,
-                reason: r.get(2)?,
-                ts: r.get(3)?,
+                path: format!("{}{}", parent, name),
+                reason: r.get(3)?,
+                ts: r.get(4)?,
             })
         })
         .map_err(|e| format!("list_failed query: {}", e))?;
@@ -252,8 +260,7 @@ mod tests {
                 &tx,
                 &NewFile {
                     name: "a.txt",
-                    path: "/tmp/a.txt",
-                    parent: "/tmp",
+                    parent: "/tmp/",
                     size: 1,
                     mtime: 1,
                     mime: Some("text/plain"),
@@ -269,8 +276,7 @@ mod tests {
                 &tx,
                 &NewFile {
                     name: "b.bin",
-                    path: "/tmp/b.bin",
-                    parent: "/tmp",
+                    parent: "/tmp/",
                     size: 1,
                     mtime: 1,
                     mime: None,
@@ -343,8 +349,7 @@ mod tests {
                 &tx,
                 &NewFile {
                     name: "c.txt",
-                    path: "/tmp/c.txt",
-                    parent: "/tmp",
+                    parent: "/tmp/",
                     size: 1,
                     mtime: 1,
                     mime: Some("text/plain"),
@@ -361,8 +366,7 @@ mod tests {
                 &tx,
                 &NewFile {
                     name: "d.bin",
-                    path: "/tmp/d.bin",
-                    parent: "/tmp",
+                    parent: "/tmp/",
                     size: 1,
                     mtime: 1,
                     mime: None,
@@ -422,8 +426,7 @@ mod tests {
                 &tx,
                 &NewFile {
                     name: "big.txt",
-                    path: "/tmp/big.txt",
-                    parent: "/tmp",
+                    parent: "/tmp/",
                     size: 1,
                     mtime: 1,
                     mime: Some("text/plain"),
@@ -477,13 +480,12 @@ mod tests {
         {
             let mut conn = open_or_recreate(dbp, "unicode61").unwrap();
             let tx = conn.transaction().unwrap();
-            for (name, path) in [("a.txt", "/tmp/a.txt"), ("b.txt", "/tmp/b.txt")] {
+            for name in ["a.txt", "b.txt"] {
                 insert_file(
                     &tx,
                     &NewFile {
                         name,
-                        path,
-                        parent: "/tmp",
+                        parent: "/tmp/",
                         size: 1,
                         mtime: 1,
                         mime: Some("text/plain"),

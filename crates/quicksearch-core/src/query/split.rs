@@ -291,11 +291,14 @@ mod tests {
     fn a_windows_drive_path_reaches_the_filter_intact() {
         let q = split_for_cascade(r"path:C:\Users\me\docs").unwrap();
         assert_eq!(q.term, "", "the whole input is a filter");
-        assert!(
-            matches!(
-                &q.filter_params[0],
-                Value::Text(t) if t == r"C:\Users\me\docs"
-            ),
+        // The folder filter binds one value: the subtree LIKE pattern built
+        // from the spelling the user typed. Asserted through the builder so
+        // this stays about the plumbing rather than about escaping rules.
+        assert_eq!(
+            q.filter_params[0],
+            Value::Text(crate::query::translator::like_subtree_pattern(
+                r"C:\Users\me\docs"
+            )),
             "{:?}",
             q.filter_params
         );
@@ -307,7 +310,9 @@ mod tests {
         assert_eq!(q.term, "");
         assert_eq!(
             q.filter_params[0],
-            Value::Text("/home/me/My Documents".into())
+            Value::Text(crate::query::translator::like_subtree_pattern(
+                "/home/me/My Documents"
+            ))
         );
     }
 
@@ -439,9 +444,12 @@ mod tests {
         let q = split_for_cascade("name:%*_").unwrap();
         assert!(matches!(&q.filter_params[0], Value::Text(t) if t == "%\\%%\\_%"));
 
-        // path: values never glob.
+        // path: values never glob — the star reaches the pattern as a literal.
         let q = split_for_cascade("path:/da*ta").unwrap();
-        assert!(matches!(&q.filter_params[0], Value::Text(t) if t == "/da*ta"));
+        assert_eq!(
+            q.filter_params[0],
+            Value::Text(crate::query::translator::like_subtree_pattern("/da*ta"))
+        );
     }
 
     #[test]

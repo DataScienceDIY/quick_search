@@ -86,6 +86,34 @@ const ODF_SHEET: TextSpec = TextSpec {
     separator: Some(' '),
 };
 
+/// The text an `&entity;` or `&#1234;` reference stands for.
+///
+/// quick-xml 0.41 reports a reference as its own event instead of resolving
+/// it inside the surrounding `Text`, so a reader that ignores this event
+/// silently drops every `&amp;`, `&lt;` and `&#8217;` from the document —
+/// no error, just missing characters in the index. Only the five predefined
+/// entities and numeric references are resolvable without a DTD; anything
+/// else is a document-defined entity we cannot expand, and is skipped.
+fn entity_text(raw: &str) -> Option<String> {
+    if let Some(digits) = raw.strip_prefix('#') {
+        let code = match digits.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+            None => digits.parse::<u32>().ok()?,
+        };
+        let c = char::from_u32(code)?;
+        // `char::from_u32` accepts far more than XML's character production
+        // does: every C0 control but tab, newline and carriage return is
+        // forbidden, and `&#0;` in particular would put a literal NUL into the
+        // indexed text and from there into an FTS5 column. `None` here reaches
+        // the callers as the same "unknown entity" error an unexpandable name
+        // gets — a `failed_files` row naming the file, which is the visible
+        // outcome this extractor prefers to a quietly mangled document.
+        let legal = !c.is_control() || matches!(c, '\t' | '\n' | '\r');
+        return legal.then(|| String::from(c));
+    }
+    quick_xml::escape::resolve_predefined_entity(raw).map(String::from)
+}
+
 /// Append the text `spec` selects out of `xml` to `out`.
 ///
 /// `in_text` is a flag rather than a depth count, which means a closing
@@ -93,7 +121,13 @@ const ODF_SHEET: TextSpec = TextSpec {
 /// open.
 fn collect_xml_text(xml: &str, spec: &TextSpec, out: &mut String) -> Result<(), Box<dyn Error>> {
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
+    // Deliberately no `trim_text`: it trims each *event*, and since 0.41 an
+    // entity reference splits the character data around it into separate
+    // events — so `Jack &amp; Jill` would come back as `Jack&Jill`, with the
+    // spaces trimmed off the ends of the two fragments. Nothing needs it
+    // either: whitespace between elements arrives while the `in_text`/`in_cell`
+    // flag is false and is ignored there, and whitespace *inside* a
+    // text-bearing element is content.
     let mut buf = Vec::new();
     let mut in_text = false;
 
@@ -105,10 +139,22 @@ fn collect_xml_text(xml: &str, spec: &TextSpec, out: &mut String) -> Result<(), 
                 }
             }
             Ok(Event::Text(e)) if in_text => {
-                out.push_str(&e.unescape()?);
+                out.push_str(&e.decode()?);
                 if let Some(sep) = spec.separator {
                     out.push(sep);
                 }
+            }
+            // An entity reference is its own event in 0.41; without this arm
+            // every `&amp;` in a document would vanish from the index.
+            Ok(Event::GeneralRef(e)) if in_text => {
+                let raw = e.decode()?;
+                // An entity nothing can expand is an error, as it was when
+                // `unescape` resolved these inline: dropping it would take
+                // characters out of the indexed text with nothing to show for
+                // it, and this reader has no DTD to define one with.
+                let text = entity_text(&raw)
+                    .ok_or_else(|| format!("Error parsing XML: unknown entity &{};", raw))?;
+                out.push_str(&text);
             }
             Ok(Event::End(ref e)) => {
                 let name = e.name();
@@ -235,18 +281,46 @@ fn shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Vec<String> {
         return Vec::new();
     };
     let mut reader = Reader::from_str(&xml);
-    reader.trim_text(true);
+    // Deliberately no `trim_text`: it trims each *event*, and since 0.41 an
+    // entity reference splits the character data around it into separate
+    // events — so `Jack &amp; Jill` would come back as `Jack&Jill`, with the
+    // spaces trimmed off the ends of the two fragments. Nothing needs it
+    // either: whitespace between elements arrives while the `in_text`/`in_cell`
+    // flag is false and is ignored there, and whitespace *inside* a
+    // text-bearing element is content.
     let mut buf = Vec::new();
     let mut strings = Vec::new();
     let mut in_text = false;
+    // One `<t>` is one shared string, but it is not one event: an entity
+    // reference inside it arrives separately and splits the character data
+    // around it. Accumulated here and pushed on the closing tag, or a cell
+    // containing `&amp;` would become three table entries and every later
+    // index would point at the wrong one.
+    let mut current = String::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"t" => in_text = true,
-            Ok(Event::Text(e)) if in_text => match e.unescape() {
-                Ok(s) => strings.push(s.into_owned()),
+            Ok(Event::Start(ref e)) if e.name().as_ref() == b"t" => {
+                in_text = true;
+                current.clear();
+            }
+            Ok(Event::Text(e)) if in_text => match e.decode() {
+                Ok(s) => current.push_str(&s),
                 Err(_) => return strings,
             },
-            Ok(Event::End(ref e)) if e.name().as_ref() == b"t" => in_text = false,
+            Ok(Event::GeneralRef(e)) if in_text => {
+                // Unlike the other two readers this one cannot fail — a
+                // missing table is not an error here — so an entity nothing
+                // can expand is simply left out.
+                if let Ok(raw) = e.decode() {
+                    if let Some(text) = entity_text(&raw) {
+                        current.push_str(&text);
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) if e.name().as_ref() == b"t" => {
+                in_text = false;
+                strings.push(std::mem::take(&mut current));
+            }
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
@@ -259,7 +333,13 @@ fn shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Vec<String> {
 /// rather than text of its own; every other type holds its value inline.
 fn collect_sheet(xml: &str, strings: &[String], out: &mut String) -> Result<(), Box<dyn Error>> {
     let mut reader = Reader::from_str(xml);
-    reader.trim_text(true);
+    // Deliberately no `trim_text`: it trims each *event*, and since 0.41 an
+    // entity reference splits the character data around it into separate
+    // events — so `Jack &amp; Jill` would come back as `Jack&Jill`, with the
+    // spaces trimmed off the ends of the two fragments. Nothing needs it
+    // either: whitespace between elements arrives while the `in_text`/`in_cell`
+    // flag is false and is ignored there, and whitespace *inside* a
+    // text-bearing element is content.
     let mut buf = Vec::new();
     let mut in_cell = false;
     let mut cell_type = String::new();
@@ -287,18 +367,48 @@ fn collect_sheet(xml: &str, strings: &[String], out: &mut String) -> Result<(), 
                 }
             }
             Ok(Event::Text(e)) if in_cell => {
-                let text = e.unescape()?;
+                let text = e.decode()?;
                 if cell_type == "s" {
                     // A shared-string reference. An index past the end of the
                     // table is a corrupt workbook, not something to guess at.
-                    if let Some(s) = text.parse::<usize>().ok().and_then(|i| strings.get(i)) {
+                    //
+                    // `trim` because this reader no longer sets `trim_text`
+                    // (see the comment above): a generator that indents its
+                    // XML hands `<v>` over as "\n  0\n", and an untrimmed
+                    // parse would fail and drop the string with nothing to
+                    // show for it. Whitespace around an integer index is not
+                    // content, unlike whitespace inside a `<t>`.
+                    if let Some(s) = text
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| strings.get(i))
+                    {
                         out.push_str(s);
                         out.push(' ');
                     }
-                } else {
+                } else if !text.trim().is_empty() {
+                    // Whitespace-only fragments are the indentation *between*
+                    // a cell's child elements, which reaches this arm now that
+                    // the reader no longer sets `trim_text`. Skipped rather
+                    // than pushed: `in_cell` is a flag, so it cannot tell an
+                    // indent from a value, and a cell whose entire content is
+                    // whitespace contributes nothing to a search index either
+                    // way. The value itself is pushed whole — no `trim` — so a
+                    // deliberate `xml:space="preserve"` inline string keeps
+                    // its shape.
                     out.push_str(&text);
                     out.push(' ');
                 }
+            }
+            // See `entity_text`. Only inline values can carry one: a `t="s"`
+            // cell's text is an integer index, and an entity inside it would
+            // be a corrupt workbook rather than a character to recover.
+            Ok(Event::GeneralRef(e)) if in_cell && cell_type != "s" => {
+                let raw = e.decode()?;
+                let text = entity_text(&raw)
+                    .ok_or_else(|| format!("Error parsing XML: unknown entity &{};", raw))?;
+                out.push_str(&text);
             }
             Ok(Event::End(ref e)) => {
                 let name = e.name();
@@ -375,6 +485,111 @@ impl Extractor for OfficeExtractor {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Entity references must survive extraction.
+    ///
+    /// quick-xml 0.41 reports `&amp;` as its own `GeneralRef` event instead of
+    /// resolving it into the surrounding text, so a reader that only handles
+    /// `Event::Text` loses the character with no error to show for it. This is
+    /// the test that makes that visible: it fails by producing "Blake  Co"
+    /// rather than by failing to compile.
+    #[test]
+    fn entity_references_survive_extraction() {
+        let body = "<w:document><w:body><w:p><w:r>\
+             <w:t>Blake &amp; Co &lt;tags&gt; &#8217;24 &#x2019;25</w:t>\
+             </w:r></w:p></w:body></w:document>";
+        let path = container("docx-entities", "docx", &[("word/document.xml", body)]);
+        let out = OfficeExtractor.extract(&path).expect("extract");
+        assert!(
+            out.text.contains("Blake & Co"),
+            "predefined entity lost: {:?}",
+            out.text
+        );
+        assert!(
+            out.text.contains("<tags>"),
+            "angle-bracket entities lost: {:?}",
+            out.text
+        );
+        assert!(
+            out.text.contains('\u{2019}'),
+            "numeric entities lost: {:?}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("&amp;") && !out.text.contains("&#"),
+            "entities left unresolved: {:?}",
+            out.text
+        );
+    }
+
+    /// The same, through the shared-string table an `.xlsx` cell indexes into
+    /// — a separate reader, and so a separate chance to drop the character.
+    #[test]
+    fn entity_references_survive_shared_strings() {
+        let shared = "<sst><si><t>Jack &amp; Jill</t></si></sst>";
+        let sheet = "<worksheet><sheetData><row>\
+             <c t=\"s\"><v>0</v></c></row></sheetData></worksheet>";
+        let path = container(
+            "xlsx-entities",
+            "xlsx",
+            &[
+                ("xl/sharedStrings.xml", shared),
+                ("xl/worksheets/sheet1.xml", sheet),
+            ],
+        );
+        let out = OfficeExtractor.extract(&path).expect("extract");
+        assert!(
+            out.text.contains("Jack & Jill"),
+            "entity lost through the shared-string table: {:?}",
+            out.text
+        );
+    }
+
+    /// A shared-string reference must survive an indented `<v>`.
+    ///
+    /// The reader deliberately does not set `trim_text` (an entity reference
+    /// splits the character data around it, and trimming each fragment would
+    /// eat the spaces at the split). A `t="s"` cell's `<v>` is an integer
+    /// index, though, so a generator that pretty-prints its sheet XML hands
+    /// this reader `"\n      0\n    "` — and an untrimmed `parse::<usize>()`
+    /// fails, dropping the cell's text with no error and no `failed_files`
+    /// row. Whitespace-only fragments between a cell's children must not
+    /// reach the output either.
+    #[test]
+    fn an_indented_shared_string_reference_still_resolves() {
+        let shared = "<sst><si><t>Marmalade</t></si></sst>";
+        let sheet = "<worksheet>\n  <sheetData>\n    <row>\n      \
+             <c t=\"s\">\n        <v>\n          0\n        </v>\n      </c>\n      \
+             <c t=\"n\">\n        <v>17</v>\n      </c>\n    \
+             </row>\n  </sheetData>\n</worksheet>";
+        let path = container(
+            "xlsx-indented",
+            "xlsx",
+            &[
+                ("xl/sharedStrings.xml", shared),
+                ("xl/worksheets/sheet1.xml", sheet),
+            ],
+        );
+        let out = OfficeExtractor.extract(&path).expect("extract");
+        assert!(
+            out.text.contains("Marmalade"),
+            "the shared string was dropped by an indented index: {:?}",
+            out.text
+        );
+        assert!(
+            out.text.contains("17"),
+            "the inline value was dropped: {:?}",
+            out.text
+        );
+        // The indentation itself is not content: every run of whitespace in
+        // the output should be a separator this reader put there, never a
+        // line of the source XML's own layout.
+        assert!(
+            !out.text.contains("\n  "),
+            "sheet indentation reached the indexed text: {:?}",
+            out.text
+        );
+    }
 
     #[test]
     fn supports_docx_and_friends() {

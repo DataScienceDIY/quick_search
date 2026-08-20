@@ -170,6 +170,92 @@ fn an_ambiguous_windows_window_reports_gone_rather_than_guessing() {
     assert_eq!(decided.get("/docs/b.txt"), Some(&Op::Gone));
 }
 
+/// [`event`], for a path that cannot be spelled as a `&str`.
+fn event_os(kind: EventKind, paths: &[PathBuf]) -> NotifyEvent {
+    NotifyEvent {
+        kind,
+        paths: paths.to_vec(),
+        attrs: Default::default(),
+    }
+}
+
+/// A path in the displayed set, and its unrepresentable neighbour that
+/// `to_string_lossy` collapses onto exactly that spelling.
+fn twin_pair() -> (String, PathBuf) {
+    let shown = format!("/docs/{}", crate::testutil::lossy_twin("report", ".txt"));
+    let bad = PathBuf::from("/docs").join(crate::testutil::unrepresentable_name("report", ".txt"));
+    assert_eq!(bad.to_string_lossy(), shown, "the two must collide");
+    (shown, bad)
+}
+
+/// A file the index could never hold still generates events, and its lossy
+/// spelling is a displayed row's real path. Keyed lossily, every one of those
+/// events lands on that row: a `Remove` of the file we cannot index would mark
+/// a completely different file gone, on screen, while it sits there on disk.
+#[test]
+fn events_for_an_unrepresentable_path_never_touch_its_lossy_twin() {
+    let (shown, bad) = twin_pair();
+    let t = targets(&[&shown]);
+    let decided = window(
+        &t,
+        vec![
+            event_os(
+                EventKind::Remove(RemoveKind::File),
+                std::slice::from_ref(&bad),
+            ),
+            event_os(
+                EventKind::Create(CreateKind::File),
+                std::slice::from_ref(&bad),
+            ),
+            event_os(EventKind::Modify(ModifyKind::Any), &[bad]),
+        ],
+    );
+    assert!(
+        decided.is_empty(),
+        "the displayed row must be untouched: {decided:?}"
+    );
+}
+
+/// Renamed *to* a name the index cannot spell, the row cannot keep a usable
+/// path — `Op::Renamed` carries the destination, and the GUI opens rows by it,
+/// so a lossy one would open some other file. It left the searchable world, so
+/// the honest answer is `Gone`; dropping the event instead would leave a stale
+/// row on screen until something else disturbed it.
+#[test]
+fn a_rename_to_an_unrepresentable_name_reports_gone() {
+    let (_, bad) = twin_pair();
+    let t = targets(&["/docs/a.txt"]);
+    let decided = window(
+        &t,
+        vec![event_os(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[PathBuf::from("/docs/a.txt"), bad],
+        )],
+    );
+    assert_eq!(decided.get("/docs/a.txt"), Some(&Op::Gone));
+}
+
+/// The Windows shape of the same thing: the halves arrive separately, and a
+/// lone `Gone` plus a lone arrival are paired into a rename. The arrival must
+/// not be a path we cannot spell, or the pairing invents the same bad
+/// destination the test above rejects.
+#[test]
+fn a_split_rename_is_not_paired_with_an_unrepresentable_arrival() {
+    let (_, bad) = twin_pair();
+    let t = targets(&["/docs/a.txt"]);
+    let decided = window(
+        &t,
+        vec![
+            event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                &["/docs/a.txt"],
+            ),
+            event_os(EventKind::Modify(ModifyKind::Name(RenameMode::To)), &[bad]),
+        ],
+    );
+    assert_eq!(decided.get("/docs/a.txt"), Some(&Op::Gone));
+}
+
 /// A watched directory is full of files that are not on screen. None of them
 /// may produce an update — live results never add rows.
 #[test]
