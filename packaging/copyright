@@ -78,11 +78,15 @@ Comment:
  font data rather than as linked program code, which is the same basis on
  which Debian ships these fonts and other egui-based applications.
  .
- One dependency is carried in-tree rather than fetched: vendor/pdf-extract
+ Two dependencies are carried in-tree rather than fetched. vendor/pdf-extract
  is pdf-extract 0.12.0 (MIT, Jeff Muizelaar,
  https://github.com/jrmuizel/pdf-extract) with two unbounded recursions
- given a depth limit, marked "LOCAL PATCH" in the source. Its licence is
- unchanged and is the MIT stanza below.
+ given a depth limit. vendor/rtf-parser is rtf-parser 0.4.3 (MIT, Dorian
+ Beauchesne, https://github.com/d0rianb/rtf-parser) with its lexer corrected
+ to end a control word where the RTF specification ends one, and a panic on
+ malformed Unicode escapes replaced by lossy decoding. Both sets of changes
+ are marked "LOCAL PATCH" in the source; both licences are unchanged and are
+ the MIT stanza below.
  .
  Run `cargo metadata --all-features` against the source tree to reproduce
  the per-crate licence list.

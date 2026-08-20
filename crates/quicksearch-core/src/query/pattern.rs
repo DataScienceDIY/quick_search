@@ -174,6 +174,19 @@ impl TermPattern {
         }
     }
 
+    /// [`literal`](Self::literal), ASCII-folded — the form every
+    /// case-insensitive scan actually searches with.
+    ///
+    /// Handing this out rather than folding at the call site matters because
+    /// the full-text pass calls it once per candidate row: the pattern built
+    /// this string once, when the query was parsed.
+    pub fn literal_folded(&self) -> Option<&str> {
+        match self {
+            TermPattern::Literal(l) => Some(&l.folded),
+            _ => None,
+        }
+    }
+
     /// Literal chunks between wildcards (the whole term when literal).
     pub fn segments(&self) -> &[String] {
         match self {
@@ -289,8 +302,12 @@ impl TermPattern {
         }
     }
 
-    /// Non-overlapping occurrence count, capped at 1000 (the cascade's
-    /// `count_frac` saturates there anyway).
+    /// Non-overlapping occurrence count.
+    ///
+    /// Wildcards stop at 1000 — the cascade's `count_frac` saturates there
+    /// anyway, and each regex match costs far more than a `memmem` hit.
+    /// Literals are counted in full, because stopping early would cost a
+    /// branch on the one path that runs over every candidate body.
     pub fn count(&self, text: &str, case_insensitive: bool) -> usize {
         match self {
             TermPattern::Empty => 0,
@@ -314,6 +331,84 @@ impl TermPattern {
 pub struct RegexQuery {
     pub source: String,
     re: Regex,
+    /// Literals of which at least one must occur in anything this matches, when
+    /// the pattern admits such a set. See [`RegexQuery::required`].
+    required: Option<crate::search::prefilter::Required>,
+}
+
+/// Extract a set of literals at least one of which occurs in every match.
+///
+/// This is the same analysis the regex engine performs to build its own
+/// prefilter, run for the same reason a level up: the `regex:` passes scan every
+/// name, every path and every stored document, and a required literal lets
+/// SQLite and the trigram index reject most of those rows first.
+///
+/// # What makes it sound
+///
+/// A *prefix* set has the property that every match begins with one of its
+/// literals; a *suffix* set, that every match ends with one. Either way the
+/// matched text — itself a substring of the field being searched — contains that
+/// literal, so the field does. When the set is unbounded (`\d+`, `.*foo` by
+/// prefix) `literals()` answers `None` and there is nothing to filter on.
+///
+/// Both kinds are tried because they fail on opposite patterns: `foo.*` has a
+/// usable prefix and no usable suffix, `.*foo` the reverse. The more selective
+/// of the two wins, measured by the shortest literal each would force a scan to
+/// match — the weakest link in an OR.
+///
+/// # Why it parses case-sensitively
+///
+/// The query itself is case-insensitive, and extracting from a case-insensitive
+/// pattern expands combinatorially — `(?i)FOO` comes back as eight literals, and
+/// a longer word simply exceeds the extractor's budget and yields nothing.
+/// Parsing without the flag gives one clean literal instead.
+///
+/// That is still sound. A case-insensitive match of `foo` against text `FOO`
+/// means the text holds *some* case variant of the literal, and both consumers
+/// fold: the trigram index lowercases what it indexes, and `LIKE` is
+/// ASCII-case-insensitive by SQLite's default collation. An inline `(?i)` inside
+/// the pattern is honoured by the parser regardless, so it explodes and yields
+/// `None` — a lost optimisation, never a lost row.
+fn required_literals(source: &str) -> Option<crate::search::prefilter::Required> {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
+
+    let hir = regex_syntax::ParserBuilder::new()
+        .case_insensitive(false)
+        .build()
+        .parse(source)
+        .ok()?;
+
+    let mut best: Option<(usize, crate::search::prefilter::Required)> = None;
+    for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
+        let seq = Extractor::new().kind(kind).extract(&hir);
+        let Some(literals) = seq.literals() else {
+            continue; // unbounded: no constraint to be had from this direction
+        };
+        // A literal is bytes, and the extractor can split a multi-byte character
+        // across the boundary of what it kept. Anything that is not valid UTF-8
+        // cannot be handed to FTS5 or bound as SQL text, so the whole direction
+        // is abandoned rather than filtered — dropping one literal from an OR
+        // would drop the rows only it covers.
+        let strings: Option<Vec<String>> = literals
+            .iter()
+            .map(|l| std::str::from_utf8(l.as_bytes()).ok().map(str::to_owned))
+            .collect();
+        let Some(strings) = strings else { continue };
+        let Some(required) = crate::search::prefilter::Required::new(strings) else {
+            continue;
+        };
+        // The OR is only as selective as its shortest arm.
+        let weakest = required
+            .literals()
+            .iter()
+            .map(|l| l.chars().count())
+            .min()
+            .unwrap_or(0);
+        if best.as_ref().is_none_or(|(w, _)| weakest > *w) {
+            best = Some((weakest, required));
+        }
+    }
+    best.map(|(_, required)| required)
 }
 
 impl RegexQuery {
@@ -335,7 +430,21 @@ impl RegexQuery {
         Ok(RegexQuery {
             source: source.to_string(),
             re,
+            // Once per query, never per row. A pattern that yields nothing
+            // simply scans, exactly as every `regex:` query used to.
+            required: required_literals(source),
         })
+    }
+
+    /// Literals of which at least one occurs in anything this matches, when the
+    /// pattern admits such a set.
+    ///
+    /// The `regex:` passes use it to narrow what they scan; `None` means the
+    /// pattern constrains nothing usable (`\d+`, `a.*b`) and the pass reads
+    /// everything, which is what it always did. See
+    /// [`crate::search::prefilter`] for the rule a prefilter has to obey.
+    pub fn required(&self) -> Option<&crate::search::prefilter::Required> {
+        self.required.as_ref()
     }
 
     pub fn is_match(&self, text: &str) -> bool {

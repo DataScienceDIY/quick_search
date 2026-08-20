@@ -277,3 +277,34 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
     std::fs::remove_dir_all(&root).ok();
     std::fs::remove_file(&db).ok();
 }
+
+/// A `find` that fails writes nothing, and `wc -l` then reads EOF, prints `0`
+/// and exits *successfully* — so checking only the last process in the
+/// pipeline reported a tree of zero entries. That answer is indistinguishable
+/// from a real empty tree, and it is what kept the non-GNU `-printf` fallback
+/// from ever running: it is an `.or_else` on the error this used to swallow.
+#[test]
+#[cfg(unix)]
+fn a_failing_find_is_an_error_not_a_count_of_zero() {
+    let missing = tmp("count-missing").join("no-such-tree");
+    let cancel = AtomicBool::new(false);
+    let result = count_tree_entries_fast(missing.to_str().unwrap(), &cancel);
+    assert!(
+        result.is_err(),
+        "a path that does not exist counted {:?} entries",
+        result
+    );
+}
+
+/// An empty directory really does count zero (one entry on Unix, the root
+/// `find` lists itself) — the error above must not have been bought by
+/// calling every small answer a failure.
+#[test]
+fn an_empty_tree_still_counts() {
+    let root = tmp("count-empty");
+    std::fs::create_dir_all(&root).unwrap();
+    let cancel = AtomicBool::new(false);
+    let n = count_tree_entries_fast(root.to_str().unwrap(), &cancel).unwrap();
+    assert_eq!(n, if cfg!(windows) { 0 } else { 1 });
+    std::fs::remove_dir_all(&root).ok();
+}

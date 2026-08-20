@@ -163,6 +163,37 @@ mod substring {
         bencher.bench(|| finder.find_iter(divan::black_box(text)).count());
     }
 
+    /// A `Finder` built once per query against one built per call.
+    ///
+    /// **A losing arm, kept as the record.** `memmem::find_iter(hay, needle)`
+    /// constructs a searcher every time, and the full-text pass calls it once
+    /// or twice per candidate row, so hoisting that into the compiled pattern
+    /// looks like free money. It is not: medians of 35.5 ns against 35.2 at
+    /// 1 KiB and 3.18 µs against 3.17 at 256 KiB — indistinguishable at every
+    /// size, including the smallest, where setup would dominate if it were
+    /// going to.
+    ///
+    /// The reason is that the precompute is O(needle), and a search term is a
+    /// handful of bytes. What *did* cost something on this path was the
+    /// `to_ascii_lowercase` rebuilding the needle per row, and that is an
+    /// allocation rather than a searcher — see `snippet::extract_folded`, which
+    /// borrows an already-folded term instead.
+    #[divan::bench(args = corpus::SIZES)]
+    fn memmem_per_call_miss(bencher: Bencher, size: usize) {
+        let text = corpus::text(size, 0).as_bytes();
+        bencher.bench(|| {
+            memchr::memmem::find_iter(divan::black_box(text), corpus::NEEDLE.as_bytes()).count()
+        });
+    }
+
+    #[divan::bench(args = corpus::SIZES)]
+    fn memmem_per_call_hits(bencher: Bencher, size: usize) {
+        let text = corpus::text(size, 64).as_bytes();
+        bencher.bench(|| {
+            memchr::memmem::find_iter(divan::black_box(text), corpus::NEEDLE.as_bytes()).count()
+        });
+    }
+
     #[divan::bench(args = corpus::SIZES)]
     fn match_indices_hits(bencher: Bencher, size: usize) {
         let text = corpus::text(size, 64);
@@ -176,9 +207,9 @@ mod substring {
         bencher.bench(|| finder.find_iter(divan::black_box(text)).count());
     }
 
-    /// What `pass_fulltext` actually runs per row, through the real crate
-    /// entry points: a case-sensitive count, then a folded count, then the
-    /// snippet extraction. Three sweeps of the same document.
+    /// What `pass_fulltext` runs per row on the literal path, through the
+    /// real crate entry points: a case-sensitive count, then one folded
+    /// extraction that yields the count and the snippet together.
     #[divan::bench(args = corpus::SIZES)]
     fn cascade_row_sweeps(bencher: Bencher, size: usize) {
         let pattern = literal(corpus::NEEDLE);
@@ -186,17 +217,37 @@ mod substring {
         let folded = corpus::text_folded(size, 4);
         let opts = snippet::Options { approx_chars: 600 };
         bencher.bench(|| {
+            let (s, b) = snippet::extract_folded(
+                divan::black_box(text),
+                divan::black_box(folded),
+                &[corpus::NEEDLE],
+                &opts,
+            );
+            let a = pattern.count(text, false);
+            (a, b, s.ranges.len())
+        });
+    }
+
+    /// The shape it replaced, kept as the comparison: counting the folded
+    /// haystack separately from extracting the window sweeps the same
+    /// document a third time for a number the extraction already knew.
+    #[divan::bench(args = corpus::SIZES)]
+    fn cascade_row_sweeps_separate_count(bencher: Bencher, size: usize) {
+        let pattern = literal(corpus::NEEDLE);
+        let text = corpus::text_mixed(size, 4);
+        let folded = corpus::text_folded(size, 4);
+        let opts = snippet::Options { approx_chars: 600 };
+        bencher.bench(|| {
             let a = pattern.count(divan::black_box(text), false);
             let b = pattern.count_folded(divan::black_box(folded));
-            let s = snippet::extract_folded(text, folded, &[corpus::NEEDLE], &opts);
+            let (s, _) = snippet::extract_folded(text, folded, &[corpus::NEEDLE], &opts);
             (a, b, s.ranges.len())
         });
     }
 }
 
-/// Snippet extraction against a pre-folded haystack, the third of those
-/// sweeps. Also carries a per-call `term.to_ascii_lowercase()` at
-/// `snippet.rs:81` for a needle the caller already holds folded.
+/// Snippet extraction against a pre-folded haystack — on the literal path,
+/// now the *only* folded sweep of a row, and the source of its count.
 mod snippet_extract {
     use super::*;
 
@@ -319,6 +370,62 @@ mod filename_ladder {
                 scratch.push_str(&row.path);
                 scratch.make_ascii_lowercase();
                 if finder.find(scratch.as_bytes()).is_some() {
+                    found += 1;
+                }
+            }
+            found
+        });
+    }
+
+    /// `find_ascii_ci`'s scalar candidate loop against a `memchr2` one.
+    ///
+    /// **A losing arm, kept as the record.** The production function walks the
+    /// haystack a byte at a time comparing `to_ascii_lowercase()`; `memchr2`
+    /// finds the next byte matching either case of the needle's first byte with
+    /// SIMD and only then compares. That looks like it must win, and it does
+    /// not: 47.9 µs against 49.0 µs median, inside the run-to-run spread.
+    ///
+    /// Two reasons, both about *short* haystacks. `memchr2` has per-call setup
+    /// to amortize and a filename is tens of bytes, not a document; and the
+    /// scalar loop's inner comparison almost never fires, because a first byte
+    /// that occurs rarely in the corpus makes the loop a plain byte scan the
+    /// compiler already vectorizes.
+    ///
+    /// Fold-free and allocation-free either way, so this isolates the search
+    /// itself — unlike the arms above, which conflate it with a fold. If a
+    /// future change makes this pass run over many more rows, re-measure; as it
+    /// stands the SQL `LIKE` prefilter means the classifier barely runs at all
+    /// for literal terms, so this was never where the time was.
+    #[divan::bench]
+    fn find_first_ci_memchr2(bencher: Bencher) {
+        let rows = corpus::rows();
+        let needle = corpus::NEEDLE.as_bytes();
+        // The same shape `TermPattern::find_ascii_ci` would take.
+        fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+            let (lo, up) = (
+                needle[0].to_ascii_lowercase(),
+                needle[0].to_ascii_uppercase(),
+            );
+            let last = hay.len().checked_sub(needle.len())?;
+            let mut at = 0usize;
+            while at <= last {
+                let Some(off) = memchr::memchr2(lo, up, &hay[at..=last]) else {
+                    return None;
+                };
+                let i = at + off;
+                if hay[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+                    return Some(i);
+                }
+                at = i + 1;
+            }
+            None
+        }
+        bencher.bench(|| {
+            let mut found = 0usize;
+            for row in divan::black_box(rows) {
+                if find(row.name.as_bytes(), needle).is_some()
+                    || find(row.path.as_bytes(), needle).is_some()
+                {
                     found += 1;
                 }
             }

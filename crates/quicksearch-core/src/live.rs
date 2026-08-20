@@ -329,7 +329,18 @@ impl Loop {
                         &mut self.pending,
                         &mut self.orphan_to,
                     );
-                    if !self.pending.is_empty() && self.settle_at.is_none() {
+                    // Either queue, not just `pending`. `orphan_to` collects
+                    // rename destinations whose source is not on screen, and
+                    // it is drained only by `flush_settled` — so arming on
+                    // `pending` alone means churn that touches no visible row
+                    // pushes for the life of the arm and is never taken. That
+                    // is a leak, and on Windows it is also a wrong answer:
+                    // with no `RenameMode::Both` there, the pairing below
+                    // needs `orphans.len() == 1`, so one stale entry turns
+                    // every later rename into "gone".
+                    if (!self.pending.is_empty() || !self.orphan_to.is_empty())
+                        && self.settle_at.is_none()
+                    {
                         self.settle_at = Some(Instant::now() + SETTLE);
                     }
                 }
@@ -368,9 +379,10 @@ impl Loop {
             if q.pattern.is_wildcard() {
                 return None;
             }
-            let folded = q.term.to_ascii_lowercase();
-            let k = edit_budget(folded.len(), config.search.fuzzy_max_edits)?;
-            Bitap::new(folded.as_bytes(), k)
+            // As typed, exactly as the pass builds it: the matcher is
+            // case-insensitive in its own mask table.
+            let k = edit_budget(q.term.len(), config.search.fuzzy_max_edits)?;
+            Bitap::new(q.term.as_bytes(), k)
         });
         self.config = Some(config);
 
@@ -593,20 +605,22 @@ impl Loop {
         let Some(text) = crate::file_handling::outcome_body(&outcome) else {
             return WindowUpdate::Unchanged;
         };
-        let folded = text.to_ascii_lowercase();
         let cut = match tier {
             ContentTier::Exact => {
                 // A literal term always yields a window, marked or not,
                 // because the passes only ever call this for a body FTS
                 // already matched. Here the body may genuinely have stopped
                 // matching, and an unmarked window is how that reads.
+                //
+                // The fold is cut here rather than above the match, because
+                // only this arm needs one now — the fuzzy matcher folds in its
+                // own mask table.
+                let folded = text.to_ascii_lowercase();
                 crate::search::cascade::text_snippet(&query.pattern, text, &folded)
                     .filter(|snip| !snip.ranges.is_empty())
             }
             ContentTier::Fuzzy => match &self.fuzzy {
-                Some(bitap) => {
-                    crate::search::cascade::fuzzy_snippet(bitap, text, &folded).map(|(_, s)| s)
-                }
+                Some(bitap) => crate::search::cascade::fuzzy_snippet(bitap, text).map(|(_, s)| s),
                 // The term does not fuzz, so a fuzzy row cannot be re-judged;
                 // leaving it is the honest reading.
                 None => return WindowUpdate::Unchanged,

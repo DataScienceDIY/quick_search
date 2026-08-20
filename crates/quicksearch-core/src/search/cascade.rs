@@ -54,6 +54,7 @@
 //! order.
 
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -67,7 +68,7 @@ use crate::query::split::CascadeQuery;
 use crate::query::translator::{escape_like, quote_phrase};
 use crate::snippet;
 
-use super::fuzzy::{edit_budget, Bitap};
+use super::fuzzy::{edit_budget, pigeonhole_chunks, Bitap};
 use super::{SearchHit, SearchOptions};
 
 mod passes;
@@ -100,16 +101,41 @@ pub fn text_snippet(
     let opts = snippet::Options {
         approx_chars: SNIPPET_WINDOW_CHARS,
     };
-    match pattern.literal() {
+    match text_snippet_counted(pattern, text, folded) {
         // Literal terms keep the richer multi-occurrence extract; a wildcard
         // match marks its own first range.
-        Some(term) => Some(snippet::extract_folded(text, folded, &[term], &opts)),
+        Some((snip, _)) => Some(snip),
         None => pattern.find_first_folded(folded).map(|r| {
             // A greedy pattern can match megabytes; clamp before the window.
             let r = clamp_match_range(text, r, SNIPPET_WINDOW_CHARS);
             snippet::window_around(text, (r.start, r.end), &opts)
         }),
     }
+}
+
+/// [`text_snippet`] for a literal pattern, with the case-insensitive
+/// occurrence count the extraction found on its way to the window. `None`
+/// when the pattern is not literal.
+///
+/// The count is a by-product: [`snippet::extract_folded`] locates every
+/// occurrence in `folded` in order to coalesce and mark them, and that set has
+/// the same cardinality [`crate::query::pattern::TermPattern::count_folded`]
+/// would return. Taking it from here is what lets the full-text pass verify a
+/// row and cut its snippet in one sweep of the body rather than two — see
+/// `benches/search.rs`, group `cascade_row_sweeps`. It does not generalise to
+/// a wildcard, whose snippet comes from a single leftmost match.
+pub fn text_snippet_counted(
+    pattern: &crate::query::pattern::TermPattern,
+    text: &str,
+    folded: &str,
+) -> Option<(snippet::Snippet, usize)> {
+    let opts = snippet::Options {
+        approx_chars: SNIPPET_WINDOW_CHARS,
+    };
+    // The pre-folded form: this runs per candidate row, and folding the term
+    // again here would allocate once per row for a string the pattern holds.
+    let term = pattern.literal_folded()?;
+    Some(snippet::extract_folded(text, folded, &[term], &opts))
 }
 
 /// The fuzzy full-text match in one document body: how many times the term
@@ -120,19 +146,23 @@ pub fn text_snippet(
 /// Shared with [`crate::live`] for the same reason as [`text_snippet`]: a
 /// fuzzy row whose file changes has to be re-cut the way it was cut, and
 /// bitap's range is what it was cut around. `bitap` is built once by the
-/// caller — per scan in the pass, per arm in the live watcher — since
-/// building it is the cost, and `folded` must be `text` ASCII-lowercased.
+/// caller — per scan in the pass, per arm in the live watcher — since building
+/// it is the cost.
+///
+/// Takes no folded copy, unlike [`text_snippet`]: the matcher folds in its
+/// mask table (see [`crate::search::fuzzy`]), so it reads the body as stored.
+/// That is the difference between this pass copying and lowercasing every
+/// document in the index per keystroke and not doing so.
 pub fn fuzzy_snippet(
     bitap: &crate::search::fuzzy::Bitap,
     text: &str,
-    folded: &str,
 ) -> Option<(usize, snippet::Snippet)> {
     let opts = snippet::Options {
         approx_chars: SNIPPET_WINDOW_CHARS,
     };
     // `first` is `Some` exactly when `count` is non-zero: it *is* the first
     // of them.
-    let (count, first) = bitap.count_and_first(folded.as_bytes());
+    let (count, first) = bitap.count_and_first(text.as_bytes());
     first.map(|range| (count, snippet::window_around(text, range, &opts)))
 }
 
@@ -171,7 +201,7 @@ pub fn run(
         generation,
         latest_gen,
         ignore,
-        emitted: HashSet::new(),
+        emitted: IdSet::default(),
         deferred_path: Deferred::default(),
         deferred_fuzzy_path: Deferred::default(),
         total: 0,
@@ -197,8 +227,13 @@ pub fn run(
         if cx.cancelled() {
             return Ok(None);
         }
+        // Stop, but do not call it truncation. `remaining() == 0` is also
+        // what an exactly-full result set looks like, and claiming a cut there
+        // tells a user to raise `--limit` on a complete answer. `flush_pass`
+        // is the authority — it sets the flag when it actually had to drop
+        // rows — and `scan_pass` breaks its row loop the moment the limit
+        // fills, for the same reason this break exists.
         if cx.remaining() == 0 {
-            cx.limited = true;
             break;
         }
         let run_pass = match pass {
@@ -317,6 +352,54 @@ struct Deferred {
 /// inside the GUI's 250 ms result fade.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(80);
 
+/// Hasher for the emitted-id set, which is probed **once per scanned row**.
+///
+/// The default `HashSet` hasher is SipHash-1-3, chosen to be collision-resistant
+/// against hostile keys. These keys are SQLite rowids the cascade itself just
+/// read — nobody outside chooses them — so the resistance buys nothing, while
+/// the ~10 ns it costs is paid on every row of a whole-table scan.
+///
+/// Multiplicative, by an odd constant near 2^64/φ. Odd keeps it a bijection, so
+/// distinct ids stay distinct; hashbrown then takes the low bits for the bucket
+/// and the top seven for its control byte, and the rotate is what puts real
+/// entropy in both halves for the near-consecutive ids a table scan produces.
+///
+/// Worth ~5% of a fuzzy search — 17.1/17.4/17.9 ms against 18.2/18.3/18.8 over
+/// three runs each of `tests/search_alloc.rs`, every run of the one beating
+/// every run of the other. Small, but it is the whole of what a hash function
+/// choice can be worth, and it is bought for fifteen lines with no behaviour
+/// attached. The figure will grow with the row count: this is one probe per
+/// scanned row, and the corpus is 50,000 rows.
+#[derive(Default)]
+struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    // The only shape the set ever hashes is a single `i64`, which `Hash for
+    // i64` delivers through `write_i64`. `write` exists because the trait
+    // requires it and is deliberately a poor general-purpose hash: routing
+    // anything else through here would be a bug, not a use.
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_i64(&mut self, n: i64) {
+        self.write_u64(n as u64);
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        let mixed = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mixed.rotate_left(31) ^ mixed;
+    }
+}
+
+type IdSet = HashSet<i64, BuildHasherDefault<IdHasher>>;
+
 struct Cx<'a> {
     conn: &'a Connection,
     query: &'a CascadeQuery,
@@ -324,7 +407,7 @@ struct Cx<'a> {
     generation: u64,
     latest_gen: &'a AtomicU64,
     ignore: IgnoreSet,
-    emitted: HashSet<i64>,
+    emitted: IdSet,
     /// Ranks 9–10, filled by pass A.
     deferred_path: Deferred,
     /// Rank 11, filled by pass C.

@@ -51,8 +51,19 @@ encoding_rs = "0.8"
 # UTF-8 nor BOM-marked. Its mandatory deps beyond encoding_rs are tiny
 # (cfg-if, memchr, detone).
 chardetng = "1.0"
-# RTF text extraction. Pure Rust; with the default `jsbindings` feature off
-# (it exists for the crate's WASM build) it depends only on serde.
+# RTF text extraction. Pure Rust; depends only on serde.
+#
+# Resolves to `vendor/rtf-parser` through the workspace's `[patch.crates-io]`,
+# which is also where the reasons are written down: the stock lexer ended a
+# control word at whitespace and nowhere else, which silently dropped indexed
+# text from two shapes of document that LibreOffice and Word produce, and the
+# parser panicked on a malformed `\uN` escape. The version here still names
+# 0.4 because that is what the patch is against.
+#
+# `default-features = false` is redundant against the vendored copy, which has
+# no features left to disable — the `jsbindings` one existed for the crate's
+# WebAssembly build and was deleted. It stays so that dropping the patch falls
+# back to a registry build that does not pull wasm-bindgen.
 rtf-parser = { version = "0.4", default-features = false }
 # `lopdf` is deliberately NOT declared here. `pdf-extract` re-exports it
 # (`pub use lopdf::*`), and `extract/pdf.rs` reaches it that way. Naming it
@@ -68,6 +79,11 @@ ctrlc = "3.4"
 zstd = "0.13"
 globset = "0.4"
 regex = "1"
+# Required-literal extraction for the `regex:` prefilter: the same analysis the
+# regex engine does to pick its own prefilter, reused to narrow which rows the
+# regex passes ever see. Already in the lockfile transitively (via `regex`), so
+# naming it directly compiles nothing new.
+regex-syntax = "0.8"
 # SIMD substring search for the full-text passes. `str::match_indices` uses
 # std's Two-Way searcher, which has no vector prefilter: measured against a
 # 256 KiB body (`benches/search.rs`, group `substring`) it runs 111 µs where
@@ -116,6 +132,44 @@ windows-sys = { version = "0.52", features = [
 # threads of its own.
 [dev-dependencies]
 divan = "0.1"
+
+# Writers for `tests/extraction_corpus.rs`. Every one of these is chosen to be
+# a *different implementation* from the reader it feeds: a fixture built with
+# the same library that parses it can only prove the two agree with each other,
+# not that either agrees with the format. The unit tests in `src/extract/` do
+# use the readers' own libraries, deliberately — they aim at malformed input,
+# where the point is to control every byte. This set aims at well-formed input
+# from a foreign producer, which is the other half.
+#
+# None of these reach the release binary: dev-dependencies are linked into test
+# and bench targets only.
+#
+# `.doc`/`.xls`/`.ppt` are absent because nothing in Rust writes OLE2 compound
+# files but `cfb`, which is the reader. Those three are committed fixtures from
+# LibreOffice instead; see `tests/fixtures/legacy/`.
+#
+# docx: writes its own OOXML, and carries `zip` 8.x — a different major from
+# the 0.6 our reader uses, so even the container bytes come from elsewhere.
+# The default `image` feature pulls the whole `image` crate for embedding
+# pictures, which nothing here does.
+docx-rs = { version = "0.4", default-features = false }
+# xlsx: builds a real shared-string table, which is the path `extract_xlsx`
+# actually cares about.
+rust_xlsxwriter = { version = "0.98", default-features = false }
+# pdf: typst's low-level writer. No `lopdf` anywhere in its tree, which is what
+# makes it independent of `pdf-extract`.
+pdf-writer = "0.15"
+# audio tags: `id3` writes the ID3v2 frames `lofty` reads back, `metaflac` the
+# Vorbis comment block. The MPEG frames under the first are hand-rolled; the
+# FLAC stream under the second is committed, because `lofty` reads a real audio
+# frame to derive the stream's properties and a FLAC frame is CRC-checked
+# bit-packed data rather than a fixed header. See `tests/corpus/audio.rs`.
+id3 = "1"
+metaflac = "0.2"
+# CRC32 for the hand-rolled stored-entry zip that builds the pptx and ODF
+# containers. Already in the lockfile transitively via `zip`, so naming it
+# here compiles nothing new.
+crc32fast = "1"
 
 # `harness = false` on both: divan supplies its own `main` via `divan::main()`,
 # so libtest must not also link one in.

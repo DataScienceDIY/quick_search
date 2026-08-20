@@ -232,7 +232,11 @@ by the running process — so a crash or a power cut releases it, and the
 leftover file never locks you out. The lock follows `database_path`: point
 Settings at a different index and it moves with you, and if that index
 belongs to another instance the change is refused rather than written, so a
-path you cannot open can never end up in the config file.
+path you cannot open can never end up in the config file. A path naming
+some *other* program's SQLite database is refused for the same reason: the
+file there is created when missing and replaced when it is an index from an
+older layout of QuickSearch's own, but anything else is left alone and the
+error names the tables that identified it.
 
 - **Search**: results appear as you type; every keystroke cancels the
   previous search. One checkbox enables the two fuzzy passes, and once a
@@ -456,6 +460,12 @@ the Settings tab prints it (`Ctrl+Shift+F`): Ctrl, Alt and Shift in any
 combination, plus one key, joined with `+`. An empty string switches it
 off. A value that is not a shortcut is not a config error — the app loads,
 says so on the Settings tab, and runs without one.
+
+Numbers behave the same way. A hand-edited value outside the range a
+setting can work in — `display_limit = 0`, which would make every search
+return nothing — is clamped to the nearest workable one with a warning,
+never rejected: a typo in a text file must not stop the app starting. The
+ranges are in `config_example.toml` beside each setting that has one.
 
 `[ui] color_scheme` is `dark` (the default) or `light`, changeable on the
 Settings tab and applied without a restart. It does not follow the
@@ -885,8 +895,16 @@ microseconds regardless of row count.
   program, so the installer needs no Windows runner either.
 - New extractors: implement `extract::Extractor` and register it in
   `Registry::default_set()` — order matters, the first extractor whose
-  `supports` accepts a MIME wins. New cascade behavior: `search/cascade.rs`
-  documents the rank invariants that keep streamed results append-only.
+  `supports` accepts a MIME wins. Then add the format to the corpus in
+  `crates/quicksearch-core/tests/corpus/`, which writes a randomized lipsum
+  document in every supported format and asserts the planted text comes back —
+  at the extractor, through the walk-time head path, and end to end through
+  indexing and search (`tests/extraction_corpus.rs`). Its rule is that no
+  corpus file may be written by the library that reads it back, since a writer
+  and reader sharing a wrong assumption agree with each other; the module docs
+  say which library writes what and why. New cascade behavior:
+  `search/cascade.rs` documents the rank invariants that keep streamed results
+  append-only.
 - `packaging/capture.sh`: regenerates the website assets — `search.webm`,
   `manage-indexing.webm`, `duplicates.png`, `query-highlight.png` — into
   `packaging/captures/` (gitignored). It builds the GUI with the `capture`

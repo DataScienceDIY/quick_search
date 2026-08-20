@@ -44,6 +44,13 @@
 //! as a FAILED row with a reason, the normal shape of head-based
 //! classification.
 
+/// How much of a file the charset detector is shown.
+///
+/// chardetng scores byte frequencies against a model per encoding; the answer
+/// stops moving well inside this. Reading further is a second full pass over
+/// the file for no change in the verdict.
+const DETECT_PREFIX: usize = 64 * 1024;
+
 use std::path::Path;
 
 enum TextClass {
@@ -134,7 +141,14 @@ pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
             // ISO-2022-JP detection is safe here: the browser caveat about
             // it concerns script-running web content, not indexed files.
             let mut det = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
-            det.feed(&bytes, true);
+            // A prefix, not the whole file. The detector is scoring byte
+            // frequencies against per-encoding models, and those converge in
+            // kilobytes — feeding it a 200 MiB log costs a full extra pass
+            // over it to reach the same answer. `last` stays false because
+            // there may be more: it only tells the detector this is not the
+            // end of the input, which is exactly right for a prefix.
+            let prefix = &bytes[..bytes.len().min(DETECT_PREFIX)];
+            det.feed(prefix, prefix.len() == bytes.len());
             // Deny UTF-8: strict UTF-8 was already ruled out, so a UTF-8
             // guess could only mean malformed UTF-8.
             let enc = det.guess(None, chardetng::Utf8Detection::Deny);
@@ -234,6 +248,38 @@ mod tests {
             !looks_like_text(&body),
             "the sniff must not adopt a non-UTF-8 head on its own"
         );
+        assert_eq!(
+            decode_text(body, &p()).unwrap(),
+            "Le café près de la fenêtre est agréable en été."
+        );
+    }
+
+    /// Detection reads a bounded prefix, so a file far larger than it still
+    /// decodes as the encoding its head implies — and the tail is decoded in
+    /// full regardless, since only the *detector*'s input is bounded.
+    #[test]
+    fn detection_prefix_is_bounded_and_the_tail_still_decodes() {
+        let head = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9. ";
+        let mut body = Vec::new();
+        while body.len() < DETECT_PREFIX * 3 {
+            body.extend_from_slice(head);
+        }
+        // A marker past the detector's window: it must survive the decode.
+        body.extend_from_slice(b"caf\xe9-tail-marker");
+        let out = decode_text(body, &p()).unwrap();
+        assert!(
+            out.ends_with("café-tail-marker"),
+            "the tail past the detection prefix must still be decoded"
+        );
+        assert!(out.starts_with("Le café près"), "got {:?}", &out[..24]);
+    }
+
+    /// The prefix bound must not change the verdict for a file smaller than
+    /// it — the whole buffer is still what the detector sees.
+    #[test]
+    fn detection_prefix_leaves_short_files_alone() {
+        let body = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9.".to_vec();
+        assert!(body.len() < DETECT_PREFIX);
         assert_eq!(
             decode_text(body, &p()).unwrap(),
             "Le café près de la fenêtre est agréable en été."

@@ -5,12 +5,23 @@
 //! plaintext extractor in [`super::Registry::default_set`], because
 //! plaintext claims every `text/*` and would otherwise swallow `text/rtf`
 //! and index the control-word noise raw.
+//!
+//! `rtf-parser` resolves to `vendor/rtf-parser`, a patched copy — its lexer
+//! ended a control word at whitespace and nowhere else, which silently dropped
+//! text from documents LibreOffice and Word produce. The `[patch.crates-io]`
+//! note in the workspace manifest is where that is written up; the tests below
+//! and `tests/extraction_corpus.rs` are what keep it fixed.
 
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use rtf_parser::document::RtfDocument;
 
 use super::{ExtractError, ExtractedContent, Extractor};
+
+/// Ceiling on a single read; see [`super::plaintext`], same reasoning.
+const MAX_READ: usize = 64 * 1024 * 1024;
 
 /// Parse a complete RTF file's bytes. Shared by both entry points so
 /// on-disk and already-in-memory extraction cannot drift apart.
@@ -29,15 +40,28 @@ fn parse(bytes: Vec<u8>, path: &Path) -> Result<ExtractedContent, ExtractError> 
 
 pub struct RtfExtractor;
 
+/// Read at most `cap` bytes of `path`.
+///
+/// Bounded rather than `fs::read`: the size gate that admitted this file was
+/// applied to what the walk recorded, and the file may have grown since.
+/// `rtf-parser` also amplifies its input several-fold in heap, so an unbounded
+/// read here is unbounded twice over.
+fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, ExtractError> {
+    let file = File::open(path).map_err(|e| format!("rtf read {}: {}", path.display(), e))?;
+    let mut bytes = Vec::new();
+    file.take(cap)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("rtf read {}: {}", path.display(), e))?;
+    Ok(bytes)
+}
+
 impl Extractor for RtfExtractor {
     fn supports(&self, mime: &str) -> bool {
         mime == "application/rtf" || mime == "text/rtf"
     }
 
     fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError> {
-        let bytes =
-            std::fs::read(path).map_err(|e| format!("rtf read {}: {}", path.display(), e))?;
-        parse(bytes, path)
+        parse(read_capped(path, MAX_READ as u64)?, path)
     }
 
     /// RTF has no trailer and needs no seeking, so a head that is the whole
@@ -83,19 +107,29 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// A `\\u` escape naming a lone UTF-16 surrogate must fail the file, not
-    /// the thread.
+    /// A `\\u` escape naming a lone UTF-16 surrogate costs one character, not
+    /// the document and not the thread.
     ///
-    /// `rtf-parser` reaches `String::from_utf16(..).unwrap()` with whatever
-    /// `\\uN` supplied, and screens nothing for the surrogate range. RTF is one
-    /// of the two extractors that also run at *walk* time, off
-    /// `extract_from_head`, where a panicking worker costs the root its entire
-    /// content pass and disables stale cleanup run-wide — so this is contained
-    /// in `decide_content` and `prepare_file_record` rather than left to the
-    /// parser. Both entry points are exercised here.
+    /// `rtf-parser` reached `String::from_utf16(..).unwrap()` with whatever
+    /// `\\uN` supplied and screened nothing for the surrogate range, so a
+    /// fifteen-byte document could panic. RTF is one of the two extractors that
+    /// also run at *walk* time, off `extract_from_head`, where a panicking
+    /// worker costs the root its entire content pass and disables stale
+    /// cleanup run-wide — so the panic was contained in `decide_content` and
+    /// `prepare_file_record`, and the file recorded as FAILED.
+    ///
+    /// `vendor/rtf-parser` decodes lossily instead (LOCAL PATCH, see
+    /// `Parser::flush_unicode`), which beats either outcome: the bad escape
+    /// becomes one `U+FFFD` and the rest of the document is indexed. Both
+    /// entry points are still exercised, because the containment above them
+    /// has to keep working for every other way a parser can panic.
     #[test]
-    fn a_lone_surrogate_escape_is_contained() {
-        let body = br"{\rtf1\u55296 }";
+    fn a_lone_surrogate_escape_costs_one_character() {
+        // `\u55296` is a high surrogate with no low half to follow it. The `?`
+        // is its ANSI fallback, written the way a real producer writes one —
+        // spelled with a space delimiter instead, the `a` of `after` would be
+        // the fallback and would correctly be eaten.
+        let body = "{\\rtf1\\ansi before \\u55296?after}".as_bytes();
         let p = tmp("surrogate", body);
 
         // The on-disk path, as the content pass reaches it.
@@ -105,28 +139,53 @@ mod tests {
             &crate::extract::Registry::default_set(),
             &crate::config::Config::default(),
         );
+        let text = match &outcome {
+            crate::file_handling::ContentOutcome::Done { text } => text.clone(),
+            other => panic!("a malformed escape must not fail the document: {other:?}"),
+        };
         assert!(
-            matches!(outcome, crate::file_handling::ContentOutcome::Failed(_)),
-            "a panicking parser must record a failure, not unwind: {:?}",
-            outcome
+            text.contains("before") && text.contains("after"),
+            "the rest of the document must survive: {text:?}"
+        );
+        assert!(
+            text.contains('\u{FFFD}'),
+            "the bad escape must leave a replacement character: {text:?}"
         );
 
-        // And the head path, as a walk worker reaches it: through the
-        // registry, which is where the containment lives. The raw
-        // `RtfExtractor::extract_from_head` below it still panics — that is
-        // third-party code doing what it does, and the point is that no
-        // caller in this crate is exposed to it.
+        // And the head path, as a walk worker reaches it: through the registry,
+        // which is where the containment for any *other* panicking input lives.
         let head = crate::extract::Registry::default_set().extract_complete_head(
             &p,
             "application/rtf",
             body,
         );
-        assert!(
-            matches!(head, Some(Err(_))),
-            "a panicking parser must be charged to the file, not the worker: {:?}",
-            head.map(|r| r.map(|c| c.text))
+        assert_eq!(
+            head.expect("claimed").expect("parsed").text,
+            text,
+            "head and disk extraction must agree"
         );
 
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// `\\par` ends a paragraph, so it has to reach the text as a line break.
+    ///
+    /// It used to emit nothing, and every paragraph boundary closed up:
+    /// a LibreOffice document came back as `...do eiusmod.The needle...`.
+    /// No text was lost, but the join invents word and sentence boundaries
+    /// that are not in the document — which a snippet then shows to the user,
+    /// and which a phrase query can match across. Fixed in
+    /// `vendor/rtf-parser` (LOCAL PATCH), alongside `\\line`, which always
+    /// did the right thing.
+    #[test]
+    fn paragraph_breaks_reach_the_text() {
+        let body = br"{\rtf1\ansi First paragraph.\par Second paragraph.\par}";
+        let p = tmp("par", body);
+        let text = RtfExtractor.extract(&p).unwrap().text;
+        assert!(
+            text.contains("First paragraph.\nSecond paragraph."),
+            "paragraphs ran together: {text:?}"
+        );
         std::fs::remove_file(&p).ok();
     }
 
@@ -151,5 +210,31 @@ mod tests {
         assert!(e.supports("text/rtf"));
         assert!(!e.supports("text/plain"));
         assert!(!e.supports("application/pdf"));
+    }
+
+    /// `rtf-parser` amplifies its input several-fold in heap, so the read that
+    /// feeds it has to be bounded independently of what the walk recorded.
+    #[test]
+    fn a_read_stops_at_the_cap() {
+        let body = vec![b'x'; 4096];
+        let p = tmp("cap", &body);
+        assert_eq!(
+            read_capped(&p, 100).unwrap().len(),
+            100,
+            "read past the cap"
+        );
+        assert_eq!(
+            read_capped(&p, MAX_READ as u64).unwrap().len(),
+            4096,
+            "a file under the cap must be read whole"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error_naming_it() {
+        let p = crate::testutil::scratch_dir("rtf-missing").join("nope.rtf");
+        let err = read_capped(&p, MAX_READ as u64).unwrap_err();
+        assert!(err.contains(&p.display().to_string()), "{err}");
     }
 }

@@ -5,9 +5,17 @@
 //! (insertion / deletion / substitution); the u64 bit-parallel update costs
 //! O(k) word ops per haystack byte with zero allocations.
 //!
-//! Callers fold both sides to ASCII lowercase first (the pipeline-wide
-//! convention). Patterns are limited to 64 bytes by the machine word; the
-//! cascade skips fuzzy stages for longer terms.
+//! Matching is **ASCII-case-insensitive, in the automaton itself**: the mask
+//! table sets a bit for both cases of every pattern byte, so neither side needs
+//! folding first. That is not a convenience — it is what lets the whole-table
+//! fuzzy passes run. Folding the haystack meant a `to_ascii_lowercase()` per
+//! scanned filename *and* per scanned path, and, in the full-text pass, a
+//! complete copy-and-fold of every stored document on every keystroke. Bytes
+//! above 0x7F are untouched by ASCII folding, so setting both cases in the mask
+//! accepts exactly what folding both sides accepted.
+//!
+//! Patterns are limited to 64 bytes by the machine word; the cascade skips
+//! fuzzy stages for longer terms.
 
 /// Registers the automaton needs: one per error count `0..=k`.
 ///
@@ -19,7 +27,7 @@
 const MAX_REGISTERS: usize = 22;
 
 pub struct Bitap {
-    /// `masks[c]` has bit `i` set iff `pattern[i] == c`.
+    /// `masks[c]` has bit `i` set iff `pattern[i] == c` ignoring ASCII case.
     masks: [u64; 256],
     /// The same table for the *reversed* pattern, which is what lets
     /// [`Bitap::match_start`] find where a match began by scanning backwards
@@ -35,6 +43,11 @@ impl Bitap {
     /// `None` when the pattern is empty, longer than 64 bytes, or the edit
     /// budget does not fit the registers (`reset` shifts by `k`, and the
     /// register array holds [`MAX_REGISTERS`]).
+    ///
+    /// The pattern need not be folded: each byte's bit is set under **both**
+    /// ASCII cases, which is what makes the automaton case-insensitive and the
+    /// haystack fold unnecessary. For a byte that is not an ASCII letter the
+    /// two cases are the same byte and the second write is a no-op.
     pub fn new(pattern: &[u8], k: usize) -> Option<Bitap> {
         if pattern.is_empty() || pattern.len() > 64 || k >= MAX_REGISTERS {
             return None;
@@ -42,8 +55,12 @@ impl Bitap {
         let mut masks = [0u64; 256];
         let mut rev_masks = [0u64; 256];
         for (i, &b) in pattern.iter().enumerate() {
-            masks[b as usize] |= 1u64 << i;
-            rev_masks[b as usize] |= 1u64 << (pattern.len() - 1 - i);
+            let (lower, upper) = (b.to_ascii_lowercase(), b.to_ascii_uppercase());
+            let (fwd, rev) = (1u64 << i, 1u64 << (pattern.len() - 1 - i));
+            masks[lower as usize] |= fwd;
+            masks[upper as usize] |= fwd;
+            rev_masks[lower as usize] |= rev;
+            rev_masks[upper as usize] |= rev;
         }
         Some(Bitap {
             masks,
@@ -224,6 +241,70 @@ impl Bitap {
     }
 }
 
+/// Re-exported: the trigram floor is a property of the index, not of fuzzy
+/// matching, and the regex prefilter applies the same one. See
+/// [`crate::search::prefilter`].
+pub use super::prefilter::TRIGRAM_FLOOR;
+
+/// Split `term` into `k + 1` consecutive chunks of at least [`TRIGRAM_FLOOR`]
+/// characters each, for the fuzzy full-text pass's candidate prefilter.
+/// `None` when the term is too short to divide that way.
+///
+/// # Why this is a sound prefilter
+///
+/// The chunks **partition** the term: consecutive, disjoint, and together the
+/// whole of it. Suppose the term occurs somewhere in a document within `k`
+/// edits. Each edit falls inside at most one chunk, so at most `k` of the
+/// `k + 1` chunks are touched — and therefore at least one chunk survives
+/// *verbatim* in the document. Asking the index for "any document containing
+/// chunk 1, or chunk 2, … " is consequently a **superset** of the documents the
+/// pass can accept, and narrowing to it cannot lose a hit. It can admit
+/// documents that do not match at all, which is harmless: every candidate is
+/// still verified by the bitap scan that follows.
+///
+/// The partition is what makes it work, so it must stay one. Chunks that
+/// overlapped, or that skipped part of the term, would let `k` edits damage
+/// every chunk and the argument would collapse silently — as a search that
+/// quietly stops finding things.
+///
+/// # Why the floor, and why chars rather than bytes
+///
+/// Below `3 * (k + 1)` characters some chunk would be shorter than a trigram
+/// and match no token at all, turning the "superset" into an empty set. There
+/// is no prefilter for such a term and the caller must scan; that is what
+/// `None` says. Note this is reachable only when `fuzzy_max_edits` *binds* —
+/// [`edit_budget`]'s own ladder gives one edit per three characters, so a term
+/// long enough for `k` edits by length alone is never long enough to split.
+///
+/// Splitting on characters, not bytes: a byte split can land inside a UTF-8
+/// sequence, and the halves would be handed to FTS5 as phrases that no longer
+/// spell anything the tokenizer indexed.
+pub fn pigeonhole_chunks(term: &str, k: usize) -> Option<Vec<&str>> {
+    let chunks = k + 1;
+    let total = term.chars().count();
+    if total < TRIGRAM_FLOOR * chunks {
+        return None;
+    }
+    // Char-boundary offsets, plus the end, so a chunk can be sliced by
+    // character index without re-walking the string per chunk.
+    let mut bounds: Vec<usize> = term.char_indices().map(|(at, _)| at).collect();
+    bounds.push(term.len());
+
+    // The remainder is spread one character at a time over the leading chunks
+    // rather than dumped on the last, so no chunk is left near the floor while
+    // another is long. Every chunk is a candidate; the shortest is the weakest
+    // filter, so the useful thing is to keep the shortest as long as possible.
+    let (base, extra) = (total / chunks, total % chunks);
+    let mut out = Vec::with_capacity(chunks);
+    let mut start = 0usize;
+    for i in 0..chunks {
+        let end = start + base + usize::from(i < extra);
+        out.push(&term[bounds[start]..bounds[end]]);
+        start = end;
+    }
+    Some(out)
+}
+
 /// The cascade's edit-distance budget for a folded term: one edit per
 /// three characters, capped by `[search].fuzzy_max_edits`. Terms outside
 /// 3..=64 bytes skip the fuzzy stages entirely (< 3 is noise, > 64 exceeds
@@ -267,6 +348,35 @@ mod tests {
             .best_distance_and_first(hay.as_bytes())
             .expect("the pattern occurs");
         &hay[s..e]
+    }
+
+    /// The property that removes the fold from every caller: a pattern and a
+    /// haystack that differ only in case match at distance zero, with neither
+    /// side lowercased first.
+    #[test]
+    fn case_is_free_without_folding_either_side() {
+        assert_eq!(best("HELLO", "say hello world", 2), Some(0));
+        assert_eq!(best("hello", "say HELLO world", 2), Some(0));
+        assert_eq!(best("HeLLo", "say hEllO world", 0), Some(0));
+        // A case difference is not an edit, so the budget stays available for
+        // real ones: one substitution on top of four case flips still fits k=1.
+        assert_eq!(best("hello", "say HeXLO world", 1), Some(1));
+        // And the marked span is the occurrence as it appears in the haystack.
+        assert_eq!(marked("QUARTZITE", "the quartzite slab", 2), "quartzite");
+        assert_eq!(marked_best("quartzite", "the QUARTZITE slab", 2), "QUARTZITE");
+    }
+
+    /// Non-ASCII bytes are untouched by ASCII case folding, so setting both
+    /// cases in the mask cannot make two different multi-byte characters
+    /// collide.
+    #[test]
+    fn non_ascii_bytes_are_not_folded_together() {
+        // 'é' is 0xC3 0xA9 and 'É' is 0xC3 0x89 — distinct byte sequences that
+        // ASCII folding leaves distinct. The second byte differs, so this is
+        // one substitution, not a free case flip.
+        assert_eq!(best("café", "le café", 0), Some(0));
+        assert_eq!(best("café", "le CAFÉ", 0), None, "É is not a fold of é");
+        assert_eq!(best("café", "le CAFÉ", 1), Some(1), "and costs one edit");
     }
 
     #[test]
@@ -511,6 +621,11 @@ mod tests {
 
     /// Brute-force oracle: minimum Levenshtein distance between `pattern`
     /// and any substring of `hay`, capped at k.
+    ///
+    /// Compares **ignoring ASCII case**, matching the automaton: the mask table
+    /// sets both cases of every pattern byte, so a case difference is not an
+    /// edit. On an all-lowercase alphabet this is identical to an exact
+    /// comparison, so the older cases below are unaffected by the fold.
     fn oracle(pattern: &[u8], hay: &[u8], k: usize) -> Option<usize> {
         // An occurrence must end at some text position; empty text has none.
         // Without this, k >= pattern-length "matches" empty text by deleting
@@ -528,7 +643,11 @@ mod tests {
         for i in 1..=m {
             cur[0] = i;
             for j in 1..=hay.len() {
-                let cost = if pattern[i - 1] == hay[j - 1] { 0 } else { 1 };
+                let cost = if pattern[i - 1].eq_ignore_ascii_case(&hay[j - 1]) {
+                    0
+                } else {
+                    1
+                };
                 cur[j] = (prev[j - 1] + cost).min(prev[j] + 1).min(cur[j - 1] + 1);
             }
             std::mem::swap(&mut prev, &mut cur);
@@ -553,7 +672,10 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) as usize
         };
-        let alphabet = b"abcx";
+        // Mixed case on both sides, which is the whole point: the matcher folds
+        // in its mask table rather than having its haystack folded for it, and
+        // an alphabet of one case could never tell the two apart.
+        let alphabet = b"abcxABCX";
         for _ in 0..500 {
             let plen = 3 + rng() % 6;
             let hlen = rng() % 20;

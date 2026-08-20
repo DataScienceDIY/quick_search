@@ -9,6 +9,77 @@ fn tmp_path() -> std::path::PathBuf {
     crate::testutil::scratch_dir("repo").join("index.sqlite")
 }
 
+/// `set_content_done_fresh` skips the pre-delete, so the whole of its safety is
+/// the caller's claim that the row is clean. This pins both halves of that:
+/// the fast path leaves exactly one FTS row where it is used correctly, and the
+/// ordinary entry point still repairs a row that *does* carry content.
+///
+/// A duplicate `searchabletext` row is the failure this guards. It surfaces as
+/// a file appearing twice in full-text results, not as an error, so nothing
+/// else in the suite would necessarily notice.
+#[test]
+fn the_fresh_content_write_leaves_exactly_one_fts_row() {
+    fn new_file(name: &str, mtime: u64) -> NewFile<'_> {
+        NewFile {
+            name,
+            parent: "/d/",
+            size: 10,
+            mtime,
+            mime: Some("text/plain"),
+            ftype: crate::mime::FileType::TEXT,
+            hash: None,
+            needs_content: true,
+        }
+    }
+    fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+    fn matches(conn: &rusqlite::Connection, term: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH ?1",
+            [term],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    let path = tmp_path();
+    let mut conn = open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+
+    let tx = conn.transaction().unwrap();
+    // The insert path: a row that has never had content.
+    let id = insert_file(&tx, &new_file("a.txt", 1)).unwrap().unwrap();
+    set_content_done_fresh(&tx, id, "sphinx quartz", zstd_of("sphinx quartz").as_deref()).unwrap();
+
+    // The update path: `update_file_basic` clears the content, so the fresh
+    // write that follows is writing into an empty slot — the exact sequence
+    // `process_batch_updates` performs.
+    let same = update_file_basic(&tx, &new_file("a.txt", 2)).unwrap().unwrap();
+    assert_eq!(same, id, "the same row");
+    set_content_done_fresh(&tx, id, "sphinx onyx", zstd_of("sphinx onyx").as_deref()).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM searchabletext"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents_text"), 1);
+    assert_eq!(matches(&conn, "onyx"), 1, "the new body is searchable");
+    assert_eq!(matches(&conn, "quartz"), 0, "the old body is gone");
+
+    // And the idempotent entry point still repairs a row that really does hold
+    // content — writing over the top of a DONE row with no update first, which
+    // is what the content pass and the watcher do.
+    let tx = conn.transaction().unwrap();
+    set_content_done(&tx, id, "sphinx jasper", zstd_of("sphinx jasper").as_deref()).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM searchabletext"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents_text"), 1);
+    assert_eq!(matches(&conn, "jasper"), 1);
+    assert_eq!(matches(&conn, "onyx"), 0);
+
+    drop(conn);
+    std::fs::remove_file(&path).ok();
+}
+
 /// The size report reads each body's uncompressed length out of its zstd
 /// frame header instead of from a stored column, which works only because
 /// [`DocEncoder`] compresses through `ZSTD_compress2` — the API that is

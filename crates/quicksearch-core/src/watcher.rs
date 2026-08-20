@@ -622,8 +622,19 @@ fn watch_if_new_dir(ctx: &LoopCtx, path: &Path) {
         return;
     }
     // Files are reported through their parent's watch; only directories
-    // need one of their own.
-    if !path.is_dir() {
+    // need one of their own. `symlink_metadata` rather than `is_dir` so a
+    // symlink to a directory is judged as the link it is: when following is
+    // off the walk will not descend it, and watching it would spend
+    // descriptors reporting events for a subtree that is never indexed. When
+    // following is on it is a directory as far as everything else is
+    // concerned, so fall back to the followed answer.
+    let is_dir = match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => ctx.filters.follow_symlinks && path.is_dir(),
+        Ok(md) => md.is_dir(),
+        // Raced with a delete, or unreadable: nothing to register.
+        Err(_) => return,
+    };
+    if !is_dir {
         return;
     }
     if !is_event_interesting(ctx, path) {

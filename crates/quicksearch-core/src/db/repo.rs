@@ -184,7 +184,38 @@ pub fn set_content_done(
     text_zstd: Option<&[u8]>,
 ) -> Result<(), String> {
     remove_content_for_id(tx, file_id)?;
+    set_content_done_fresh(tx, file_id, text, text_zstd)
+}
 
+/// [`set_content_done`] for a row that **provably holds no content yet**,
+/// skipping the pre-delete.
+///
+/// The two statements `remove_content_for_id` issues are not free: one is a
+/// tombstoning delete on a contentless FTS5 table, and both run inside the
+/// writer's transaction with the shared connection held. For a row that cannot
+/// have content they are pure overhead, and the indexer hit them on nearly
+/// every file it wrote:
+///
+/// * a row `insert_file` has just created has no `searchabletext` or
+///   `documents_text` row by construction;
+/// * a row [`update_file_basic`] has just written has had its content removed
+///   **by that call**, so `set_content_done` was deleting it a second time.
+///
+/// Both paths run for every file small enough for the walk to extract inline
+/// (`hash_length`, 8 KiB by default), which on a source tree is most of it.
+///
+/// Use [`set_content_done`] wherever the row's prior state is not known — the
+/// content pass writing a row that may have been extracted before, the watcher,
+/// anything reached from a config reconcile. Getting this wrong leaves a
+/// duplicate FTS entry rather than a visible error, so the rule is: skip the
+/// delete only where the *same transaction* has already established there is
+/// nothing there.
+pub fn set_content_done_fresh(
+    tx: &Transaction<'_>,
+    file_id: i64,
+    text: &str,
+    text_zstd: Option<&[u8]>,
+) -> Result<(), String> {
     // Contentless FTS5 still accepts values on INSERT — the tokenizer needs
     // them — it simply doesn't persist the raw column values.
     exec(
@@ -265,7 +296,15 @@ impl DocDecoder {
         // settles at the largest document in the scan within the first few
         // rows, after which decoding a row allocates nothing at all.
         if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(blob) {
-            self.buf.reserve(usize::try_from(size).ok()?);
+            // Clamped: `size` is a `u64` read straight out of the frame
+            // header, so a corrupt or hostile blob can ask for terabytes here
+            // and `reserve` answers an impossible request by aborting the
+            // process, not by failing. The doubling loop below already treats
+            // `MAX_DOC_CAPACITY` as the point past which a frame is corrupt
+            // rather than merely large, so a clamped reservation that then
+            // fails to decompress returns `None` through the same path.
+            self.buf
+                .reserve(usize::try_from(size).ok()?.min(MAX_DOC_CAPACITY));
         }
         loop {
             if self.buf.capacity() == 0 {
@@ -949,9 +988,50 @@ pub fn maintain(conn: &Connection, db_dir: &str) -> Result<bool, String> {
     // matter, so it is close to free on a run that changed little.
     conn.execute_batch("PRAGMA optimize;")
         .map_err(|e| format!("optimize: {}", e))?;
+    note_optimized(db_dir);
 
     checkpoint_truncate(conn)?;
     Ok(vacuumed)
+}
+
+/// How many times `PRAGMA optimize` has been accepted by SQLite, per index
+/// directory.
+///
+/// Keyed by directory rather than counted globally because the test binaries
+/// run their `#[test]` functions on concurrent threads against separate scratch
+/// indexes; a single counter would let one test's maintenance satisfy another
+/// test's assertion. Bounded by the number of distinct indexes a process opens,
+/// which outside the tests is one.
+static OPTIMIZED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Record that the pragma above returned `Ok` for `db_dir`.
+fn note_optimized(db_dir: &str) {
+    *crate::lock_ok(&OPTIMIZED)
+        .entry(db_dir.to_string())
+        .or_insert(0) += 1;
+}
+
+/// How many times the index in `db_dir` has had `PRAGMA optimize` run against
+/// it in this process.
+///
+/// Exists so a test can ask *whether the optimize pass happened* rather than
+/// trying to catch [`crate::indexing::IndexingStatus::Optimizing`] as it goes
+/// past. That distinction is the whole point: the status is a sample of a
+/// transient state, and the faster the pass gets the less often a poller sees
+/// it — so a test written that way fails more as the code improves, which is
+/// exactly backwards. This is a latch, so it cannot be missed however quickly
+/// the pass runs.
+///
+/// It records that the statement was handed to SQLite and accepted, not what
+/// SQLite then chose to do with it — `PRAGMA optimize` is deliberately a no-op
+/// when no table has drifted far enough to be worth re-analysing, so there is
+/// no observable side effect to assert on instead.
+pub fn optimize_count(db_dir: &str) -> u64 {
+    crate::lock_ok(&OPTIMIZED)
+        .get(db_dir)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Read the `last_full_index` marker (unix seconds of the last *successful*

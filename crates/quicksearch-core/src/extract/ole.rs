@@ -172,9 +172,31 @@ mod doc {
             .ok_or("CLX runs past the end of the table stream")?;
         let pieces = piece_table(clx)?;
 
+        let out = decode_pieces(&doc, &pieces, MAX_TEXT_BYTES);
+        if out.trim().is_empty() {
+            return Err("no text found in the piece table".into());
+        }
+        Ok(out)
+    }
+
+    /// Decode `pieces` out of the document stream, stopping at `budget`.
+    ///
+    /// Two budgets, because the output one cannot bound the input. `clean`
+    /// drops the whole C0 range, so a piece of control bytes decodes at full
+    /// width and appends nothing — leaving a brake on `out.len()` that never
+    /// advances. And nothing requires pieces to be disjoint or ordered: each
+    /// names its own `fc`, so a table can point every piece at the same span,
+    /// and a 2 MiB file can name tens of GiB of decoding. Charging the bytes
+    /// actually read bounds both the repetition and the merely enormous
+    /// document.
+    ///
+    /// `budget` is a parameter so a test can trip it without building a file
+    /// the size of the real one.
+    pub(super) fn decode_pieces(doc: &[u8], pieces: &[Piece], budget: usize) -> String {
         let mut out = String::new();
+        let mut decoded = 0usize;
         for piece in pieces {
-            if out.len() >= MAX_TEXT_BYTES {
+            if out.len() >= budget || decoded >= budget {
                 break;
             }
             let Some(bytes) = doc.get(piece.start..piece.end) else {
@@ -183,6 +205,7 @@ mod doc {
                 // a recoverable document.
                 break;
             };
+            decoded = decoded.saturating_add(bytes.len());
             let text = if piece.compressed {
                 cp1252(bytes)
             } else {
@@ -190,10 +213,7 @@ mod doc {
             };
             clean(&text, &mut out);
         }
-        if out.trim().is_empty() {
-            return Err("no text found in the piece table".into());
-        }
-        Ok(out)
+        out
     }
 
     /// Walk the FIB's variable-length sections to find `fcClx`/`lcbClx`.
@@ -223,10 +243,10 @@ mod doc {
     }
 
     /// One run of characters in the `WordDocument` stream.
-    struct Piece {
-        start: usize,
-        end: usize,
-        compressed: bool,
+    pub(super) struct Piece {
+        pub(super) start: usize,
+        pub(super) end: usize,
+        pub(super) compressed: bool,
     }
 
     /// Locate the `Pcdt` inside the CLX and decode its `PlcPcd`.
@@ -333,14 +353,40 @@ mod xls {
         let book = stream(cfb, "Workbook")
             .or_else(|| stream(cfb, "Book"))
             .ok_or("no Workbook stream")?;
+        extract_from_book(&book, MAX_TEXT_BYTES)
+    }
 
-        let records = split_records(&book);
+    /// The workbook stream's text, stopping at `budget`. Split out from
+    /// [`extract`] so a test can trip the budget without building a file the
+    /// size of the real one.
+    pub(super) fn extract_from_book(book: &[u8], budget: usize) -> Result<String, Box<dyn Error>> {
+        let records = split_records(book);
         let strings = shared_strings(&records);
 
+        let out = decode_cells(&records, &strings, budget);
+        if out.trim().is_empty() {
+            return Err("workbook holds no readable cell text".into());
+        }
+        Ok(out)
+    }
+
+    /// Render every cell-bearing record, stopping at `budget`.
+    ///
+    /// The same two budgets as [`super::doc::decode_pieces`], for the same
+    /// reason: `clean` can consume a whole cell and emit nothing, so a
+    /// workbook whose shared strings are all control characters runs to the
+    /// end of its records with the output brake never advancing — and one
+    /// `LABELSST` is six bytes, so a small file holds a great many of them,
+    /// each free to name the same 64 KiB shared string.
+    ///
+    /// `budget` is a parameter so a test can trip it without building a file
+    /// the size of the real one.
+    fn decode_cells(records: &[Record<'_>], strings: &[String], budget: usize) -> String {
         let mut out = String::new();
         let mut row_open = false;
-        for rec in &records {
-            if out.len() >= MAX_TEXT_BYTES {
+        let mut decoded = 0usize;
+        for rec in records {
+            if out.len() >= budget || decoded >= budget {
                 break;
             }
             let cell = match rec.id {
@@ -363,6 +409,7 @@ mod xls {
                 _ => None,
             };
             if let Some(text) = cell {
+                decoded = decoded.saturating_add(text.len());
                 clean(&text, &mut out);
                 out.push(' ');
                 row_open = true;
@@ -371,10 +418,7 @@ mod xls {
         if row_open {
             out.push('\n');
         }
-        if out.trim().is_empty() {
-            return Err("workbook holds no readable cell text".into());
-        }
-        Ok(out)
+        out
     }
 
     struct Record<'a> {
