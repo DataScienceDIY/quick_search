@@ -57,6 +57,39 @@ fn decode(bytes: Vec<u8>, path: &Path) -> Result<ExtractedContent, ExtractError>
 
 pub struct PlaintextExtractor;
 
+/// Ceiling on a single read, whatever the file claims.
+///
+/// Not a policy about what is worth indexing — `maximum_text_file_size` is
+/// that, and it is applied to the size the walk saw. This is the backstop for
+/// the gap between those two moments, and for a node whose `fstat` lies.
+const MAX_READ: usize = 64 * 1024 * 1024;
+
+/// Read `size` bytes from `f`, never more than `cap`.
+///
+/// The cap is the point of the function. The gate that got this file here is
+/// `maximum_text_file_size` against the size the *walk* recorded, which on a
+/// large tree was minutes or hours ago; `size` is from the `fstat` just now. A
+/// file that grew since — a log, a cloud placeholder that hydrated — would
+/// otherwise be allocated and read in full, and the decode afterwards can take
+/// three times that again.
+///
+/// A short read is not an error: a file that shrank keeps its prefix.
+fn read_sized(f: &mut File, size: usize, cap: usize, path: &Path) -> Result<Vec<u8>, ExtractError> {
+    let size = size.min(cap);
+    let mut buf = vec![0u8; size];
+    let mut filled = 0;
+    while filled < size {
+        match f.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(format!("plaintext read {}: {}", path.display(), e)),
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
 impl Extractor for PlaintextExtractor {
     fn supports(&self, mime: &str) -> bool {
         mime.starts_with("text/") || EXTRA_TEXT_MIMES.contains(&mime)
@@ -83,26 +116,14 @@ impl Extractor for PlaintextExtractor {
         // before anyway. Capped so a node that streams forever (a FIFO, a
         // lying filesystem) cannot allocate without bound.
         if size == 0 {
-            const MAX_UNSIZED_READ: u64 = 64 * 1024 * 1024;
             let mut buf = Vec::new();
-            f.take(MAX_UNSIZED_READ)
+            f.take(MAX_READ as u64)
                 .read_to_end(&mut buf)
                 .map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
             return decode(buf, path);
         }
 
-        let mut buf = vec![0u8; size];
-        let mut filled = 0;
-        while filled < size {
-            match f.read(&mut buf[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(format!("plaintext read {}: {}", path.display(), e)),
-            }
-        }
-        buf.truncate(filled);
-        decode(buf, path)
+        decode(read_sized(&mut f, size, MAX_READ, path)?, path)
     }
 
     fn extract_from_head(
@@ -282,5 +303,39 @@ mod tests {
         assert!(!e.supports("application/rtf"));
         assert!(!e.supports("application/pdf"));
         assert!(!e.supports("image/png"));
+    }
+
+    /// The cap is what stands between a file that grew since the walk sized
+    /// it — a log, a cloud placeholder that hydrated — and an allocation the
+    /// size of whatever it grew to.
+    #[test]
+    fn a_sized_read_stops_at_the_cap() {
+        let body = vec![b'x'; 4096];
+        let p = tmp("cap", &body);
+        let mut f = File::open(&p).unwrap();
+        let out = read_sized(&mut f, body.len(), 100, &p).unwrap();
+        assert_eq!(out.len(), 100, "read past the cap");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// A file that *shrank* between the `fstat` and the read keeps its prefix
+    /// rather than failing: the next run reclassifies it anyway.
+    #[test]
+    fn a_short_read_keeps_what_was_there() {
+        let p = tmp("short", b"only ten!!");
+        let mut f = File::open(&p).unwrap();
+        let out = read_sized(&mut f, 1_000_000, MAX_READ, &p).unwrap();
+        assert_eq!(out, b"only ten!!");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Under a cap larger than the file, nothing changes.
+    #[test]
+    fn a_file_under_the_cap_is_read_whole() {
+        let body = vec![b'y'; 4096];
+        let p = tmp("uncapped", &body);
+        let out = PlaintextExtractor.extract(&p).unwrap();
+        assert_eq!(out.text.len(), 4096);
+        std::fs::remove_file(&p).ok();
     }
 }

@@ -5,6 +5,138 @@ fn new_tab() -> SearchTab {
     SearchTab::new(false, ColumnsConfig::default(), true)
 }
 
+/// A tab whose rows all carry a **content** snippet, so the Content Match
+/// column renders through `centered_match_job` rather than falling back to its
+/// dash. That cell is the expensive one — it measures glyph advances across the
+/// window to centre the match — so a render benchmark without it measures the
+/// cheap half of the table.
+fn tab_with_content_snippets(n: usize) -> SearchTab {
+    let mut tab = new_tab();
+    tab.query = "quartzite".into();
+    tab.focus_query = false;
+    // A full-width window with the match in the middle, as the cascade cuts
+    // them: `SNIPPET_WINDOW_CHARS` is 600.
+    let filler = "lorem ipsum dolor sit amet consectetur ";
+    let head = filler.repeat(8);
+    let tail = filler.repeat(8);
+    let window = format!("{head}quartzite{tail}");
+    let at = head.len();
+    tab.results = (0..n)
+        .map(|i| SearchHit {
+            file_id: i as i64,
+            name: format!("alpha_widget_{i}.txt"),
+            path: format!("/qs-test/deeply/nested/directory/tree/alpha_widget_{i}.txt"),
+            size: 116,
+            mtime: 1_700_000_000,
+            rank: 6.0,
+            stage: 6,
+            snippet: Some(Snippet {
+                window: window.clone(),
+                ranges: vec![(at, at + "quartzite".len())],
+                truncated_start: true,
+                truncated_end: true,
+            }),
+        })
+        .collect();
+    tab.order = (0..n as u32).collect();
+    tab
+}
+
+/// One frame with no input and no assertions — `run_frame` checks every glyph,
+/// which is right for a correctness test and wrong for a timing one.
+fn timed_frame(ctx: &egui::Context, tab: &mut SearchTab) {
+    let input = crate::test_ui::raw_input(egui::vec2(1400.0, 900.0), Vec::new());
+    ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            tab.ui(ui);
+        });
+    });
+}
+
+/// What a frame of the results table costs, printed rather than asserted.
+///
+/// The table virtualizes, so the row count barely matters — what is measured is
+/// the per-*visible*-row cost, which is where the Content Match and Path cells
+/// re-measure their text against the column width on every frame.
+///
+/// # What it says, and the change it argued against
+///
+/// At 1400x900, three runs agreeing:
+///
+/// | | per frame | attributable to rows |
+/// |---|---:|---:|
+/// | empty tab | 14.4 µs | — |
+/// | 1000 rows, name only | 306 µs | 292 µs |
+/// | 1000 rows, content snippets | 615 µs | 601 µs |
+///
+/// So the Content Match column roughly doubles the cost of a row, and it is
+/// the one cell that walks its text character by character asking the font for
+/// glyph advances. That was enough to propose memoizing the computed cut per
+/// row, keyed by column width and font.
+///
+/// **The measurement says not to.** A 60 fps frame is 16,600 µs and the whole
+/// table is 615 of them — under 4%. Halving the content cells would buy 0.9% of
+/// a frame, in exchange for a cache that has to be invalidated on resize, on
+/// theme change, and on every live-result update, which is three chances to
+/// paint a stale highlight to save nothing anybody can see.
+///
+/// The reason the loops are cheaper than they look is that they stop early:
+/// `fits_within` gives up at the first character past the budget, so a 600-byte
+/// window costs about as many glyph lookups as the column is wide, not 600.
+///
+/// Re-read this before optimizing the row renderer. If the numbers above have
+/// grown — a much taller viewport, a wider Content Match column, or per-frame
+/// work added to a cell — the conclusion is worth revisiting; the harness is
+/// here so that is a measurement rather than an argument.
+///
+/// Gated so `cargo test` does not pay for it:
+///
+/// ```text
+/// QSB_RENDER_PERF=1 cargo test --release -p quicksearch-gui -- render_perf --nocapture
+/// ```
+#[test]
+fn render_perf() {
+    if std::env::var("QSB_RENDER_PERF").is_err() {
+        eprintln!("skipping: set QSB_RENDER_PERF=1 to run");
+        return;
+    }
+    const FRAMES: u32 = 300;
+    let ctx = crate::test_ui::ctx();
+
+    // An empty tab is the floor: the query strip, the panel, egui's own
+    // per-frame work. Subtracting it is what turns the loaded figure into a
+    // statement about the *rows*, which is the only part this code controls.
+    let mut cases: Vec<(&str, std::time::Duration)> = Vec::new();
+    for (label, mut tab) in [
+        ("empty (floor)", new_tab()),
+        ("1000 rows, name only", tab_with_results(1000)),
+        ("1000 rows, content snippets", tab_with_content_snippets(1000)),
+    ] {
+        // Warm the galley cache and settle the column widths; the first frames
+        // of a table are a sizing pass and are not what a scrolling user pays.
+        for _ in 0..10 {
+            timed_frame(&ctx, &mut tab);
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..FRAMES {
+            timed_frame(&ctx, &mut tab);
+        }
+        cases.push((label, start.elapsed() / FRAMES));
+    }
+
+    let floor = cases[0].1;
+    for (label, each) in &cases {
+        println!(
+            "{:<30} {:>9.1?}/frame   rows cost {:>9.1?}   ({:.0} fps ceiling)",
+            label,
+            each,
+            each.saturating_sub(floor),
+            1.0 / each.as_secs_f64(),
+        );
+    }
+    println!("\n(a 60 fps budget is 16.6 ms; the table virtualizes, so this is per *visible* row)");
+}
+
 fn tab_with_results(n: usize) -> SearchTab {
     let mut tab = new_tab();
     tab.query = "alpha".into();

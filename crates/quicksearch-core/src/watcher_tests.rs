@@ -585,3 +585,40 @@ fn a_created_ignored_directory_is_not_watched() {
     w.stop();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Registration must not follow a symlinked directory when the indexer will
+/// not: every descriptor spent there reports events for a subtree that gets
+/// discarded on arrival, and on Linux the watch budget is a shared kernel
+/// resource.
+#[test]
+#[cfg(unix)]
+fn a_symlinked_directory_is_not_registered_when_following_is_off() {
+    let dir = tmp_dir("symlink-reg");
+    std::fs::create_dir_all(dir.join("real/nested")).unwrap();
+    let outside = tmp_dir("symlink-reg-target");
+    std::fs::create_dir_all(outside.join("deep")).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+
+    let w = Watcher::start(
+        std::iter::once(&dir),
+        default_filters(),
+        fast_config(),
+        sink_to_vec().0,
+    )
+    .unwrap();
+
+    // root + real + real/nested. The link and everything under it cost
+    // nothing.
+    assert_eq!(
+        w.watched_dirs(),
+        if crate::platform::WATCH_ROOTS_RECURSIVELY {
+            1
+        } else {
+            3
+        },
+        "the symlinked directory must not be registered"
+    );
+    drop(w);
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&outside).ok();
+}

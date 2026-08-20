@@ -29,6 +29,7 @@
 pub mod cascade;
 pub mod duplicates;
 pub mod fuzzy;
+pub mod prefilter;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

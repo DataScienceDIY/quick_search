@@ -336,17 +336,92 @@ fn key_mismatch_message(db_path: &str, had_key: bool) -> String {
 /// True iff the DB has a `schema_info` table whose `version` equals
 /// [`CURRENT_SCHEMA_VERSION`]. Ignores the tokenizer — that's only the
 /// owner's concern.
-fn schema_version_current(conn: &Connection) -> Result<bool, String> {
-    let has_info: bool = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_info'",
-            [],
-            |_| Ok(true),
+/// Prefix tagging the "this file is not a QuickSearch index" refusal, so a
+/// caller can tell it from the schema drift that legitimately rebuilds.
+pub const FOREIGN_DB_PREFIX: &str = "FOREIGN_DB: ";
+
+/// Tables left behind by the pre-`schema_info` layout, which is the only kind
+/// of index of ours that [`has_our_schema_info`] cannot recognise.
+///
+/// `files` is the only one guaranteed present across those layouts, and it is
+/// the loose end here: another application's database with a table called
+/// `files` would still be taken for an ancient index of ours and wiped.
+/// Refusing a genuine legacy index is the worse failure of the two, so it
+/// stays — narrowed by the fact that anything with a `schema_info` of our
+/// shape is already decided before this list is consulted.
+const LEGACY_TABLES: &[&str] = &["files", "files_fts", "documents_text", "failed_files"];
+
+/// Whether `schema_info` exists *and* is shaped like ours.
+///
+/// The shape, not the contents: preparing the statement succeeds only if the
+/// table has both columns, and an index whose creation was interrupted before
+/// the version row landed is still ours. A foreign database that happens to
+/// use the name for something else is not.
+fn has_our_schema_info(conn: &Connection) -> bool {
+    conn.prepare("SELECT key, value FROM schema_info").is_ok()
+}
+
+/// Whether the file is one of ours, or empty enough to become one.
+///
+/// `sqlite_master` is empty for a file SQLite has just created and for a
+/// zero-length one, which is the "ours to create" case. Internal `sqlite_%`
+/// names are excluded so an autoindex or a stat table cannot make an
+/// otherwise-empty file look occupied.
+fn is_ours_or_empty(conn: &Connection) -> Result<bool, String> {
+    if has_our_schema_info(conn) {
+        return Ok(true);
+    }
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+        .map_err(|e| format!("read sqlite_master: {}", e))?;
+    let mut any = false;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("read sqlite_master: {}", e))?;
+    for name in names {
+        let name = name.map_err(|e| format!("read sqlite_master: {}", e))?;
+        any = true;
+        if LEGACY_TABLES.contains(&name.as_str()) {
+            return Ok(true);
+        }
+    }
+    Ok(!any)
+}
+
+/// The refusal message, naming a few of the tables that are in the way so the
+/// user can recognise whose file they pointed at.
+fn foreign_database_message(conn: &Connection) -> Result<String, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             ORDER BY name LIMIT 4",
         )
-        .optional()
-        .map_err(|e| format!("sqlite_master schema_info: {}", e))?
-        .unwrap_or(false);
-    if !has_info {
+        .map_err(|e| format!("read sqlite_master: {}", e))?;
+    let names: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("read sqlite_master: {}", e))?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(format!(
+        "{}the file is a SQLite database, but not a QuickSearch index \
+         (it holds {}). Refusing to replace it — point [paths] database_path \
+         somewhere else, or move that file away first.",
+        FOREIGN_DB_PREFIX,
+        if names.is_empty() {
+            "tables this program does not recognise".to_string()
+        } else {
+            names.join(", ")
+        }
+    ))
+}
+
+fn schema_version_current(conn: &Connection) -> Result<bool, String> {
+    // The shape check rather than a name lookup: a table called `schema_info`
+    // with other columns belongs to some other program, and reading `value`
+    // out of it would fail the open with a SQL error instead of the refusal
+    // the caller can act on.
+    if !has_our_schema_info(conn) {
         return Ok(false);
     }
 
@@ -365,6 +440,17 @@ fn schema_version_current(conn: &Connection) -> Result<bool, String> {
 /// effective-tokenizer string this caller asked for.
 fn db_matches_current(conn: &Connection, tokenizer: &str) -> Result<bool, String> {
     if !schema_version_current(conn)? {
+        // Refuse rather than wipe unless the file is recognisably ours. The
+        // wipe policy is about replacing an index this program wrote under an
+        // older layout, and `database_path` is a free-text field with no
+        // picker and no confirmation — a typo naming some other
+        // application's SQLite file would otherwise delete it, and its `-wal`
+        // and `-shm` with it, on the next indexing run. An older layout of
+        // ours still wipes, and so does a file with no tables at all, which
+        // is ours to create.
+        if !is_ours_or_empty(conn)? {
+            return Err(foreign_database_message(conn)?);
+        }
         return Ok(false);
     }
 

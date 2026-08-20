@@ -102,6 +102,20 @@ fn upsert_path(
     {
         return Ok(Applied::Done);
     }
+    // Symlink-aware, and checked before the followed `metadata` below: with
+    // following off the walk will not descend a symlinked directory nor
+    // record a symlinked file, so neither may this. It is not merely
+    // redundant work — `prepare_file_record_from_path` canonicalizes, so a
+    // followed link whose target lies outside every root writes a row no
+    // sweep range covers, and nothing but a rebuild clears it.
+    if !config.indexing.follow_symlinks {
+        match std::fs::symlink_metadata(path) {
+            Ok(md) if md.file_type().is_symlink() => return Ok(Applied::Done),
+            // Already gone again — the pending Remove event handles it.
+            Err(_) => return Ok(Applied::Done),
+            Ok(_) => {}
+        }
+    }
     let Ok(meta) = std::fs::metadata(path) else {
         // Already gone again — the pending Remove event handles it.
         return Ok(Applied::Done);
@@ -778,5 +792,74 @@ mod tests {
         let canonical = f.canonical(&p);
         let (_, _, content_state) = f.row(&canonical).unwrap();
         assert_eq!(content_state, repo::STATE_NA);
+    }
+
+    /// `follow_symlinks = false` means the walk will not descend a symlinked
+    /// directory, and the live path must agree. It used to disagree twice
+    /// over: `metadata` follows, so the link read as a directory, and
+    /// `prepare_file_record_from_path` canonicalizes before storing — so a
+    /// target outside every root produced rows under the target's real path
+    /// that no sweep range covers. Nothing but a rebuild cleared them.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_directory_is_not_followed_when_following_is_off() {
+        let mut f = Fixture::new();
+        assert!(
+            !f.config.indexing.follow_symlinks,
+            "the default this test is about"
+        );
+
+        // A tree outside every configured root, and a link to it inside one.
+        let outside = crate::testutil::scratch_dir("incr-outside");
+        std::fs::write(outside.join("secret.txt"), "content out of scope").unwrap();
+        let link = f.dir.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        f.apply(&FsEvent::Create(link.clone()));
+        assert_eq!(
+            f.counts(),
+            (0, 0, 0),
+            "nothing under the link may be indexed"
+        );
+
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// The same for a symlinked *file*: canonicalization would file it under
+    /// the target's path, which is outside the root that produced the event.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_file_is_not_indexed_when_following_is_off() {
+        let mut f = Fixture::new();
+        let outside = crate::testutil::scratch_dir("incr-outside-file");
+        let target = outside.join("target.txt");
+        std::fs::write(&target, "content out of scope").unwrap();
+        let link = f.dir.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        f.apply(&FsEvent::Create(link.clone()));
+        assert_eq!(f.counts(), (0, 0, 0), "the link must not be indexed");
+
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// With following on, the link is indexed — under the target's real path,
+    /// which is what canonicalization has always done. This is the other half
+    /// of the guard: it must gate on the setting, not refuse symlinks outright.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_file_is_indexed_when_following_is_on() {
+        let mut f = Fixture::new();
+        f.config.indexing.follow_symlinks = true;
+        let target = f.write("target.txt", "greetings earthling");
+        let link = f.dir.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        f.apply(&FsEvent::Create(link.clone()));
+        let canonical = f.canonical(&target);
+        assert!(
+            f.row(&canonical).is_some(),
+            "the link should have indexed its target"
+        );
     }
 }

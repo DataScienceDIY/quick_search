@@ -535,6 +535,13 @@ impl Config {
             let mut cfg: Config = toml::from_str(&content)
                 .map_err(|e| format!("Failed to parse config file {}: {}", path.display(), e))?;
             cfg.source = Some(path.to_path_buf());
+            // Before anything reads a value — and in particular before
+            // `config_check` compares `hash_length` against what the index was
+            // built with, or a clamp applied later would read as a changed
+            // setting and force a rebuild.
+            for warning in cfg.clamp_out_of_range() {
+                crate::log_warn!("config: {}", warning);
+            }
             Ok(cfg)
         } else {
             let cfg = Config {
@@ -544,6 +551,70 @@ impl Config {
             cfg.save()?;
             Ok(cfg)
         }
+    }
+
+    /// Bring values that would break the program back into range, returning a
+    /// line about each one changed.
+    ///
+    /// Clamps, never rejects: this file is hand-editable and a typo in it must
+    /// not stop the app starting, the same position `main.rs` takes on a file
+    /// that will not parse at all. Only the fields that are *not* already
+    /// defended where they are used appear here — `results_per_page`,
+    /// `root_workers`, `ui.scale`, `maximum_wal_size`, `batch_size` and
+    /// `reindex_interval_minutes` all clamp at their call sites, and doing it
+    /// twice would just be two places to disagree.
+    fn clamp_out_of_range(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut clamp = |name: &str, value: &mut u64, lo: u64, hi: u64| {
+            let bounded = (*value).clamp(lo, hi);
+            if bounded != *value {
+                warnings.push(format!(
+                    "{} is {}, which is out of range; using {}",
+                    name, *value, bounded
+                ));
+                *value = bounded;
+            }
+        };
+
+        // Zero means every search returns nothing at all: `cascade::run`
+        // computes `remaining()` as zero and stops before its first pass, and
+        // reports the empty result as truncated.
+        let mut display_limit = self.search.display_limit as u64;
+        clamp("[search] display_limit", &mut display_limit, 1, 1_000_000);
+        self.search.display_limit = display_limit as usize;
+
+        // The last ceiling on how much an extractor reads: the extractors cap
+        // a single read, but this is what decides which files they open at all.
+        clamp(
+            "[processing] maximum_text_file_size",
+            &mut self.processing.maximum_text_file_size,
+            1,
+            4 * 1024 * 1024 * 1024,
+        );
+
+        // Below 262 bytes `infer`'s longest magic-number matcher cannot run,
+        // so file types stop being detectable by content; above a megabyte the
+        // walk's per-file head buffer stops being a head.
+        let mut hash_length = self.processing.hash_length as u64;
+        clamp(
+            "[processing] hash_length",
+            &mut hash_length,
+            262,
+            1024 * 1024,
+        );
+        self.processing.hash_length = hash_length as usize;
+
+        // The writer's round-robin turn. Unbounded, one root holds the writer
+        // for as long as it likes and every other root's walk waits behind it;
+        // zero is meaningful (one quantum per turn) and stays legal.
+        clamp(
+            "[processing] writer_turn_slice_ms",
+            &mut self.processing.writer_turn_slice_ms,
+            0,
+            10_000,
+        );
+
+        warnings
     }
 
     /// Write back to the file this config was loaded from (or the default

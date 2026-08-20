@@ -203,7 +203,12 @@ CREATE TABLE files (
 -- occupies — rather than restoring the covering one.
 CREATE UNIQUE INDEX idx_files_parent ON files(parent, name);
 CREATE INDEX idx_files_mtime  ON files(mtime);
-CREATE INDEX idx_files_type   ON files(type);
+-- No index on `type`. The only query that touches it is the kind filter's
+-- `(f.type & ?) != 0` (`crate::query::translator`), and a bitmask test on the
+-- left of the operator is not sargable, so SQLite scans regardless — nothing
+-- can seek such an index and nothing orders or groups by the column. Carrying
+-- one measured ~10% on inserts and 805 pages at 300k rows, and those pages
+-- compete with the ones search wants resident.
 CREATE INDEX idx_files_mime   ON files(mime);
 CREATE INDEX idx_files_hash   ON files(hash);
 CREATE INDEX idx_files_content_pending ON files(id) WHERE content_state = 0;

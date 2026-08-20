@@ -4,11 +4,11 @@ members = [
     "crates/quicksearch-core",
     "crates/quicksearch-gui",
 ]
-# `vendor/pdf-extract` is deliberately NOT a member: it is a third-party crate
-# carried here for one patch, not part of this workspace's lints, tests or
+# The `vendor/` crates are deliberately NOT members: they are third-party code
+# carried here for a patch each, not part of this workspace's lints, tests or
 # release profile. `[patch.crates-io]` below is what makes the dependency graph
-# resolve to it.
-exclude = ["vendor/pdf-extract"]
+# resolve to them.
+exclude = ["vendor/pdf-extract", "vendor/rtf-parser"]
 
 # pdf-extract 0.12.0, with the two unbounded recursions in it bounded.
 #
@@ -27,11 +27,53 @@ exclude = ["vendor/pdf-extract"]
 # keeps meaning what it means, and the cross-compile job needs no new host.
 # The patch is marked LOCAL PATCH in the source and is upstreamable; the crate
 # is MIT and the copy is recorded in `packaging/copyright`.
+# rtf-parser 0.4.3, with its lexer taught where an RTF control word ends.
+#
+# The format's rule is that a control word runs `\` plus letters plus an
+# optional numeric parameter, and ends at the first character that is neither —
+# a space if there is one, which is swallowed as the delimiter, otherwise
+# whatever that character is, which is *not* swallowed. The crate's lexer ends
+# it at whitespace and nothing else. Two consequences, both of which lose
+# indexed text silently rather than failing the file:
+#
+#   * A `\uN` escape is followed by an ANSI fallback character for readers that
+#     predate Unicode, and the spec lets that be any character. `\u233?after`
+#     lexes as one unrecognised control word, so the character *and the rest of
+#     the word* vanish. LibreOffice writes `\uN\'3f` and dodges it; a literal
+#     `?` is just as legal and just as common.
+#   * After a `\'hh` escape the lexer re-tokenises the remainder and trims its
+#     leading spaces before classifying it. A remainder that is plain text
+#     keeps them; one that begins with another escape does not. So two adjacent
+#     words made entirely of escapes come back joined — `Καλημέρα κόσμε` as
+#     `Καλημέρακόσμε`, one FTS term where there were two. That reproduces on a
+#     file LibreOffice wrote, and it hits every script outside cp1252.
+#
+# Both were found by `tests/extraction_corpus.rs`, which is also what pins them
+# fixed. A third patch replaces the two production `unwrap()`s in the parser:
+# `String::from_utf16` on whatever `\uN` supplied panicked on a lone surrogate,
+# and RTF is one of the two formats that also extract at *walk* time, where a
+# panicking worker costs the root its whole content pass. That file now costs
+# one replacement character instead of the whole document.
+#
+# One behaviour change is not a bug fix and is worth knowing about. Fixing the
+# first bug leaves the ANSI fallback character sitting in the token stream as
+# ordinary text, so the parser now counts fallbacks off against `\ucN` the way
+# the specification says, rather than recognising only the `\'hh` spelling by
+# guesswork. A document that writes `\u233 text` — space delimiter, no
+# fallback, no `\uc0` — therefore loses the `t`, which is what Word does with
+# that document too. It used to keep it.
+#
+# Vendored for the same reasons pdf-extract is, below: the build stays offline,
+# `--locked` keeps meaning what it means, and the cross-compile job needs no
+# new host. 0.4.3 is the latest release, so there is no upgrade to wait for.
+# The patches are marked LOCAL PATCH in the source and are upstreamable; the
+# crate is MIT and the copy is recorded in `packaging/copyright`.
 [patch.crates-io]
 pdf-extract = { path = "vendor/pdf-extract" }
+rtf-parser = { path = "vendor/rtf-parser" }
 
 [workspace.package]
-version = "1.1.2"
+version = "1.1.3"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Jeremy <jeremy@karsttech.com>"]

@@ -564,6 +564,78 @@ fn limit_truncates_and_flags() {
     std::fs::remove_file(&p).ok();
 }
 
+/// Exactly `limit` results is a complete answer, not a cut one.
+///
+/// `remaining()` reaches zero at the pass boundary either way, so the outer
+/// loop used to set `limited` there on its way out — surfacing as the CLI's
+/// "(truncated at N results; raise with --limit)" and the GUI's equivalent
+/// over a result set that had dropped nothing. `flush_pass` is the authority:
+/// it sets the flag when it actually truncates.
+///
+/// Three under a limit of three is the case that isolates it: the first hit
+/// flushes immediately, leaving room for two, and the pass ends with exactly
+/// those two buffered — so nothing truncates, nothing breaks mid-scan, and
+/// only the between-pass test could have raised the flag. See
+/// [`filling_the_limit_mid_pass_still_reports_truncated`] for the boundary
+/// this does not reach.
+#[test]
+fn exactly_the_limit_is_not_reported_as_truncated() {
+    let p = tmp_db("limit-exact");
+    let mut s = Seeder::new(&p, true);
+    for i in 0..3 {
+        s.add(&format!("match-{:02}.txt", i), "/d", 1, None);
+    }
+    let conn = s.done();
+
+    let options = SearchOptions {
+        limit: 3,
+        ..SearchOptions::default()
+    };
+    let (hits, outcome) = run_collect(&conn, "match", &options);
+    assert_eq!(hits.len(), 3);
+    assert_eq!(outcome.total, 3);
+    assert!(
+        !outcome.limited,
+        "3 matches under a limit of 3 dropped nothing"
+    );
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// The boundary the fix above deliberately does *not* cover, pinned so it is
+/// a known shape rather than a surprise.
+///
+/// A limit of one is filled by the first hit of the first pass — and the first
+/// batch of a pass flushes the moment there is anything to send, so `total`
+/// reaches the limit while the scan is still running. The scan then breaks
+/// with rows unexamined, and `cut_short` reports that honestly as "there may
+/// be more", which here there was not. Distinguishing the two costs a row
+/// scanned past the limit in every pass that fills it — a document decompress,
+/// fold and snippet on the full-text passes — which is not worth paying on
+/// every keystroke to correct a message.
+#[test]
+fn filling_the_limit_mid_pass_still_reports_truncated() {
+    let p = tmp_db("limit-one");
+    let mut s = Seeder::new(&p, true);
+    s.add("match.txt", "/d", 1, None);
+    let conn = s.done();
+
+    let options = SearchOptions {
+        limit: 1,
+        ..SearchOptions::default()
+    };
+    let (hits, outcome) = run_collect(&conn, "match", &options);
+    assert_eq!(hits.len(), 1);
+    assert!(
+        outcome.limited,
+        "a scan that stopped with rows unexamined says so"
+    );
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
 /// Stopping at the limit must not cost a result that belongs in it.
 ///
 /// The scan breaks out as soon as the display limit is full, which is what
@@ -832,6 +904,100 @@ fn wildcard_with_short_segments_falls_back_to_a_full_scan() {
             .map(|h| (h.file_id, h.stage))
             .collect::<Vec<_>>(),
         vec![(hit, 5)]
+    );
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// The `LIKE` prefilter a straddling wildcard now gets must be a *superset* of
+/// what the classifier accepts, or real hits vanish silently — the failure mode
+/// with no symptom. Rather than assert a hand-written expected set, this seeds
+/// rows that exercise every way a segment can sit across `parent || name` and
+/// checks the prefiltered pass against the unfiltered one.
+///
+/// The unfiltered side is obtained by asking for a pattern whose segments all
+/// contain a separator, which is the arm that still scans — so both sides run
+/// through the real cascade and no test-only code path is involved.
+#[test]
+fn a_wildcard_prefilter_never_loses_a_hit_the_full_scan_finds() {
+    let p = tmp_db("wildprefilter");
+    let mut s = Seeder::new(&p, true);
+    // A segment wholly inside the name.
+    let in_name = s.add("report-q3.txt", "/data", 1, None);
+    // A segment wholly inside the parent.
+    let in_parent = s.add("a.bin", "/reports/q3", 2, None);
+    // The pattern's `%` spanning the parent/name boundary: `rep` is in the
+    // directory, `q3` in the file name.
+    let across = s.add("q3.txt", "/reports", 3, None);
+    // A name that only matches once case is folded.
+    let folded = s.add("REPORT-Q3.TXT", "/upper", 4, None);
+    // A near miss that must not be admitted by either path.
+    let _miss = s.add("summary.txt", "/data", 5, None);
+    // The trap the separator-free rule exists for: the only way to read this
+    // row as a match spans the boundary, and the spanning text contains the
+    // separator itself.
+    let boundary = s.add("q3.txt", "/x/rep", 6, None);
+    // The row that makes the separator-free rule load-bearing rather than
+    // decorative. Against `e/pq*txt` the longest segment is `e/pq`, which
+    // occurs in `parent || name` **only across the join** — `/a/re/` does not
+    // contain it and `pq.txt` does not either. Anchoring on it would drop this
+    // row, so the rule has to reject it and fall to `txt`.
+    let straddling = s.add("pq.txt", "/a/re", 7, None);
+    let conn = s.done();
+
+    let opts = SearchOptions::default();
+    for query in ["rep*q3", "rep*rt", "*report*", "re*or*q3", "e/pq*txt"] {
+        let (hits, _) = run_collect(&conn, query, &opts);
+        let mut got: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
+        got.sort();
+
+        // The same query with every segment forced to carry a separator would
+        // change what matches, so the reference set is computed directly: a row
+        // is expected exactly when the compiled pattern matches its name or its
+        // full path, which is what the classifier tests.
+        let split = split_for_cascade(query).unwrap();
+        let mut want: Vec<i64> = [
+            (in_name, "/data/report-q3.txt"),
+            (in_parent, "/reports/q3/a.bin"),
+            (across, "/reports/q3.txt"),
+            (folded, "/upper/REPORT-Q3.TXT"),
+            (_miss, "/data/summary.txt"),
+            (boundary, "/x/rep/q3.txt"),
+            (straddling, "/a/re/pq.txt"),
+        ]
+        .iter()
+        .filter(|(_, path)| {
+            let name = path.rsplit('/').next().unwrap();
+            split.pattern.find_first(name, true).is_some()
+                || split.pattern.find_first(path, true).is_some()
+        })
+        .map(|(id, _)| *id)
+        .collect();
+        want.sort();
+
+        assert_eq!(got, want, "query {:?}", query);
+    }
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// A pattern every segment of which carries a separator has nothing to anchor
+/// on, so the pass falls back to scanning — and must still find its hits.
+#[test]
+fn a_wildcard_with_only_separator_segments_still_scans_and_matches() {
+    let p = tmp_db("wildnoanchor");
+    let mut s = Seeder::new(&p, true);
+    let hit = s.add("q3.txt", "/a/reports", 1, None);
+    let _miss = s.add("q3.txt", "/a/summaries", 2, None);
+    let conn = s.done();
+
+    // Segments are "a/rep" and "rts/" — both contain a separator.
+    let (hits, _) = run_collect(&conn, "a/rep*rts/", &SearchOptions::default());
+    assert_eq!(
+        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        vec![hit]
     );
 
     drop(conn);

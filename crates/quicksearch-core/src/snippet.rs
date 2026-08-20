@@ -55,35 +55,102 @@ impl Snippet {
 /// [`extract`] against a haystack the caller has already ASCII-folded.
 /// `folded` must be `text.to_ascii_lowercase()` — the fold is byte-length
 /// preserving, which is what lets offsets found in it slice the original.
-pub fn extract_folded(text: &str, folded: &str, terms: &[&str], opts: &Options) -> Snippet {
+///
+/// Returns the window together with **how many occurrences it found**, before
+/// touching ranges are coalesced. For a single term that number is exactly
+/// what [`count_occurrences`] against `folded` would return, which is what
+/// lets the full-text pass take its case-insensitive count from here instead
+/// of sweeping the body a second time to compute it.
+///
+/// Blank terms are dropped, but a term that merely *has* surrounding
+/// whitespace is searched as given: trimming it here would count and
+/// highlight a different string than the pattern's own counters do.
+pub fn extract_folded(
+    text: &str,
+    folded: &str,
+    terms: &[&str],
+    opts: &Options,
+) -> (Snippet, usize) {
     debug_assert_eq!(folded.len(), text.len(), "ASCII folding preserves length");
     if text.is_empty() {
-        return Snippet::empty();
+        return (Snippet::empty(), 0);
     }
     let effective_terms: Vec<&str> = terms
         .iter()
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
+        .copied()
+        .filter(|t| !t.trim().is_empty())
         .collect();
     if effective_terms.is_empty() {
-        return head_window(text, opts.approx_chars);
+        return (head_window(text, opts.approx_chars), 0);
     }
 
     // `memmem` rather than `str::match_indices`: both find non-overlapping
     // occurrences, but std's Two-Way searcher has no vector prefilter and a
     // full-text row scans a whole document body. See `benches/search.rs`,
     // group `substring`.
+    // The count has to see every occurrence, so the walk runs to the end of the
+    // body either way. What does *not* have to happen is keeping them: the
+    // window is fixed by the first match, and everything starting past its
+    // right edge is discarded a few lines below. Storing them all meant a `Vec`
+    // proportional to the match count and then a sort over it — for a term
+    // occurring thousands of times in one file, which is an ordinary minified
+    // bundle or log, that is hundreds of kilobytes and an O(n log n) sort per
+    // candidate row, to render a 600-byte window.
+    //
+    // Bounded only for a single term, which is every caller the cascade makes
+    // (`cascade::text_snippet` passes one). With several, two different terms
+    // can coalesce across the edge and no single-pass bound sees it, so they
+    // are collected in full rather than approximately.
+    let pre_pad = opts.approx_chars / 3;
+    let bounded = effective_terms.len() == 1;
     let mut matches: Vec<(usize, usize)> = Vec::new();
+    let mut found = 0usize;
+    // The right edge, once the first match has fixed it. Computed exactly as
+    // the window is computed below, so "kept" and "rendered" cannot disagree.
+    let mut keep_below: Option<usize> = None;
+
     for term in &effective_terms {
-        let pattern = term.to_ascii_lowercase();
-        matches.extend(
-            memchr::memmem::find_iter(folded.as_bytes(), pattern.as_bytes())
-                .map(|at| (at, at + pattern.len())),
-        );
+        // Borrow when the term is already folded, which is the case for every
+        // call the search cascade makes: this runs once per candidate row, and
+        // an unconditional `to_ascii_lowercase` is an allocation per row to
+        // rebuild a string the pattern already holds.
+        let pattern: std::borrow::Cow<'_, str> = if term.bytes().any(|b| b.is_ascii_uppercase()) {
+            std::borrow::Cow::Owned(term.to_ascii_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(*term)
+        };
+        // The end of the last kept match, so a chain of touching occurrences
+        // (`abab…` for term `ab`) that starts inside the window and continues
+        // past it stays intact — `coalesce_overlapping` merges those, and the
+        // expansion step below is entitled to follow the merged range out.
+        let mut chain_end = 0usize;
+        for at in memchr::memmem::find_iter(folded.as_bytes(), pattern.as_bytes()) {
+            // Before any dropping: this is the occurrence count, and two
+            // occurrences that happen to abut are two hits for ranking even
+            // though they are one highlight for painting.
+            found += 1;
+            if bounded {
+                let bound = *keep_below.get_or_insert_with(|| {
+                    let mut end = (at.saturating_sub(pre_pad) + opts.approx_chars).min(text.len());
+                    while end < text.len() && !text.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    end
+                });
+                if at >= bound && at > chain_end {
+                    // Past the edge and not chained to anything kept. Keep
+                    // counting — that is the whole rest of the walk — but stop
+                    // storing.
+                    continue;
+                }
+            }
+            chain_end = at + pattern.len();
+            matches.push((at, chain_end));
+        }
     }
 
     if matches.is_empty() {
-        return head_window(text, opts.approx_chars);
+        return (head_window(text, opts.approx_chars), 0);
     }
 
     matches.sort_by_key(|(a, _)| *a);
@@ -92,7 +159,6 @@ pub fn extract_folded(text: &str, folded: &str, terms: &[&str], opts: &Options) 
     // Pick the window. Start a third of the budget before the first match
     // so the hit isn't pinned to the left edge; round both ends to char
     // boundaries so we never slice a multi-byte UTF-8 sequence.
-    let pre_pad = opts.approx_chars / 3;
     let mut win_start = matches[0].0.saturating_sub(pre_pad);
     let mut win_end = (win_start + opts.approx_chars).min(text.len());
     while win_start > 0 && !text.is_char_boundary(win_start) {
@@ -124,12 +190,15 @@ pub fn extract_folded(text: &str, folded: &str, terms: &[&str], opts: &Options) 
         })
         .collect();
 
-    Snippet {
-        window: text[win_start..win_end].to_string(),
-        ranges,
-        truncated_start: win_start > 0,
-        truncated_end: win_end < text.len(),
-    }
+    (
+        Snippet {
+            window: text[win_start..win_end].to_string(),
+            ranges,
+            truncated_start: win_start > 0,
+            truncated_end: win_end < text.len(),
+        },
+        found,
+    )
 }
 
 /// Clamp `range` into `text` and widen it to the nearest char boundaries.
@@ -275,11 +344,99 @@ mod tests {
     /// Production always holds a fold buffer already, so the wrapper earned
     /// nothing; folding here keeps its coverage of the window logic.
     fn extract(text: &str, terms: &[&str], opts: &Options) -> Snippet {
+        extract_folded(text, &text.to_ascii_lowercase(), terms, opts).0
+    }
+
+    /// The occurrence count alongside the window — the half the full-text
+    /// pass consumes.
+    fn extract_counted(text: &str, terms: &[&str], opts: &Options) -> (Snippet, usize) {
         extract_folded(text, &text.to_ascii_lowercase(), terms, opts)
     }
 
     fn opts_small() -> Options {
         Options { approx_chars: 40 }
+    }
+
+    /// The count `extract_folded` hands back is what the full-text pass ranks
+    /// on, so it must be occurrences — not the highlights they coalesce into.
+    #[test]
+    fn extract_folded_counts_occurrences_not_ranges() {
+        let text = "abab and ab";
+        let (s, n) = extract_counted(text, &["ab"], &opts_small());
+        assert_eq!(n, 3, "three occurrences");
+        assert_eq!(
+            n,
+            count_occurrences(text, "ab", true),
+            "must agree with the counter the pass used to call"
+        );
+        assert_eq!(s.ranges.len(), 2, "the abutting pair paints as one range");
+    }
+
+    /// The pass takes `count_folded`'s answer from here now; anything that
+    /// made the two disagree would silently change which rows survive.
+    #[test]
+    fn extract_folded_count_agrees_with_count_occurrences() {
+        let cases: &[(&str, &str)] = &[
+            ("no hits at all", "zzz"),
+            ("one hit here", "hit"),
+            ("Hit hit HIT", "hit"),
+            ("aaaa", "aa"),
+            ("", "x"),
+            ("short", "much longer than the haystack"),
+            ("ünïcode ünïcode", "ünïcode"),
+        ];
+        for (text, term) in cases {
+            let folded = text.to_ascii_lowercase();
+            let (_, n) = extract_folded(text, &folded, &[term], &opts_small());
+            assert_eq!(
+                n,
+                count_occurrences(&folded, &term.to_ascii_lowercase(), true),
+                "count mismatch for {:?} in {:?}",
+                term,
+                text
+            );
+        }
+    }
+
+    /// An uppercase needle takes the owning branch of the fold; a needle that
+    /// is already folded takes the borrowing one. Both must find the same
+    /// matches, since the whole point of the borrow is that it changes
+    /// nothing but the allocation.
+    #[test]
+    fn extract_folded_needle_case_does_not_change_matches() {
+        let text = "The Needle and the needle";
+        let folded = text.to_ascii_lowercase();
+        let (upper, n_upper) = extract_folded(text, &folded, &["Needle"], &opts_small());
+        let (lower, n_lower) = extract_folded(text, &folded, &["needle"], &opts_small());
+        assert_eq!(n_upper, 2);
+        assert_eq!(n_upper, n_lower);
+        assert_eq!(upper.ranges, lower.ranges);
+        assert_eq!(upper.window, lower.window);
+    }
+
+    /// A blank term is dropped rather than searched: an empty needle matches
+    /// at every byte offset, which would rank a document by its length.
+    #[test]
+    fn extract_folded_ignores_blank_terms() {
+        let text = "some text";
+        let folded = text.to_ascii_lowercase();
+        for term in ["", "   ", "\t"] {
+            let (s, n) = extract_folded(text, &folded, &[term], &opts_small());
+            assert_eq!(n, 0, "blank term {:?} counted", term);
+            assert!(s.ranges.is_empty(), "blank term {:?} highlighted", term);
+        }
+    }
+
+    /// A term with surrounding space is searched as given. It used to be
+    /// trimmed, which counted and highlighted a different string than the
+    /// pattern's own counters did.
+    #[test]
+    fn extract_folded_does_not_trim_a_padded_term() {
+        let text = "needle needlework";
+        let folded = text.to_ascii_lowercase();
+        let (_, n) = extract_folded(text, &folded, &["needle "], &opts_small());
+        assert_eq!(n, 1, "only the occurrence followed by a space");
+        assert_eq!(n, count_occurrences(&folded, "needle ", true));
     }
 
     /// Every range must be in-bounds, ordered, non-overlapping, and sit on
@@ -297,6 +454,83 @@ mod tests {
 
     fn marked(s: &Snippet) -> Vec<&str> {
         s.ranges.iter().map(|&(a, b)| &s.window[a..b]).collect()
+    }
+
+    /// Occurrences past the window's right edge are counted but not kept, and
+    /// that has to be invisible from the outside.
+    ///
+    /// The count is what the full-text pass ranks on, so it must still see the
+    /// whole body; the ranges are what gets painted, so they must still be
+    /// exactly the occurrences inside the window. A bound that leaked into
+    /// either would be a ranking change or a missing highlight.
+    #[test]
+    fn occurrences_past_the_window_are_counted_but_not_kept() {
+        // 400 occurrences, evenly spread, far more than a 40-byte window holds.
+        let unit = "needle filler filler ";
+        let text = unit.repeat(400);
+        let (snip, found) = extract_counted(&text, &["needle"], &opts_small());
+
+        assert_eq!(found, 400, "every occurrence must still be counted");
+        assert_ranges_valid(&snip);
+        assert!(!snip.ranges.is_empty());
+        assert!(snip.truncated_end, "there is a great deal more body");
+
+        // Every range is a real occurrence, and every occurrence that falls
+        // inside the window has a range.
+        for &(a, b) in &snip.ranges {
+            assert_eq!(&snip.window[a..b], "needle");
+        }
+        let win_at = text.find(&snip.window).expect("the window is a slice of the text");
+        let expected = memchr::memmem::find_iter(text.as_bytes(), b"needle")
+            .filter(|at| *at >= win_at && *at < win_at + snip.window.len())
+            .count();
+        assert_eq!(
+            snip.ranges.len(),
+            expected,
+            "every occurrence inside the window must be marked"
+        );
+    }
+
+    /// The case the chain rule exists for: touching occurrences coalesce into
+    /// one range, and a chain that starts inside the window can run past its
+    /// right edge. Dropping the moment the edge is crossed would cut the
+    /// highlight short.
+    #[test]
+    fn a_coalescing_chain_is_not_cut_at_the_window_edge() {
+        // One unbroken run of `ab`, far longer than the window.
+        let text = "ab".repeat(400);
+        let (snip, found) = extract_counted(&text, &["ab"], &opts_small());
+
+        assert_eq!(found, 400, "non-overlapping occurrences, all counted");
+        assert_ranges_valid(&snip);
+        assert_eq!(snip.ranges.len(), 1, "one chain, one highlight");
+
+        // The load-bearing assertion, and it has to be about the window's
+        // *size*. The whole run coalesces into one range, and the expansion
+        // step then grows the window to cover it — so an unbroken chain
+        // legitimately produces a window the length of the text, not the
+        // 40-byte budget. Dropping the chain rule cuts the run at the budget
+        // and yields a 40-byte window instead, which asserting only
+        // "range == whole window" cannot tell apart, because both are.
+        assert_eq!(
+            snip.window.len(),
+            text.len(),
+            "the window must grow to cover the coalesced run"
+        );
+        assert!(!snip.truncated_end, "nothing is left past a full-length window");
+        assert_eq!(snip.ranges[0], (0, text.len()), "one highlight over the lot");
+    }
+
+    /// Several terms disable the bound, because two different terms can
+    /// coalesce across the edge and a per-term walk cannot see it. Pin that the
+    /// multi-term path still produces the full, correct answer.
+    #[test]
+    fn several_terms_still_coalesce_across_the_edge() {
+        let text = format!("{}{}", "x".repeat(10), "abc".repeat(200));
+        let (snip, found) = extract_counted(&text, &["ab", "bc"], &opts_small());
+        assert_eq!(found, 400, "200 of each term");
+        assert_ranges_valid(&snip);
+        assert_eq!(snip.ranges.len(), 1, "the two terms interleave into one run");
     }
 
     #[test]

@@ -642,3 +642,123 @@ fn maintain_reads_its_pragmas_on_a_keyed_index() {
     drop(conn);
     std::fs::remove_file(&p).ok();
 }
+
+/// `database_path` is a free-text field in Settings with no picker and no
+/// confirmation. A typo naming another application's database used to delete
+/// it — and its `-wal` and `-shm` — on the next indexing run, because "no
+/// `schema_info` table" was read as "an old index of ours".
+#[test]
+fn a_foreign_database_is_refused_not_wiped() {
+    let p = tmp_db_path();
+    {
+        let conn = Connection::open(&p).unwrap();
+        conn.execute(
+            "CREATE TABLE moz_places (id INTEGER PRIMARY KEY, url TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO moz_places(url) VALUES('https://example.invalid/')",
+            [],
+        )
+        .unwrap();
+    }
+    let err = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap_err();
+    assert!(err.starts_with(FOREIGN_DB_PREFIX), "got: {err}");
+    assert!(
+        err.contains("moz_places"),
+        "the message must name what is in the way: {err}"
+    );
+
+    // The row is still there — the point of the whole exercise.
+    let conn = Connection::open(&p).unwrap();
+    let url: String = conn
+        .query_row("SELECT url FROM moz_places", [], |r| r.get(0))
+        .expect("the foreign database must survive intact");
+    assert_eq!(url, "https://example.invalid/");
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// The refusal must not extend to a file that is genuinely ours to create:
+/// an empty database is what SQLite leaves behind for a path nothing has
+/// written yet.
+#[test]
+fn an_empty_database_file_is_still_ours_to_build() {
+    let p = tmp_db_path();
+    // An empty but real SQLite file, header and all.
+    drop(Connection::open(&p).unwrap());
+    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    let v: String = conn
+        .query_row(
+            "SELECT value FROM schema_info WHERE key='version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v, CURRENT_SCHEMA_VERSION.to_string());
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// Each pre-`schema_info` table name marks a file as ours, and so is wiped
+/// rather than refused — the legacy-layout policy depends on exactly that.
+#[test]
+fn a_legacy_table_marks_a_file_as_ours() {
+    for table in LEGACY_TABLES {
+        let p = tmp_db_path();
+        {
+            let conn = Connection::open(&p).unwrap();
+            conn.execute(&format!("CREATE TABLE {} (x INTEGER)", table), [])
+                .unwrap();
+        }
+        let conn = open_or_recreate(p.to_str().unwrap(), "trigram")
+            .unwrap_or_else(|e| panic!("{table} should read as ours, got: {e}"));
+        drop(conn);
+        std::fs::remove_file(&p).ok();
+    }
+}
+
+/// A `schema_info` with our columns but no version row is an index whose
+/// creation was interrupted. It is ours, and rebuilding it is right.
+#[test]
+fn a_schema_info_without_a_version_row_is_still_ours() {
+    let p = tmp_db_path();
+    {
+        let conn = Connection::open(&p).unwrap();
+        conn.execute(
+            "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+    }
+    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").expect("half-built index is ours");
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// A table that merely *shares the name* `schema_info` is not ours. Matching
+/// on the name alone used to fail the open with a raw SQL error about a
+/// missing column, which is neither a refusal the caller can act on nor a
+/// message anyone could act on either.
+#[test]
+fn a_foreign_schema_info_is_refused() {
+    let p = tmp_db_path();
+    {
+        let conn = Connection::open(&p).unwrap();
+        conn.execute("CREATE TABLE schema_info (revision INTEGER)", [])
+            .unwrap();
+        conn.execute("INSERT INTO schema_info(revision) VALUES(3)", [])
+            .unwrap();
+    }
+    let err = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap_err();
+    assert!(err.starts_with(FOREIGN_DB_PREFIX), "got: {err}");
+
+    let conn = Connection::open(&p).unwrap();
+    let revision: i64 = conn
+        .query_row("SELECT revision FROM schema_info", [], |r| r.get(0))
+        .expect("the foreign database must survive intact");
+    assert_eq!(revision, 3);
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}

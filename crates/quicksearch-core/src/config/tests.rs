@@ -1095,3 +1095,61 @@ fn a_tilde_database_path_still_matches_the_real_file() {
     assert!(c.is_index_file(&wal));
     assert!(!c.is_index_file(&absolute.with_file_name("other.sqlite")));
 }
+
+/// `display_limit = 0` makes `cascade::run` compute `remaining()` as zero and
+/// stop before its first pass, so *every* search returns nothing and reports
+/// itself truncated. A hand-editable file must not be able to do that.
+#[test]
+fn out_of_range_numbers_are_clamped_not_rejected() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
+    fs::write(
+        &path,
+        "[search]\ndisplay_limit=0\n\
+         [processing]\nmaximum_text_file_size=0\nhash_length=8\nwriter_turn_slice_ms=18446744073709551615\n",
+    )
+    .unwrap();
+    let cfg = Config::load_from(&path).expect("a bad number must not stop the app starting");
+    assert_eq!(cfg.search.display_limit, 1);
+    assert_eq!(cfg.processing.maximum_text_file_size, 1);
+    assert_eq!(cfg.processing.hash_length, 262);
+    assert_eq!(cfg.processing.writer_turn_slice_ms, 10_000);
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// The clamp must be silent about values that are merely unusual, or the
+/// warning is noise and `hash_length` — which is in `REBUILD_KEYS` — would
+/// read as changed and force a rebuild on every start.
+#[test]
+fn in_range_numbers_are_left_exactly_alone() {
+    let mut cfg = Config::default();
+    let before = cfg.clone();
+    let warnings = cfg.clamp_out_of_range();
+    assert!(warnings.is_empty(), "defaults must not warn: {warnings:?}");
+    assert_eq!(cfg.search.display_limit, before.search.display_limit);
+    assert_eq!(cfg.processing.hash_length, before.processing.hash_length);
+    assert_eq!(
+        cfg.processing.maximum_text_file_size,
+        before.processing.maximum_text_file_size
+    );
+    assert_eq!(
+        cfg.processing.writer_turn_slice_ms,
+        before.processing.writer_turn_slice_ms
+    );
+
+    // Zero is a legal turn slice — one quantum per turn, not "no turn".
+    cfg.processing.writer_turn_slice_ms = 0;
+    assert!(cfg.clamp_out_of_range().is_empty());
+    assert_eq!(cfg.processing.writer_turn_slice_ms, 0);
+}
+
+/// Each clamped field must say so, by name, so the warning is actionable.
+#[test]
+fn a_clamped_field_is_named_in_its_warning() {
+    let mut cfg = Config::default();
+    cfg.search.display_limit = 0;
+    let warnings = cfg.clamp_out_of_range();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("display_limit"), "{warnings:?}");
+    assert!(warnings[0].contains('1'), "{warnings:?}");
+}

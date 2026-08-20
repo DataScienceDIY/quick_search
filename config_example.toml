@@ -21,6 +21,11 @@ indexing_paths = ["~"]
 # backslashes need no escaping, and keep the index out of a roaming
 # profile — it is far too large to synchronise:
 #   database_path = 'C:\Users\you\AppData\Local\quicksearch\index.sqlite'
+#
+# The file here is created if it is missing, and replaced if it is an index
+# from an older layout of QuickSearch's own. A SQLite database belonging to
+# some other program is neither: pointing this at one is refused with an
+# error naming the tables it found, and nothing is deleted.
 database_path = "~/.local/share/quicksearch/index.sqlite"
 
 [indexing]
@@ -107,10 +112,15 @@ ignore_patterns = [".git", "node_modules", "*.tmp", ".venv", "venv"]
 # images: a fixed-size VHD stores its unique footer at the end of the
 # file, and a freshly pre-allocated raw/qcow2/VMDK image is all zeros at
 # the head until it is partitioned.
+#
+# Clamped to 262..1048576 on load: below 262 the longest magic-number
+# matcher cannot run, so file types stop being detectable by content, and
+# above a megabyte the per-file head buffer stops being a head.
 hash_length = 8192
 # Maximum extracted text stored per file (bytes).
 maximum_text_size = 262144
-# Files larger than this skip text extraction entirely (bytes).
+# Files larger than this skip text extraction entirely (bytes). Clamped to
+# 1..4294967296 on load.
 maximum_text_file_size = 2097152
 # Files per batch during walks / inserts / extraction.
 batch_size = 500
@@ -118,7 +128,9 @@ batch_size = 500
 # on (milliseconds). The time half of the knob whose row half is batch_size:
 # it bounds how long one root can hold up the others, so a root extracting
 # large documents cannot leave another root's walkers parked behind it. 0
-# gives each turn one batch_size quantum and no more.
+# gives each turn one batch_size quantum and no more. Clamped to 0..10000
+# on load: unbounded, one root holds the writer for as long as it likes and
+# every other root's walk waits behind it.
 writer_turn_slice_ms = 100
 # Files per transaction for incremental FTS updates.
 fts_update_batch_size = 1000
@@ -203,7 +215,9 @@ fuzzy_default = false
 # the fuzzy stages off. Above 3 is allowed but not recommended: matches
 # become dominated by coincidence and every fuzzy pass slows down.
 fuzzy_max_edits = 2
-# Hard cap on results per search (the GUI's scroll list length).
+# Hard cap on results per search (the GUI's scroll list length). Clamped to
+# 1..1000000 on load: at zero the cascade stops before its first pass, so
+# every search returns nothing and calls the empty answer truncated.
 display_limit = 1000
 # Results per streamed batch (latency/overhead knob, not a page size).
 results_per_page = 100

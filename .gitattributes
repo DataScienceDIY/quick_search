@@ -4,3 +4,14 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.sh  text eol=lf
+
+# The extraction corpus's committed fixtures. `.doc`/`.xls`/`.ppt` are OLE2
+# compound files and `.flac` is an audio stream: an EOL filter applied to any
+# of them corrupts the file, and `text` detection is a heuristic this does not
+# need to rely on. `*.bat` above is `text eol=crlf` crate-wide, which would
+# otherwise catch the `.bat` the corpus generates — but that one is written at
+# test time and never enters git.
+crates/quicksearch-core/tests/fixtures/**/*.doc  binary
+crates/quicksearch-core/tests/fixtures/**/*.xls  binary
+crates/quicksearch-core/tests/fixtures/**/*.ppt  binary
+crates/quicksearch-core/tests/fixtures/**/*.flac binary

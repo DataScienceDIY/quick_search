@@ -116,9 +116,13 @@ fn entity_text(raw: &str) -> Option<String> {
 
 /// Append the text `spec` selects out of `xml` to `out`.
 ///
-/// `in_text` is a flag rather than a depth count, which means a closing
-/// `</text:span>` ends the run even though its enclosing `<text:p>` is still
-/// open.
+/// Text-bearing elements are counted, not flagged. ODF nests them — a
+/// `<text:span>` inside a `<text:p>` — and a flag made the span's own close
+/// end the run, dropping every character between it and the paragraph's
+/// close. Counting also gives the separator somewhere honest to go: it
+/// belongs after a *run*, and since quick-xml 0.41 a run arrives as several
+/// events, so emitting one per event put a space in the middle of every cell
+/// containing an entity.
 fn collect_xml_text(xml: &str, spec: &TextSpec, out: &mut String) -> Result<(), Box<dyn Error>> {
     let mut reader = Reader::from_str(xml);
     // Deliberately no `trim_text`: it trims each *event*, and since 0.41 an
@@ -129,24 +133,23 @@ fn collect_xml_text(xml: &str, spec: &TextSpec, out: &mut String) -> Result<(), 
     // flag is false and is ignored there, and whitespace *inside* a
     // text-bearing element is content.
     let mut buf = Vec::new();
-    let mut in_text = false;
+    // How many text-bearing elements are open. The run ends when it returns
+    // to zero, not when the innermost one closes.
+    let mut depth = 0usize;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 if spec.text.contains(&e.name().as_ref()) {
-                    in_text = true;
+                    depth += 1;
                 }
             }
-            Ok(Event::Text(e)) if in_text => {
+            Ok(Event::Text(e)) if depth > 0 => {
                 out.push_str(&e.decode()?);
-                if let Some(sep) = spec.separator {
-                    out.push(sep);
-                }
             }
             // An entity reference is its own event in 0.41; without this arm
             // every `&amp;` in a document would vanish from the index.
-            Ok(Event::GeneralRef(e)) if in_text => {
+            Ok(Event::GeneralRef(e)) if depth > 0 => {
                 let raw = e.decode()?;
                 // An entity nothing can expand is an error, as it was when
                 // `unescape` resolved these inline: dropping it would take
@@ -159,7 +162,28 @@ fn collect_xml_text(xml: &str, spec: &TextSpec, out: &mut String) -> Result<(), 
             Ok(Event::End(ref e)) => {
                 let name = e.name();
                 if spec.text.contains(&name.as_ref()) {
-                    in_text = false;
+                    depth = depth.saturating_sub(1);
+                    // Closing the outermost one closes the run.
+                    if depth == 0 {
+                        if let Some(sep) = spec.separator {
+                            out.push(sep);
+                        }
+                    }
+                }
+                if spec.breaks.contains(&name.as_ref()) {
+                    out.push('\n');
+                }
+            }
+            // A self-closed element gets no `Start` and no `End` of its own,
+            // so `<text:p/>` — ODF's blank line — would otherwise lose both
+            // its separator and its paragraph break. It carries no text, so
+            // the run it opens is empty and closes immediately.
+            Ok(Event::Empty(ref e)) => {
+                let name = e.name();
+                if depth == 0 && spec.text.contains(&name.as_ref()) {
+                    if let Some(sep) = spec.separator {
+                        out.push(sep);
+                    }
                 }
                 if spec.breaks.contains(&name.as_ref()) {
                     out.push('\n');
@@ -302,6 +326,16 @@ fn shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Vec<String> {
             Ok(Event::Start(ref e)) if e.name().as_ref() == b"t" => {
                 in_text = true;
                 current.clear();
+            }
+            // `<t/>` — an empty cell. quick-xml reports a self-closed element
+            // as its own event with no `Start` and no `End`, so without this
+            // arm the entry is never pushed and **every later index is off by
+            // one**: `collect_sheet` then renders a real string for the wrong
+            // cell, with nothing anywhere reporting a problem. LibreOffice,
+            // openpyxl and POI all write `<si><t/></si>` for a blank, so this
+            // is ordinary output rather than a crafted file.
+            Ok(Event::Empty(ref e)) if e.name().as_ref() == b"t" => {
+                strings.push(String::new());
             }
             Ok(Event::Text(e)) if in_text => match e.decode() {
                 Ok(s) => current.push_str(&s),
@@ -643,6 +677,15 @@ mod tests {
 
     const XLSX_SHARED: &str = "<sst><si><t>Shared</t></si><si><t>Second</t></si></sst>";
 
+    /// The first entry is `<si><t/></si>` — a blank cell, which every
+    /// spreadsheet writer emits. It still occupies index 0.
+    const XLSX_SHARED_WITH_BLANK: &str = "<sst><si><t/></si><si><t>Second</t></si></sst>";
+
+    /// One cell, referring to shared string index 1.
+    const XLSX_SHEET_INDEX_1: &str = "<worksheet><sheetData>\
+         <row><c t=\"s\"><v>1</v></c></row>\
+         </sheetData></worksheet>";
+
     const XLSX_SHEET: &str = "<worksheet><sheetData>\
          <row><c t=\"s\"><v>0</v></c><c t=\"n\"><v>42</v></c></row>\
          <row><c t=\"s\"><v>1</v></c></row>\
@@ -814,5 +857,84 @@ mod tests {
         let p = dir.join("doc.docx");
         crate::testutil::touch(&p, b"this is not a zip archive");
         assert!(extract_document_text(&p, "docx").is_err());
+    }
+
+    /// A self-closed `<t/>` is a whole shared-string entry. Skip it and every
+    /// later index slides by one, so the sheet renders a real string for the
+    /// wrong cell — clean extraction, no error, wrong content. This is the
+    /// regression that made the batch worth doing.
+    #[test]
+    fn a_blank_shared_string_still_occupies_its_index() {
+        let p = container(
+            "xlsx-blank-si",
+            "xlsx",
+            &[
+                ("xl/sharedStrings.xml", XLSX_SHARED_WITH_BLANK),
+                ("xl/worksheets/sheet1.xml", XLSX_SHEET_INDEX_1),
+            ],
+        );
+        assert_eq!(
+            extract_document_text(&p, "xlsx").unwrap(),
+            "Second \n",
+            "index 1 must still be the second entry"
+        );
+    }
+
+    /// The same shape one level up: a `<si>` holding nothing at all.
+    #[test]
+    fn an_empty_si_still_occupies_its_index() {
+        let p = container(
+            "xlsx-empty-si",
+            "xlsx",
+            &[
+                (
+                    "xl/sharedStrings.xml",
+                    "<sst><si><t></t></si><si><t>Second</t></si></sst>",
+                ),
+                ("xl/worksheets/sheet1.xml", XLSX_SHEET_INDEX_1),
+            ],
+        );
+        assert_eq!(extract_document_text(&p, "xlsx").unwrap(), "Second \n");
+    }
+
+    /// An entity splits its run into three events. The separator belongs to
+    /// the run, so the cell must read `A&B` — not `A &B`, and not `A & B`.
+    #[test]
+    fn an_entity_does_not_split_an_ods_cell() {
+        let body = "<office:document-content><office:body><office:spreadsheet>\
+             <table:table><table:table-row>\
+             <table:table-cell><text:p>A&amp;B</text:p></table:table-cell>\
+             </table:table-row></table:table>\
+             </office:spreadsheet></office:body></office:document-content>";
+        let p = container("ods-entity", "ods", &[("content.xml", body)]);
+        assert_eq!(extract_document_text(&p, "ods").unwrap(), "A&B \n");
+    }
+
+    /// A span closing inside a paragraph ends the span, not the paragraph:
+    /// the text after it is body text and must be indexed.
+    #[test]
+    fn text_after_a_nested_span_is_not_dropped() {
+        let body = "<office:document-content><office:body><office:text>\
+             <text:p>before<text:span>inside</text:span>after</text:p>\
+             </office:text></office:body></office:document-content>";
+        let p = container("odt-span-tail", "odt", &[("content.xml", body)]);
+        assert_eq!(
+            extract_document_text(&p, "odt").unwrap(),
+            "beforeinsideafter\n"
+        );
+    }
+
+    /// ODF writes a blank line as a self-closed `<text:p/>`, which has no
+    /// `End` to hang the paragraph break on.
+    #[test]
+    fn a_self_closed_paragraph_still_breaks_the_line() {
+        let body = "<office:document-content><office:body><office:text>\
+             <text:p>first</text:p><text:p/><text:p>third</text:p>\
+             </office:text></office:body></office:document-content>";
+        let p = container("odt-empty-p", "odt", &[("content.xml", body)]);
+        assert_eq!(
+            extract_document_text(&p, "odt").unwrap(),
+            "first\n\nthird\n"
+        );
     }
 }

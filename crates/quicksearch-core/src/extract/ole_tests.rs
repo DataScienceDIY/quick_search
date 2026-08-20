@@ -436,3 +436,103 @@ fn an_empty_file_is_an_error() {
     crate::testutil::touch(&p, b"");
     assert!(extract_ole_text(&p, "xls").is_err());
 }
+
+// -- decode budgets ---------------------------------------------------
+
+/// Nothing in the format requires pieces to be disjoint, so a piece table may
+/// point every entry at the same span: a small file that decodes gigabytes.
+/// `clean` drops the whole C0 range, so a run of control bytes produces no
+/// output at all and a brake on the emitted text never fires. The budget has
+/// to charge what was *read*.
+#[test]
+fn doc_overlapping_control_pieces_stop_at_the_budget() {
+    // One 4 KiB span of control bytes, pointed at over and over.
+    const SPAN: usize = 4 * 1024;
+    let mut doc = vec![0x01u8; SPAN];
+    let marker_at = doc.len();
+    doc.extend_from_slice(b"MARKER");
+
+    let mut pieces: Vec<doc::Piece> = (0..64)
+        .map(|_| doc::Piece {
+            start: 0,
+            end: SPAN,
+            compressed: true,
+        })
+        .collect();
+    // Reachable only if the budget did not stop the walk first.
+    pieces.push(doc::Piece {
+        start: marker_at,
+        end: doc.len(),
+        compressed: true,
+    });
+
+    // A budget of half what those pieces decode.
+    let out = doc::decode_pieces(&doc, &pieces, SPAN * 32);
+    assert!(
+        !out.contains("MARKER"),
+        "the walk ran past its budget: {out:?}"
+    );
+    assert!(
+        out.trim().is_empty(),
+        "control bytes must not survive `clean`: {out:?}"
+    );
+}
+
+/// The same table under a budget it fits inside must be extracted whole —
+/// the brake must not fire early.
+#[test]
+fn doc_pieces_within_the_budget_are_all_decoded() {
+    const SPAN: usize = 4 * 1024;
+    let mut doc = vec![0x01u8; SPAN];
+    let marker_at = doc.len();
+    doc.extend_from_slice(b"MARKER");
+
+    let mut pieces: Vec<doc::Piece> = (0..4)
+        .map(|_| doc::Piece {
+            start: 0,
+            end: SPAN,
+            compressed: true,
+        })
+        .collect();
+    pieces.push(doc::Piece {
+        start: marker_at,
+        end: doc.len(),
+        compressed: true,
+    });
+
+    let out = doc::decode_pieces(&doc, &pieces, SPAN * 32);
+    assert!(out.contains("MARKER"), "stopped early: {out:?}");
+}
+
+/// A workbook whose cells are all control characters: every `LABELSST` is six
+/// bytes of record and resolves to a shared string that `clean` erases, so the
+/// emitted-text brake never advances however many of them there are.
+#[test]
+fn xls_control_character_cells_stop_at_the_budget() {
+    let control: String = std::iter::repeat('\u{1}').take(4096).collect();
+
+    let mut sst = Vec::new();
+    sst.extend_from_slice(&le32(2)); // total
+    sst.extend_from_slice(&le32(2)); // unique
+    sst.extend_from_slice(&sst_string(&control, false));
+    sst.extend_from_slice(&sst_string("MARKER", false));
+
+    let mut book = biff(xls::REC_SST, &sst);
+    for _ in 0..64 {
+        book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(0)));
+    }
+    // Reachable only if the budget did not stop the scan first.
+    book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(1)));
+
+    let out = xls::extract_from_book(&book, 4096 * 32)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        out.contains("no readable cell text"),
+        "expected the scan to stop before the marker, got: {out}"
+    );
+
+    // Under a budget it fits inside, the same workbook reads normally.
+    let out = xls::extract_from_book(&book, 4096 * 1024).unwrap();
+    assert!(out.contains("MARKER"), "stopped early: {out:?}");
+}

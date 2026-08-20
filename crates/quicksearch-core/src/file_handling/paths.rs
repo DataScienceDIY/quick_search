@@ -297,6 +297,14 @@ fn walk_entries<'a>(
 ) -> impl Iterator<Item = DirEntry> + 'a {
     WalkDir::new(root)
         .follow_links(follow_symlinks)
+        // walkdir defaults this to *true*, independently of `follow_links`:
+        // without it a root that is itself a symlink gets descended even when
+        // following is off. That matters more than it sounds, because
+        // `prepare_file_record_from_path` canonicalizes before storing, so the
+        // rows land under the target's real path — and if the target is
+        // outside every configured root, no sweep range covers them and they
+        // are orphans until a rebuild.
+        .follow_root_links(follow_symlinks)
         .into_iter()
         .filter_entry(move |e| walk_filter(e, follow_symlinks, include_hidden, ignore))
         .filter_map(move |res| match res {
@@ -313,6 +321,18 @@ fn walk_entries<'a>(
                 None
             }
         })
+        // A symlink is an entry in its own right when following is off, and
+        // `walk_filter` cannot drop it: that runs before the descent and
+        // passes depth 0 unconditionally, because a root is the user's own
+        // choice. Yielding it would index the link as a file — and
+        // `prepare_file_record_from_path` canonicalizes, so the row would
+        // land under the target's real path. Inside a root that is a
+        // duplicate of a row the walk reaches anyway; outside every root it
+        // is a row no sweep range covers, and only a rebuild removes it.
+        //
+        // No cost when following is on: walkdir resolves links then, so
+        // nothing reports itself as one.
+        .filter(move |e| follow_symlinks || !e.file_type().is_symlink())
 }
 
 /// Walk `root` yielding only files, pruning hidden and ignored subtrees

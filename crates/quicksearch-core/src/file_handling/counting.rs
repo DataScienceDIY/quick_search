@@ -25,6 +25,31 @@ const COUNT_POLL_MS: u64 = 50;
 /// `cancel`: on cancellation every process in `children` is killed and a
 /// recognizable error is returned. On normal exit, returns the terminal
 /// child's stdout.
+/// Wait on every member of the pipeline and report the first failure.
+///
+/// `terminal_status` is the one already collected by the caller; the rest are
+/// waited on here. Returns the status of a member that failed, or `None` when
+/// all of them succeeded.
+#[cfg(unix)]
+fn reap_all(
+    children: &mut [&mut std::process::Child],
+    terminal_status: std::process::ExitStatus,
+) -> Option<std::process::ExitStatus> {
+    let mut failed = (!terminal_status.success()).then_some(terminal_status);
+    let last = children.len().saturating_sub(1);
+    for (i, child) in children.iter_mut().enumerate() {
+        if i == last {
+            continue;
+        }
+        if let Ok(status) = child.wait() {
+            if !status.success() && failed.is_none() {
+                failed = Some(status);
+            }
+        }
+    }
+    failed
+}
+
 #[cfg(unix)]
 fn wait_pipeline_cancellable(
     children: &mut [&mut std::process::Child],
@@ -44,9 +69,6 @@ fn wait_pipeline_cancellable(
         };
         match terminal.try_wait() {
             Ok(Some(status)) => {
-                if !status.success() {
-                    return Err(format!("count pipeline exited with {}", status));
-                }
                 // The terminal child's output is a couple dozen bytes
                 // (a `wc -l` figure), so reading after exit can't deadlock.
                 let mut out = Vec::new();
@@ -55,14 +77,28 @@ fn wait_pipeline_cancellable(
                     let mut stdout = stdout;
                     let _ = stdout.read_to_end(&mut out);
                 }
-                // Reap the rest of the pipeline.
-                for child in children.iter_mut() {
-                    let _ = child.wait();
+                // Every member, not just the terminal — and before deciding.
+                // A `find` that fails writes nothing and exits non-zero, while
+                // `wc -l` reads EOF, prints `0` and exits *successfully*: read
+                // through the terminal alone that is a tree of zero files, and
+                // the `-printf` fallback keyed on this returning `Err` never
+                // runs at all. Reaping here also covers the failure paths,
+                // which used to return leaving `find` a zombie for the life of
+                // the process.
+                let failed = reap_all(children, status);
+                if let Some(bad) = failed {
+                    return Err(format!("count pipeline exited with {}", bad));
                 }
                 return Ok(out);
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(COUNT_POLL_MS)),
-            Err(e) => return Err(format!("count wait: {}", e)),
+            Err(e) => {
+                for child in children.iter_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return Err(format!("count wait: {}", e));
+            }
         }
     }
 }
@@ -74,7 +110,12 @@ fn count_find_pipe_wc(
     printf_newlines: bool,
 ) -> Result<usize, String> {
     let mut find_cmd = Command::new("find");
-    find_cmd.arg(path);
+    // `--` before the path, though nothing can currently reach here with a
+    // leading `-`: every root goes through `resolved_indexing_paths`, which
+    // absolutizes it, and then `normalize_root_string`, which canonicalizes.
+    // It is one token, and it keeps that reasoning from being load-bearing
+    // for whoever changes root resolution next.
+    find_cmd.arg("--").arg(path);
     if printf_newlines {
         // GNU find: emit one newline per entry without formatting paths.
         find_cmd.arg("-printf").arg("\n");

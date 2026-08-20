@@ -1,0 +1,58 @@
+# Derived from the Cargo-normalized manifest of rtf-parser 0.4.3 as published
+# to crates.io. Four things differ, all of them removals — see
+# vendor/rtf-parser/README.md and the `[patch.crates-io]` note in the workspace
+# manifest for what and why this crate is carried in-tree at all.
+#
+#   * The `examples/` targets are gone, because `examples/` is not vendored:
+#     the two of them load `.rtf` files from a directory the crate excludes
+#     from its own package, so they do not build from a published copy either.
+#   * `crate-type` loses `cdylib`. It exists for the crate's WebAssembly build,
+#     which is also what the `jsbindings` default feature is for; QuickSearch
+#     links the rlib and would otherwise pay for a shared object nothing loads.
+#   * The `default = ["jsbindings"]` feature and its two optional dependencies
+#     (`wasm-bindgen`, `tsify`) are gone. `quicksearch-core` already depends on
+#     this crate with `default-features = false`; deleting the feature outright
+#     means a future `cargo add` cannot quietly turn it back on and drag the
+#     wasm-bindgen tree into a desktop build. The `#[cfg(feature =
+#     "jsbindings")]` attributes in the source went with it — see README.md.
+#   * The `[profile.*]` sections are gone. Cargo ignores profiles in a
+#     non-workspace-root manifest and warns about them; the workspace's own
+#     release profile is what applies.
+
+[package]
+edition = "2021"
+name = "rtf-parser"
+version = "0.4.3"
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "A Rust RTF parser & lexer library designed for speed and memory efficiency."
+readme = "README.md"
+keywords = [
+    "rtf",
+    "rich",
+    "text",
+    "format",
+    "parser",
+]
+categories = [
+    "parsing",
+    "parser-implementations",
+]
+license = "MIT"
+repository = "https://github.com/d0rianb/rtf-parser"
+
+[lib]
+name = "rtf_parser"
+crate-type = ["lib"]
+path = "src/lib.rs"
+
+[dependencies.serde]
+version = "1.0"
+features = ["derive"]
+
+[lints.clippy]
+needless_return = "allow"

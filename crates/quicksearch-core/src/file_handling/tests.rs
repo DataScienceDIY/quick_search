@@ -525,3 +525,118 @@ fn a_backslash_is_just_a_character_on_unix() {
         r"/tmp/weird\/"
     );
 }
+
+/// walkdir defaults `follow_root_links` to **true**, independently of
+/// `follow_links` — so a root that is itself a symlink was descended even with
+/// following off. It matters more than a duplicate scan: the records are
+/// stored under the canonicalized path, so a target outside every configured
+/// root lands where no sweep range reaches and stays there until a rebuild.
+#[test]
+#[cfg(unix)]
+fn a_symlinked_root_is_not_descended_when_following_is_off() {
+    let base = tmp_tree();
+    let real = base.join("real");
+    touch(&real.join("inside.txt"));
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let ignore = IgnoreSet::compile(&[]).unwrap();
+    let names: Vec<String> = filtered_walk(
+        link.to_str().unwrap(),
+        false,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+    )
+    .map(|e| e.file_name().to_string_lossy().into_owned())
+    .collect();
+    assert!(
+        names.is_empty(),
+        "a symlinked root must not be descended: {names:?}"
+    );
+
+    // With following on it is descended, as it always was.
+    let names: Vec<String> = filtered_walk(
+        link.to_str().unwrap(),
+        true,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+    )
+    .map(|e| e.file_name().to_string_lossy().into_owned())
+    .collect();
+    assert_eq!(names, vec!["inside.txt"]);
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// A symlink *inside* a root is the same hazard one level down: yielding it
+/// as a file indexes it under the canonicalized target path.
+#[test]
+#[cfg(unix)]
+fn a_symlink_inside_a_root_is_skipped_when_following_is_off() {
+    let base = tmp_tree();
+    let root = base.join("root");
+    touch(&root.join("real.txt"));
+    let outside = base.join("outside");
+    touch(&outside.join("target.txt"));
+    std::os::unix::fs::symlink(outside.join("target.txt"), root.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("linkdir")).unwrap();
+
+    let ignore = IgnoreSet::compile(&[]).unwrap();
+    let mut names: Vec<String> = filtered_walk(
+        root.to_str().unwrap(),
+        false,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+    )
+    .map(|e| e.file_name().to_string_lossy().into_owned())
+    .collect();
+    names.sort();
+    assert_eq!(names, vec!["real.txt"], "only the real file may be walked");
+
+    // Following on: the link resolves and its target is walked through it.
+    let mut names: Vec<String> = filtered_walk(
+        root.to_str().unwrap(),
+        true,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+    )
+    .map(|e| e.file_name().to_string_lossy().into_owned())
+    .collect();
+    names.sort();
+    assert_eq!(names, vec!["link.txt", "real.txt", "target.txt"]);
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// The same for the directory walk the watcher registers from: it must not
+/// spend descriptors on a subtree the indexer will discard.
+#[test]
+#[cfg(unix)]
+fn a_symlinked_root_yields_no_directories_when_following_is_off() {
+    let base = tmp_tree();
+    let real = base.join("real");
+    touch(&real.join("sub/inside.txt"));
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let ignore = IgnoreSet::compile(&[]).unwrap();
+    let dirs: Vec<String> = filtered_dirs(
+        link.to_str().unwrap(),
+        false,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+    )
+    .map(|e| e.path().display().to_string())
+    .collect();
+    assert!(
+        dirs.is_empty(),
+        "a symlinked root must yield no directories: {dirs:?}"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}

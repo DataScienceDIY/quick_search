@@ -739,3 +739,41 @@ fn re_arming_drops_the_previous_targets() {
     );
     assert!(decided.is_empty(), "{decided:?}");
 }
+
+/// `orphan_to` collects rename destinations whose source is not a displayed
+/// row, and only `flush_settled` drains it — which used to run only when
+/// `pending` was non-empty. Churn beside the results therefore pushed a
+/// `PathBuf` that was never taken, and the stale entry then *paired* with the
+/// next lone `Gone`: a deleted row reported as renamed to a file it has
+/// nothing to do with, and the GUI following that path.
+///
+/// A file moved in from outside is the reliable way to leave a lone orphan on
+/// every platform — there is no `From` half to pair it with, so no
+/// `RenameMode::Both` follows.
+#[test]
+fn e2e_an_unpaired_move_in_does_not_capture_a_later_deletion() {
+    let dir = scratch_dir("live-orphan-drain");
+    let (watcher, rx, path) = watch_one(&dir, "before.txt");
+
+    // Move a file in from a directory nothing is watching: the watcher sees
+    // the destination and never a source.
+    let elsewhere = scratch_dir("live-orphan-source");
+    let outside = elsewhere.join("moved-in.txt");
+    std::fs::write(&outside, "unrelated").unwrap();
+    std::fs::rename(&outside, dir.join("moved-in.txt")).unwrap();
+
+    // Past the settle window, so the drain has had its chance.
+    std::thread::sleep(Duration::from_millis(600));
+
+    // Now delete the row that *is* on screen.
+    std::fs::remove_file(&path).unwrap();
+
+    let updates = collect(&rx, 1, Duration::from_secs(5));
+    stop_and_clean(watcher, &dir);
+    std::fs::remove_dir_all(&elsewhere).ok();
+
+    match updates.first() {
+        Some(LiveUpdate::Gone { path: gone, .. }) => assert_eq!(gone, &path),
+        other => panic!("a deletion must not pair with unrelated churn: {other:?}"),
+    }
+}

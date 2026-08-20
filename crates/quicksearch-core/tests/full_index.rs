@@ -1824,7 +1824,28 @@ fn the_wal_stays_bounded_during_a_run() {
 /// A run cut short is exactly when the log is at its largest and nothing else
 /// will come along to land it: the writer connection closes, and the next run
 /// may be hours away. So Stop ends the *indexing*, and the pass that follows
-/// runs either way — visible as `Optimizing` until it is done.
+/// runs either way.
+///
+/// # Why this asks SQLite rather than watching the status
+///
+/// This used to poll `get_status()` at 1 ms hoping to catch
+/// `IndexingStatus::Optimizing` as it went past, and assert it had seen it.
+/// That is a sample of a transient state, and it fails for reasons that have
+/// nothing to do with the behaviour under test: a loaded machine deschedules
+/// the polling thread, and — worse — *making the indexer faster shortens the
+/// window*, so the test failed more often the better the code got. It was
+/// failing roughly a third of the time before any of that, and five times in
+/// six after a round of writer optimisations.
+///
+/// So it asks the question directly instead: was `PRAGMA optimize` handed to
+/// SQLite for this index? [`repo::optimize_count`] is a latch rather than a
+/// sample, so no amount of speed or scheduling can hide the answer. Per the
+/// pass's own contract, the pragma reaching SQLite is the optimization
+/// happening — what SQLite then decides to re-analyse is its business, and
+/// deliberately nothing when no table has drifted.
+///
+/// The log assertion stays, because it checks the other half of the pass: the
+/// trailing checkpoint that a stopped run exists to get.
 #[test]
 fn a_stopped_run_is_still_optimized() {
     let root = tmp_dir("stop-optimize");
@@ -1838,6 +1859,11 @@ fn a_stopped_run_is_still_optimized() {
     let db_dir = tmp_dir("stop-optimize-db");
     let db = db_dir.join("index.sqlite");
     let wal = db_dir.join("index.sqlite-wal");
+    let dir_key = db_dir.to_string_lossy().into_owned();
+
+    // Per-directory, so a sibling test optimizing its own scratch index on
+    // another thread cannot satisfy this.
+    let before = quicksearch_core::db::repo::optimize_count(&dir_key);
 
     let service = IndexingService::new();
     service
@@ -1861,11 +1887,11 @@ fn a_stopped_run_is_still_optimized() {
     }
     service.request_stop();
 
-    let mut saw_optimizing = false;
+    // Idle is the *end* of the pass, and unlike Optimizing it is a resting
+    // state — waiting for it cannot miss it however fast the pass was.
     let idle_by = Instant::now() + Duration::from_secs(120);
     loop {
         match service.get_status() {
-            IndexingStatus::Optimizing => saw_optimizing = true,
             IndexingStatus::Idle => break,
             IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
             _ => {}
@@ -1877,9 +1903,10 @@ fn a_stopped_run_is_still_optimized() {
         std::thread::sleep(Duration::from_millis(1));
     }
 
-    assert!(
-        saw_optimizing,
-        "a stopped run must still publish Optimizing"
+    assert_eq!(
+        quicksearch_core::db::repo::optimize_count(&dir_key),
+        before + 1,
+        "a stopped run must still run PRAGMA optimize against its index"
     );
     assert_eq!(
         std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
