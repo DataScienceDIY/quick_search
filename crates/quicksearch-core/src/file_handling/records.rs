@@ -78,7 +78,10 @@ pub(super) fn get_file_hash(
     path: &Path,
     hash_length: usize,
 ) -> Result<(Vec<u8>, Vec<u8>), std::io::Error> {
-    let mut f: File = File::open(path)?;
+    // The caller's `is_file()` came from a `stat` taken before this open; a
+    // FIFO renamed over the name in between would block this walk worker
+    // forever and park the pool behind it. See `platform::open_regular_file`.
+    let mut f: File = crate::platform::open_regular_file(path)?;
     // Files shorter than the window hash whole; `min` keeps the cast sound
     // for large files on 32-bit targets.
     let mut head = vec![0u8; size.min(hash_length as u64) as usize];
@@ -233,6 +236,9 @@ pub fn prepare_file_record(
         if size == 0 || size > config.processing.hash_length as u64 {
             return None;
         }
+        // A panicking parser arrives here as `Some(Err(..))` — contained by
+        // the registry, which is what keeps a walk worker alive. See
+        // `Registry::extract`.
         match registry.extract_complete_head(Path::new(path), m, &head) {
             Some(Ok(content)) => {
                 let mut text = content.text;
@@ -344,7 +350,9 @@ pub fn decide_content(
         return ContentOutcome::NotApplicable;
     }
     // `content_extractable` established that an extractor claims this MIME,
-    // so the `Ok(None)` arm below is unreachable.
+    // so the `Ok(None)` arm below is unreachable. A panicking parser is
+    // contained by the registry and arrives as `Err`, which becomes this
+    // row's recorded failure reason rather than a dead worker.
     let result = match mime {
         Some(m) => registry.extract(p, m),
         None => Ok(None),

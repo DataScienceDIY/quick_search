@@ -948,6 +948,53 @@ fn a_deletion_during_a_full_run_is_queued_then_applied() {
     coord.shutdown();
 }
 
+/// A path that cannot be read is not a path that is gone.
+///
+/// `update_paths` is fed by the frontend from the rows it is displaying, and
+/// its `Remove` verb takes the row *and its whole subtree*. `is_file()` cannot
+/// tell "not a regular file" from "I could not look", so an unreadable file —
+/// a network share that dropped, a removable drive unplugged with its results
+/// on screen, a directory another process just chmod'd — used to read as a
+/// deletion. The next full run cannot undo it: an unreachable root is recorded
+/// unreadable rather than re-walked.
+#[test]
+fn an_unreadable_path_is_not_treated_as_deleted() {
+    let dir = crate::testutil::scratch_dir("verb");
+    let present = dir.join("here.txt");
+    std::fs::write(&present, b"x").unwrap();
+    assert!(
+        matches!(verb_for(present.clone()), Some(FsEvent::Modify(_))),
+        "a readable file is a Modify"
+    );
+
+    let gone = dir.join("never-existed.txt");
+    assert!(
+        matches!(verb_for(gone), Some(FsEvent::Remove(_))),
+        "a genuinely absent file is a Remove"
+    );
+
+    // A directory is not something the walk indexes, so it is still a Remove.
+    assert!(matches!(verb_for(dir.clone()), Some(FsEvent::Remove(_))));
+
+    // The case that matters: the file is there, and unreadable.
+    let locked = dir.join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    let hidden = locked.join("file.txt");
+    std::fs::write(&hidden, b"x").unwrap();
+    if crate::platform::deny_read(&locked).is_ok() {
+        // Skipped when the test runs with rights that ignore the mode — CI
+        // drops CAP_DAC_OVERRIDE with capsh for exactly this reason.
+        if std::fs::metadata(&hidden).is_err() {
+            assert!(
+                verb_for(hidden).is_none(),
+                "an unreadable file must leave the index alone"
+            );
+        }
+        let _ = crate::platform::restore_read(&locked);
+    }
+    std::fs::remove_file(&present).ok();
+}
+
 #[test]
 fn enqueue_last_wins_and_rename_splits() {
     let mut pending = HashMap::new();

@@ -11,6 +11,8 @@
 //! containment check is repeated here.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -24,22 +26,59 @@ use crate::file_handling::{
 use crate::platform::path_has_hidden_component_under;
 use crate::watcher::FsEvent;
 
+/// How much of one event may be applied in this turn, and where the last turn
+/// stopped.
+///
+/// One event is not always one file: a directory moved into a watched tree
+/// arrives as a single `Create` covering everything beneath it. Shaped like
+/// [`crate::scope::advance`]'s arguments and there for the same reason — this
+/// runs on the coordinator's own thread, so an unbounded call is a command
+/// loop that reads no commands, including the shutdown a closing window is
+/// waiting on.
+pub struct Budget<'a> {
+    pub deadline: Instant,
+    pub cancel: &'a AtomicBool,
+    /// Entries an earlier turn already applied for this event.
+    pub resume_from: usize,
+}
+
+impl Budget<'_> {
+    fn spent(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || Instant::now() >= self.deadline
+    }
+}
+
+/// Whether an event was applied in full, or ran out of budget partway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applied {
+    /// Everything the event implied is in the index.
+    Done,
+    /// Budget spent. What was written is committed; the caller should re-queue
+    /// the same event with `resume_from` set to `done`.
+    Unfinished { done: usize },
+}
+
 /// Apply one filesystem event to the index. Missing files are treated as
 /// no-ops (a Create followed by a quick delete resolves via the Remove
 /// event); unchanged mtimes short-circuit without touching the DB.
+///
+/// See [`Budget`] for the one event that is not small.
 pub fn apply_fs_event(
     conn: &mut Connection,
     event: &FsEvent,
     config: &Config,
     ignore: &IgnoreSet,
     registry: &Registry,
-) -> Result<(), String> {
+    budget: &Budget<'_>,
+) -> Result<Applied, String> {
     match event {
-        FsEvent::Create(p) | FsEvent::Modify(p) => upsert_path(conn, p, config, ignore, registry),
-        FsEvent::Remove(p) => remove_path(conn, p),
+        FsEvent::Create(p) | FsEvent::Modify(p) => {
+            upsert_path(conn, p, config, ignore, registry, budget)
+        }
+        FsEvent::Remove(p) => remove_path(conn, p).map(|()| Applied::Done),
         FsEvent::Rename { from, to } => {
             remove_path(conn, from)?;
-            upsert_path(conn, to, config, ignore, registry)
+            upsert_path(conn, to, config, ignore, registry, budget)
         }
     }
 }
@@ -50,9 +89,10 @@ fn upsert_path(
     config: &Config,
     ignore: &IgnoreSet,
     registry: &Registry,
-) -> Result<(), String> {
+    budget: &Budget<'_>,
+) -> Result<Applied, String> {
     if ignore.matches_path(path) {
-        return Ok(());
+        return Ok(Applied::Done);
     }
     // Measured from the innermost configured root: the walk never filters
     // the root it was handed, so a root that is itself hidden must not be
@@ -60,11 +100,11 @@ fn upsert_path(
     if !config.indexing.include_hidden
         && path_has_hidden_component_under(path, &config.resolved_indexing_paths())
     {
-        return Ok(());
+        return Ok(Applied::Done);
     }
     let Ok(meta) = std::fs::metadata(path) else {
         // Already gone again — the pending Remove event handles it.
-        return Ok(());
+        return Ok(Applied::Done);
     };
     if meta.is_dir() {
         // A moved-in tree surfaces as one directory event; walk it with
@@ -76,20 +116,37 @@ fn upsert_path(
         let Some(root) = path.to_str() else {
             return Err(format!("directory path is not valid UTF-8: {:?}", path));
         };
-        let entries: Vec<_> = filtered_walk(
+        // Streamed, not collected: `mv` of a large tree is one event, and
+        // materialising its entries first is a `DirEntry` per file resident
+        // before a single row is written. Each file is its own transaction,
+        // so stopping between two of them leaves the index consistent and the
+        // remainder for the next turn.
+        //
+        // `skip` rather than re-testing every entry: `upsert_file` on an
+        // unchanged file is cheap but not free, and paying it again for
+        // everything already done would make a large tree quadratic in the
+        // number of turns it takes. The walk order is deterministic for an
+        // unchanged tree; if the tree does change under us the count is only
+        // an optimisation, and the next full run is what makes it exact.
+        let mut done = budget.resume_from;
+        for entry in filtered_walk(
             root,
             config.indexing.follow_symlinks,
             config.indexing.include_hidden,
             ignore,
             &UnreadableDirs::default(),
         )
-        .collect();
-        for entry in entries {
+        .skip(budget.resume_from)
+        {
+            if budget.spent() {
+                return Ok(Applied::Unfinished { done });
+            }
             upsert_file(conn, entry.path(), config, registry)?;
+            done += 1;
         }
-        Ok(())
+        Ok(Applied::Done)
     } else {
-        upsert_file(conn, path, config, registry)
+        upsert_file(conn, path, config, registry).map(|()| Applied::Done)
     }
 }
 
@@ -195,6 +252,7 @@ pub fn remove_paths(
 mod tests {
     use super::*;
     use crate::db::open_or_recreate;
+    use std::time::Duration;
 
     struct Fixture {
         conn: Connection,
@@ -224,15 +282,32 @@ mod tests {
             }
         }
 
+        /// Applies with an effectively unlimited budget: these tests are about
+        /// what lands in the index, not about the slicing. See
+        /// [`Fixture::apply_within`] for the budget itself.
         fn apply(&mut self, event: &FsEvent) {
+            let done = self.apply_within(event, Duration::from_secs(3600));
+            assert_eq!(done, Applied::Done, "unexpectedly ran out of budget");
+        }
+
+        fn apply_within(&mut self, event: &FsEvent, budget: Duration) -> Applied {
+            self.apply_resuming(event, budget, 0)
+        }
+
+        fn apply_resuming(&mut self, event: &FsEvent, budget: Duration, from: usize) -> Applied {
             apply_fs_event(
                 &mut self.conn,
                 event,
                 &self.config,
                 &self.ignore,
                 &self.registry,
+                &Budget {
+                    deadline: Instant::now() + budget,
+                    cancel: &AtomicBool::new(false),
+                    resume_from: from,
+                },
             )
-            .unwrap();
+            .unwrap()
         }
 
         fn write(&self, name: &str, content: &str) -> std::path::PathBuf {
@@ -296,6 +371,44 @@ mod tests {
 
     /// The collapse must not change what ends up deleted — only how much work
     /// it takes to get there.
+    /// A directory event is applied in slices, and a slice resumes where the
+    /// last one stopped instead of re-walking what it already did.
+    ///
+    /// `mv` of a large tree is one `Create`. Applying it in one go held the
+    /// coordinator's command loop — and the shutdown queued behind it — for as
+    /// long as the whole tree took; applying it in slices that each restarted
+    /// from the top would be quadratic instead. Asserted by resume point
+    /// rather than by clock, because a timing-based assertion says nothing
+    /// reliable on a loaded CI runner.
+    #[test]
+    fn a_directory_event_resumes_where_its_budget_ran_out() {
+        let mut f = Fixture::new();
+        for i in 0..4 {
+            f.write(&format!("sub/f{i}.txt"), "body");
+        }
+        let sub = f.dir.join("sub");
+
+        // Nothing may be spent, so nothing is applied and the resume point is
+        // where it started.
+        let outcome = f.apply_within(&FsEvent::Create(sub.clone()), Duration::ZERO);
+        assert_eq!(outcome, Applied::Unfinished { done: 0 });
+        assert_eq!(f.counts().0, 0, "a spent budget must write nothing");
+
+        // Resuming past the first two entries applies only what is left, which
+        // is what makes slicing linear rather than quadratic.
+        let outcome = f.apply_resuming(&FsEvent::Create(sub.clone()), Duration::from_secs(3600), 2);
+        assert_eq!(outcome, Applied::Done);
+        assert_eq!(
+            f.counts().0,
+            2,
+            "entries before the resume point must be skipped, not re-applied"
+        );
+
+        // And from the start, the rest arrive.
+        f.apply(&FsEvent::Create(sub));
+        assert_eq!(f.counts().0, 4);
+    }
+
     #[test]
     fn collapsed_removal_deletes_the_same_rows_as_the_full_set() {
         let mut f = Fixture::new();

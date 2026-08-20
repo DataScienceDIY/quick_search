@@ -549,16 +549,31 @@ impl Config {
     /// Write back to the file this config was loaded from (or the default
     /// location), creating parent directories as needed. Raw values are
     /// written verbatim — relative paths in a portable config stay relative.
+    ///
+    /// Atomic: see the comment on the rename below.
     pub fn save(&self) -> Result<(), String> {
         let path = self.source.clone().unwrap_or_else(Self::config_path);
         if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)
+            crate::platform::create_dir_private(dir)
                 .map_err(|e| format!("Failed to create config dir {}: {}", dir.display(), e))?;
         }
         let content = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
-        fs::write(&path, content)
-            .map_err(|e| format!("Failed to write config file {}: {}", path.display(), e))?;
+        // Written beside the target and renamed over it, rather than
+        // truncate-then-write. `[security].salt` exists *only* in this file:
+        // it is not derivable from the index and not stored anywhere else, so
+        // a config truncated by a crash, a full disk or a power cut in the
+        // middle of `write` is an encrypted index that no password can ever
+        // open again. `rename` is atomic on both platforms, and the `sync_all`
+        // before it means the bytes are on the disk before the name points at
+        // them.
+        let tmp = path.with_extension("toml.tmp");
+        write_private(&tmp, content.as_bytes())
+            .map_err(|e| format!("Failed to write config file {}: {}", tmp.display(), e))?;
+        fs::rename(&tmp, &path).map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            format!("Failed to replace config file {}: {}", path.display(), e)
+        })?;
         Ok(())
     }
 
@@ -614,6 +629,32 @@ impl Config {
             })
             .collect()
     }
+}
+
+/// Write `bytes` to `path`, owner-readable only, and flush them to the disk
+/// before returning.
+///
+/// `O_NOFOLLOW` on Unix: the config directory is not always somewhere only
+/// this user can write — a portable install can sit in a shared or removable
+/// directory — and a symlink left at the config's name would otherwise
+/// redirect this write onto whatever it points at.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    // The rename that follows is atomic with respect to the *directory*, not
+    // to the file's contents: without this, a crash can leave the new name
+    // pointing at a block of zeroes.
+    f.sync_all()
 }
 
 /// Reserved `content_extensions` entry standing for "files with no

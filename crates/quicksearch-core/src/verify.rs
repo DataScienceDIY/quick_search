@@ -109,7 +109,12 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
     let mut reference: Option<(usize, File, u64)> = None;
     let mut rest: Vec<(usize, File)> = Vec::new();
     for (i, path) in paths.iter().enumerate() {
-        let file = match File::open(path) {
+        // These paths come from the index, which records what each file was
+        // when it was walked. A member replaced by a FIFO since then needs no
+        // race at all to be sitting here — the walk keeps the old row when a
+        // regular file turns into something else — and a blocking open would
+        // strand this worker before it reported a single verdict.
+        let file = match crate::platform::open_regular_file(path) {
             Ok(f) => f,
             Err(e) => {
                 verdicts[i] = MemberVerdict::Unreadable(describe(path, &e));

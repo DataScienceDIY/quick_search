@@ -524,7 +524,22 @@ pub fn pending_content_page(
 ) -> Result<Vec<PendingContentRow>, String> {
     let mut stmt = conn
         .prepare_cached(
-            "SELECT id, name, path, mime FROM files
+            // `INDEXED BY` rather than a hint, because the planner gets this
+            // one wrong exactly when it costs most. Left to itself it takes
+            // `UNIQUE(path)` for the range and then sorts the survivors into a
+            // temp b-tree to satisfy `ORDER BY id` — which means every page
+            // walks the whole root's range and fetches each row's heap entry
+            // to test `content_state`. At `FEED_PAGE` rows per page that is
+            // quadratic over a run. The partial index below is already
+            // id-ordered, so it answers `id > ?` and the ORDER BY together and
+            // holds only pending rows. Measured on 500k rows with everything
+            // pending — the first index of a tree, i.e. the case that matters:
+            // 127 ms/page against 0.1 ms/page.
+            //
+            // The planner only prefers it once pending rows are a small
+            // minority, and never before ANALYZE has run at all, which is why
+            // this cannot be left to statistics.
+            "SELECT id, name, path, mime FROM files INDEXED BY idx_files_content_pending
               WHERE content_state = 0 AND size <= ?1 AND id > ?2
                 AND path >= ?3 AND path < ?4
               ORDER BY id

@@ -69,6 +69,17 @@ impl ExtractedContent {
 /// should surface human-readable messages.
 pub type ExtractError = String;
 
+/// Run `f`, turning a panic into an [`ExtractError`] naming the file.
+///
+/// The extractors drive third-party parsers — `pdf-extract`, `rtf-parser`,
+/// `cfb`, `lofty`, `quick-xml` — over bytes chosen by whoever wrote the file,
+/// and several of them are documented to panic on malformed input. See
+/// [`Registry::extract`] for what each caller stands to lose.
+fn contain_panic<T>(path: &Path, f: impl FnOnce() -> T) -> Result<T, ExtractError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|_| format!("extractor panicked on {}", path.display()))
+}
+
 /// A pluggable content extractor. Stateless; implementors should not hold
 /// file handles across calls.
 pub trait Extractor: Send + Sync {
@@ -139,26 +150,54 @@ impl Registry {
     /// Look up a handler for `mime` and run it against `path`. Returns
     /// `Ok(None)` if no extractor claims the MIME — the caller should then
     /// decide whether the file is "not applicable" (text state NA).
+    ///
+    /// A panicking parser becomes an `Err`, here rather than at each call
+    /// site: this and [`Registry::extract_complete_head`] are the two places
+    /// third-party code is handed a file nobody vouched for, and every caller
+    /// has more than one file to lose. A content worker's panic silently
+    /// drops the row it claimed; a *walk* worker's costs the root its whole
+    /// content pass and disables stale cleanup run-wide; the live watcher's
+    /// costs every displayed row for the rest of the session. Containing it
+    /// at the boundary means a new caller cannot forget.
+    ///
+    /// This cannot help with a stack overflow, which aborts rather than
+    /// unwinding — see `vendor/pdf-extract`, which bounds the recursion that
+    /// made that reachable.
     pub fn extract(
         &self,
         path: &Path,
         mime: &str,
     ) -> Result<Option<ExtractedContent>, ExtractError> {
-        self.find(mime).map(|e| e.extract(path)).transpose()
+        let Some(extractor) = self.find(mime) else {
+            return Ok(None);
+        };
+        contain_panic(path, || extractor.extract(path))
+            .and_then(|r| r)
+            .map(Some)
     }
 
     /// [`Registry::extract`] for a file whose complete contents the caller
     /// already holds. `None` when no extractor claims the MIME or the one
     /// that does needs the file on disk — both mean "leave this to the
     /// content pass".
+    /// Contained the same way [`Registry::extract`] is, and this is the one
+    /// that runs on a walk worker.
     pub fn extract_complete_head(
         &self,
         path: &Path,
         mime: &str,
         head: &[u8],
     ) -> Option<Result<ExtractedContent, ExtractError>> {
-        self.find(mime)
-            .and_then(|e| e.extract_from_head(path, head))
+        let extractor = self.find(mime)?;
+        // `extract_from_head` returning `None` means "needs the file on
+        // disk", which is not a failure and must stay distinguishable from
+        // one — so the guard wraps the whole `Option` and a panic becomes
+        // `Some(Err(..))`, i.e. a failure this file is charged with rather
+        // than a deferral to the content pass that would meet the same panic.
+        match contain_panic(path, || extractor.extract_from_head(path, head)) {
+            Ok(outcome) => outcome,
+            Err(e) => Some(Err(e)),
+        }
     }
 
     /// The default set: RTF, plaintext, office docs, PDF, audio tags.

@@ -67,6 +67,18 @@ impl<'a> Cx<'a> {
             if scanned.is_multiple_of(cancel_every) && self.cancelled() {
                 return Ok(false);
             }
+            // The display limit is already full, and holding a row proves at
+            // least one more match exists than will be shown — so `limited` is
+            // exactly true here, and everything below is work whose result
+            // `flush_pass` would throw away. That work is not small: the
+            // full-text passes decompress the document, fold a copy of it, and
+            // cut a snippet, per row. `cascade::run` makes the same test
+            // between passes; without this one a single pass over a common
+            // term runs to the end of the candidate set.
+            if self.remaining() == 0 {
+                self.limited = true;
+                break;
+            }
             let file_id: i64 = col(row, 0)?;
             // Borrowed from the statement rather than `col::<String>`: this
             // runs for every *scanned* row — a full-table scan on the filename
