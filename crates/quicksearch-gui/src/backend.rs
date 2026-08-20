@@ -51,6 +51,31 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Ask the coordinator to rebuild, after letting go of everything that
+    /// holds the index file open.
+    ///
+    /// The search worker keeps its connection for half a minute after the last
+    /// keystroke so a typing session runs against a warm cache — which is
+    /// exactly the wrong thing to be holding when the file is about to be
+    /// deleted. Without this the delete fails on Windows and the rebuild
+    /// silently becomes an ordinary run against the old index; after a
+    /// password change that leaves the config claiming protection the file on
+    /// disk does not have.
+    pub fn rebuild_index(&self) {
+        if let Some(search) = &self.search {
+            search.release_connection();
+        }
+        self.coordinator.rebuild_index();
+    }
+
+    /// [`Backend::rebuild_index`]'s reasoning, for the delete-only path.
+    pub fn clear_index(&self) {
+        if let Some(search) = &self.search {
+            search.release_connection();
+        }
+        self.coordinator.clear_index();
+    }
+
     pub fn start(config: &Config, ctx: egui::Context) -> Result<Backend, String> {
         // eframe is reactive: a run the coordinator schedules on its own
         // would sit unseen behind a settled window until the pointer moved.
@@ -89,10 +114,17 @@ impl Backend {
     pub fn watch_live(
         &self,
         query: &str,
-        targets: Vec<quicksearch_core::live::Target>,
+        mut targets: Vec<quicksearch_core::live::Target>,
         config: &Config,
     ) {
         let Some(live) = &self.live else { return };
+        // The watcher re-reads a row's file to re-cut its snippet, and the one
+        // file it must never open is the index it is reading the row from:
+        // closing a descriptor on it cancels SQLite's locks process-wide. The
+        // walk no longer writes such rows, but one from an older build lives
+        // until the stale sweep reaches its directory, and it can be on screen
+        // before then.
+        targets.retain(|t| !config.is_index_file(std::path::Path::new(&t.path)));
         if targets.is_empty() {
             live.clear();
         } else {
@@ -133,10 +165,13 @@ impl Backend {
 
     /// Read a duplicate group through on a worker thread, comparing every
     /// member against the first byte for byte. Replaces any run already going.
-    pub fn start_verify(&mut self, paths: Vec<PathBuf>, ctx: egui::Context) {
+    pub fn start_verify(&mut self, mut paths: Vec<PathBuf>, config: &Config, ctx: egui::Context) {
         if let Some(job) = &self.verify_job {
             job.cancel();
         }
+        // Byte-for-byte comparison opens every member. See `watch_live` for
+        // why the index must not be one of them.
+        paths.retain(|p| !config.is_index_file(p));
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();

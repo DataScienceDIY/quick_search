@@ -15,7 +15,7 @@ use super::*;
 /// app was closed. See [`crate::scope`] for the pass that applies it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IndexWork {
-    /// Roots that are no longer configured, in `files.path` spelling. Every
+    /// Roots that are no longer configured, in stored spelling. Every
     /// row beneath one is deleted; no filesystem access is involved, so a
     /// root whose folder is gone is handled the same as one that still
     /// exists.

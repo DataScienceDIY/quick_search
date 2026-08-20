@@ -3,6 +3,32 @@
 
 use super::*;
 
+/// First wait after a full run is refused or fails to start.
+pub(super) const RUN_RETRY_BASE: Duration = Duration::from_secs(30);
+
+/// Ceiling for that wait. A misconfiguration that is never fixed then costs
+/// one attempt every few minutes instead of one per second.
+const RUN_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// Individually-logged occurrences of each refusal before it goes quiet. The
+/// message is identical every time, and the log ring is the only record of
+/// what *else* happened; these are reset the moment a run starts.
+static NO_ROOTS: crate::log::Throttle = crate::log::Throttle::new(3);
+static NESTED_ROOTS: crate::log::Throttle = crate::log::Throttle::new(3);
+static START_FAILURES: crate::log::Throttle = crate::log::Throttle::new(3);
+
+/// Why a full run is being started, which is what decides how a refusal is
+/// reported. See [`Inner::refuse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunTrigger {
+    /// Something the user did: *Index now*, *Rebuild index*, or a settings
+    /// change wide enough to need a walk. A refusal owes them an answer.
+    Requested,
+    /// The periodic timer, or repair the coordinator scheduled for itself. A
+    /// refusal here is worth one log line and then quiet.
+    Scheduled,
+}
+
 pub(super) struct Inner {
     pub(super) config: Config,
     pub(super) indexing: Arc<IndexingService>,
@@ -40,6 +66,18 @@ pub(super) struct Inner {
     /// defer application past `pending_max_defer`.
     pub(super) pending_since: Option<Instant>,
     pub(super) needs_full_run: bool,
+    /// Earliest time another full run may be *attempted*, when the last one
+    /// was refused or failed. Without it a config with no roots, or with
+    /// nested roots, or an index on a full disk, retries every tick forever:
+    /// two stderr writes and two ring pushes a second, which evicts the whole
+    /// 5000-line log ring in under an hour and takes the diagnostics for the
+    /// actual problem with it — and in the failed-run case re-walks the tree
+    /// each time.
+    pub(super) run_retry_at: Option<Instant>,
+    /// How long the next refusal waits, doubling to [`RUN_RETRY_MAX`] so a
+    /// permanent misconfiguration costs almost nothing, and reset once a run
+    /// actually starts.
+    pub(super) run_retry_delay: Duration,
     /// Reconciliation owed to a config change, part-applied across ticks.
     /// Unlike `needs_full_run`, this is acted on in manual mode too.
     pub(super) pending_work: Option<WorkCursor>,
@@ -95,7 +133,7 @@ impl Inner {
             CoordCmd::SetMode(IndexMode::ManualStopped) => self.enter_manual_stopped(),
             // ManualRunning isn't directly settable; ReindexNow is the verb.
             CoordCmd::SetMode(IndexMode::ManualRunning) | CoordCmd::ReindexNow => {
-                self.start_full_run();
+                self.start_full_run(RunTrigger::Requested);
                 if self.mode != IndexMode::Auto {
                     self.mode = IndexMode::ManualRunning;
                 }
@@ -139,10 +177,18 @@ impl Inner {
                 self.pending_work = None;
                 self.reconcile_done = None;
                 if let Err(e) = self.indexing.delete_index_for_rebuild(&db) {
+                    // Not a warning to step over: a run started now would
+                    // reopen the *old* index and present itself as the rebuild
+                    // the user asked for. Worse after a password change, where
+                    // the config already claims a protection the surviving
+                    // file does not have. Report it and leave the index alone.
                     crate::log_warn!("coordinator: rebuild: {}", e);
+                    self.indexing
+                        .report_error(format!("could not rebuild the index: {}", e));
+                    return;
                 }
                 self.clear_root_counts();
-                self.start_full_run();
+                self.start_full_run(RunTrigger::Requested);
                 if self.mode != IndexMode::Auto {
                     self.mode = IndexMode::ManualRunning;
                 }
@@ -174,7 +220,7 @@ impl Inner {
                 // delivers anything else, so nothing downstream checks, and
                 // a file renamed *out* of every root would otherwise be
                 // written into the index at its new home. Roots in the same
-                // spelling `files.path` uses — the caller's paths are.
+                // spelling the index uses — the caller's paths are.
                 let prefixes: Vec<String> = self
                     .config
                     .normalized_indexing_paths()
@@ -224,6 +270,12 @@ impl Inner {
         if self.saw_running {
             self.saw_running = false;
             self.was_busy = true;
+            // A run that errored never stamps `last_full_index`, so
+            // `periodic_due` stays true and the next tick starts another one —
+            // a fresh whole-tree walk per second against, say, a full disk.
+            if matches!(status, IndexingStatus::Error(_)) {
+                self.defer_runs();
+            }
             self.refresh_last_full_index();
             // Eager re-read: the run just changed the number on screen.
             self.files_at = None;
@@ -263,8 +315,9 @@ impl Inner {
             worked = true;
         }
 
-        if self.needs_full_run || self.periodic_due() {
-            self.start_full_run();
+        let deferred = self.run_retry_at.is_some_and(|at| Instant::now() < at);
+        if (self.needs_full_run || self.periodic_due()) && !deferred {
+            self.start_full_run(RunTrigger::Scheduled);
             worked = true;
         }
 
@@ -408,7 +461,7 @@ impl Inner {
         // Widening adds files only a walk can produce; mirrors `ReindexNow`,
         // including the manual-mode round trip back to stopped.
         if cursor.reindex() {
-            self.start_full_run();
+            self.start_full_run(RunTrigger::Requested);
             if self.mode != IndexMode::Auto {
                 self.mode = IndexMode::ManualRunning;
             }
@@ -555,6 +608,9 @@ impl Inner {
             Err(e) => {
                 crate::log_warn!("coordinator: targeted update unavailable: {}", e);
                 self.targeted.clear();
+                // As in `start_full_run`: a resume point outlives its event
+                // here too, and would misapply to the next one for that path.
+                self.resume_from.retain(|p, _| self.pending.contains_key(p));
                 return;
             }
         };
@@ -633,10 +689,15 @@ impl Inner {
     }
 
     fn periodic_due(&self) -> bool {
+        // `.max(1)`: at zero every tick is "due", so a full run would start
+        // the moment the previous one finished, forever. There is no setting
+        // that means "reindex continuously" — manual mode is how you say
+        // "never", so zero is a typo rather than an intent.
         let interval_secs = self
             .config
             .indexing
             .reindex_interval_minutes
+            .max(1)
             .saturating_mul(60);
         let last = crate::lock_ok(&self.shared).last_full_index;
         match last {
@@ -651,7 +712,20 @@ impl Inner {
         }
     }
 
-    fn start_full_run(&mut self) {
+    fn start_full_run(&mut self, trigger: RunTrigger) {
+        // A run already in progress is not a refusal: whoever called this
+        // wanted a run and there is one. Returning here rather than falling
+        // through to `start_indexing`'s "already running" error keeps an
+        // *Index now* pressed mid-run from backing off future runs and from
+        // replacing the progress the user is watching with an error. It also
+        // covers `Optimizing`, which `start_indexing` does not reject even
+        // though it holds a write transaction over the whole file.
+        if !matches!(
+            self.indexing.get_status(),
+            IndexingStatus::Idle | IndexingStatus::Error(_)
+        ) {
+            return;
+        }
         let roots: Vec<String> = self
             .config
             .resolved_indexing_paths()
@@ -659,20 +733,23 @@ impl Inner {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         if roots.is_empty() {
-            crate::log_warn!("coordinator: no indexing roots configured");
+            self.refuse(trigger, &NO_ROOTS, "no indexing roots are configured");
             return;
         }
         // Backstop for hand-edited configs; the GUI rejects nested roots
         // itself.
         let nested = crate::config::nested_roots(&roots);
         if !nested.is_empty() {
-            for (child, parent) in &nested {
-                crate::log_warn!(
-                    "coordinator: refusing to index: root {} is nested under {}",
-                    child,
-                    parent
-                );
-            }
+            let detail = nested
+                .iter()
+                .map(|(child, parent)| format!("{} is nested under {}", child, parent))
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.refuse(
+                trigger,
+                &NESTED_ROOTS,
+                &format!("refusing to index nested roots: {}", detail),
+            );
             return;
         }
         // The full run owns the DB (and may wipe/rebuild the file).
@@ -683,6 +760,12 @@ impl Inner {
         // unreadable directory (`unreadable.covers`) or of an aliased symlink
         // target (`aliased_paths`), and those rows would leak until a rebuild.
         self.pending.retain(|_, ev| is_removal(ev));
+        // Resume points describe events that no longer exist. Left behind, the
+        // next `Create` for that path would `skip` the first n entries of a
+        // walk that has nothing to do with the one the count came from, and
+        // those files would have no row until a later full run.
+        self.resume_from
+            .retain(|p, _| self.pending.contains_key(p) || self.targeted.contains_key(p));
         if self.pending.is_empty() {
             self.last_event_at = None;
             self.pending_since = None;
@@ -691,13 +774,56 @@ impl Inner {
             .indexing
             .start_indexing(roots, self.db_path(), self.config.clone())
         {
-            crate::log_warn!("coordinator: start indexing: {}", e);
+            self.refuse(
+                trigger,
+                &START_FAILURES,
+                &format!("could not start indexing: {}", e),
+            );
             return;
         }
+        // A run started, so whatever was wrong is not wrong any more.
+        self.run_retry_at = None;
+        self.run_retry_delay = RUN_RETRY_BASE;
+        NO_ROOTS.reset();
+        NESTED_ROOTS.reset();
+        START_FAILURES.reset();
         // `start_indexing` claims Running before returning, so there is no
         // window in which this thread believes the service idle and writes to
         // a database the run is about to reopen.
         self.saw_running = true;
+    }
+
+    /// Refuse a full run: back off, and say so at a volume the trigger earns.
+    ///
+    /// The throttles exist for the *scheduled* retry, which repeats the same
+    /// sentence every few minutes for as long as the configuration stays
+    /// broken and would otherwise evict the log ring. They must not silence a
+    /// run somebody asked for: after three refusals a fourth press of *Index
+    /// now* would log nothing, show nothing and change nothing, which reads as
+    /// a button that does not work. So a requested run resets the throttle —
+    /// it is a fresh occurrence in the user's eyes — and publishes the reason
+    /// where they are already looking, the same way a failed rebuild does.
+    fn refuse(&mut self, trigger: RunTrigger, throttle: &crate::log::Throttle, reason: &str) {
+        self.defer_runs();
+        if trigger == RunTrigger::Requested {
+            throttle.reset();
+            self.indexing.report_error(reason.to_string());
+        }
+        if throttle.allow() {
+            crate::log_warn!("coordinator: {}", reason);
+        }
+    }
+
+    /// Hold off further full runs for a while, doubling the wait each time.
+    ///
+    /// Called wherever a run is refused or fails to start. `needs_full_run` is
+    /// cleared with it: the two refusal paths sit above the point that clears
+    /// it, so without this the flag stays set and `tick` retries immediately,
+    /// every second, for as long as the configuration stays broken.
+    fn defer_runs(&mut self) {
+        self.needs_full_run = false;
+        self.run_retry_at = Some(Instant::now() + self.run_retry_delay);
+        self.run_retry_delay = (self.run_retry_delay * 2).min(RUN_RETRY_MAX);
     }
 
     fn enter_auto(&mut self) {
@@ -811,6 +937,29 @@ impl Inner {
         let Some(mut reason) = w.degraded_reason() else {
             return;
         };
+        // An overflow is not a capacity problem: the watcher is still good,
+        // it just cannot tell us what it missed. Schedule the run that finds
+        // out, rather than disabling live updates for the session over
+        // something a busy minute can cause.
+        //
+        // Not a restart. `inotify` and `ReadDirectoryChangesW` both keep
+        // delivering after their queue overflows — the rescan flag means "you
+        // missed some", not "this watch is broken" — so tearing down and
+        // re-registering would re-`stat` every one of `max_watched_dirs`
+        // (128k) directories, generate events of its own, and do it again the
+        // next time a busy tree overflowed the queue, which is exactly when
+        // the machine can least afford it.
+        //
+        // Consuming the reason is what makes this a one-shot: the slot is
+        // never otherwise cleared, so a standing `Overflowed` would re-arm
+        // `needs_full_run` on every tick and hide a `KernelLimit` recorded
+        // afterwards.
+        if matches!(reason, WatchError::Overflowed) {
+            w.clear_degraded();
+            crate::log_warn!("watcher: {}", reason);
+            self.needs_full_run = true;
+            return;
+        }
         // The async notify callback can't know the count; fill it in here.
         if let WatchError::KernelLimit { registered } = &mut reason {
             if *registered == 0 {

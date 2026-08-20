@@ -9,8 +9,43 @@ use crate::ui_util::hint;
 pub enum DupState {
     NotLoaded,
     Loading,
-    Loaded(Vec<DuplicateGroup>),
+    Loaded(LoadedGroups),
     Error(String),
+}
+
+/// The scan's result, with each group's header line already built.
+///
+/// The titles are four formatted numbers each and the list runs to 500, so
+/// building them in the render loop meant ~2000 allocations *per frame* — and
+/// this list overflows by definition, which keeps `more_below_hint`'s 20 Hz
+/// repaint running for as long as the tab is open. They depend only on the
+/// data, so they are built once, here, where the data arrives.
+pub struct LoadedGroups {
+    pub groups: Vec<DuplicateGroup>,
+    titles: Vec<String>,
+}
+
+impl LoadedGroups {
+    pub fn new(groups: Vec<DuplicateGroup>) -> LoadedGroups {
+        let titles = groups
+            .iter()
+            .map(|group| {
+                let name = group
+                    .members
+                    .first()
+                    .map(|m| m.1.as_str())
+                    .unwrap_or("(unknown)");
+                format!(
+                    "{} × {}: {} reclaimable ({} total)",
+                    group_thousands(group.count as u64),
+                    name,
+                    human_size(group.redundant_size.max(0) as u64),
+                    human_size(group.total_size.max(0) as u64),
+                )
+            })
+            .collect();
+        LoadedGroups { groups, titles }
+    }
 }
 
 pub struct DuplicatesTab {
@@ -73,7 +108,8 @@ impl DuplicatesTab {
             DupState::Error(e) => {
                 ui.colored_label(ui.visuals().error_fg_color, e);
             }
-            DupState::Loaded(groups) => {
+            DupState::Loaded(loaded) => {
+                let groups = &loaded.groups;
                 if groups.is_empty() {
                     ui.label("No duplicate files found.");
                     return actions;
@@ -85,18 +121,9 @@ impl DuplicatesTab {
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         for (i, group) in groups.iter().enumerate() {
-                            let name = group
-                                .members
-                                .first()
-                                .map(|m| m.1.as_str())
-                                .unwrap_or("(unknown)");
-                            let title = format!(
-                                "{} × {}: {} reclaimable ({} total)",
-                                group_thousands(group.count as u64),
-                                name,
-                                human_size(group.redundant_size.max(0) as u64),
-                                human_size(group.total_size.max(0) as u64),
-                            );
+                            // Built once when the scan landed; see
+                            // `LoadedGroups`.
+                            let title = loaded.titles[i].as_str();
                             let header =
                                 egui::CollapsingHeader::new(title)
                                     .id_salt(i)

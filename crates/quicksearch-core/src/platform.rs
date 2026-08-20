@@ -407,6 +407,15 @@ pub const WATCH_ROOTS_RECURSIVELY: bool = cfg!(windows);
 /// other with `LIKE` would otherwise disagree with itself. `NOCASE` folds ASCII
 /// only, which matches what `LIKE` does — non-ASCII paths stay case-sensitive
 /// on both sides, consistently.
+///
+/// **No query interpolates this any more.** The folder filter was its last
+/// caller, and it now needs one `LIKE` where it used to need `= COLLATE …  OR
+/// LIKE`. What is left is a *specification*: this constant and
+/// `tests::collation_matches_like_case_folding` are where the rule is written
+/// down, and the places that fold paths by hand —
+/// [`PATHS_ARE_CASE_INSENSITIVE`], [`crate::config::IgnoreSet`],
+/// [`crate::config::Config::is_index_file`] — are required to agree with it.
+/// Deleting it would leave that agreement asserted nowhere.
 pub const PATH_COLLATION: &str = if cfg!(windows) { "NOCASE" } else { "BINARY" };
 
 /// Whether this platform's filesystem matches names without regard to case —
@@ -571,6 +580,324 @@ pub fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
         ));
     }
     Ok(file)
+}
+
+/// Why [`IndexLock::acquire`] did not hand back a lock.
+#[derive(Debug)]
+pub enum LockError {
+    /// Another process holds it. `pid` is whatever the holder recorded in the
+    /// file and is for the message only — it is never what decides.
+    Held { pid: Option<u32> },
+    /// The filesystem does not do locks. The caller must carry on regardless;
+    /// see [`IndexLock::acquire`].
+    Unsupported(String),
+}
+
+/// Proof that this process, and no other, owns the index at a given path.
+///
+/// Held for the life of the process: dropping it, or exiting, releases the
+/// lock.
+#[derive(Debug)]
+pub struct IndexLock {
+    /// The lock lives on this open file description. Keeping the handle alive
+    /// is the whole mechanism, which is why the field is never read.
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+/// The lock this process is holding, if any.
+///
+/// A `static` because that is what the thing models: `flock` and `LockFileEx`
+/// are owned by an open file description, one index is locked per process, and
+/// what releases it is the process ending. Threading an `Arc<Mutex<_>>` from
+/// `main` down through the unlock gate and into the settings handler would say
+/// the same thing in three more places.
+///
+/// Never dropped — statics are not — and that costs nothing here: the kernel
+/// releases the lock however the process goes away, which is the whole design.
+static HELD_LOCK: std::sync::Mutex<Option<IndexLock>> = std::sync::Mutex::new(None);
+
+impl IndexLock {
+    /// The lock file for the index at `db_path`.
+    ///
+    /// Its own name, never the database or one of SQLite's sidecars: a
+    /// `flock` of ours on an inode SQLite also locks would be a second
+    /// locking protocol on one file, and on Unix our `close` of it would
+    /// cancel SQLite's locks — the very failure this whole change exists to
+    /// prevent.
+    pub fn path_for(db_path: &Path) -> PathBuf {
+        let name = db_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("index.sqlite");
+        db_path.with_file_name(format!("{}.lock", name))
+    }
+
+    /// Take the index lock, or report who has it.
+    ///
+    /// **The guard is the kernel's lock, never the file's existence.** `flock`
+    /// and `LockFileEx` are held by the open file description, so the kernel
+    /// drops them when the process goes away for *any* reason — a clean exit,
+    /// a panic, SIGKILL, the OOM killer, a SIGBUS, or the power going out. A
+    /// `.lock` file left behind by an unclean shutdown is therefore inert, and
+    /// the next start re-acquires it normally. Nothing here may ever branch on
+    /// the file being present; a stale-PID-file scheme would strand the user
+    /// behind a crash exactly when they most want to reopen the app.
+    ///
+    /// [`LockError::Unsupported`] means the filesystem could not answer, not
+    /// that the lock is taken — NFS without `lockd`, some FUSE mounts, a few
+    /// network shares. Callers **must** start anyway: a convenience guard is
+    /// never a good enough reason to refuse to open.
+    pub fn acquire(db_path: &Path) -> Result<IndexLock, LockError> {
+        let path = IndexLock::path_for(db_path);
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() {
+                let _ = create_dir_private(dir);
+            }
+        }
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+        {
+            Ok(f) => f,
+            // A read-only or unwritable index directory is not a second
+            // instance. Same rule as an unsupported filesystem: carry on.
+            Err(e) => return Err(LockError::Unsupported(format!("{}: {}", path.display(), e))),
+        };
+        lock_exclusive_nonblocking(&file).map_err(|e| match e {
+            LockAttempt::Held => LockError::Held {
+                pid: read_recorded_pid(&path),
+            },
+            LockAttempt::Unsupported(msg) => LockError::Unsupported(msg),
+        })?;
+        let lock = IndexLock {
+            _file: file,
+            path: path.clone(),
+        };
+        // Only after the lock is ours, and only so a second instance can name
+        // us in its message. Nothing reads this to make a decision.
+        lock.record_holder();
+        Ok(lock)
+    }
+
+    /// [`IndexLock::acquire`], keeping the lock in [`HELD_LOCK`] for the life
+    /// of the process. What a frontend calls at startup.
+    pub fn hold(db_path: &Path) -> Result<(), LockError> {
+        let lock = IndexLock::acquire(db_path)?;
+        *crate::lock_ok(&HELD_LOCK) = Some(lock);
+        Ok(())
+    }
+
+    /// Move the held lock onto the index at `db_path`, for a `database_path`
+    /// that changed while the app was running.
+    ///
+    /// **The new lock is taken before the old one is let go.** A refusal then
+    /// leaves this process holding exactly what it held before, so the caller
+    /// can reject the change and stay in a state that is still true. Releasing
+    /// first would leave a window in which another instance could claim the
+    /// index we are about to keep using.
+    ///
+    /// Naming the index already locked is [`LockError::Held`] and changes
+    /// nothing. [`LockError::Unsupported`] means the move *happened* — the old
+    /// lock is gone — and the new path simply cannot be locked; carry on, as at
+    /// startup. Holding the old path's lock in that case would be worse than
+    /// holding none: it guards a file this process no longer uses while barring
+    /// a second instance from it.
+    pub fn move_to(db_path: &Path) -> Result<(), LockError> {
+        let mut slot = crate::lock_ok(&HELD_LOCK);
+        // Short-circuit before acquiring: `flock` conflicts with itself across
+        // two open file descriptions even inside one process, so re-taking the
+        // path we already hold would report itself as `Held`.
+        if slot
+            .as_ref()
+            .is_some_and(|held| held.path == IndexLock::path_for(db_path))
+        {
+            return Ok(());
+        }
+        match IndexLock::acquire(db_path) {
+            Ok(lock) => {
+                *slot = Some(lock);
+                Ok(())
+            }
+            Err(LockError::Unsupported(why)) => {
+                *slot = None;
+                Err(LockError::Unsupported(why))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn record_holder(&self) {
+        use std::io::Write;
+        // A fresh handle: writing through `_file` would move the shared file
+        // offset the lock has nothing to do with, and the failure here is
+        // cosmetic either way. That a *second* handle can write here at all is
+        // why the Windows lock byte sits at [`LOCK_BYTE_OFFSET`] rather than at
+        // offset 0 — its byte-range locks are mandatory and per-handle, so a
+        // lock over this byte would block our own write.
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .and_then(|mut f| write!(f, "{}", std::process::id()));
+        if let Err(e) = written {
+            crate::log_warn!(
+                "could not record the lock holder in {}: {}",
+                self.path.display(),
+                e
+            );
+        }
+    }
+}
+
+/// The PID a holder recorded, for a message. `None` whenever the file is
+/// absent, empty or unparseable — all of which are ordinary.
+fn read_recorded_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// What one attempt at the lock found.
+enum LockAttempt {
+    Held,
+    Unsupported(String),
+}
+
+/// Where the Windows lock byte lives, chosen to be nowhere near the PID the
+/// lock file holds at offset 0. See [`lock_exclusive_nonblocking`]'s Windows
+/// arm; the Unix arm has no equivalent, because `flock` locks the open file
+/// description rather than a byte range.
+#[cfg(windows)]
+const LOCK_BYTE_OFFSET: u64 = 1 << 63;
+
+#[cfg(unix)]
+fn lock_exclusive_nonblocking(file: &std::fs::File) -> Result<(), LockAttempt> {
+    use std::os::unix::io::AsRawFd;
+
+    // `flock`, not `fcntl`: a POSIX record lock would be cancelled by any
+    // `close` this process makes on the same inode, which is the hazard
+    // documented in `file_handling::index_file_set`. A `flock` belongs to the
+    // open file description and is immune to it.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Err(LockAttempt::Held),
+        _ => Err(LockAttempt::Unsupported(err.to_string())),
+    }
+}
+
+#[cfg(windows)]
+fn lock_exclusive_nonblocking(file: &std::fs::File) -> Result<(), LockAttempt> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
+
+    // The locked byte sits at [`LOCK_BYTE_OFFSET`], far past anything this
+    // file will ever hold — **not** at offset 0, where the PID is written.
+    // Windows byte-range locks are *mandatory* and belong to the file object,
+    // not the process: a lock covering offset 0 makes our own
+    // `record_holder`, which writes through a second handle, fail with
+    // `ERROR_LOCK_VIOLATION`, and `read_recorded_pid` fail the same way — so
+    // the "already running" message would lose the PID on the one platform
+    // that has no terminal to print it to. Locking beyond end-of-file is
+    // explicitly legal and is the conventional way to use a file as a
+    // semaphore.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.Anonymous = OVERLAPPED_0 {
+        Anonymous: OVERLAPPED_0_0 {
+            Offset: LOCK_BYTE_OFFSET as u32,
+            OffsetHigh: (LOCK_BYTE_OFFSET >> 32) as u32,
+        },
+    };
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if ok != 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code) if code == ERROR_LOCK_VIOLATION as i32 => Err(LockAttempt::Held),
+        _ => Err(LockAttempt::Unsupported(err.to_string())),
+    }
+}
+
+/// Bytes free to this user on the filesystem holding `path`, or `None` where
+/// the platform will not say.
+///
+/// `None` is "unknown", never "zero": every caller treats it as no reason to
+/// hold anything back.
+///
+/// The path need not exist — its nearest existing ancestor is what gets
+/// asked, so this answers for a database that has not been created yet.
+pub fn available_space(path: &Path) -> Option<u64> {
+    let mut probe = path;
+    loop {
+        if probe.exists() {
+            break;
+        }
+        probe = probe.parent()?;
+    }
+    available_space_of_existing(probe)
+}
+
+#[cfg(unix)]
+fn available_space_of_existing(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    // `f_bavail`, not `f_bfree`: the reserved blocks in the difference are
+    // root's, and this process is not root. `f_frsize` is the fragment size
+    // the block counts are in — `f_bsize` is the preferred I/O size and is
+    // the wrong multiplier.
+    let frsize = if stat.f_frsize > 0 {
+        stat.f_frsize
+    } else {
+        stat.f_bsize
+    };
+    (stat.f_bavail as u64).checked_mul(frsize as u64)
+}
+
+#[cfg(windows)]
+fn available_space_of_existing(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_to_caller: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free_to_caller)
 }
 
 /// How long to keep retrying a delete that fails because something else holds

@@ -567,13 +567,37 @@ impl Config {
         // open again. `rename` is atomic on both platforms, and the `sync_all`
         // before it means the bytes are on the disk before the name points at
         // them.
-        let tmp = path.with_extension("toml.tmp");
-        write_private(&tmp, content.as_bytes())
-            .map_err(|e| format!("Failed to write config file {}: {}", tmp.display(), e))?;
+        let tmp = write_private_temp(&path, content.as_bytes()).map_err(|e| {
+            format!(
+                "Failed to write config file beside {}: {}",
+                path.display(),
+                e
+            )
+        })?;
         fs::rename(&tmp, &path).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             format!("Failed to replace config file {}: {}", path.display(), e)
         })?;
+        // The rename is atomic but not durable: it is a directory entry, and
+        // the directory has its own dirty state. Without this a power cut just
+        // after can leave *neither* name, which is the salt loss the whole
+        // dance exists to prevent. Best-effort, and on Windows it is a no-op
+        // every time rather than only on an exotic filesystem: opening a
+        // directory as a file needs `FILE_FLAG_BACKUP_SEMANTICS`, which
+        // `fs::File::open` does not pass, so this fails and is skipped. NTFS
+        // journals the rename itself, which is the guarantee this is reaching
+        // for; on Unix it has to be asked for.
+        if let Some(dir) = path.parent() {
+            if let Ok(handle) = fs::File::open(dir) {
+                let _ = handle.sync_all();
+            }
+            // Leftovers from a save that died between `create_new` and the
+            // rename. The old fixed `config.toml.tmp` overwrote itself, so
+            // there was never more than one; a unique name per attempt is what
+            // makes the write safe (see `write_private_temp`) and what makes
+            // them accumulate, so they are swept here instead.
+            sweep_stale_temps(dir, &path);
+        }
         Ok(())
     }
 
@@ -598,8 +622,72 @@ impl Config {
         }
     }
 
+    /// Whether `path` is the index itself — the database, one of SQLite's
+    /// `-wal`/`-shm`/`-journal` sidecars, or the instance lock.
+    ///
+    /// For the paths that arrive from a `files` row rather than from a walk:
+    /// once the walk stops indexing the index
+    /// ([`crate::file_handling::index_file_set`], which explains why opening
+    /// one is fatal), such rows are swept away, but a row written by an older
+    /// build survives until the sweep reaches it and can still be opened from
+    /// a result list in the meantime.
+    ///
+    /// The name is compared first and the directory only on a hit, so the
+    /// overwhelmingly common miss costs one string comparison rather than the
+    /// `canonicalize` the directory check needs.
+    ///
+    /// Names are folded where the filesystem folds them
+    /// ([`crate::platform::PATHS_ARE_CASE_INSENSITIVE`]): a stored row spelling
+    /// the database `Index.sqlite` names the same file as a config spelling it
+    /// `index.sqlite`, and opening it has the same consequence. ASCII only,
+    /// matching `PATH_COLLATION` and [`IgnoreSet`].
+    pub fn is_index_file(&self, path: &Path) -> bool {
+        let db = self.resolved_database_path();
+        let (Some(db_name), Some(name)) = (
+            db.file_name().and_then(|s| s.to_str()),
+            path.file_name().and_then(|s| s.to_str()),
+        ) else {
+            return false;
+        };
+        let same_name = |a: &str, b: &str| {
+            if crate::platform::PATHS_ARE_CASE_INSENSITIVE {
+                a.eq_ignore_ascii_case(b)
+            } else {
+                a == b
+            }
+        };
+        // `str::get`, not `name[..cut]`: the cut is `db_name`'s *byte* length
+        // and the two names are unrelated strings, so it can land inside a
+        // multi-byte character — `€xyz` against a two-byte `db_name` is six
+        // bytes either way — and indexing there panics. A non-boundary is
+        // simply not a match.
+        let name_matches = same_name(name, db_name)
+            || crate::file_handling::INDEX_SIDECAR_SUFFIXES
+                .iter()
+                .any(|s| {
+                    let cut = db_name.len();
+                    name.len() == cut + s.len()
+                        && name.get(..cut).is_some_and(|head| same_name(head, db_name))
+                        && name.get(cut..).is_some_and(|tail| same_name(tail, s))
+                });
+        if !name_matches {
+            return false;
+        }
+        let same_dir = |a: &Path, b: &Path| {
+            a == b
+                || a.canonicalize().unwrap_or_else(|_| a.to_path_buf())
+                    == b.canonicalize().unwrap_or_else(|_| b.to_path_buf())
+        };
+        match (path.parent(), db.parent()) {
+            (Some(a), Some(b)) => same_dir(a, b),
+            // Both at a filesystem root, or neither: the name match stands.
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// `resolved_indexing_paths` canonicalized and spelled the way
-    /// `files.path` prefixes them.
+    /// stored parents are prefixed with them.
     ///
     /// The form roots must be compared in: `~/docs`, `docs` in a portable
     /// config and `/home/me/docs` are one root under three spellings, and a
@@ -631,30 +719,121 @@ impl Config {
     }
 }
 
-/// Write `bytes` to `path`, owner-readable only, and flush them to the disk
-/// before returning.
+/// Write `bytes` to a fresh temporary file beside `target`, owner-only, with
+/// its contents flushed to the disk, and return its path for the caller to
+/// rename into place.
 ///
-/// `O_NOFOLLOW` on Unix: the config directory is not always somewhere only
-/// this user can write — a portable install can sit in a shared or removable
-/// directory — and a symlink left at the config's name would otherwise
-/// redirect this write onto whatever it points at.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// `create_new` and a unique name, not a fixed one: `O_NOFOLLOW` refuses a
+/// symlink but says nothing about a *regular* file or a hardlink that is
+/// already sitting at the name we were going to use. The config directory is
+/// not always somewhere only this user can write — a portable install can sit
+/// in a shared or removable directory — and an attacker who pre-creates the
+/// temp file as a hardlink to a file they can read would otherwise be handed
+/// `[security].salt`. `mode(0o600)` only applies to a file this call creates,
+/// which is the same reason.
+fn write_private_temp(target: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
     use std::io::Write;
 
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
-        opts.mode(0o600);
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let stem = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+
+    // A handful of attempts, then give up rather than spin: if something is
+    // racing us for every name we pick, failing the save is the honest
+    // outcome — the caller treats a failed save as fatal to the change.
+    let mut last_err = None;
+    for _ in 0..8 {
+        let tmp = dir.join(format!("{}.{}.tmp", stem, unique_suffix()));
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+            opts.mode(0o600);
+        }
+        match opts.open(&tmp) {
+            Ok(mut f) => {
+                let wrote = f.write_all(bytes).and_then(|()| f.sync_all());
+                return match wrote {
+                    Ok(()) => Ok(tmp),
+                    Err(e) => {
+                        let _ = fs::remove_file(&tmp);
+                        Err(e)
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => return Err(e),
+        }
     }
-    let mut f = opts.open(path)?;
-    f.write_all(bytes)?;
-    // The rename that follows is atomic with respect to the *directory*, not
-    // to the file's contents: without this, a crash can leave the new name
-    // pointing at a block of zeroes.
-    f.sync_all()
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a temporary config file",
+        )
+    }))
+}
+
+/// How old an abandoned temp file must be before [`sweep_stale_temps`] takes
+/// it. A save is a serialize, a write and a rename — milliseconds — so an hour
+/// is far past any doubt, while still short enough that leftovers do not
+/// accumulate across a run of crashes.
+const TEMP_SWEEP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Delete abandoned `<config name>.*.tmp` files beside the config.
+///
+/// [`write_private_temp`] must use a *unique* name — a fixed one can be
+/// pre-created by someone else as a hardlink — and a unique name is one that
+/// nothing later overwrites, so a process that dies between `create_new` and
+/// the rename leaves its temp file behind for good. The old fixed
+/// `config.toml.tmp` was reused by the next save and so never accumulated;
+/// this is what replaces that property.
+///
+/// Age is the discriminator, not the recorded PID: a temp file created seconds
+/// ago may belong to a save running *right now* in another process, and
+/// deleting that would destroy the very write this whole dance protects.
+/// Entirely best-effort — a directory that cannot be listed is not a reason to
+/// fail a save that already succeeded.
+fn sweep_stale_temps(dir: &Path, target: &Path) {
+    let Some(stem) = target.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    // The trailing dot matters: without it the config file itself would be a
+    // prefix match.
+    let prefix = format!("{}.", stem);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(&prefix) || !name.ends_with(".tmp") {
+            continue;
+        }
+        let abandoned = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age >= TEMP_SWEEP_AGE));
+        if abandoned {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// A short, non-guessable-enough suffix for the temp name.
+///
+/// This does not need to be unpredictable to an attacker — `create_new` is
+/// what makes the write safe — only unlikely to collide with a leftover from
+/// an interrupted save, so the process id and a clock reading are plenty.
+fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", std::process::id(), nanos)
 }
 
 /// Reserved `content_extensions` entry standing for "files with no

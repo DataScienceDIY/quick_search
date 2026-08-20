@@ -396,8 +396,7 @@ mod tests {
                     &tx,
                     &NewFile {
                         name: f.file_name().unwrap().to_str().unwrap(),
-                        path: f.to_str().unwrap(),
-                        parent: d.to_str().unwrap(),
+                        parent: &crate::file_handling::dir_to_db_parent(&d),
                         size: std::fs::metadata(&f).unwrap().len(),
                         mtime: 1,
                         mime: Some("text/plain"),
@@ -494,7 +493,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .query_row(
-                    "SELECT content_state FROM files WHERE path = ?1",
+                    "SELECT content_state FROM files WHERE parent || name = ?1",
                     rusqlite::params![p.to_str().unwrap()],
                     |r| r.get(0),
                 )

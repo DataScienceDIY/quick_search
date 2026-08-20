@@ -234,6 +234,8 @@ impl IndexCoordinator {
             last_event_at: None,
             pending_since: None,
             needs_full_run: false,
+            run_retry_at: None,
+            run_retry_delay: inner::RUN_RETRY_BASE,
             pending_work: None,
             reconcile_done: None,
             reconcile_cut_short: false,

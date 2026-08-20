@@ -189,6 +189,75 @@ fn e2e_create_modify_remove_surfaces() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A file the index cannot spell must produce no event at all.
+///
+/// It is never indexed, so no row exists for a `Create` to update or a
+/// `Remove` to delete — but the incremental side keys on `path_to_db_string`,
+/// which is lossy, so an event that got through would be applied to whichever
+/// *different* file owns the lossy spelling. Screened in
+/// [`is_event_interesting`], the one gate every `FsEvent` passes through.
+///
+/// A real file is created alongside, so a run where the watcher simply saw
+/// nothing cannot pass by accident.
+#[test]
+fn events_for_an_unrepresentable_name_never_surface() {
+    let dir = tmp_dir("e2e-unrepresentable");
+    let bad = dir.join(crate::testutil::unrepresentable_name("report", ".txt"));
+    if std::fs::write(&bad, "hi").is_err() {
+        eprintln!("skipped: this filesystem will not store an unrepresentable name");
+        std::fs::remove_dir_all(&dir).ok();
+        return;
+    }
+    std::fs::remove_file(&bad).unwrap();
+
+    let (sink, got) = sink_to_vec();
+    let mut w = Watcher::start(
+        std::iter::once(&dir),
+        default_filters(),
+        fast_config(),
+        sink,
+    )
+    .unwrap();
+
+    std::fs::write(&bad, "hi").unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    std::fs::remove_file(&bad).unwrap();
+    // The control: whatever the backend does for the bad name, it certainly
+    // reports this one, so an empty event list means the watcher was working.
+    let good = dir.join("ordinary.txt");
+    std::fs::write(&good, "hi").unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+
+    w.stop();
+
+    let events = got.lock().unwrap().clone();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            FsEvent::Create(p) | FsEvent::Modify(p) if p == &good
+        )),
+        "the control file produced no event, so this test proves nothing: {:?}",
+        events
+    );
+    let leaked: Vec<&FsEvent> = events
+        .iter()
+        .filter(|e| {
+            let paths: Vec<&PathBuf> = match e {
+                FsEvent::Create(p) | FsEvent::Modify(p) | FsEvent::Remove(p) => vec![p],
+                FsEvent::Rename { from, to } => vec![from, to],
+            };
+            paths.iter().any(|p| p.to_str().is_none())
+        })
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "an unrepresentable path reached the sink: {:?}",
+        leaked
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// Descriptors are not spent on directories the indexer would discard.
 #[test]
 fn ignored_and_hidden_dirs_are_not_registered() {

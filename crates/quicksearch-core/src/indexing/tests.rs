@@ -166,8 +166,11 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
                 &tx,
                 &NewFile {
                     name: &format!("f{}.txt", i),
-                    path: &path.to_string_lossy(),
-                    parent: &tree.to_string_lossy(),
+                    // `dir_to_db_parent`, not `to_string_lossy`: a stored
+                    // parent always ends in a separator, and a row spelled
+                    // without one sorts below every `ExtractCursor` range that
+                    // should contain it.
+                    parent: &crate::file_handling::dir_to_db_parent(&tree),
                     size: 22,
                     mtime: 1,
                     mime: Some("text/plain"),
@@ -669,4 +672,63 @@ fn a_run_with_no_roots_is_complete_rather_than_unknown() {
     let o = overall_progress(&[]);
     assert_eq!(o.processed, 0);
     assert_eq!(o.total, Some(0));
+}
+
+/// A roomy volume leaves `maximum_wal_size` exactly as configured: this is a
+/// safety valve, not a second tuning knob.
+#[test]
+fn a_roomy_volume_does_not_move_the_checkpoint_threshold() {
+    use super::pipeline::wal_cap_for_free;
+    let configured = 512 * 1024 * 1024;
+    assert_eq!(
+        wal_cap_for_free(configured, 500 * 1024 * 1024 * 1024),
+        configured
+    );
+    // Exactly enough: floor plus four times the log.
+    let just_enough = 128 * 1024 * 1024 + configured * 4;
+    assert_eq!(wal_cap_for_free(configured, just_enough), configured);
+}
+
+/// A tight volume checkpoints sooner, so the log cannot grow into the space
+/// that is left. Running out is not a clean failure — the wal-index is reached
+/// through an mmap, and a write the filesystem cannot back is a SIGBUS.
+#[test]
+fn a_tight_volume_lowers_the_checkpoint_threshold() {
+    use super::pipeline::wal_cap_for_free;
+    let configured = 512 * 1024 * 1024;
+    // 1 GiB free: 896 MiB above the floor, a quarter of which is 224 MiB.
+    let got = wal_cap_for_free(configured, 1024 * 1024 * 1024);
+    assert_eq!(got, 224 * 1024 * 1024);
+    assert!(got < configured);
+}
+
+/// `0` means "never force a checkpoint", which is a performance choice and not
+/// a licence to fill the disk — so it is bounded by the volume like any other
+/// value. On a roomy disk that bound is larger than any run's log, which is
+/// how the setting keeps its meaning without a second rule to special-case it.
+#[test]
+fn disabled_checkpoints_are_still_bounded_by_the_volume() {
+    use super::pipeline::wal_cap_for_free;
+    let roomy = wal_cap_for_free(0, 500 * 1024 * 1024 * 1024);
+    assert!(
+        roomy > 100 * 1024 * 1024 * 1024,
+        "effectively never on a roomy disk, got {} bytes",
+        roomy
+    );
+    let tight = wal_cap_for_free(0, 1024 * 1024 * 1024);
+    assert_eq!(tight, 224 * 1024 * 1024, "a tight one checkpoints anyway");
+}
+
+/// Below the floor there is nothing sensible left to divide, and the run is
+/// about to be stopped by the in-run check anyway — so the threshold bottoms
+/// out at the same floor a configured value is raised to, never at zero.
+#[test]
+fn a_full_volume_bottoms_out_at_the_minimum_rather_than_zero() {
+    use super::pipeline::wal_cap_for_free;
+    for free in [0, 1024, 127 * 1024 * 1024] {
+        assert_eq!(
+            wal_cap_for_free(512 * 1024 * 1024, free),
+            crate::config::MINIMUM_WAL_SIZE
+        );
+    }
 }

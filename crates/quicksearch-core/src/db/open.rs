@@ -25,7 +25,7 @@ pub const KEY_MISMATCH_PREFIX: &str = "KEY_MISMATCH: ";
 /// values go stale: `files.mime`, `files.type` and `content_state` are
 /// computed at walk time and never re-derived for unchanged files, so a
 /// classification change needs the wipe to apply everywhere.
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// Open `db_path` and ensure the on-disk schema matches this build; if it
 /// doesn't (including a changed `tokenizer`), delete the file and recreate it
@@ -241,6 +241,57 @@ fn is_notadb(e: &rusqlite::Error) -> bool {
     )
 }
 
+/// Why a keyed open failed, as something the caller can branch on.
+///
+/// The three cases want three different things from a user — retype the
+/// password, rebuild the index, supply a password at all — and only one of
+/// them is "wrong password". They used to be distinguishable only by reading
+/// the English in the message, which breaks the moment a database path
+/// happens to contain that English.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMismatch {
+    /// A key was applied and the file did not accept it.
+    WrongPassword,
+    /// A key was applied but the file on disk is not encrypted at all —
+    /// protection was enabled and the rebuild that would encrypt it did not
+    /// finish.
+    NotEncrypted,
+    /// No key was applied and the file wants one.
+    PasswordRequired,
+}
+
+impl KeyMismatch {
+    /// The machine-readable token carried in the message, between
+    /// [`KEY_MISMATCH_PREFIX`] and the human detail.
+    fn token(self) -> &'static str {
+        match self {
+            KeyMismatch::WrongPassword => "wrong-password",
+            KeyMismatch::NotEncrypted => "not-encrypted",
+            KeyMismatch::PasswordRequired => "password-required",
+        }
+    }
+
+    fn from_token(token: &str) -> Option<KeyMismatch> {
+        match token {
+            "wrong-password" => Some(KeyMismatch::WrongPassword),
+            "not-encrypted" => Some(KeyMismatch::NotEncrypted),
+            "password-required" => Some(KeyMismatch::PasswordRequired),
+            _ => None,
+        }
+    }
+}
+
+/// Split a tagged mismatch message into its cause and the human detail.
+///
+/// `None` for any message that is not one — including a `KEY_MISMATCH_PREFIX`
+/// message from an older build, which callers should treat as they always did.
+pub fn key_mismatch_parts(message: &str) -> Option<(KeyMismatch, &str)> {
+    let rest = message.strip_prefix(KEY_MISMATCH_PREFIX)?;
+    let (token, detail) = rest.split_once(' ')?;
+    let token = token.strip_suffix(':')?;
+    Some((KeyMismatch::from_token(token)?, detail))
+}
+
 fn key_mismatch_message(db_path: &str, had_key: bool) -> String {
     // An unencrypted SQLite file still has its plaintext magic; sniffing it
     // distinguishes "wrong password" from "protection is enabled but the
@@ -255,15 +306,31 @@ fn key_mismatch_message(db_path: &str, had_key: bool) -> String {
             Some(&magic == b"SQLite format 3\0")
         })
         .unwrap_or(false);
-    let detail = match (had_key, plaintext) {
-        (true, true) => {
+    let (cause, detail) = match (had_key, plaintext) {
+        (true, true) => (
+            KeyMismatch::NotEncrypted,
             "password protection is enabled but the index is not encrypted; \
-                         rebuild the index to encrypt it"
-        }
-        (true, false) => "wrong password (or the file is not a QuickSearch index)",
-        (false, _) => "the index is password-protected; a password is required",
+             rebuild the index to encrypt it",
+        ),
+        (true, false) => (
+            KeyMismatch::WrongPassword,
+            "wrong password (or the file is not a QuickSearch index)",
+        ),
+        (false, _) => (
+            KeyMismatch::PasswordRequired,
+            "the index is password-protected; a password is required",
+        ),
     };
-    format!("{}index at {}: {}", KEY_MISMATCH_PREFIX, db_path, detail)
+    // The token sits between the prefix and the detail so that every existing
+    // `starts_with(KEY_MISMATCH_PREFIX)` test still holds, while a caller that
+    // needs the cause can have it without reading prose.
+    format!(
+        "{}{}: index at {}: {}",
+        KEY_MISMATCH_PREFIX,
+        cause.token(),
+        db_path,
+        detail
+    )
 }
 
 /// True iff the DB has a `schema_info` table whose `version` equals

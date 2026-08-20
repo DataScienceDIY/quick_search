@@ -1,5 +1,7 @@
 use super::*;
 
+use std::time::{Duration, Instant};
+
 #[test]
 fn unc_spellings() {
     assert!(is_unc_string(r"\\server\share"));
@@ -241,4 +243,241 @@ fn sep_prefix() -> String {
     } else {
         "/".to_string()
     }
+}
+
+/// Two live instances cannot both hold the index.
+#[test]
+fn the_index_lock_is_exclusive_while_held() {
+    let db = crate::testutil::scratch_dir("lock-excl").join("index.sqlite");
+    let first = IndexLock::acquire(&db).expect("first acquire");
+    match IndexLock::acquire(&db) {
+        Err(LockError::Held { pid }) => {
+            // Recorded for the message only, but it should name us.
+            assert_eq!(pid, Some(std::process::id()));
+        }
+        Err(LockError::Unsupported(why)) => {
+            // A filesystem with no locks cannot answer; nothing to assert.
+            eprintln!("skipping: {}", why);
+        }
+        Ok(_) => panic!("the lock was handed out twice"),
+    }
+    drop(first);
+    // And it comes back once the holder lets go — but not necessarily in the
+    // same instant, which is why this retries instead of asserting outright.
+    //
+    // `flock` belongs to the *open file description*, and `fork` duplicates
+    // the descriptor table: between another thread's `fork` and its `exec`,
+    // the child shares every description this process has open, including the
+    // one we just released. `O_CLOEXEC` closes it at `exec` — verified, no
+    // descriptor survives into a spawned child — but until then the lock
+    // stays held. Several tests in this suite spawn processes (the sibling
+    // test below, and `file_handling::counting`'s `find`/`wc`), so under
+    // `cargo test` this window is reached often enough to be seen.
+    //
+    // It cannot reach the product: the lock is taken once at startup and held
+    // for the life of the process, never dropped and immediately retaken.
+    acquire_within(&db, Duration::from_secs(5));
+}
+
+/// [`IndexLock::acquire`], retried past the `fork`/`exec` window described in
+/// [`the_index_lock_is_exclusive_while_held`].
+fn acquire_within(db: &std::path::Path, budget: Duration) -> IndexLock {
+    let deadline = Instant::now() + budget;
+    loop {
+        match IndexLock::acquire(db) {
+            Ok(lock) => return lock,
+            Err(e) if Instant::now() >= deadline => panic!("never acquired: {:?}", e),
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+/// Env var naming the database whose lock [`lock_holder_child`] should take.
+/// Absent in an ordinary run, which is what makes that test a no-op.
+const LOCK_CHILD_DB: &str = "QS_LOCK_CHILD_DB";
+
+/// **A crash must not lock the user out.**
+///
+/// Nothing unlinks the lock file, so it outlives an unclean exit. If startup
+/// keyed on the file *existing*, one SIGKILL — or the SIGBUS this whole change
+/// is about — would leave QuickSearch permanently unopenable. The guard is the
+/// kernel's `flock`/`LockFileEx`, released when the holder's handle goes away
+/// however it goes away, so the leftover file is inert.
+///
+/// Only a real killed process proves that, so this spawns one: nothing a
+/// single process can do to itself reproduces "died without running a
+/// destructor" while leaving a test alive to check the result.
+#[test]
+fn a_killed_holder_does_not_block_the_next_start() {
+    let db = crate::testutil::scratch_dir("lock-crash").join("index.sqlite");
+    let lock_path = IndexLock::path_for(&db);
+
+    // Probe first: on a filesystem without locks there is nothing to test.
+    match IndexLock::acquire(&db) {
+        Ok(lock) => drop(lock),
+        Err(LockError::Unsupported(why)) => {
+            eprintln!("skipping: {}", why);
+            return;
+        }
+        Err(LockError::Held { .. }) => panic!("a fresh path cannot be held"),
+    }
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "platform::tests::lock_holder_child",
+            "--nocapture",
+        ])
+        .env(LOCK_CHILD_DB, &db)
+        .spawn()
+        .expect("spawn the lock holder");
+
+    // Poll rather than read a pipe: a child that dies early then fails this
+    // test at the deadline instead of hanging it forever.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if matches!(IndexLock::acquire(&db), Err(LockError::Held { .. })) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the child never took the lock");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // SIGKILL / TerminateProcess: no unwinding, no destructors, no cleanup —
+    // exactly what a SIGBUS leaves behind.
+    child.kill().expect("kill the holder");
+    child.wait().expect("reap the holder");
+
+    assert!(
+        lock_path.exists(),
+        "the crash should leave the lock file at {}",
+        lock_path.display()
+    );
+    // The point of the whole test: file present, holder dead, start succeeds.
+    // Retried for the reason `acquire_within` documents, not because a dead
+    // holder could still be holding anything.
+    acquire_within(&db, Duration::from_secs(5));
+}
+
+/// The child half of [`a_killed_holder_does_not_block_the_next_start`]: take
+/// the lock, then wait to be killed. A no-op in an ordinary run.
+#[test]
+fn lock_holder_child() {
+    let Some(db) = std::env::var_os(LOCK_CHILD_DB) else {
+        return;
+    };
+    let db = std::path::PathBuf::from(db);
+    // The parent probes the lock to find out when we have it, so it may hold
+    // it for an instant just as we ask. Retry rather than lose the race.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let _lock = loop {
+        match IndexLock::acquire(&db) {
+            Ok(lock) => break lock,
+            Err(e) if Instant::now() >= deadline => panic!("child never acquired: {:?}", e),
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    // Killed long before this returns. The sleep is a backstop so a parent
+    // that dies first cannot strand this process.
+    std::thread::sleep(Duration::from_secs(120));
+}
+
+/// A `database_path` changed in Settings must carry the lock with it — and a
+/// refused move must leave this process holding exactly what it held.
+///
+/// The whole point of taking the new lock before dropping the old: if the
+/// destination is already somebody else's, the settings change is rejected and
+/// the app goes on using the index it was using, still guarded. Releasing
+/// first would open a window on the index we are about to keep writing to.
+///
+/// Uses the process-wide slot, so it is the one test that touches
+/// [`HELD_LOCK`]; the paths are per-test scratch directories, so it does not
+/// race the sibling tests that call [`IndexLock::acquire`] directly.
+#[test]
+fn the_held_lock_follows_the_database_path() {
+    let dir = crate::testutil::scratch_dir("lock-move");
+    let first = dir.join("first.sqlite");
+    let second = dir.join("second.sqlite");
+
+    // A filesystem with no locks cannot answer any of this.
+    match IndexLock::hold(&first) {
+        Ok(()) => {}
+        Err(LockError::Unsupported(why)) => {
+            eprintln!("skipping: {}", why);
+            return;
+        }
+        Err(LockError::Held { .. }) => panic!("a fresh path cannot be held"),
+    }
+
+    // Naming the index we already hold is a no-op, not a self-collision:
+    // `flock` conflicts with itself across two descriptions in one process.
+    IndexLock::move_to(&first).expect("re-holding the same path");
+
+    // Somebody else owns the destination, so the move is refused...
+    let rival = acquire_within(&second, Duration::from_secs(5));
+    assert!(
+        matches!(IndexLock::move_to(&second), Err(LockError::Held { .. })),
+        "a held destination must refuse the move"
+    );
+    // ...and the old path is still ours, which is what lets the caller reject
+    // the settings change and stay correct.
+    assert!(
+        matches!(IndexLock::acquire(&first), Err(LockError::Held { .. })),
+        "the original lock must survive a refused move"
+    );
+
+    // Once the destination frees up the move goes through, and the path we
+    // came from is released.
+    drop(rival);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while IndexLock::move_to(&second).is_err() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        matches!(IndexLock::acquire(&second), Err(LockError::Held { .. })),
+        "the new path must be held after the move"
+    );
+    acquire_within(&first, Duration::from_secs(5));
+}
+
+/// `database_path` in hand, the lock is a sibling with its own name — never
+/// the database or one of SQLite's sidecars, whose inodes we must not touch.
+#[test]
+fn the_lock_file_is_not_the_database_or_a_sidecar() {
+    let db = std::path::Path::new("/var/lib/qs/index.sqlite");
+    let lock = IndexLock::path_for(db);
+    assert_eq!(lock, std::path::Path::new("/var/lib/qs/index.sqlite.lock"));
+    for suffix in crate::file_handling::INDEX_SIDECAR_SUFFIXES {
+        if suffix == ".lock" {
+            continue;
+        }
+        assert_ne!(
+            lock,
+            std::path::PathBuf::from(format!("{}{}", db.display(), suffix))
+        );
+    }
+    assert_ne!(lock, db);
+}
+
+#[test]
+fn available_space_answers_for_a_real_directory() {
+    let dir = crate::testutil::scratch_dir("space");
+    let free = available_space(&dir).expect("temp dir has a filesystem");
+    assert!(free > 0, "a writable scratch dir should have free space");
+}
+
+/// The database is asked about before it exists — the check runs at the start
+/// of the first run, when nothing has created the file yet.
+#[test]
+fn available_space_walks_up_to_an_existing_ancestor() {
+    let missing = crate::testutil::scratch_dir("space-missing")
+        .join("not")
+        .join("created")
+        .join("index.sqlite");
+    assert!(!missing.exists());
+    assert!(available_space(&missing).is_some());
 }

@@ -45,12 +45,12 @@ fn seed(conn: &mut Connection, paths: &[PathBuf]) {
     let tx = conn.transaction().unwrap();
     for path in paths {
         let path = path.to_string_lossy();
-        let (parent, name) = path.rsplit_once('/').unwrap();
+        // The indexer's own split, so the separator stays with the parent.
+        let (parent, name) = crate::file_handling::split_db_path(&path).expect("a file's path");
         repo::insert_file(
             &tx,
             &repo::NewFile {
                 name,
-                path: &path,
                 parent,
                 size: 1,
                 mtime: 1,

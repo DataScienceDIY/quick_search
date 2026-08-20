@@ -673,8 +673,16 @@ fn classify(
 ) {
     use notify::event::{ModifyKind, RenameMode};
 
-    let key = |p: &PathBuf| p.to_string_lossy().into_owned();
-    let is_target = |p: &PathBuf| targets.contains_key(&key(p));
+    // `to_str`, not `to_string_lossy`. Targets are paths out of the index, so
+    // they are all representable, and a path that is *not* still has a lossy
+    // spelling — one that is a perfectly valid path for some other file. Keyed
+    // lossily, an event for a file we could never index would match a row we
+    // are displaying and fire a Gone or a Changed at it.
+    let target_key = |p: &PathBuf| {
+        p.to_str()
+            .filter(|k| targets.contains_key(*k))
+            .map(str::to_owned)
+    };
 
     match event.kind {
         EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
@@ -684,43 +692,55 @@ fn classify(
             let (Some(from), Some(to)) = (event.paths.first(), event.paths.get(1)) else {
                 return;
             };
-            if is_target(from) {
-                pending.insert(key(from), Op::Renamed(to.clone()));
-            } else if is_target(to) {
+            if let Some(from_key) = target_key(from) {
+                // A destination the index cannot spell cannot be recorded as a
+                // rename: the row would carry a path naming a different file,
+                // and the GUI opens rows by that path. The file did leave the
+                // searchable world, so `Gone` is the honest update — and the
+                // one the user would get anyway once the row was verified.
+                let op = match to.to_str() {
+                    Some(_) => Op::Renamed(to.clone()),
+                    None => Op::Gone,
+                };
+                pending.insert(from_key, op);
+            } else if let Some(to_key) = target_key(to) {
                 // The atomic-save shape: a temporary file renamed over a row
                 // we are watching. The row did not move; its contents changed.
-                pending.insert(key(to), Op::Changed);
+                pending.insert(to_key, Op::Changed);
             }
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
             for path in &event.paths {
-                if is_target(path) {
-                    pending.insert(key(path), Op::Changed);
-                } else {
+                if let Some(key) = target_key(path) {
+                    pending.insert(key, Op::Changed);
+                } else if path.to_str().is_some() {
+                    // Screened for the same reason: an orphan is paired with a
+                    // lone `Gone` into a `Renamed` below, so an unrepresentable
+                    // one would arrive at the same bad destination.
                     orphan_to.push(path.clone());
                 }
             }
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
             for path in &event.paths {
-                if is_target(path) {
+                if let Some(key) = target_key(path) {
                     // Provisional; a Both in this same window upgrades it.
-                    pending.entry(key(path)).or_insert(Op::Gone);
+                    pending.entry(key).or_insert(Op::Gone);
                 }
             }
         }
         EventKind::Remove(_) => {
             for path in &event.paths {
-                if is_target(path) {
-                    pending.insert(key(path), Op::Gone);
+                if let Some(key) = target_key(path) {
+                    pending.insert(key, Op::Gone);
                 }
             }
         }
         EventKind::Create(_) | EventKind::Modify(_) => {
             for path in &event.paths {
-                if is_target(path) {
+                if let Some(key) = target_key(path) {
                     // A Create at a watched path un-deletes the row.
-                    pending.insert(key(path), Op::Changed);
+                    pending.insert(key, Op::Changed);
                 }
             }
         }

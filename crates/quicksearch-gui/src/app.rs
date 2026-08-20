@@ -11,6 +11,7 @@ use quicksearch_core::db;
 use quicksearch_core::indexing::{
     overall_progress, ConfigChange, IndexingStatus, PrepStep, RootPhase, RootProgress,
 };
+use quicksearch_core::platform::{IndexLock, LockError};
 use quicksearch_core::search::SearchOptions;
 use quicksearch_core::security::{derive_key, generate_salt, salt_to_hex, IndexKey};
 use quicksearch_core::watcher::WatchError;
@@ -322,10 +323,45 @@ impl QuickSearchApp {
             .watch_cap_warned_roots
             .retain(|root| new.paths.indexing_paths.contains(root));
         let actions = diff_actions(&self.cfg, &new);
+        // The instance lock follows the database path, and it has to move
+        // before the change is written: a `database_path` that another
+        // instance already holds must never reach the config file, or the next
+        // launch reads it and refuses to start at all. `move_to` takes the new
+        // lock before dropping the old, so this rejection leaves us holding
+        // what we already had.
+        if actions.search_db_changed {
+            match IndexLock::move_to(&new.resolved_database_path()) {
+                Ok(()) => {}
+                Err(LockError::Held { pid }) => {
+                    let who = match pid {
+                        Some(pid) => format!(" (process {})", pid),
+                        None => String::new(),
+                    };
+                    self.config_error = Some(format!(
+                        "Not applied: another QuickSearch{} is using that index.",
+                        who
+                    ));
+                    return false;
+                }
+                // The move happened and the new path simply cannot be locked.
+                // Same rule as at startup: a convenience guard is never a good
+                // enough reason to refuse.
+                Err(LockError::Unsupported(why)) => {
+                    quicksearch_core::log_warn!("cannot lock the index ({}); continuing", why);
+                }
+            }
+        }
         // A config that could not be written must not take effect either: it
         // would apply to this process, revert on restart, and show nothing
         // unsaved in between.
         if let Err(e) = new.save() {
+            // Put the lock back on the path the config still names, or this
+            // process would go on using the old index while guarding the new
+            // one — leaving the index it is actually writing open to a second
+            // instance.
+            if actions.search_db_changed {
+                let _ = IndexLock::move_to(&self.cfg.resolved_database_path());
+            }
             self.config_error = Some(e);
             return false;
         }
@@ -350,7 +386,7 @@ impl QuickSearchApp {
         self.backend.coordinator.apply_config(new.clone());
         if actions.requires_rebuild {
             if self.backend.coordinator.state().mode == IndexMode::Auto {
-                self.backend.coordinator.rebuild_index();
+                self.backend.rebuild_index();
             } else {
                 let changes = self
                     .backend
@@ -440,7 +476,9 @@ impl QuickSearchApp {
         if let Some(rx) = &self.backend.dup_job {
             use std::sync::mpsc::TryRecvError;
             let done = match rx.try_recv() {
-                Ok(Ok(groups)) => Some(DupState::Loaded(groups)),
+                Ok(Ok(groups)) => Some(DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(
+                    groups,
+                ))),
                 Ok(Err(e)) => Some(DupState::Error(e)),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => {
@@ -692,7 +730,8 @@ impl eframe::App for QuickSearchApp {
                 if let Some(paths) = actions.verify {
                     let paths: Vec<std::path::PathBuf> =
                         paths.into_iter().map(std::path::PathBuf::from).collect();
-                    self.backend.start_verify(paths.clone(), ctx.clone());
+                    self.backend
+                        .start_verify(paths.clone(), &self.cfg, ctx.clone());
                     self.verify = Some(VerifyModal::new(paths));
                 }
             }

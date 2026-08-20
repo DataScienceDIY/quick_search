@@ -80,7 +80,7 @@ fn serial(root: &str, config: &Config, existing: &DirRows) -> (usize, usize) {
     for entry in filtered_walk(root, false, false, &ignore, &UnreadableDirs::default()) {
         seen += 1;
         // Same rule as the real walk: a name that is not valid UTF-8 cannot be
-        // stored in `files.path` and reopened by it, so it is skipped before
+        // stored in the index and reopened by its path, so it is skipped before
         // anything tries to hash it. Counted as seen, never prepared.
         let Some(path) = entry.path().to_str().map(str::to_owned) else {
             continue;

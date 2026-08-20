@@ -204,6 +204,20 @@ impl IndexingService {
     }
 
     pub fn stop_indexing(&self) -> Result<(), String> {
+        self.stop_indexing_inner(true)
+    }
+
+    /// [`Self::stop_indexing`] for a caller that is about to delete the file.
+    ///
+    /// Skips the checkpoint. `checkpoint_truncate` copies the whole write-ahead
+    /// log into the database — up to `maximum_wal_size`, 512 MiB by default —
+    /// and the next two statements delete both. It is pure cost, and it is
+    /// paid on the coordinator's thread while the user waits for a rebuild.
+    fn stop_indexing_for_delete(&self) -> Result<(), String> {
+        self.stop_indexing_inner(false)
+    }
+
+    fn stop_indexing_inner(&self, checkpoint: bool) -> Result<(), String> {
         self.command_tx
             .send(IndexingCommand::Stop)
             .map_err(|e| format!("Failed to send stop command: {}", e))?;
@@ -226,13 +240,25 @@ impl IndexingService {
         // Flush the WAL and release the shared connection. WAL mode itself
         // stays on — it's the persistent journal mode for the index.
         if let Some(db_conn_arc) = crate::lock_ok(&self.db_connection).take() {
-            let conn = crate::lock_ok(&db_conn_arc);
-            if let Err(e) = crate::db::repo::checkpoint_truncate(&conn) {
-                crate::log_warn!("{}", e);
+            if checkpoint {
+                let conn = crate::lock_ok(&db_conn_arc);
+                if let Err(e) = crate::db::repo::checkpoint_truncate(&conn) {
+                    crate::log_warn!("{}", e);
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Publish a failure that happened *outside* a run, so the status bar
+    /// shows it rather than only the log ring.
+    ///
+    /// A failed "Rebuild index" is the case this exists for: the user asked
+    /// for something, it did not happen, and a warning in a tab they are not
+    /// looking at is not telling them.
+    pub fn report_error(&self, message: String) {
+        *crate::lock_ok(&self.status) = IndexingStatus::Error(message);
     }
 
     pub fn get_status(&self) -> IndexingStatus {
@@ -279,7 +305,7 @@ impl IndexingService {
 
     /// Stop indexing and delete the database file for a clean rebuild
     pub fn delete_index_for_rebuild(&self, db_path: &str) -> Result<(), String> {
-        self.stop_indexing()
+        self.stop_indexing_for_delete()
             .map_err(|e| format!("Failed to stop indexing: {}", e))?;
         // Cut short the optimize pass too: the file about to be deleted is
         // the file it holds open.
@@ -308,8 +334,15 @@ impl IndexingService {
         // [`db::bump_index_epoch`].
         db::bump_index_epoch();
 
-        if std::path::Path::new(db_path).exists() {
-            std::fs::remove_file(db_path)
+        let path = std::path::Path::new(db_path);
+        if path.exists() {
+            // Retried, as every other delete of this file is: on Windows it
+            // fails while any handle is open, and the readers are exactly the
+            // ones a user has just been using — the search worker holds its
+            // connection for `IDLE_RELEASE` after the last keystroke. The
+            // caller releases that one first; this covers a scan or a
+            // duplicates pass that has not noticed yet.
+            crate::platform::remove_file_retrying(path)
                 .map_err(|e| format!("Failed to delete database file: {}", e))?;
         }
         for suffix in ["-wal", "-shm", "-journal"] {

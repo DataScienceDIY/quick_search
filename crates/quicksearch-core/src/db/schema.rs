@@ -130,7 +130,11 @@ pub const PRAGMAS_READONLY: &str = "
 ///
 /// Two of these can exist per indexing root, so the cache size is multiplied
 /// by the root count. 1 MiB is sized for the walk's queries, which each read
-/// one range of `idx_files_parent` once and never revisit it. The feeder's
+/// one range of `idx_files_parent` once and never revisit it — plus, since
+/// that index stopped carrying `mtime`, one table-row fetch per entry in the
+/// range. Those land on a handful of pages while a directory's rows stay
+/// rowid-adjacent; **this is the number to raise** if a tree churned across
+/// many incremental runs ever scatters them far enough to matter. The feeder's
 /// paging is the same shape, but its one-off `count_extract_scope` at pass
 /// start is not: that scans the root's whole path range fetching a row per
 /// entry, so on a large root it is a cold read all the way through. It is
@@ -156,10 +160,20 @@ CREATE TABLE schema_info (
     value TEXT NOT NULL
 );
 
+-- **There is no `path` column.** A file's path is `parent || name`, and
+-- storing it a third time cost ~43% of the per-row footprint: over a
+-- 400k-file corpus (avg path 77 bytes, parent 59, name 17) ~394 bytes/row
+-- against the ~226 below, or ~170 MB per million files. It also widened the
+-- row by a third, and three of the search cascade's passes scan every row —
+-- on an encrypted index each extra page is an AES-CBC decrypt and an
+-- HMAC-SHA512 verify. Reassembling a path is a `push_str` in the one place
+-- that needs one (`file_handling::split_db_path` is the inverse).
+--
+-- `parent` always ends in the platform separator; see `dir_to_db_parent` for
+-- why the whole design turns on that.
 CREATE TABLE files (
     id            INTEGER PRIMARY KEY,
     name          TEXT    NOT NULL,
-    path          TEXT    NOT NULL UNIQUE,
     parent        TEXT    NOT NULL,
     size          INTEGER NOT NULL,
     mtime         INTEGER NOT NULL,
@@ -169,15 +183,25 @@ CREATE TABLE files (
     hash          BLOB
 );
 
--- Covering, not just `(parent)`. The walk's row prefetcher issues
--- `SELECT name, mtime FROM files WHERE parent = ?` once per directory — the
--- hottest read in a full run — and with the bare index that is an index probe
--- plus a table-row fetch per entry. Those fetches are cold by design: the walk
--- reader deliberately runs on a 1 MiB page cache (see `PRAGMAS_WALK_READER`).
--- Carrying `name` and `mtime` in the index makes it an index-only scan.
--- `parent` stays leading, so `SELECT DISTINCT parent` range scans and
--- `paths_in_dir` are unaffected.
-CREATE INDEX idx_files_parent ON files(parent, name, mtime);
+-- The identity of a row, and the only index `parent` needs.
+--
+-- It replaces both of what came before — a `UNIQUE(path)` and a covering
+-- `(parent, name, mtime)` — and dropping the second is the deliberate half.
+-- The walk's row prefetcher issues `SELECT name, mtime FROM files WHERE
+-- parent = ?` once per directory, the hottest read in a full run, and without
+-- `mtime` in the index that is a table-row fetch per entry. It is affordable
+-- because the prefetcher is one thread ahead of four walk workers that each
+-- spend a `stat` *and* a SHA-256 of the path per file (`crate::walk`), so it
+-- has budget to spend; because a directory's rows are written in one batch and
+-- so are rowid-adjacent; and because the row is now narrow enough that a
+-- 1 MiB cache holds ~7,200 of them. `mtime` cannot simply be appended here —
+-- `UNIQUE(parent, name, mtime)` would let the same file be inserted twice
+-- under two mtimes.
+--
+-- If the prefetcher is ever measured falling behind, raise
+-- `PRAGMAS_WALK_READER` — paid for out of the space this index no longer
+-- occupies — rather than restoring the covering one.
+CREATE UNIQUE INDEX idx_files_parent ON files(parent, name);
 CREATE INDEX idx_files_mtime  ON files(mtime);
 CREATE INDEX idx_files_type   ON files(type);
 CREATE INDEX idx_files_mime   ON files(mime);

@@ -10,6 +10,7 @@ use quicksearch_core::db;
 use quicksearch_core::query::split::split_for_cascade;
 use quicksearch_core::search::{cascade, SearchHit, SearchOptions};
 use quicksearch_core::security::{derive_key, IndexKey};
+use quicksearch_core::textenc::scrub_controls;
 use zeroize::Zeroizing;
 
 use crate::format::{fmt_mtime, human_size};
@@ -127,15 +128,22 @@ pub(crate) fn resolve_key(
 
     if let Some(hex) = keychain_hex {
         match IndexKey::from_hex(&hex).map_err(|e| format!("keychain entry: {}", e)) {
-            Ok(key) => {
-                match try_key(key) {
-                    Ok(()) => return Ok(()),
-                    Err(e) if e.starts_with(db::KEY_MISMATCH_PREFIX) => {
-                        eprintln!("warning: the key remembered in the OS keychain no longer opens this index");
+            Ok(key) => match try_key(key) {
+                Ok(()) => return Ok(()),
+                Err(e) => match mismatch_cause(&e) {
+                    Some((db::KeyMismatch::WrongPassword, _)) => {
+                        eprintln!(
+                            "warning: the key remembered in the OS keychain no longer \
+                             opens this index"
+                        );
                     }
-                    Err(e) => return Err(e),
-                }
-            }
+                    // Not a stale keychain entry at all: the index is not
+                    // encrypted, or wants a key this one is not. Say which,
+                    // then fall through to the other sources as before.
+                    Some((_, detail)) => eprintln!("warning: {}", detail),
+                    None => return Err(e),
+                },
+            },
             Err(e) => eprintln!("warning: {}", e),
         }
     }
@@ -145,11 +153,17 @@ pub(crate) fn resolve_key(
         drop(password);
         return match try_key(key) {
             Ok(()) => Ok(()),
-            Err(e) if e.starts_with(db::KEY_MISMATCH_PREFIX) => Err(format!(
-                "{} does not match this index's password",
-                PASSWORD_ENV
-            )),
-            Err(e) => Err(e),
+            Err(e) => match mismatch_cause(&e) {
+                Some((db::KeyMismatch::WrongPassword, _)) => Err(format!(
+                    "{} does not match this index's password",
+                    PASSWORD_ENV
+                )),
+                // Blaming the environment variable for "the index is not
+                // encrypted" sends the user to change the one thing that is
+                // not wrong.
+                Some((_, detail)) => Err(detail),
+                None => Err(e),
+            },
         };
     }
 
@@ -168,13 +182,29 @@ pub(crate) fn resolve_key(
         drop(password);
         match try_key(key) {
             Ok(()) => return Ok(()),
-            Err(e) if e.starts_with(db::KEY_MISMATCH_PREFIX) => {
-                eprintln!("Wrong password.");
-            }
-            Err(e) => return Err(e),
+            Err(e) => match mismatch_cause(&e) {
+                // Only a wrong password is worth another attempt. The other
+                // two causes are facts about the index — it is not encrypted,
+                // or it wants a password this build did not apply — and
+                // retrying makes the user type a *correct* password twice more
+                // before being told something that was never about their
+                // typing. The same reasoning as the unlock screen's.
+                Some((db::KeyMismatch::WrongPassword, _)) => eprintln!("Wrong password."),
+                Some((_, detail)) => return Err(detail),
+                None => return Err(e),
+            },
         }
     }
     Err("wrong password (3 attempts)".to_string())
+}
+
+/// [`db::key_mismatch_parts`] with the detail copied out.
+///
+/// Owned rather than borrowed so a caller can hand the original error back on
+/// the `None` arm: `key_mismatch_parts` borrows from the message, and a `match`
+/// on its result would hold that borrow across a `return Err(e)`.
+fn mismatch_cause(error: &str) -> Option<(db::KeyMismatch, String)> {
+    db::key_mismatch_parts(error).map(|(cause, detail)| (cause, detail.to_string()))
 }
 
 /// Wire [`resolve_key`] to the real terminal, environment, keychain and
@@ -269,7 +299,21 @@ fn run_query(query: &str, fuzzy: bool, limit: Option<usize>, long: bool) -> i32 
 
     match outcome {
         Ok(Some(outcome)) => {
-            let color = long && std::io::stdout().is_terminal() && enable_vt();
+            let tty = std::io::stdout().is_terminal();
+            let color = long && tty && enable_vt();
+            // Scrubbed only for a terminal, the way `ls` does it and the way
+            // the colour above already decides: a filename may contain escape
+            // sequences, and printed raw they rewrite the line, retitle the
+            // window, or reach the clipboard on a terminal with OSC 52 on.
+            // Piped output stays byte-exact, because the next program in the
+            // pipe wants the real name and interprets nothing.
+            let show = |s: &str| -> String {
+                if tty {
+                    scrub_controls(s).into_owned()
+                } else {
+                    s.to_string()
+                }
+            };
             for hit in &hits {
                 if long {
                     println!(
@@ -277,13 +321,13 @@ fn run_query(query: &str, fuzzy: bool, limit: Option<usize>, long: bool) -> i32 
                         hit.rank,
                         human_size(hit.size),
                         fmt_mtime(hit.mtime),
-                        hit.path
+                        show(&hit.path)
                     );
                     if let Some(snip) = &hit.snippet {
-                        println!("        {}", render_snippet(snip, color));
+                        println!("        {}", render_snippet(snip, color, tty));
                     }
                 } else {
-                    println!("{}", hit.path);
+                    println!("{}", show(&hit.path));
                 }
             }
             if outcome.limited {
@@ -334,28 +378,58 @@ fn enable_vt() -> bool {
 }
 
 /// One-line snippet with matches emphasized (ANSI bold on TTYs).
-fn render_snippet(snip: &quicksearch_core::snippet::Snippet, color: bool) -> String {
+fn render_snippet(snip: &quicksearch_core::snippet::Snippet, color: bool, tty: bool) -> String {
+    // The window is document text, so it can hold anything the file did —
+    // including the escape sequences this function is about to add its own
+    // emphasis codes around. Each piece is scrubbed as it goes in, before the
+    // codes, so the only escapes in the result are the ones put there here.
     let mut out = String::new();
+    let push = |out: &mut String, piece: &str| {
+        // Line breaks are flattened *before* the scrub, not after the whole
+        // string is assembled. A snippet is one line by contract for both
+        // destinations, and `scrub_controls` turns `\n` into `U+FFFD` — so a
+        // trailing `replace(['\n', '\r'], " ")` would find nothing left to
+        // collapse on a terminal and print `�` where the space belongs.
+        let flat = flatten_lines(piece);
+        if tty {
+            out.push_str(&scrub_controls(&flat));
+        } else {
+            out.push_str(&flat);
+        }
+    };
     if snip.truncated_start {
         out.push('…');
     }
     let mut cursor = 0;
     for &(start, end) in &snip.ranges {
-        out.push_str(&snip.window[cursor..start]);
+        push(&mut out, &snip.window[cursor..start]);
         if color {
             out.push_str("\x1b[1m");
-            out.push_str(&snip.window[start..end]);
+            push(&mut out, &snip.window[start..end]);
             out.push_str("\x1b[0m");
         } else {
-            out.push_str(&snip.window[start..end]);
+            push(&mut out, &snip.window[start..end]);
         }
         cursor = end;
     }
-    out.push_str(&snip.window[cursor..]);
+    push(&mut out, &snip.window[cursor..]);
     if snip.truncated_end {
         out.push('…');
     }
-    out.replace(['\n', '\r'], " ")
+    out
+}
+
+/// `piece` with line breaks flattened to spaces, borrowed when it has none.
+///
+/// A `Cow` for the same reason [`scrub_controls`] is one: this runs per
+/// fragment of every snippet of every hit, and the overwhelmingly common case
+/// has nothing to change.
+fn flatten_lines(piece: &str) -> std::borrow::Cow<'_, str> {
+    if piece.contains(['\n', '\r']) {
+        std::borrow::Cow::Owned(piece.replace(['\n', '\r'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(piece)
+    }
 }
 
 #[cfg(test)]
@@ -372,7 +446,10 @@ mod tests {
     }
 
     fn mismatch() -> Result<(), String> {
-        Err(format!("{}wrong password", db::KEY_MISMATCH_PREFIX))
+        Err(format!(
+            "{}wrong-password: index at /x: wrong password",
+            db::KEY_MISMATCH_PREFIX
+        ))
     }
 
     fn argv(args: &[&str]) -> Vec<String> {

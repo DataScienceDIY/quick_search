@@ -146,18 +146,15 @@ pub fn build_filter(
                 // single root, so say it directly rather than by accident.
                 return Ok(frag("1=1", Vec::new()));
             }
-            // The `=` half needs the collation spelled out: `LIKE` folds ASCII
-            // case on its own, so without this the two halves of the same
-            // filter disagree about `C:\Users` versus `c:\users`.
+            // One `LIKE`, where this used to need `parent = ? OR parent LIKE ?`
+            // with the collation spelled out to stop the two halves disagreeing
+            // about `C:\Users` versus `c:\users`. Every stored parent now ends
+            // in a separator, so `dir + SEP + %` matches the folder's own files
+            // (`%` matching nothing) as well as its subdirectories', and the
+            // `=` half has nothing left to do.
             Ok(frag(
-                &format!(
-                    "(f.parent = ? COLLATE {} OR f.parent LIKE ? ESCAPE '\\')",
-                    crate::platform::PATH_COLLATION
-                ),
-                vec![
-                    Value::Text(base.clone()),
-                    Value::Text(like_subtree_pattern(&base)),
-                ],
+                "f.parent LIKE ? ESCAPE '\\'",
+                vec![Value::Text(like_subtree_pattern(&base))],
             ))
         }
         "name" | "filename" => {
@@ -204,21 +201,23 @@ pub fn escape_like(s: &str) -> String {
     out
 }
 
-/// Tidy a user-supplied folder value into the spelling `files.parent` stores.
+/// Tidy a user-supplied folder value: trim it, and drop any trailing
+/// separator, of either flavour — that is how people naturally write a
+/// directory, and either may show up on Windows.
 ///
-/// Trailing separators are how people naturally write directories, and either
-/// separator may show up on Windows. A bare drive (`C:`) is *not* a path — the
-/// stored parent is `C:\` — so the separator goes back on.
+/// Empty out means "every folder", which is what a bare `/` or a blank value
+/// comes to; [`build_filter`] turns that into `1=1`.
+///
+/// It used to special-case a bare drive (`C:` → `C:\`), because the filter's
+/// `parent = ?` half had to match the stored spelling exactly. That half is
+/// gone, and [`like_subtree_pattern`] puts the separator back itself, so both
+/// spellings now produce the same pattern.
 fn normalize_folder_value(value: &str) -> String {
-    let base = value.trim().trim_end_matches(['/', '\\']);
-    if base.len() == 2 && base.ends_with(':') && base.starts_with(|c: char| c.is_ascii_alphabetic())
-    {
-        return format!("{}{}", base, std::path::MAIN_SEPARATOR);
-    }
-    base.to_string()
+    value.trim().trim_end_matches(['/', '\\']).to_string()
 }
 
-/// A `LIKE ... ESCAPE '\'` pattern matching every path strictly beneath `dir`.
+/// A `LIKE ... ESCAPE '\'` pattern matching `dir`'s own files and everything
+/// beneath it.
 ///
 /// The separator is escaped along with the base, because on Windows the
 /// separator *is* the escape character — a hand-written `format!("{}/%", dir)`
@@ -315,10 +314,15 @@ mod tests {
     #[test]
     fn path_filter_covers_the_folder_and_its_subtree() {
         let f = frag("path", Op::Contains, "/home/me/docs");
-        assert!(f.sql.contains("f.parent = ?"));
-        assert!(f.sql.contains("f.parent LIKE ?"));
-        // The LIKE half must declare its escape character; without the clause
-        // a Windows separator would be eaten as an escape.
+        // One `LIKE`, and one bound value: since every stored parent ends in a
+        // separator, `dir + SEP + %` reaches the folder's own files as well as
+        // its subdirectories'. The `parent = ?` half this used to need — and
+        // the explicit collation that went with it — is gone.
+        assert!(f.sql.contains("f.parent LIKE ?"), "{}", f.sql);
+        assert!(!f.sql.contains("f.parent = ?"), "{}", f.sql);
+        assert_eq!(f.params.len(), 1);
+        // The LIKE must declare its escape character; without the clause a
+        // Windows separator would be eaten as an escape.
         assert!(f.sql.contains("ESCAPE '\\'"), "{}", f.sql);
     }
 
@@ -404,12 +408,14 @@ mod tests {
             .unwrap();
 
         let base = format!("{}a{}b", root_prefix(), SEP);
+        // Stored parents always end in a separator, so each row here is spelled
+        // the way the indexer would spell it.
         let rows = [
-            format!("{}{}sub", base, SEP),            // inside
-            format!("{}{}sub{}deep", base, SEP, SEP), // deeper
-            base.clone(),                             // the folder itself
-            format!("{}a{}bc", root_prefix(), SEP),   // prefix sibling: outside
-            format!("{}a", root_prefix()),            // parent: outside
+            format!("{}{}sub{}", base, SEP, SEP),            // inside
+            format!("{}{}sub{}deep{}", base, SEP, SEP, SEP), // deeper
+            format!("{}{}", base, SEP),                      // the folder's own files
+            format!("{}a{}bc{}", root_prefix(), SEP, SEP),   // prefix sibling: outside
+            format!("{}a{}", root_prefix(), SEP),            // parent: outside
         ];
         for r in &rows {
             conn.execute("INSERT INTO files (parent) VALUES (?1)", [r])
@@ -423,7 +429,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(matched, 2, "only the two rows strictly beneath {}", base);
+        // Three, not two: the trailing separator is what brings the folder's
+        // *own* files in, which is why the filter needs no second predicate.
+        // The prefix sibling and the parent stay out.
+        assert_eq!(matched, 3, "the subtree of {}, and only that", base);
     }
 
     #[test]
@@ -436,9 +445,9 @@ mod tests {
 
         let base = format!("{}a_b", root_prefix());
         for r in [
-            format!("{}{}inside", base, SEP),           // real child
-            format!("{}axb{}bait", root_prefix(), SEP), // `_` must not glob to `x`
-            format!("{}100%_done{}x", root_prefix(), SEP),
+            format!("{}{}inside{}", base, SEP, SEP), // real child
+            format!("{}axb{}bait{}", root_prefix(), SEP, SEP), // `_` must not glob to `x`
+            format!("{}100%_done{}x{}", root_prefix(), SEP, SEP),
         ] {
             conn.execute("INSERT INTO files (parent) VALUES (?1)", [&r])
                 .unwrap();
@@ -456,13 +465,17 @@ mod tests {
 
     #[test]
     fn folder_value_normalization() {
-        use std::path::MAIN_SEPARATOR as SEP;
         // Trailing separators of either flavour are stripped.
         assert_eq!(normalize_folder_value("/home/me/"), "/home/me");
         assert_eq!(normalize_folder_value(r"C:\Users\me\"), r"C:\Users\me");
-        // A bare drive is not a path; the stored parent is `C:\`.
-        assert_eq!(normalize_folder_value("C:"), format!("C:{}", SEP));
-        assert_eq!(normalize_folder_value(r"C:\"), format!("C:{}", SEP));
+        // A bare drive and a rooted one now normalize alike: the pattern
+        // builder puts the separator back either way.
+        assert_eq!(normalize_folder_value("C:"), "C:");
+        assert_eq!(normalize_folder_value(r"C:\"), "C:");
+        assert_eq!(
+            like_subtree_pattern(&normalize_folder_value("C:")),
+            like_subtree_pattern(&normalize_folder_value(r"C:\")),
+        );
         // Empty means "everywhere".
         assert_eq!(normalize_folder_value("/"), "");
         assert_eq!(normalize_folder_value("  "), "");

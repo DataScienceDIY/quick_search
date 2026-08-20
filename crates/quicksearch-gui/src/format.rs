@@ -43,10 +43,14 @@ pub fn fmt_ago(unix_secs: u64) -> String {
 /// A configured interval as a phrase to drop after "every": `90 min`,
 /// `24 h`, `3 days`.
 pub fn fmt_interval(minutes: u64) -> String {
-    if minutes == 0 {
-        // The scheduler treats 0 as always-due.
-        return "run".to_string();
-    }
+    // The same clamp the scheduler applies. Zero is only reachable from a
+    // hand-edited config — the spinner's floor is 5 — and it used to read
+    // "run", from a time when the scheduler took it as always-due. It no
+    // longer does (`coordinator::inner::periodic_due` raises it to one
+    // minute, because "reindex continuously" is not a setting anyone wants
+    // and manual mode is how you say "never"), so saying "run" here would
+    // describe a behaviour the app does not have.
+    let minutes = minutes.max(1);
     if minutes < 60 {
         return format!("{} min", minutes);
     }
@@ -170,7 +174,9 @@ mod tests {
 
     #[test]
     fn intervals() {
-        assert_eq!(fmt_interval(0), "run");
+        // Clamped, exactly as `periodic_due` clamps it: the two must not
+        // describe different behaviour.
+        assert_eq!(fmt_interval(0), "1 min");
         assert_eq!(fmt_interval(1), "1 min");
         assert_eq!(fmt_interval(59), "59 min");
         assert_eq!(fmt_interval(60), "1 h", "the shipped default");

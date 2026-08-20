@@ -14,16 +14,13 @@ fn db_with(tag: &str, rows: &[(String, u64)]) -> PathBuf {
     let p = crate::testutil::scratch_dir(tag).join("index.sqlite");
     let conn = crate::db::open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     for (path, mtime) in rows {
-        let as_path = Path::new(path);
+        // Split the same way the indexer does, so the seeded parent carries
+        // its trailing separator and the prefetcher's `parent = ?` finds it.
+        let (parent, name) = crate::file_handling::split_db_path(path).expect("a file's path");
         conn.execute(
-            "INSERT INTO files (name, path, parent, size, mtime, type, content_state)
-             VALUES (?1, ?2, ?3, 0, ?4, 0, 3)",
-            rusqlite::params![
-                as_path.file_name().unwrap().to_string_lossy(),
-                path,
-                as_path.parent().unwrap().to_string_lossy(),
-                *mtime as i64,
-            ],
+            "INSERT INTO files (name, parent, size, mtime, type, content_state)
+             VALUES (?1, ?2, 0, ?3, 0, 3)",
+            rusqlite::params![name, parent, *mtime as i64],
         )
         .unwrap();
     }
@@ -108,35 +105,237 @@ fn walks_a_nested_tree_exactly_once() {
     fs::remove_dir_all(&root).ok();
 }
 
-/// A name that is not valid UTF-8 must be skipped, not deleted. Unix only:
-/// on Windows `OsString` comes from UTF-16 and the case cannot be built.
-#[cfg(unix)]
-#[test]
-fn a_non_utf8_name_is_skipped_and_never_prepared() {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
+/// Put `name` on disk under `dir`, or report that this filesystem refused it.
+///
+/// FAT, exFAT and some network redirectors reject the names
+/// [`crate::testutil::unrepresentable_name`] builds. A test that cannot create
+/// one has nothing to assert and says so, rather than failing on the
+/// filesystem's behalf.
+fn try_touch(path: &Path) -> bool {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, b"x").is_ok() && path.symlink_metadata().is_ok()
+}
 
+fn try_mkdir(path: &Path) -> bool {
+    fs::create_dir_all(path).is_ok() && path.symlink_metadata().is_ok()
+}
+
+/// A name the index cannot spell is dropped at the directory entry, before any
+/// string is built from it — so it is neither prepared nor reported.
+///
+/// Both platforms, and the Windows half is not the exotic one: `OsString`
+/// there is WTF-8 over UTF-16, and `OsString::from_wide(&[0xD800])` builds an
+/// unpaired surrogate that NTFS stores happily. (An older comment here claimed
+/// the case could not be built on Windows. It can, which is exactly why WSL
+/// and Samba trees hit it.)
+#[test]
+fn a_non_utf8_name_is_dropped_at_the_entry() {
     let root = tmp_tree("nonutf8");
     touch(&root.join("plain.txt"));
-    // 0xFF only survives `to_string_lossy` as U+FFFD.
-    let bad = root.join(OsStr::from_bytes(b"DRH257\xff~X.MP4"));
-    touch(&bad);
-    assert!(bad.symlink_metadata().is_ok(), "the file really is on disk");
+    let bad = root.join(crate::testutil::unrepresentable_name("DRH257", "~X.MP4"));
+    if !try_touch(&bad) {
+        eprintln!("skipped: this filesystem will not store an unrepresentable name");
+        return;
+    }
 
     let files = walk(&root, &empty_db("nonutf8"));
 
-    // Both are yielded, so neither reads as deleted...
-    assert_eq!(files.len(), 2, "the bad name is still reported as seen");
-    // ...but only the representable one is prepared for insertion.
-    let prepared: Vec<&WalkedFile> = files.iter().filter(|f| f.record.is_some()).collect();
-    assert_eq!(prepared.len(), 1);
-    assert!(prepared[0].path.ends_with("plain.txt"));
-
-    let skipped = files.iter().find(|f| f.record.is_none()).unwrap();
-    assert!(matches!(skipped.action, FileIndexAction::Skip));
+    // Not yielded at all — a `WalkedFile` for it would carry the lossy path as
+    // its key and its duplicate-visit digest.
+    assert_eq!(names(&files), vec!["plain.txt"]);
     assert!(
-        skipped.path.contains('\u{FFFD}'),
-        "stored spelling is the lossy one"
+        files.iter().all(|f| !f.path.contains('\u{FFFD}')),
+        "no lossy spelling may reach the writer: {:?}",
+        files.iter().map(|f| &f.path).collect::<Vec<_>>()
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// The safety argument for dropping the entry, pinned: a `continue` in
+/// `read_directory` leaves the name out of `present`, and everything left out
+/// of `present` is deleted.
+///
+/// It is safe because the dropped entry has no row of its own — an
+/// unrepresentable name cannot be stored — and because the row that *is*
+/// named its lossy spelling belongs to a different file, which the same
+/// listing yields separately and which marks itself present. This test is what
+/// says that second half still happens.
+#[test]
+fn dropping_a_bad_entry_deletes_nothing() {
+    let root = tmp_tree("nonutf8-stale");
+    let twin = crate::testutil::lossy_twin("DRH257", "~X.MP4");
+    touch(&root.join("plain.txt"));
+    touch(&root.join(&twin));
+    let bad = root.join(crate::testutil::unrepresentable_name("DRH257", "~X.MP4"));
+    if !try_touch(&bad) {
+        eprintln!("skipped: this filesystem will not store an unrepresentable name");
+        return;
+    }
+
+    // Seed both real files as already indexed, so anything the walk reports
+    // stale is a row it wants deleted.
+    let db = db_with(
+        "nonutf8-stale",
+        &[
+            (path_to_db_string(&root.join("plain.txt")), 0),
+            (path_to_db_string(&root.join(&twin)), 0),
+        ],
+    );
+    let stale = stale_only(walk_indexable_files(
+        &[root.to_string_lossy().into_owned()],
+        false,
+        false,
+        IgnoreSet::compile(&[]).unwrap(),
+        db.to_str().unwrap(),
+        Config::default(),
+        Arc::new(Registry::default_set()),
+        Arc::new(AtomicBool::new(false)),
+        4,
+    ));
+
+    assert!(
+        stale.is_empty(),
+        "both files are on disk; nothing may be deleted: {:?}",
+        stale
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A root spelled in UTF-8 can still *resolve* onto a name that is not:
+/// canonicalizing follows symlinks, so `~/docs` may be a link to a directory
+/// the index cannot spell.
+///
+/// Stored lossily, that root's parent string names some other directory — so
+/// the walk would attribute a completely unrelated tree to it, or read nothing
+/// and report the root's real rows as deleted. It has to be recorded as
+/// unreadable instead, which is what keeps stale cleanup off it.
+#[cfg(unix)]
+#[test]
+fn a_root_that_resolves_onto_an_unrepresentable_name_is_not_walked() {
+    let base = tmp_tree("nonutf8-root");
+    let real = base.join(crate::testutil::unrepresentable_name("target", ""));
+    if !try_mkdir(&real) {
+        eprintln!("skipped: this filesystem will not store an unrepresentable name");
+        return;
+    }
+    touch(&real.join("inside.txt"));
+
+    // The root the user configures is an ordinary, spellable string.
+    let link = base.join("docs");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let root = link.to_str().expect("the configured root is spellable");
+
+    let mut walk = walk_indexable_files(
+        &[root.to_string()],
+        false,
+        false,
+        IgnoreSet::compile(&[]).unwrap(),
+        empty_db("nonutf8-root").to_str().unwrap(),
+        Config::default(),
+        Arc::new(Registry::default_set()),
+        Arc::new(AtomicBool::new(false)),
+        4,
+    );
+    let events: Vec<WalkEvent> = walk.by_ref().collect();
+    assert!(
+        events.is_empty(),
+        "nothing under an unspellable root may be walked: {:?}",
+        events
+    );
+    assert!(
+        !walk.unreadable().is_empty(),
+        "the root must read as unreadable, or its rows fall to stale cleanup"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// The collision that made this worth fixing: a file whose *lossy* spelling is
+/// another file's real name must not stand in for it.
+///
+/// Before the screen moved to the directory entry, the bad name was still
+/// turned into a `WalkedFile` carrying the lossy path — and the pipeline hashes
+/// that path into `seen_paths` before it looks for a record, so whichever of
+/// the two the walk happened to reach second was dropped from the index.
+#[test]
+fn a_bad_name_cannot_stand_in_for_its_lossy_twin() {
+    let root = tmp_tree("nonutf8-twin");
+    let twin = crate::testutil::lossy_twin("x", ".txt");
+    touch(&root.join(&twin));
+    let bad = root.join(crate::testutil::unrepresentable_name("x", ".txt"));
+    if !try_touch(&bad) {
+        eprintln!("skipped: this filesystem will not store an unrepresentable name");
+        return;
+    }
+
+    let files = walk(&root, &empty_db("nonutf8-twin"));
+
+    let prepared: Vec<&WalkedFile> = files.iter().filter(|f| f.record.is_some()).collect();
+    assert_eq!(
+        prepared.len(),
+        1,
+        "exactly the representable file is prepared"
+    );
+    assert_eq!(
+        prepared[0].path,
+        path_to_db_string(&root.join(&twin)),
+        "and it is the real one, under its own name"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A directory the index cannot spell is pruned at its root: every path
+/// beneath it would carry the bad component, so none of them is indexable
+/// either way.
+///
+/// The reason this is the *directory* case and not just N file cases: the
+/// walk's row prefetcher keys on the directory's lossy parent string, so a bad
+/// directory sitting beside a real one with the colliding name was handed the
+/// real one's rows — and then reported every one of them stale.
+#[test]
+fn a_bad_directory_is_pruned_with_its_whole_subtree() {
+    let root = tmp_tree("nonutf8-dir");
+    let twin = crate::testutil::lossy_twin("dir", "");
+    touch(&root.join(&twin).join("a.txt"));
+    let bad = root.join(crate::testutil::unrepresentable_name("dir", ""));
+    if !try_mkdir(&bad) {
+        eprintln!("skipped: this filesystem will not store an unrepresentable name");
+        return;
+    }
+    for n in 0..5 {
+        touch(&bad.join(format!("b{}.txt", n)));
+    }
+    touch(&bad.join("deep/c.txt"));
+
+    let db = db_with(
+        "nonutf8-dir",
+        &[(path_to_db_string(&root.join(&twin).join("a.txt")), 0)],
+    );
+    let stale = stale_only(walk_indexable_files(
+        &[root.to_string_lossy().into_owned()],
+        false,
+        false,
+        IgnoreSet::compile(&[]).unwrap(),
+        db.to_str().unwrap(),
+        Config::default(),
+        Arc::new(Registry::default_set()),
+        Arc::new(AtomicBool::new(false)),
+        4,
+    ));
+    assert!(
+        stale.is_empty(),
+        "the real directory's row must survive its bad-named sibling: {:?}",
+        stale
+    );
+
+    let files = walk(&root, &db);
+    assert_eq!(
+        names(&files),
+        vec!["a.txt"],
+        "nothing under the bad directory is walked"
     );
 
     fs::remove_dir_all(&root).ok();
@@ -803,4 +1002,98 @@ fn local_temp_dir_is_not_detected_as_network() {
         LOCAL_THREADS
     );
     fs::remove_dir_all(&root).ok();
+}
+
+/// **The index must never be walked into.**
+///
+/// Hashing a file means opening it, and on Unix closing a descriptor on an
+/// inode cancels every advisory lock the whole process holds on it. Doing that
+/// to `index.sqlite-shm` destroys the DMS lock SQLite took, after which an
+/// attaching connection truncates the wal-index under our live mapping and the
+/// next commit dies with SIGBUS — which is the crash this pruning exists to
+/// prevent. The same close cancels the database's own locks, SQLite's
+/// documented corruption hazard.
+///
+/// `include_hidden` is on because that is what exposes the default layout:
+/// the index lives under `~/.local/share`, which a default walk skips for
+/// being dot-named — so the hazard is real but latent until a user turns
+/// hidden files on.
+#[test]
+fn the_index_and_its_sidecars_are_never_walked() {
+    let root = tmp_tree("walk-self-index");
+    touch(&root.join("ordinary.txt"));
+
+    // The index inside the tree being walked, as it is by default: the
+    // default root is the home directory and the default database sits
+    // beneath it.
+    let db = root.join("data").join("index.sqlite");
+    let conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+    // A write, so the WAL and SHM exist to be walked over.
+    conn.execute(
+        "INSERT INTO files (name, parent, size, mtime, type, content_state)
+         VALUES ('a', '/', 0, 0, 0, 3)",
+        [],
+    )
+    .unwrap();
+
+    let found = names(&walk_with(&root, &db, false, true));
+    assert!(
+        found.contains(&"ordinary.txt".to_string()),
+        "the walk should still report ordinary files: {:?}",
+        found
+    );
+    for name in ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"] {
+        assert!(
+            !found.contains(&name.to_string()),
+            "{} was walked; found {:?}",
+            name,
+            found
+        );
+    }
+    drop(conn);
+}
+
+/// Pruning it is not enough — a row written before this existed has to go, or
+/// the live watcher and duplicate verification keep opening the file from a
+/// result list forever.
+///
+/// This is why the walk `continue`s past the index rather than emitting a
+/// `WalkedFile::skipped`: a skip keeps the row, and only leaving the name out
+/// of the directory's `present` set hands it to the stale sweep.
+#[test]
+fn a_stored_row_for_the_index_falls_to_the_stale_sweep() {
+    let root = crate::testutil::scratch_dir_canonical("walk-self-index-stale");
+    // The database the walk uses has to be the one inside the walked tree,
+    // or there is nothing self-referential to sweep.
+    let db = root.join("data").join("index.sqlite");
+    let conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+
+    // The row an older build would have written for the database itself,
+    // inserted exactly the way `db_with` inserts one.
+    let stored = path_to_db_string(&db);
+    let (parent, name) = crate::file_handling::split_db_path(&stored).expect("a file's path");
+    conn.execute(
+        "INSERT INTO files (name, parent, size, mtime, type, content_state)
+         VALUES (?1, ?2, 0, 0, 0, 3)",
+        rusqlite::params![name, parent],
+    )
+    .unwrap();
+    drop(conn);
+
+    let stale = stale_only(walk_indexable_files(
+        &[root.to_string_lossy().into_owned()],
+        false,
+        true,
+        IgnoreSet::compile(&[]).unwrap(),
+        db.to_str().unwrap(),
+        Config::default(),
+        Arc::new(Registry::default_set()),
+        Arc::new(AtomicBool::new(false)),
+        4,
+    ));
+    assert!(
+        stale.contains(&stored),
+        "the index's own row should be swept; got {:?}",
+        stale
+    );
 }

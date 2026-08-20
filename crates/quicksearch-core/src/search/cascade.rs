@@ -277,11 +277,14 @@ fn rank_order(a: &SearchHit, b: &SearchHit) -> std::cmp::Ordering {
 }
 
 /// The `files` columns every pass selects, in the order the passes index
-/// them: `0` id, `1` name, `2` path, `3` size, `4` mtime. Passes that also
+/// them: `0` id, `1` name, `2` parent, `3` size, `4` mtime. Passes that also
 /// want the stored document text append `dt.text_zstd` as column `5`. A pass
 /// spelling its own list in a different order would compile and then quietly
-/// serve paths as names.
-const HIT_COLUMNS: &str = "f.id, f.name, f.path, f.size, f.mtime";
+/// serve parents as names.
+///
+/// There is no `path` column to select; [`Cx::scan_pass`] concatenates columns
+/// 2 and 1 into one reused buffer and hands every classifier the result.
+const HIT_COLUMNS: &str = "f.id, f.name, f.parent, f.size, f.mtime";
 
 /// Columns 3 and 4. The clamp matters: `size` is `INTEGER` in SQLite and so
 /// signed; a corrupt row holding `-1` would otherwise become 18 exabytes on

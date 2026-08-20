@@ -65,6 +65,24 @@ pub fn record(level: Level, message: String) {
         Level::Warn => format!("Warning: {}", message),
         Level::Info => message,
     };
+    // Almost every line here names a path, and a path is whatever someone
+    // called a file. An escape sequence in one reaches a terminal three ways:
+    // the stderr write below, a user running the GUI from a shell, and the
+    // Logs tab's Copy button, which puts the ring on the clipboard for pasting
+    // into a bug report. Diagnostics are not data — nothing downstream needs
+    // these bytes exactly — so they are scrubbed unconditionally.
+    //
+    // Line breaks are collapsed *first*, because `scrub_controls` counts them
+    // as controls and would leave `U+FFFD` where a space belongs. One record
+    // is one line — the ring renders it that way and `writeln!` adds the only
+    // newline there should be — so a message that arrives multi-line, such as
+    // a nested error's chain of causes, is flattened rather than boxed.
+    let text = if text.contains(['\n', '\r']) {
+        text.replace(['\n', '\r'], " ")
+    } else {
+        text
+    };
+    let text = crate::textenc::scrub_controls(&text).into_owned();
     let _ = writeln!(std::io::stderr(), "{}", text);
     lock().push(level, text);
 }

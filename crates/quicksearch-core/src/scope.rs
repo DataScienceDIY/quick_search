@@ -5,8 +5,8 @@
 //! produce. When the configuration changes, the two disagree — and almost
 //! always in a way that can be *reconciled* rather than rebuilt:
 //!
-//! * A root was removed. Its rows are a contiguous `files.path` range, so
-//!   they go in five statements ([`crate::db::repo::delete_subtree`]).
+//! * A root was removed. Its rows are a contiguous `files.parent` range, so
+//!   they go in four statements ([`crate::db::repo::delete_subtree`]).
 //! * An ignore pattern was added, hidden files were switched off, symlinks
 //!   stopped being followed. The rows to drop are picked out by a predicate
 //!   no SQL range can express, so [`Scope::covers`] re-runs the walker's own
@@ -51,7 +51,7 @@ use crate::indexing::ReconcileProgress;
 /// through [`crate::db::InterruptGuard`].
 pub const SLICE: Duration = Duration::from_millis(250);
 
-/// One configured root, with the `files.path` range it owns precomputed.
+/// One configured root, with the `files.parent` range it owns precomputed.
 struct Root {
     path: PathBuf,
     lo: String,
@@ -208,9 +208,9 @@ pub struct WorkCursor {
     dropped_aliases: bool,
     /// Index into `scope.roots` of the range being scanned.
     root_idx: usize,
-    /// Last path served by the scan — the keyset cursor. Empty means "start
-    /// this root's range from its `lo` bound".
-    after: String,
+    /// Last `(parent, name)` served by the scan — the keyset cursor. An empty
+    /// parent means "start this root's range from its `lo` bound".
+    after: (String, String),
     /// Set once the FTS automerge that follows a batch of deletions has run.
     finalized: bool,
     /// Rows deleted so far, for the log line when the work completes.
@@ -233,7 +233,7 @@ impl WorkCursor {
             drop_idx: 0,
             dropped_aliases: false,
             root_idx: 0,
-            after: String::new(),
+            after: (String::new(), String::new()),
             finalized: false,
             deleted: 0,
             recontented: 0,
@@ -352,16 +352,19 @@ pub fn advance(
                 return Ok(());
             }
             let root = &cursor.scope.roots[cursor.root_idx];
-            if cursor.after.is_empty() {
-                cursor.after = root.lo.clone();
+            if cursor.after.0.is_empty() {
+                // `(lo, "")` sorts below every row in the range: no stored name
+                // is empty, so the first page starts exactly at `lo`.
+                cursor.after = (root.lo.clone(), String::new());
             }
-            let rows = repo::rows_in_range_page(conn, &cursor.after, &root.hi, page)?;
+            let rows =
+                repo::rows_in_range_page(conn, &cursor.after.0, &cursor.after.1, &root.hi, page)?;
             let Some(last) = rows.last() else {
                 cursor.root_idx += 1;
-                cursor.after.clear();
+                cursor.after = (String::new(), String::new());
                 continue;
             };
-            cursor.after = last.path.clone();
+            cursor.after = (last.parent.clone(), last.name.clone());
             cursor.examined += rows.len();
             let root = cursor.scope.roots[cursor.root_idx].path.clone();
             let (deleted, recontented) = apply_page(

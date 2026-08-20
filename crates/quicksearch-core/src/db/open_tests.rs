@@ -124,8 +124,8 @@ fn tokenizer_drift_wipes_db() {
     let first_effective = {
         let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         conn.execute(
-            "INSERT INTO files (name, path, parent, size, mtime) \
-             VALUES ('x', '/x', '/', 0, 0)",
+            "INSERT INTO files (name, parent, size, mtime) \
+             VALUES ('x', '/', 0, 0)",
             [],
         )
         .unwrap();
@@ -164,8 +164,8 @@ fn open_existing_reads_nondefault_tokenizer_without_wiping() {
     {
         let conn = open_or_recreate(p.to_str().unwrap(), "unicode61").unwrap();
         conn.execute(
-            "INSERT INTO files (name, path, parent, size, mtime) \
-             VALUES ('note', '/note.txt', '/', 0, 0)",
+            "INSERT INTO files (name, parent, size, mtime) \
+             VALUES ('note', '/', 0, 0)",
             [],
         )
         .unwrap();
@@ -384,8 +384,8 @@ fn keyed_create_reopen_and_header_is_encrypted() {
     {
         let conn = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&key)).unwrap();
         conn.execute(
-            "INSERT INTO files (name, path, parent, size, mtime) \
-             VALUES ('secret', '/secret.txt', '/', 0, 0)",
+            "INSERT INTO files (name, parent, size, mtime) \
+             VALUES ('secret', '/', 0, 0)",
             [],
         )
         .unwrap();
@@ -418,8 +418,8 @@ fn wrong_key_errors_without_wiping() {
         let conn =
             open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&test_key(0xa1))).unwrap();
         conn.execute(
-            "INSERT INTO files (name, path, parent, size, mtime) \
-             VALUES ('x', '/x', '/', 0, 0)",
+            "INSERT INTO files (name, parent, size, mtime) \
+             VALUES ('x', '/', 0, 0)",
             [],
         )
         .unwrap();
@@ -532,15 +532,15 @@ fn open_existing_rw_allows_delete() {
     {
         let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         conn.execute(
-            "INSERT INTO files (name, path, parent, size, mtime) \
-             VALUES ('a', '/a', '/', 0, 0)",
+            "INSERT INTO files (name, parent, size, mtime) \
+             VALUES ('a', '/', 0, 0)",
             [],
         )
         .unwrap();
     }
     let conn = open_existing(p.to_str().unwrap(), true).unwrap();
     let removed = conn
-        .execute("DELETE FROM files WHERE path = '/a'", [])
+        .execute("DELETE FROM files WHERE parent = '/' AND name = 'a'", [])
         .unwrap();
     assert_eq!(removed, 1);
     drop(conn);
@@ -571,8 +571,8 @@ fn a_fresh_index_and_its_sidecars_are_owner_only() {
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     // A write, so the WAL and SHM exist to be checked.
     conn.execute(
-        "INSERT INTO files (name, path, parent, size, mtime) \
-         VALUES ('a', '/perm-a', '/', 0, 0)",
+        "INSERT INTO files (name, parent, size, mtime) \
+         VALUES ('a', '/', 0, 0)",
         [],
     )
     .unwrap();
@@ -594,6 +594,50 @@ fn a_fresh_index_and_its_sidecars_are_owner_only() {
     // And the directory created for it, which would otherwise take the umask
     // and let any account list what is indexed.
     assert_eq!(mode_of(p.parent().unwrap()), 0o700);
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// `maintain` must work on a *keyed* index, which is the one case the pragma
+/// it reads does not answer with an integer.
+///
+/// SQLCipher intercepts `PRAGMA page_size` on a keyed connection, answers with
+/// `cipher_page_size`, and hands that back as TEXT. Reading it straight into an
+/// `i64` failed there and only there — so every unencrypted test passed while
+/// every index with a password set silently skipped both its VACUUM and its
+/// `PRAGMA optimize`. The assertion is simply that the call succeeds: it has to
+/// get past all three pragma reads to return at all.
+#[test]
+fn maintain_reads_its_pragmas_on_a_keyed_index() {
+    let p = tmp_db_path();
+    let key = test_key(0xc3);
+    let dir = p.parent().unwrap().to_string_lossy().into_owned();
+    {
+        let conn = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&key)).unwrap();
+        conn.execute(
+            "INSERT INTO files (name, parent, size, mtime) VALUES ('x', '/', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+    let conn = open_keyed_with_pragmas(p.to_str().unwrap(), true, Some(&key), PRAGMAS_MAINTENANCE)
+        .unwrap();
+    // A two-row index has no slack worth reclaiming, so `false` is the
+    // expected answer — what matters is that it is an answer and not an error.
+    assert_eq!(
+        crate::db::repo::maintain(&conn, &dir),
+        Ok(false),
+        "maintain must not fail on a keyed index"
+    );
+
+    // And the value itself has to be usable, not merely readable: a page size
+    // that parsed as 0 would size the free-space check at zero bytes and wave
+    // through a VACUUM that cannot fit.
+    assert!(
+        crate::db::repo::pragma_number(&conn, "page_size").unwrap() >= 512,
+        "a real page size, not a silent zero"
+    );
 
     drop(conn);
     std::fs::remove_file(&p).ok();

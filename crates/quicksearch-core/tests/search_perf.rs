@@ -114,13 +114,12 @@ fn seed(path: &std::path::Path) {
         let w1 = WORDS[(rng.next() as usize) % WORDS.len()];
         let w2 = WORDS[(rng.next() as usize) % WORDS.len()];
         let name = format!("{}-{}-{:07}.txt", w1, w2, i);
-        let dir = format!("/seed/{:03}", i % 500);
-        let full = format!("{}/{}", dir, name);
+        // Stored parents always end in a separator.
+        let dir = format!("/seed/{:03}/", i % 500);
         let id = insert_file(
             &tx,
             &NewFile {
                 name: &name,
-                path: &full,
                 parent: &dir,
                 size: 4096,
                 mtime: 1_700_000_000 + i as u64,

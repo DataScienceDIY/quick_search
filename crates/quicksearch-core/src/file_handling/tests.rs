@@ -300,6 +300,41 @@ fn db_key_for_a_vanished_path_canonicalizes_what_remains() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The hazard every screen in the codebase exists for, stated once here.
+///
+/// `path_to_db_string` is many-to-one, and the collapsed spelling is not
+/// garbage — it is a perfectly ordinary filename that a *different* file can
+/// really have. So the stored key for an unrepresentable path is another
+/// file's key, and any use of it (open, hash, delete by path, delete a subtree
+/// range) lands on that file instead. `warn_if_unrepresentable` is how a
+/// caller holding a single path avoids ever building one.
+#[test]
+fn the_stored_spelling_of_an_unrepresentable_path_is_another_files_key() {
+    let dir = Path::new("/docs");
+    let bad = dir.join(crate::testutil::unrepresentable_name("report", ".txt"));
+    let twin = dir.join(crate::testutil::lossy_twin("report", ".txt"));
+
+    assert!(warn_if_unrepresentable(&bad));
+    assert!(
+        !warn_if_unrepresentable(&twin),
+        "the twin is an ordinary name and must pass"
+    );
+    assert_eq!(
+        path_to_db_string(&bad),
+        path_to_db_string(&twin),
+        "two different files, one stored key"
+    );
+
+    // And the same one component deeper, which is why a bad *directory* has to
+    // be pruned rather than walked: the collision is inherited by everything
+    // beneath it.
+    assert_eq!(
+        path_to_db_string(&bad.join("child.txt")),
+        path_to_db_string(&twin.join("child.txt"))
+    );
+    assert!(warn_if_unrepresentable(&bad.join("child.txt")));
+}
+
 #[test]
 fn db_key_for_an_entirely_missing_path_falls_back_to_the_raw_spelling() {
     let nowhere = Path::new("relative-thing-that-does-not-exist.txt");
@@ -395,4 +430,98 @@ fn hash_covers_size_and_head_only() {
     assert_eq!(head, b"HEAD", "a short file hashes whole");
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// The invariant the whole schema rests on: `parent` and `name` concatenate
+/// back into the path, with no separator logic at the join.
+///
+/// Checked against real paths built by `Path::join` rather than by string
+/// formatting, so a platform whose separator is not `/` is tested too.
+#[test]
+fn a_split_path_concatenates_back_into_itself() {
+    let root = std::path::Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+    let cases = [
+        root.join("a.txt"),                        // a file at the very root
+        root.join("home").join("me").join("x.md"), // the ordinary case
+        root.join("dir with spaces").join("y"),
+        root.join("weird.name").join("z.tar.gz"),
+    ];
+    for path in cases {
+        let s = path_to_db_string(&path);
+        let (parent, name) = split_db_path(&s).expect("a file's path");
+        assert_eq!(
+            format!("{}{}", parent, name),
+            s,
+            "{:?} must round-trip through its (parent, name) key",
+            s
+        );
+        assert_eq!(
+            name,
+            path.file_name().unwrap().to_string_lossy(),
+            "the name half is the file name"
+        );
+        assert_eq!(
+            parent,
+            dir_to_db_parent(path.parent().unwrap()),
+            "the parent half is what `dir_to_db_parent` would store"
+        );
+        assert!(
+            parent.ends_with(MAIN_SEPARATOR),
+            "a stored parent always ends in a separator: {:?}",
+            parent
+        );
+        assert!(
+            !name.contains(MAIN_SEPARATOR),
+            "a stored name never contains one: {:?}",
+            name
+        );
+    }
+}
+
+/// A filesystem root already ends in a separator, so `dir_to_db_parent` must
+/// not add a second one — otherwise every file directly at the root would be
+/// stored under `//` (or `C:\\`) and never found again.
+#[test]
+fn a_root_directory_does_not_get_a_doubled_separator() {
+    let root = std::path::Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+    let parent = dir_to_db_parent(root);
+    assert_eq!(parent, path_to_db_string(root));
+    assert!(!parent.ends_with(&format!("{}{}", MAIN_SEPARATOR, MAIN_SEPARATOR)));
+    // And the join still produces a path that names the same file.
+    assert_eq!(
+        format!("{}{}", parent, "a.txt"),
+        path_to_db_string(&root.join("a.txt"))
+    );
+}
+
+/// Strings that are not a file's path have no key, and must say so rather
+/// than producing a half-formed one — every lookup helper reads `None` as
+/// "not indexed".
+#[test]
+fn a_string_that_cannot_be_a_files_path_has_no_key() {
+    assert_eq!(split_db_path("bare-name.txt"), None, "no separator at all");
+    assert_eq!(
+        split_db_path(&format!("{}dir{}", MAIN_SEPARATOR, MAIN_SEPARATOR)),
+        None,
+        "trailing separator: names a directory, not a file"
+    );
+    assert_eq!(split_db_path(""), None);
+}
+
+/// On Unix a backslash is an ordinary filename character. Splitting on it
+/// there would put half a name in the parent, and the row would be
+/// unreachable by the path it was stored under.
+#[test]
+#[cfg(unix)]
+fn a_backslash_is_just_a_character_on_unix() {
+    let (parent, name) = split_db_path(r"/home/me/back\slash.txt").expect("a file's path");
+    assert_eq!(parent, "/home/me/");
+    assert_eq!(name, r"back\slash.txt");
+
+    // Same on the directory side: a folder genuinely named `weird\` still
+    // gets its own separator appended.
+    assert_eq!(
+        dir_to_db_parent(std::path::Path::new(r"/tmp/weird\")),
+        r"/tmp/weird\/"
+    );
 }

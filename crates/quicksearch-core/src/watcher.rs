@@ -30,7 +30,7 @@
 //! root looks live while going silently stale. A single directory the kernel
 //! refuses is logged and skipped instead (see [`add_watch`]).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -97,6 +97,11 @@ pub enum WatchError {
     KernelLimit {
         registered: usize,
     },
+    /// The kernel's event queue overflowed and events were dropped. Unlike
+    /// the two above this says nothing about the watcher's *capacity* — it
+    /// keeps working — only that the index is now out of step with the disk
+    /// by an unknown amount, so a full run is owed.
+    Overflowed,
     Other(String),
 }
 
@@ -121,6 +126,11 @@ impl std::fmt::Display for WatchError {
                 } else {
                     ""
                 }
+            ),
+            WatchError::Overflowed => write!(
+                f,
+                "the system event queue overflowed and changes were missed; \
+                 reindexing to catch up"
             ),
             WatchError::Other(msg) => write!(f, "{}", msg),
         }
@@ -156,8 +166,9 @@ pub struct WatcherConfig {
     /// How often the tick loop inspects the throttle map. Short ticks mean
     /// low latency for first-in-a-burst; long ticks lower CPU at idle.
     pub tick_interval: Duration,
-    /// Maximum directories processed per tick. Caps the time spent in a
-    /// single flush pass so long backlogs don't monopolize the thread.
+    /// Maximum directories *selected* per tick. A ceiling on the work one
+    /// pass takes on; [`FLUSH_BUDGET`] is what bounds how long it may spend
+    /// on them, and is the real limit.
     pub max_dirs_per_tick: usize,
     /// When to garbage-collect stale throttle entries (idle > window * N).
     pub prune_max_age_multiplier: u32,
@@ -172,7 +183,7 @@ impl Default for WatcherConfig {
             pending_max_defer: Duration::from_secs(30),
             throttle_window: Duration::from_secs(30),
             tick_interval: Duration::from_millis(500),
-            max_dirs_per_tick: 64,
+            max_dirs_per_tick: 512,
             prune_max_age_multiplier: 10,
             max_watched_dirs: DEFAULT_MAX_WATCHED_DIRS,
         }
@@ -187,9 +198,22 @@ impl Default for WatcherConfig {
 /// never blocks behind a large subtree registration.
 struct WatchRegistry {
     raw: RecommendedWatcher,
-    dirs: HashSet<PathBuf>,
+    /// Ordered, not hashed, so [`WatchRegistry::remove_tree`] can take the
+    /// subtree as a range instead of scanning every watched directory. The
+    /// set reaches `max_watched_dirs` (128k by default) and `rm -rf` deletes
+    /// bottom-up, so every directory in a deleted tree hits that path.
+    dirs: BTreeSet<PathBuf>,
     cap: usize,
 }
+
+/// How long one flush pass may spend handing events to the sink.
+///
+/// Paired with `max_dirs_per_tick`: the count decides how many directories a
+/// pass takes on, this decides when it stops regardless. A backlog then
+/// drains at whatever the machine can actually do rather than at a fixed
+/// directories-per-second, while one enormous directory still cannot hold the
+/// tick loop.
+const FLUSH_BUDGET: Duration = Duration::from_millis(50);
 
 /// The mode every `watch()` call uses on this platform. See
 /// [`crate::platform::WATCH_ROOTS_RECURSIVELY`] for why it differs.
@@ -243,10 +267,15 @@ impl WatchRegistry {
         if !self.dirs.contains(dir) {
             return 0;
         }
+        // A range from `dir`, stopping at the first entry that is no longer
+        // beneath it: descendants sort immediately after their ancestor, so
+        // this visits the subtree and one entry more, rather than the whole
+        // set. `starts_with` is still the test — it compares whole components,
+        // where a raw string prefix would take `/a/bc` for a child of `/a/b`.
         let doomed: Vec<PathBuf> = self
             .dirs
-            .iter()
-            .filter(|d| d.starts_with(dir))
+            .range(dir.to_path_buf()..)
+            .take_while(|d| d.starts_with(dir))
             .cloned()
             .collect();
         for d in &doomed {
@@ -311,6 +340,21 @@ impl Watcher {
         let raw = RecommendedWatcher::new(
             move |res: notify::Result<NotifyEvent>| match res {
                 Ok(ev) => {
+                    // An overflow of the kernel's own event queue arrives here
+                    // — on the *Ok* arm, as `EventKind::Other` with the rescan
+                    // flag and no paths at all — so the error arm below never
+                    // sees it and the per-path loop downstream iterates zero
+                    // times. Left alone it is silent data loss: an arbitrary
+                    // set of creates, modifies and removes never reaches the
+                    // index while the watcher goes on reporting itself
+                    // healthy. It is reported rather than repaired here
+                    // because the events are simply gone; only a full run can
+                    // find out what happened.
+                    if ev.need_rescan() {
+                        let mut slot = crate::lock_ok(&degraded_cb);
+                        slot.get_or_insert(WatchError::Overflowed);
+                        return;
+                    }
                     // A closed receiver just means the watcher was stopped; ignore.
                     let _ = tx.send(ev);
                 }
@@ -330,7 +374,7 @@ impl Watcher {
 
         let registry = Arc::new(Mutex::new(WatchRegistry {
             raw,
-            dirs: HashSet::new(),
+            dirs: BTreeSet::new(),
             cap: config.max_watched_dirs,
         }));
 
@@ -414,6 +458,19 @@ impl Watcher {
     /// Whether the watcher ran out of budget after starting.
     pub fn is_degraded(&self) -> bool {
         crate::lock_ok(&self.degraded).is_some()
+    }
+
+    /// Forget the recorded reason, so a later one can take its place.
+    ///
+    /// For [`WatchError::Overflowed`] only, and the distinction is the whole
+    /// point of the method: the other two reasons are *standing* — the watch
+    /// budget does not come back — while an overflow is a one-shot "you missed
+    /// some" from a watcher that is still delivering. Left in place it would
+    /// re-trigger on every coordinator tick and, worse, mask a real
+    /// [`WatchError::KernelLimit`] arriving afterwards, because the callback
+    /// records with `get_or_insert`.
+    pub fn clear_degraded(&self) {
+        *crate::lock_ok(&self.degraded) = None;
     }
 
     /// Signal the background thread to stop and wait for it to join. Safe to
@@ -594,6 +651,16 @@ fn unwatch_tree(ctx: &LoopCtx, path: &Path) {
 /// on which subtrees exist. Under a recursive root watch it is the *only*
 /// thing keeping `node_modules` churn out of the throttle map.
 fn is_event_interesting(ctx: &LoopCtx, path: &Path) -> bool {
+    // A path the index cannot spell, screened here because this is the one
+    // gate every `FsEvent` passes through. Such a file is never indexed, so
+    // there is no row for a Create to update and none for a Remove to delete —
+    // but the incremental side keys on `path_to_db_string`, which is lossy, so
+    // letting the event through means acting on whichever *different* file
+    // happens to own the lossy spelling. The event carries no information and
+    // every use of it is a mistake.
+    if path.to_str().is_none() {
+        return false;
+    }
     if ctx.filters.ignore.matches_path(path) {
         return false;
     }
@@ -696,7 +763,18 @@ fn flush_ready(
             }
         }
     }
+    // The count above bounds how many directories are *selected*; this bounds
+    // how long draining them may take, which is the thing that actually
+    // matters. Directory queues differ by orders of magnitude, so a fixed
+    // count is either too small after a large delete — at 64 per 500 ms tick
+    // the drain rate is 128 directories a second regardless of backlog, and a
+    // 20k-directory unpack takes minutes to reach the index — or too large for
+    // one deep directory.
+    let deadline = now + FLUSH_BUDGET;
     for dir in ready {
+        if Instant::now() >= deadline {
+            break;
+        }
         if let Some(entry) = throttle.get_mut(&dir) {
             let drained: Vec<(PathBuf, QueuedOp)> = entry.queue.drain().collect();
             entry.immediate = false;

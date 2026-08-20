@@ -50,7 +50,7 @@ impl QuickSearchApp {
                 ));
                 ui.horizontal(|ui| {
                     if ui.button("Rebuild now").clicked() {
-                        self.backend.coordinator.rebuild_index();
+                        self.backend.rebuild_index();
                         close = true;
                     }
                     if ui.button("Later").clicked() {
@@ -97,7 +97,7 @@ impl QuickSearchApp {
         }
         if stale_index_window(ctx, self.key_source) {
             self.stale_index_prompt = false;
-            self.backend.coordinator.rebuild_index();
+            self.backend.rebuild_index();
             self.dups.state = DupState::NotLoaded;
         }
     }
@@ -157,6 +157,18 @@ impl QuickSearchApp {
                          QuickSearch cannot update the index as files change.",
                         group_thousands(*registered as u64),
                     ));
+                }
+                // Not reachable through this modal today: an overflow leaves
+                // the watcher running and schedules a full run instead of
+                // disabling live updates, so it never becomes a
+                // `WatcherStatus::Disabled`. Spelled out rather than folded
+                // into a catch-all so that a future variant is a compile
+                // error here, which is how this arm came to be written.
+                WatchError::Overflowed => {
+                    ui.label(
+                        "The system dropped some change notifications, so the index \
+                         is being rebuilt to catch up.",
+                    );
                 }
                 WatchError::Other(msg) => {
                     ui.label(format!("Live updates are unavailable: {}", msg));
@@ -227,7 +239,7 @@ impl QuickSearchApp {
                     // resurrect what was just deleted, nor the next launch
                     // undo the stop.
                     self.set_index_mode(false);
-                    self.backend.coordinator.clear_index();
+                    self.backend.clear_index();
                     self.dups.state = DupState::NotLoaded;
                     return true;
                 }

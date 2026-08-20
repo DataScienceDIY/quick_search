@@ -74,6 +74,11 @@ content_extensions = []
 # The Windows defaults add: "$RECYCLE.BIN", "System Volume Information",
 # "pagefile.sys", "hiberfil.sys", "swapfile.sys", "Thumbs.db",
 # "desktop.ini".
+#
+# The index itself (database_path and its -wal/-shm/-journal/.lock
+# siblings) is always skipped and needs no pattern here — not as a
+# convenience but because merely opening one of those files to hash it
+# would cancel SQLite's locks on it for the whole process.
 ignore_patterns = [".git", "node_modules", "*.tmp", ".venv", "venv"]
 
 # Worth adding by hand if you index a whole Windows drive rather than just
@@ -124,6 +129,13 @@ fts_update_batch_size = 1000
 # unattended the log grows for the whole run and can end up larger than the
 # index. Set to 0 to disable forced checkpoints; any other value below
 # 16777216 is raised to it.
+#
+# This is a stall-frequency knob, not a safety one: when the volume holding
+# the index is short on space the indexer checkpoints sooner than asked —
+# including when this is 0 — and stops the run with an error rather than
+# fill the disk. Running out is not a clean failure; SQLite reaches its
+# wal-index through a memory map, and a write the filesystem cannot back
+# kills the process with SIGBUS instead of returning an error.
 maximum_wal_size = 536870912
 # FTS5 tokenizer: 'trigram' (substring matching, the default; gets
 # remove_diacritics 1 appended), 'unicode61', 'porter', or a full FTS5

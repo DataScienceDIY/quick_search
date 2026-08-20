@@ -3,6 +3,7 @@
 
 use rusqlite::Connection;
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -72,6 +73,81 @@ fn sweep_unvisited_parents(
 /// which is why `run_indexing` forces one every `maximum_wal_size` bytes.
 fn wal_len(path: &str) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Free space at which a run gives up rather than keep writing.
+///
+/// Filling the volume the index sits on is not a clean failure. SQLite's
+/// guard against a short wal-index only covers the moment that file is
+/// *extended*; a later write goes through the `-shm` mmap, and a page fault
+/// the filesystem cannot back is delivered as **SIGBUS**, which no `Result`
+/// can catch. On a copy-on-write filesystem (btrfs, ZFS) even overwriting an
+/// already-allocated page needs a new extent, so a full volume can take the
+/// process down on a write to a page that has existed for hours. Stopping
+/// with an error while there is still room is the only safe end.
+const DISK_FLOOR: u64 = 128 * 1024 * 1024;
+
+/// Share of the free space above [`DISK_FLOOR`] the log may occupy.
+///
+/// The log is what grows unboundedly between checkpoints, so its cap is the
+/// figure that has to fit in what is left. A quarter leaves room for the
+/// index's own growth, the FTS segments a merge writes beside it, and
+/// whatever else on the machine wants the same volume.
+const WAL_SHARE_OF_FREE: u64 = 4;
+
+/// The configured checkpoint threshold, lowered to what the volume can
+/// actually absorb.
+///
+/// `maximum_wal_size` is a stall-frequency knob chosen against a roomy disk;
+/// on a nearly full one its 512 MiB default is more than everything left.
+/// Checkpointing sooner costs some lock acquisitions and keeps the log inside
+/// the space available — see [`DISK_FLOOR`] for why running out is not
+/// survivable.
+///
+/// A configured `0` (forced checkpoints off) is bounded like any other value
+/// rather than special-cased: the knob turns off a *performance* behaviour and
+/// is not a licence to fill the disk. On a roomy volume the derived bound is
+/// larger than any run's log, so `0` keeps its meaning without a second rule.
+/// Unknown free space changes nothing.
+fn wal_cap_for_volume(configured: u64, db_path: &Path) -> u64 {
+    let Some(free) = crate::platform::available_space(db_path) else {
+        return configured;
+    };
+    let effective = wal_cap_for_free(configured, free);
+    if effective != configured {
+        crate::log_info!(
+            "{} free where the index lives: forcing a WAL checkpoint every {} MiB \
+             instead of {}",
+            human_mib(free),
+            effective / (1024 * 1024),
+            match configured {
+                0 => "never".to_string(),
+                n => format!("{} MiB", n / (1024 * 1024)),
+            }
+        );
+    }
+    effective
+}
+
+/// The arithmetic of [`wal_cap_for_volume`], split from the syscall so it is
+/// testable without a filesystem of a chosen size — the same split the rest of
+/// the codebase makes for anything decidable without asking the kernel.
+pub(super) fn wal_cap_for_free(configured: u64, free: u64) -> u64 {
+    let room = free.saturating_sub(DISK_FLOOR) / WAL_SHARE_OF_FREE;
+    // Never below the floor a configured value would be raised to: checkpoints
+    // more often than that cost more in lock acquisition than the log costs in
+    // space, and the in-run check is what actually stops a doomed run.
+    let capped = room.max(crate::config::MINIMUM_WAL_SIZE);
+    // `0` is "no cap", so it loses every `min` — hence the explicit arm.
+    if configured == 0 {
+        capped
+    } else {
+        configured.min(capped)
+    }
+}
+
+fn human_mib(bytes: u64) -> String {
+    format!("{} MiB", bytes / (1024 * 1024))
 }
 
 /// Flips an [`AtomicBool`] when dropped. Held by `run_indexing` so the
@@ -780,10 +856,11 @@ impl IndexingService {
         // Log size at which to force a checkpoint; see [`wal_len`] for why
         // SQLite's autocheckpoint cannot be left to do this.
         let wal_path = format!("{}-wal", db_path);
-        let wal_cap = match config.processing.maximum_wal_size {
+        let configured_cap = match config.processing.maximum_wal_size {
             0 => 0,
             n => n.max(crate::config::MINIMUM_WAL_SIZE),
         };
+        let wal_cap = wal_cap_for_volume(configured_cap, Path::new(db_path));
         let mut checkpoint_at = wal_cap;
 
         // Walks first, one slice each, then a single extraction slice.
@@ -850,6 +927,24 @@ impl IndexingService {
                     let conn = crate::lock_ok(&cx.conn_mutex);
                     if let Err(e) = crate::db::repo::checkpoint_truncate(&conn) {
                         crate::log_warn!("{}", e);
+                    }
+                }
+                // Only here, not every round: this is the moment the log is
+                // at its largest, and it costs one syscall per checkpoint
+                // rather than one per writer turn. The checkpoint above has
+                // just returned whatever it could, so what is left is the
+                // honest figure.
+                if let Some(free) = crate::platform::available_space(Path::new(db_path)) {
+                    if free < DISK_FLOOR {
+                        return Err(format!(
+                            "Stopped: only {} free where the index lives ({}). \
+                             Indexing needs room for its write-ahead log, and \
+                             filling the disk can kill the process outright \
+                             rather than fail cleanly. Free some space and run \
+                             again — what is already indexed is kept.",
+                            human_mib(free),
+                            db_path
+                        ));
                     }
                 }
                 // Re-armed from what is on disk: a checkpoint that lost the

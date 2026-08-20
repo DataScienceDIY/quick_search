@@ -47,7 +47,7 @@ fn index_once(root: &Path, db: &Path, config: &Config) {
 fn rows(db: &Path) -> Vec<(String, i64, i64)> {
     let conn = rusqlite::Connection::open(db).unwrap();
     let mut stmt = conn
-        .prepare("SELECT path, mtime, content_state FROM files ORDER BY path")
+        .prepare("SELECT parent || name, mtime, content_state FROM files ORDER BY parent, name")
         .unwrap();
     let out = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -756,11 +756,11 @@ fn content_rows(db: &Path) -> Vec<ContentRow> {
     let conn = rusqlite::Connection::open(db).unwrap();
     let mut stmt = conn
         .prepare(
-            "SELECT f.path, f.content_state, ff.reason, LENGTH(d.text_zstd)
+            "SELECT f.parent || f.name, f.content_state, ff.reason, LENGTH(d.text_zstd)
                FROM files f
                LEFT JOIN documents_text d ON d.file_id = f.id
                LEFT JOIN failed_files ff ON ff.file_id = f.id
-              ORDER BY f.path",
+              ORDER BY f.parent, f.name",
         )
         .unwrap();
     let out = stmt
@@ -778,7 +778,7 @@ fn stored_text(db: &Path, suffix: &str) -> Option<String> {
         .query_row(
             "SELECT d.text_zstd FROM documents_text d
                JOIN files f ON f.id = d.file_id
-              WHERE f.path LIKE '%' || ?1",
+              WHERE f.parent || f.name LIKE '%' || ?1",
             [suffix],
             |r| r.get(0),
         )
@@ -900,7 +900,7 @@ fn undecodable_small_files_are_reported_as_failures_not_silently_skipped() {
         .query_row(
             "SELECT f.content_state, ff.reason FROM files f \
                LEFT JOIN failed_files ff ON ff.file_id = f.id \
-              WHERE f.path LIKE '%bad.txt'",
+              WHERE f.parent || f.name LIKE '%bad.txt'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -943,7 +943,7 @@ fn an_unreadable_legacy_office_file_fails_with_a_reason() {
         .query_row(
             "SELECT f.content_state, ff.reason FROM files f \
                LEFT JOIN failed_files ff ON ff.file_id = f.id \
-              WHERE f.path LIKE '%broken.doc'",
+              WHERE f.parent || f.name LIKE '%broken.doc'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -981,7 +981,7 @@ fn extensionless_text_files_are_indexed() {
     let conn = rusqlite::Connection::open(&db).unwrap();
     let state_of = |name: &str| -> i64 {
         conn.query_row(
-            "SELECT content_state FROM files WHERE path LIKE '%' || ?1",
+            "SELECT content_state FROM files WHERE parent || name LIKE '%' || ?1",
             [name],
             |r| r.get(0),
         )
@@ -1162,7 +1162,7 @@ fn an_empty_file_is_done_with_no_snippet_sidecar() {
     let (state, sidecars): (i64, i64) = conn
         .query_row(
             "SELECT f.content_state, (SELECT COUNT(*) FROM documents_text d WHERE d.file_id = f.id)
-               FROM files f WHERE f.path LIKE '%empty.txt'",
+               FROM files f WHERE f.parent || f.name LIKE '%empty.txt'",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -1188,7 +1188,7 @@ fn the_content_extension_filter_still_excludes_small_text_files() {
 
     let conn = rusqlite::Connection::open(&db).unwrap();
     let states: Vec<(String, i64)> = conn
-        .prepare("SELECT path, content_state FROM files ORDER BY path")
+        .prepare("SELECT parent || name, content_state FROM files ORDER BY parent, name")
         .unwrap()
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
@@ -1933,7 +1933,7 @@ fn high_byte_binaries_are_listed_but_not_text_extracted() {
             "SELECT f.content_state,
                     (SELECT COUNT(*) FROM documents_text d WHERE d.file_id = f.id),
                     (SELECT COUNT(*) FROM failed_files x WHERE x.file_id = f.id)
-               FROM files f WHERE f.path LIKE '%' || ?1",
+               FROM files f WHERE f.parent || f.name LIKE '%' || ?1",
             [suffix],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
