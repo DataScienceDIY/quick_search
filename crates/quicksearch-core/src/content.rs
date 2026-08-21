@@ -72,9 +72,9 @@ struct Shared {
     queue: Mutex<Queue>,
     idle: Condvar,
     /// What the range held when the pass began: rows still to extract and
-    /// rows already done. Set by the feeder before it pages anything, so
-    /// `already_done + rows written this pass` stays exact; never set if the
-    /// feeder could not count.
+    /// rows already done. Set by the feeder just *behind* its first page, so
+    /// the pool is never blocked on the scan that produces it; never set if the
+    /// feeder could not count. See `feeder` for what deferring it costs.
     totals: std::sync::OnceLock<ExtractScope>,
 }
 
@@ -173,9 +173,10 @@ impl ContentPass {
     /// The range's pending and already-done counts as they stood when the
     /// pass began.
     ///
-    /// `None` until the feeder has counted — a scan that takes seconds on a
-    /// large root, which is why it happens here on the pass's own connection
-    /// and not on the indexer's writer — and forever if it could not.
+    /// `None` until the feeder has counted — a scan measured at 513 ms over a
+    /// million rows, which is why it happens on the pass's own connection
+    /// rather than the indexer's writer, and behind the first page rather than
+    /// in front of the pool — and forever if it could not.
     pub fn totals(&self) -> Option<ExtractScope> {
         self.shared.totals.get().copied()
     }
@@ -224,16 +225,36 @@ fn feeder(shared: &Shared, db_path: &str, mut cursor: ExtractCursor, config: &Co
         }
     };
 
-    // Before the first page, so nothing this pass writes is inside the count.
-    // The workers cannot run ahead of this: they block in `take` until the
-    // first page lands. A failure here costs the progress figure, not the
-    // pass.
-    match crate::file_handling::count_extract_scope(&conn, &cursor, config) {
-        Ok(totals) => {
-            let _ = shared.totals.set(totals);
+    // The count happens *behind* the first page, not in front of it.
+    //
+    // It used to run here, before anything was fetched, and the workers block
+    // in `take` until a page lands — so every thread in the pool sat idle for
+    // the whole of it, to compute a progress-bar denominator. That is not
+    // free: the scan walks the root's entire parent range fetching a row per
+    // entry, measured at 20 ms over 100,000 rows and **513 ms over a million**
+    // with the index already in cache, and the count was moved onto this
+    // connection in the first place because on a large root it takes seconds
+    // cold. The move took it off the writer and left the stall one level down.
+    //
+    // What it costs to defer: rows this pass writes during the count can be
+    // seen by it as `already_done` rather than `pending`. The two move in
+    // opposite directions and `extract_total` is their **sum**, so the
+    // denominator is unaffected; only the numerator can run briefly ahead of
+    // itself, which is a shape `RootProgress` already reports and deliberately
+    // does not clamp — see the note on `snapshot`.
+    let mut counted = false;
+    let mut count_now = |conn: &rusqlite::Connection, cursor: &ExtractCursor| {
+        if counted {
+            return;
         }
-        Err(e) => crate::log_warn!("content reader: {}", e),
-    }
+        counted = true;
+        match crate::file_handling::count_extract_scope(conn, cursor, config) {
+            Ok(totals) => {
+                let _ = shared.totals.set(totals);
+            }
+            Err(e) => crate::log_warn!("content reader: {}", e),
+        }
+    };
 
     let max_size = crate::file_handling::max_text_file_size(config);
     while shared.take_feed_slot().is_some() {
@@ -261,10 +282,16 @@ fn feeder(shared: &Shared, db_path: &str, mut cursor: ExtractCursor, config: &Co
             })
             .collect();
         shared.finish_feed(rows, last_page);
+        // The pool is running now; the denominator can be worked out behind it.
+        count_now(&conn, &cursor);
         if last_page {
             return;
         }
     }
+    // A range whose first `take_feed_slot` said the pass was already over
+    // still deserves its figure — `an_empty_range_terminates_immediately`
+    // pins that an empty root reports a known zero rather than an unknown.
+    count_now(&conn, &cursor);
 }
 
 fn worker(

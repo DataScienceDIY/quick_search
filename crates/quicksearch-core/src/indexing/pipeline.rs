@@ -14,7 +14,8 @@ use crate::db;
 use crate::db::repo;
 use crate::extract::Registry;
 use crate::file_handling::{
-    cleanup_stale_index_entries, count_tree_entries_fast, fts_finalize_after_text_indexing,
+    cleanup_stale_index_entries, count_tree_entries_fast, fts_begin_bulk_write,
+    fts_finalize_after_text_indexing,
     mark_oversize_pending_na, normalize_root_string, process_batch_inserts, process_batch_updates,
     store_extracted, ExtractCursor, ExtractScope, FileIndexAction, OwnedNewFile,
 };
@@ -280,6 +281,17 @@ impl RootPipeline {
             },
             // Earlier runs' rows count once the pass has counted them; until
             // then only this run's, so the figure never goes backwards.
+            //
+            // Not clamped against `extract_total`, deliberately. The count now
+            // runs *behind* the pass's first page rather than blocking its
+            // workers in front of it (see `content::feeder`), so a row written
+            // while it was in flight is seen by it as already done and counted
+            // again in `written` — the numerator can briefly overshoot. That is
+            // already a shape this reports: a pass fed rows from outside its own
+            // range writes them with an `extract_total` of zero, which
+            // `an_extracting_turn_lands_its_leftovers_one_slice_at_a_time`
+            // pins. Clamping here broke that test and would have hidden the
+            // case it exists to describe.
             extracted: totals.map_or(self.written, |t| t.already_done + self.written),
             extract_total: totals.map(|t| t.pending + t.already_done),
             current_file: self.current_file.clone(),
@@ -810,6 +822,45 @@ impl IndexingService {
         }
         Self::update_config(&conn, config, &roots)?;
 
+        // Before a single row is written, so the whole load runs at the
+        // write-side threshold. Setting it afterwards — which is what this
+        // used to do — left every fresh index's first run at FTS5's default.
+        fts_begin_bulk_write(&conn);
+
+        // Turn off SQLite's automatic checkpointing for the duration of the
+        // run, because during a run it cannot do its job and charges full
+        // price for failing.
+        //
+        // The default fires every 1000 pages (~4 MB) and copies the log back
+        // into the database — but it can only *reset* the log at an instant no
+        // reader holds a read mark, and this run keeps a reader per root from
+        // start to finish (the walk's row prefetcher, then the content pass's
+        // feeder). So it copied pages back perpetually and never truncated
+        // anything: measured on a 10,000-file tree, the log grew to 144 MiB and
+        // stayed there while the process wrote **1,220 MiB** — the same log
+        // copied back some seven times over.
+        //
+        // Safe here and nowhere else, which is why it is set on this connection
+        // rather than in `PRAGMAS_FAST`: this is the one writer that already
+        // owns the machinery to land its own log. `wal_cap_for_volume` bounds
+        // how large it may grow — by free space, not just by
+        // `maximum_wal_size` — the loop below forces a checkpoint at that cap,
+        // and the optimize pass checkpoints again at the end. A writer without
+        // all three (`cli::clear_path`, say) must keep the automatic one.
+        //
+        // Measured, two runs each, same tree:
+        //
+        // | | cold | written | log peak |
+        // |---|---:|---:|---:|
+        // | autocheckpoint on (default) | 7.19 / 7.37 s | 1219 / 1227 MiB | 144 MiB |
+        // | off | **5.59 / 5.50 s** | **990 / 992 MiB** | 512 MiB |
+        //
+        // The log gets larger and the run gets cheaper, which is the trade the
+        // default is making backwards for this workload.
+        if let Err(e) = conn.execute_batch("PRAGMA wal_autocheckpoint = 0;") {
+            crate::log_warn!("could not disable autocheckpoint (non-fatal): {}", e);
+        }
+
         // No up-front load of the whole `files` table: each walk's prefetcher
         // fetches one directory's rows at a time.
         let conn_mutex = Arc::new(Mutex::new(conn));
@@ -974,6 +1025,17 @@ impl IndexingService {
                     .is_some();
                 // Nothing walking (extracting passes have no such handle);
                 // fall back to the sleep.
+                //
+                // Parking on an extracting root's channel here was tried and
+                // **measured at nothing**: over a cold run of a 10,000-file
+                // tree the loop found nothing 91 times and only *one* of those
+                // reached this sleep, because the writer is the bottleneck
+                // during extraction and is almost never idle. One 2 ms sleep a
+                // run — 15.6 ms on Windows, where the timer granularity is what
+                // makes this comment worth having — did not justify a second
+                // `wait_ready` and the `pending` slot it needs. Re-measure with
+                // an extraction-bound corpus (PDFs, a network share) before
+                // concluding otherwise.
                 if !waited {
                     thread::sleep(IDLE_BACKOFF);
                 }
