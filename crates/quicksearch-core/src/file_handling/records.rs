@@ -92,14 +92,117 @@ pub(super) fn get_file_hash(
     Ok((hasher.finalize().to_vec(), head))
 }
 
-/// Nudge FTS5 to merge its index segments. Best-effort; failure is logged
-/// and swallowed.
-pub fn fts_finalize_after_text_indexing(conn: &Connection) {
+/// FTS5's automerge threshold, applied before a run writes anything.
+///
+/// The number of index segments that must accumulate at one level before FTS5
+/// merges them: 2..=16, or 0 to disable incremental merging. Every merge
+/// rewrites segments to disk, so this is a **write-amplification** knob rather
+/// than a CPU one, and the FTS index is where essentially all of an indexing
+/// run's writing goes — `searchabletext_data` measured 228 MiB of a 265 MiB
+/// index, against 2.8 MiB for all six `files` indexes put together.
+///
+/// 16 is the maximum FTS5 accepts and is measured, on a 10,000-file tree, three
+/// builds per setting:
+///
+/// | automerge | cold index | written | search (unlimited) |
+/// |---:|---:|---:|---:|
+/// | 4 (FTS5 default) | 8.53 / 8.65 / 8.58 s | 1862 / 1890 / 1818 MiB | 763–772 ms |
+/// | 16 | 7.10 / 7.10 / 6.67 s | 1235 / 1221 / 1213 MiB | 756–769 ms |
+///
+/// **19% faster and a third fewer bytes written, for no search cost.** The
+/// search column has to be read carefully, and is the reason this comment
+/// exists: measured at the *default* display limit the same six indexes span
+/// 40 ms to 540 ms, and none of that spread is automerge. `scan_pass` stops as
+/// soon as the limit fills and streams FTS candidates in rowid order — which is
+/// `file_id` order, which is whatever order the concurrent walk inserted rows
+/// in — so an index where the large documents drew low ids decompresses
+/// megabytes to fill 1000 hits where another reads a few hundred kilobytes.
+/// Two builds of one configuration differed by 13x that way. Comparing
+/// anything about FTS against a limited search measures that lottery instead;
+/// raise the limit past the corpus so every index examines every candidate.
+const WRITE_AUTOMERGE: u8 = 16;
+
+/// Set FTS5's automerge threshold. Best-effort; failure is logged.
+///
+/// **This sets a parameter — it does not merge anything.** With a value bound
+/// to `rank`, `INSERT INTO ft(ft, rank) VALUES('automerge', N)` writes N into
+/// the table's `%_config`, where it persists. The merging command is
+/// `'merge'`, and the merge-everything command is `'optimize'`; see
+/// [`fts_finalize_after_text_indexing`].
+///
+/// That distinction was worth a great deal. This used to be called once, at the
+/// *end* of a run, under the name `fts_finalize_after_text_indexing` and the
+/// comment "nudge FTS5 to merge its index segments" — so a fresh index did its
+/// entire first bulk load at FTS5's default threshold of 4, every later run
+/// silently inherited 8 from the config table, and no merge was ever performed
+/// at all.
+pub fn fts_set_automerge(conn: &Connection, segments: u8) {
     if let Err(e) = conn.execute(
-        "INSERT INTO searchabletext(searchabletext, rank) VALUES('automerge', 8)",
-        [],
+        "INSERT INTO searchabletext(searchabletext, rank) VALUES('automerge', ?1)",
+        [segments as i64],
     ) {
         crate::log_warn!("FTS automerge failed (non-fatal): {}", e);
+    }
+}
+
+/// FTS5's crisis-merge threshold: the segment count at which it stops deferring
+/// and *forces* a merge, whatever `automerge` would have preferred.
+///
+/// Raised from FTS5's default of 16 to 32 — half way to the 64 that measured
+/// identically, so the safety valve this is stays nearer where SQLite put it.
+/// Two builds each, 10,000-file tree, everything else equal:
+///
+/// | crisismerge | index | written | cold | search (unlimited) |
+/// |---:|---:|---:|---:|---:|
+/// | 16 (default) | 311.8 / 289.9 MiB | 1008 / 973 MiB | 5.54 / 5.51 s | 755–769 ms |
+/// | 32 | **268.2 / 266.1 MiB** | 946 / 964 MiB | 5.53 / 5.52 s | 756–762 ms |
+///
+/// A **13% smaller index for no cost in time or search**, and — the part worth
+/// noticing — a far more *stable* one: the default's size swings 290–312 MiB
+/// between builds where this lands within 2 MiB of itself. Fewer forced merges
+/// mid-load leave the final merge a tidier structure to consolidate.
+const WRITE_CRISISMERGE: u8 = 32;
+
+/// Apply the write-side FTS5 settings, before a run starts writing.
+///
+/// `pgsz` was swept here too and **rejected**: at 8192 and 16384 it wrote
+/// 1061 MiB and 1008 MiB against the default's 943 MiB, for an index the same
+/// size. It is a runtime option like these two — settable on an existing table,
+/// not creation-time-only — so trying it cost nothing and needed no schema
+/// change; it simply does not pay on this workload.
+pub fn fts_begin_bulk_write(conn: &Connection) {
+    fts_set_automerge(conn, WRITE_AUTOMERGE);
+    if let Err(e) = conn.execute(
+        "INSERT INTO searchabletext(searchabletext, rank) VALUES('crisismerge', ?1)",
+        [WRITE_CRISISMERGE as i64],
+    ) {
+        crate::log_warn!("FTS crisismerge failed (non-fatal): {}", e);
+    }
+}
+
+/// Merge FTS5 segments once a run has finished writing.
+///
+/// A real merge, which is what this function's name has always claimed and what
+/// it never did. Cheap next to the load — measured at +0.2 s and +5 MiB on a
+/// 20,000-file tree — and it is what reclaims the tombstones a
+/// `contentless_delete` table accumulates, which is why the incremental callers
+/// (`scope`, `cleanup_stale_index_entries`) want it after removing rows.
+///
+/// Deliberately **not** `'optimize'`. That merges everything into one segment
+/// and costs, on the same tree, +1.8 s and +900 MiB written — for no measurable
+/// search gain: it took the segment-index from 7,337 rows to 730 and left an
+/// unlimited search within noise of where it started.
+///
+/// Best-effort; failure is logged and swallowed, because an unconsolidated
+/// index is slower to search and still correct.
+pub fn fts_finalize_after_text_indexing(conn: &Connection) {
+    // A negative page budget means "keep merging until there is nothing left
+    // worth merging", rather than doing a fixed slice of the work.
+    if let Err(e) = conn.execute(
+        "INSERT INTO searchabletext(searchabletext, rank) VALUES('merge', -16)",
+        [],
+    ) {
+        crate::log_warn!("FTS merge failed (non-fatal): {}", e);
     }
 }
 
