@@ -1,33 +1,20 @@
 //! The committed `.doc` / `.xls` / `.ppt` fixtures.
 //!
-//! These three are the corpus's one departure from generate-on-the-fly, and
-//! the reason is narrow: `cfb` is the only Rust crate that writes OLE2
-//! compound files, and `cfb` is what `extract::ole` reads them with. A fixture
-//! built by the reader's own library proves only that the two agree with each
-//! other. So LibreOffice writes them, once, and the output is committed —
-//! see `tests/fixtures/legacy/regen.sh`.
+//! The one departure from generate-on-the-fly: `cfb` is the only Rust OLE2
+//! writer and also the reader, so LibreOffice writes these once and the
+//! output is committed (see `tests/fixtures/legacy/regen.sh`).
 //!
-//! Two consequences worth being explicit about:
-//!
-//! * **Their text is fixed, not seeded.** `QUICKSEARCH_CORPUS_SEED` shakes the
-//!   generated half of the corpus and leaves these alone.
-//! * **The expectations are read out of the committed sources**, not written
-//!   out here a second time. A regenerated fixture that lost a line therefore
-//!   fails, instead of quietly redefining what it was supposed to contain.
-//!
-//! What the fixtures prove that a synthetic file cannot: LibreOffice's `.doc`
-//! is a real FIB with a real piece table, its `.xls` a real BIFF stream with a
-//! real shared-string table, and its `.ppt` drags the master slide's
-//! placeholder prompts ("Click to edit the title text format", `___PPT10`)
-//! into the text alongside the content. That last one is exactly why
+//! Their text is fixed, not seeded, and the expectations are read out of
+//! the committed sources — a regenerated fixture that lost a line fails
+//! instead of redefining what it contains. LibreOffice's `.ppt` drags
+//! master-slide prompts into the text, which is exactly why
 //! [`super::match_in_order`] asserts containment rather than equality.
 
 use std::path::{Path, PathBuf};
 
 use super::Sample;
 
-/// The directory the fixtures live in, resolved against the crate root so the
-/// test does not care what the working directory is.
+/// Resolved against the crate root, so cwd does not matter.
 pub fn dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy")
 }
@@ -42,7 +29,6 @@ fn read(name: &str) -> String {
     })
 }
 
-/// Non-empty, trimmed lines — the expectation for the line-per-record sources.
 fn lines(source: &str) -> Vec<String> {
     source
         .lines()
@@ -52,11 +38,9 @@ fn lines(source: &str) -> Vec<String> {
         .collect()
 }
 
-/// The text of every `<text:p>` in the flat-ODF deck, in document order.
-///
-/// A three-line hand parse rather than `quick-xml`, which is the reader's
-/// library: the source is committed, its shape is fixed, and reaching for the
-/// parser under test to compute the expectation would defeat the point.
+/// The text of every `<text:p>` in the flat-ODF deck, in document order — a
+/// hand parse, not `quick-xml`: computing the expectation with the parser
+/// under test would defeat the point.
 fn paragraphs(source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = source;
@@ -71,16 +55,14 @@ fn paragraphs(source: &str) -> Vec<String> {
     out
 }
 
-/// The needle planted in each source. Fixed rather than derived, and well
-/// clear of the generated corpus's `chalcedony0000`-`chalcedony00NN` range —
-/// under the trigram tokenizer "distinct" means "not a substring of another".
+/// Fixed rather than derived, and well clear of the generated
+/// `chalcedony00NN` range — "distinct" means "not a substring of another".
 const NEEDLES: [(&str, &str); 3] = [
     ("sample.doc", "chalcedony9001"),
     ("sample.xls", "chalcedony9002"),
     ("sample.ppt", "chalcedony9003"),
 ];
 
-/// The three fixtures as corpus samples.
 pub fn samples() -> Vec<Sample> {
     let expectations = [
         ("sample.doc", "doc", lines(&read("prose.txt"))),
@@ -106,20 +88,16 @@ pub fn samples() -> Vec<Sample> {
                 label,
                 must_contain,
                 needle: needle.to_string(),
-                // OLE2 reads a directory that can sit anywhere in the file, so
-                // this format never takes the walk-time buffer path.
+                // OLE2's directory can sit anywhere in the file: never the
+                // walk-time buffer path.
                 head_path: false,
             }
         })
         .collect()
 }
 
-/// Copy the fixtures into `dir` so the end-to-end run indexes them alongside
-/// the generated corpus. Returns the samples with their paths rewritten to the
-/// copies.
-///
-/// Copied rather than indexed in place: the indexer walks a directory tree,
-/// and pointing it at the repository would pull in whatever else lives there.
+/// Copy the fixtures into `dir`, paths rewritten. Copied rather than indexed
+/// in place: pointing the indexer at the repository would pull in the rest.
 pub fn copy_into(dir: &Path) -> Vec<Sample> {
     samples()
         .into_iter()

@@ -1,17 +1,9 @@
 //! A lipsum corpus in every format QuickSearch claims to extract text from.
 //!
-//! # Why this exists
-//!
-//! The per-extractor unit tests in `src/extract/` build their fixtures with
-//! the same libraries that read them back — `zip` 0.6 for the OOXML/ODF
-//! containers, `cfb` for OLE2, `lopdf` (through `pdf-extract`) for PDF. That
-//! is the right choice there, because those tests aim at *malformed* input and
-//! need to control every byte. But it means a writer and a reader that share a
-//! wrong assumption agree with each other and the test passes.
-//!
-//! This module is the other half: well-formed documents from *foreign*
-//! producers. Every writer here is a different implementation from the reader
-//! it feeds —
+//! The per-extractor unit tests build fixtures with the libraries that read
+//! them back; a writer and reader sharing a wrong assumption agree with each
+//! other. This module is the other half: well-formed documents from
+//! *foreign* producers — every writer differs from its reader.
 //!
 //! | format | written by | read by |
 //! |---|---|---|
@@ -25,28 +17,17 @@
 //! | plain text | `std`, plus a hand-rolled cp1252 encoder | `encoding_rs` |
 //! | doc, xls, ppt | LibreOffice, committed — see [`legacy`] | `cfb` |
 //!
-//! Two places take committed bytes, for two different reasons, and in both the
-//! *text* still comes from the generator:
+//! Two places take committed bytes — the legacy OLE2 binaries (`cfb` is the
+//! only OLE2 writer in Rust, and it is the reader; see
+//! `tests/fixtures/legacy/README.md`) and the `.flac`'s fifty milliseconds
+//! of silence (`lofty` reads a real frame for stream properties; see
+//! [`audio`]). In both the *text* still comes from the generator.
 //!
-//! * The three legacy binaries are what nothing in Rust can fix: `cfb` is the
-//!   only crate that writes OLE2 compound files, and it is the reader. Those
-//!   are LibreOffice's output, and they are also the one part of the corpus
-//!   whose text is fixed rather than seeded — see
-//!   `tests/fixtures/legacy/README.md`.
-//! * The `.flac` borrows fifty milliseconds of committed silence because
-//!   `lofty` reads a real audio frame to derive stream properties. The fixture
-//!   carries no text; `metaflac` writes the seeded lipsum into a copy of it.
-//!   See [`audio`].
-//!
-//! # Determinism
-//!
-//! Everything on-the-fly is generated from one LCG seeded by [`seed`], which
-//! is [`DEFAULT_SEED`] unless `QUICKSEARCH_CORPUS_SEED` says otherwise. A
-//! failing assertion prints the seed it ran with, so a red CI job reproduces
-//! locally with one environment variable.
+//! Everything on-the-fly comes from one LCG seeded by [`seed`]
+//! (`QUICKSEARCH_CORPUS_SEED` overrides); failing assertions print the seed.
 
-// Only `extraction_corpus.rs` compiles this, and it uses most but not all of
-// it; the writers each expose a little more surface than any one test needs.
+// Only `extraction_corpus.rs` compiles this, and each writer exposes a
+// little more surface than any one test needs.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -60,12 +41,9 @@ pub mod plaintext;
 pub mod rtf;
 pub mod zipwriter;
 
-/// The seed used when the environment says nothing. Arbitrary; what matters
-/// is that it does not change between runs.
 pub const DEFAULT_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// The active seed. Override with `QUICKSEARCH_CORPUS_SEED=<u64>` to shake the
-/// corpus without editing anything.
+/// The active seed; override with `QUICKSEARCH_CORPUS_SEED=<u64>`.
 pub fn seed() -> u64 {
     match std::env::var("QUICKSEARCH_CORPUS_SEED") {
         Ok(v) => v
@@ -76,29 +54,10 @@ pub fn seed() -> u64 {
     }
 }
 
-/// The same LCG `benches/corpus/mod.rs` uses. Copied rather than shared:
-/// `benches/` is not reachable from `tests/`, and the bench corpus is
-/// deliberately frozen so its numbers stay comparable across runs.
-pub struct Lcg(u64);
+pub use quicksearch_core::testutil::Lcg;
 
-impl Lcg {
-    pub fn new(seed: u64) -> Lcg {
-        Lcg(seed)
-    }
-
-    pub fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
-        self.0 >> 33
-    }
-
-    fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {
-        &from[self.next() as usize % from.len()]
-    }
-}
-
-/// Filler vocabulary. Plain ASCII lowercase so it survives every encoding in
-/// the corpus unchanged, and long enough that a sentence drawn from it is
-/// effectively unique.
+/// Plain ASCII lowercase so it survives every encoding unchanged, and long
+/// enough that a drawn sentence is effectively unique.
 const WORDS: &[&str] = &[
     "lorem",
     "ipsum",
@@ -129,60 +88,41 @@ const WORDS: &[&str] = &[
     "laborum",
 ];
 
-/// A phrase every format can carry: Latin-1 representable, so it survives
-/// cp1252 and the base-14 WinAnsi font the PDF writer uses.
+/// Latin-1 representable, so it survives cp1252 and the PDF's WinAnsi font.
 const LATIN1_PHRASE: &str = "café résumé naïve";
 
-/// A phrase only formats with a Unicode text model can carry.
 const UNICODE_PHRASE: &str = "Καλημέρα κόσμε";
 
-/// What characters a format's *writer* can round-trip. Gates the non-ASCII
-/// coverage so the corpus is neither lax (ASCII everywhere) nor wrong
-/// (demanding Greek from a WinAnsi font).
+/// What characters a format's *writer* can round-trip: neither lax (ASCII
+/// everywhere) nor wrong (demanding Greek from a WinAnsi font).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Charset {
-    /// 7-bit only.
     Ascii,
-    /// Adds [`LATIN1_PHRASE`].
     Latin1,
-    /// Adds [`UNICODE_PHRASE`] on top.
     Unicode,
 }
 
-/// How many sentences every generated document carries.
 const SENTENCES: usize = 6;
 
-/// Words per sentence.
 const WORDS_PER_SENTENCE: usize = 7;
 
 /// The lipsum planted in one file, plus the token that identifies it.
-///
 /// Sentences are the unit of assertion for every format: prose formats write
-/// one per paragraph, spreadsheets one per cell, decks one per shape. Keeping
-/// the granularity identical everywhere is what lets a single `must_contain`
-/// list describe them all.
+/// one per paragraph, spreadsheets one per cell, decks one per shape, which
+/// is what lets a single `must_contain` list describe them all.
 pub struct Body {
     pub sentences: Vec<String>,
-    /// Unique to this file, planted in sentence 1 and never in the file name,
-    /// so an end-to-end search hit is attributable to the body text.
+    /// Planted in sentence 1 and never in the file name.
     pub needle: String,
 }
 
-/// What every needle starts with.
-///
-/// The same word as `common::BODY_TERM`, and for the same reason that constant
-/// exists: a term that reaches the index only through a document body and
-/// never through a file name, so a hit for it is attributable to extraction.
-/// This module stays self-contained rather than naming `common` — it has no
-/// other reason to depend on the shared harness — so
-/// `corpus_needles_use_the_shared_body_term` in `extraction_corpus.rs` is what
-/// keeps the two from drifting.
+/// What every needle starts with — the same word as `common::BODY_TERM`, so
+/// a hit is attributable to extraction. This module stays self-contained;
+/// `corpus_needles_use_the_shared_body_term` keeps the two from drifting.
 pub const NEEDLE_PREFIX: &str = "chalcedony";
 
 impl Body {
-    /// Build a body for `index`-th file, carrying whatever `charset` allows.
-    ///
-    /// The needle is derived from the index alone, not from the LCG: it has to
+    /// The needle is derived from the index alone, not from the LCG: it must
     /// stay distinct from every other file's under any seed, and under the
     /// trigram tokenizer "distinct" means "not a substring of another".
     pub fn new(lcg: &mut Lcg, index: usize, charset: Charset) -> Body {
@@ -192,8 +132,7 @@ impl Body {
             let mut words: Vec<String> = (0..WORDS_PER_SENTENCE)
                 .map(|_| lcg.pick(WORDS).to_string())
                 .collect();
-            // One planted item per sentence, at a fixed position so a
-            // reordering bug shows up as a failed match rather than a pass.
+            // Planted at fixed positions so a reordering bug fails the match.
             match i {
                 1 => words.insert(0, needle.clone()),
                 2 if charset != Charset::Ascii => words.insert(3, LATIN1_PHRASE.to_string()),
@@ -206,32 +145,22 @@ impl Body {
     }
 }
 
-/// One corpus file plus what its extracted text must contain.
 pub struct Sample {
     pub path: PathBuf,
-    /// A label for assertion messages — the format, not the file name.
     pub label: &'static str,
-    /// Fragments that must appear in the extracted text, in this order, with
-    /// anything permitted between them.
-    ///
-    /// Ordered containment, not equality, and not set membership. Equality is
-    /// unusable: LibreOffice's `.ppt` filter drags master-slide boilerplate
-    /// ("Click to edit the title text format", "___PPT10") into the text
-    /// stream, and every spreadsheet reader puts its cell separators
-    /// somewhere slightly different. Set membership is too weak: text
-    /// assembled out of order is exactly what a mis-read Word piece table
-    /// produces, and that has to fail.
+    /// Fragments that must appear in the extracted text, in this order.
+    /// Ordered containment, not equality (readers drag in boilerplate and
+    /// separators) and not set membership (text assembled out of order is
+    /// exactly what a mis-read Word piece table produces, and must fail).
     pub must_contain: Vec<String>,
     /// Planted in the body and absent from the file name.
     pub needle: String,
-    /// Whether this format implements `Extractor::extract_from_head` — i.e.
-    /// whether the walk may extract it without reopening the file. Only
-    /// plaintext and RTF do.
+    /// Whether the walk may extract this format without reopening the file
+    /// (`Extractor::extract_from_head`); only plaintext and RTF do.
     pub head_path: bool,
 }
 
 impl Sample {
-    /// The prose case, where the sentences *are* the expectation.
     fn prose(path: PathBuf, label: &'static str, body: &Body, head_path: bool) -> Sample {
         Sample {
             path,
@@ -243,11 +172,8 @@ impl Sample {
     }
 }
 
-/// Where `fragments` stop matching `text` as an ordered subsequence.
-///
-/// `Ok(())` when every fragment is found in turn. `Err` names the first one
-/// that is not, which is the only diagnostic worth printing: "the text does
-/// not contain X" plus where the scan had got to.
+/// Where `fragments` stop matching `text` as an ordered subsequence: `Err`
+/// names the first fragment not found, and where the scan had got to.
 pub fn match_in_order(text: &str, fragments: &[String]) -> Result<(), String> {
     let mut cursor = 0usize;
     for (i, fragment) in fragments.iter().enumerate() {
@@ -270,21 +196,16 @@ pub fn match_in_order(text: &str, fragments: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// First `n` characters of `s`, for an error message.
 fn head(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// Last `n` characters of `s`, for an error message.
 fn tail(s: &str, n: usize) -> String {
     let count = s.chars().count();
     s.chars().skip(count.saturating_sub(n)).collect()
 }
 
 /// Build the whole corpus into one directory and return it with its samples.
-///
-/// The directory is a `testutil::scratch_dir`, so it survives a failing run
-/// for inspection and is swept on a later day like every other test's tree.
 pub fn build(tag: &str) -> (PathBuf, Vec<Sample>) {
     let dir = quicksearch_core::testutil::scratch_dir(tag);
     let mut lcg = Lcg::new(seed());
@@ -305,10 +226,9 @@ pub fn build(tag: &str) -> (PathBuf, Vec<Sample>) {
     // The committed OLE2 fixtures, copied in so the whole corpus is one tree.
     samples.extend(legacy::copy_into(&dir));
 
-    // Every needle has to identify exactly one file, or the end-to-end search
-    // proves nothing. Under the trigram tokenizer that means no needle may be
-    // a substring of another, which a bad `Body::new` index would produce
-    // silently.
+    // Every needle must identify exactly one file, or the search proves
+    // nothing: under the trigram tokenizer no needle may be a substring of
+    // another, which a bad `Body::new` index would produce silently.
     for (i, a) in samples.iter().enumerate() {
         for b in samples.iter().skip(i + 1) {
             assert!(
@@ -325,12 +245,10 @@ pub fn build(tag: &str) -> (PathBuf, Vec<Sample>) {
     (dir, samples)
 }
 
-/// The signature the per-format writers take for "give me a fresh body".
 /// A closure rather than a method so the file index keeps counting across
 /// modules and every needle in the corpus stays unique.
 pub type BodyFn<'a> = dyn FnMut(&mut Lcg, Charset) -> Body + 'a;
 
-/// Write `bytes` to `dir/name` and return the path.
 pub fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     let path = dir.join(name);
     std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));

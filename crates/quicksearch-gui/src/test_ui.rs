@@ -1,8 +1,6 @@
 //! Driving egui headlessly from tests: build an input frame, synthesize a
 //! click, read back what was painted.
 
-/// A frame of input at `size`, carrying `events`.
-///
 /// The viewport size is load-bearing: a modal is centred in it, and a panel
 /// that does not fit is simply not painted at all.
 pub fn raw_input(size: egui::Vec2, events: Vec<egui::Event>) -> egui::RawInput {
@@ -13,10 +11,19 @@ pub fn raw_input(size: egui::Vec2, events: Vec<egui::Event>) -> egui::RawInput {
     }
 }
 
-/// A primary-button press and release at `pos`, preceded by the pointer
-/// moving there: egui hit-tests against the pointer's *current* position,
-/// so a press delivered without the move lands wherever the pointer was
-/// last frame.
+/// The same, with the clock pinned. Without a time egui advances by
+/// `predicted_dt` per pass, which is fine until a test is *about* what
+/// something does over time — an animation, or a delay.
+pub fn raw_input_at(size: egui::Vec2, events: Vec<egui::Event>, time: f64) -> egui::RawInput {
+    egui::RawInput {
+        time: Some(time),
+        ..raw_input(size, events)
+    }
+}
+
+/// Press and release at `pos`, preceded by the pointer moving there: egui
+/// hit-tests against the pointer's *current* position, so a press without
+/// the move lands wherever the pointer was last frame.
 pub fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
     let button = |pressed| egui::Event::PointerButton {
         pos,
@@ -27,30 +34,19 @@ pub fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
     vec![egui::Event::PointerMoved(pos), button(true), button(false)]
 }
 
-/// A context carrying the fonts the app installs.
-///
-/// Not `egui::Context::default()`, which every test here used to call: egui is
-/// built without `default_fonts`, so a default context has *no* faces. That
-/// does not fail loudly — epaint hands back a font of `row_height` 0.0 and
-/// zero-advance glyphs — so every measurement, every wrap and every click
-/// target below would quietly stop meaning anything.
+/// A context carrying the app's fonts — a default context has *no* faces,
+/// and that does not fail loudly: epaint hands back `row_height` 0.0 and
+/// zero-advance glyphs, so every measurement quietly stops meaning anything.
 pub fn ctx() -> egui::Context {
     let ctx = egui::Context::default();
     crate::fonts::install(&ctx);
     ctx
 }
 
-/// Assert that every character painted this frame has a real glyph in the
-/// installed fonts — that nothing on screen is a `◻`.
-///
-/// The `FontId` comes from each layout section, so a monospace run is checked
-/// against the monospace family and a proportional run against the
-/// proportional one, exactly as epaint resolved them. Whitespace and controls
-/// are skipped: epaint maps those to space-derived or invisible glyphs on
-/// purpose, and `\n` is documented to report as the replacement.
-///
-/// Only sees what this frame actually painted, so its reach is the reach of
-/// the test that calls it.
+/// Assert nothing painted this frame is a `◻`. Whitespace and controls are
+/// skipped: epaint maps those to invisible glyphs on purpose, and `\n` is
+/// documented to report as the replacement. Only sees what this frame
+/// painted, so its reach is the calling test's reach.
 pub fn assert_no_tofu(ctx: &egui::Context, out: &egui::FullOutput) {
     let mut missing: Vec<(char, String, egui::FontId)> = Vec::new();
     ctx.fonts(|fonts| {
@@ -74,8 +70,7 @@ pub fn assert_no_tofu(ctx: &egui::Context, out: &egui::FullOutput) {
     assert!(missing.is_empty(), "no glyph for: {missing:#?}");
 }
 
-/// A `Ui` from a real (headless) egui pass, so measuring helpers see the
-/// same fonts the app paints with.
+/// A `Ui` from a real headless pass, so helpers see the app's own fonts.
 pub fn with_ui<R>(f: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let ctx = ctx();
     let mut f = Some(f);
@@ -90,8 +85,6 @@ pub fn with_ui<R>(f: impl FnOnce(&mut egui::Ui) -> R) -> R {
     out.expect("the central panel ran")
 }
 
-/// Every text galley painted this frame, in paint order, each with the
-/// rectangle it occupies.
 fn painted_galleys(out: &egui::FullOutput) -> Vec<(&std::sync::Arc<egui::Galley>, egui::Rect)> {
     fn walk<'a>(
         shape: &'a egui::epaint::Shape,
@@ -116,9 +109,8 @@ fn painted_galleys(out: &egui::FullOutput) -> Vec<(&std::sync::Arc<egui::Galley>
     galleys
 }
 
-/// Every text galley painted this frame, each with the rectangle it
-/// occupies. Labels carry no widget id worth recording, so reading the
-/// shapes back is the only way to check the text a user actually sees.
+/// Labels carry no widget id worth recording, so reading the shapes back is
+/// the only way to check the text a user actually sees.
 pub fn painted(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
     painted_galleys(out)
         .into_iter()
@@ -126,15 +118,12 @@ pub fn painted(out: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
         .collect()
 }
 
-/// Every string painted this frame, in paint order.
 pub fn painted_text(out: &egui::FullOutput) -> Vec<String> {
     painted(out).into_iter().map(|(text, _)| text).collect()
 }
 
-/// Every styled *run* of text painted this frame with the color it was
-/// painted in, in paint order. A galley can hold several colors at once;
-/// runs are the layout job's own sections, so a single-color label yields
-/// exactly one entry.
+/// Every styled *run* with its color: runs are the layout job's own
+/// sections, so a single-color label yields exactly one entry.
 pub fn painted_spans(out: &egui::FullOutput) -> Vec<(String, egui::Color32)> {
     painted_galleys(out)
         .into_iter()
@@ -148,12 +137,8 @@ pub fn painted_spans(out: &egui::FullOutput) -> Vec<(String, egui::Color32)> {
         .collect()
 }
 
-/// Every styled run painted this frame that has a background behind it, with
-/// that background, in paint order.
-///
-/// The distinguishing mark of a highlighted match: the column headers and the
-/// strong parts of a snippet are painted in the same *text* color, so
-/// [`painted_spans`] alone cannot tell a match from a header.
+/// Runs with a background behind them — the distinguishing mark of a match:
+/// headers use the same *text* color, so [`painted_spans`] cannot tell them apart.
 pub fn painted_backgrounds(out: &egui::FullOutput) -> Vec<(String, egui::Color32)> {
     painted_galleys(out)
         .into_iter()
@@ -173,10 +158,9 @@ pub fn painted_backgrounds(out: &egui::FullOutput) -> Vec<(String, egui::Color32
         .collect()
 }
 
-/// Every *visible* row of every galley painted this frame, in paint order.
-/// Not the same as [`painted_text`]: a galley's `text()` is the job it was
-/// laid out from, including the rows epaint dropped at `wrap.max_rows` —
-/// the laid-out rows are the only place a truncation is visible.
+/// Every *visible* row: a galley's `text()` includes the rows epaint
+/// dropped at `wrap.max_rows`, so the laid-out rows are the only place a
+/// truncation is visible.
 pub fn painted_rows(out: &egui::FullOutput) -> Vec<String> {
     painted_galleys(out)
         .into_iter()
@@ -184,10 +168,30 @@ pub fn painted_rows(out: &egui::FullOutput) -> Vec<String> {
         .collect()
 }
 
-/// Every mesh painted this frame, in paint order. A mesh means a shape
-/// assembled vertex by vertex — the only way to get a gradient out of egui
-/// — and its color varies across the shape, so the vertices are what a
-/// check has to read.
+/// Every rectangle painted this frame. Fills and strokes both arrive as
+/// `RectShape`, so a caller checking for one has to look at which of the two
+/// the shape actually carries.
+pub fn painted_rects(out: &egui::FullOutput) -> Vec<&egui::epaint::RectShape> {
+    fn walk<'a>(shape: &'a egui::epaint::Shape, into: &mut Vec<&'a egui::epaint::RectShape>) {
+        match shape {
+            egui::epaint::Shape::Rect(rect) => into.push(rect),
+            egui::epaint::Shape::Vec(shapes) => {
+                for s in shapes {
+                    walk(s, into);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut rects = Vec::new();
+    for clipped in &out.shapes {
+        walk(&clipped.shape, &mut rects);
+    }
+    rects
+}
+
+/// A mesh is the only way to get a gradient out of egui, and its color
+/// varies across the shape, so the vertices are what a check has to read.
 pub fn painted_meshes(out: &egui::FullOutput) -> Vec<&egui::Mesh> {
     fn walk<'a>(shape: &'a egui::epaint::Shape, into: &mut Vec<&'a egui::Mesh>) {
         match shape {
@@ -207,10 +211,9 @@ pub fn painted_meshes(out: &egui::FullOutput) -> Vec<&egui::Mesh> {
     meshes
 }
 
-/// The centre of `needle`'s galley, as a click target.
-///
-/// The *last* match wins, so a string painted both behind a modal and on it
-/// resolves to the one on top — which is the one a click would reach.
+/// The centre of `needle`'s galley, as a click target. The *last* match
+/// wins, so a string painted behind a modal and on it resolves to the one
+/// on top — the one a click would reach.
 pub fn painted_text_center(out: &egui::FullOutput, needle: &str) -> Option<egui::Pos2> {
     painted(out)
         .iter()

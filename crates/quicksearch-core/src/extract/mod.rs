@@ -1,119 +1,58 @@
-//! Content extractors: the searchable text of a file.
+//! Content extractors: the searchable text of a file. The [`Registry`] runs
+//! the first registered [`Extractor`] that accepts the MIME.
 //!
-//! An [`Extractor`] decides whether it can handle a given MIME type and, if
-//! so, produces [`ExtractedContent`] for the file. The [`Registry`] picks the
-//! first registered extractor that accepts the MIME and runs it.
-//!
-//! Dispatch is by MIME only — a file with no detected type is recorded as
-//! "not applicable" rather than guessed at again here. "What is this file"
-//! is decided once, upstream in [`crate::mime::guess_mime_from_head`];
-//! nothing downstream reopens the file to ask again.
+//! Dispatch is by MIME only: "what is this file" is decided once, upstream in
+//! [`crate::mime::guess_mime_from_head`]; nothing downstream reopens the
+//! file to ask again.
 
 use std::path::Path;
 
 pub mod audio;
-// pub mod image;   // parked — see `ExtractedContent` below
 pub mod office;
 pub mod ole;
 pub mod pdf;
 pub mod plaintext;
 pub mod rtf;
 
-/// Result of a successful extraction: `text` feeds the FTS5 `text` column.
-///
-/// Extractors may return an empty `text` when the file has no narrative
-/// content (an audio file whose tags are all empty, say). Filename search
-/// still works in that case.
-///
-/// # Structured properties are parked
-///
-/// Extractors used to return a `properties: HashMap<String, String>` beside
-/// the text — EXIF, audio tags, the PDF `Info` dictionary — stored in a
-/// `properties` table *and* concatenated into a `properties` FTS column.
-/// Nothing ever read either back: no query, no result row, no UI. So the
-/// storage is gone and the extraction is commented out rather than deleted.
-///
-/// Reviving it means restoring, together: this field and
-/// `properties_sorted`, the blocks marked "properties (parked)" in
-/// `image.rs` / `audio.rs` / `pdf.rs`, the `image` module registration in
-/// [`Registry::default_set`], the `properties` table and FTS column in
-/// [`crate::db::schema`], the `properties` argument to
-/// [`crate::db::repo::set_content_done`] — and a consumer that shows them.
-#[derive(Debug, Default, Clone)]
-pub struct ExtractedContent {
-    pub text: String,
-    // pub properties: HashMap<String, String>,
-}
-
-impl ExtractedContent {
-    pub fn with_text(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
-    }
-
-    // /// Convert properties into the `Vec<(String, String)>` shape expected by
-    // /// [`crate::db::repo::set_content_done`]. Keys are sorted for determinism
-    // /// in tests and snapshots.
-    // pub fn properties_sorted(&self) -> Vec<(String, String)> {
-    //     let mut v: Vec<(String, String)> = self
-    //         .properties
-    //         .iter()
-    //         .map(|(k, v)| (k.clone(), v.clone()))
-    //         .collect();
-    //     v.sort_by(|a, b| a.0.cmp(&b.0));
-    //     v
-    // }
-}
-
-/// Boxed error type for extractor failures. A string reason is stored on the
-/// file row (see [`crate::db::repo::set_content_failed`]), so extractors
-/// should surface human-readable messages.
+/// The string reason is stored on the file row, so extractors should surface
+/// human-readable messages.
 pub type ExtractError = String;
 
-/// Run `f`, turning a panic into an [`ExtractError`] naming the file.
-///
-/// The extractors drive third-party parsers — `pdf-extract`, `rtf-parser`,
-/// `cfb`, `lofty`, `quick-xml` — over bytes chosen by whoever wrote the file,
-/// and several of them are documented to panic on malformed input. See
-/// [`Registry::extract`] for what each caller stands to lose.
+/// Run `f`, turning a panic into an [`ExtractError`] naming the file. The
+/// extractors drive third-party parsers over bytes chosen by whoever wrote
+/// the file, and several are documented to panic on malformed input.
 fn contain_panic<T>(path: &Path, f: impl FnOnce() -> T) -> Result<T, ExtractError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
         .map_err(|_| format!("extractor panicked on {}", path.display()))
 }
 
-/// A pluggable content extractor. Stateless; implementors should not hold
-/// file handles across calls.
+/// A pluggable content extractor; stateless.
 pub trait Extractor: Send + Sync {
-    /// Whether this extractor can handle the given MIME type. `mime` is
-    /// normalized to lowercase before dispatch.
+    /// `mime` is normalized to lowercase before dispatch.
     fn supports(&self, mime: &str) -> bool;
 
-    /// Read the file at `path` and return its extracted content. Return an
-    /// [`ExtractError`] to mark the file's content state as failed (so it
-    /// won't be retried every run).
-    fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError>;
+    /// Extracted text for the FTS5 `text` column. An [`ExtractError`] marks
+    /// the file's content state failed (so it is not retried every run).
+    /// Empty text is fine — filename search still works.
+    fn extract(&self, path: &Path) -> Result<String, ExtractError>;
 
-    /// Extract from bytes the caller already holds, when those bytes are the
-    /// file's *entire* contents. For anything no larger than `hash_length`
-    /// the whole file is already in memory at walk time, so working from the
-    /// buffer saves the content pass an open/read/close and keeps the text
-    /// consistent with the size, mtime and hash read alongside it.
+    /// Extract from bytes that are the file's *entire* contents, already in
+    /// memory at walk time; keeps the text consistent with the size, mtime
+    /// and hash read alongside it.
     ///
-    /// The default is `None`: "I need the file on disk." Formats that seek,
-    /// or read a central directory at the end of the file, must keep it.
-    /// `Some(Err(_))` is a real extraction failure; `None` defers to
-    /// [`Extractor::extract`]. `path` is passed only so failures name the
-    /// file — nothing here may open it.
+    /// The default `None` means "I need the file on disk" — formats that seek
+    /// or read a trailer must keep it; `Some(Err(_))` is a real failure.
+    /// `path` is only so failures name the file — nothing here may open it.
     fn extract_from_head(
         &self,
         _path: &Path,
         _head: &[u8],
-    ) -> Option<Result<ExtractedContent, ExtractError>> {
+    ) -> Option<Result<String, ExtractError>> {
         None
     }
 }
 
-/// An ordered dispatch table of extractors. The first extractor whose
-/// [`supports`](Extractor::supports) returns true for the MIME is used.
+/// An ordered dispatch table: the first extractor claiming the MIME wins.
 pub struct Registry {
     extractors: Vec<Box<dyn Extractor>>,
 }
@@ -125,13 +64,6 @@ impl Registry {
         }
     }
 
-    pub fn with(mut self, e: impl Extractor + 'static) -> Self {
-        self.extractors.push(Box::new(e));
-        self
-    }
-
-    /// The extractor that claims `mime`, if any — the one place dispatch
-    /// happens.
     fn find(&self, mime: &str) -> Option<&dyn Extractor> {
         let lower = mime.to_ascii_lowercase();
         self.extractors
@@ -140,34 +72,27 @@ impl Registry {
             .map(|e| &**e)
     }
 
-    /// Whether any extractor claims `mime`, without touching the file — what
-    /// lets the walk decide a row's `content_state` up front (see
-    /// [`crate::file_handling::content_extractable`]).
+    /// Whether any extractor claims `mime`, without touching the file — lets
+    /// the walk decide a row's `content_state` up front.
     pub fn supports(&self, mime: &str) -> bool {
         self.find(mime).is_some()
     }
 
-    /// Look up a handler for `mime` and run it against `path`. Returns
-    /// `Ok(None)` if no extractor claims the MIME — the caller should then
-    /// decide whether the file is "not applicable" (text state NA).
+    /// Run the handler for `mime` against `path`; `Ok(None)` if no extractor
+    /// claims the MIME.
     ///
-    /// A panicking parser becomes an `Err`, here rather than at each call
-    /// site: this and [`Registry::extract_complete_head`] are the two places
-    /// third-party code is handed a file nobody vouched for, and every caller
-    /// has more than one file to lose. A content worker's panic silently
-    /// drops the row it claimed; a *walk* worker's costs the root its whole
-    /// content pass and disables stale cleanup run-wide; the live watcher's
-    /// costs every displayed row for the rest of the session. Containing it
-    /// at the boundary means a new caller cannot forget.
-    ///
-    /// This cannot help with a stack overflow, which aborts rather than
-    /// unwinding — see `vendor/pdf-extract`, which bounds the recursion that
-    /// made that reachable.
+    /// A panicking parser becomes an `Err` here, at the boundary: every
+    /// caller has more than one file to lose (a walk worker's panic costs the
+    /// root its whole content pass; the live watcher's costs every displayed
+    /// row for the session), and containing at the boundary means a new
+    /// caller cannot forget. This cannot help with a stack overflow, which
+    /// aborts rather than unwinding — see `vendor/pdf-extract`, which bounds
+    /// the recursion that made that reachable.
     pub fn extract(
         &self,
         path: &Path,
         mime: &str,
-    ) -> Result<Option<ExtractedContent>, ExtractError> {
+    ) -> Result<Option<String>, ExtractError> {
         let Some(extractor) = self.find(mime) else {
             return Ok(None);
         };
@@ -177,52 +102,40 @@ impl Registry {
     }
 
     /// [`Registry::extract`] for a file whose complete contents the caller
-    /// already holds. `None` when no extractor claims the MIME or the one
-    /// that does needs the file on disk — both mean "leave this to the
-    /// content pass".
-    /// Contained the same way [`Registry::extract`] is, and this is the one
-    /// that runs on a walk worker.
+    /// already holds. `None` means "leave this to the content pass".
+    /// Contained the same way — and this is the one on a walk worker.
     pub fn extract_complete_head(
         &self,
         path: &Path,
         mime: &str,
         head: &[u8],
-    ) -> Option<Result<ExtractedContent, ExtractError>> {
+    ) -> Option<Result<String, ExtractError>> {
         let extractor = self.find(mime)?;
-        // `extract_from_head` returning `None` means "needs the file on
-        // disk", which is not a failure and must stay distinguishable from
-        // one — so the guard wraps the whole `Option` and a panic becomes
-        // `Some(Err(..))`, i.e. a failure this file is charged with rather
-        // than a deferral to the content pass that would meet the same panic.
+        // The guard wraps the whole `Option` so a panic becomes
+        // `Some(Err(..))` — a failure this file is charged with, not a
+        // deferral to the content pass that would meet the same panic.
         match contain_panic(path, || extractor.extract_from_head(path, head)) {
             Ok(outcome) => outcome,
             Err(e) => Some(Err(e)),
         }
     }
 
-    /// The default set: RTF, plaintext, office docs, PDF, audio tags.
-    ///
-    /// Order matters — the first extractor whose `supports` accepts a MIME
-    /// wins. RTF precedes plaintext because plaintext claims every `text/*`
-    /// and would swallow `text/rtf` as raw control words. Plaintext
-    /// precedes audio because it deliberately claims playlist
-    /// (`audio/x-mpegurl`, `audio/scpls`) and SVG MIMEs whose text is worth
-    /// more than their tags.
-    ///
-    /// No image extractor: it produced EXIF properties and never any text,
-    /// so with properties parked it would open and parse every image on
-    /// disk to return nothing. Leaving `image/*` unclaimed is what makes
-    /// [`crate::file_handling::content_extractable`] record images as
-    /// `STATE_NA` at walk time, so the content pass never opens them.
-    /// Filenames are indexed exactly as before.
+    /// The default set. Order matters: RTF precedes plaintext, which claims
+    /// every `text/*` and would swallow `text/rtf` as raw control words;
+    /// plaintext precedes audio because it deliberately claims playlist and
+    /// SVG MIMEs whose text is worth more than their tags. No image
+    /// extractor, deliberately: `image/*` unclaimed is what records images
+    /// `STATE_NA` at walk time and keeps the content pass from opening them.
     pub fn default_set() -> Self {
-        Self::new()
-            .with(rtf::RtfExtractor)
-            .with(plaintext::PlaintextExtractor)
-            .with(office::OfficeExtractor)
-            .with(pdf::PdfExtractor)
-            .with(audio::AudioExtractor)
-        // .with(image::ImageExtractor)   // parked with `ExtractedContent`
+        Self {
+            extractors: vec![
+                Box::new(rtf::RtfExtractor),
+                Box::new(plaintext::PlaintextExtractor),
+                Box::new(office::OfficeExtractor),
+                Box::new(pdf::PdfExtractor),
+                Box::new(audio::AudioExtractor),
+            ],
+        }
     }
 }
 
@@ -250,21 +163,17 @@ mod tests {
         let r = Registry::default_set();
         let p = Path::new("/tmp/whatever");
 
-        // Plaintext opts in, so a small text file never reaches the disk pass.
         let out = r.extract_complete_head(p, "text/plain", b"hello");
-        assert!(matches!(out, Some(Ok(ref c)) if c.text == "hello"));
+        assert!(matches!(out, Some(Ok(ref c)) if c == "hello"));
 
         // A format that seeks or reads a trailer must not be handed a buffer.
-        // `None` here is what routes it back to the on-disk extractor.
         assert!(r
             .extract_complete_head(p, "application/pdf", b"%PDF-1.4")
             .is_none());
-        // No extractor claims images at all now — the head path must agree.
         assert!(r
             .extract_complete_head(p, "image/png", b"\x89PNG")
             .is_none());
 
-        // No extractor claims the MIME at all.
         assert!(r
             .extract_complete_head(p, "application/x-nonesuch", b"..")
             .is_none());
@@ -272,8 +181,7 @@ mod tests {
 
     #[test]
     fn complete_head_extraction_matches_the_on_disk_dispatch() {
-        // Both entry points must pick the same extractor for a MIME, or a
-        // file's text would depend on which pass happened to handle it.
+        // Or a file's text would depend on which pass happened to handle it.
         let r = Registry::default_set();
         let p = Path::new("/tmp/whatever");
         for mime in [
@@ -297,9 +205,6 @@ mod tests {
         }
     }
 
-    /// `text/rtf` must dispatch to the RTF extractor, not to plaintext's
-    /// `text/*` claim — i.e. the registration order does its job. The RTF
-    /// parser strips control words; plaintext would keep them.
     #[test]
     fn text_rtf_reaches_the_rtf_extractor_not_plaintext() {
         let r = Registry::default_set();
@@ -308,16 +213,14 @@ mod tests {
             .extract_complete_head(p, "text/rtf", br"{\rtf1\ansi Hello {\b World}}")
             .expect("claimed")
             .expect("parsed");
-        assert_eq!(out.text, "Hello World");
+        assert_eq!(out, "Hello World");
     }
 
     #[test]
     fn supports_agrees_with_extract_dispatch() {
-        // `supports` is the cheap form of the question `extract` answers with
-        // `Ok(None)`. They must agree for every MIME, or the walk would write
-        // a content state the content pass then contradicts. The path does not
-        // exist, so a claimed MIME surfaces as `Err`, not `Ok(None)` — which is
-        // exactly the distinction under test.
+        // The two must agree for every MIME, or the walk would write a
+        // content state the content pass then contradicts. The path does not
+        // exist, so a claimed MIME surfaces as `Err`, not `Ok(None)`.
         let r = Registry::default_set();
         let missing = Path::new("/nonexistent/quicksearch-supports-probe");
         for mime in [
@@ -331,7 +234,6 @@ mod tests {
             "Image/JPEG",
             "application/msword",
             "application/vnd.oasis.opendocument.text",
-            // Real MIMEs with no extractor: the population the fix is about.
             "video/mp4",
             "application/zip",
             "application/x-executable",
@@ -348,8 +250,6 @@ mod tests {
         }
     }
 
-    /// Images are claimed by nothing, so the walk records them `NA` and the
-    /// content pass never opens them. Pins the parked image extractor.
     #[test]
     fn images_are_not_claimed_by_any_extractor() {
         let r = Registry::default_set();

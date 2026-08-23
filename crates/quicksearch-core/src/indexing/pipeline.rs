@@ -15,24 +15,18 @@ use crate::db::repo;
 use crate::extract::Registry;
 use crate::file_handling::{
     cleanup_stale_index_entries, count_tree_entries_fast, fts_begin_bulk_write,
-    fts_finalize_after_text_indexing,
-    mark_oversize_pending_na, normalize_root_string, process_batch_inserts, process_batch_updates,
-    store_extracted, ExtractCursor, ExtractScope, FileIndexAction, OwnedNewFile,
+    fts_finalize_after_text_indexing, mark_oversize_pending_na, normalize_root_string,
+    process_batch_inserts, process_batch_updates, store_extracted, ExtractCursor, ExtractScope,
+    FileIndexAction, OwnedNewFile,
 };
 use crate::walk::{thread_count_for, walk_indexable_files, ParallelWalk, TryNext, WalkEvent};
 
 use super::*;
 
-/// Collect rows whose parent directory the walk never reached: a directory
-/// deleted wholesale — or newly excluded — is never read, so per-directory
-/// reconciliation cannot see its rows.
-///
-/// Two kinds of absence are *not* deletions and are filtered out:
-///
-/// - A parent under a directory the walk could not read. Its children were
-///   never discovered, so their absence proves nothing.
-/// - A path reached by resolving a symlink, whose row's parent may lie
-///   outside every root; `aliased` records that the file itself was seen.
+/// Collect rows whose parent the walk never reached: a directory deleted
+/// wholesale — or newly excluded — is never read, so per-directory
+/// reconciliation cannot see its rows. Not deletions: parents under an
+/// unreadable directory, and paths reached via symlink (`aliased`).
 fn sweep_unvisited_parents(
     conn_mutex: &Arc<Mutex<Connection>>,
     root: &str,
@@ -45,8 +39,6 @@ fn sweep_unvisited_parents(
     let range = ExtractCursor::for_root(root);
     let conn = crate::lock_ok(conn_mutex);
 
-    // Collected rather than streamed into the second query: both borrow the
-    // same connection, and the outer statement is still live while iterating.
     let mut unvisited: Vec<String> = Vec::new();
     repo::for_each_parent_in_range(&conn, &range.lo, &range.hi, |parent| {
         if !seen_dirs.contains(&parent) && !unreadable.covers(&parent) {
@@ -64,52 +56,26 @@ fn sweep_unvisited_parents(
     Ok(())
 }
 
-/// Size of the write-ahead log on disk, or 0 if it is absent.
-///
-/// SQLite will not bound the WAL: the log only *shrinks* when the writer
-/// opens a transaction at an instant no reader holds a read mark — a lock
-/// SQLite tries once, without retrying. A run keeps a reader per root
-/// querying from start to finish, so the log appends for the whole run. An
-/// explicit checkpoint retries the same lock under `busy_timeout` and wins,
-/// which is why `run_indexing` forces one every `maximum_wal_size` bytes.
+/// WAL size on disk. SQLite only shrinks the WAL when no reader holds a read
+/// mark, and a run keeps a reader per root from start to finish; an explicit
+/// checkpoint retries that lock under `busy_timeout` and wins.
 fn wal_len(path: &str) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// Free space at which a run gives up rather than keep writing.
-///
-/// Filling the volume the index sits on is not a clean failure. SQLite's
-/// guard against a short wal-index only covers the moment that file is
-/// *extended*; a later write goes through the `-shm` mmap, and a page fault
-/// the filesystem cannot back is delivered as **SIGBUS**, which no `Result`
-/// can catch. On a copy-on-write filesystem (btrfs, ZFS) even overwriting an
-/// already-allocated page needs a new extent, so a full volume can take the
-/// process down on a write to a page that has existed for hours. Stopping
+/// Free space at which a run gives up. Filling the volume is not a clean
+/// failure: a WAL write through the `-shm` mmap that the filesystem cannot
+/// back is delivered as **SIGBUS**, which no `Result` can catch (and on
+/// copy-on-write filesystems even overwrites need new extents). Stopping
 /// with an error while there is still room is the only safe end.
 const DISK_FLOOR: u64 = 128 * 1024 * 1024;
 
-/// Share of the free space above [`DISK_FLOOR`] the log may occupy.
-///
-/// The log is what grows unboundedly between checkpoints, so its cap is the
-/// figure that has to fit in what is left. A quarter leaves room for the
-/// index's own growth, the FTS segments a merge writes beside it, and
-/// whatever else on the machine wants the same volume.
+/// Share of the free space above [`DISK_FLOOR`] the log may occupy; a
+/// quarter leaves room for index growth and FTS merge segments.
 const WAL_SHARE_OF_FREE: u64 = 4;
 
 /// The configured checkpoint threshold, lowered to what the volume can
-/// actually absorb.
-///
-/// `maximum_wal_size` is a stall-frequency knob chosen against a roomy disk;
-/// on a nearly full one its 512 MiB default is more than everything left.
-/// Checkpointing sooner costs some lock acquisitions and keeps the log inside
-/// the space available — see [`DISK_FLOOR`] for why running out is not
-/// survivable.
-///
-/// A configured `0` (forced checkpoints off) is bounded like any other value
-/// rather than special-cased: the knob turns off a *performance* behaviour and
-/// is not a licence to fill the disk. On a roomy volume the derived bound is
-/// larger than any run's log, so `0` keeps its meaning without a second rule.
-/// Unknown free space changes nothing.
+/// absorb. A configured `0` is bounded too: not a licence to fill the disk.
 fn wal_cap_for_volume(configured: u64, db_path: &Path) -> u64 {
     let Some(free) = crate::platform::available_space(db_path) else {
         return configured;
@@ -130,14 +96,11 @@ fn wal_cap_for_volume(configured: u64, db_path: &Path) -> u64 {
     effective
 }
 
-/// The arithmetic of [`wal_cap_for_volume`], split from the syscall so it is
-/// testable without a filesystem of a chosen size — the same split the rest of
-/// the codebase makes for anything decidable without asking the kernel.
+/// The arithmetic of [`wal_cap_for_volume`], split from the syscall for tests.
 pub(super) fn wal_cap_for_free(configured: u64, free: u64) -> u64 {
     let room = free.saturating_sub(DISK_FLOOR) / WAL_SHARE_OF_FREE;
-    // Never below the floor a configured value would be raised to: checkpoints
-    // more often than that cost more in lock acquisition than the log costs in
-    // space, and the in-run check is what actually stops a doomed run.
+    // Checkpoints more often than MINIMUM_WAL_SIZE cost more in locks than
+    // the log costs in space; the in-run check is what stops a doomed run.
     let capped = room.max(crate::config::MINIMUM_WAL_SIZE);
     // `0` is "no cap", so it loses every `min` — hence the explicit arm.
     if configured == 0 {
@@ -151,8 +114,7 @@ fn human_mib(bytes: u64) -> String {
     format!("{} MiB", bytes / (1024 * 1024))
 }
 
-/// Flips an [`AtomicBool`] when dropped. Held by `run_indexing` so the
-/// per-root count subprocesses die on every exit path of a run.
+/// Held by `run_indexing` so the count threads die on every exit path.
 struct CancelOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
@@ -162,63 +124,48 @@ impl Drop for CancelOnDrop {
 }
 
 /// Most extracted rows a root holds back between turns. Not `quantum`: a row
-/// carries up to `maximum_text_size` of text, and 500 of those would be
-/// 128 MiB per root. At 64 it is 16 MiB.
+/// carries up to `maximum_text_size` of text — 500 would be 128 MiB per root.
 const READY_TOPUP: usize = 64;
 
 /// One root's in-flight indexing state, owned by the writer loop.
 pub(super) struct RootPipeline {
     pub(super) root: String,
     pub(super) walk: ParallelWalk,
-    /// This root's walk denominator; 0 = not yet known. From last run's
-    /// stored count, or the count scan for a root that has none.
+    /// This root's walk denominator; 0 = not yet known.
     pub(super) count_total: Arc<AtomicUsize>,
-    /// Threads this root gets, for both the walk and extraction.
     pub(super) workers: usize,
     pub(super) pending_updates: Vec<OwnedNewFile>,
     pub(super) pending_inserts: Vec<OwnedNewFile>,
     pub(super) walked: usize,
     pub(super) walk_clean: bool,
     pub(super) phase: RootPhase,
-    /// The running content pass, once this root's walk has finished.
     pub(super) content: Option<crate::content::ContentPass>,
-    /// Extracted rows pulled off the pass and not yet written. A turn writes
-    /// for its slice, not for its batch, so it may leave some behind.
+    /// Rows pulled off the pass and not yet written; a turn may leave some.
     pub(super) ready: Vec<crate::content::ExtractedRow>,
-    /// Rows this run's content pass has written for this root.
     pub(super) written: usize,
-    /// The pass's range counts, cached once known so a `Done` root still has
-    /// them after its pass is gone.
+    /// The pass's range counts, cached so a `Done` root still has them.
     pub(super) totals: Option<ExtractScope>,
     pub(super) current_file: Option<String>,
-    /// When this root's current phase began, for the one line each phase logs
-    /// when it ends.
+    /// When this root's current phase began.
     pub(super) phase_started: Instant,
 }
 
 impl RootPipeline {
-    /// End the current phase and return how long it took, restarting the clock
-    /// for the next one.
     fn phase_elapsed(&mut self) -> Duration {
         let started = std::mem::replace(&mut self.phase_started, Instant::now());
         started.elapsed()
     }
 }
 
-/// `n` per second, or `None` when the interval is too short to divide by —
-/// a sub-millisecond walk would otherwise report a rate in the millions.
 fn per_second(n: usize, elapsed: Duration) -> Option<f64> {
     let secs = elapsed.as_secs_f64();
     (secs >= 0.001).then(|| n as f64 / secs)
 }
 
-/// How long the writer loop waits when every root has momentarily run dry.
-/// A ceiling, not a delay: the loop parks on a channel and any producer
-/// wakes it at once.
+/// Idle-wait ceiling, not a delay: the loop parks on a channel and any
+/// producer wakes it at once.
 const IDLE_BACKOFF: Duration = Duration::from_millis(2);
 
-/// Report what the per-run warning throttles counted but did not print.
-/// See [`crate::log::Throttle`].
 fn report_run_warnings() {
     let (failed, suppressed) = crate::file_handling::hash_failure_counts();
     if failed > 0 {
@@ -235,7 +182,6 @@ fn report_run_warnings() {
     }
 }
 
-/// One phase's timing line: "12,345 files in 41.2s (300/s)".
 fn phase_summary(n: usize, noun: &str, elapsed: Duration) -> String {
     match per_second(n, elapsed) {
         Some(rate) => format!(
@@ -250,8 +196,7 @@ fn phase_summary(n: usize, noun: &str, elapsed: Duration) -> String {
 }
 
 impl RootPipeline {
-    /// Busy threads / pool size for the pool this root is currently running.
-    /// A root outlives its walk, so the pool is chosen by phase.
+    /// Busy threads / pool size; a root outlives its walk, so chosen by phase.
     pub(super) fn worker_counts(&self) -> (usize, usize) {
         let stats = match self.phase {
             RootPhase::Walking => Some(self.walk.worker_stats()),
@@ -261,8 +206,6 @@ impl RootPipeline {
         stats.map_or((0, 0), |s| (s.active(), s.total()))
     }
 
-    /// The pass's counts, from the cache or — until the cache is filled — from
-    /// the pass itself.
     fn extract_totals(&self) -> Option<ExtractScope> {
         self.totals
             .or_else(|| self.content.as_ref().and_then(|p| p.totals()))
@@ -279,19 +222,10 @@ impl RootPipeline {
                 0 => None,
                 n => Some(n),
             },
-            // Earlier runs' rows count once the pass has counted them; until
-            // then only this run's, so the figure never goes backwards.
-            //
-            // Not clamped against `extract_total`, deliberately. The count now
-            // runs *behind* the pass's first page rather than blocking its
-            // workers in front of it (see `content::feeder`), so a row written
-            // while it was in flight is seen by it as already done and counted
-            // again in `written` — the numerator can briefly overshoot. That is
-            // already a shape this reports: a pass fed rows from outside its own
-            // range writes them with an `extract_total` of zero, which
-            // `an_extracting_turn_lands_its_leftovers_one_slice_at_a_time`
-            // pins. Clamping here broke that test and would have hidden the
-            // case it exists to describe.
+            // Never goes backwards. Not clamped against `extract_total`: the
+            // numerator can briefly overshoot (count runs behind the pass's
+            // first page), a shape
+            // `an_extracting_turn_lands_its_leftovers_one_slice_at_a_time` pins.
             extracted: totals.map_or(self.written, |t| t.already_done + self.written),
             extract_total: totals.map(|t| t.pending + t.already_done),
             current_file: self.current_file.clone(),
@@ -300,13 +234,8 @@ impl RootPipeline {
         }
     }
 
-    /// Drain walk events into the pending batches for up to one slice,
-    /// finishing the walk if it ends. Returns whether anything happened.
-    ///
-    /// Batches still land per quantum; the slice only decides how many of
-    /// them one turn may write. A walk slower than the writer ends its turn at
-    /// `Empty` well inside the slice; only a walk that has the writer
-    /// saturated uses all of it.
+    /// Drain walk events into the pending batches for up to one slice;
+    /// batches still land per quantum.
     pub(super) fn service_walking(&mut self, cx: &mut RunCx<'_>) -> Result<bool, String> {
         let deadline = Instant::now() + cx.slice;
         let mut took = 0usize;
@@ -322,8 +251,7 @@ impl RootPipeline {
     }
 
     /// One quantum of [`RootPipeline::service_walking`]. Returns whether the
-    /// channel still had events when the quantum ended — false on `Empty` or
-    /// on the walk finishing.
+    /// channel still had events when the quantum ended.
     fn walk_quantum(
         &mut self,
         cx: &mut RunCx<'_>,
@@ -335,9 +263,9 @@ impl RootPipeline {
             match self.walk.try_next() {
                 TryNext::Item(WalkEvent::Stale(paths)) => {
                     *took += 1;
-                    // Applied at the end of the run: deleting mid-walk would
-                    // break "a stopped run deletes nothing", and an aliased
-                    // sighting that exempts a path may still be ahead.
+                    // Applied at run end: deleting mid-walk would break "a
+                    // stopped run deletes nothing", and an exempting aliased
+                    // sighting may still be ahead.
                     cx.stale_candidates.extend(paths);
                 }
                 TryNext::Item(WalkEvent::File(file)) => {
@@ -347,13 +275,10 @@ impl RootPipeline {
                         self.current_file = Some(file.path.clone());
                     }
                     if file.aliased {
-                        // Its row's parent may never be visited, so the
-                        // vanished-directory sweep must not read that parent's
-                        // absence as proof the file is gone.
+                        // The vanished-directory sweep must not read its
+                        // parent's absence as proof the file is gone.
                         cx.aliased_paths.insert(file.path.clone());
                     }
-                    // Dedupes a canonical file reachable through several
-                    // spellings, or from more than one root.
                     if !cx.seen_paths.insert(file.digest) {
                         continue;
                     }
@@ -396,8 +321,7 @@ impl RootPipeline {
     /// The walk ended: land the buffered batches, then either hand the root
     /// to the content pass or mark it done.
     fn finish_walk(&mut self, cx: &mut RunCx<'_>) -> Result<(), String> {
-        // Join before deciding anything about what this walk saw; see
-        // `ParallelWalk::finish`.
+        // Join before deciding; see `ParallelWalk::finish`.
         self.walk_clean = self.walk.finish();
         process_batch_updates(
             &cx.conn_mutex,
@@ -437,10 +361,8 @@ impl RootPipeline {
         } else if cx.stop_flag.load(Ordering::Relaxed) {
             self.phase = RootPhase::Done;
         } else {
-            // Recorded only when the walk saw the whole tree: the figure is
-            // sticky, and an unreadable subtree would teach every later run a
-            // too-small denominator. `unreadable()` is final here — `finish()`
-            // joined the workers.
+            // Only when the walk saw the whole tree: the figure is sticky,
+            // and an unreadable subtree would teach a too-small denominator.
             if self.walk.unreadable().is_empty() {
                 let conn = crate::lock_ok(&cx.conn_mutex);
                 if let Err(e) = crate::db::repo::set_root_walk_count(&conn, &self.root, self.walked)
@@ -449,10 +371,8 @@ impl RootPipeline {
                 }
             }
             let cursor = ExtractCursor::for_root(&self.root);
-            // Only the sweep runs on the writer. Counting the range is the
-            // pass's own job, on its own connection: on a large root it is
-            // seconds, and here that was seconds of every other root's walk
-            // standing still.
+            // Counting the range is the pass's job, on its own connection —
+            // on the writer it is seconds of every other walk standing still.
             {
                 let conn = crate::lock_ok(&cx.conn_mutex);
                 mark_oversize_pending_na(&conn, &cursor, cx.config)?;
@@ -460,10 +380,8 @@ impl RootPipeline {
             self.totals = None;
             self.written = 0;
             self.ready.clear();
-            // Starts only now: the rows have to exist before the feeder can
-            // page over them. Started even when nothing may be pending — the
-            // count that would say so is the pass's — and an empty range
-            // finishes on its own next turn.
+            // Starts only now: the rows must exist before the feeder can page
+            // over them. An empty range finishes on its own next turn.
             self.content = Some(crate::content::extract_content(
                 cx.db_path,
                 &cursor,
@@ -478,15 +396,12 @@ impl RootPipeline {
     }
 
     /// Write finished extraction work for up to one slice; extraction itself
-    /// runs on this root's own pool. Returns whether anything happened.
-    ///
-    /// Rows the slice does not reach stay in `ready` for the next turn, and
-    /// the pass is not declared done until they have all landed.
+    /// runs on this root's own pool. Rows the slice does not reach stay in
+    /// `ready`, and the pass is not declared done until they have all landed.
     pub(super) fn service_extracting(&mut self, cx: &mut RunCx<'_>) -> Result<bool, String> {
         let deadline = Instant::now() + cx.slice;
         let mut finished = false;
         let mut consumed = 0usize;
-        // Disjoint borrows: the pass is held across the store.
         let Self {
             content,
             ready,
@@ -515,15 +430,12 @@ impl RootPipeline {
             }
             let stored = store_extracted(&cx.conn_mutex, ready, cx.stop_flag, cx.config, deadline)?;
             if stored.consumed > 0 {
-                // The last row *written*, not the last fetched: with leftovers
-                // the two can be a slice apart.
+                // The last row *written*, not the last fetched.
                 *current_file = Some(ready[stored.consumed - 1].name.clone());
             }
             ready.drain(..stored.consumed);
             *written += stored.written;
             consumed += stored.consumed;
-            // Stopped, out of time, or still holding rows the deadline cut
-            // short — the next turn takes it from here.
             if stored.consumed == 0 || !ready.is_empty() || Instant::now() >= deadline {
                 break;
             }
@@ -532,15 +444,12 @@ impl RootPipeline {
             if totals.is_none() {
                 *totals = pass.totals();
             }
-            // Join before deciding; see `ParallelWalk::finish`.
             if !pass.finish() {
                 crate::log_warn!("a content worker for {} terminated abnormally", self.root);
             }
             self.content = None;
             self.phase = RootPhase::Done;
             let extract_time = self.phase_elapsed();
-            // Quiet for the pass that found nothing to do: every root passes
-            // through here now, changed or not.
             if self.written > 0 {
                 crate::log_info!(
                     "{}: content done — {}",
@@ -553,30 +462,23 @@ impl RootPipeline {
     }
 }
 
-/// One run's shared environment and cross-root state, threaded through the
-/// per-phase [`RootPipeline`] service methods.
 pub(super) struct RunCx<'a> {
     pub(super) conn_mutex: Arc<Mutex<Connection>>,
     pub(super) config: &'a Config,
     pub(super) db_path: &'a str,
     pub(super) stop_flag: &'a Arc<AtomicBool>,
-    /// Shared with every root's walk workers, which use it to finish small
-    /// text files without handing them to the content pass.
+    /// Walk workers use it to finish small text files without the content pass.
     pub(super) registry: Arc<Registry>,
     pub(super) quantum: usize,
-    /// Writer time one root's turn may take before the round moves on; see
-    /// [`crate::config::ProcessingConfig::writer_turn_slice_ms`], which is
-    /// where the default and the reasoning live. Zero is one quantum a turn.
+    /// Writer time one root's turn may take before the round moves on
+    /// ([`crate::config::ProcessingConfig::writer_turn_slice_ms`]).
     pub(super) slice: Duration,
-    /// 128-bit path digests, not paths: at millions of files, owning every
-    /// path string again was the single largest allocation in a run. See
-    /// `walk::path_digest`.
+    /// 128-bit path digests, not paths: measured, owning every path string
+    /// again was the single largest allocation in a run.
     pub(super) seen_paths: HashSet<u128>,
-    /// Rows the per-directory reconciliation found no file behind, plus
-    /// whatever the vanished-directory sweep adds once the walks end.
+    /// Rows with no file behind them, per-directory plus the vanished sweep.
     pub(super) stale_candidates: Vec<String>,
-    /// Paths reached by resolving a symlink, whose row lives under a parent
-    /// that may be outside every root.
+    /// Paths reached via symlink; their rows may live outside every root.
     pub(super) aliased_paths: HashSet<String>,
     pub(super) stale_cleanup_ok: bool,
 }
@@ -621,9 +523,7 @@ fn publish_status(
     }
 }
 
-/// One pipeline for one root: its own walker (with per-root worker count),
-/// its own buffers and extraction cursor, and — only on a root never walked
-/// before — its own count thread.
+/// One pipeline for one root; a never-walked root also gets a count thread.
 fn build_pipeline(
     cx: &RunCx<'_>,
     root: &str,
@@ -649,13 +549,10 @@ fn build_pipeline(
         workers,
     );
 
-    // A root walked before needs no scan: its stored count is exact rather
-    // than 1.6x high, and the counting scan is a second full traversal of
-    // the tree.
+    // A walked root needs no scan: its stored count is exact.
     let count_total = Arc::new(AtomicUsize::new(0));
     match stored_count {
-        // `max(1)` for the same reason the counting arm uses it: 0 is the
-        // "unknown" sentinel, so an empty root must not store it.
+        // `max(1)`: 0 is the "unknown" sentinel; an empty root must not store it.
         Some(n) => count_total.store(n.max(1), Ordering::Relaxed),
         None => {
             let root = root.to_string();
@@ -666,7 +563,6 @@ fn build_pipeline(
                 .spawn(move || {
                     crate::platform::set_background_priority();
                     match count_tree_entries_fast(&root, &cancel) {
-                        // An empty root stores 1: 0 is the "unknown" sentinel.
                         Ok(n) => total.store(n.max(1), Ordering::Relaxed),
                         Err(e) => {
                             if !e.contains("cancelled") {
@@ -698,9 +594,8 @@ fn build_pipeline(
 }
 
 /// Reconcile deletions once every walk has ended — globally, because a file
-/// may be reachable through more than one root's symlinks. Runs at most once
-/// per run, on the writer thread. A no-op for a stopped run or one whose walk
-/// terminated abnormally.
+/// may be reachable through more than one root's symlinks. A no-op for a
+/// stopped or abnormally terminated run.
 fn cleanup_stale(pipelines: &mut [RootPipeline], cx: &mut RunCx<'_>) -> Result<(), String> {
     let stopped = cx.stop_flag.load(Ordering::Relaxed);
     if !cx.stale_cleanup_ok || stopped {
@@ -716,14 +611,9 @@ fn cleanup_stale(pipelines: &mut [RootPipeline], cx: &mut RunCx<'_>) -> Result<(
             &mut cx.stale_candidates,
         )?;
     }
-    // No unreadable-directory filter here: neither source of candidates can
-    // produce one — `read_directory` returns before reconciling an unreadable
-    // directory, and the sweep skips parents beneath one.
-    //
-    // The aliased filter *is* applied to both: per-directory reconciliation
-    // can flag a hidden or ignore-matched symlink target as stale while the
-    // alias route inserted it — without this the row would be written and
-    // deleted on every run.
+    // The aliased filter applies to both sources: per-directory
+    // reconciliation can flag a symlink target as stale while the alias route
+    // inserted it — the row would be written and deleted on every run.
     let stale_paths: Vec<String> = cx
         .stale_candidates
         .drain(..)
@@ -741,7 +631,6 @@ fn cleanup_stale(pipelines: &mut [RootPipeline], cx: &mut RunCx<'_>) -> Result<(
             if unreadable_count == 1 { "y" } else { "ies" }
         );
     }
-    // One line for the whole run — see `walk::PruneCounts`.
     for p in pipelines.iter() {
         if let Some(summary) = p.walk.pruned().summary() {
             crate::log_info!("{}: {}", p.root, summary);
@@ -767,7 +656,6 @@ fn cleanup_stale(pipelines: &mut [RootPipeline], cx: &mut RunCx<'_>) -> Result<(
 }
 
 impl IndexingService {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_indexing(
         status: &Arc<Mutex<IndexingStatus>>,
         paths: &[String],
@@ -782,13 +670,11 @@ impl IndexingService {
         }
 
         let run_started = Instant::now();
-        // Per-run: the counts must describe this run only.
         crate::walk::reset_run_warnings();
         crate::file_handling::reset_run_warnings();
 
-        // De-duplicate while preserving order; canonicalized first so
-        // spelling variants collapse to one walk. Nested-root dedup is
-        // handled by the per-file `seen_paths` set.
+        // Canonicalized first so spelling variants collapse to one walk;
+        // nested-root dedup is the `seen_paths` set's job.
         let mut seen_roots = HashSet::new();
         let roots: Vec<String> = paths
             .iter()
@@ -796,87 +682,62 @@ impl IndexingService {
             .filter(|p| seen_roots.insert(p.clone()))
             .collect();
 
-        // Rekeyed to match the canonicalized `roots`; a lookup that misses is
-        // invisible. See `resolved_root_workers`.
         let worker_overrides = resolved_root_workers(config);
 
-        // One clock for the whole run: the prologue can outlast the walk.
         let run_start = Self::run_start(status);
 
-        // Open and migrate; a large WAL recovery happens here, so it is
-        // announced before it is attempted.
+        // A large WAL recovery happens here; announced before attempted.
         Self::set_prep_step(status, PrepStep::OpeningIndex);
         let mut conn = db::open_or_recreate(db_path, &config.processing.tokenize)?;
 
         // Reconcile against the settings the index was last written under,
         // *before* stamping the new ones — the old record is the only thing
-        // that knows a root was dropped. Against `roots`, not
-        // `config.paths.indexing_paths`: nothing makes the caller pass the
-        // roots its config names, and reconciling against the config could
-        // delete every row of the tree actually being indexed. Stamping is
-        // conditional on the reconcile *finishing*: stamping a cut-short scan
-        // would orphan the disowned rows for good.
+        // that knows a root was dropped. Against `roots`, not the config's
+        // paths, which could name a different tree. Stamping is conditional
+        // on the reconcile *finishing*: a cut-short stamp orphans the rows.
         if !Self::reconcile_stored_config(status, interrupt, &mut conn, config, &roots, stop_flag)?
         {
             return Ok(());
         }
         Self::update_config(&conn, config, &roots)?;
 
-        // Before a single row is written, so the whole load runs at the
-        // write-side threshold. Setting it afterwards — which is what this
-        // used to do — left every fresh index's first run at FTS5's default.
+        // Failed files are retried once per run; only a retry can tell.
+        {
+            let tx = conn
+                .transaction()
+                .map_err(|e| format!("begin failed-file retry: {}", e))?;
+            let retried = db::repo::retry_failed_files(&tx)?;
+            tx.commit()
+                .map_err(|e| format!("commit failed-file retry: {}", e))?;
+            if retried > 0 {
+                crate::log_info!("retrying {} previously failed files", retried);
+            }
+        }
+
+        // Before a single row is written: setting it afterwards left every
+        // fresh index's first run at FTS5's default.
         fts_begin_bulk_write(&conn);
 
-        // Turn off SQLite's automatic checkpointing for the duration of the
-        // run, because during a run it cannot do its job and charges full
-        // price for failing.
-        //
-        // The default fires every 1000 pages (~4 MB) and copies the log back
-        // into the database — but it can only *reset* the log at an instant no
-        // reader holds a read mark, and this run keeps a reader per root from
-        // start to finish (the walk's row prefetcher, then the content pass's
-        // feeder). So it copied pages back perpetually and never truncated
-        // anything: measured on a 10,000-file tree, the log grew to 144 MiB and
-        // stayed there while the process wrote **1,220 MiB** — the same log
-        // copied back some seven times over.
-        //
-        // Safe here and nowhere else, which is why it is set on this connection
-        // rather than in `PRAGMAS_FAST`: this is the one writer that already
-        // owns the machinery to land its own log. `wal_cap_for_volume` bounds
-        // how large it may grow — by free space, not just by
-        // `maximum_wal_size` — the loop below forces a checkpoint at that cap,
-        // and the optimize pass checkpoints again at the end. A writer without
-        // all three (`cli::clear_path`, say) must keep the automatic one.
-        //
-        // Measured, two runs each, same tree:
-        //
-        // | | cold | written | log peak |
-        // |---|---:|---:|---:|
-        // | autocheckpoint on (default) | 7.19 / 7.37 s | 1219 / 1227 MiB | 144 MiB |
-        // | off | **5.59 / 5.50 s** | **990 / 992 MiB** | 512 MiB |
-        //
-        // The log gets larger and the run gets cheaper, which is the trade the
-        // default is making backwards for this workload.
+        // Autocheckpoint off for the run: it can never reset the log while a
+        // reader per root is live, so it copies pages back perpetually at full
+        // price. Safe here and nowhere else — this writer bounds its own log
+        // (`wal_cap_for_volume`, the forced checkpoint below, the optimize
+        // pass); a writer without all three must keep the automatic one.
         if let Err(e) = conn.execute_batch("PRAGMA wal_autocheckpoint = 0;") {
             crate::log_warn!("could not disable autocheckpoint (non-fatal): {}", e);
         }
 
-        // No up-front load of the whole `files` table: each walk's prefetcher
-        // fetches one directory's rows at a time.
         let conn_mutex = Arc::new(Mutex::new(conn));
 
         // Published so `stop_indexing` can checkpoint through it without
         // waiting for this run's thread to unwind.
         *crate::lock_ok(db_connection) = Some(conn_mutex.clone());
 
-        // The guard kills the per-root count subprocesses on every exit path.
         let count_cancel = Arc::new(AtomicBool::new(false));
         let _count_guard = CancelOnDrop(count_cancel.clone());
 
         let mut cx = RunCx::new(conn_mutex, config, db_path, stop_flag);
 
-        // Read stored counts up front, under one lock, before the walks
-        // compete for the connection.
         let stored_counts: Vec<Option<usize>> = {
             let conn = crate::lock_ok(&cx.conn_mutex);
             let _ = crate::db::repo::prune_root_stats(&conn, &roots);
@@ -886,7 +747,6 @@ impl IndexingService {
                 .collect()
         };
 
-        // One pipeline per root, all funnelling into this one writer thread.
         let mut pipelines: Vec<RootPipeline> = Vec::with_capacity(roots.len());
         for (root, stored_count) in roots.iter().zip(stored_counts) {
             pipelines.push(build_pipeline(
@@ -899,13 +759,10 @@ impl IndexingService {
         }
         publish_status(status, run_start, &pipelines);
 
-        // Set by whichever `break` exits the loop, so a stopped run is never
-        // mistaken for a completed one.
+        // Set by whichever `break` exits: a stop must never read as completion.
         let aborted;
         let mut cleanup_done = false;
         let mut rr = 0usize;
-        // Log size at which to force a checkpoint; see [`wal_len`] for why
-        // SQLite's autocheckpoint cannot be left to do this.
         let wal_path = format!("{}-wal", db_path);
         let configured_cap = match config.processing.maximum_wal_size {
             0 => 0,
@@ -914,17 +771,12 @@ impl IndexingService {
         let wal_cap = wal_cap_for_volume(configured_cap, Path::new(db_path));
         let mut checkpoint_at = wal_cap;
 
-        // Walks first, one slice each, then a single extraction slice.
-        //
-        // The walk is the disk-bound phase and the one whose stall shows: its
-        // workers can only run as far ahead as their channel, so a writer that
-        // does not come back to it soon enough parks a whole pool behind one
-        // root's tokenizing. Serving every walking root before any extraction
-        // caps a walk's wait at one slice per round; taking one extraction
-        // slice per round, not one per root, keeps that cap independent of
-        // how many roots are extracting — while still handing extraction a
-        // slice every round, so it is never starved either. Any root's turn
-        // ends early the moment it has nothing ready.
+        // Walks first, one slice each, then a single extraction slice. The
+        // walk must never wait on the writer's FTS work: its workers can only
+        // run as far ahead as their channel, so a slow writer parks a whole
+        // pool behind one root's tokenizing. Serving every walking root before
+        // any extraction caps a walk's wait at one slice per round; one
+        // extraction slice per round keeps that cap independent of root count.
         loop {
             if stop_flag.load(Ordering::Relaxed) {
                 aborted = true;
@@ -938,13 +790,9 @@ impl IndexingService {
                     progressed |= p.service_walking(&mut cx)?;
                 }
             }
-            // Between the stages, not only at the end of the round: a root
-            // enters `Extracting` in the walk stage above, and the stage
-            // below can finish its pass in the same round. Published once a
-            // round, the whole phase falls between two snapshots whenever a
-            // root's content pass is short — a small root reads as
-            // `Walking → Done`, having never reported the phase it spent its
-            // extraction in.
+            // Between the stages: published only once a round, a short
+            // content pass falls between two snapshots and a small root reads
+            // as `Walking → Done`.
             publish_status(status, run_start, &pipelines);
 
             for k in 0..n {
@@ -964,11 +812,9 @@ impl IndexingService {
 
             publish_status(status, run_start, &pipelines);
 
-            // After `publish_status`, so the GUI's last snapshot is fresh
-            // going into a checkpoint that may block for `busy_timeout`.
-            // `progressed` gates the stat (a round that wrote nothing cannot
-            // have grown the log); the stop-flag check keeps a checkpoint from
-            // sitting in front of `stop_indexing` for five seconds.
+            // After `publish_status`: the checkpoint may block for
+            // `busy_timeout`, and it must not sit in front of `stop_indexing`
+            // — hence the stop-flag check.
             if wal_cap > 0
                 && progressed
                 && !stop_flag.load(Ordering::Relaxed)
@@ -980,11 +826,9 @@ impl IndexingService {
                         crate::log_warn!("{}", e);
                     }
                 }
-                // Only here, not every round: this is the moment the log is
-                // at its largest, and it costs one syscall per checkpoint
-                // rather than one per writer turn. The checkpoint above has
-                // just returned whatever it could, so what is left is the
-                // honest figure.
+                // Only here, not every round: the log is at its largest, and
+                // the checkpoint above has just returned whatever it could,
+                // so what is left is the honest figure.
                 if let Some(free) = crate::platform::available_space(Path::new(db_path)) {
                     if free < DISK_FLOOR {
                         return Err(format!(
@@ -998,44 +842,29 @@ impl IndexingService {
                         ));
                     }
                 }
-                // Re-armed from what is on disk: a checkpoint that lost the
-                // race then costs one attempt per further `wal_cap` of
-                // growth, not a retry every round.
+                // Re-armed from what is on disk: a lost race costs one
+                // attempt per further `wal_cap` of growth, not one per round.
                 checkpoint_at = wal_len(&wal_path) + wal_cap;
             }
 
             if pipelines.iter().all(|p| p.phase == RootPhase::Done) {
-                // A stop can land inside the pass above, with every root
-                // reaching Done before the top-of-loop check sees the flag.
-                // Re-read it, or a cut-short run is stamped as a completed
-                // full index.
+                // A stop can land with every root reaching Done before the
+                // top-of-loop check sees the flag; re-read it, or a cut-short
+                // run is stamped as a completed full index.
                 aborted = stop_flag.load(Ordering::Relaxed);
                 break;
             }
             if !progressed {
-                // Park on a walking root's channel rather than sleeping: a
-                // sender wakes this immediately, and on Windows a 2 ms
-                // `thread::sleep` really stalls for the 15.6 ms timer tick.
-                // `wait_ready` holds whatever it pulls, so the round-robin
-                // still sees it in order.
+                // Park on a walking root's channel: a sender wakes this
+                // immediately, and on Windows a 2 ms sleep really stalls for
+                // the 15.6 ms timer tick.
                 let waited = pipelines
                     .iter_mut()
                     .find(|p| p.phase == RootPhase::Walking)
                     .map(|p| p.walk.wait_ready(IDLE_BACKOFF))
                     .is_some();
-                // Nothing walking (extracting passes have no such handle);
-                // fall back to the sleep.
-                //
-                // Parking on an extracting root's channel here was tried and
-                // **measured at nothing**: over a cold run of a 10,000-file
-                // tree the loop found nothing 91 times and only *one* of those
-                // reached this sleep, because the writer is the bottleneck
-                // during extraction and is almost never idle. One 2 ms sleep a
-                // run — 15.6 ms on Windows, where the timer granularity is what
-                // makes this comment worth having — did not justify a second
-                // `wait_ready` and the `pending` slot it needs. Re-measure with
-                // an extraction-bound corpus (PDFs, a network share) before
-                // concluding otherwise.
+                // Measured: parking on an extracting root's channel gained
+                // nothing; don't retry without an extraction-bound corpus.
                 if !waited {
                     thread::sleep(IDLE_BACKOFF);
                 }
@@ -1043,26 +872,16 @@ impl IndexingService {
         }
 
         if aborted {
-            // Nothing is landed on the way out, and there used to be a loop
-            // here that looked as though it did: `aborted` implies the stop
-            // flag is set, and both batch writers return on it before their
-            // first chunk, so it wrote nothing. What a stop drops is each
-            // root's part-filled insert/update batch (under `batch_size`
-            // rows) and whatever extraction had ready — all of it still
-            // `content_state = 0` or absent, so the next run finds it again.
-            // That is what "a stopped run promises nothing" already means,
-            // and it is cheaper than tokenizing a slice's worth of documents
-            // while someone waits for the window to close.
-            //
-            // No stale cleanup either: a partial walk's seen set would delete
-            // most of the index.
+            // Nothing is landed on the way out — "a stopped run promises
+            // nothing"; the next run finds it all again. No stale cleanup
+            // either: a partial walk's seen set would delete most of the index.
             report_run_warnings();
             crate::log_info!(
                 "indexing stopped after {:.1}s",
                 run_started.elapsed().as_secs_f64()
             );
-            // The final status is the caller's to publish: a stopped run is
-            // still followed by an optimize pass, so this is not yet Idle.
+            // Not yet Idle: a stopped run is still followed by an optimize
+            // pass, and the final status is the caller's to publish.
             return Ok(());
         }
 
@@ -1072,27 +891,21 @@ impl IndexingService {
             run_started.elapsed().as_secs_f64()
         );
 
-        // FTS housekeeping once per completed run (cheap if nothing changed).
         {
             let conn = crate::lock_ok(&cx.conn_mutex);
             fts_finalize_after_text_indexing(&conn);
         }
 
-        // Stamp the successful run: an absent stamp reads as "never indexed"
-        // and `periodic_due` starts another full run on the very next tick.
+        // An absent stamp reads as "never indexed" and `periodic_due` starts
+        // another full run on the very next tick.
         let now = crate::log::now_unix();
         let conn = crate::lock_ok(&cx.conn_mutex);
         if let Err(e) = crate::db::repo::set_last_full_index(&conn, now) {
             crate::log_warn!("{}", e);
         }
 
-        // What each root holds, for the folder list to show once these
-        // pipelines and their `RootProgress` rows are gone. Here rather than on
-        // a cadence: `count_root` reads every row in the range, and this run
-        // has just written them, so the pages are as warm as they will ever be.
-        // Under the interrupt guard because it is still a scan per root, and
-        // quitting should not wait out one of them; a root whose count fails
-        // keeps the figure it had.
+        // Per-root figures, while the pages are warm; under the interrupt
+        // guard because quitting should not wait out a per-root scan.
         let _guard = db::InterruptGuard::arm(interrupt, &conn);
         for root in &roots {
             let range = ExtractCursor::for_root(root);

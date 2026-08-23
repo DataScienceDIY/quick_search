@@ -23,25 +23,21 @@ https://github.com/DataScienceDIY/quick_search
 build.bat           # Windows
 ```
 
-These take a fresh machine all the way to a running app: install whatever
-build dependencies are missing, build release, then launch the GUI. Each
-setup stage is skipped when what it provides is already there, so a normal
-run costs one `cargo build`. `build.sh` installs Linux system packages with
-the distribution's package manager via `sudo` (apt/dnf/pacman/zypper) and the
-Rust toolchain with rustup; `build.bat` uses winget and rustup. Both take
-`--check` to report dependency status without installing or building,
-`--no-run` to stop after the build, and `--` to pass the rest to the binary.
-`build.sh` also takes `--installer`, which adds NSIS and the mingw-w64 cross
-toolchain to what it installs and builds the Windows installer instead of
+These take a fresh machine to a running app: install missing build
+dependencies, build release, launch the GUI. Stages already satisfied are
+skipped, so a normal run costs one `cargo build`. `build.sh` installs
+system packages via `sudo` (apt/dnf/pacman/zypper) and the Rust toolchain
+with rustup; `build.bat` uses winget and rustup. Both take `--check` to
+report dependency status without installing or building, `--no-run` to
+stop after the build, and `--` to pass the rest to the binary. `build.sh`
+also takes `--installer`, which builds the Windows installer instead of
 launching anything — see [Install (Windows)](#install-windows).
 
-Building by hand needs a Rust toolchain plus, on every platform, a C toolchain
-and Perl: SQLCipher, zstd and OpenSSL are compiled from bundled C sources, and
-OpenSSL's `Configure` is a Perl script. `rust-toolchain.toml` pins the compiler
-version and the cross-compilation targets, so rustup installs the right ones on
-the first `cargo` command and no `rustup target add` is needed. The old
-WebKit/WebView dependencies (`setup.sh`) are gone; the GUI renders with
-OpenGL via egui.
+Building by hand needs a Rust toolchain plus, on every platform, a C
+toolchain and Perl: SQLCipher, zstd and OpenSSL are compiled from bundled
+C sources, and OpenSSL's `Configure` is a Perl script.
+`rust-toolchain.toml` pins the compiler version and the cross-compilation
+targets, so rustup installs the right ones on the first `cargo` command.
 
 - Linux: working OpenGL 3.3 drivers; `xdg-desktop-portal` (present on all
   mainstream desktops) provides the native folder picker. On minimal
@@ -49,16 +45,14 @@ OpenGL via egui.
   xkbcommon `-dev` packages are needed: winit dlopens the display stack at
   run time, so only the runtime libraries matter.
 - Windows: Visual Studio 2022 Build Tools with the "Desktop development
-  with C++" workload (MSVC v143 plus a Windows SDK), and Perl (Strawberry
-  Perl); NASM is optional and only enables OpenSSL's assembly paths. The GNU
-  target needs only a mingw-w64 toolchain, and cross-compiles from Linux —
-  `cargo build --release -p quicksearch-gui --target x86_64-pc-windows-gnu`
-  with `gcc-mingw-w64-x86-64` installed, which is how CI produces the Windows
-  binaries. Note that Windows ships only a software OpenGL 1.1
-  driver, so a bare VM or an RDP session without a vendor GPU driver cannot
-  create a context and the window will fail to open.
-- macOS: Xcode command line tools (`build.sh` does not auto-install these —
-  only Linux package managers are handled).
+  with C++" workload (MSVC v143 plus a Windows SDK), and Strawberry Perl;
+  NASM is optional. The GNU target needs only a mingw-w64 toolchain and
+  cross-compiles from Linux (`cargo build --release -p quicksearch-gui
+  --target x86_64-pc-windows-gnu`), which is how CI produces the Windows
+  binaries. Windows ships only a software OpenGL 1.1 driver, so a bare VM
+  or an RDP session without a vendor GPU driver cannot create a context
+  and the window will fail to open.
+- macOS: Xcode command line tools (`build.sh` does not auto-install these).
 
 ```sh
 cargo build --release -p quicksearch-gui   # binaries: target/release/quicksearch{,-cli}
@@ -76,8 +70,10 @@ and exit codes behave normally. On Unix `quicksearch` also does both, and
 
 ```sh
 ./packaging/build-deb.sh
-sudo apt install ./dist/quicksearch_1.0.2_amd64.deb
+sudo apt install ./dist/quicksearch_<version>_amd64.deb
 ```
+
+Substitute the current release version for `<version>`.
 
 The script builds the release binary, strips it, and assembles a `.deb` with
 `dpkg-deb`. It needs no `cargo-deb`, no `debhelper` and no SVG rasteriser —
@@ -110,34 +106,28 @@ the app writes `~/.config/quicksearch/config.toml` on first run.
 ### Icons
 
 `crates/quicksearch-gui/assets/icons/` holds `quicksearch_icon.svg` and the
-PNGs rasterised from it. The PNGs are committed rather than generated, so an
-ordinary `cargo build` needs no image tooling — the 256px one is compiled into
-the binary with `include_bytes!` and becomes the window icon. Editing the SVG
-means re-rendering the PNGs; `packaging/build-deb.sh` documents how in a
-comment at the top.
+PNGs rasterised from it. The PNGs are committed, so an ordinary `cargo
+build` needs no image tooling — the 256px one is compiled into the binary
+with `include_bytes!` and becomes the window icon. Editing the SVG means
+re-rendering the PNGs; `packaging/build-deb.sh` documents how in a comment
+at the top.
 
 X11 takes the window icon from the embedded PNG. Wayland ignores it and
 matches the app id (`quicksearch`) against the installed
-`quicksearch.desktop`, so under Wayland the titlebar icon appears only once
-the package is installed.
-
-`quicksearch.ico` in the same directory bundles the 16–256px PNGs unchanged
-(one PNG-compressed entry per size) for the Windows installer, which uses it
-for the installer window, the shortcuts and the Add/Remove Programs entry.
-Regenerate it from the PNGs with Pillow: open each `quicksearch-N.png`,
-largest first, and `save(..., format="ICO", sizes=[...], append_images=rest)`
-— passing the images rather than one image and a size list is what keeps the
-committed pixels instead of resampling them.
+`quicksearch.desktop`, so there the titlebar icon appears only once the
+package is installed. `quicksearch.ico` bundles the 16–256px PNGs
+unchanged for the Windows installer; regenerate it from the PNGs with
+Pillow (`append_images` keeps the committed pixels unresampled).
 
 ## Install (AppImage)
 
 For anything that is not Debian or Ubuntu. Download
-`quicksearch-<version>-x86_64.AppImage` from the release page, make it
-executable and run it:
+`quicksearch-<version>-x86_64.AppImage` from the release page (substitute
+the current release version), make it executable and run it:
 
 ```sh
-chmod +x quicksearch-1.0.4-x86_64.AppImage
-./quicksearch-1.0.4-x86_64.AppImage
+chmod +x quicksearch-<version>-x86_64.AppImage
+./quicksearch-<version>-x86_64.AppImage
 ```
 
 If it fails to start with a FUSE error — some distributions no longer install
@@ -145,7 +135,7 @@ FUSE by default — either install the distribution's FUSE package or run it
 unpacked:
 
 ```sh
-APPIMAGE_EXTRACT_AND_RUN=1 ./quicksearch-1.0.4-x86_64.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./quicksearch-<version>-x86_64.AppImage
 ```
 
 To build one, `./packaging/build-appimage.sh` takes the same flags as
@@ -158,7 +148,8 @@ have. It needs no FUSE itself, which is what lets CI build one in a container.
 ## Install (Windows)
 
 Download `quicksearch-<version>-windows-x86_64-setup.exe` from the release
-page and run it, or build it on a Linux machine:
+page (substitute the current release version) and run it, or build it on a
+Linux machine:
 
 ```sh
 ./build.sh --installer           # installs the two extra packages first
@@ -166,14 +157,12 @@ page and run it, or build it on a Linux machine:
 ```
 
 That cross-compiles for `x86_64-pc-windows-gnu` and compiles the installer
-with NSIS, which runs on Linux — no Windows machine is involved, and CI
-produces the installer in the same job as the `.zip`. It needs `nsis` and
-`gcc-mingw-w64-x86-64` (`mingw32-nsis` and `mingw64-gcc` on Fedora, `nsis` and
-`mingw-w64-gcc` on Arch; on openSUSE both come from the `windows:mingw` OBS
-project, so `build.sh` names them and leaves the repository to you). The same
-flags as `build-deb.sh` apply: `--no-build` to package binaries you already
-built, `--no-strip`, `-o DIR`; after `--`, `build.sh --installer` passes them
-straight through.
+with NSIS, which runs on Linux — no Windows machine is involved. It needs
+`nsis` and `gcc-mingw-w64-x86-64` (`mingw32-nsis` and `mingw64-gcc` on
+Fedora, `nsis` and `mingw-w64-gcc` on Arch; on openSUSE both come from the
+`windows:mingw` OBS project). The same flags as `build-deb.sh` apply:
+`--no-build`, `--no-strip`, `-o DIR`; after `--`, `build.sh --installer`
+passes them straight through.
 
 The install is per-machine and asks for elevation. Into
 `C:\Program Files\QuickSearch` go:
@@ -187,31 +176,26 @@ The install is per-machine and asks for elevation. Into
 | `uninstall.exe` | written by the installer; Add/Remove Programs runs it |
 
 The components page offers a Start menu shortcut (on) and a desktop shortcut
-(off); both are created for all users. The final page lists what was installed
-and where — the install itself takes about a second, which without saying so
-reads as a failure — and offers to start QuickSearch, ticked. No `config.toml` is installed, for the
-same reason the `.deb` ships none — one next to the binaries is portable mode
-(see [Configuration](#configuration)) and would override the personal config
-of every account. The app writes `%APPDATA%\quicksearch\config.toml` on first
-run instead.
-
-Installing over an older version reuses wherever that one went, taken from its
-registry entry rather than guessed. Both the installer and the uninstaller
-stop with a message if QuickSearch is still running, since Windows will not
-replace a running executable and the alternative is a half-replaced install.
+(off); both are created for all users. No `config.toml` is installed — one
+next to the binaries is portable mode (see [Configuration](#configuration))
+and would override the personal config of every account; the app writes
+`%APPDATA%\quicksearch\config.toml` on first run instead. Installing over
+an older version reuses that version's install directory, taken from its
+registry entry, and both the installer and the uninstaller stop with a
+message if QuickSearch is still running.
 
 Uninstalling removes what was installed and nothing else. The index in
 `%LOCALAPPDATA%\quicksearch` and the config in `%APPDATA%\quicksearch` stay,
 so reinstalling picks up the existing index; the program directory is removed
 only if empty, which leaves a portable-mode `config.toml` and its index alone.
 
-`PATH` is deliberately untouched — add `C:\Program Files\QuickSearch` to it
-yourself if you want `quicksearch-cli` on every prompt. It is an NSIS
-installer, so it takes `/S` for a silent install and `/D=` for the directory
-(last argument, unquoted):
+`PATH` is untouched — add `C:\Program Files\QuickSearch` to it yourself if
+you want `quicksearch-cli` on every prompt. It is an NSIS installer, so it
+takes `/S` for a silent install and `/D=` for the directory (last argument,
+unquoted):
 
 ```bat
-quicksearch-1.0.2-windows-x86_64-setup.exe /S /D=C:\Tools\QuickSearch
+quicksearch-<version>-windows-x86_64-setup.exe /S /D=C:\Tools\QuickSearch
 ```
 
 The `.zip` on the release page is the alternative to all of this: the same two
@@ -227,24 +211,20 @@ inside that folder.
 time**: a second launch reports that QuickSearch is already running and
 exits, because two processes indexing one database corrupt it. Terminal
 search (`quicksearch <query>`) only reads and keeps working while the
-window is open. The guard is a kernel lock on `<database_path>.lock`, held
-by the running process — so a crash or a power cut releases it, and the
-leftover file never locks you out. The lock follows `database_path`: point
-Settings at a different index and it moves with you, and if that index
-belongs to another instance the change is refused rather than written, so a
-path you cannot open can never end up in the config file. A path naming
-some *other* program's SQLite database is refused for the same reason: the
-file there is created when missing and replaced when it is an index from an
-older layout of QuickSearch's own, but anything else is left alone and the
-error names the tables that identified it.
+window is open. The guard is a kernel lock on `<database_path>.lock`, so a
+crash or a power cut releases it and the leftover file never locks you
+out. The lock follows `database_path`: point Settings at a different index
+and it moves with you. An index locked by another instance, or a SQLite
+database belonging to some other program, is refused with an error rather
+than written; the file there is created when missing and replaced only
+when it is an index from an older layout of QuickSearch's own.
 
 - **Search**: results appear as you type; every keystroke cancels the
   previous search. One checkbox enables the two fuzzy passes, and once a
   search has finished a button inside the right of the search box re-runs
   it. Click a column heading to sort by it; **right-click any heading to
   choose which columns are shown** — the path is always there, and size
-  and modified date start hidden, which is what buys the width the path
-  and the match get instead. The choice is saved (`[search.columns]`,
+  and modified date start hidden. The choice is saved (`[search.columns]`,
   also in Settings → Search) and applies immediately. Sorting by a column
   you then hide falls back to rank. Double-click a result to open it;
   right-click it to reveal it in the file manager, open it, copy its
@@ -255,16 +235,9 @@ error names the tables that identified it.
   highlighted snippet in the Content Match column, with more of the
   surrounding text on hover. Rows matched on name or path show a dash
   there instead. With `[search] live_results` on (the default) the rows
-  actually on screen are watched, and what they show is read from the
-  files themselves: a rename, a deletion or an edit lands within a
-  second, whether or not indexing is running. The rows coming on screen
-  are also checked against the disk as they are watched, so one the index
-  was already out of date about corrects itself; the index is then
-  brought back in line for those files alone. Over a network share, where
-  the system reports no events, that check is all you get — the row is
-  right when it comes on screen and then holds still. Nothing is ever
-  added, removed or re-ordered underneath you; a file that disappears is
-  struck through where it sits. Editing the query drops every watch.
+  on screen are watched and checked against the disk, so a rename,
+  deletion or edit shows within a second whether or not indexing is
+  running — see `config_example.toml`.
 - **Manage Index**: full indexing status, Start/Stop/Automatic controls,
   indexed folder list, full-text extension filters, ignore patterns, and
   the indexing options. Stopping switches to manual mode and saves that
@@ -272,22 +245,27 @@ error names the tables that identified it.
   restarts until you return to automatic. The index size beside the
   status heading totals the database and its `-wal`/`-shm` sidecars,
   refreshed every ten seconds; hovering it lists the ways to make it
-  smaller. Each folder in the list carries what it holds — files
-  indexed, and how many of those had text extracted — counted once as
-  each indexing run finishes and stored with the index, so they are
-  there the moment the app opens rather than costing a scan to show. A
-  folder nothing has finished indexing reads "not yet indexed" rather
-  than zero, and because the figures come from completed runs they do
-  not move as live updates apply single changes in between.
-- **Duplicates**: files sharing a content hash, grouped. That hash covers
-  each file's size and its first `processing.hash_length` bytes and nothing
-  else, which is the whole reason indexing is affordable — and the reason a
-  group is a strong suspicion rather than a fact. Right-click a group, or any
-  file in one, to settle it: every member is read through and compared byte
-  for byte, with progress and a Cancel button in a modal that then names each
-  file as identical, differing at a given byte, a different size, or
-  unreadable. Nothing is deleted or changed either way; the point is to know
-  before you delete something yourself.
+  smaller. Each folder in the list shows how many files it holds and how
+  many of those had text extracted, counted as each indexing run finishes
+  and stored with the index; a folder nothing has finished indexing reads
+  "not yet indexed".
+- **Duplicates**: files sharing a content hash, grouped. The hash covers
+  each file's size and its first `processing.hash_length` bytes and
+  nothing else, so a group is a strong suspicion, not a certainty.
+  Right-click a group, or any file in one, to settle it: every member is
+  read through and compared byte for byte, with progress and a Cancel
+  button in a modal that then names each file as identical, differing at
+  a given byte, a different size, or unreadable. Nothing is deleted or
+  changed either way; the point is to know before you delete something
+  yourself. **Sort by** lists the groups either by reclaimable space or by
+  file extension, for working through one file type at a time. It reorders
+  what the scan already returned rather than asking for a different set, so
+  which groups are listed never changes: they are always the 500 wasting the
+  most space, said as much in the line above the list. The scan runs on the
+  first visit to the tab and the listing then stays put, so coming back to it
+  is instant; **Refresh** re-runs it, and so does anything that moves the
+  index underneath it — a finished indexing run, or pointing the app at a
+  different index.
 - **Logs**: the lines the app would have printed to a terminal — warnings
   from indexing, folder watching and opening files, newest last, with a
   filter box and Copy button. Launched from a desktop launcher (or on
@@ -297,38 +275,42 @@ error names the tables that identified it.
   what each tab does — pointing here for everything technical. A brand-new
   installation is shown a short click-through introduction covering the
   same ground on its first launch; the Help tab brings it back. Upgrading
-  into this version does not raise it (see `[ui] tutorial_seen`).
+  into this version does not raise it (see `[ui] tutorial_seen`). The
+  introduction walks the app rather than describing it: each page switches
+  to the tab it is about, colours the keywords in its own prose, and pulses
+  the widget each keyword names in the same colour — the query box, the
+  Rank column, the status bar, the Fuzzy tick, a tab. One page types a
+  search into the box to show results arriving. Its window is draggable and
+  not modal, so it can be moved off whatever it is pointing at and the app
+  used underneath it.
 - **Settings**: every configuration control in one place — the database
   path, indexing and processing limits, search behaviour, the interface
   (scale, shortcut, color scheme) and password protection. Each row
   explains itself on hover. Edits are staged and applied together by
   **Apply & Save**; leaving the tab with unapplied edits asks first. The
   column choices and the password controls are the exceptions, acting the
-  moment they are used, since the Search tab's own header menu writes the
-  same settings. The indexed folder list and the indexing mode live on
-  Manage Index instead, next to the controls that act on them.
+  moment they are used. The indexed folder list and the indexing mode
+  live on Manage Index instead, next to the controls that act on them.
 
 **Ctrl+Shift+F from anywhere** brings QuickSearch to the front, restoring
 it if it was minimized, and puts the cursor in the search box with the
-previous search selected, so the next thing you type is the new one. The
-Settings tab's Interface section rebinds it — click the button and press
-the keys — or switches it off. It is a system-wide shortcut, registered
-with Windows or with the X server, so it works while another application
-has focus. Wayland does not let an application claim a key, so there the
-shortcut is registered with your desktop through the XDG desktop portal
-instead; your desktop then has the final say over which key it is, and its
-own keyboard settings are where to change it. The Settings tab says which
-key it settled on. Wayland likewise gives no application a way to put itself
-in front of what you are doing, so under it the shortcut selects the Search
-tab and the search box but leaves raising the window to the desktop; on X11
-and Windows it raises and restores the window itself.
+previous search selected. The Settings tab's Interface section rebinds it
+— click the button and press the keys — or switches it off. It is a
+system-wide shortcut, registered with Windows or with the X server, so it
+works while another application has focus. Wayland does not let an
+application claim a key, so there the shortcut is registered with your
+desktop through the XDG desktop portal; your desktop then has the final
+say over which key it is, and the Settings tab says which key it settled
+on. Wayland likewise gives no application a way to raise itself, so under
+it the shortcut selects the Search tab and the search box but leaves
+raising the window to the desktop; on X11 and Windows it raises and
+restores the window itself.
 
 The bottom status bar always shows what the indexer is doing (phase,
 percent, files/sec) or the total indexed file count when idle. Applying a
 settings change to the index counts as something the indexer is doing: it
 reports its progress there and in the Manage Index tab, and says what it
-removed for a few seconds after it finishes, so a change that takes a
-millisecond is as visible as one that takes minutes.
+removed for a few seconds after it finishes.
 
 Quitting while a settings change is still being applied asks first. Leaving
 is never refused — the work stops promptly and the index stays consistent —
@@ -436,60 +418,39 @@ capped by `[search] fuzzy_max_edits` (default 2; 0 turns fuzzy off).
 `config.toml` lives at `~/.config/quicksearch/config.toml` (Windows:
 `%APPDATA%\quicksearch\config.toml`) and is created on first run; the
 default index goes to `~/.local/share/quicksearch/index.sqlite`
-(Windows: `%LOCALAPPDATA%\quicksearch\index.sqlite`). See
-`config_example.toml` for every option.
+(Windows: `%LOCALAPPDATA%\quicksearch\index.sqlite`).
 
-Defaults follow the platform. The first indexing root is your home
-directory or `%USERPROFILE%`; `include_hidden = false` skips dot-files
-everywhere and additionally anything marked Hidden on Windows, which is
-what keeps `AppData`, `$RECYCLE.BIN` and `System Volume Information` out
-of the index — the System attribute alone is not enough, because cloud
-sync roots carry it purely to get a branded folder icon; and ignore
-patterns are matched case-insensitively on Windows and macOS, matching
-the filesystem.
+`config_example.toml` is the full reference — every key with its default,
+valid range, and caveats. It ships in the repository root, in the `.deb`
+under `/usr/share/doc/quicksearch/`, and in the Windows install
+directory. In brief: `[paths]` says what to index and where the index
+lives; `[indexing]` sets the mode, reindex interval, symlink and
+hidden-file policy, `content_extensions` and `ignore_patterns`;
+`[processing]` sets extraction and storage limits (`hash_length`, text
+size caps, batching, `maximum_wal_size`, `tokenize`,
+`store_text_for_snippets`); `[security]` covers password protection;
+`[ui]` covers scale, `search_hotkey` and `color_scheme`; `[search]`
+covers the fuzzy settings, result limits, `live_results` and the visible
+columns.
+
+The GUI edits the config live; external edits apply on next start. A
+hand-edited value outside a setting's working range is clamped with a
+warning, never rejected — a typo in a text file must not stop the app
+starting.
 
 **Portable mode**: a `config.toml` sitting next to the `quicksearch`
 binary overrides the user config entirely, and relative paths inside any
 config resolve against the config file's own directory, so a folder
 containing the binary, its config, and its index can be moved wholesale.
 
-The GUI edits the config live; external edits apply on next start.
-
-`[ui] search_hotkey` is the system-wide search shortcut, written the way
-the Settings tab prints it (`Ctrl+Shift+F`): Ctrl, Alt and Shift in any
-combination, plus one key, joined with `+`. An empty string switches it
-off. A value that is not a shortcut is not a config error — the app loads,
-says so on the Settings tab, and runs without one.
-
-Numbers behave the same way. A hand-edited value outside the range a
-setting can work in — `display_limit = 0`, which would make every search
-return nothing — is clamped to the nearest workable one with a warning,
-never rejected: a typo in a text file must not stop the app starting. The
-ranges are in `config_example.toml` beside each setting that has one.
-
-`[ui] color_scheme` is `dark` (the default) or `light`, changeable on the
-Settings tab and applied without a restart. It does not follow the
-desktop's own light/dark setting: on Linux nothing in the window system
-reports that, so the only way to know is to connect to the session message
-bus and subscribe to the user's settings feed — more of your session than a
-search tool should be in, to decide what color some text is.
-
-**Changing what is indexed** does not throw the index away. Narrowing the
-scope — removing a folder, adding an ignore pattern, turning off hidden
-files or symlink following, shortening `content_extensions` — deletes
-exactly the entries that fell out of scope, in place. Widening it — adding
-a folder, deleting a pattern, lengthening the extension list — schedules a
-reindex to find what is newly in scope. Both happen automatically, in
-automatic and manual mode alike, and neither asks first: it is the edit you
-just made. Order and spelling are not changes at all, so reordering the
-folder list or writing `~/docs` where you wrote `/home/you/docs` costs
-nothing.
-
-Only three settings still delete and rebuild the index, because nothing
-stored survives them: `processing.tokenize` (part of the FTS table's
-definition), `processing.hash_length` (existing hashes become
-incomparable), and turning password protection on or off or changing the
-password. In manual mode those ask for confirmation first.
+**Changing what is indexed** does not throw the index away: narrowing the
+scope deletes exactly the entries that fell out of scope, in place, and
+widening it schedules a reindex to find what is newly in scope — both
+automatically, in automatic and manual mode alike. Only three settings
+still delete and rebuild the index, because nothing stored survives them:
+`processing.tokenize`, `processing.hash_length`, and turning password
+protection on or off or changing the password. In manual mode those ask
+for confirmation first.
 
 ## Engineering overview
 
@@ -507,231 +468,126 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
 - **Storage** (`db/`): SQLite via rusqlite (bundled SQLCipher build —
   identical to stock SQLite until a key is applied), WAL mode so the
   single writer never blocks streaming read-only searches. A run forces a
-  `wal_checkpoint(TRUNCATE)` every `processing.maximum_wal_size` bytes of
-  log, because SQLite's own autocheckpoint can only reset the log at an
-  instant no reader holds it — and a run keeps a reader per root querying
-  throughout, so left alone the log grows for the whole run. That threshold
-  is lowered to fit the volume when free space is short, and a run stops
-  with an error rather than fill the disk: SQLite reaches the wal-index
-  through an mmap, and a page fault the filesystem cannot back arrives as
-  **SIGBUS**, which no `Result` can catch. The index's own files are, for
-  the same reason, never walked into — hashing one means opening it, and on
-  POSIX closing any descriptor on an inode cancels every advisory lock the
-  process holds on it, SQLite's documented corruption hazard. `files` holds
-  metadata (name, path, size, mtime, hash, MIME/type bitmask, content
-  state); `searchabletext` is a *contentless* FTS5 table over one column,
-  the document body (postings only, configurable tokenizer, trigram by
-  default) — filename ranks come from scanning `files.name`, so a `name`
-  column there would only index the same strings twice; canonical extracted
-  text lives zstd-compressed in `documents_text`, which powers snippets,
-  occurrence ranking, and fuzzy full-text search, and whose uncompressed
-  length is read back from the zstd frame header rather than stored beside
-  it. Schema changes wipe and
-  rebuild by policy; the indexer (`open_or_recreate`) is the only code
-  allowed to do that; every consumer uses `open_existing`, which treats
-  drift as an error, never data loss. With password protection on, every
-  open applies the Argon2id-derived raw key (`security.rs`, process-global
-  in `db/key.rs`) before anything reads the file; a wrong key is a tagged
-  `KEY_MISMATCH` error, structurally distinct from the schema drift that
-  may wipe, so it can never destroy an intact index. Each kind of connection
-  takes a page cache sized for what it does and how long it lives, rather than
-  one figure applied everywhere (`db/schema.rs` sets six profiles and argues
-  each): the caches are `malloc`ed, so a connection that scans a table and is
-  then held — the coordinator's writer, before it learned to let go when idle —
-  keeps that memory for the life of the process. Search is the one deliberately
-  large one, because it is the only cache reused often enough to pay for
-  itself, and it is released once searching stops. Dropping the connection is
-  only half of releasing it: glibc hands the freed pages back to its own arena
-  rather than to the kernel, so the search worker calls
-  `platform::release_free_heap` after it lets go, exactly as
-  `coordinator::go_idle` does for the writer. Without that call one typing
-  session left the process 42 MiB heavier for as long as it ran — measured on a
-  77k-file index, where an idle GUI sat at 76 MiB `RssAnon` and stayed there,
-  against 34 MiB before the first search and 42 MiB once the trim runs.
+  `wal_checkpoint(TRUNCATE)` every `processing.maximum_wal_size` bytes,
+  checkpoints sooner when free space is short, and stops with an error
+  before the disk fills (see `config_example.toml`). The index's own
+  files are never walked into: opening one to hash it would cancel the
+  process's POSIX advisory locks on that inode, SQLite's documented
+  corruption hazard. `files` holds metadata (name, path, size, mtime,
+  hash, MIME/type bitmask, content state); `searchabletext` is a
+  *contentless* FTS5 table over the document body (postings only,
+  trigram tokenizer by default) — filename ranks come from scanning
+  `files.name`; canonical extracted text lives zstd-compressed in
+  `documents_text`, powering snippets, occurrence ranking, and fuzzy
+  full-text search. Schema changes wipe and rebuild by policy: only the
+  indexer (`open_or_recreate`) may do that, and every consumer uses
+  `open_existing`, which treats drift as an error, never data loss. With
+  password protection on, every open applies the Argon2id-derived raw key
+  (`security.rs`, process-global in `db/key.rs`) first; a wrong key is a
+  tagged `KEY_MISMATCH` error, structurally distinct from schema drift,
+  so it can never destroy an intact index. Each connection kind takes a
+  page cache sized for its job and lifetime — `db/schema.rs` sets six
+  profiles and explains each — released, heap included
+  (`platform::release_free_heap`), when the search worker or idle writer
+  lets go.
 - **Indexing** (`indexing.rs`, `file_handling.rs`): full runs walk each
-  root (`filtered_walk` prunes hidden/ignored subtrees before descending),
-  classify files by mtime into insert/update/skip, batch-write metadata,
-  sweep stale rows, then extract content (plaintext, RTF, Office — both the
-  OOXML/ODF zip formats and the pre-2007 binary `.doc`/`.xls`/`.ppt`, whose
-  OLE2 streams are read in `extract/ole.rs` — PDF, audio tags; see
-  `extract/`) for FTS. Images are claimed by no extractor: the EXIF reader
-  produced structured properties and never text, and with properties parked
-  (see `extract::ExtractedContent`) leaving `image/*` unclaimed is what keeps
-  the content pass from opening every image on disk. PDFs are parsed once:
-  the two-parse version that preceded it was the largest single memory
-  consumer of a run over a PDF-heavy tree, and it was what pulled a second
-  copy of `lopdf` — and with it rayon's
-  never-torn-down thread pool — into the build. That is a claim about PDFs
-  rather than about runs in general, and it is worth knowing which tree a
-  number came from: on one with almost no PDFs, a cold run peaks at 130 MiB
-  against 27 MiB for the same walk with content extraction switched off, and
-  switching off `store_text_for_snippets` moves that peak not at all — so what
-  is left is the extraction workers and FTS5's own index build, not any single
-  parser and not the stored text. Files whose extension no MIME
-  table knows — including extensionless ones like `README` or `Makefile` —
-  are sniffed from their head bytes and indexed as text only when that head
-  is provably text: valid UTF-8, or BOM-marked (`mime.rs`, `textenc.rs`).
-  Legacy charsets are decoded via chardetng and stored as UTF-8, but only
-  for files something *else* typed as text, normally their extension —
-  chardetng's windows-1252 floor never fails, so accepting it on a bare
-  sniff would adopt any binary lacking NUL bytes. More claimed files means a
-  bigger index — `indexing.content_extensions` remains the throttle. Files no larger than `processing.hash_length` skip that second
-  pass entirely: the head the walk reads to hash them is already their
-  whole content, so a plaintext body is extracted in the same `read` and
-  stored complete. Every root runs its own pipeline — its own walker pool
-  and, once the walk ends, its own extraction pool — but every root's
-  *writes* go through one thread and one connection
-  (`indexing/pipeline.rs`), because that is what a single SQLite file
-  allows. That thread is where FTS5 tokenizes, up to `maximum_text_size`
-  of text per document inside the insert, and it is the run's dominant
-  cost. So its loop is scheduled around the walk, the disk-bound phase and
-  the one whose stall shows: each round serves every walking root first,
-  then one extracting root, and no turn runs past a 100 ms slice — an
-  extraction turn commits at the slice and carries the rows it did not
-  reach to its next turn. A walk therefore waits at most one slice per
-  round, which its walkers' channel absorbs, so a root walking a large tree
-  runs at its own rate while another root tokenizes big documents beside
-  it. What a root has left to extract is counted by its own content pass,
-  on that pass's read connection, rather than on the writer: on a large
-  root the count is seconds, and seconds of writer time is every other
-  root's walk standing still. Total write throughput is what one connection
-  tokenizing can do; the scheduling shares it fairly and keeps the walk
-  first, it does not raise it. Every run ends — whether
-  it completed or was stopped — with an optimize pass on its own connection:
-  checkpoint, VACUUM if the file has at least 20% slack to reclaim, `PRAGMA
-  optimize`, checkpoint again. Progress streams through a polled
-  `IndexingStatus`, which reads `Optimizing` for the duration of that pass —
-  and `Preparing` for everything a run does before its first file is walked:
-  waiting on the previous run's thread, opening the index (a WAL recovery
-  lands here), and reconciling a changed configuration. Each carries the run's
-  start time, so a prologue that outlasts the walk on a large index reads as
-  slow work rather than a hang.
-- **Scope reconciliation** (`scope.rs`): the index is a cache of what a walk
-  under the configured roots would produce, so a configuration change is a
-  difference between the two rather than a reason to start over.
-  `config::diff_actions` turns old-versus-new into an `IndexWork` plan —
-  roots to delete by path range, rows to re-test against the walker's own
-  filtering rules (`Scope::covers` mirrors `read_directory` exactly, or the
-  next run would re-add what the last prune removed), stored text to
-  re-decide, and whether a walk must follow. The coordinator applies it in
-  250 ms slices so a multi-million-row scan never blocks its command loop,
-  and every run applies it once more against the `config_validation`
-  fingerprint, which is what makes a config hand-edited while the app was
-  closed behave like one edited live. The scan is per-root, by `[lo, hi)`
-  range: a symlink target stored outside every root has no owning root and
-  therefore no rules that could be applied to it, so it is never visited.
-  Whichever of the two applies it, a pass that *finishes* records what it
-  reconciled against — everything but the three rebuild-only keys, which no
-  scan can satisfy. That record is the whole convergence condition: an
-  abandoned pass leaves it alone and the next run picks the work back up,
-  while a completed one stops every later run from re-deriving the same plan
-  and rescanning every row to redo work already done. Both report a live
-  `ReconcileProgress` while they scan, since on a large index this is minutes
-  of work with no files moving to show for it. Both can also be abandoned:
-  `advance` reads a cancel flag before every statement, and the statement
-  already running — one `DELETE` can cover a whole root — is ended by
-  `sqlite3_interrupt`, since a flag alone cannot reach inside SQLite. That is
-  what makes closing the window during a prune immediate instead of a wait
-  the desktop offers to kill. `scope::outstanding_work` asks the record what
-  is still owed, which is how the GUI knows to remind you at the next launch.
+  root (`filtered_walk` prunes hidden/ignored subtrees before
+  descending), classify files by mtime into insert/update/skip,
+  batch-write metadata, sweep stale rows, then extract content for FTS —
+  plaintext, RTF, Office (the OOXML/ODF zip formats and the pre-2007
+  binary OLE2 formats, `extract/ole.rs`), PDF (parsed once per file),
+  audio tags; see `extract/`. Images are claimed by no extractor, which
+  keeps the content pass from opening every image on disk. Files whose
+  extension no MIME table knows — including extensionless ones like
+  `README` — are sniffed from their head bytes and indexed as text only
+  when that head is provably text: valid UTF-8, or BOM-marked
+  (`mime.rs`, `textenc.rs`). Legacy charsets are decoded via chardetng
+  and stored as UTF-8, but only for files something *else* typed as text
+  (a bare sniff would adopt any binary lacking NUL bytes);
+  `indexing.content_extensions` is the throttle. Files no larger than
+  `processing.hash_length` skip the content pass: the head the walk
+  reads to hash them is already their whole content. Every root runs its
+  own walker and extraction pools, but all writes go through one thread
+  and one connection (`indexing/pipeline.rs`) — the thread where FTS5
+  tokenizes, the run's dominant cost. Its loop keeps the walk first:
+  each round serves every walking root, then one extracting root, and no
+  turn runs past a 100 ms slice, so one root's big documents never park
+  another root's walkers. Every run ends — completed or stopped — with
+  an optimize pass: checkpoint, VACUUM if the file has at least 20%
+  slack, `PRAGMA optimize`, checkpoint again. Progress streams through a
+  polled `IndexingStatus` (`Optimizing` during that pass, `Preparing`
+  for everything before the first file is walked).
+- **Scope reconciliation** (`scope.rs`): the index is a cache of what a
+  walk under the configured roots would produce, so a configuration
+  change is a difference between the two, not a reason to start over.
+  `config::diff_actions` turns old-versus-new into an `IndexWork` plan:
+  roots to delete by path range, rows to re-test against the walker's
+  own rules (`Scope::covers` mirrors `read_directory` exactly), stored
+  text to re-decide, and whether a walk must follow. The coordinator
+  applies it in 250 ms slices; every run applies it once more against
+  the `config_validation` fingerprint, so a config hand-edited while the
+  app was closed behaves like one edited live. A finished pass records
+  what it reconciled against; an abandoned one leaves the record so the
+  next run resumes the work, a completed one stops later runs from
+  re-deriving the plan, and `scope::outstanding_work` is how the GUI
+  knows to remind you at the next launch. Both paths report live
+  progress and can be abandoned mid-statement (`sqlite3_interrupt`).
 - **Coordinator** (`coordinator.rs`): the object binaries construct.
   Owns the `IndexingService`, the debouncing filesystem watcher
-  (`watcher.rs`), and the mode state machine (Auto / Manual, persisted as
-  `indexing.auto_index` — the mode the app is left in is the mode it
-  starts in, and a config carrying a different value switches it). Watcher
-  events become single-file transactions (`incremental.rs`) that keep
-  `files`, FTS, and the text sidecar consistent per commit; a full
-  reindex runs on a configurable interval. Incremental writes defer while
-  a full run is active, so there is exactly one writer at a time — scope
-  reconciliation defers with them, for the same reason.
-  Registration follows what the platform's notification API can do:
-  inotify covers one directory per watch, so the roots are walked and each
-  surviving directory registered individually (skipping `.git`,
-  `node_modules` and hidden subtrees, which is what keeps the watch count
-  affordable), while `ReadDirectoryChangesW` covers a whole tree from one
-  handle and takes a single watch per root, filtering the events instead.
-  Either way a tree too large to watch degrades to periodic reindexing
-  rather than going silently stale.
-- **Live results** (`live.rs`): a second, much smaller watcher, owned by the
-  frontend rather than the coordinator, pointed at the parent directories of
-  the result rows *currently on screen* once they have held still for a
-  moment. It watches directories, not the result files: editors save by
-  writing a temporary file and renaming it over the target, so the event
-  lands on the directory and a watch on the file is left holding an orphaned
-  inode. What a row shows is read from the **file**, never from the index —
-  metadata from `stat`, and for a content match the same MIME sniffing and
-  extractors the indexer uses, re-cut through the same `cascade::text_snippet`
-  the search itself does. That is what makes it work with indexing stopped.
-  Arming also sweeps each target once against the size and modified time the
-  row is displaying, which on a fresh result is what the index said: so
-  bringing a row on screen *is* a check of the index against the disk, and it
-  is the only thing that reports anything where the platform sends no events.
-  It still writes nothing itself; the paths it has just read go to
-  `IndexCoordinator::update_paths`, which applies them on the coordinator's
-  own thread — in any mode, so a stopped index does not drift from the screen
-  — leaving the single-writer rule intact. Caps at 64 directories and 256
-  rows, rate-limited per path, and dropped wholesale the moment the query is
-  edited.
+  (`watcher.rs`), and the Auto/Manual mode state machine (persisted as
+  `indexing.auto_index`). Watcher events become single-file transactions
+  (`incremental.rs`) that keep `files`, FTS, and the text sidecar
+  consistent per commit; a full reindex runs on a configurable interval.
+  Incremental writes and scope reconciliation defer while a full run is
+  active, so there is exactly one writer at a time. Watch registration
+  follows the platform: inotify takes one watch per surviving directory
+  (skipping `.git`, `node_modules` and hidden subtrees, which keeps the
+  count affordable); `ReadDirectoryChangesW` covers a whole tree from
+  one handle. Either way a tree too large to watch degrades to periodic
+  reindexing instead of going silently stale.
+- **Live results** (`live.rs`): a second, much smaller watcher, owned by
+  the frontend, pointed at the parent directories of the result rows
+  currently on screen — directories, not files, because editors save by
+  renaming a temporary file over the target. What a row shows is read
+  from the **file**, never from the index (metadata from `stat`, content
+  re-extracted and re-cut through the same `cascade::text_snippet` the
+  search uses), which is what makes it work with indexing stopped.
+  Arming also checks each row once against the disk, and the paths just
+  read go to `IndexCoordinator::update_paths`, applied on the
+  coordinator's own thread — the single-writer rule stays intact. Caps
+  at 64 directories and 256 rows, rate-limited per path, and dropped
+  wholesale the moment the query is edited.
 - **Search** (`search/`): `SearchService` runs one worker thread; each
   query is a *generation*. New queries interrupt the in-flight SQLite
   statement (`InterruptHandle`) and stale generations stop cooperatively,
-  so typing never waits. The worker keeps its connection across requests and
-  drops it once searching stops, so a typing session runs against a page cache
-  that is already warm instead of rebuilding one per keystroke; because a
-  rebuild or clear puts a *new* file at the *same* path, an index generation
-  counter (`db::index_epoch`) is what tells the held connection to reopen. The cascade streams rank-ordered batches: one
-  `files` scan classifies exact/case/substring filename matches (ranks
-  1–4) and, since a path contains its own name, sets aside full-path
-  matches from the same rows (ranks 9–10); one FTS phrase probe verified
-  against the decompressed text yields full-text ranks 5–6 ordered by
-  occurrence count; and the opt-in fuzzy passes run a bitap (Wu–Manber)
-  matcher over filenames (rank 7), document text (rank 8) and paths
-  (rank 11), with a configurable edit budget. The deferred path tiers
-  flush last, so weaker matches only ever append. All SQL is
-  parameterized; structured filters from the query language (`query/`)
-  are ANDed onto every pass.
-
-  The passes that read document text share one `zstd::bulk::Decompressor` and
-  one output buffer per scan (`DocDecoder` in `search/cascade/passes.rs`),
-  and the row's path is borrowed from the statement rather than copied — only
-  rows that become hits own one. Both matter more than they look: peak memory
-  during a search never exceeded 14 MiB even before any of this, but a *single*
-  fuzzy query moved 31 GiB through `malloc`, and resident-set sampling is blind
-  to that by construction, because a buffer allocated and freed inside one loop
-  iteration never moves RSS. `DocDecoder` must therefore never fall back to a
-  per-row allocating decode, and there is a trap waiting there:
-  the indexer writes through `DocEncoder`, i.e. `zstd::bulk::Compressor` and
-  so `ZSTD_compress2`, which is handed the whole document at once and records
-  its length in the frame header. `get_frame_content_size` therefore returns
-  `Some` for every row this writer produced, the reservation is normally
-  exact, and the growth loop below it is the fallback for a frame written by
-  a *stream* encoder rather than the only branch. What must not come back is
-  handing the `None` case to `zstd::decode_all`, which looks obviously right
-  and costs ~2.4 MiB per document because it builds a streaming decoder per
-  call — 27 of the 30 GiB a fuzzy search moved. Growing this buffer and
-  keeping it is what makes decoding a row allocate nothing at all.
-  Measured over the same 77k-file index, per query:
-  `cascade` 582 → 14 MiB, `function` 6.0 GiB → 29 MiB, `--fuzzy cascade`
-  31 GiB → 57 MiB, `regex:` 31 GiB → 39 MiB, each a little faster rather than
-  slower. `TermPattern::find_first` folds nothing either: its
-  case-insensitive literal branch used to allocate a lowercased copy of its
-  haystack, which the filename pass asked for twice per row of a full-table
-  scan.
-- **Duplicate verification** (`verify.rs`): the second opinion on a group from
-  `search/duplicates.rs`, which groups by `sha256(size ‖ head)` and so cannot
-  tell two pre-allocated disk images apart — same size, same zeroes at the
-  front, everything that distinguishes them in a footer. One lockstep pass:
-  open every member, drop the ones whose length already disagrees without
-  reading them, then read a chunk from the first that opened and the same
-  span from each of the others, reporting the offset of the first byte that
-  differs and dropping that file from the walk. Deliberately not a hash —
-  "the same digest" is a probabilistic answer, and a probabilistic answer is
-  what the head hash already gave. The reference is the first member that
-  *opens*, so one unreadable file costs its own verdict and nobody else's,
-  and termination follows what that file actually reads rather than the
-  length it claimed, so a file truncated mid-run degrades to a short
-  comparison. The read buffers share a fixed 8 MiB between them however many
-  members a group has, because a hardlink farm's group runs to thousands.
+  so typing never waits. The worker keeps its connection across requests
+  and drops it once searching stops, so a typing session runs against a
+  warm page cache; an index generation counter (`db::index_epoch`) tells
+  the held connection to reopen when a rebuild puts a new file at the
+  same path. The cascade streams rank-ordered batches: one `files` scan
+  classifies exact/case/substring filename matches (ranks 1–4) and sets
+  aside full-path matches from the same rows (ranks 9–10); one FTS
+  phrase probe verified against the decompressed text yields full-text
+  ranks 5–6 ordered by occurrence count; the opt-in fuzzy passes run a
+  bitap (Wu–Manber) matcher over filenames (rank 7), document text
+  (rank 8) and paths (rank 11). The deferred path tiers flush last, so
+  weaker matches only ever append. All SQL is parameterized; structured
+  filters from the query language (`query/`) are ANDed onto every pass.
+  The passes that read document text share one reusable decompressor and
+  output buffer per scan — see `DocDecoder` in `db/repo.rs` for the
+  allocation rules that keep that path cheap.
+- **Duplicate listing** (`search/duplicates.rs`): three queries,first a  
+  sorted `idx_files_hash`, iterating the sorted hashes to find duplicates,
+  then hydrating them with size and path information, keeping the largest.
+- **Duplicate verification** (`verify.rs`): the second opinion on a group
+  from `search/duplicates.rs`, which groups by `sha256(size ‖ head)` and
+  so cannot tell apart files that differ only past the head. One
+  lockstep byte-for-byte pass — not a hash; the head hash already gave
+  the probabilistic answer. Members whose length disagrees are dropped
+  unread; the rest are compared span by span against the first member
+  that *opened*, so one unreadable file costs its own verdict and nobody
+  else's, and a file truncated mid-run degrades to a short comparison.
+  The read buffers share a fixed 8 MiB however many members a group has.
 - **Baloo compatibility** (`cli.rs`, `mime.rs`): the read API this repo's
   parent consumes — `status_for_path`, `list_failed`,
   `index_size_breakdown`, `pending_content_count`, `clear_path` — plus a
@@ -739,7 +595,7 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   repository; the rest are a compatibility surface for the parent's
   `balooctl` layer and are not dead code.
 - **Logging** (`log.rs`): background reporting goes through `log_info!` /
-  `log_warn!` rather than `println!`/`eprintln!`. Each writes its line to
+  `log_warn!`. Each writes its line to
   stderr *and* appends it to a bounded in-memory ring (newest 5000 lines,
   with a count of what was dropped) that the GUI's Logs tab reads, so a
   windowed run with no terminal still surfaces them. Command output —
@@ -747,10 +603,10 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
 - **Platform differences** (`platform.rs`): the single home for `#[cfg]`.
   Home directory lookup, what counts as a hidden entry (dot-prefix, plus
   the Hidden attribute on Windows — System deliberately excluded, since
-  cloud sync roots set it to get a folder icon), network-filesystem detection
-  (`/proc/mounts` against `GetDriveTypeW`), path collation, and the
-  watch-registration strategy all live here, so the rest of the crate can
-  ask a question rather than test a target. Anything decidable from a
+  cloud sync roots set it to get a folder icon), network-filesystem
+  detection (`/proc/mounts` against `GetDriveTypeW`), path collation, and
+  the watch-registration strategy all live here, so the rest of the crate
+  asks questions instead of testing `cfg` targets. Anything decidable from a
   string alone is split out so its tests run on every platform.
 
 ### Frontend (`quicksearch-gui`)
@@ -766,14 +622,18 @@ core threads ─────────────▶ ctx.request_repaint() (w
 Modules map one-to-one onto what you see: `app.rs` (shell and config
 routing, with `app/` submodules for the status bar, the security flow, the
 confirmation modals and the duplicate-verification modal — the one place a
-worker's progress is shown in a window rather than the status bar),
+worker's progress is shown in a window, not the status bar),
 `search_tab.rs` (query strip and virtualized
 results table; snippet rendering via `LayoutJob` byte ranges, the ignore
 dialog and the syntax help live in `search_tab/`), `manage_tab.rs` (status
 detail + `tracker.rs` rate estimation, roots and filter editors),
 `duplicates_tab.rs`, `logs_tab.rs` (a virtualized view of the core log
 ring), `settings_tab.rs` (the draft-based config editor, the second of the
-two tabs that stage their edits behind an Apply & Save), `platform.rs`
+two tabs that stage their edits behind an Apply & Save), `tutorial.rs` (the
+first-start tour) with `spotlight.rs` (the pass-scoped registry of where the
+widgets it points at were drawn — written by the tabs as they lay out, read
+by the tour at the end of the same pass, and inert whenever the tour is
+closed), `platform.rs`
 (open / reveal-in-file-manager, and the
 Windows stdio setup a window-subsystem process needs before anything
 prints), `hotkey/` (the system-wide search shortcut: one key table feeding
@@ -785,135 +645,63 @@ microseconds regardless of row count.
 
 ## Development
 
-- `cargo test -p quicksearch-core`: unit + integration suites (cascade
+- `cargo test -p quicksearch-core`: unit + integration suites — cascade
   ranking, cancellation, incremental indexing, coordinator modes, config
-  resolution, fuzzy matcher vs. brute-force oracle, `verify.rs`'s byte-for-byte
-  comparison — the shared-head-different-tail case the head hash cannot see, an
-  unreadable first member, a difference past the first chunk, cancellation —
-  and `live.rs`'s event
-  classification, where the platform-specific rename and atomic-save shapes are
-  synthesized rather than provoked, so they are checked on every platform).
-- `cargo test -p quicksearch-gui`: formatter/tracker/CLI-parsing units plus
-  headless egui tests that drive the real widgets — building an input frame,
-  synthesizing clicks and reading back the painted text (`test_ui.rs`) — over
-  the search, manage and settings tabs, the unlock gate, the logs
-  and duplicates tabs, the first-start tour, and query highlighting. The search
-  tab's cover the column picker (including that the path column survives all
-  32 combinations of the others), which column a match is highlighted in, and
-  that the repeat-search button appearing inside the query box does not cost it
-  keyboard focus. The duplicates tab's open the real context menus and click
-  the entries inside them, so "the verification asks for the whole group, from
-  either menu, and not at all while one is running" is checked rather than
-  assumed; the verification modal is rendered in each of its states, and the
-  tour's footer is probed for where its three buttons actually landed rather
-  than for the numbers they were expected to land on.
-- `cargo bench -p quicksearch-core --bench search` and `--bench index`: divan
-  microbenchmarks over the two hot paths. Each group runs *what the code does
-  today* against *the change being considered*, in one process on one corpus,
-  so the comparison is a measurement rather than an estimate — read the losing
-  arm as documentation of something already tried. Sizes sweep 1 KiB, 16 KiB
-  and 256 KiB, the last being `maximum_text_size` and so the worst a full-text
-  row can present; `benches/corpus/` builds all of it from a fixed seed. This
-  is the harness to extend when a hot path is in question, because it is the
-  only one here that can A/B a single function.
-- `QSB_SNIPPET_PERF=1 cargo test --release -p quicksearch-core --test
-  snippet_perf -- --nocapture`: snippet pipeline benchmark.
-- `QSB_SEARCH_PERF=1 cargo test --release -p quicksearch-core --test
-  search_perf -- --nocapture`: what a warm page cache is worth to search, swept
-  across cache ceilings and run both encrypted and not. It exists because the
-  right size for `PRAGMAS_SEARCH` is not something to reason about: encrypted,
-  the curve has a cliff at the working set, because SQLCipher caches pages
-  decrypted and a miss below that costs an AES-CBC plus an HMAC-SHA512 per
-  4 KiB page. Unencrypted it is flat. Read it before changing that number.
+  resolution, fuzzy matcher vs. brute-force oracle, `verify.rs`'s
+  byte-for-byte comparison, and `live.rs`'s event classification (the
+  platform-specific rename and atomic-save shapes are synthesized, so
+  they are checked on every platform).
+- `cargo test -p quicksearch-gui`: formatter/tracker/CLI-parsing units
+  plus headless egui tests that drive the real widgets — building an
+  input frame, synthesizing clicks and reading back the painted text
+  (`test_ui.rs`) — over the search, manage and settings tabs, the unlock
+  gate, the logs and duplicates tabs, the first-start tour, and query
+  highlighting.
+- `cargo bench -p quicksearch-core --bench search` and `--bench index`:
+  divan microbenchmarks over the two hot paths, A/B-ing the current code
+  against a considered change on one seeded corpus (`benches/corpus/`).
+  This is the harness to extend when a hot path is in question.
+- `QSB_SEARCH_PERF=1 cargo bench -p quicksearch-core --bench search_perf`:
+  what a warm page cache is worth to search, swept across cache ceilings,
+  encrypted and not. Read it before changing `PRAGMAS_SEARCH`.
+- `QSB_SEARCH_ALLOC=1 cargo bench -p quicksearch-core --bench search_alloc`:
+  what a search moves through the allocator, per query shape.
 - Memory probes, all under `crates/quicksearch-core/examples/`:
-  `memprobe <cold|warm> <root> <db>` reports an indexing run's peak *and* what
-  it settles at once idle — the gap between those is the memory a process
-  keeps for nothing, since glibc's `free` returns chunks to its arena rather
-  than to the kernel. `rssprobe <pid> [duration_s]` attributes a *running*
-  process's footprint instead, splitting anonymous heap (ours) from
-  file-backed pages (the binary, libc, the GL stack), reading `Private_Dirty`
-  rather than `VmRSS`, and counting glibc's arenas so retention is
-  distinguishable from live data. It reads another process's `/proc`, so it
-  measures a build made without knowing it would be measured.
-  `indexprobe` and `walkprobe` answer "how fast" rather than "how much".
-
-  All of these read the resident set, and none of them can see allocator
-  *churn*: a buffer allocated and freed within one loop iteration never moves
-  RSS, so a search whose peak is a flat 14 MiB can still be pushing tens of
-  gigabytes a query through `malloc`. Both search-side regressions found so far
-  were invisible to every probe listed above and showed up only under an
-  interposed `malloc` that counted calls and bytes. Until a probe here reports
-  allocation counts, measure that separately before concluding a path is cheap,
-  and measure the GUI rather than a one-shot `quicksearch-cli` run — a
-  short-lived process cannot show what a typing session retains.
-- `.forgejo/workflows/ci.yml`: builds and tests both platforms on every push to
-  `master` and every pull request. Those runs stop there — packaging (the
-  `.deb`, the AppImage, the tarball, the Windows installer and `.zip`, and the
-  artifact upload) runs only where a release can actually come out, which is a
-  `v*` tag or a `Release...` branch. The Windows non-system-DLL check is
-  deliberately not gated that way: it validates the `.exe` rather than
-  packaging it, so it runs everywhere and catches a regression on `master`
-  rather than at release time.
-
-  To cut a release, bump `[workspace.package] version`
-  in `Cargo.toml` and push the commit on a branch named `Release...`; CI runs
-  `cargo update -w` first, so a lockfile still pinning the old member versions
-  is not something you have to remember. That only re-resolves the workspace
-  crates, so the `--locked` build after it still fails on a dependency added or
-  bumped without committing `Cargo.lock`. Forgetting the version bump is caught
-  in seconds rather than after two full release builds: each release path gets
-  a guard before anything is compiled — a `v*` tag is checked against the
-  workspace version, and a `Release...` branch is checked against the tags that
-  already exist. Both are accelerators, not the authority; the release job
-  re-checks and remains the thing that actually refuses. Once both
-  build jobs are green, CI tags that commit `v<version>` and publishes a release
-  with the `.deb`, an AppImage and its `.zsync` sidecar, a Linux tarball, the
-  Windows installer and a Windows zip attached; pushing a `v*` tag by hand does
-  the same thing. The sidecar is the one asset named without a version, because
-  every released AppImage embeds its URL and that URL has to keep resolving as
-  releases come and go — Forgejo resolves the literal tag `latest` to the newest
-  release and looks an asset up by name, so it is always at
-  `.../releases/download/latest/quicksearch-x86_64.AppImage.zsync`. Note that is
-  `/releases/download/latest/`, not the GitHub-style `/releases/latest/download/`,
-  which Forgejo does not implement. The version is never taken from the branch
-  name, and a tag that already exists at a different commit aborts the release
-  rather than shipping two builds under one version. Every build carries its
-  identity: `crates/quicksearch-gui/build.rs` bakes in the commit CI passes as
-  `QS_COMMIT`, and the pair shows up as `v<version> (<commit>)` in the
-  bottom-right of the status bar, from `quicksearch-cli --version`, and in the
-  Windows `.exe` properties. A build made outside a git checkout reads
-  `unknown` there rather than failing. The Linux job runs in an Ubuntu
-  22.04 container on purpose — `packaging/build-deb.sh` reads the package's
-  `libc6` floor from the binary it just built, so the builder's glibc becomes
-  the package's minimum, and 22.04 pins it at 2.35. The AppImage is cut from
-  that same binary and bundles no libraries, so 2.35 is its floor too — it is
-  the one number that decides how far either Linux artifact reaches.
-  The Windows job
-  cross-compiles with mingw-w64 and fails if either `.exe` picks up a
-  dependency on a non-system DLL, then builds both Windows assets from those
-  binaries — `packaging/build-installer.sh` runs `makensis`, which is a Linux
-  program, so the installer needs no Windows runner either.
+  `memprobe <cold|warm> <root> <db>` reports an indexing run's peak and
+  what it settles at once idle; `rssprobe <pid> [duration_s]` attributes
+  a running process's footprint, distinguishing retention from live data;
+  `indexprobe` and `walkprobe` answer "how fast", not "how much".
+  All of them read the resident set and none can see allocator churn, so
+  measure allocations separately before concluding a path is cheap.
+- `.forgejo/workflows/ci.yml`: builds and tests both platforms on every
+  push to `master` and every pull request; packaging and release
+  publication run only on a `v*` tag or a `Release...` branch. The
+  release mechanics — version guards, tagging, asset naming, the `.zsync`
+  update URL — are documented in that file and in
+  `packaging/build-appimage.sh`.
 - New extractors: implement `extract::Extractor` and register it in
   `Registry::default_set()` — order matters, the first extractor whose
   `supports` accepts a MIME wins. Then add the format to the corpus in
-  `crates/quicksearch-core/tests/corpus/`, which writes a randomized lipsum
-  document in every supported format and asserts the planted text comes back —
-  at the extractor, through the walk-time head path, and end to end through
-  indexing and search (`tests/extraction_corpus.rs`). Its rule is that no
-  corpus file may be written by the library that reads it back, since a writer
-  and reader sharing a wrong assumption agree with each other; the module docs
-  say which library writes what and why. New cascade behavior:
-  `search/cascade.rs` documents the rank invariants that keep streamed results
-  append-only.
-- `packaging/capture.sh`: regenerates the website assets — `search.webm`,
-  `manage-indexing.webm`, `duplicates.png`, `query-highlight.png` — into
-  `packaging/captures/` (gitignored). It builds the GUI with the `capture`
-  feature, whose scripted driver types, switches tabs, waits on indexer
-  state, and captures both screenshots and video frames from the app's own
-  framebuffer (piped to ffmpeg), so the display server never matters — X11
-  and Wayland record identically, and overlapping windows can't leak into
-  the footage; `packaging/capture-scenario.txt` is the choreography and is
-  meant to be edited. Runs against a throwaway index of this repository plus
-  `~/.cargo/registry/src` under scratch XDG dirs, so your real config and
-  index are untouched. Needs a graphical session and ffmpeg with
-  `libx264rgb` and `libvpx-vp9`.
+  `crates/quicksearch-core/tests/corpus/` and `tests/extraction_corpus.rs`;
+  no corpus file may be written by the library that reads it back. New
+  cascade behavior: `search/cascade.rs` documents the rank invariants
+  that keep streamed results append-only.
+- `packaging/capture.sh`: regenerates the website assets into
+  `packaging/captures/` (gitignored) by building the GUI with the
+  `capture` feature, whose scripted driver
+  (`packaging/capture-scenario.txt`) records from the app's own
+  framebuffer against a throwaway index under scratch XDG dirs. Needs a
+  graphical session and ffmpeg with `libx264rgb` and `libvpx-vp9`.
+
+To cut a release:
+
+1. Bump `[workspace.package] version` in `Cargo.toml`.
+2. Commit and push on a branch named `Release...` (CI runs
+   `cargo update -w`, so the lockfile's own member versions follow).
+3. Once both build jobs are green, CI tags the commit `v<version>` and
+   publishes the release with the `.deb`, the AppImage and its `.zsync`
+   sidecar, a Linux tarball, the Windows installer and a Windows zip.
+   Pushing a `v*` tag by hand does the same thing.
+4. Release builds run on the oldest supported LTS (an Ubuntu 22.04
+   container): the builder's glibc becomes the `.deb`'s and the
+   AppImage's floor.

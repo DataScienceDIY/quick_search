@@ -1,15 +1,8 @@
 //! The audio corpus files: `.mp3` and `.flac`.
-//!
-//! Audio is the one format family whose "text" is not a document body but a
-//! handful of tag values, so its expectation is the five fields
-//! `extract::audio` concatenates, in the order it concatenates them: title,
-//! artist, album, genre, comment. Getting that order wrong is a real
-//! regression — the stored text would churn between runs — so the ordered
-//! match is doing load-bearing work here rather than just tolerating
-//! boilerplate.
-//!
-//! `id3` and `metaflac` write the tags; `lofty` reads them. The audio data
-//! underneath is hand-rolled, since neither crate synthesises any.
+//! Audio "text" is the five tag values `extract::audio` concatenates, in
+//! its emit order — order is load-bearing, so the ordered match really
+//! checks it. `id3` and `metaflac` write the tags, `lofty` reads them; the
+//! audio data is hand-rolled, since neither crate synthesises any.
 
 use std::path::Path;
 
@@ -20,11 +13,8 @@ pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec
     flac(dir, lcg, body, out);
 }
 
-/// The five tag values, in `extract::audio`'s emit order.
-///
-/// Sentence 1 carries the needle, 2 the Latin-1 phrase and 3 the Greek, so
-/// this spread also puts non-ASCII into two different tag frames — which is
-/// what forces the writers off ISO-8859-1 and into a wide encoding.
+/// The five tags in emit order; non-ASCII in two frames forces the writers
+/// off ISO-8859-1 into a wide encoding.
 fn fields(sentences: &[String]) -> [&str; 5] {
     [
         &sentences[0],
@@ -35,9 +25,8 @@ fn fields(sentences: &[String]) -> [&str; 5] {
     ]
 }
 
-/// Four silent MPEG-1 Layer III frames: 128 kbps, 44.1 kHz, no padding, so
-/// each is 417 bytes. Four because a probe confirms a sync word by checking
-/// that the next frame begins where the first one said it would.
+/// Four silent MPEG-1 Layer III frames (128 kbps, 44.1 kHz, 417 bytes each):
+/// a probe confirms a sync word by checking where the next frame begins.
 fn mpeg_frames() -> Vec<u8> {
     let mut out = Vec::with_capacity(4 * 417);
     for _ in 0..4 {
@@ -77,18 +66,10 @@ fn mp3(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) 
     });
 }
 
-/// Fifty milliseconds of silence, committed at `tests/fixtures/silence.flac`.
-///
-/// Unlike MPEG — whose frames are a fixed-size header plus zeroes, cheap
-/// enough to hand-roll — a FLAC frame carries CRC-8 and CRC-16 over
-/// bit-packed subframes, and `lofty` reads the first one to derive the
-/// stream's properties. A metadata-only file is rejected outright with
-/// "failed to fill whole buffer".
-///
-/// So the *audio* is committed and the *tags* are still written per run: the
-/// fixture carries no text at all, `metaflac` puts the seeded lipsum into it,
-/// and `lofty` is still reading something a different library wrote. Produced
-/// once with:
+/// Fifty milliseconds of committed silence: a FLAC frame carries CRCs over
+/// bit-packed subframes and `lofty` reads the first frame for stream
+/// properties, so a metadata-only file is rejected. The *tags* are written
+/// per run by `metaflac` — the fixture carries no text. Produced once with:
 ///
 /// ```text
 /// ffmpeg -f lavfi -i anullsrc=r=44100:cl=mono -t 0.05 \

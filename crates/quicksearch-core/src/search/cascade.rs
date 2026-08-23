@@ -16,42 +16,12 @@
 //! | 10.x | full path substring, any case    | A    |
 //! | 11.x | fuzzy full path                  | C    |
 //!
-//! Pass A is a single `files` scan (`LIKE`, the ASCII-nocase superset of
-//! its ranks) classified per-row in Rust — no index needed, the substring
-//! stage visits every row anyway. A path always ends in its own name, so
-//! `path LIKE` is a superset of `name LIKE` and that one scan covers the
-//! filename *and* the path tiers. Pass B is one FTS phrase MATCH verified
-//! against the decompressed text. Passes C/D (opt-in) iterate the whole
-//! table with a bitap matcher, C covering both the name and the path.
+//! Pass A is one `files` scan classified per-row in Rust; pass B one FTS
+//! MATCH verified against the text; passes C/D (opt-in) bitap-scan the table.
+//! Path tiers are buffered and flushed last.
 //!
-//! Wildcard terms (`rep*rt`) rank through the same tiers, with 1/2 meaning
-//! the whole name matches the pattern; they skip the fuzzy passes (bitap is
-//! a literal matcher). A regex-only query (`regex:…` with no term) runs two
-//! dedicated scans that reuse tiers 4 (name), 6 (content) and 10 (path); a
-//! regex accompanying a term is an accept-predicate on every pass instead,
-//! not a rank source.
-//!
-//! The path tiers rank below everything else, so passes A and C buffer them
-//! instead of emitting them — stages E and F flush those buffers at the
-//! end, dropping files an earlier stage already emitted. Path matching
-//! needs a term of at least three characters, the same floor pass B has.
-//!
-//! Full-text ranks order equal-based hits by occurrence count via a
-//! decimal fraction: `base + (1000 - min(count, 1000)) / 1000` — more
-//! occurrences sorts earlier, 1000+ occurrences adds zero. Fuzzy ranks add
-//! `0.1 × edit_distance` instead.
-//!
-//! Every scan appends the caller's structured-filter SQL (anonymous
-//! placeholders over alias `f`) and checks the generation counter as it
-//! streams; a bumped generation aborts mid-statement.
-//!
-//! # Batches are ordered within themselves, not against each other
-//!
-//! A pass hands hits over *while* it scans (see [`FLUSH_INTERVAL`]), and a
-//! scan finds hits in table order — batch two can hold something better than
-//! anything in batch one. Each batch is sorted before it goes; the consumer
-//! owns the ordering *across* batches. Do not assume arrival order is rank
-//! order.
+//! Batches are ordered within themselves, not against each other — do not
+//! assume arrival order is rank order.
 
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -73,26 +43,16 @@ use super::{SearchHit, SearchOptions};
 
 mod passes;
 
-/// Cancellation is checked every this many scanned rows in row-cheap
-/// passes; decompression-heavy passes check every row.
+/// Cancellation check stride for row-cheap passes; decompression-heavy passes check every row.
 const CANCEL_CHECK_ROWS: usize = 256;
 
-/// Snippet window budget: the GUI trims the cell text to its column width
-/// around the match, and the mouseover shows the rest as extended context.
+/// Snippet window budget: the GUI trims to column width; mouseover shows the rest.
 const SNIPPET_WINDOW_CHARS: usize = 600;
 
 /// The Content Match snippet for one document body, cut exactly as the
-/// full-text passes cut it.
-///
-/// `folded` must be `text` ASCII-lowercased. That fold is byte-length
-/// preserving, which is the whole reason offsets found in it can slice `text`;
-/// the passes hold one reusable fold buffer per scan and hand it in here
-/// rather than paying for a second copy.
-///
-/// Shared so that [`crate::live`], re-cutting a snippet for a file that
-/// changed under a result already on screen, produces the same window the
-/// search itself would — otherwise a row would visibly re-frame its own match
-/// the moment the file was touched.
+/// full-text passes cut it; shared with [`crate::live`] so a re-cut matches.
+/// `folded` must be `text` ASCII-lowercased — byte-length preserving, which
+/// is the whole reason offsets found in it can slice `text`.
 pub fn text_snippet(
     pattern: &crate::query::pattern::TermPattern,
     text: &str,
@@ -102,8 +62,6 @@ pub fn text_snippet(
         approx_chars: SNIPPET_WINDOW_CHARS,
     };
     match text_snippet_counted(pattern, text, folded) {
-        // Literal terms keep the richer multi-occurrence extract; a wildcard
-        // match marks its own first range.
         Some((snip, _)) => Some(snip),
         None => pattern.find_first_folded(folded).map(|r| {
             // A greedy pattern can match megabytes; clamp before the window.
@@ -113,17 +71,8 @@ pub fn text_snippet(
     }
 }
 
-/// [`text_snippet`] for a literal pattern, with the case-insensitive
-/// occurrence count the extraction found on its way to the window. `None`
-/// when the pattern is not literal.
-///
-/// The count is a by-product: [`snippet::extract_folded`] locates every
-/// occurrence in `folded` in order to coalesce and mark them, and that set has
-/// the same cardinality [`crate::query::pattern::TermPattern::count_folded`]
-/// would return. Taking it from here is what lets the full-text pass verify a
-/// row and cut its snippet in one sweep of the body rather than two — see
-/// `benches/search.rs`, group `cascade_row_sweeps`. It does not generalise to
-/// a wildcard, whose snippet comes from a single leftmost match.
+/// [`text_snippet`] for a literal pattern, plus the case-insensitive
+/// occurrence count found on the way. `None` when the pattern is not literal.
 pub fn text_snippet_counted(
     pattern: &crate::query::pattern::TermPattern,
     text: &str,
@@ -132,27 +81,14 @@ pub fn text_snippet_counted(
     let opts = snippet::Options {
         approx_chars: SNIPPET_WINDOW_CHARS,
     };
-    // The pre-folded form: this runs per candidate row, and folding the term
-    // again here would allocate once per row for a string the pattern holds.
     let term = pattern.literal_folded()?;
     Some(snippet::extract_folded(text, folded, &[term], &opts))
 }
 
-/// The fuzzy full-text match in one document body: how many times the term
-/// occurs within the edit budget, and the Content Match window cut around
-/// the first occurrence at the cascade's own width. `None` when it does not
-/// occur at all.
-///
-/// Shared with [`crate::live`] for the same reason as [`text_snippet`]: a
-/// fuzzy row whose file changes has to be re-cut the way it was cut, and
-/// bitap's range is what it was cut around. `bitap` is built once by the
-/// caller — per scan in the pass, per arm in the live watcher — since building
-/// it is the cost.
-///
-/// Takes no folded copy, unlike [`text_snippet`]: the matcher folds in its
-/// mask table (see [`crate::search::fuzzy`]), so it reads the body as stored.
-/// That is the difference between this pass copying and lowercasing every
-/// document in the index per keystroke and not doing so.
+/// The fuzzy full-text match in one document body: occurrence count within
+/// the edit budget and the window around the first occurrence; `None` when
+/// absent. Shared with [`crate::live`]; no folded copy — the matcher folds
+/// in its mask table.
 pub fn fuzzy_snippet(
     bitap: &crate::search::fuzzy::Bitap,
     text: &str,
@@ -160,8 +96,6 @@ pub fn fuzzy_snippet(
     let opts = snippet::Options {
         approx_chars: SNIPPET_WINDOW_CHARS,
     };
-    // `first` is `Some` exactly when `count` is non-zero: it *is* the first
-    // of them.
     let (count, first) = bitap.count_and_first(text.as_bytes());
     first.map(|range| (count, snippet::window_around(text, range, &opts)))
 }
@@ -172,11 +106,10 @@ pub struct Outcome {
     pub limited: bool,
 }
 
-/// Run the cascade, streaming rank-ordered batches into `sink`.
-/// `Ok(None)` means the search was cancelled (generation moved on) — the
-/// caller sends no completion. SQL errors are returned as strings *unless*
-/// the search was already cancelled (an interrupted statement is normal
-/// cancellation, not an error).
+/// Run the cascade, streaming rank-ordered batches into `sink`. `Ok(None)`
+/// means cancelled (generation moved on) — the caller sends no completion.
+/// SQL errors are returned as strings *unless* already cancelled (an
+/// interrupted statement is normal cancellation, not an error).
 pub fn run(
     conn: &Connection,
     query: &CascadeQuery,
@@ -227,12 +160,9 @@ pub fn run(
         if cx.cancelled() {
             return Ok(None);
         }
-        // Stop, but do not call it truncation. `remaining() == 0` is also
-        // what an exactly-full result set looks like, and claiming a cut there
-        // tells a user to raise `--limit` on a complete answer. `flush_pass`
-        // is the authority — it sets the flag when it actually had to drop
-        // rows — and `scan_pass` breaks its row loop the moment the limit
-        // fills, for the same reason this break exists.
+        // Stop, but do not call it truncation: `remaining() == 0` is also
+        // what an exactly-full result set looks like. `flush_pass` sets
+        // `limited` only when it actually drops rows.
         if cx.remaining() == 0 {
             break;
         }
@@ -245,11 +175,13 @@ pub fn run(
             Pass::RegexContent => cx.pass_regex_content(),
             Pass::Path => {
                 let d = std::mem::take(&mut cx.deferred_path);
-                cx.flush_deferred(d)
+                cx.flush_deferred(d);
+                Ok(true)
             }
             Pass::FuzzyPath => {
                 let d = std::mem::take(&mut cx.deferred_fuzzy_path);
-                cx.flush_deferred(d)
+                cx.flush_deferred(d);
+                Ok(true)
             }
         };
         match run_pass {
@@ -291,19 +223,16 @@ enum Pass {
     FuzzyPath,
 }
 
-/// Occurrence-count fraction: more occurrences → smaller fraction → sorts
-/// earlier within a rank base; 1000+ adds zero.
+/// More occurrences → smaller fraction → sorts earlier within a rank base; 1000+ adds zero.
 fn count_frac(count: usize) -> f64 {
     (1000usize.saturating_sub(count.min(1000))) as f64 / 1000.0
 }
 
-/// `row.get` with the crate's string-error convention.
 fn col<T: rusqlite::types::FromSql>(row: &rusqlite::Row<'_>, idx: usize) -> Result<T, String> {
     row.get(idx).map_err(|e| e.to_string())
 }
 
-/// Rank, then name, then path — the path tiebreak makes the order total, so
-/// equal-rank hits cannot shuffle between otherwise-identical sorts.
+/// Rank, then name, then path — the path tiebreak makes the order total.
 fn rank_order(a: &SearchHit, b: &SearchHit) -> std::cmp::Ordering {
     a.rank
         .total_cmp(&b.rank)
@@ -311,65 +240,37 @@ fn rank_order(a: &SearchHit, b: &SearchHit) -> std::cmp::Ordering {
         .then_with(|| a.path.cmp(&b.path))
 }
 
-/// The `files` columns every pass selects, in the order the passes index
-/// them: `0` id, `1` name, `2` parent, `3` size, `4` mtime. Passes that also
-/// want the stored document text append `dt.text_zstd` as column `5`. A pass
-/// spelling its own list in a different order would compile and then quietly
-/// serve parents as names.
-///
-/// There is no `path` column to select; [`Cx::scan_pass`] concatenates columns
-/// 2 and 1 into one reused buffer and hands every classifier the result.
+/// The columns every pass selects, in the order the passes index them:
+/// `0` id, `1` name, `2` parent, `3` size, `4` mtime, optionally `5` text.
+/// A pass spelling its own order would quietly serve parents as names.
 const HIT_COLUMNS: &str = "f.id, f.name, f.parent, f.size, f.mtime";
 
-/// Columns 3 and 4. The clamp matters: `size` is `INTEGER` in SQLite and so
-/// signed; a corrupt row holding `-1` would otherwise become 18 exabytes on
-/// the way to `u64` and sort to the top of every size-ordered result.
+/// Columns 3 and 4. `size` is signed in SQLite; without the clamp a corrupt
+/// `-1` would become 18 exabytes on the way to `u64`.
 fn size_and_mtime(row: &rusqlite::Row<'_>) -> Result<(u64, i64), String> {
     let size = col::<i64>(row, 3)?.max(0) as u64;
     let mtime = col(row, 4)?;
     Ok((size, mtime))
 }
 
-/// The path tiers only make sense with enough term to be specific — same
-/// floor the trigram full-text pass uses. Wildcards count only their
-/// literal content (`a*b` is two characters of specificity, not three).
+/// Same specificity floor as the trigram pass; wildcards count only literals.
 fn path_tiers_enabled(pattern: &crate::query::pattern::TermPattern) -> bool {
     pattern.literal_char_count() >= 3
 }
 
-/// Hits collected by one scan but ranked below later scans, so held back
-/// until every better stage has emitted.
+/// Hits ranked below later scans, held back until every better stage emitted.
 #[derive(Default)]
 struct Deferred {
     hits: Vec<SearchHit>,
     overflowed: bool,
 }
 
-/// Longest a pass may sit on hits before handing them over. A pass is a
-/// whole-table scan that can run for seconds; draining on a clock rather
-/// than only on a full buffer keeps even a sparse query painting as the
-/// scan reaches its matches. Short enough to land two or three batches
-/// inside the GUI's 250 ms result fade.
+/// Longest a pass may sit on hits: draining on a clock keeps a sparse query
+/// painting; short enough to land 2–3 batches inside the GUI's 250 ms fade.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(80);
 
-/// Hasher for the emitted-id set, which is probed **once per scanned row**.
-///
-/// The default `HashSet` hasher is SipHash-1-3, chosen to be collision-resistant
-/// against hostile keys. These keys are SQLite rowids the cascade itself just
-/// read — nobody outside chooses them — so the resistance buys nothing, while
-/// the ~10 ns it costs is paid on every row of a whole-table scan.
-///
-/// Multiplicative, by an odd constant near 2^64/φ. Odd keeps it a bijection, so
-/// distinct ids stay distinct; hashbrown then takes the low bits for the bucket
-/// and the top seven for its control byte, and the rotate is what puts real
-/// entropy in both halves for the near-consecutive ids a table scan produces.
-///
-/// Worth ~5% of a fuzzy search — 17.1/17.4/17.9 ms against 18.2/18.3/18.8 over
-/// three runs each of `tests/search_alloc.rs`, every run of the one beating
-/// every run of the other. Small, but it is the whole of what a hash function
-/// choice can be worth, and it is bought for fifteen lines with no behaviour
-/// attached. The figure will grow with the row count: this is one probe per
-/// scanned row, and the corpus is 50,000 rows.
+/// Multiplicative hasher (odd constant — a bijection) for SQLite rowids.
+/// Measured ~5% of a fuzzy search over SipHash; don't put SipHash back.
 #[derive(Default)]
 struct IdHasher(u64);
 
@@ -378,10 +279,7 @@ impl Hasher for IdHasher {
         self.0
     }
 
-    // The only shape the set ever hashes is a single `i64`, which `Hash for
-    // i64` delivers through `write_i64`. `write` exists because the trait
-    // requires it and is deliberately a poor general-purpose hash: routing
-    // anything else through here would be a bug, not a use.
+    // Only `write_i64` is ever used; `write` exists because the trait requires it.
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
             self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
@@ -417,8 +315,6 @@ struct Cx<'a> {
     sink: &'a mut dyn FnMut(Vec<SearchHit>),
 }
 
-/// Drives [`Cx::flush_if_due`]: when this pass last handed hits over, and
-/// whether it has handed over anything at all.
 struct FlushClock {
     last: Instant,
     sent_anything: bool,
@@ -432,8 +328,6 @@ impl FlushClock {
         }
     }
 
-    /// Whether a buffer of `len` hits should go now. The first batch of a
-    /// pass goes the moment there is anything to send.
     fn due(&self, len: usize, batch: usize) -> bool {
         if len == 0 {
             return false;
@@ -456,8 +350,7 @@ impl<'a> Cx<'a> {
         self.options.limit.saturating_sub(self.total)
     }
 
-    /// Buffer cap for scan passes: enough headroom that sorting keeps the
-    /// best candidates, without unbounded growth on huge hit sets.
+    /// Headroom so sorting keeps the best candidates, without unbounded growth.
     fn buffer_cap(&self) -> usize {
         4096.max(2 * self.remaining())
     }
@@ -471,17 +364,13 @@ impl<'a> Cx<'a> {
         p
     }
 
-    /// Skip rows already emitted at a better rank or hidden by session
-    /// ignore chips.
     fn skip(&self, file_id: i64, path: &str) -> bool {
         self.emitted.contains(&file_id) || self.ignore.matches_path(std::path::Path::new(path))
     }
 
-    /// The `regex:` accept-predicate applied to every candidate row when a
-    /// regex accompanies a term. The path contains the name, so one path
-    /// check covers both; content is fetched (and decompressed) only for
-    /// rows whose path missed — bounded by the pass's hit count, not its
-    /// scan count. Pass `text` when the pass already has the content.
+    /// The `regex:` accept-predicate when a regex accompanies a term. The
+    /// path contains the name, so one path check covers both; content is
+    /// fetched only for rows whose path missed.
     fn regex_accepts(&self, file_id: i64, path: &str, text: Option<&str>) -> Result<bool, String> {
         let Some(re) = &self.query.regex else {
             return Ok(true);
@@ -508,20 +397,16 @@ impl<'a> Cx<'a> {
     }
 
     /// Hand `buf` over mid-scan if it is due, leaving it empty when it goes.
-    /// Ordering *between* batches is the consumer's problem.
     fn flush_if_due(&mut self, buf: &mut Vec<SearchHit>, clock: &mut FlushClock) {
         if !clock.due(buf.len(), self.options.batch.max(1)) {
             return;
         }
         let batch = std::mem::take(buf);
-        // `overflowed` belongs to the pass as a whole, not to one batch; the
-        // final flush reports it.
+        // `overflowed` belongs to the pass as a whole; the final flush reports it.
         self.flush_pass(batch, false);
         clock.mark_sent();
     }
 
-    /// Sort a finished pass buffer, truncate to what's left of the display
-    /// limit, and stream it out in `options.batch`-sized events.
     fn flush_pass(&mut self, mut buf: Vec<SearchHit>, overflowed: bool) {
         buf.sort_by(rank_order);
         let room = self.remaining();
@@ -539,8 +424,7 @@ impl<'a> Cx<'a> {
         let batch = self.options.batch.max(1);
         let mut buf = buf.into_iter().peekable();
         while buf.peek().is_some() {
-            // A cancelled search stops emitting immediately — the newer
-            // generation owns the UI.
+            // A cancelled search stops emitting — the newer generation owns the UI.
             if self.cancelled() {
                 return;
             }
@@ -549,17 +433,13 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// Emit a buffer held back from an earlier scan. Anything a better
-    /// stage already emitted drops out here — `emitted` was still empty (or
-    /// smaller) when these hits were collected.
-    fn flush_deferred(&mut self, mut deferred: Deferred) -> Result<bool, String> {
+    /// Emit a held-back buffer; anything a better stage emitted since drops out here.
+    fn flush_deferred(&mut self, mut deferred: Deferred) {
         deferred.hits.retain(|h| !self.emitted.contains(&h.file_id));
         self.flush_pass(deferred.hits, deferred.overflowed);
-        Ok(true)
     }
 
-    /// Keep a scan buffer bounded: sort + cut back to the display-limit
-    /// room once it doubles past it. Returns whether anything was dropped.
+    /// Sort + cut back to display-limit room once past the cap; true if anything dropped.
     fn enforce_cap(&self, buf: &mut Vec<SearchHit>) -> bool {
         if buf.len() <= self.buffer_cap() {
             return false;

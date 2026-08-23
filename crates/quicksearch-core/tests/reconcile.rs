@@ -1,12 +1,9 @@
 //! End-to-end tests for reconciling a real index against a changed
 //! configuration.
 //!
-//! The thing every test here really asserts is that the index file *survived*.
-//! Losing it is silent — the next run rebuilds and everything looks fine, only
-//! hours later and with every extracted document read again — so each test
-//! pins `schema_info.created_at`, which only a wipe can change. Without that
-//! assertion a regression that quietly reintroduces the rebuild would pass
-//! every other check in this file.
+//! Every test also pins `schema_info.created_at`, which only a wipe can
+//! change: losing the index file is silent — the next run rebuilds and
+//! everything looks fine, hours later.
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -20,7 +17,6 @@ use quicksearch_core::scope::{advance, WorkCursor, SLICE};
 mod common;
 use common::{scratch_dir_canonical as tmp_dir, touch};
 
-/// Run one full index over `config`'s roots and wait for it to finish.
 fn index_once(db: &Path, config: &Config) {
     common::IndexOnce {
         db,
@@ -62,13 +58,8 @@ fn conn(db: &Path) -> rusqlite::Connection {
     rusqlite::Connection::open(db).unwrap()
 }
 
-/// Every indexed path, in **path** order.
-///
-/// Sorted here rather than in SQL: the index's own order is `(parent, name)`,
-/// which groups by directory and is not the same sequence — `/r/keep.txt`
-/// sorts *before* `/r/sub/k2.txt` there and after it by path. These assertions
-/// are about which rows survived, so they read best in the order a person
-/// would list them.
+/// Every indexed path, in **path** order — not the index's own
+/// `(parent, name)` order, which groups by directory.
 fn paths(db: &Path) -> Vec<String> {
     let c = conn(db);
     let mut stmt = c.prepare("SELECT parent || name FROM files").unwrap();
@@ -105,15 +96,10 @@ fn residue(db: &Path) -> (i64, i64) {
     )
 }
 
-/// Rows in a dependent table whose file is gone.
-///
-/// `searchabletext` is the one that matters and the one this exists for: it
-/// is an FTS5 virtual table with no foreign key, so a delete that forgets it
-/// leaves postings behind — and a contentless table happily keeps serving a
-/// rowid nothing can resolve, which surfaces as a search hit for a file that
-/// is no longer indexed. The other three cascade, and are checked so that a
-/// future connection opened without `PRAGMA foreign_keys` cannot make this
-/// quietly untrue.
+/// Rows in a dependent table whose file is gone. `searchabletext` is the one
+/// that matters: FTS5 has no foreign key, so a forgotten delete leaves
+/// postings that surface as hits for files no longer indexed. The other
+/// three cascade, checked in case a connection skips `PRAGMA foreign_keys`.
 fn orphans(db: &Path) -> i64 {
     [
         ("searchabletext", "rowid"),
@@ -146,14 +132,10 @@ fn base_config(root: &Path, db: &Path) -> Config {
     let mut config = Config::default();
     config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
     config.paths.database_path = db.to_string_lossy().into_owned();
-    // Start with nothing excluded, so each test narrows from a full index.
     config.indexing.ignore_patterns = vec![];
     config
 }
 
-/// Adding an ignore pattern must remove exactly the entries it matches —
-/// their name row, their FTS postings and their extracted text — and leave
-/// the index file itself alone.
 #[test]
 fn adding_an_ignore_pattern_prunes_instead_of_rebuilding() {
     let root = tmp_dir("ignore-add");
@@ -203,9 +185,6 @@ fn adding_an_ignore_pattern_prunes_instead_of_rebuilding() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
-/// Removing a pattern only ever *adds* files, so it must delete nothing and
-/// ask for a walk. Running that walk brings the entries back without the
-/// index having been thrown away in between.
 #[test]
 fn removing_an_ignore_pattern_reindexes_and_deletes_nothing() {
     let root = tmp_dir("ignore-remove");
@@ -236,9 +215,6 @@ fn removing_an_ignore_pattern_reindexes_and_deletes_nothing() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
-/// Removing a folder takes its entries and only its entries. This used to be
-/// a full wipe, so a user with two roots paid for both to be walked again to
-/// stop indexing one of them.
 #[test]
 fn removing_a_root_takes_only_its_own_entries() {
     let base = tmp_dir("roots");
@@ -282,8 +258,6 @@ fn removing_a_root_takes_only_its_own_entries() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
-/// Adding a folder is pure widening: nothing stored is wrong, there is just
-/// more to find. The existing root's rows must not even be re-examined.
 #[test]
 fn adding_a_root_keeps_everything_already_indexed() {
     let base = tmp_dir("root-add");
@@ -317,9 +291,6 @@ fn adding_a_root_keeps_everything_already_indexed() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
-/// Narrowing the content filter costs the excluded files their text, not
-/// their existence: they must stay findable by name. Widening it queues them
-/// for extraction again.
 #[test]
 fn narrowing_content_extensions_keeps_the_file_findable_by_name() {
     let root = tmp_dir("content");
@@ -353,8 +324,6 @@ fn narrowing_content_extensions_keeps_the_file_findable_by_name() {
         "the excluded file is parked, not pending"
     );
 
-    // Widening again queues it for another extraction, which the next run
-    // performs.
     let (deleted, recontented) = reconcile(&db, &narrowed, &old);
     assert_eq!(deleted, 0);
     assert_eq!(recontented, 1);
@@ -371,9 +340,7 @@ fn narrowing_content_extensions_keeps_the_file_findable_by_name() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
-/// `store_text_for_snippets` off throws the blobs away and keeps full-text
-/// search working; on again re-extracts, because the text of files already
-/// indexed was never kept.
+/// On again re-extracts: the text of files already indexed was never kept.
 #[test]
 fn store_text_toggles_without_losing_full_text_search() {
     let root = tmp_dir("store-text");
@@ -408,8 +375,6 @@ fn store_text_toggles_without_losing_full_text_search() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
-/// Turning hidden files off must reach entries several levels inside a hidden
-/// directory, not just the dot-name itself.
 #[test]
 fn turning_hidden_files_off_prunes_whole_hidden_subtrees() {
     let root = tmp_dir("hidden");
@@ -449,14 +414,9 @@ fn turning_hidden_files_off_prunes_whole_hidden_subtrees() {
 }
 
 /// A followed symlink's target is stored under its own canonical path, which
-/// can be outside every configured root. Such a row has no owning root and
-/// therefore no filtering rules that could be applied to it — a prune that
-/// tested it anyway would delete it on every config change and the next run
-/// would put it straight back, forever.
-///
-/// The patterns here are the hostile half: `**` and `../*` describe the whole
-/// filesystem, and one names the neighbour tree outright. None of them may
-/// reach a row the scan never visits.
+/// can be outside every root: no owning root, no filtering rules to apply.
+/// The patterns here are the hostile half — `**` and `../*` describe the
+/// whole filesystem — and none may reach a row the scan never visits.
 #[cfg(unix)]
 #[test]
 fn a_symlink_target_outside_every_root_survives_a_prune() {
@@ -500,9 +460,8 @@ fn a_symlink_target_outside_every_root_survives_a_prune() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
-/// Turning symlink following off leaves rows for targets that live outside
-/// every root, which no walk and no stale sweep ever reaches — the reason
-/// this setting used to force a wipe.
+/// Rows for out-of-root targets are reached by no walk and no stale sweep —
+/// the reason this setting used to force a wipe.
 #[cfg(unix)]
 #[test]
 fn turning_symlinks_off_reaches_targets_outside_the_roots() {
@@ -535,8 +494,7 @@ fn turning_symlinks_off_reaches_targets_outside_the_roots() {
 }
 
 /// A config changed while the app was not running is reconciled by the next
-/// run, from the `config_validation` record of what the index was built with
-/// — the only thing that knows a root was dropped.
+/// run, from the `config_validation` record of what the index was built with.
 #[test]
 fn a_run_reconciles_a_config_edited_while_it_was_closed() {
     let base = tmp_dir("offline");
@@ -572,9 +530,8 @@ fn a_run_reconciles_a_config_edited_while_it_was_closed() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
-/// Reconciling twice must be a no-op the second time. The run-start pass and
-/// the coordinator's pass can both fire for one edit, and a plan that is not
-/// idempotent would delete rows the walk had just re-added.
+/// The run-start pass and the coordinator's pass can both fire for one edit;
+/// a plan that is not idempotent would delete rows the walk just re-added.
 #[test]
 fn reconciling_is_idempotent() {
     let root = tmp_dir("idempotent");

@@ -1,18 +1,15 @@
 //! Tokenizer for the query grammar.
 
-use super::ast::Op;
+use super::Op;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
-    /// Unquoted word. `AND`/`OR` are intercepted before emitting a `Word`.
     Word(String),
     Quoted(String),
     LParen,
     RParen,
-    /// Binary property operator (`:`, `=`, `>`, `>=`, `<`, `<=`).
-    ///
-    /// `:` is [`Op::Contains`] by default; the parser re-interprets it when
-    /// followed immediately by a comparator (e.g. `modified:>=2024-01-01`).
+    /// Binary property operator. `:` is [`Op::Contains`] by default; the
+    /// parser re-interprets it when a comparator follows (`modified:>=x`).
     Op(Op),
     And,
     Or,
@@ -32,12 +29,9 @@ impl std::fmt::Display for LexError {
 
 impl std::error::Error for LexError {}
 
-/// Whether the `:` at `colon` is the one in a drive letter rather than a
-/// property operator.
-///
-/// True only when the word so far is exactly one ASCII letter *and* a path
-/// separator follows, which is narrow enough to leave `12:30`, `a:b` and
-/// `type:Audio` tokenizing exactly as before.
+/// Whether the `:` at `colon` is a drive letter's, not a property operator:
+/// true only when the word so far is exactly one ASCII letter *and* a path
+/// separator follows — narrow enough to leave `12:30` and `a:b` untouched.
 fn is_drive_letter_colon(bytes: &[u8], start: usize, colon: usize) -> bool {
     colon == start + 1
         && bytes[start].is_ascii_alphabetic()
@@ -52,11 +46,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
     }
 }
 
-/// [`tokenize`], but each token carries its byte range in `input`, and a
-/// trailing error (unterminated quote, invalid UTF-8) is returned alongside
-/// the tokens lexed before it instead of discarding them. `Quoted` spans
-/// include both quote characters. This is what the GUI's syntax highlighter
-/// runs on: it must color the intact prefix of a half-typed query.
+/// [`tokenize`], but each token carries its byte range and a trailing error
+/// is returned alongside the tokens lexed before it — the GUI's highlighter
+/// must color the intact prefix of a half-typed query. `Quoted` spans
+/// include both quote characters.
 pub fn tokenize_spanned(input: &str) -> (Vec<(Token, std::ops::Range<usize>)>, Option<LexError>) {
     let bytes = input.as_bytes();
     let mut i = 0usize;
@@ -104,9 +97,8 @@ pub fn tokenize_spanned(input: &str) -> (Vec<(Token, std::ops::Range<usize>)>, O
                 }
             }
             b'"' => {
-                // Double-quoted phrase with doubled-quote escape `""`.
-                // Segments are copied as UTF-8 slices — `bytes[j] as char`
-                // would decode Latin-1 and mangle non-ASCII.
+                // Doubled-quote escape. Segments are copied as UTF-8 slices —
+                // `bytes[j] as char` would decode Latin-1 and mangle non-ASCII.
                 let mut j = i + 1;
                 let mut buf = String::new();
                 let mut segment_start = j;
@@ -136,13 +128,11 @@ pub fn tokenize_spanned(input: &str) -> (Vec<(Token, std::ops::Range<usize>)>, O
                 i = j + 1;
             }
             _ => {
-                // Unquoted word; continues until whitespace, paren, or operator.
                 let start = i;
                 while i < bytes.len() {
                     let c = bytes[i];
                     if c == b':' && is_drive_letter_colon(bytes, start, i) {
-                        // `C:\Users\me` is one word; otherwise `path:C:\Users\me`
-                        // parses as the filter `path` = `C` and matches nothing.
+                        // Otherwise `path:C:\Users\me` parses as `path` = `C`.
                         i += 1;
                         continue;
                     }
@@ -259,12 +249,10 @@ mod tests {
 
     #[test]
     fn non_ascii_survives_a_quoted_phrase() {
-        // Byte-wise copying decoded this as Latin-1 (`JosÃ©`), so the phrase
-        // never matched anything.
+        // Byte-wise copying decoded this as Latin-1 (`JosÃ©`).
         let t = tokenize(r#""C:\Users\José\docs""#).unwrap();
         assert_eq!(t, vec![Token::Quoted(r"C:\Users\José\docs".into())]);
 
-        // ...including around a doubled-quote escape, which splits the copy.
         let t = tokenize(r#""ü""ö""#).unwrap();
         assert_eq!(t, vec![Token::Quoted(r#"ü"ö"#.into())]);
     }
@@ -281,7 +269,6 @@ mod tests {
             ]
         );
 
-        // Forward slashes are equally valid on Windows.
         let t = tokenize("path:D:/data").unwrap();
         assert_eq!(
             t,
@@ -386,7 +373,6 @@ mod tests {
                 Token::Word("30".into()),
             ]
         );
-        // One letter, but no separator after the colon.
         assert_eq!(
             tokenize("a:b").unwrap(),
             vec![
@@ -395,7 +381,6 @@ mod tests {
                 Token::Word("b".into()),
             ]
         );
-        // A separator, but the key is longer than one character.
         assert_eq!(
             tokenize("type:/Audio").unwrap(),
             vec![

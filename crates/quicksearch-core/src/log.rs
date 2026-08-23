@@ -1,32 +1,21 @@
-//! The process log: every line that would go to the terminal, kept in
-//! memory so a windowed run — which on Windows has no console at all under
-//! the GUI subsystem — can show it.
-//!
-//! Background reporting goes through [`crate::log_info!`] and
-//! [`crate::log_warn!`] instead of `println!`/`eprintln!`: each writes the
-//! same line to stderr *and* appends it to a bounded ring the GUI's Logs tab
-//! reads. Command output — search hits, usage text, the errors a command
-//! exits with — is a program's answer, not a background event, and is not
-//! logged.
+//! The process log: each line goes to stderr *and* a bounded in-memory ring
+//! the GUI's Logs tab reads (a windowed run on Windows has no console).
+//! Command output is a program's answer, not a background event: not logged.
 
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Lines retained before the oldest are dropped. The ring holds the count it
-/// threw away so the tab can say so instead of quietly lying.
+/// Lines retained before the oldest are dropped.
 pub const CAPACITY: usize = 5_000;
 
-/// How loud a line is. The GUI colors by this; stderr gets the `Warning:`
-/// prefix that the same messages carried when they were `eprintln!`s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Level {
     Info,
     Warn,
 }
 
-/// One recorded line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
     /// Unix seconds when it was recorded.
@@ -36,7 +25,6 @@ pub struct LogLine {
     pub text: String,
 }
 
-/// Record an informational line: `println!`-style formatting.
 #[macro_export]
 macro_rules! log_info {
     ($($arg:tt)*) => {
@@ -44,8 +32,8 @@ macro_rules! log_info {
     };
 }
 
-/// Record a warning. The stored and printed text gains a `Warning: ` prefix,
-/// so call sites pass the message alone.
+/// The stored and printed text gains a `Warning: ` prefix; call sites pass
+/// the message alone.
 #[macro_export]
 macro_rules! log_warn {
     ($($arg:tt)*) => {
@@ -53,30 +41,19 @@ macro_rules! log_warn {
     };
 }
 
-/// Write `message` to stderr and to the ring. Prefer the macros; this is
-/// what they call.
-///
-/// A failed stderr write is ignored rather than propagated: `eprintln!`
-/// *panics* when the handle is unwritable, which on a process launched
-/// without stdio would take down whichever background thread happened to
-/// report something.
+/// Write `message` to stderr and to the ring. A failed stderr write is
+/// ignored: `eprintln!` *panics* when the handle is unwritable, which on a
+/// process launched without stdio would take down a background thread.
 pub fn record(level: Level, message: String) {
     let text = match level {
         Level::Warn => format!("Warning: {}", message),
         Level::Info => message,
     };
-    // Almost every line here names a path, and a path is whatever someone
-    // called a file. An escape sequence in one reaches a terminal three ways:
-    // the stderr write below, a user running the GUI from a shell, and the
-    // Logs tab's Copy button, which puts the ring on the clipboard for pasting
-    // into a bug report. Diagnostics are not data — nothing downstream needs
-    // these bytes exactly — so they are scrubbed unconditionally.
-    //
-    // Line breaks are collapsed *first*, because `scrub_controls` counts them
-    // as controls and would leave `U+FFFD` where a space belongs. One record
-    // is one line — the ring renders it that way and `writeln!` adds the only
-    // newline there should be — so a message that arrives multi-line, such as
-    // a nested error's chain of causes, is flattened rather than boxed.
+    // Almost every line names a path, and an escape sequence in one reaches
+    // a terminal three ways (stderr, GUI-from-shell, the Logs tab's Copy
+    // button). Diagnostics are not data, so they are scrubbed unconditionally.
+    // Line breaks are collapsed *first*: `scrub_controls` counts them as
+    // controls and would leave U+FFFD where a space belongs.
     let text = if text.contains(['\n', '\r']) {
         text.replace(['\n', '\r'], " ")
     } else {
@@ -87,14 +64,10 @@ pub fn record(level: Level, message: String) {
     lock().push(level, text);
 }
 
-/// A cap on how many times one *kind* of warning is allowed to speak.
-///
-/// Some failures are per-file and arrive in the thousands — on Windows,
-/// `ERROR_SHARING_VIOLATION` from a file another process holds open is
-/// routine and has no Unix equivalent. Logging each one costs a global mutex
-/// and an unbuffered stderr write on the walk's hottest path, and evicts the
-/// ring's warnings worth reading. So the first few speak and the rest are
-/// counted; reset by whoever owns the run, so the numbers describe one run.
+/// A cap on how many times one *kind* of warning may speak: some failures
+/// arrive per-file in the thousands (Windows sharing violations are routine),
+/// and each log line costs a global mutex plus an unbuffered stderr write on
+/// the walk's hottest path. The first few speak, the rest are counted.
 pub struct Throttle {
     limit: u64,
     seen: std::sync::atomic::AtomicU64,
@@ -108,12 +81,11 @@ impl Throttle {
         }
     }
 
-    /// Count one occurrence, and answer whether it may be logged individually.
+    /// Count one occurrence; answer whether it may be logged individually.
     pub fn allow(&self) -> bool {
         self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < self.limit
     }
 
-    /// Occurrences counted since the last [`Throttle::reset`].
     pub fn seen(&self) -> u64 {
         self.seen.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -133,9 +105,8 @@ pub fn snapshot() -> Vec<LogLine> {
     lock().lines.iter().cloned().collect()
 }
 
-/// How many lines have been recorded since the process started, including
-/// ones since dropped. Only ever grows, so a poll of this is the cheap way
-/// to ask "anything new?" without copying the ring.
+/// Lines recorded since the process started, including ones since dropped.
+/// Only ever grows — the cheap "anything new?" poll.
 pub fn recorded() -> u64 {
     lock().recorded
 }
@@ -152,15 +123,15 @@ pub fn clear() {
 
 static LOG: LazyLock<Mutex<Ring>> = LazyLock::new(|| Mutex::new(Ring::new(CAPACITY)));
 
-/// Logging must not turn one panic into a cascade of them: a thread that
-/// died mid-push would otherwise poison the lock and take down every later
-/// logger. The worst a poisoned guard can hold is a half-added line.
+/// Logging must not turn one panic into a cascade: a thread that died
+/// mid-push would poison the lock and take down every later logger. The
+/// worst a poisoned guard can hold is a half-added line.
 fn lock() -> MutexGuard<'static, Ring> {
     crate::lock_ok(&LOG)
 }
 
-/// The bounded line buffer. Split from the global so it can be tested on its
-/// own instance — every other test in the process shares the global one.
+/// The bounded line buffer, split from the global so it can be tested on
+/// its own instance.
 struct Ring {
     lines: VecDeque<LogLine>,
     capacity: usize,
@@ -197,8 +168,7 @@ impl Ring {
     }
 }
 
-/// Seconds since the Unix epoch. A clock set before 1970 yields `0`, which
-/// every caller already reads as "very long ago".
+/// Seconds since the Unix epoch; a clock set before 1970 yields `0`.
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -240,9 +210,7 @@ mod tests {
         assert_eq!(ring.recorded, 5, "recorded counts everything ever pushed");
     }
 
-    /// A zero capacity would spin the eviction loop forever on the first
-    /// push; hand-configuring one is not possible today, but the ring should
-    /// not depend on that staying true.
+    /// A zero capacity would spin the eviction loop forever on first push.
     #[test]
     fn a_zero_capacity_still_holds_one_line() {
         let mut ring = Ring::new(0);
@@ -280,7 +248,6 @@ mod tests {
         assert!(t.allow(), "a reset throttle speaks again");
     }
 
-    /// A zero limit must silence rather than divide by anything.
     #[test]
     fn a_zero_limit_throttle_logs_nothing() {
         let t = Throttle::new(0);
@@ -289,9 +256,7 @@ mod tests {
         assert_eq!(t.suppressed(), 1);
     }
 
-    /// Through the global: the macros must land in the snapshot, and a
-    /// warning must carry the prefix its terminal line has. Written to
-    /// tolerate lines from tests running in parallel in this process.
+    /// Written to tolerate lines from tests running in parallel.
     #[test]
     fn recorded_lines_reach_the_snapshot() {
         let before = recorded();

@@ -1,38 +1,24 @@
-//! Scratch directories for tests.
-//!
-//! Public and `#[doc(hidden)]` rather than `#[cfg(test)]`: the `tests/`
-//! integration binaries and the GUI crate are separate compilation units, so
-//! a test-gated item here would be invisible to them.
+//! Scratch directories for tests. Public and `#[doc(hidden)]` rather than
+//! `#[cfg(test)]`: the `tests/` binaries and the GUI crate are separate
+//! compilation units, so a test-gated item would be invisible to them.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Distinguishes directories requested within one process; a timestamp alone
-/// lets two tests in the same millisecond collide.
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// The compressed body [`crate::db::repo::set_content_done`] wants, for tests
-/// that only care that a sidecar row gets written.
-///
-/// Production callers compress a whole batch through one
-/// [`crate::db::repo::DocEncoder`] before taking the connection lock; a test
-/// writing one row has nothing to amortize and wants the one-liner.
+/// The compressed body [`crate::db::repo::set_content_done`] wants.
 pub fn zstd_of(text: &str) -> Option<Vec<u8>> {
     crate::db::repo::encode_one(text, true).expect("zstd encode")
 }
 
-/// How old a leftover scratch directory must be before [`sweep_stale`] takes
-/// it. Far longer than any test run, so a failure investigated the same day —
-/// or the next morning — still has its tree.
+/// Old enough that a failure investigated the next morning has its tree.
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
-/// Whether `name` is one of [`scratch_dir`]'s own directories.
-///
-/// Matched on the *shape* — `quicksearch-{tag}-{pid}-{seq}`, so the last two
-/// dash-separated components must be numbers — rather than on the
-/// `quicksearch-` prefix alone. `packaging/capture.sh` keeps its output in
-/// `quicksearch-capture` in the same directory, and a prefix match would eat a
-/// capture run's screenshots along with the litter.
+/// Whether `name` is one of [`scratch_dir`]'s own directories. Matched on the
+/// *shape* — `quicksearch-{tag}-{pid}-{seq}` — not the prefix alone:
+/// `packaging/capture.sh` keeps its output in `quicksearch-capture` in the
+/// same directory, and a prefix match would eat a capture run's screenshots.
 fn is_scratch_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("quicksearch-") else {
         return false;
@@ -45,19 +31,9 @@ fn is_scratch_name(name: &str) -> bool {
     numeric(tail.next()) && numeric(tail.next()) && tail.next().is_some_and(|tag| !tag.is_empty())
 }
 
-/// Remove scratch directories left by runs that are long over.
-///
-/// Nothing here cleans up on the way *out*: a failed test's tree is most of
-/// the evidence, which is why [`scratch_dir`] deliberately leaves it. But
-/// passing tests leave theirs too, and most never remove it — so the temp
-/// directory grew by roughly three hundred directories per full run and had
-/// accumulated some nine thousand of them. Where `/tmp` is a tmpfs that is
-/// gigabytes of RAM, which slows the whole suite and pushes the
-/// timing-sensitive tests toward their budgets.
-///
-/// Sweeping on the way *in* keeps both halves: this run's evidence survives,
-/// and so does yesterday's, while nothing accumulates without bound. Only
-/// [`scratch_dir`]'s own naming is touched.
+/// Remove scratch directories left by runs that are long over. Sweeping on
+/// the way *in* keeps this run's evidence and yesterday's while nothing
+/// accumulates without bound.
 fn sweep_stale() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
         return;
@@ -75,19 +51,14 @@ fn sweep_stale() {
             .and_then(|t| now.duration_since(t).ok())
             .is_some_and(|age| age >= STALE_AFTER);
         if stale {
-            // Best effort throughout: two test binaries starting together race
-            // on the same directory and one of them loses, which is fine.
             std::fs::remove_dir_all(entry.path()).ok();
         }
     }
 }
 
 /// A fresh, empty directory under the system temp dir, named for `tag`.
-///
-/// Not cleaned up on drop: when a test fails, the tree it built is most of
-/// the evidence. Long-dead runs' trees are swept once per process instead —
-/// see [`sweep_stale`]. Panics — a test that cannot create a directory has
-/// nothing left to assert.
+/// Never cleaned up: a failing test's tree is most of the evidence. Long-dead
+/// runs' trees are swept once per process instead — see [`sweep_stale`].
 #[doc(hidden)]
 pub fn scratch_dir(tag: &str) -> PathBuf {
     static SWEPT: std::sync::Once = std::sync::Once::new();
@@ -104,8 +75,7 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
     p
 }
 
-/// [`scratch_dir`] canonicalized, for the tests that compare walked paths
-/// against the root they were given. On macOS `/tmp` is a symlink to
+/// [`scratch_dir`] canonicalized: on macOS `/tmp` is a symlink to
 /// `/private/tmp`, so an uncanonicalized root and a walked path disagree.
 #[doc(hidden)]
 pub fn scratch_dir_canonical(tag: &str) -> PathBuf {
@@ -121,27 +91,11 @@ pub fn touch(path: &std::path::Path, body: &[u8]) {
     std::fs::write(path, body).expect("write file");
 }
 
-/// A filename that is legal on disk but cannot round-trip through the index,
-/// spelled so that `to_string_lossy` yields exactly `{stem}\u{FFFD}{suffix}` —
-/// which is itself a perfectly ordinary filename, and so a name a *different*
-/// file can really have. That collision is what the screens in
-/// `crate::walk::read_directory` and `crate::watcher` exist to prevent, and
-/// pairing this with [`lossy_twin`] is how the tests reproduce it.
-///
-/// The two platforms fail in different ways and both are real:
-///
-/// * On Unix an `OsStr` is arbitrary bytes, so any invalid UTF-8 byte does it.
-///   `0xFF` can never appear in well-formed UTF-8.
-/// * On Windows a path is UTF-16 code units and NTFS does not check that they
-///   are well-*formed*, so an unpaired surrogate is storable. Rust models this
-///   with WTF-8, and `to_str()` returns `None` for precisely that case. Far
-///   from theoretical: WSL's DrvFs encodes non-UTF-8 Linux names this way by
-///   design, and Samba shares of Linux servers produce them from legacy
-///   encodings.
-///
-/// Some filesystems (FAT, exFAT, some network redirectors) refuse the name —
-/// tests that put one on disk must tolerate the creation failing rather than
-/// asserting on it.
+/// A filename that is legal on disk but cannot round-trip through the index:
+/// `to_string_lossy` yields exactly `{stem}\u{FFFD}{suffix}` — itself a name
+/// a *different* file can really have, the collision the walk and watcher
+/// screens prevent; pair with [`lossy_twin`] to reproduce it. Some
+/// filesystems (FAT, exFAT) refuse the name — tests must tolerate that.
 #[doc(hidden)]
 pub fn unrepresentable_name(stem: &str, suffix: &str) -> std::ffi::OsString {
     #[cfg(unix)]
@@ -163,16 +117,14 @@ pub fn unrepresentable_name(stem: &str, suffix: &str) -> std::ffi::OsString {
     }
 }
 
-/// The name [`unrepresentable_name`] collapses to under `to_string_lossy`, as
-/// a name that is genuinely representable — so a test can put both on disk and
-/// assert the real one survives what happens to the other.
+/// The genuinely-representable name [`unrepresentable_name`] collapses to
+/// under `to_string_lossy`.
 #[doc(hidden)]
 pub fn lossy_twin(stem: &str, suffix: &str) -> String {
     format!("{}\u{FFFD}{}", stem, suffix)
 }
 
-/// Power-of-two bucket, so memory-map sizes group by what allocated them
-/// rather than by their exact size. Shared by the memory probes.
+/// Power-of-two bucket, so memory-map sizes group by what allocated them.
 #[doc(hidden)]
 pub fn size_class(bytes: u64) -> String {
     let mib = bytes as f64 / (1024.0 * 1024.0);
@@ -187,6 +139,187 @@ pub fn size_class(bytes: u64) -> String {
 #[doc(hidden)]
 pub fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// A scratch directory that removes itself on drop — **unless the thread is
+/// panicking**, keeping [`scratch_dir`]'s policy that a failing test's tree
+/// is the evidence.
+pub struct Scratch(PathBuf);
+
+impl Scratch {
+    pub fn dir(tag: &str) -> Scratch {
+        Scratch(scratch_dir(tag))
+    }
+
+    /// A scratch database path; the guard owns the directory, so SQLite's
+    /// sidecars are removed with it.
+    pub fn db(tag: &str) -> (Scratch, PathBuf) {
+        let dir = Scratch::dir(tag);
+        let db = dir.join("index.sqlite");
+        (dir, db)
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for Scratch {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Seeded synthetic corpora, shared by tests/, benches/ and examples/.
+// ---------------------------------------------------------------------------
+
+/// Deterministic word picker — a fixed seed makes two runs comparable.
+pub struct Lcg(pub u64);
+
+impl Lcg {
+    pub fn new(seed: u64) -> Lcg {
+        Lcg(seed)
+    }
+
+    pub fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.0 >> 33
+    }
+
+    pub fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {
+        &from[self.next() as usize % from.len()]
+    }
+}
+
+/// A scratch database path under a fresh directory.
+pub fn scratch_db(tag: &str) -> PathBuf {
+    scratch_dir(tag).join("index.sqlite")
+}
+
+/// The rare term a seeded index is searched for. Nine bytes: clears the
+/// trigram floor, and sits exactly on the boundary where a
+/// `fuzzy_max_edits = 2` pigeonhole split into three-char chunks becomes legal.
+pub const NEEDLE: &str = "quartzite";
+
+/// A term planted only in document *bodies*, never in a file name — forces
+/// the full-text pass to do real work: the filename `LIKE` finds nothing, and
+/// every trigram candidate has to be decompressed and verified.
+pub const BODY_TERM: &str = "chalcedony";
+
+/// Filler vocabulary for seeded indexes. **Deliberately shares no trigram
+/// with [`NEEDLE`]**: with a vocabulary that merely resembled the needle,
+/// every query would fill the display limit in the first few hundred rows,
+/// the cascade would break out of pass A, and passes B–D would never run —
+/// while the harness looked perfectly healthy.
+pub const WORDS: &[&str] = &[
+    "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
+    "lambda", "brown", "fox", "jumps", "lazy", "index", "search", "cascade", "snippet", "document",
+    "content", "extract", "summary", "meeting", "invoice", "contract", "budget", "revenue",
+    "planning", "review", "draft", "final", "notes", "appendix", "figure",
+];
+
+/// What [`seed_index`] should build.
+pub struct SeedSpec {
+    pub files: usize,
+    /// One file in every `content_every` gets extracted text.
+    pub content_every: usize,
+    /// Words in each stored document body.
+    pub body_words: usize,
+    /// Directories to spread the rows across.
+    pub dirs: usize,
+    /// File names carrying [`NEEDLE`]. Kept far below any sane display limit
+    /// — an early-exiting query measures how fast the cascade gives up.
+    pub needle_names: usize,
+    /// Document bodies carrying [`NEEDLE`], on top of the names.
+    pub needle_docs: usize,
+    /// Document bodies carrying [`BODY_TERM`]; sized by the caller to stay
+    /// under the display limit.
+    pub body_term_docs: usize,
+}
+
+impl Default for SeedSpec {
+    fn default() -> SeedSpec {
+        SeedSpec {
+            files: 50_000,
+            content_every: 10,
+            // ~2 KB per document: a corpus of tiny documents makes the fuzzy
+            // full-text pass look free when it is the cascade's most expensive.
+            body_words: 300,
+            dirs: 500,
+            needle_names: 50,
+            needle_docs: 50,
+            body_term_docs: 500,
+        }
+    }
+}
+
+/// Seed an index with synthetic rows, in one transaction. Shared by the
+/// measurement harnesses so they all describe the same corpus.
+pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
+    use crate::db::repo::{insert_file, set_content_done, NewFile};
+    use crate::mime::FileType;
+
+    let mut conn = crate::db::open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+    let mut rng = Lcg::new(0x5eed);
+    // Spacing, not a random draw: a cluster at the front would let a pass
+    // stop early and report a fraction of the work a real rare query costs.
+    let name_stride = spec.files / spec.needle_names.max(1);
+    let doc_stride = spec.files / spec.needle_docs.max(1);
+    let body_stride = spec.files / spec.body_term_docs.max(1);
+    let tx = conn.transaction().unwrap();
+    for i in 0..spec.files {
+        let w1 = rng.pick(WORDS);
+        let w2 = rng.pick(WORDS);
+        let name = if spec.needle_names > 0 && i % name_stride.max(1) == 0 {
+            format!("{}-{}-{:07}.txt", w1, NEEDLE, i)
+        } else {
+            format!("{}-{}-{:07}.txt", w1, w2, i)
+        };
+        // Stored parents always end in a separator; see `dir_to_db_parent`.
+        let dir = format!("/seed/{:03}/", i % spec.dirs.max(1));
+        let id = insert_file(
+            &tx,
+            &NewFile {
+                name: &name,
+                parent: &dir,
+                size: 4096,
+                mtime: 1_700_000_000 + i as u64,
+                mime: Some("text/plain"),
+                ftype: FileType::TEXT,
+                hash: None,
+                needs_content: i % spec.content_every.max(1) == 0,
+            },
+        )
+        .unwrap()
+        .expect("unique path");
+        if i % spec.content_every.max(1) == 0 {
+            let mut body: Vec<&str> = (0..spec.body_words).map(|_| *rng.pick(WORDS)).collect();
+            if spec.needle_docs > 0 && i % doc_stride.max(1) == 0 {
+                // Mid-body, so a snippet window has to be cut around it.
+                body[spec.body_words / 2] = NEEDLE;
+            }
+            if spec.body_term_docs > 0 && i % body_stride.max(1) == 0 {
+                // Two thirds in, so verifying it scans most of the document.
+                body[spec.body_words * 2 / 3] = BODY_TERM;
+            }
+            let body = body.join(" ");
+            set_content_done(&tx, id, &body, zstd_of(&body).as_deref()).unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
 }
 
 #[cfg(test)]
@@ -212,10 +345,8 @@ mod tests {
         assert_eq!(std::fs::read(&deep).unwrap(), b"hi");
     }
 
-    /// The premise every collision test rests on, pinned per platform: the
-    /// name really is unrepresentable, and its lossy image really is a name
-    /// another file could have. If this ever stops holding, those tests would
-    /// silently start asserting nothing.
+    /// The premise every collision test rests on, pinned per platform: if
+    /// this ever stops holding, those tests silently assert nothing.
     #[test]
     fn the_unrepresentable_name_collapses_onto_its_twin() {
         let bad = unrepresentable_name("x", ".txt");
@@ -239,17 +370,14 @@ mod tests {
     }
 
     /// The sweep runs against a shared temp directory, so what it matches is
-    /// the whole safety argument. `quicksearch-capture` is the one that would
-    /// hurt: `packaging/capture.sh` puts a run's screenshots and screencasts
-    /// there, and a prefix match would delete them mid-capture.
+    /// the whole safety argument.
     #[test]
     fn only_scratch_directories_are_swept() {
         for ours in [
             "quicksearch-coord-1234-0",
             "quicksearch-stall-heavy-1001402-7",
             "quicksearch-a-0-0",
-            // Tags contain dashes of their own; only the last two components
-            // are read as numbers.
+            // Tags contain dashes of their own.
             "quicksearch-sniff-binary-db-2621744-1",
         ] {
             assert!(is_scratch_name(ours), "{ours} should be swept");
@@ -260,12 +388,10 @@ mod tests {
             "quicksearch-capture",
             "quicksearch",
             "quicksearch-",
-            // A tag but no pid/seq pair.
             "quicksearch-coord",
             "quicksearch-coord-1234",
             // Numbers, but nothing in front of them to be a tag.
             "quicksearch-1234-0",
-            // Not ours at all.
             "cargo-install-abc-1-2",
             "tmp-quicksearch-coord-1-2",
         ] {
@@ -273,16 +399,13 @@ mod tests {
         }
     }
 
-    /// Fresh directories survive; only long-dead runs are collected. Uses a
-    /// hand-built name rather than `scratch_dir` so the assertion is about the
-    /// age gate and not about whatever else the suite has left lying around.
+    /// Fresh directories survive; only long-dead runs are collected.
     #[test]
     fn the_sweep_keeps_recent_trees_and_takes_old_ones() {
         let fresh = scratch_dir("sweep-fresh");
         touch(&fresh.join("evidence.txt"), b"kept");
 
-        // Same shape, but back-dated past the threshold. `set_times` is the
-        // only way to age a directory without waiting twelve hours for it.
+        // Same shape, but back-dated past the threshold.
         let old = std::env::temp_dir().join(format!(
             "quicksearch-sweep-old-{}-{}",
             std::process::id(),

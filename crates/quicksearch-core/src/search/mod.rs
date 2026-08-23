@@ -1,30 +1,9 @@
 //! Interruptible, streaming search service.
 //!
-//! One dedicated worker thread owns the cascade. Callers send queries via
-//! [`SearchService::search`]; results stream back over an mpsc receiver as
-//! [`SearchUpdate`] events tagged with a generation number. Starting a new
-//! search bumps the generation and interrupts the in-flight SQLite
-//! statement, so a keystroke never waits on the previous query.
-//!
-//! Cancellation is two-layer:
-//! - **cooperative** — the cascade compares its generation against the
-//!   latest every few hundred rows and stops silently when stale;
-//! - **interrupt** — [`rusqlite::InterruptHandle::interrupt`] kills the
-//!   statement currently executing. An interrupted stale search is normal
-//!   cancellation, not an error.
-//!
-//! The interrupt handle is stored tagged with the generation that owns it,
-//! and only ever fired at a generation the counter has already moved past:
-//! interrupting the *current* generation would surface as "Search failed:
-//! interrupted" instead of results, and the worker really can dequeue and
-//! start a request before the caller that queued it gets back onto the CPU.
-//!
-//! Consumers that want a plain blocking search (the CLI mode) skip the
-//! service entirely and call [`cascade::run`] with a collecting sink.
-//!
-//! The worker holds one connection across requests and releases it after
-//! [`IDLE_RELEASE`] of quiet; [`Worker::take_connection`] covers when it
-//! must be reopened instead of reused.
+//! One worker thread owns the cascade; [`SearchService::search`] bumps a
+//! generation and streams [`SearchUpdate`] events back. Cancellation is
+//! two-layer: cooperative generation checks plus
+//! [`rusqlite::InterruptHandle::interrupt`] on superseded statements.
 
 pub mod cascade;
 pub mod duplicates;
@@ -46,15 +25,13 @@ use crate::snippet::Snippet;
 pub use cascade::Outcome;
 pub use duplicates::{find_duplicate_groups, DuplicateGroup};
 
-/// How long the worker keeps its connection after the last request. Not held
-/// forever: an open handle on a deleted index keeps its blocks allocated on
-/// disk, and an open reader stops SQLite from resetting the WAL.
+/// Idle window before the connection is released: an open reader stops
+/// SQLite resetting the WAL and pins a deleted index's blocks.
 const IDLE_RELEASE: Duration = Duration::from_secs(30);
 
-/// One search result. `rank` is the sort key (lower = better): integer
-/// part = cascade stage (1–11), fraction = occurrence-count or
-/// edit-distance tiebreak. Batches arrive already rank-ordered and later
-/// batches only append, so a rank-sorted view never reshuffles.
+/// One search result. `rank` is the sort key (lower = better): integer part
+/// = cascade stage (1–11), fraction = tiebreak. Batches arrive rank-ordered
+/// and later batches only append, so a rank-sorted view never reshuffles.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub file_id: i64,
@@ -64,17 +41,13 @@ pub struct SearchHit {
     pub mtime: i64,
     pub rank: f64,
     pub stage: u8,
-    /// The matched span in context: the filename for name stages, the full
-    /// path for path stages, a window of the body for full-text stages
-    /// (absent there when document text isn't stored).
+    /// The matched span in context: name, path, or a window of the body per
+    /// stage (absent for full-text stages when no text is stored).
     pub snippet: Option<Snippet>,
 }
 
 /// Which field a hit's [`SearchHit::snippet`] excerpts, derived from the
 /// cascade stage. See the rank table at the top of [`crate::search::cascade`].
-///
-/// Frontends branch on this rather than on the raw stage number, so a new tier
-/// is classified in one place instead of in every renderer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchField {
     Name,
@@ -82,19 +55,14 @@ pub enum MatchField {
     Path,
 }
 
-/// How a [`MatchField::Contents`] hit matched its body — what has to be
-/// re-run to cut its snippet again from the file as it now stands.
-///
-/// The two are not interchangeable: an exact tier's snippet is cut around the
-/// literal term, and a fuzzy tier's around a bitap match the literal is
-/// usually *absent* from. Re-cutting a fuzzy hit as if it were exact finds
-/// nothing and reads as "the file no longer matches".
+/// How a [`MatchField::Contents`] hit matched its body. Not interchangeable:
+/// re-cutting a fuzzy hit as if it were exact finds nothing and reads as
+/// "the file no longer matches".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentTier {
     /// Stages 5 and 6: the body contains the term as written.
     Exact,
-    /// Stage 8: the body contains something within the fuzzy edit budget of
-    /// the term.
+    /// Stage 8: within the fuzzy edit budget of the term.
     Fuzzy,
 }
 
@@ -103,13 +71,11 @@ impl SearchHit {
         match self.stage {
             1..=4 | 7 => MatchField::Name,
             5 | 6 | 8 => MatchField::Contents,
-            // 9..=11, and whatever a later tier adds: the path is the safe
-            // reading, since it is the one field every hit carries in full.
+            // 9..=11, and whatever a later tier adds: the path is the safe reading.
             _ => MatchField::Path,
         }
     }
 
-    /// `Some` for a hit whose snippet is a window on the file's body.
     pub fn content_tier(&self) -> Option<ContentTier> {
         match self.stage {
             5 | 6 => Some(ContentTier::Exact),
@@ -154,15 +120,13 @@ impl SearchUpdate {
 pub struct SearchOptions {
     /// Enable the fuzzy stages (ranks 7, 8 and 11).
     pub fuzzy: bool,
-    /// Ceiling on the fuzzy edit budget (`[search].fuzzy_max_edits`); see
-    /// [`fuzzy::edit_budget`]. 0 disables the fuzzy stages.
+    /// Ceiling on the fuzzy edit budget (`[search].fuzzy_max_edits`); 0 disables.
     pub fuzzy_max_edits: usize,
     /// Hard cap on total hits per search (`[search].display_limit`).
     pub limit: usize,
     /// Streaming batch size (`[search].results_per_page`).
     pub batch: usize,
-    /// Session-scoped ignore patterns (GUI chips), same glob semantics as
-    /// the config's `ignore_patterns`. Applied before the display cap.
+    /// Session-scoped ignore patterns (GUI chips); applied before the display cap.
     pub session_ignores: Vec<String>,
 }
 
@@ -184,27 +148,19 @@ struct SearchRequest {
     options: SearchOptions,
 }
 
-/// The search the worker is executing right now, and the handle that kills
-/// its statement, tagged with the generation that owns it.
+/// The statement-kill handle, tagged with the generation that owns it.
 type InFlight = Arc<Mutex<Option<(u64, rusqlite::InterruptHandle)>>>;
 
-/// One-shot channel the worker answers a release request on.
 type ReleaseAck = Arc<Mutex<Option<mpsc::Sender<()>>>>;
 
-/// How long [`SearchService::release_connection`] waits for the worker to
-/// answer. Long enough for it to finish a statement and drop the handle,
-/// short enough that a wedged worker cannot hold up a rebuild.
+/// How long [`SearchService::release_connection`] waits for the worker's answer.
 const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
-/// What the worker thread accepts. A search is the overwhelming majority;
-/// the release exists because dropping the held connection is something only
-/// the worker can do, and it is parked in a 30-second `recv_timeout` where a
-/// flag would not reach it.
+/// The release is a message rather than a flag because the worker is parked
+/// in a 30-second `recv_timeout` where a flag would not reach it.
 enum WorkerMsg {
     Search(SearchRequest),
-    /// Drop the held connection now, so whoever asked can delete or replace
-    /// the index file. On Windows an open handle makes that fail outright;
-    /// everywhere else it keeps the deleted inode's blocks pinned.
+    /// Drop the held connection so the index file can be deleted or replaced.
     ReleaseConnection,
 }
 
@@ -213,17 +169,13 @@ pub struct SearchService {
     latest_gen: Arc<AtomicU64>,
     in_flight: InFlight,
     db_path: Arc<Mutex<PathBuf>>,
-    /// Where the worker reports that it has let the connection go; see
-    /// [`SearchService::release_connection`].
     release_ack: ReleaseAck,
     handle: Option<JoinHandle<()>>,
 }
 
 impl SearchService {
-    /// Spawn the worker. `notify` is invoked after every update event so
-    /// an egui frontend can `request_repaint` (pass a no-op for headless
-    /// use). Returns the service handle plus the update receiver, which
-    /// the caller drains non-blockingly.
+    /// Spawn the worker. `notify` is invoked after every update event so an
+    /// egui frontend can `request_repaint` (pass a no-op for headless use).
     pub fn new(
         db_path: PathBuf,
         notify: Arc<dyn Fn() + Send + Sync>,
@@ -231,8 +183,7 @@ impl SearchService {
         Self::new_with_idle_release(db_path, notify, IDLE_RELEASE)
     }
 
-    /// [`Self::new`] with an explicit connection-release window (tests use
-    /// short ones).
+    /// [`Self::new`] with an explicit connection-release window (for tests).
     pub fn new_with_idle_release(
         db_path: PathBuf,
         notify: Arc<dyn Fn() + Send + Sync>,
@@ -274,7 +225,7 @@ impl SearchService {
         )
     }
 
-    /// Start a new search, cancelling any in-flight one. Returns the
+    /// Start a new search, cancelling any in-flight one; returns the
     /// generation whose events to keep.
     pub fn search(&self, input: &str, options: SearchOptions) -> u64 {
         let generation = self.latest_gen.fetch_add(1, Ordering::SeqCst) + 1;
@@ -289,24 +240,9 @@ impl SearchService {
         generation
     }
 
-    /// Drop the connection the worker is holding, and wait briefly for it.
-    ///
-    /// The worker keeps its connection for [`IDLE_RELEASE`] after the last
-    /// query so a typing session runs against a warm page cache. That is the
-    /// right default and the wrong thing to be holding when the index file is
-    /// about to be deleted: on Windows the delete fails outright, and a
-    /// "Rebuild index" that silently did not rebuild is worse than a slow one.
-    ///
-    /// Cancelled first, and not merely as a courtesy. The worker coalesces its
-    /// queue, so a search enqueued just before this — a keystroke, then a
-    /// click on *Rebuild index* — is still current when the release is found,
-    /// and the worker would acknowledge the release and then **reopen** the
-    /// connection to serve it. Bumping the generation makes that request stale,
-    /// so it is dropped at the generation check instead. Results against a file
-    /// about to be deleted are worth nothing anyway.
-    ///
-    /// Best-effort past that — it returns once the worker acknowledges or the
-    /// wait elapses, and the caller proceeds either way.
+    /// Drop the held connection and wait briefly. Cancels first, necessarily:
+    /// a search enqueued just before this would otherwise run after the
+    /// release, **reopening** the connection. Best-effort.
     pub fn release_connection(&self) {
         self.cancel();
         let (ack_tx, ack_rx) = mpsc::channel();
@@ -317,13 +253,11 @@ impl SearchService {
         let _ = ack_rx.recv_timeout(RELEASE_WAIT);
     }
 
-    /// Cancel without starting anything new.
     pub fn cancel(&self) {
         self.latest_gen.fetch_add(1, Ordering::SeqCst);
         self.interrupt_stale();
     }
 
-    /// Point subsequent searches at a different index file.
     pub fn set_db_path(&self, path: PathBuf) {
         *crate::lock_ok(&self.db_path) = path;
         self.cancel();
@@ -331,9 +265,7 @@ impl SearchService {
 
     /// Kill the running statement — but only if the generation counter has
     /// already moved past the search that owns it. Interrupting the *newest*
-    /// search does not cancel it, it fails it as
-    /// `Search failed: interrupted`; and the worker can pick up a request
-    /// before the thread that queued it runs again.
+    /// search does not cancel it, it fails it as `Search failed: interrupted`.
     fn interrupt_stale(&self) {
         let latest = self.latest_gen.load(Ordering::SeqCst);
         if let Some((generation, handle)) = crate::lock_ok(&self.in_flight).as_ref() {
@@ -343,7 +275,6 @@ impl SearchService {
         }
     }
 
-    /// Cancel, close the request channel, and join the worker.
     pub fn shutdown(self) {
         self.cancel();
         let SearchService { req_tx, handle, .. } = self;
@@ -361,10 +292,7 @@ pub fn classify_sql_err(error_msg: &str) -> String {
         // Must never fall into the corruption bucket — the recovery dialog
         // would offer to delete an index that is perfectly intact.
         error_msg.to_string()
-    } else if error_msg.contains("malformed")
-        || error_msg.contains("corrupt")
-        || error_msg.contains("database disk image is malformed")
-    {
+    } else if error_msg.contains("malformed") || error_msg.contains("corrupt") {
         format!("DATABASE_CORRUPTED: {}", error_msg)
     } else if error_msg.contains("fts5: syntax error") {
         "Search syntax error: the search term contains characters that cannot be processed."
@@ -382,15 +310,11 @@ struct Worker {
     in_flight: InFlight,
     db_path: Arc<Mutex<PathBuf>>,
     release_ack: ReleaseAck,
-    /// The connection, and the index generation and path it was opened
-    /// against. See [`Worker::take_connection`].
     open: Option<OpenIndex>,
-    /// How long `open` survives with no requests; [`IDLE_RELEASE`] outside
-    /// tests.
+    /// How long `open` survives with no requests; [`IDLE_RELEASE`] outside tests.
     idle_release: Duration,
 }
 
-/// A connection held across requests, tagged with what it was opened on.
 struct OpenIndex {
     conn: Connection,
     epoch: u64,
@@ -407,17 +331,9 @@ impl Worker {
                 }
                 Ok(WorkerMsg::Search(req)) => req,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Dropping the connection frees `PRAGMAS_SEARCH`'s 32 MiB
-                    // page cache to glibc, which parks it in an arena rather
-                    // than returning it to the kernel. Without the trim a
-                    // single typing session raises the process floor by ~42 MiB
-                    // for as long as it runs — measured on a 77k-file index,
-                    // where an idle GUI sat at 76 MiB `RssAnon` instead of 34.
-                    // Gated on there having *been* a connection so this is once
-                    // per session→idle transition, never a repeating tick:
-                    // `malloc_trim` walks every arena and costs milliseconds.
-                    // The coordinator's writer settles the same way in
-                    // `go_idle`.
+                    // glibc parks the dropped connection's page cache in an
+                    // arena; without the trim the process floor stays ~42 MiB
+                    // higher. Once per idle transition, never a repeating tick.
                     if self.open.take().is_some() {
                         crate::platform::release_free_heap();
                     }
@@ -425,14 +341,9 @@ impl Worker {
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             };
-            // A fast typist queues several requests; only the newest one
-            // matters. A release queued behind them is *not* superseded — it
-            // is the one message that must not be coalesced away, so it is
-            // handled where it is found. Whether the search below still runs
-            // is then the generation check's business:
-            // `release_connection` cancels before it sends, so anything
-            // enqueued ahead of the release is stale and drops out rather than
-            // reopening the connection that was just let go of.
+            // Only the newest search matters, but a release must not be
+            // coalesced away; anything enqueued ahead of it is already
+            // cancelled and drops out rather than reopening the connection.
             let mut req = first;
             while let Ok(newer) = self.req_rx.try_recv() {
                 match newer {
@@ -447,10 +358,7 @@ impl Worker {
         }
     }
 
-    /// Drop the held connection and tell whoever asked.
-    ///
-    /// The same trim `run`'s idle path does, for the same reason: glibc parks
-    /// `PRAGMAS_SEARCH`'s page cache in an arena rather than returning it.
+    /// Drop the held connection and tell whoever asked; same trim as idle.
     fn release(&mut self) {
         if self.open.take().is_some() {
             crate::platform::release_free_heap();
@@ -460,24 +368,16 @@ impl Worker {
         }
     }
 
-    /// Take the connection to run this request on, reopening if the one held
-    /// cannot be reused. Reuse is what keeps
-    /// [`crate::db::schema::PRAGMAS_SEARCH`]'s page cache warm across
-    /// keystrokes.
-    ///
-    /// Reopened when either half of what it was opened against has changed:
-    /// the path (config points at a different index) or the epoch (the file
-    /// at the *same* path was replaced — rebuild, clear, schema-drift wipe —
-    /// which no path comparison can catch, and which would leave this worker
-    /// querying a deleted inode and pinning its blocks on disk).
+    /// Take the connection, reopening when the path changed or the epoch
+    /// moved — the file at the *same* path was replaced, which no path
+    /// comparison can catch and would leave this worker on a deleted inode.
     fn take_connection(&mut self, db_path: &Path) -> Result<OpenIndex, String> {
         let epoch = db::index_epoch();
         if let Some(open) = self.open.take() {
             if open.epoch == epoch && open.path == db_path {
                 return Ok(open);
             }
-            // Dropped here, before the open below, so the handle on the old
-            // index is gone before a handle on the new one exists.
+            // The handle on the old index must be gone before one on the new exists.
             drop(open);
         }
         Ok(OpenIndex {
@@ -518,8 +418,7 @@ impl Worker {
                 return;
             }
         };
-        // Publish the handle tagged with the generation it kills, before the
-        // first statement runs.
+        // Publish the kill handle before the first statement runs.
         *crate::lock_ok(&self.in_flight) = Some((generation, open.conn.get_interrupt_handle()));
 
         let mut sink = |hits: Vec<SearchHit>| {
@@ -536,9 +435,8 @@ impl Worker {
 
         *crate::lock_ok(&self.in_flight) = None;
 
-        // Kept only if it still works: a failed cascade may have failed
-        // *because* of this connection, and putting it back would wedge every
-        // later search behind the same bad handle.
+        // A failed cascade may have failed *because* of this connection;
+        // putting it back would wedge every later search behind it.
         if outcome.is_ok() {
             self.open = Some(open);
         }
@@ -563,8 +461,7 @@ impl Worker {
 mod tests {
     use super::*;
 
-    /// Start a query long enough to be killed while it is executing, on its
-    /// own thread. Returns the handle that kills it and the result channel.
+    /// A query long enough to be killed while executing, on its own thread.
     fn spawn_slow_query() -> (
         rusqlite::InterruptHandle,
         mpsc::Receiver<rusqlite::Result<i64>>,
@@ -584,8 +481,7 @@ mod tests {
         (handle, rx)
     }
 
-    /// Cancel repeatedly for as long as the query runs, so every window in
-    /// which an interrupt could land is exercised rather than hoped past.
+    /// Cancel repeatedly, so every window an interrupt could land in is exercised.
     fn cancel_until_done(
         service: &SearchService,
         rx: &mpsc::Receiver<rusqlite::Result<i64>>,
@@ -604,9 +500,7 @@ mod tests {
         SearchService::new(PathBuf::from("/nonexistent"), Arc::new(|| {})).0
     }
 
-    /// Typing the next character must not kill the search that character
-    /// started: killing the newest generation surfaces as
-    /// "Search failed: interrupted" instead of results.
+    /// Killing the newest generation surfaces as an error instead of results.
     #[test]
     fn cancelling_spares_the_newest_generation() {
         let service = idle_service();
@@ -624,9 +518,8 @@ mod tests {
         service.shutdown();
     }
 
-    /// The other half: a generation the counter has moved past still dies
-    /// promptly, which is what keeps a keystroke from waiting on the previous
-    /// query.
+    /// A superseded generation still dies promptly — a keystroke must not
+    /// wait on the previous query.
     #[test]
     fn cancelling_kills_a_superseded_generation() {
         let service = idle_service();
@@ -656,8 +549,7 @@ mod tests {
         assert_eq!(classified, msg, "must pass through verbatim");
         assert!(!classified.starts_with("DATABASE_CORRUPTED:"));
 
-        // The raw SQLite wording for an undecryptable page must not land in
-        // the corruption bucket either; pin that.
+        // The raw wording for an undecryptable page stays out of that bucket too.
         let raw = "Failed to read database at /tmp/x.sqlite: file is not a database";
         assert!(!classify_sql_err(raw).starts_with("DATABASE_CORRUPTED:"));
     }

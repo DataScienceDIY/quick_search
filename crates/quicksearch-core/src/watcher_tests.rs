@@ -8,8 +8,6 @@ fn sink_to_vec() -> (EventSink, Arc<StdMutex<Vec<FsEvent>>>) {
     (s, v)
 }
 
-/// Filters matching the shipped defaults: hidden excluded, `.git` and
-/// `node_modules` ignored.
 fn default_filters() -> WatchFilters {
     WatchFilters {
         include_hidden: false,
@@ -32,8 +30,7 @@ fn tmp_dir(tag: &str) -> PathBuf {
     crate::testutil::scratch_dir(tag)
 }
 
-/// A registry with `dirs` seeded directly, so the pure set logic can be
-/// tested without registering real kernel watches.
+/// Seeds `dirs` directly so set logic is tested without real kernel watches.
 fn registry_with(dirs: &[&str]) -> WatchRegistry {
     let raw = RecommendedWatcher::new(|_res| {}, NotifyConfig::default()).unwrap();
     WatchRegistry {
@@ -43,23 +40,17 @@ fn registry_with(dirs: &[&str]) -> WatchRegistry {
     }
 }
 
-/// Most `Remove` events name *files*, which are never watched; the early
-/// return keeps them off the O(watched) scan.
 #[test]
 fn remove_tree_skips_the_scan_for_a_path_that_is_not_watched() {
     let mut reg = registry_with(&["/a/b", "/a/b/c", "/a/bc"]);
 
-    // A file inside a watched directory: not watched itself, and nothing
-    // can live beneath it.
     assert_eq!(reg.remove_tree(Path::new("/a/b/file.txt")), 0);
     assert_eq!(reg.dirs.len(), 3, "the watch set is untouched");
 
-    // An entirely unrelated path is likewise a no-op.
     assert_eq!(reg.remove_tree(Path::new("/elsewhere")), 0);
     assert_eq!(reg.dirs.len(), 3);
 
-    // The watched directory itself still takes its descendants with it —
-    // and only its descendants: /a/bc is a sibling, not a child.
+    // /a/bc is a name-prefix sibling, not a child.
     assert_eq!(reg.remove_tree(Path::new("/a/b")), 2);
     assert_eq!(
         reg.dirs.iter().collect::<Vec<_>>(),
@@ -151,8 +142,6 @@ fn prune_stale_keeps_active_entries() {
     assert_eq!(map.len(), 1);
 }
 
-/// End-to-end: create files in a tempdir, verify the watcher surfaces
-/// events via the sink.
 #[test]
 fn e2e_create_modify_remove_surfaces() {
     let dir = tmp_dir("e2e");
@@ -177,8 +166,7 @@ fn e2e_create_modify_remove_surfaces() {
     w.stop();
 
     let events = got.lock().unwrap().clone();
-    // Expect at least one Create (or Modify, depending on backend) and one Remove.
-    // Some platforms emit Create+Modify for `write`.
+    // Some backends emit Create+Modify for `write`, so accept either.
     let has_create_or_modify = events
         .iter()
         .any(|e| matches!(e, FsEvent::Create(_) | FsEvent::Modify(_)));
@@ -189,16 +177,9 @@ fn e2e_create_modify_remove_surfaces() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A file the index cannot spell must produce no event at all.
-///
-/// It is never indexed, so no row exists for a `Create` to update or a
-/// `Remove` to delete — but the incremental side keys on `path_to_db_string`,
-/// which is lossy, so an event that got through would be applied to whichever
-/// *different* file owns the lossy spelling. Screened in
-/// [`is_event_interesting`], the one gate every `FsEvent` passes through.
-///
-/// A real file is created alongside, so a run where the watcher simply saw
-/// nothing cannot pass by accident.
+/// The incremental side keys on lossy `path_to_db_string`, so an event that
+/// got through would be applied to whichever *different* file owns the lossy
+/// spelling. The control file rules out a watcher that simply saw nothing.
 #[test]
 fn events_for_an_unrepresentable_name_never_surface() {
     let dir = tmp_dir("e2e-unrepresentable");
@@ -222,8 +203,6 @@ fn events_for_an_unrepresentable_name_never_surface() {
     std::fs::write(&bad, "hi").unwrap();
     std::thread::sleep(Duration::from_millis(150));
     std::fs::remove_file(&bad).unwrap();
-    // The control: whatever the backend does for the bad name, it certainly
-    // reports this one, so an empty event list means the watcher was working.
     let good = dir.join("ordinary.txt");
     std::fs::write(&good, "hi").unwrap();
     std::thread::sleep(Duration::from_millis(250));
@@ -258,7 +237,6 @@ fn events_for_an_unrepresentable_name_never_surface() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Descriptors are not spent on directories the indexer would discard.
 #[test]
 fn ignored_and_hidden_dirs_are_not_registered() {
     let dir = tmp_dir("filter");
@@ -282,7 +260,6 @@ fn ignored_and_hidden_dirs_are_not_registered() {
     )
     .unwrap();
 
-    // root + keep + keep/nested. The 4 ignored/hidden dirs cost nothing.
     assert_eq!(w.watched_dirs(), 3, "expected root, keep, keep/nested only");
     drop(w);
     std::fs::remove_dir_all(&dir).ok();
@@ -310,8 +287,6 @@ fn include_hidden_registers_dotted_dirs() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Exceeding the cap fails the whole registration — no root gets
-/// partial live updates.
 #[test]
 fn exceeding_the_cap_fails_all_or_nothing() {
     let dir = tmp_dir("cap");
@@ -339,8 +314,6 @@ fn exceeding_the_cap_fails_all_or_nothing() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// One folder the user cannot read is not a reason to switch live
-/// updates off for every root — it costs its own events only.
 #[test]
 #[cfg(unix)]
 fn an_unreadable_directory_is_skipped_not_fatal() {
@@ -365,8 +338,6 @@ fn an_unreadable_directory_is_skipped_not_fatal() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A tree over the cap that *also* holds an unreadable directory must
-/// report the cap — the one limit the user can act on.
 #[test]
 #[cfg(unix)]
 fn the_cap_outranks_an_unreadable_directory() {
@@ -390,7 +361,6 @@ fn the_cap_outranks_an_unreadable_directory() {
     );
     crate::platform::restore_read(&locked).ok();
 
-    // Whichever order the walk visits them in, the cap is what stops us.
     assert_eq!(
         started.unwrap_err(),
         WatchError::TooManyDirectories { dirs: 2, cap: 2 },
@@ -421,8 +391,6 @@ fn a_tree_inside_the_cap_registers() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A directory created after startup must get its own watch, or its
-/// contents are invisible to live updates.
 #[test]
 fn a_directory_created_after_start_is_watched() {
     let dir = tmp_dir("newdir");
@@ -441,7 +409,6 @@ fn a_directory_created_after_start_is_watched() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(w.watched_dirs(), 2, "the new directory must be watched");
 
-    // A file inside it is only visible if that watch really landed.
     let f = sub.join("inside.txt");
     std::fs::write(&f, "hi").unwrap();
     std::thread::sleep(Duration::from_millis(300));
@@ -459,8 +426,6 @@ fn a_directory_created_after_start_is_watched() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A whole tree can arrive in one event; every directory in it needs a
-/// watch, not just the top.
 #[test]
 fn a_moved_in_tree_registers_every_directory() {
     let staging = tmp_dir("staging");
@@ -507,8 +472,7 @@ fn a_removed_directory_releases_its_watches() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// `Path::starts_with` compares components, so a sibling sharing a name
-/// prefix must survive its neighbour's removal.
+/// `Path::starts_with` compares components, not byte prefixes.
 #[test]
 fn remove_tree_does_not_match_name_prefixes() {
     let dir = tmp_dir("prefix");
@@ -532,8 +496,6 @@ fn remove_tree_does_not_match_name_prefixes() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Crossing the cap at runtime (rather than at startup) must record
-/// *which* limit was hit, so the coordinator doesn't have to guess.
 #[test]
 fn running_out_of_budget_later_records_the_reason() {
     let dir = tmp_dir("degrade");
@@ -550,7 +512,6 @@ fn running_out_of_budget_later_records_the_reason() {
     .unwrap();
     assert!(!w.is_degraded(), "one directory is under the cap of 2");
 
-    // Two more directories: the first fits, the second cannot.
     std::fs::create_dir(dir.join("fits")).unwrap();
     std::thread::sleep(Duration::from_millis(200));
     std::fs::create_dir(dir.join("overflows")).unwrap();
@@ -586,10 +547,8 @@ fn a_created_ignored_directory_is_not_watched() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Registration must not follow a symlinked directory when the indexer will
-/// not: every descriptor spent there reports events for a subtree that gets
-/// discarded on arrival, and on Linux the watch budget is a shared kernel
-/// resource.
+/// On Linux the watch budget is a shared kernel resource; none of it is spent
+/// on a subtree the indexer discards.
 #[test]
 #[cfg(unix)]
 fn a_symlinked_directory_is_not_registered_when_following_is_off() {
@@ -607,8 +566,6 @@ fn a_symlinked_directory_is_not_registered_when_following_is_off() {
     )
     .unwrap();
 
-    // root + real + real/nested. The link and everything under it cost
-    // nothing.
     assert_eq!(
         w.watched_dirs(),
         if crate::platform::WATCH_ROOTS_RECURSIVELY {

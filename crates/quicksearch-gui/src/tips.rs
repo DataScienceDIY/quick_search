@@ -1,33 +1,23 @@
-//! Plain-language tooltips for the configuration controls: every setting in
-//! the Settings tab, and every configuration control on the Manage Index
-//! tab, explains itself on hover.
+//! Plain-language tooltips: every configuration control explains itself on hover.
 
-/// How wide a tooltip may get; matches `manage_tab::db_size_tooltip`.
 const TIP_WIDTH: f32 = 420.0;
 
-/// One control's tooltip.
 pub struct Tip {
-    /// The setting's name, in bold at the top.
     pub title: &'static str,
-    /// The explanation. One or more paragraphs separated by `"\n\n"`.
     pub body: &'static str,
     /// Concrete values and when to choose them, rendered small underneath.
-    /// Empty where a setting has nothing to weigh up.
     pub examples: &'static [&'static str],
-    /// A consequence worth seeing before the click, rendered small and
-    /// orange. Reserved for rebuilds and deletions.
+    /// Rendered small and orange; reserved for rebuilds and deletions.
     pub caution: Option<&'static str>,
 }
 
 impl Tip {
-    /// Render into a hover popup.
     pub fn show(&self, ui: &mut egui::Ui) {
         ui.set_max_width(TIP_WIDTH);
         ui.strong(self.title);
         ui.label(self.body);
         if !self.examples.is_empty() {
             ui.add_space(4.0);
-            // One example reads as a sentence; several read as a list.
             let single = self.examples.len() == 1;
             for example in self.examples {
                 let line = if single {
@@ -46,10 +36,9 @@ impl Tip {
     }
 }
 
-/// Attach a [`Tip`] to any widget.
 pub trait Tipped {
-    /// Show `tip` on hover, whether or not the widget is enabled: a greyed
-    /// out button is exactly when someone wants to know what it would do.
+    /// Shown even while disabled: a greyed-out button is exactly when
+    /// someone wants to know what it would do.
     fn tip(self, tip: &'static Tip) -> Self;
 }
 
@@ -60,8 +49,7 @@ impl Tipped for egui::Response {
     }
 }
 
-/// One row of a two-column settings grid: the label and the control share a
-/// tooltip, so hovering the name works as well as hovering the widget.
+/// One grid row; the label and the control share the tooltip.
 pub fn tip_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -642,8 +630,7 @@ pub static APPLY_SAVE: Tip = Tip {
 mod tests {
     use super::*;
 
-    /// Every tip in the file. A tip missing from here is only missing from
-    /// the checks below, so keep it in step when adding one.
+    /// Keep in step when adding a tip: one missing here skips the checks below.
     const ALL: &[&Tip] = &[
         &DATABASE_PATH,
         &REINDEX_INTERVAL,
@@ -682,7 +669,6 @@ mod tests {
         &APPLY_SAVE,
     ];
 
-    /// Everything a tip can put on screen, as one string.
     fn all_text(tip: &Tip) -> String {
         let mut text = format!("{}\n{}", tip.title, tip.body);
         for example in tip.examples {
@@ -696,7 +682,6 @@ mod tests {
         text
     }
 
-    /// House style: these tooltips use no em-dashes.
     #[test]
     fn no_tip_uses_an_em_dash() {
         for tip in ALL {
@@ -727,9 +712,8 @@ mod tests {
                 "{}: body is not a finished sentence",
                 tip.title
             );
-            // "Stops the run in progress" under the title "Stop" is fine;
-            // "Stop. Stops the run" is the restatement worth catching, so
-            // the title only counts as repeated when a word ends there.
+            // "Stop. Stops the run" is the restatement worth catching; the
+            // title only counts as repeated when a word ends there.
             let restates = tip
                 .body
                 .strip_prefix(tip.title)
@@ -753,7 +737,6 @@ mod tests {
         }
     }
 
-    /// A tooltip nobody reads to the end helps nobody.
     #[test]
     fn no_tip_is_a_wall_of_text() {
         for tip in ALL {
@@ -762,8 +745,6 @@ mod tests {
         }
     }
 
-    /// Two controls sharing a title means one of them was pasted from the
-    /// other and never renamed.
     #[test]
     fn titles_are_distinct() {
         let mut seen: Vec<&str> = ALL.iter().map(|t| t.title).collect();
@@ -773,8 +754,6 @@ mod tests {
         assert_eq!(count, seen.len(), "two tips share a title: {:?}", seen);
     }
 
-    /// The renderer puts every part on screen: title, body, examples and
-    /// caution. Written against the tip with all four.
     #[test]
     fn show_paints_every_part() {
         let ctx = crate::test_ui::ctx();
@@ -792,7 +771,6 @@ mod tests {
         );
     }
 
-    /// A lone example reads as a sentence rather than a one-item list.
     #[test]
     fn a_single_example_is_prefixed_with_example() {
         let ctx = crate::test_ui::ctx();
@@ -807,8 +785,8 @@ mod tests {
         );
     }
 
-    /// A greyed-out control still explains itself: egui shows nothing on a
-    /// disabled widget unless the *disabled* tooltip is set too.
+    /// egui shows nothing on a disabled widget unless the *disabled*
+    /// tooltip is set too.
     #[test]
     fn a_disabled_control_still_explains_itself() {
         let ctx = crate::test_ui::ctx();

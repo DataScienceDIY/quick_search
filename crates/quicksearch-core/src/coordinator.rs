@@ -1,8 +1,6 @@
-//! The indexing coordinator: the one object binaries construct.
-//!
-//! Owns the [`IndexingService`] (full runs), the filesystem [`Watcher`]
-//! (change events), a periodic-reindex scheduler, and the mode state
-//! machine:
+//! The indexing coordinator: the one object binaries construct. Owns the
+//! [`IndexingService`], the filesystem [`Watcher`], a periodic-reindex
+//! scheduler, and the mode state machine:
 //!
 //! - **Auto** — watcher running; events apply incrementally between full
 //!   runs; a full reindex triggers whenever `last_full_index` is older
@@ -12,17 +10,11 @@
 //! - **ManualRunning** — one user-forced full run; returns to
 //!   `ManualStopped` when it finishes. (A forced run in Auto stays Auto.)
 //!
-//! `indexing.auto_index` is the persisted form of that mode: it picks the
-//! starting mode and tracks every mode change; writing the file back is the
-//! caller's job — the coordinator's config is a copy, not the source of truth.
-//!
-//! Single-writer guarantee: incremental writes are deferred while a full
-//! run is active, then the queue drains. Overflowing the queue (>100k
-//! pending paths) collapses into one full run instead.
-//!
-//! Once per busy→idle transition, [`Inner::go_idle`] drops the write
-//! connection (and its page cache), returns freed heap to the OS, and
-//! refreshes the published file count.
+//! `indexing.auto_index` persists the mode; writing the file back is the
+//! caller's job — the coordinator's config is a copy, not the source of
+//! truth. Single-writer guarantee: incremental writes are deferred while a
+//! full run is active, then the queue drains; overflow collapses into one
+//! full run.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -50,7 +42,6 @@ use inner::Inner;
 /// Pending-event ceiling; beyond this a full run is cheaper than replay.
 const PENDING_OVERFLOW: usize = 100_000;
 
-/// How often the published file count is re-read while idle.
 const FILE_COUNT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +59,6 @@ pub enum WatcherStatus {
     /// Registration in flight — it walks every root, so this can last
     /// minutes on large or networked trees.
     Starting,
-    /// Live updates active over `dirs` watched directories.
     Active { dirs: usize },
     /// Live updates unavailable; the periodic reindex is the only refresh.
     Disabled { reason: WatchError },
@@ -77,7 +67,6 @@ pub enum WatcherStatus {
 /// A config reconciliation the coordinator applies between runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileState {
-    /// Scanning now; the counters move every slice.
     Running(ReconcileProgress),
     /// Finished within the last [`RECONCILE_SUMMARY_LINGER`].
     Finished(ReconcileProgress),
@@ -95,30 +84,22 @@ pub struct IndexerState {
     pub last_full_index: Option<u64>,
     /// Rows in the index, refreshed while idle. `None` before the first read.
     pub files: Option<i64>,
-    /// Watcher events waiting to be applied.
     pub queued_events: usize,
-    /// Live-update health; see [`WatcherStatus`].
     pub watcher: WatcherStatus,
-    /// The between-runs reconciliation, while it runs and briefly after.
-    ///
-    /// A run's *own* reconciliation is not here — it reads as
+    /// The between-runs reconciliation, while it runs and briefly after. A
+    /// run's *own* reconciliation is not here — it reads as
     /// [`IndexingStatus::Preparing`] with a [`PrepStep::Reconciling`].
     pub reconcile: Option<ReconcileState>,
     /// What each configured root held when indexing last completed. Roots
     /// never indexed to completion are absent rather than zero.
-    ///
-    /// `Arc` because `state()` is called more than once per frame and this
-    /// changes only when a run ends.
     pub root_counts: Arc<Vec<RootCount>>,
 }
 
 /// One configured root's stored figures, keyed the way the caller spells it.
 #[derive(Debug, Clone)]
 pub struct RootCount {
-    /// The root exactly as `paths.indexing_paths` gives it, so a frontend can
-    /// match it against the string it already draws. The `schema_info` key
-    /// behind it is the canonicalized spelling, so re-spelling a root in the
-    /// config keeps its figures.
+    /// The root exactly as `paths.indexing_paths` gives it; the `schema_info`
+    /// key behind it is canonicalized, so re-spelling a root keeps its figures.
     pub root: String,
     pub counts: db::repo::RootCounts,
 }
@@ -146,10 +127,8 @@ pub struct IndexCoordinator {
 }
 
 /// The two halves of cutting the coordinator's reconciliation short — the pair
-/// [`db::InterruptSlot`] describes.
-///
-/// A command cannot do it: the thread that would read the command is the
-/// thread inside the scan.
+/// [`db::InterruptSlot`] describes. A command cannot do it: the thread that
+/// would read the command is the thread inside the scan.
 #[derive(Default)]
 struct ReconcileStop {
     cancel: AtomicBool,
@@ -173,8 +152,6 @@ impl ReconcileStop {
 struct Shared {
     mode: IndexMode,
     last_full_index: Option<u64>,
-    /// Rows in `files`, for the idle status bar's "N files indexed".
-    /// `None` until the first successful read.
     files: Option<i64>,
     queued_events: usize,
     watcher: WatcherStatus,
@@ -279,6 +256,13 @@ impl IndexCoordinator {
         }
     }
 
+    /// Whether a run currently holds the database. [`Self::state`] answers this
+    /// too, but clones the per-root progress with it; this is the form for a
+    /// caller polling once a frame.
+    pub fn is_indexing(&self) -> bool {
+        self.indexing.is_active()
+    }
+
     pub fn set_mode(&self, mode: IndexMode) {
         let _ = self.cmd_tx.send(CoordCmd::SetMode(mode));
     }
@@ -310,17 +294,10 @@ impl IndexCoordinator {
 
     /// Bring the index up to date for these paths and nothing else.
     ///
-    /// For [`crate::live`]: a frontend that has just read a displayed file
-    /// from disk hands the path here so the index agrees with what the user
-    /// is looking at. Deliberately **not** gated on [`IndexMode`] — the whole
-    /// point is that the rows on screen stay honest with indexing stopped —
-    /// but still applied on the coordinator's own thread, so the
-    /// single-writer rule holds and a full run is never raced.
-    ///
-    /// Each path is re-read and rewritten only if its modified time has moved
-    /// (see [`crate::incremental::apply_fs_event`]), so submitting a path that
-    /// is already current costs a `stat` and a row lookup. A path that no
-    /// longer exists is removed from the index.
+    /// For [`crate::live`]. Deliberately **not** gated on [`IndexMode`] — the
+    /// whole point is that the rows on screen stay honest with indexing
+    /// stopped — but still applied on the coordinator's own thread, so the
+    /// single-writer rule holds. A path that no longer exists is removed.
     pub fn update_paths(&self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
@@ -339,12 +316,11 @@ impl IndexCoordinator {
             .check_config_validation(&db.to_string_lossy(), config, &roots)
     }
 
-    /// Stop the watcher, any running index pass, and the coordinator
-    /// thread. Idempotent; usable from a signal handler through an Arc.
-    ///
-    /// The reconciliation is cancelled *before* the command is sent: the
-    /// command is read by the thread inside the scan, so the join — and the
-    /// window close behind it — would otherwise wait out the scan.
+    /// Stop the watcher, any running index pass, and the coordinator thread.
+    /// Idempotent; usable from a signal handler through an Arc. The
+    /// reconciliation is cancelled *before* the command is sent: the command
+    /// is read by the thread inside the scan, so the join — and the window
+    /// close behind it — would otherwise wait out the scan.
     pub fn shutdown(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
@@ -358,9 +334,6 @@ impl IndexCoordinator {
 
     /// Whether a configuration change is being applied to the index right
     /// now, by either of the two places that can be doing it.
-    ///
-    /// An abandoned pass leaves entries the user excluded still in the index
-    /// until the next indexing run redoes it.
     pub fn reconciling(&self) -> bool {
         // Lock released before asking the service; never hold both at once.
         let between_runs = crate::lock_ok(&self.shared).reconcile;
@@ -382,25 +355,15 @@ impl Drop for IndexCoordinator {
 }
 
 /// The verb a path submitted through [`IndexCoordinator::update_paths`]
-/// deserves, or `None` to leave the index alone.
-///
-/// The caller knows a file changed, not what it changed into. `is_file()` is
-/// the fast answer and almost always the right one — one `stat`, and this runs
-/// while results are on screen — but it folds every stat error into `false`,
-/// and a `Remove` costs the row *and everything beneath it*. So the negative
-/// answer, and only it, is confirmed with a second `stat` that can tell "gone"
-/// from "cannot see it just now": a share that dropped, a drive pulled while
-/// its rows were displayed, a parent another process chmod'd.
-///
-/// In doubt the index wins. A stale row is a wrong line on screen until the
-/// next full run; a deleted live one is data no run brings back until the file
-/// is walked again — and if the reason it could not be read was that its whole
-/// tree went away, that walk will not reach it either.
+/// deserves, or `None` to leave the index alone. `is_file()` folds every stat
+/// error into `false`, and a `Remove` costs the row *and everything beneath
+/// it* — so the negative answer, and only it, is confirmed with a second
+/// `stat` that can tell "gone" from "cannot see it just now".
 fn verb_for(path: PathBuf) -> Option<FsEvent> {
     if path.is_file() {
         return Some(FsEvent::Modify(path));
     }
-    // `metadata`, not `symlink_metadata`: it has to agree with `is_file()`
+    // `metadata`, not `symlink_metadata`: it must agree with `is_file()`
     // above about following links, or the two can disagree about the verb.
     match std::fs::metadata(&path) {
         // There, but no longer something the walk would index.
@@ -429,12 +392,10 @@ fn is_removal(event: &FsEvent) -> bool {
     matches!(event, FsEvent::Remove(_))
 }
 
-/// Drop queued removals that a queued removal of one of their ancestors
-/// already covers, in place. Keeps `rm -rf` on a large tree from tripping
-/// [`PENDING_OVERFLOW`] into a redundant full run.
-///
-/// Only removals collapse: a `Create` under a removed directory is a
-/// re-creation and must survive (removals are applied first).
+/// Drop queued removals already covered by a queued removal of an ancestor,
+/// keeping `rm -rf` on a large tree under [`PENDING_OVERFLOW`]. Only removals
+/// collapse: a `Create` under a removed directory is a re-creation and must
+/// survive (removals are applied first).
 fn collapse_pending_removals(pending: &mut HashMap<PathBuf, FsEvent>) {
     if pending.values().filter(|e| is_removal(e)).take(2).count() < 2 {
         return;
@@ -444,7 +405,6 @@ fn collapse_pending_removals(pending: &mut HashMap<PathBuf, FsEvent>) {
         .filter(|(_, ev)| is_removal(ev))
         .map(|(p, _)| p.clone())
         .collect();
-    // Component-wise containment, per `UnreadableDirs::covers`.
     pending.retain(|path, ev| {
         !is_removal(ev) || !path.ancestors().skip(1).any(|a| removed.contains(a))
     });
@@ -457,7 +417,6 @@ const APPLY_BUDGET: Duration = Duration::from_millis(250);
 /// Wakes the frontend when this thread changes something worth drawing.
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
-/// Whether a reconciliation that finished at `at` is still worth reporting.
 fn summary_is_fresh(at: Instant, now: Instant) -> bool {
     now.duration_since(at) < RECONCILE_SUMMARY_LINGER
 }

@@ -17,7 +17,6 @@ fn text_that_fits_comes_back_untouched() {
         let out = middle_elide(ui, DEEP, 10_000.0, &font);
         assert!(matches!(out, Cow::Borrowed(_)), "borrowed when it fits");
         assert_eq!(out, DEEP);
-        // Nothing to elide, however little room there is.
         assert!(matches!(middle_elide(ui, "", 0.0, &font), Cow::Borrowed(_)));
     });
 }
@@ -42,9 +41,8 @@ fn eliding_keeps_both_ends_and_cuts_once() {
     });
 }
 
-/// The load-bearing property. If the result laid out in the same font
-/// were wider than the budget, egui would elide it a *second* time and
-/// paint two ellipses.
+/// The load-bearing property: a result wider than the budget would be elided
+/// a *second* time by egui, painting two ellipses.
 #[test]
 fn the_result_fits_the_budget_it_was_given() {
     with_ui(|ui| {
@@ -64,8 +62,6 @@ fn the_result_fits_the_budget_it_was_given() {
     });
 }
 
-/// An ellipsis is the least that can stand for the text; a column too
-/// narrow even for that gets it anyway rather than a panic.
 #[test]
 fn degenerate_widths_never_panic() {
     with_ui(|ui| {
@@ -76,8 +72,6 @@ fn degenerate_widths_never_panic() {
     });
 }
 
-/// Indices walk by whole characters, so a path of multi-byte glyphs
-/// slices cleanly instead of panicking mid-codepoint.
 #[test]
 fn multi_byte_paths_split_on_character_boundaries() {
     with_ui(|ui| {
@@ -92,16 +86,13 @@ fn multi_byte_paths_split_on_character_boundaries() {
     });
 }
 
-/// The trap behind "my ignore filters don't work" reports: ".jpg" is an
-/// exact-name pattern, and the hint must say so and offer "*.jpg".
+/// The trap behind "my ignore filters don't work": ".jpg" is an exact name.
 #[test]
 fn extension_like_patterns_get_a_hint() {
     let hint = pattern_hint(".jpg").expect("hint for .jpg");
     assert!(hint.contains("*.jpg"), "{}", hint);
     assert!(hint.contains("exactly"), "{}", hint);
 
-    // Fires for genuine exact-name patterns too — the statement it
-    // makes is just as true for .git, so no allowlist.
     assert!(pattern_hint(".git").is_some());
     assert!(pattern_hint("  .venv  ").is_some(), "trimmed first");
 
@@ -166,7 +157,6 @@ fn usual_patterns_are_valid() {
 
 #[test]
 fn empty_editor_keeps_the_theme_border() {
-    // Nothing typed yet is not an error to flag.
     for dark in [true, false] {
         assert_eq!(pattern_border("", dark), None);
         assert_eq!(pattern_border("   ", dark), None);
@@ -181,8 +171,7 @@ fn typed_text_is_judged() {
         assert_eq!(pattern_border("*.tmp", dark), Some(p.green));
         assert_eq!(pattern_border("  node_modules  ", dark), Some(p.green));
         assert_eq!(pattern_border("foo[", dark), Some(p.red));
-        // Typed, but trims away to nothing under the pattern rules —
-        // still worth flagging, unlike a box the user has not filled in.
+        // Trims away to nothing, unlike a box the user has not filled in.
         assert_eq!(pattern_border("/", dark), Some(p.red));
     }
 }
@@ -218,7 +207,6 @@ fn covered_spans(mesh: &egui::Mesh) -> Vec<(f32, f32)> {
 
 #[test]
 fn a_revealed_section_paints_no_scrim() {
-    // The steady state is the common one: no shape, no vertices, no cost.
     assert!(wipe_mesh(SECTION, 0.0, FILL).is_none());
     assert!(wipe_mesh(SECTION, -0.5, FILL).is_none());
 }
@@ -252,8 +240,6 @@ fn the_scrim_ramps_clear_at_the_top_to_solid_at_the_bottom() {
     let ramp = ramp(&mesh);
     assert_eq!(ramp.first().expect("vertices").1, 0, "the top is untouched");
     assert_eq!(ramp.last().expect("vertices").1, 255, "the bottom is gone");
-    // Alpha only ever increases downward, and the quads stay contiguous:
-    // a gradient, not a stack of steps.
     for pair in ramp.windows(2) {
         assert!(
             pair[1].0 >= pair[0].0 && pair[1].1 >= pair[0].1,
@@ -265,9 +251,8 @@ fn the_scrim_ramps_clear_at_the_top_to_solid_at_the_bottom() {
 
 #[test]
 fn less_of_the_section_shows_the_further_the_wipe_is_from_done() {
-    // How much of the section's height the scrim swallows: the integral
-    // of alpha down it, so a widening gradient counts as well as a
-    // growing solid block.
+    // How much of the section's height the scrim swallows: the integral of
+    // alpha down it, so a widening gradient counts as well as a solid block.
     let hidden_height = |wipe: f32| {
         let mesh = wipe_mesh(SECTION, wipe, FILL).expect("travelling");
         mesh.vertices
@@ -296,8 +281,8 @@ fn less_of_the_section_shows_the_further_the_wipe_is_from_done() {
 
 #[test]
 fn a_short_section_still_gets_a_gradient() {
-    // Two rows tall: the proportional band would be a few points, small
-    // enough to read as a hard cut, so the floor takes over.
+    // Two rows tall: the proportional band would read as a hard cut here, so
+    // the floor takes over.
     let short = egui::Rect::from_min_max(egui::pos2(10.0, 100.0), egui::pos2(410.0, 130.0));
     let mesh = wipe_mesh(short, 0.5, FILL).expect("mid-travel");
     let gradient = mesh

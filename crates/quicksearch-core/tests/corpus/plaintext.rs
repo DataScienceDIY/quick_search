@@ -1,33 +1,23 @@
-//! Plain-text corpus files: one per extension family, plus one per encoding.
+//! Plain-text corpus files: one per extension family, plus one per
+//! encoding. Written with `std` alone; the one encoder needed —
+//! windows-1252 — is hand-rolled rather than `encoding_rs`, the decoder
+//! under test.
 //!
-//! Written with `std` alone. The one place that needs an encoder — windows-1252
-//! — gets a hand-rolled one rather than `encoding_rs`, which is what
-//! `textenc::decode_text` reads it back with.
-//!
-//! The extension sweep is not decoration: it drives all three stages of
-//! `mime::guess_mime_from_head`. `.bat` comes from the override table, most
-//! come from `mime_guess`, and the extensionless `README` reaches the text
-//! sniff with no other evidence at all. Several of the extensions here also
-//! resolve to `EXTRA_TEXT_MIMES` entries (`.json`, `.sql`, `.svg`, `.m3u`,
-//! `.eml`), which the plaintext extractor claims only because it is registered
-//! ahead of the audio one.
+//! The extension sweep drives all three stages of `guess_mime_from_head`:
+//! `.bat` from the override table, most from `mime_guess`, the
+//! extensionless `README` from the text sniff; several resolve to
+//! `EXTRA_TEXT_MIMES` entries the plaintext extractor claims only by
+//! registration order.
 
 use std::path::{Path, PathBuf};
 
 use super::{BodyFn, Charset, Lcg, Sample};
 
-/// Encode `s` as windows-1252, replacing anything the codepage cannot hold.
-///
-/// cp1252 is Latin-1 with 27 printable characters filled into the C1 range, so
-/// the whole encoder is: identity below 0x100 except for that range, plus the
-/// reverse of the table for it. Hand-rolled deliberately — `encoding_rs` is the
-/// decoder under test.
-///
-/// Shared with [`super::pdf`], whose base-14 font is WinAnsi — the same
-/// repertoire under a different name.
+/// Encode `s` as windows-1252 (Latin-1 plus 27 printables in the C1 range);
+/// `encoding_rs` is the decoder under test. Shared with [`super::pdf`],
+/// whose WinAnsi font is the same repertoire.
 pub fn to_cp1252(s: &str) -> Vec<u8> {
-    /// The 0x80-0x9F block, in order. `\u{FFFD}` marks the five unassigned
-    /// slots, which nothing maps onto.
+    /// The 0x80-0x9F block; `\u{FFFD}` marks the five unassigned slots.
     const C1: [char; 32] = [
         '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
         '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}',
@@ -49,13 +39,9 @@ pub fn to_cp1252(s: &str) -> Vec<u8> {
     out
 }
 
-/// Extensions that exercise a distinct route through `guess_mime_from_head`,
-/// paired with a wrapper that makes the file plausible for its type.
-///
-/// The wrapper matters less than it looks — the plaintext extractor decodes
-/// rather than parses, so nothing here is validated as JSON or XML. It is
-/// there so a human opening the scratch directory sees files, not lipsum with
-/// a misleading suffix.
+/// Extensions exercising distinct routes through `guess_mime_from_head`,
+/// each with a wrapper making the file plausible — nothing is validated as
+/// JSON or XML; it is for a human opening the scratch directory.
 const EXTENSIONS: &[(&str, Wrapper)] = &[
     ("txt", Wrapper::Raw),
     ("md", Wrapper::Raw),
@@ -74,8 +60,7 @@ const EXTENSIONS: &[(&str, Wrapper)] = &[
     ("srt", Wrapper::Srt),
     ("m3u", Wrapper::M3u),
     ("eml", Wrapper::Eml),
-    // From `mime::EXTENSION_OVERRIDES`, not from `mime_guess`, which calls it
-    // an executable.
+    // From `mime::EXTENSION_OVERRIDES`; `mime_guess` calls it an executable.
     ("bat", Wrapper::Rem),
 ];
 
@@ -99,9 +84,8 @@ enum Wrapper {
 }
 
 impl Wrapper {
-    /// Render `sentences` in this file type's clothing. Every sentence must
-    /// come out contiguous and unaltered — the fragments are asserted against
-    /// the decoded text verbatim.
+    /// Render `sentences` in this file type's clothing; every sentence must
+    /// come out contiguous — fragments are asserted verbatim.
     fn render(self, sentences: &[String]) -> String {
         let lines = |prefix: &str| {
             sentences
@@ -112,8 +96,6 @@ impl Wrapper {
         };
         match self {
             Wrapper::Raw => sentences.join("\n"),
-            // One sentence per cell keeps it a single field; no sentence
-            // contains a comma or a quote, so no quoting is needed.
             Wrapper::Csv => lines(""),
             Wrapper::Html => format!(
                 "<!DOCTYPE html>\n<html><body>\n{}\n</body></html>",
@@ -140,8 +122,7 @@ impl Wrapper {
                     .collect::<Vec<_>>()
                     .join("\n")
             ),
-            // Not `serde_json`: the sentences contain no character JSON would
-            // escape, and an escape would break the verbatim fragment match.
+            // Not `serde_json`: an escape would break the verbatim match.
             Wrapper::Json => format!(
                 "{{\n  \"notes\": [\n{}\n  ]\n}}",
                 sentences
@@ -186,8 +167,6 @@ impl Wrapper {
     }
 }
 
-/// Every plaintext sample: the extension sweep, the encoding sweep, the
-/// extensionless sniff case, and one file past `hash_length`.
 pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
     for (ext, wrapper) in EXTENSIONS {
         let b = body(lcg, Charset::Unicode);
@@ -196,9 +175,8 @@ pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec
         out.push(Sample::prose(path, ext, &b, true));
     }
 
-    // No extension at all: `mime_guess` has nothing, `infer` has nothing, and
-    // only `textenc::looks_like_text` can answer. UTF-8 with no BOM is the
-    // one class it accepts on proof rather than on evidence.
+    // No extension: only `textenc::looks_like_text` can answer. UTF-8 with
+    // no BOM is the one class it accepts on proof rather than evidence.
     let b = body(lcg, Charset::Unicode);
     let path = super::write_file(dir, "README", b.sentences.join("\n").as_bytes());
     out.push(Sample::prose(path, "extensionless", &b, true));
@@ -207,19 +185,16 @@ pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec
     write_oversized(dir, lcg, body, out);
 }
 
-/// The same prose in five encodings. All five are `.txt`, so all five reach
-/// the extractor identically and any difference is `textenc`'s alone.
 fn write_encodings(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
-    // UTF-8 with a BOM: classified by `Encoding::for_bom` before the binary
-    // guard ever runs.
+    // UTF-8 with a BOM: `Encoding::for_bom` classifies it before the binary guard.
     let b = body(lcg, Charset::Unicode);
     let mut bytes = vec![0xEF, 0xBB, 0xBF];
     bytes.extend_from_slice(b.sentences.join("\n").as_bytes());
     let path = super::write_file(dir, "encoding-utf8-bom.txt", &bytes);
     out.push(Sample::prose(path, "utf-8 + BOM", &b, true));
 
-    // UTF-16, both endiannesses, BOM-marked. Full of NUL bytes, which is
-    // exactly why the BOM check has to precede the binary guard.
+    // UTF-16, both endiannesses: full of NUL, exactly why the BOM check
+    // precedes the binary guard.
     for (label, name, big_endian) in [
         ("utf-16le + BOM", "encoding-utf16le.txt", false),
         ("utf-16be + BOM", "encoding-utf16be.txt", true),
@@ -243,9 +218,8 @@ fn write_encodings(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut V
         out.push(Sample::prose(path, label, &b, true));
     }
 
-    // windows-1252: no BOM, not valid UTF-8, and decoded only because the
-    // `.txt` extension already established it is text. `Charset::Latin1`
-    // because the codepage cannot hold the Greek.
+    // windows-1252: no BOM, not valid UTF-8 — decoded only because `.txt`
+    // established it is text. Latin1: the codepage cannot hold Greek.
     let b = body(lcg, Charset::Latin1);
     let path = super::write_file(
         dir,
@@ -255,29 +229,22 @@ fn write_encodings(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut V
     out.push(Sample::prose(path, "windows-1252", &b, true));
 }
 
-/// A file comfortably past the default `hash_length` of 8 KiB.
-///
-/// Under that size the walk hands the whole buffer to `extract_from_head` and
-/// the file is never reopened; over it, the content pass runs the sized on-disk
-/// read instead. Both paths must produce the planted text, and only this
-/// sample proves the second one does.
+/// Past the default `hash_length` of 8 KiB, so the content pass runs the
+/// on-disk read — only this sample proves that path yields the planted text.
 fn write_oversized(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
     let b = body(lcg, Charset::Unicode);
     let mut text = String::new();
-    // Padding first, so the planted sentences sit past the 8 KiB mark and a
-    // reader that silently stopped at the head would find none of them.
+    // Padding first: a reader that silently stopped at the head finds nothing.
     while text.len() < 12 * 1024 {
         text.push_str("padding filler ligula quis bibendum auctor nisi elit\n");
     }
     text.push_str(&b.sentences.join("\n"));
     let path = super::write_file(dir, "oversized.txt", text.as_bytes());
-    // `head_path` stays true: `extract_from_head` is only ever called with a
-    // *complete* buffer, so the agreement assertion passes it the whole file.
+    // `head_path` stays true: `extract_from_head` only ever gets a *complete*
+    // buffer, so the agreement assertion passes it the whole file.
     out.push(Sample::prose(path, "oversized text", &b, true));
 }
 
-/// Not part of the corpus — used by the fixture assertions to read a committed
-/// source file.
 pub fn read_to_string(path: &PathBuf) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }

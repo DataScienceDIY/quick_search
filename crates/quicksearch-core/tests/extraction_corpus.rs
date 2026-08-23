@@ -1,19 +1,11 @@
 //! End-to-end extraction coverage across every format QuickSearch claims.
-//!
-//! The corpus itself — what is written, by which library, and why that library
-//! rather than the reader's own — is documented in [`corpus`]. This file is
-//! only the assertions.
-//!
-//! Three layers, deliberately, because they fail for different reasons:
-//!
-//! 1. [`every_format_extracts_its_planted_text`] goes through
-//!    `mime::guess_mime_from_head` and `extract::Registry`, so a file typed
-//!    wrongly and a file parsed wrongly are both caught, and the failure
-//!    message says which.
-//! 2. [`head_extraction_agrees_with_reading_the_file`] pins the walk-time
-//!    shortcut against the content-pass path, in both directions.
-//! 3. [`the_whole_corpus_indexes_and_is_searchable`] is the product claim: the
-//!    text reached FTS5 and a user typing a word from the document finds it.
+//! The corpus itself is documented in [`corpus`]; this file is only the
+//! assertions, in three layers that fail for different reasons: format
+//! dispatch and parsing ([`every_format_extracts_its_planted_text`]), the
+//! walk-time shortcut against the content pass
+//! ([`head_extraction_agrees_with_reading_the_file`]), and the product claim
+//! that a user typing a word from the document finds it
+//! ([`the_whole_corpus_indexes_and_is_searchable`]).
 
 mod common;
 mod corpus;
@@ -30,18 +22,16 @@ use quicksearch_core::search::SearchOptions;
 
 use corpus::Sample;
 
-/// How much of a file the MIME sniff is shown. The same default the indexer
-/// uses, so dispatch here matches dispatch in a real run.
+/// How much the MIME sniff is shown — the indexer's default, so dispatch
+/// here matches a real run.
 const HEAD: usize = 8 * 1024;
 
-/// Read the leading [`HEAD`] bytes, which is what the walk hands the sniff.
 fn head_of(path: &Path) -> Vec<u8> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     bytes[..bytes.len().min(HEAD)].to_vec()
 }
 
-/// Whether the file is small enough that the walk would extract it from the
-/// buffer it already hashed, rather than reopening it.
+/// Small enough that the walk would extract it from the buffer it hashed.
 fn fits_in_head(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.len() as usize)
@@ -59,8 +49,6 @@ fn ctx(sample: &Sample) -> String {
     )
 }
 
-/// Every corpus file is typed, claimed by an extractor, and yields its planted
-/// lipsum in order.
 #[test]
 fn every_format_extracts_its_planted_text() {
     let (_dir, samples) = corpus::build("corpus-extract");
@@ -81,13 +69,12 @@ fn every_format_extracts_its_planted_text() {
             .unwrap_or_else(|e| panic!("{} extraction failed: {e}", ctx(sample)))
             .unwrap_or_else(|| panic!("{} MIME {mime:?} dispatched nowhere", ctx(sample)));
 
-        if let Err(why) = corpus::match_in_order(&content.text, &sample.must_contain) {
+        if let Err(why) = corpus::match_in_order(&content, &sample.must_contain) {
             panic!("{} extracted text is wrong\n{why}", ctx(sample));
         }
     }
 
-    // A corpus that silently stopped generating anything would pass every
-    // assertion above.
+    // Vacuity guard: a corpus that stopped generating would pass everything above.
     assert!(
         samples.len() >= 35,
         "corpus shrank to {} samples",
@@ -95,8 +82,6 @@ fn every_format_extracts_its_planted_text() {
     );
 }
 
-/// The walk-time buffer path and the content-pass path agree, and only the
-/// formats that can support the shortcut take it.
 #[test]
 fn head_extraction_agrees_with_reading_the_file() {
     let (_dir, samples) = corpus::build("corpus-head");
@@ -110,9 +95,8 @@ fn head_extraction_agrees_with_reading_the_file() {
         let from_head = registry.extract_complete_head(&sample.path, &mime, &whole);
 
         if !sample.head_path {
-            // A format that seeks, or reads a trailer, must never be handed a
-            // buffer — `None` here is what routes it back to the on-disk
-            // extractor rather than to a wrong answer.
+            // A format that seeks or reads a trailer must never be handed a
+            // buffer — `None` routes it back to the on-disk extractor.
             assert!(
                 from_head.is_none(),
                 "{} took the head path but cannot support it",
@@ -131,8 +115,7 @@ fn head_extraction_agrees_with_reading_the_file() {
             .expect("claimed");
 
         assert_eq!(
-            from_head.text,
-            from_disk.text,
+            from_head, from_disk,
             "{} head and disk extraction disagree",
             ctx(sample)
         );
@@ -141,7 +124,7 @@ fn head_extraction_agrees_with_reading_the_file() {
         // shortcut. `oversized.txt` is the deliberate exception.
         if fits_in_head(&sample.path) {
             assert!(
-                corpus::match_in_order(&from_head.text, &sample.must_contain).is_ok(),
+                corpus::match_in_order(&from_head, &sample.must_contain).is_ok(),
                 "{} head extraction lost the planted text",
                 ctx(sample)
             );
@@ -154,15 +137,11 @@ fn head_extraction_agrees_with_reading_the_file() {
     );
 }
 
-/// The whole corpus indexes, and each file is findable by a word that appears
-/// only in its body.
 #[test]
 fn the_whole_corpus_indexes_and_is_searchable() {
     let (dir, samples) = corpus::build("corpus-index");
-    // The database goes in its own directory, not the one being walked. Left
-    // inside, SQLite's `-wal` and `-shm` sidecars appear under the root and
-    // survive only because a default ignore pattern happens to prune them —
-    // which is a dependency this test has no reason to take on.
+    // The database goes in its own directory: inside the root, its `-wal` and
+    // `-shm` sidecars would survive only via a default ignore pattern.
     let db = common::scratch_db("corpus-index-db");
     let config = Config::default();
 
@@ -197,7 +176,6 @@ fn the_whole_corpus_indexes_and_is_searchable() {
     }
 }
 
-/// Every result path for `term`, run through the same cascade the GUI uses.
 fn search(conn: &rusqlite::Connection, term: &str) -> Vec<String> {
     let split = split_for_cascade(term).expect("split");
     let latest = AtomicU64::new(1);
@@ -219,35 +197,19 @@ fn search(conn: &rusqlite::Connection, term: &str) -> Vec<String> {
     paths
 }
 
-/// Two RTF lexer bugs this corpus found, now fixed in `vendor/rtf-parser`.
+/// Two RTF lexer bugs this corpus found, fixed in `vendor/rtf-parser` (see
+/// the `[patch.crates-io]` note in the workspace manifest). Both came from
+/// terminating a control word at whitespace and trimming leading spaces off
+/// what followed:
 ///
-/// Both came from a lexer that decided where a control word ends by looking
-/// for whitespace, and then trimmed leading spaces off whatever followed. The
-/// second reproduced on a file LibreOffice wrote.
+/// * A `\uN` escape with a literal fallback took the rest of the word with
+///   it: `before \u233?after end` lexed `\u233?after` as one control word
+///   and yielded "before end".
+/// * A space between two escaped words was dropped, collapsing every script
+///   outside cp1252 (`Καλημέρα κόσμε` → `Καλημέρακόσμε`).
 ///
-/// **A `\uN` escape with a literal fallback took the rest of the word with
-/// it.** The escape is followed by an ANSI fallback character for readers that
-/// predate Unicode, and the spec allows any character there. Terminating a
-/// control word at whitespace only meant `before \u233?after end` lexed
-/// `\u233?after` as one unrecognised control word and yielded `"before end"` —
-/// the accented character gone, and `after` with it. The loss ran to the next
-/// space. The spellings that put a backslash where the lexer needed a boundary
-/// — LibreOffice's `\uN\'3f` and Word's `\uN\'hh` — were unaffected.
-///
-/// **A space between two escaped words was dropped.** After a `\'hh` escape
-/// the lexer re-tokenised the remainder, trimming its leading spaces before
-/// deciding what it was. A plain-text remainder kept the untrimmed slice and
-/// survived; one beginning with another control word did not. So
-/// `Καλημέρα κόσμε` — every character escaped on both sides of the space —
-/// came back as `Καλημέρακόσμε`, two words collapsed into one FTS term. That
-/// hit every script outside cp1252: Greek, Cyrillic, Hebrew, CJK. Latin-1 text
-/// was fine, because there the escapes sit *inside* words (`caf\'e9`) and the
-/// space that follows is plain text.
-///
-/// The fixes are `StrUtils::split_control_word` and the `\'hh` arm of
-/// `Lexer::tokenize`, both marked LOCAL PATCH; the fallback characters are now
-/// counted off against `\ucN` in the parser rather than guessed at. See the
-/// `[patch.crates-io]` note in the workspace manifest.
+/// Fallback characters are now counted off against `\ucN` in the parser
+/// rather than guessed at.
 #[test]
 fn rtf_unicode_escapes_survive_extraction() {
     let dir = quicksearch_core::testutil::scratch_dir("rtf-escapes");
@@ -258,20 +220,16 @@ fn rtf_unicode_escapes_survive_extraction() {
         quicksearch_core::extract::rtf::RtfExtractor
             .extract(&path)
             .unwrap_or_else(|e| panic!("{name}: {e}"))
-            .text
     };
 
-    // The literal fallback. Both halves matter: the escape survives, and so
-    // does the word it used to swallow.
+    // Both halves matter: the escape survives, and so does the word.
     let text = extract("literal.rtf", r"{\rtf1\ansi before \u233?after end}");
     assert!(text.contains("before éafter end"), "{text:?}");
-    // And the fallback itself is *not* text. It repeats the character for
-    // readers that cannot do Unicode; indexing it would put a `?` inside every
-    // word containing a non-cp1252 character.
+    // The fallback itself is *not* text: indexing it would put a `?` inside
+    // every word containing a non-cp1252 character.
     assert!(!text.contains('?'), "fallback character indexed: {text:?}");
 
-    // The same document in the two spellings that always worked, to pin that
-    // counting fallbacks did not break the ones the old mask handled.
+    // The two spellings that always worked must keep working.
     for (label, body) in [
         ("libreoffice", r"{\rtf1\ansi before \u233\'3fafter end}"),
         ("word", r"{\rtf1\ansi before \u233\'e9after end}"),
@@ -320,17 +278,10 @@ fn rtf_unicode_escapes_survive_extraction() {
     );
 }
 
-/// The corpus's needles and the shared harness's body term are the same word,
-/// deliberately.
-///
-/// `common::BODY_TERM` exists because a term that reaches the index through a
-/// file *name* as well as a body is answered mostly by the filename pass — so
-/// it plants one that only ever appears in a body. The corpus needs exactly
-/// that property, per file, for its end-to-end search to be attributable to
-/// extraction rather than to the name.
-///
-/// `corpus` does not name `common` (it has no other reason to depend on the
-/// harness), so this is what stops the two drifting apart silently.
+/// The corpus's needles and `common::BODY_TERM` are deliberately the same
+/// body-only word, so the end-to-end search is attributable to extraction;
+/// `corpus` does not depend on the harness, so this is what stops the two
+/// drifting apart silently.
 #[test]
 fn corpus_needles_use_the_shared_body_term() {
     assert_eq!(corpus::NEEDLE_PREFIX, common::BODY_TERM);

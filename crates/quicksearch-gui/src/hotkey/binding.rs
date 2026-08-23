@@ -1,32 +1,19 @@
-//! The one representation of a shortcut, and the three spellings it has to
-//! produce.
-//!
-//! A shortcut is written in three different vocabularies before it reaches an
-//! operating system: the text in `config.toml` and on the Settings tab's
-//! button, the token `global-hotkey` parses for `RegisterHotKey`/`XGrabKey`,
-//! and the xkbcommon keysym name the XDG *shortcuts* specification wants for
-//! the Wayland portal. All three come out of [`KEYS`], so a key cannot be
-//! spelled correctly for one backend and wrongly for the other.
-//!
-//! The config text and the `global-hotkey` token are the same string: every
-//! token below is one `global-hotkey`'s parser accepts, which
-//! [`tokens_are_parseable`](tests::tokens_are_parseable) holds it to.
+//! The one representation of a shortcut and its three spellings: the config
+//! text (which is also the `global-hotkey` token), and the xkbcommon keysym
+//! the XDG shortcuts spec wants for the Wayland portal. All three come out
+//! of [`KEYS`], so a key cannot be spelled correctly for one backend and
+//! wrongly for the other.
 
 use std::fmt;
 use std::str::FromStr;
 
 use egui::Key;
 
-/// One row per bindable key: what egui reports when it is pressed, the token
-/// used in the config file and by `global-hotkey`, and the xkbcommon keysym
-/// name (`XKB_KEY_` stripped) the shortcuts spec wants.
-///
-/// Not every `egui::Key` is here. Modifiers have no rows because they cannot
-/// be a shortcut's main key, and the ones egui synthesises from a character
-/// rather than a physical key (`Plus`, `Colon`, `Pipe`, `Questionmark`, the
-/// curly brackets) are left out because they are the shifted face of a key
-/// that already has a row: binding both would mean the same physical press
-/// registering under two names.
+/// One row per bindable key: egui key, config/`global-hotkey` token,
+/// xkbcommon keysym (`XKB_KEY_` stripped). Keys egui synthesises from a
+/// character (`Plus`, `Colon`, …) are left out: they are the shifted face of
+/// a key that already has a row, and binding both would register the same
+/// physical press under two names.
 const KEYS: &[(Key, &str, &str)] = &[
     (Key::A, "A", "a"),
     (Key::B, "B", "b"),
@@ -103,16 +90,12 @@ const KEYS: &[(Key, &str, &str)] = &[
     (Key::CloseBracket, "BracketRight", "bracketright"),
 ];
 
-/// Escape is reserved: it cancels the Settings tab's capture, and a
-/// system-wide Escape would be unusable anyway.
+/// Escape is reserved: it cancels the Settings tab's capture.
 const RESERVED: &[Key] = &[Key::Escape];
 
-/// A shortcut the user can press from anywhere.
-///
-/// Super/Meta is absent because `egui::Modifiers` has no field for it — egui
-/// reports alt, ctrl, shift and the Mac command key only — so a Super combo
-/// could never be captured in the Settings tab even if a backend could
-/// register it.
+/// A shortcut the user can press from anywhere. Super/Meta is absent
+/// because `egui::Modifiers` has no field for it, so a Super combo could
+/// never be captured in the Settings tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Binding {
     pub ctrl: bool,
@@ -121,13 +104,11 @@ pub struct Binding {
     key: Key,
 }
 
-/// Why a string or a key press is not a usable shortcut; the wording is
-/// shown in the Settings tab.
+/// Why a string or key press is not a usable shortcut; shown in Settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BindingError {
     Empty,
     NoModifier,
-    /// Modifiers only, as in `Ctrl+Shift`.
     NoKey,
     UnknownToken(String),
     /// More than one non-modifier token, as in `Ctrl+A+B`.
@@ -149,12 +130,8 @@ impl fmt::Display for BindingError {
 }
 
 impl Binding {
-    /// Build from a key press egui reported, for the Settings tab's capture
-    /// widget. `None` for a press that cannot be a shortcut: a key with no
-    /// row in [`KEYS`], a reserved key, or a bare key with no modifier held.
-    ///
-    /// egui never reports a modifier on its own as a `Key`, so a press that
-    /// arrives here is always a real main key.
+    /// Build from a key press egui reported. `None` for a press that cannot
+    /// be a shortcut: no row in [`KEYS`], reserved, or no modifier held.
     pub fn from_egui(key: Key, modifiers: &egui::Modifiers) -> Option<Binding> {
         if RESERVED.contains(&key) || !KEYS.iter().any(|(k, _, _)| *k == key) {
             return None;
@@ -175,14 +152,12 @@ impl Binding {
     fn row(&self) -> (&'static str, &'static str) {
         KEYS.iter()
             .find(|(k, _, _)| *k == self.key)
-            // `key` is only ever set from a KEYS row.
             .map(|(_, token, keysym)| (*token, *keysym))
             .expect("every Binding key comes from KEYS")
     }
 
-    /// The trigger in the XDG *shortcuts* spec's syntax, which the Wayland
-    /// portal takes as a preferred binding: uppercase modifier names and an
-    /// xkbcommon keysym, joined with `+`.
+    /// The trigger in the XDG shortcuts spec's syntax: uppercase modifiers
+    /// and an xkbcommon keysym, joined with `+`.
     pub fn portal_trigger(&self) -> String {
         let mut out = String::new();
         for (held, name) in [
@@ -257,7 +232,7 @@ impl FromStr for Binding {
     }
 }
 
-/// Parse a config value, where empty means "no shortcut" rather than an error.
+/// Empty means "no shortcut" rather than an error.
 pub fn parse_setting(setting: &str) -> Result<Option<Binding>, BindingError> {
     if setting.trim().is_empty() {
         return Ok(None);
@@ -277,7 +252,6 @@ mod tests {
         assert_eq!(binding.portal_trigger(), "CTRL+SHIFT+f");
     }
 
-    /// Every row round-trips through the text that ends up in `config.toml`.
     #[test]
     fn every_key_round_trips() {
         for (key, token, _) in KEYS {
@@ -293,9 +267,7 @@ mod tests {
         }
     }
 
-    /// The config token and the `global-hotkey` token are the same string, so
-    /// this is what stops a typo in [`KEYS`] from reaching `RegisterHotKey` as
-    /// a silent registration failure.
+    /// Stops a typo in [`KEYS`] reaching `RegisterHotKey` as a silent failure.
     #[test]
     fn tokens_are_parseable_by_global_hotkey() {
         for (_, token, _) in KEYS {
@@ -307,8 +279,7 @@ mod tests {
         }
     }
 
-    /// Distinct rows must stay distinct in both output vocabularies: two keys
-    /// sharing a keysym would silently bind the wrong one on Wayland.
+    /// Two keys sharing a keysym would silently bind the wrong one on Wayland.
     #[test]
     fn rows_are_unique() {
         for (i, (key, token, keysym)) in KEYS.iter().enumerate() {
@@ -350,7 +321,6 @@ mod tests {
             Err(BindingError::UnknownToken("Nope".to_string()))
         );
         assert_eq!("".parse::<Binding>(), Err(BindingError::Empty));
-        // Escape has to stay free for the capture widget's own cancel.
         assert_eq!(
             "Ctrl+Escape".parse::<Binding>(),
             Err(BindingError::UnknownToken("Escape".to_string()))
@@ -384,12 +354,10 @@ mod tests {
             None
         );
         assert_eq!(Binding::from_egui(Key::Escape, &ctrl), None);
-        // Not in KEYS: the shifted face of a key that already has a row.
         assert_eq!(Binding::from_egui(Key::Plus, &ctrl), None);
     }
 
-    /// egui sets `command` alongside `ctrl` off Mac; it must not double up
-    /// into a second modifier.
+    /// egui sets `command` alongside `ctrl` off Mac; must not double up.
     #[test]
     fn the_egui_command_alias_is_ignored() {
         let modifiers = egui::Modifiers {

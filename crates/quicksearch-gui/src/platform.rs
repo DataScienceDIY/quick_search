@@ -1,18 +1,14 @@
-//! Opening files, revealing them in the system file manager, and the one bit
-//! of process setup that has to happen before anything prints.
+//! Opening and revealing files, plus the stdio setup that must happen
+//! before anything prints.
 
 use std::process::Command;
 
 /// Give the process somewhere to write when it has no stdio.
 ///
-/// A window-subsystem binary launched from Explorer has NULL standard handles,
-/// and `println!`/`eprintln!` *panic* when the write fails rather than
-/// dropping the output. Pointing the handles at `NUL` makes those writes
-/// succeed and go nowhere. Direct prints (a startup failure, a panic
-/// message) still need a handle that accepts them.
-///
-/// Handles inherited from a real console are left alone, so running the binary
-/// from a shell still prints normally.
+/// A window-subsystem binary launched from Explorer has NULL standard
+/// handles, and `println!`/`eprintln!` *panic* on a failed write. Pointing
+/// them at `NUL` makes the writes succeed and go nowhere. Handles inherited
+/// from a real console are left alone.
 #[cfg(windows)]
 pub fn redirect_null_stdio() {
     use std::os::windows::io::IntoRawHandle;
@@ -27,8 +23,7 @@ pub fn redirect_null_stdio() {
             continue;
         }
         if let Ok(file) = std::fs::OpenOptions::new().write(true).open("NUL") {
-            // Leaked: the handle must outlive every later write, i.e. the
-            // whole process.
+            // Leaked: it must outlive every later write.
             unsafe { SetStdHandle(id, file.into_raw_handle() as _) };
         }
     }
@@ -43,27 +38,20 @@ pub fn open_file(path: &str) {
 
 /// Reveal a file in the system file manager with the file selected.
 ///
-/// Linux: `org.freedesktop.FileManager1.ShowItems` over the session bus
-/// (supported by every mainstream file manager) via `dbus-send` — no
-/// D-Bus library dependency for one call. Falls back to opening the
-/// parent directory. Windows/macOS use their native select verbs.
+/// Linux goes through `dbus-send` (no D-Bus library for one call), falling
+/// back to opening the parent directory.
 pub fn reveal_in_folder(path: &str) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        /// Keep a console window from flashing behind the spawn.
+        /// Keeps a console window from flashing behind the spawn.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        // explorer.exe parses its own command line rather than using the
-        // standard argv splitting, and wants `/select,` glued to the path as a
-        // single token with quotes around the path only. Passed as two
-        // arguments it ignores the selection and just opens the folder, and
-        // std's quoting would wrap the whole token. `raw_arg` is the only way
-        // to say exactly this.
-        //
-        // Forward slashes are valid everywhere else on Windows but not here,
-        // so normalize first. The exit code is not worth checking: explorer
-        // returns 1 even on success.
+        // explorer.exe parses its own command line: `/select,` must be glued
+        // to the path in one token with quotes around the path only, which
+        // only `raw_arg` can express — as two arguments it silently ignores
+        // the selection. Forward slashes are invalid here alone, and the exit
+        // code is meaningless (explorer returns 1 on success).
         let native = path.replace('/', "\\");
         let _ = Command::new("explorer.exe")
             .raw_arg(format!("/select,\"{}\"", native))
@@ -100,7 +88,7 @@ pub fn reveal_in_folder(path: &str) {
     }
 }
 
-/// Percent-encode a filesystem path for a file:// URI, keeping `/`.
+/// Percent-encode a path for a file:// URI, keeping `/`.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn uri_escape_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());

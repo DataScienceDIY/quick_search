@@ -3,20 +3,16 @@ use std::sync::Arc;
 
 use super::*;
 use crate::db::open_or_recreate;
-use crate::testutil::zstd_of;
+use crate::testutil::{zstd_of, Scratch};
 
-fn tmp_path() -> std::path::PathBuf {
-    crate::testutil::scratch_dir("repo").join("index.sqlite")
+fn tmp_path() -> (Scratch, std::path::PathBuf) {
+    Scratch::db("repo")
 }
 
-/// `set_content_done_fresh` skips the pre-delete, so the whole of its safety is
-/// the caller's claim that the row is clean. This pins both halves of that:
-/// the fast path leaves exactly one FTS row where it is used correctly, and the
-/// ordinary entry point still repairs a row that *does* carry content.
-///
-/// A duplicate `searchabletext` row is the failure this guards. It surfaces as
-/// a file appearing twice in full-text results, not as an error, so nothing
-/// else in the suite would necessarily notice.
+/// `set_content_done_fresh` skips the pre-delete, so the whole of its safety
+/// is the caller's claim that the row is clean. A duplicate `searchabletext`
+/// row is the failure this guards; it surfaces as a file appearing twice in
+/// results, not as an error, so nothing else in the suite would notice.
 #[test]
 fn the_fresh_content_write_leaves_exactly_one_fts_row() {
     fn new_file(name: &str, mtime: u64) -> NewFile<'_> {
@@ -43,18 +39,23 @@ fn the_fresh_content_write_leaves_exactly_one_fts_row() {
         .unwrap()
     }
 
-    let path = tmp_path();
+    let (_dir, path) = tmp_path();
     let mut conn = open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
 
     let tx = conn.transaction().unwrap();
-    // The insert path: a row that has never had content.
     let id = insert_file(&tx, &new_file("a.txt", 1)).unwrap().unwrap();
-    set_content_done_fresh(&tx, id, "sphinx quartz", zstd_of("sphinx quartz").as_deref()).unwrap();
+    set_content_done_fresh(
+        &tx,
+        id,
+        "sphinx quartz",
+        zstd_of("sphinx quartz").as_deref(),
+    )
+    .unwrap();
 
-    // The update path: `update_file_basic` clears the content, so the fresh
-    // write that follows is writing into an empty slot — the exact sequence
-    // `process_batch_updates` performs.
-    let same = update_file_basic(&tx, &new_file("a.txt", 2)).unwrap().unwrap();
+    // The update path — the exact sequence `process_batch_updates` performs.
+    let same = update_file_basic(&tx, &new_file("a.txt", 2))
+        .unwrap()
+        .unwrap();
     assert_eq!(same, id, "the same row");
     set_content_done_fresh(&tx, id, "sphinx onyx", zstd_of("sphinx onyx").as_deref()).unwrap();
     tx.commit().unwrap();
@@ -64,27 +65,27 @@ fn the_fresh_content_write_leaves_exactly_one_fts_row() {
     assert_eq!(matches(&conn, "onyx"), 1, "the new body is searchable");
     assert_eq!(matches(&conn, "quartz"), 0, "the old body is gone");
 
-    // And the idempotent entry point still repairs a row that really does hold
-    // content — writing over the top of a DONE row with no update first, which
-    // is what the content pass and the watcher do.
+    // The idempotent entry point still repairs a row that really does hold
+    // content — what the content pass and the watcher do.
     let tx = conn.transaction().unwrap();
-    set_content_done(&tx, id, "sphinx jasper", zstd_of("sphinx jasper").as_deref()).unwrap();
+    set_content_done(
+        &tx,
+        id,
+        "sphinx jasper",
+        zstd_of("sphinx jasper").as_deref(),
+    )
+    .unwrap();
     tx.commit().unwrap();
 
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM searchabletext"), 1);
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents_text"), 1);
     assert_eq!(matches(&conn, "jasper"), 1);
     assert_eq!(matches(&conn, "onyx"), 0);
-
-    drop(conn);
-    std::fs::remove_file(&path).ok();
 }
 
-/// The size report reads each body's uncompressed length out of its zstd
-/// frame header instead of from a stored column, which works only because
-/// [`DocEncoder`] compresses through `ZSTD_compress2` — the API that is
-/// handed the whole input up front and records its length. A switch back to
-/// a streaming encoder would silently zero that figure, so pin it here.
+/// The size report reads each body's length out of its zstd frame header,
+/// which works only because [`DocEncoder`] is handed the whole input up
+/// front. A switch to a streaming encoder would silently zero that figure.
 #[test]
 fn a_compressed_body_carries_its_uncompressed_length() {
     let mut enc = DocEncoder::new().unwrap();
@@ -97,8 +98,7 @@ fn a_compressed_body_carries_its_uncompressed_length() {
             "frame header lost the content size for a {}-byte body",
             text.len()
         );
-        // The size report projects only a prefix, never the whole body — the
-        // header fits in 18 bytes and that has to be enough.
+        // The size report projects only a prefix, never the whole body.
         let prefix = &blob[..blob.len().min(18)];
         assert_eq!(
             raw_text_len(prefix),
@@ -110,7 +110,7 @@ fn a_compressed_body_carries_its_uncompressed_length() {
 
 #[test]
 fn insert_update_delete_round_trip() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     {
         let tx = conn.transaction().unwrap();
@@ -133,7 +133,6 @@ fn insert_update_delete_round_trip() {
         tx.commit().unwrap();
     }
 
-    // Text is findable via FTS.
     let hit: i64 = conn
         .query_row(
             "SELECT rowid FROM searchabletext WHERE searchabletext MATCH 'hello'",
@@ -143,7 +142,6 @@ fn insert_update_delete_round_trip() {
         .unwrap();
     assert!(hit > 0);
 
-    // Delete cleans up.
     {
         let tx = conn.transaction().unwrap();
         assert!(delete_file_by_path(&tx, "/tmp/a.txt").unwrap());
@@ -157,16 +155,11 @@ fn insert_update_delete_round_trip() {
         .query_row("SELECT COUNT(*) FROM searchabletext", [], |r| r.get(0))
         .unwrap();
     assert_eq!(fts_count, 0);
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn insert_writes_content_state_from_needs_content() {
-    // A row nothing will extract is born NA, so "pending" downstream means
-    // real outstanding work.
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let tx = conn.transaction().unwrap();
     let mut row = NewFile {
@@ -195,15 +188,11 @@ fn insert_writes_content_state_from_needs_content() {
     };
     assert_eq!(state(claimed), STATE_PENDING);
     assert_eq!(state(unclaimed), STATE_NA);
-
-    drop(tx);
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn update_writes_content_state_from_needs_content() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let mut row = NewFile {
         name: "a.txt",
@@ -233,7 +222,7 @@ fn update_writes_content_state_from_needs_content() {
     };
 
     // Rewritten as something an extractor claims: back to pending, and the
-    // stale FTS row goes with it.
+    // stale FTS row goes too.
     {
         let tx = conn.transaction().unwrap();
         row.size = 20;
@@ -256,8 +245,8 @@ fn update_writes_content_state_from_needs_content() {
         .unwrap();
     assert_eq!(fts_hits, 0);
 
-    // And rewritten as something nothing claims: NA, not pending. Without
-    // this the row would re-enter the content pass on every run.
+    // Rewritten as something nothing claims: NA, not pending — else the row
+    // re-enters the content pass on every run.
     {
         let tx = conn.transaction().unwrap();
         row.mtime = 3;
@@ -269,16 +258,12 @@ fn update_writes_content_state_from_needs_content() {
         tx.commit().unwrap();
     }
     assert_eq!(content_state(&conn), STATE_NA);
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn insert_file_twice_on_same_path_is_idempotent() {
-    // A second visit to the same canonical path (overlapping roots, symlink
-    // resolution) must be a silent no-op, not a run-ending error.
-    let p = tmp_path();
+    // Overlapping roots or symlink resolution revisit a canonical path.
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let tx = conn.transaction().unwrap();
     let row = NewFile {
@@ -307,45 +292,27 @@ fn insert_file_twice_on_same_path_is_idempotent() {
         .unwrap();
     assert_eq!(id_read, id1);
     tx.commit().unwrap();
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn delete_subtree_clears_every_dependent_table() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-    let add = |tx: &Transaction<'_>, path: &str| -> i64 {
-        let (parent, name) = crate::file_handling::split_db_path(path).expect("a file's path");
-        let id = insert_file(
-            tx,
-            &NewFile {
-                name,
-                parent,
-                size: 1,
-                mtime: 1,
-                mime: Some("text/plain"),
-                ftype: FileType::TEXT,
-                hash: None,
-                needs_content: true,
-            },
-        )
-        .unwrap()
-        .expect("unique path");
-        set_content_done(tx, id, "body text", zstd_of("body text").as_deref()).unwrap();
-        id
-    };
-
+    let ids = seeded(
+        &mut conn,
+        &[
+            "/tree/a.txt",
+            "/tree/deep/b.txt",
+            "/tree/deep/c.txt",
+            // Outside the range: a prefix sibling, and a LIKE-metacharacter
+            // neighbour that a `LIKE 'tree_%'` sweep would have swallowed.
+            "/tree2/keep.txt",
+            "/treeX/keep.txt",
+        ],
+    );
     {
         let tx = conn.transaction().unwrap();
-        add(&tx, "/tree/a.txt");
-        add(&tx, "/tree/deep/b.txt");
-        let failed = add(&tx, "/tree/deep/c.txt");
-        set_content_failed(&tx, failed, "bad parse").unwrap();
-        // Outside the range: a prefix sibling, and a LIKE-metacharacter
-        // neighbour that a `LIKE 'tree_%'` sweep would have swallowed.
-        add(&tx, "/tree2/keep.txt");
-        add(&tx, "/treeX/keep.txt");
+        set_content_failed(&tx, ids["/tree/deep/c.txt"], "bad parse").unwrap();
         tx.commit().unwrap();
     }
 
@@ -380,18 +347,14 @@ fn delete_subtree_clears_every_dependent_table() {
         v
     };
     assert_eq!(survivors, vec!["/tree2/keep.txt", "/treeX/keep.txt"]);
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// Seed a database with `paths` as fully-indexed rows, each carrying an
-/// FTS entry, stored text and a property. Returns `path -> id`.
+/// Seed fully-indexed rows, each with an FTS entry and stored text; returns
+/// `path -> id`.
 fn seeded(conn: &mut Connection, paths: &[&str]) -> std::collections::HashMap<String, i64> {
     let tx = conn.transaction().unwrap();
     let mut ids = std::collections::HashMap::new();
     for path in paths {
-        // The indexer's own split, so the separator stays with the parent.
         let (parent, name) = crate::file_handling::split_db_path(path).expect("a file's path");
         let id = insert_file(
             &tx,
@@ -415,12 +378,11 @@ fn seeded(conn: &mut Connection, paths: &[&str]) -> std::collections::HashMap<St
     ids
 }
 
-/// The out-of-root sweep must keep every configured root's rows and take
-/// everything else — including a path that merely *starts* with a root's
-/// name, which is a different folder.
+/// The out-of-root sweep must take a path that merely *starts* with a root's
+/// name — a different folder.
 #[test]
 fn delete_outside_ranges_keeps_exactly_the_configured_roots() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     seeded(
         &mut conn,
@@ -490,17 +452,12 @@ fn delete_outside_ranges_keeps_exactly_the_configured_roots() {
             .unwrap(),
         3
     );
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// A file is only really gone when its `files` row, FTS postings, stored
-/// text, properties and any failure record all go; a survivor in any one of
-/// them keeps the file findable.
+/// A survivor in any dependent table keeps the file findable.
 #[test]
 fn delete_ids_clears_every_dependent_table() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let ids = seeded(
         &mut conn,
@@ -527,8 +484,7 @@ fn delete_ids_clears_every_dependent_table() {
     assert_eq!(count("SELECT COUNT(*) FROM documents_text"), 2);
     assert_eq!(count("SELECT COUNT(*) FROM failed_files"), 0);
 
-    // The FTS index really lost them, not just the `files` row: a
-    // contentless table keeps serving deleted rowids without the tombstone.
+    // A contentless table keeps serving deleted rowids without the tombstone.
     let hits: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH 'body'",
@@ -542,16 +498,11 @@ fn delete_ids_clears_every_dependent_table() {
     let tx = conn.transaction().unwrap();
     assert_eq!(delete_ids(&tx, &[]).unwrap(), 0);
     tx.commit().unwrap();
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// More ids than `DELETE_IDS_CHUNK`, so the short final chunk and the full
-/// ones both run.
 #[test]
 fn delete_ids_spans_chunk_boundaries() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let paths: Vec<String> = (0..DELETE_IDS_CHUNK + 7)
         .map(|i| format!("/t/f{:05}.txt", i))
@@ -573,15 +524,12 @@ fn delete_ids_spans_chunk_boundaries() {
         .query_row("SELECT id FROM files", [], |r| r.get(0))
         .unwrap();
     assert_eq!(left, keep);
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 /// Dropping stored text must cost the file its snippets and nothing else.
 #[test]
 fn drop_stored_text_keeps_the_file_searchable() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let ids = seeded(&mut conn, &["/t/a.txt", "/t/b.txt"]);
 
@@ -600,16 +548,13 @@ fn drop_stored_text_keeps_the_file_searchable() {
         2,
         "both files still match on content"
     );
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// Re-queuing content leaves the row's metadata alone but clears what the
-/// last extraction produced, so a second pass cannot double-insert into FTS.
+/// Clearing the last extraction is what keeps a second pass from
+/// double-inserting into FTS.
 #[test]
 fn reset_content_pending_clears_the_last_extraction() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let ids = seeded(&mut conn, &["/t/a.txt", "/t/b.txt"]);
     let id = ids["/t/a.txt"];
@@ -645,17 +590,13 @@ fn reset_content_pending_clears_the_last_extraction() {
         0,
         "a stale failure must not outlive the retry it was queued for"
     );
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// The reconciliation scan pages by path, so it must serve every row in
-/// the range exactly once, in order, and stop at the range bound rather
-/// than at a name prefix.
+/// The reconciliation scan must serve every row in the range exactly once,
+/// in order, and stop at the range bound rather than at a name prefix.
 #[test]
 fn rows_in_range_page_walks_the_range_once() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     seeded(
         &mut conn,
@@ -670,8 +611,6 @@ fn rows_in_range_page_walks_the_range_once() {
 
     let range = crate::file_handling::ExtractCursor::for_root("/t");
     let mut seen = Vec::new();
-    // `(lo, "")`: no stored name is empty, so this sorts just below the
-    // range's first row.
     let mut after = (range.lo.clone(), String::new());
     loop {
         let page = rows_in_range_page(&conn, &after.0, &after.1, &range.hi, 2).unwrap();
@@ -684,22 +623,14 @@ fn rows_in_range_page_walks_the_range_once() {
         vec!["/t/a.txt", "/t/deep/b.txt", "/t/deep/deeper/c.txt"],
         "in (parent, name) order, once each, and the prefix siblings are outside"
     );
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// `dir_rows` must *seek* on `idx_files_parent`, never scan the table.
-///
-/// It is deliberately not index-only any more: the index stopped carrying
-/// `mtime` when `UNIQUE(parent, name)` took over as the row key, so the plan
-/// is a seek plus a row fetch per entry. See the index's own comment in
-/// `schema.rs` for why that trade was taken — and note the thing this test
-/// guards is the seek, which is what keeps the cost per *directory* rather
-/// than per *tree*.
+/// `dir_rows` must *seek* on `idx_files_parent`, never scan the table — the
+/// seek is what keeps the cost per *directory* rather than per *tree*.
+/// (Deliberately not index-only; see the index's comment in `schema.rs`.)
 #[test]
 fn dir_rows_seeks_the_parent_index() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let plan: String = conn
         .query_row(
@@ -713,15 +644,13 @@ fn dir_rows_seeks_the_parent_index() {
         "dir_rows must seek the parent index, got: {}",
         plan
     );
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 /// The range form is an index seek; `LIKE … ESCAPE` cannot be (SQLite
-/// disables the LIKE optimisation whenever an ESCAPE clause is present).
+/// disables the LIKE optimisation whenever ESCAPE is present).
 #[test]
 fn the_subtree_range_is_an_index_seek_not_a_scan() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let plan: String = conn
         .query_row(
@@ -735,16 +664,13 @@ fn the_subtree_range_is_an_index_seek_not_a_scan() {
         "range delete must seek, got: {}",
         plan
     );
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// The keyset page must be one index walk: the row-value comparison against
-/// `(parent, name)` is what lets SQLite seek straight to the cursor and read
-/// forward, with no temp b-tree to satisfy the `ORDER BY`.
+/// The keyset page must be one index walk, with no temp b-tree for the
+/// `ORDER BY`.
 #[test]
 fn the_reconcile_page_seeks_and_does_not_sort() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let mut stmt = conn
         .prepare(
@@ -771,14 +697,11 @@ fn the_reconcile_page_seeks_and_does_not_sort() {
         "the index order must satisfy the ORDER BY outright, got: {}",
         plan
     );
-    drop(stmt);
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn last_full_index_round_trip() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     assert_eq!(get_last_full_index(&conn), None, "fresh DB has no marker");
     set_last_full_index(&conn, 1_700_000_123).unwrap();
@@ -786,13 +709,11 @@ fn last_full_index_round_trip() {
     // Overwrite, not accumulate.
     set_last_full_index(&conn, 1_700_000_999).unwrap();
     assert_eq!(get_last_full_index(&conn), Some(1_700_000_999));
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn checkpoint_and_close_truncates_wal() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     {
         let tx = conn.transaction().unwrap();
@@ -813,8 +734,6 @@ fn checkpoint_and_close_truncates_wal() {
         tx.commit().unwrap();
     }
     checkpoint_and_close(conn);
-    // After a TRUNCATE checkpoint + close of the last connection the WAL
-    // sidecar is gone or empty; the row lives in the main file.
     let wal = std::path::PathBuf::from(format!("{}-wal", p.display()));
     let wal_len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
     assert_eq!(wal_len, 0, "WAL should be truncated on clean close");
@@ -823,11 +742,8 @@ fn checkpoint_and_close_truncates_wal() {
         .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
         .unwrap();
     assert_eq!(n, 1);
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// Bulk rows, cheap to write, enough of them to make the file grow.
 fn seed_rows(conn: &mut Connection, range: std::ops::Range<usize>) {
     let tx = conn.transaction().unwrap();
     for i in range {
@@ -866,23 +782,20 @@ fn wal_bytes(p: &std::path::Path) -> u64 {
 
 #[test]
 fn checkpoint_truncate_empties_the_log() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     seed_rows(&mut conn, 0..200);
     assert!(wal_bytes(&p) > 0, "the writes should be sitting in the log");
 
     checkpoint_truncate(&conn).expect("nothing is holding the log back");
     assert_eq!(wal_bytes(&p), 0, "a completed TRUNCATE leaves no log");
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 /// A reader pins the log, SQLite declines to reset it, and the only word of
 /// it is in the result row.
 #[test]
 fn checkpoint_truncate_reports_an_incomplete_checkpoint() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut writer = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     seed_rows(&mut writer, 0..200);
     writer
@@ -897,25 +810,14 @@ fn checkpoint_truncate_reports_an_incomplete_checkpoint() {
     let err = checkpoint_truncate(&writer).expect_err("a reader holds the log open");
     assert!(err.contains("incomplete"), "unexpected message: {}", err);
     assert!(wal_bytes(&p) > 0, "and the log is still there");
-
-    drop(rows);
-    drop(stmt);
-    drop(reader);
-    drop(writer);
-    std::fs::remove_file(&p).ok();
 }
 
-/// SQLite's autocheckpoint copies committed frames into the database
-/// continuously, but the log is only *reset* when the writer opens a
-/// transaction at an instant no reader holds a read mark — and it tries that
-/// lock exactly once, with no retry. A reader querying back to back keeps
-/// that instant from arriving, so the log appends for as long as the run
-/// lasts. An explicit checkpoint retries the same lock under `busy_timeout`
-/// and gets it.
+/// Autocheckpoint tries the reset lock exactly once, with no retry, so a
+/// reader querying back to back keeps the log growing for the whole run. An
+/// explicit checkpoint retries the same lock under `busy_timeout` and gets it.
 #[test]
 fn a_busy_reader_defeats_the_autocheckpoint_but_not_a_forced_one() {
-    // Bare rows: no zstd or tokenising, so the test stays fast while the
-    // log still grows.
+    // Bare rows: no zstd or tokenising, so the test stays fast.
     fn seed_bare(conn: &mut Connection, range: std::ops::Range<usize>) {
         let tx = conn.transaction().unwrap();
         for i in range {
@@ -976,13 +878,11 @@ fn a_busy_reader_defeats_the_autocheckpoint_but_not_a_forced_one() {
         peak
     }
 
-    let unbounded = tmp_path();
+    let (_dir_a, unbounded) = tmp_path();
     let left_alone = run(&unbounded, 0);
-    std::fs::remove_file(&unbounded).ok();
 
-    let bounded = tmp_path();
+    let (_dir_b, bounded) = tmp_path();
     let forced = run(&bounded, 4);
-    std::fs::remove_file(&bounded).ok();
 
     eprintln!(
         "peak WAL: autocheckpoint only {}, forced {}",
@@ -998,7 +898,7 @@ fn a_busy_reader_defeats_the_autocheckpoint_but_not_a_forced_one() {
 
 #[test]
 fn maintain_vacuums_when_slack_is_significant() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     seed_rows(&mut conn, 0..2000);
     checkpoint_truncate(&conn).unwrap();
@@ -1033,7 +933,6 @@ fn maintain_vacuums_when_slack_is_significant() {
         std::fs::metadata(&p).unwrap().len() < before,
         "the file should have shrunk"
     );
-    // The surviving rows are still there and still searchable.
     let n: i64 = conn
         .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
         .unwrap();
@@ -1046,14 +945,11 @@ fn maintain_vacuums_when_slack_is_significant() {
         )
         .unwrap();
     assert_eq!(hits, 100, "the FTS index survived the rewrite");
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn maintain_skips_vacuum_on_a_tight_file() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     seed_rows(&mut conn, 0..200);
     drop(conn);
@@ -1066,14 +962,11 @@ fn maintain_skips_vacuum_on_a_tight_file() {
     );
     // The checkpoint is not conditional on the vacuum, though.
     assert_eq!(wal_bytes(&p), 0);
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn set_content_failed_writes_failed_table() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     let id = {
         let tx = conn.transaction().unwrap();
@@ -1113,12 +1006,8 @@ fn set_content_failed_writes_failed_table() {
         )
         .unwrap();
     assert_eq!(content_state, STATE_FAILED);
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// Insert one row under `path`, born pending when `needs_content`.
 fn insert_at(tx: &Transaction<'_>, path: &str, needs_content: bool) -> i64 {
     let (parent, name) = crate::file_handling::split_db_path(path).expect("a file's path");
     insert_file(
@@ -1143,16 +1032,13 @@ fn fts_rows(conn: &Connection) -> i64 {
         .unwrap()
 }
 
-/// The whole premise of answering both figures from `files`: a row reads
-/// `content_state = DONE` exactly when it has a `searchabletext` row, so the
-/// conditional sum *is* a count of the FTS table restricted to a path range.
-///
-/// Pinned against the FTS table itself rather than against the states that
-/// were written, because the equivalence is what would break if some future
-/// transition wrote one without the other.
+/// The premise of `count_root`: `content_state = DONE` exactly when a
+/// `searchabletext` row exists. Pinned against the FTS table itself, because
+/// the equivalence is what breaks if a transition writes one without the
+/// other.
 #[test]
 fn count_root_counts_the_fts_rows_it_says_it_does() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     {
         let tx = conn.transaction().unwrap();
@@ -1179,8 +1065,7 @@ fn count_root_counts_the_fts_rows_it_says_it_does() {
     assert_eq!(counts.fts, 2);
 
     // A searchable row outside the range moves the table's total and not the
-    // root's figure — otherwise the assertion above would hold for a count
-    // that ignored its bounds.
+    // root's figure.
     {
         let tx = conn.transaction().unwrap();
         let id = insert_at(&tx, "/elsewhere/f.txt", true);
@@ -1193,28 +1078,22 @@ fn count_root_counts_the_fts_rows_it_says_it_does() {
         counts,
         "a row outside the range belongs to no root's figures"
     );
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// An empty range is 0/0, not an error: a configured root nothing has been
-/// walked into yet is a normal state, and `SUM` over no rows is NULL.
+/// An empty range is 0/0, not an error — `SUM` over no rows is NULL.
 #[test]
 fn count_root_reports_zero_for_an_empty_range() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     assert_eq!(
         count_root(&conn, "/nothing/", "/nothing0").unwrap(),
         RootCounts { files: 0, fts: 0 }
     );
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn root_counts_round_trip() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     assert_eq!(get_root_counts(&conn, "/tree"), None, "never counted");
 
@@ -1232,9 +1111,7 @@ fn root_counts_round_trip() {
     // Roots do not read each other's figures.
     assert_eq!(get_root_counts(&conn, "/other"), None);
 
-    // A value this build cannot parse reads as absent, like a missing one:
-    // the folder list says "not yet indexed" rather than showing a number
-    // that is a guess.
+    // A value this build cannot parse reads as absent, like a missing one.
     for bad in ["", "12", "12,", "a,b", "12,5,3"] {
         conn.execute(
             "INSERT OR REPLACE INTO schema_info(key, value) VALUES ('counts:/tree', ?1)",
@@ -1243,16 +1120,11 @@ fn root_counts_round_trip() {
         .unwrap();
         assert_eq!(get_root_counts(&conn, "/tree"), None, "parsed {:?}", bad);
     }
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// Both kinds of per-root figure are swept together, so a root removed and
-/// later re-added starts from neither a stale denominator nor a stale count.
 #[test]
 fn prune_root_stats_drops_every_figure_of_a_dropped_root() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     for root in ["/kept", "/dropped"] {
         set_root_walk_count(&conn, root, 100).unwrap();
@@ -1271,22 +1143,14 @@ fn prune_root_stats_drops_every_figure_of_a_dropped_root() {
     assert_eq!(get_root_counts(&conn, "/dropped"), None);
     // The sweep reads every `schema_info` key; unrelated ones must survive it.
     assert_eq!(get_last_full_index(&conn), Some(1_700_000_000));
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// The vanished-directory sweep walks `for_each_parent_in_range`, and its
-/// range has to include the root's *own* directory or the files sitting
-/// directly in a root are never reconciled.
-///
-/// It does now only because every stored parent ends in a separator: the root's
-/// parent is spelled `/tree/`, which is the range's `lo` exactly. With the bare
-/// `/tree` an older schema stored, it sorted *below* `lo` and the sweep skipped
-/// it — harmless then only because a readable root is always in `seen_dirs`.
+/// The parent-scan range must include the root's *own* directory or files
+/// sitting directly in a root are never reconciled — true only because every
+/// stored parent ends in a separator, making the root's parent exactly `lo`.
 #[test]
 fn the_parent_scan_reaches_the_roots_own_directory() {
-    let p = tmp_path();
+    let (_dir, p) = tmp_path();
     let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     seeded(
         &mut conn,
@@ -1308,7 +1172,129 @@ fn the_parent_scan_reaches_the_roots_own_directory() {
         vec!["/tree/", "/tree/deep/", "/tree/deep/deeper/"],
         "the root's own directory is in range, and the siblings are not"
     );
+}
 
-    drop(conn);
-    std::fs::remove_file(&p).ok();
+/// Pins the two facts the delete helpers rest on: the cascade fires on a
+/// production connection, and `searchabletext` (FTS5, no foreign key) does
+/// NOT cascade — why its delete stays explicit.
+#[test]
+fn deleting_a_file_row_cascades_the_fk_tables() {
+    let (_dir, path) = tmp_path();
+    let mut conn = open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+    let ids = seeded(&mut conn, &["/casc/a.txt", "/casc/b.txt"]);
+    let count = |conn: &Connection, sql: &str| -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    };
+    {
+        let tx = conn.transaction().unwrap();
+        set_content_failed(&tx, ids["/casc/b.txt"], "boom").unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents_text"), 2);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM failed_files"), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM searchabletext"), 2);
+
+    conn.execute("DELETE FROM files", []).unwrap();
+
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM documents_text"),
+        0,
+        "documents_text must cascade"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM failed_files"),
+        0,
+        "failed_files must cascade"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM searchabletext"),
+        2,
+        "FTS5 cannot cascade — the explicit delete in the helpers is load-bearing"
+    );
+}
+
+#[test]
+fn retry_failed_files_resets_state_and_clears_records() {
+    let (_dir, path) = tmp_path();
+    let mut conn = open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+    let ids = seeded(&mut conn, &["/retry/bad.txt", "/retry/good.txt"]);
+    {
+        let tx = conn.transaction().unwrap();
+        set_content_failed(&tx, ids["/retry/bad.txt"], "parser choked").unwrap();
+        tx.commit().unwrap();
+    }
+
+    let tx = conn.transaction().unwrap();
+    assert_eq!(retry_failed_files(&tx).unwrap(), 1);
+    tx.commit().unwrap();
+
+    let state = |id: i64| -> i64 {
+        conn.query_row(
+            "SELECT content_state FROM files WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(state(ids["/retry/bad.txt"]), STATE_PENDING);
+    assert_eq!(state(ids["/retry/good.txt"]), STATE_DONE, "done rows untouched");
+    let failures: i64 = conn
+        .query_row("SELECT COUNT(*) FROM failed_files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(failures, 0);
+}
+
+/// `update_file_basic` must clear a stale failure record on both content
+/// paths, or `list-failed` keeps reporting a fixed file as broken.
+#[test]
+fn a_changed_file_clears_its_failure_record() {
+    let (_dir, path) = tmp_path();
+    let mut conn = open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+    let ids = seeded(&mut conn, &["/chg/a.txt", "/chg/b.txt"]);
+    {
+        let tx = conn.transaction().unwrap();
+        set_content_failed(&tx, ids["/chg/a.txt"], "boom").unwrap();
+        set_content_failed(&tx, ids["/chg/b.txt"], "boom").unwrap();
+        tx.commit().unwrap();
+    }
+
+    let update = |conn: &mut Connection, name: &str, needs_content: bool| {
+        let tx = conn.transaction().unwrap();
+        let id = update_file_basic(
+            &tx,
+            &NewFile {
+                name,
+                parent: "/chg/",
+                size: 2,
+                mtime: 9,
+                mime: if needs_content { Some("text/plain") } else { None },
+                ftype: FileType::TEXT,
+                hash: None,
+                needs_content,
+            },
+        )
+        .unwrap()
+        .expect("row exists");
+        tx.commit().unwrap();
+        id
+    };
+    // The bug this pins: needs_content = false lands in NA with the stale
+    // failure record intact.
+    let a = update(&mut conn, "a.txt", false);
+    let b = update(&mut conn, "b.txt", true);
+
+    let state = |id: i64| -> i64 {
+        conn.query_row(
+            "SELECT content_state FROM files WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(state(a), STATE_NA);
+    assert_eq!(state(b), STATE_PENDING);
+    let failures: i64 = conn
+        .query_row("SELECT COUNT(*) FROM failed_files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(failures, 0, "both records cleared");
 }

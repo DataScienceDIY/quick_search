@@ -1,22 +1,16 @@
-//! Syntax highlighting for the search box.
+//! Syntax highlighting for the search box. [`classify`] mirrors
+//! `split_for_cascade` branch for branch — it must never claim something is
+//! a filter (or a wildcard) that the engine treats as plain text.
 //!
-//! [`classify`] is a pure token walk over [`tokenize_spanned`] output that
-//! mirrors `split_for_cascade` branch for branch — it must never claim
-//! something is a filter (or a wildcard) that the engine treats as plain
-//! text. The egui layer at the bottom turns its segments into a `Galley`
-//! for `TextEdit::layouter`.
-//!
-//! Color scheme: recognized keywords red, their arguments blue, syntax
-//! characters (operators, quotes, live wildcards) green, invalid arguments
-//! in the error color, everything else plain. A complete recognized filter
-//! additionally gets a tinted background chip.
+//! Colors: keywords red, arguments blue, syntax characters green, invalid
+//! arguments error-colored; a complete recognized filter gets a chip tint.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, Galley, Stroke};
-use quicksearch_core::query::ast::Op;
+use quicksearch_core::query::Op;
 use quicksearch_core::query::lexer::{tokenize_spanned, Token};
 use quicksearch_core::query::pattern::RegexQuery;
 use quicksearch_core::query::translator::{build_filter, is_filter_key};
@@ -24,15 +18,11 @@ use quicksearch_core::query::translator::{build_filter, is_filter_key};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
     Plain,
-    /// The key word of a recognized filter (`type`, `name`, `regex`, …).
     Keyword,
-    /// Syntax characters doing work: filter operators (`:`, `:>=`, …),
-    /// quote delimiters, and `*` where it is a live wildcard.
+    /// Operators, quote delimiters, and `*` where it is a live wildcard.
     Operator,
-    /// The value of a recognized filter.
     Argument,
-    /// The value of a recognized filter that the engine would reject
-    /// (unknown type name, bad date, invalid regex).
+    /// A recognized filter's value that the engine would reject.
     InvalidArg,
 }
 
@@ -64,8 +54,7 @@ pub fn classify(text: &str) -> Vec<Seg> {
         match &tokens[i].0 {
             Token::Word(word) => {
                 if let Some(Token::Op(op1)) = tok(i + 1) {
-                    // Candidate filter: Word(key) Op [Op] (Word|Quoted),
-                    // exactly as split_for_cascade sees it.
+                    // Word(key) Op [Op] (Word|Quoted), as split_for_cascade sees it.
                     let (op, op_end_idx, value_idx) = match tok(i + 2) {
                         Some(Token::Op(op2)) => (*op2, i + 2, i + 3),
                         _ => (*op1, i + 1, i + 2),
@@ -91,23 +80,19 @@ pub fn classify(text: &str) -> Vec<Seg> {
                             }
                             let vspan = span(value_idx);
                             if !valid {
-                                // One uniform error run; no wildcard color.
                                 em.emit(vspan, Class::InvalidArg, true, true);
                             } else if !value_is_word {
                                 em.emit_quoted(vspan, Class::Argument, true);
                             } else if glob_value_key(word) {
                                 em.emit_word(vspan, Class::Argument, true, true);
                             } else {
-                                // Stars in other filter values are literal
-                                // characters — no wildcard color.
                                 em.emit(vspan, Class::Argument, true, true);
                             }
                             i = value_idx + 1;
                             continue;
                         }
-                        // Unrecognized key: the engine reassembles the whole
-                        // chain verbatim (stars stay literal), so everything
-                        // renders plain.
+                        // Unrecognized key: the engine reassembles the chain
+                        // verbatim (stars stay literal); render plain.
                         em.emit(span(i), Class::Plain, false, false);
                         for op_idx in (i + 1)..=op_end_idx {
                             em.emit(span(op_idx), Class::Plain, false, false);
@@ -124,9 +109,8 @@ pub fn classify(text: &str) -> Vec<Seg> {
                         }
                         continue;
                     }
-                    // Key + op with no value yet (mid-typing `type:`):
-                    // recognized keys color optimistically but earn no chip
-                    // until the filter is complete.
+                    // Mid-typing `type:`: recognized keys color
+                    // optimistically but earn no chip until complete.
                     let known = is_regex || is_filter_key(word);
                     let (key_class, op_class) = if known {
                         (Class::Keyword, Class::Operator)
@@ -140,11 +124,9 @@ pub fn classify(text: &str) -> Vec<Seg> {
                     i = op_end_idx + 1;
                     continue;
                 }
-                // A plain word: unquoted stars are live wildcards.
                 em.emit_word(span(i), Class::Plain, false, false);
             }
             Token::Quoted(_) => em.emit_quoted(span(i), Class::Plain, false),
-            // Demoted to plain text by the live search path.
             Token::And | Token::Or | Token::LParen | Token::RParen | Token::Op(_) => {
                 em.emit(span(i), Class::Plain, false, false);
             }
@@ -152,8 +134,7 @@ pub fn classify(text: &str) -> Vec<Seg> {
         i += 1;
     }
 
-    // Trailing lex error: an unterminated quote is a quote-in-progress,
-    // not a mistake — green delimiter, plain tail.
+    // An unterminated quote is a quote-in-progress, not a mistake.
     if let Some(err) = err {
         if err.offset < text.len() && text.as_bytes()[err.offset] == b'"' {
             em.emit(err.offset..err.offset + 1, Class::Operator, false, false);
@@ -162,8 +143,7 @@ pub fn classify(text: &str) -> Vec<Seg> {
     em.finish(text.len())
 }
 
-/// Keys whose word-form values interpret `*` as a wildcard (or, for
-/// `regex`, as live pattern syntax).
+/// Keys whose word-form values interpret `*` as live syntax.
 fn glob_value_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
@@ -178,7 +158,6 @@ struct Emitter<'a> {
 }
 
 impl Emitter<'_> {
-    /// Fill the gap (whitespace the lexer skipped) up to `pos`.
     fn gap_to(&mut self, pos: usize, chip: bool) {
         if pos > self.cursor {
             self.segs.push(Seg {
@@ -190,8 +169,8 @@ impl Emitter<'_> {
         }
     }
 
-    /// Emit one span. `gap_chip` tints the whitespace before it — true for
-    /// the interior of a filter (`type : Audio` chips as one run).
+    /// `gap_chip` tints the whitespace before the span, so a filter's
+    /// interior chips as one run.
     fn emit(&mut self, range: Range<usize>, class: Class, chip: bool, gap_chip: bool) {
         self.gap_to(range.start, gap_chip);
         if range.end > range.start {
@@ -204,8 +183,6 @@ impl Emitter<'_> {
         }
     }
 
-    /// Emit a word span with each `*` as a green wildcard and the pieces
-    /// between in `base`.
     fn emit_word(&mut self, range: Range<usize>, base: Class, chip: bool, gap_chip: bool) {
         self.gap_to(range.start, gap_chip);
         let bytes = self.text.as_bytes();
@@ -237,9 +214,8 @@ impl Emitter<'_> {
         self.cursor = self.cursor.max(range.end);
     }
 
-    /// Emit a quoted span (delimiters included): quotes green, content in
-    /// `content`. Inner `""` escapes are just content bytes — no offset
-    /// math needed.
+    /// Quotes green, content in `content`; inner `""` escapes are just
+    /// content bytes, no offset math needed.
     fn emit_quoted(&mut self, range: Range<usize>, content: Class, chip: bool) {
         self.gap_to(range.start, chip);
         self.segs.push(Seg {
@@ -264,8 +240,6 @@ impl Emitter<'_> {
         self.cursor = self.cursor.max(range.end);
     }
 
-    /// A value inside unrecognized-key glue: plain, except quote
-    /// delimiters, which still did real tokenizing work.
     fn emit_glued_value(&mut self, range: Range<usize>, token: Option<&Token>) {
         match token {
             Some(Token::Quoted(_)) => self.emit_quoted(range, Class::Plain, false),
@@ -304,14 +278,12 @@ fn query_formats(ui: &egui::Ui) -> QueryFormats {
         keyword: base(palette.red),
         operator: base(palette.green),
         argument: base(palette.blue),
-        // The keyword red and the error red are near neighbors in dark
-        // mode; the underline disambiguates at a glance.
+        // Keyword red and error red are near neighbors; the underline
+        // disambiguates at a glance.
         invalid: TextFormat {
             underline: Stroke::new(1.0, error),
             ..base(error)
         },
-        // Slightly weaker than the snippet highlight's 0.4 so the colored
-        // text on top stays crisp.
         chip_bg: ui.visuals().selection.bg_fill.gamma_multiply(0.35),
     }
 }
@@ -332,11 +304,10 @@ impl QueryFormats {
     }
 }
 
-/// Classification cache: tokenizing is cheap but validating a `regex:`
-/// argument compiles the regex, and the layouter runs every frame — so
-/// segments are recomputed only when the text changes. The `LayoutJob` is
-/// rebuilt each frame (colors follow the live theme) and epaint's own
-/// galley cache dedupes the actual layout work by job hash.
+/// Validating a `regex:` argument compiles the regex and the layouter runs
+/// every frame, so segments are recomputed only when the text changes. The
+/// job is rebuilt each frame (colors follow the live theme); epaint's galley
+/// cache dedupes the layout by job hash.
 #[derive(Default)]
 pub struct HighlightCache {
     text: String,

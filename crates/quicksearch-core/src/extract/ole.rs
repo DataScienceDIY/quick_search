@@ -1,39 +1,18 @@
-//! Legacy binary Office formats: `.doc`, `.xls`, `.ppt`.
-//!
-//! These are OLE2 compound files — a FAT-like container of named streams —
-//! rather than the zip-of-XML their `x`-suffixed successors use, so nothing in
-//! [`super::office`] can read them. What the three have in common is only the
-//! container; inside, each stores its text a completely different way, so this
-//! module is three parsers sharing a reader.
-//!
-//! # What "supported" means here
-//!
-//! The goal is the *text*, for a full-text index. Formatting, embedded
-//! objects, revision history and deleted-but-retained text are all out of
-//! scope, and the parsers deliberately read the minimum structure needed to
-//! locate character data.
-//!
-//! # Hostile input
-//!
-//! Every offset in these formats comes from the file itself, including counts
-//! that decide how much to allocate. A `.doc` claiming four billion text
-//! pieces is a valid byte sequence. So: every read is bounds-checked against
-//! the stream that actually exists, every declared length is clamped to what
-//! remains, and nothing is preallocated from a declared count. A malformed
-//! file yields `Err` — which lands as a `FAILED` row with a reason, visible in
-//! `list-failed` — never a partial string of garbage, and never a panic.
+//! Legacy binary Office formats: `.doc`, `.xls`, `.ppt` — OLE2 compound
+//! files; three parsers sharing a reader, wanting only the *text*. Every
+//! offset and count in these formats is attacker-controlled, so every read is
+//! bounds-checked, declared lengths are clamped, nothing is preallocated from
+//! a declared count, and a malformed file yields `Err` — never a partial
+//! string of garbage, and never a panic.
 
 use std::error::Error;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-/// Ceiling on extracted text from one legacy document.
-///
-/// The formats allow a document to declare far more text than it contains, and
-/// the config's own `maximum_text_size` is applied later, by the caller. This
-/// is the earlier, cruder bound that keeps a hostile header from turning into
-/// an allocation.
+/// Ceiling on extracted text from one legacy document: the formats can
+/// declare far more text than they contain, and this earlier, cruder bound
+/// keeps a hostile header from turning into an allocation.
 const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn extract_ole_text(path: &Path, extension: &str) -> Result<String, Box<dyn Error>> {
@@ -47,8 +26,6 @@ pub fn extract_ole_text(path: &Path, extension: &str) -> Result<String, Box<dyn 
     }
 }
 
-/// Read one named stream whole. `None` when the stream is absent, which is a
-/// question several callers ask before falling back to another name.
 fn stream<F: Read + std::io::Seek>(cfb: &mut cfb::CompoundFile<F>, name: &str) -> Option<Vec<u8>> {
     let mut s = cfb.open_stream(name).ok()?;
     let mut buf = Vec::new();
@@ -56,10 +33,8 @@ fn stream<F: Read + std::io::Seek>(cfb: &mut cfb::CompoundFile<F>, name: &str) -
     Some(buf)
 }
 
-// Bounds-checked little-endian reads
-//
-// Every one returns `Option` rather than panicking on a short slice: the
-// offsets these are called with are attacker-controlled.
+// Bounds-checked little-endian reads: every one returns `Option` on a short
+// slice, because the offsets are attacker-controlled.
 
 fn u8_at(b: &[u8], off: usize) -> Option<u8> {
     b.get(off).copied()
@@ -75,27 +50,22 @@ fn u32_at(b: &[u8], off: usize) -> Option<u32> {
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-/// Decode `bytes` as windows-1252 — the "compressed"/8-bit form all three
-/// formats use for text that fits it.
+/// windows-1252 — the "compressed"/8-bit form all three formats use.
 fn cp1252(bytes: &[u8]) -> String {
     encoding_rs::WINDOWS_1252.decode(bytes).0.into_owned()
 }
 
-/// Decode `bytes` as UTF-16LE, the wide form. A trailing odd byte is dropped
-/// rather than treated as an error: it means the declared length disagreed
-/// with the stream, and half a code unit carries nothing.
+/// UTF-16LE, the wide form. A trailing odd byte (declared length disagreeing
+/// with the stream) is dropped; half a code unit carries nothing.
 fn utf16le(bytes: &[u8]) -> String {
     let even = bytes.len() - (bytes.len() % 2);
     encoding_rs::UTF_16LE.decode(&bytes[..even]).0.into_owned()
 }
 
 /// Map the control codes these formats use as structure into whitespace, and
-/// drop the rest.
-///
-/// Word marks paragraphs with `\r` and table cells with `\x07`; both read as
-/// line breaks. Field instructions live between `\x13` and `\x15` and are
-/// markup, not prose — "HYPERLINK \\l foo" is not something a user searches
-/// for. PowerPoint uses `\x0B` as a soft line break.
+/// drop the rest. Word marks paragraphs with `\r` and table cells with
+/// `\x07`; field instructions (markup, not prose) live between `\x13` and
+/// `\x15`; PowerPoint uses `\x0B` as a soft line break.
 fn clean(raw: &str, out: &mut String) {
     let mut in_field_instruction = false;
     for ch in raw.chars() {
@@ -114,27 +84,23 @@ fn clean(raw: &str, out: &mut String) {
     }
 }
 
-// .doc — Word 97-2003
-//
-// Word does not store its text contiguously. The `WordDocument` stream holds
-// character data in arbitrarily ordered runs, and a *piece table* in the
-// companion table stream says which run belongs where in the document. Reading
-// the stream start-to-end therefore yields text in storage order, interleaved
-// with whatever earlier edits left behind; only the piece table gives the
-// document as it reads.
+// .doc — Word 97-2003. Text is not contiguous: the `WordDocument` stream
+// holds arbitrarily ordered runs, and a *piece table* in the companion table
+// stream says which run belongs where. Start-to-end reading yields storage
+// order interleaved with leftovers of earlier edits; only the piece table
+// gives the document as it reads.
 mod doc {
     use super::*;
 
-    /// Offset of the flags word in the FIB base, whose bit 9 selects which of
-    /// the two table streams is live.
+    /// Flags word in the FIB base; bit 9 selects the live table stream.
     pub(super) const FIB_FLAGS: usize = 0x000A;
     pub(super) const FLAG_WHICH_TBL_STM: u16 = 0x0200;
 
     /// The FIB base is fixed-length; the variable-length arrays follow it.
     pub(super) const FIB_BASE_LEN: usize = 32;
 
-    /// Index of the `fcClx`/`lcbClx` pair within `fibRgFcLcb97`, which is an
-    /// array of (u32 fc, u32 lcb) pairs. The CLX is where the piece table is.
+    /// Index of `fcClx`/`lcbClx` within `fibRgFcLcb97`, an array of
+    /// (u32 fc, u32 lcb) pairs; the CLX is where the piece table is.
     pub(super) const CLX_PAIR_INDEX: usize = 33;
 
     /// `Pcdt`, the piece-table element of a CLX.
@@ -155,9 +121,8 @@ mod doc {
     ) -> Result<String, Box<dyn Error>> {
         let doc = stream(cfb, "WordDocument").ok_or("no WordDocument stream")?;
         let flags = u16_at(&doc, FIB_FLAGS).ok_or("truncated FIB")?;
-        // Word keeps two table streams and rewrites them alternately; the flag
-        // says which one the current FIB refers to. Reading the wrong one
-        // gives a piece table from a previous save.
+        // Word rewrites its two table streams alternately; reading the wrong
+        // one gives a piece table from a previous save.
         let table_name = if flags & FLAG_WHICH_TBL_STM != 0 {
             "1Table"
         } else {
@@ -181,17 +146,11 @@ mod doc {
 
     /// Decode `pieces` out of the document stream, stopping at `budget`.
     ///
-    /// Two budgets, because the output one cannot bound the input. `clean`
-    /// drops the whole C0 range, so a piece of control bytes decodes at full
-    /// width and appends nothing — leaving a brake on `out.len()` that never
-    /// advances. And nothing requires pieces to be disjoint or ordered: each
-    /// names its own `fc`, so a table can point every piece at the same span,
-    /// and a 2 MiB file can name tens of GiB of decoding. Charging the bytes
-    /// actually read bounds both the repetition and the merely enormous
-    /// document.
-    ///
-    /// `budget` is a parameter so a test can trip it without building a file
-    /// the size of the real one.
+    /// Two budgets, because the output one cannot bound the input: a piece of
+    /// control bytes decodes at full width and appends nothing, and nothing
+    /// requires pieces to be disjoint or ordered — a table can point every
+    /// piece at the same span, so a 2 MiB file can name tens of GiB of
+    /// decoding. Charging the bytes actually read bounds both.
     pub(super) fn decode_pieces(doc: &[u8], pieces: &[Piece], budget: usize) -> String {
         let mut out = String::new();
         let mut decoded = 0usize;
@@ -200,9 +159,7 @@ mod doc {
                 break;
             }
             let Some(bytes) = doc.get(piece.start..piece.end) else {
-                // A piece pointing outside the stream is corruption, but the
-                // pieces before it were real: keep them rather than discarding
-                // a recoverable document.
+                // Corruption; the pieces before it were real, keep them.
                 break;
             };
             decoded = decoded.saturating_add(bytes.len());
@@ -217,9 +174,7 @@ mod doc {
     }
 
     /// Walk the FIB's variable-length sections to find `fcClx`/`lcbClx`.
-    ///
-    /// The sections are self-describing — each is preceded by its own count —
-    /// so this works across the FIB versions without a version table.
+    /// Each is preceded by its own count, so no version table is needed.
     fn clx_location(doc: &[u8]) -> Result<(usize, usize), Box<dyn Error>> {
         // csw: count of 16-bit values in rgW97.
         let csw = u16_at(doc, FIB_BASE_LEN).ok_or("truncated FIB (csw)")? as usize;
@@ -276,8 +231,8 @@ mod doc {
         }
     }
 
-    /// A `PlcPcd` is `n+1` character positions followed by `n` piece
-    /// descriptors, so its length determines `n`.
+    /// A `PlcPcd` is `n+1` character positions then `n` piece descriptors,
+    /// so its length determines `n`.
     fn decode_plc_pcd(plc: &[u8]) -> Result<Vec<Piece>, Box<dyn Error>> {
         if plc.len() < CP_LEN + PCD_LEN {
             return Err("piece table holds no pieces".into());
@@ -289,8 +244,7 @@ mod doc {
         for k in 0..n {
             let cp = u32_at(plc, k * CP_LEN).ok_or("truncated CP array")? as usize;
             let cp_next = u32_at(plc, (k + 1) * CP_LEN).ok_or("truncated CP array")? as usize;
-            // CPs must advance; a table that goes backwards is corrupt and
-            // would otherwise underflow the character count.
+            // CPs must advance; a backwards table would underflow the count.
             let chars = cp_next.saturating_sub(cp);
             if chars == 0 {
                 continue;
@@ -321,15 +275,11 @@ mod doc {
     }
 }
 
-// .xls — Excel 97-2003 (BIFF8)
-//
-// The workbook is a flat sequence of records. Cell text is not stored in the
-// cells: repeated strings are pooled in a shared-string table (`SST`) and the
-// cells hold indices into it. The SST is also the record most likely to
-// overflow BIFF's 8224-byte record ceiling, in which case it continues into
-// `CONTINUE` records — and a string may be cut mid-way, resuming with a fresh
-// width flag. Getting that boundary wrong is the classic way to read an
-// Excel file as mojibake.
+// .xls — Excel 97-2003 (BIFF8): a flat sequence of records. Cell text is
+// pooled in a shared-string table (`SST`) the cells index into. The SST can
+// overflow BIFF's 8224-byte record ceiling into `CONTINUE` records, cutting a
+// string mid-way and resuming with a fresh width flag — getting that boundary
+// wrong is the classic way to read an Excel file as mojibake.
 mod xls {
     use super::*;
 
@@ -356,9 +306,6 @@ mod xls {
         extract_from_book(&book, MAX_TEXT_BYTES)
     }
 
-    /// The workbook stream's text, stopping at `budget`. Split out from
-    /// [`extract`] so a test can trip the budget without building a file the
-    /// size of the real one.
     pub(super) fn extract_from_book(book: &[u8], budget: usize) -> Result<String, Box<dyn Error>> {
         let records = split_records(book);
         let strings = shared_strings(&records);
@@ -370,17 +317,10 @@ mod xls {
         Ok(out)
     }
 
-    /// Render every cell-bearing record, stopping at `budget`.
-    ///
-    /// The same two budgets as [`super::doc::decode_pieces`], for the same
-    /// reason: `clean` can consume a whole cell and emit nothing, so a
-    /// workbook whose shared strings are all control characters runs to the
-    /// end of its records with the output brake never advancing — and one
-    /// `LABELSST` is six bytes, so a small file holds a great many of them,
-    /// each free to name the same 64 KiB shared string.
-    ///
-    /// `budget` is a parameter so a test can trip it without building a file
-    /// the size of the real one.
+    /// Render every cell-bearing record, stopping at `budget` — the same two
+    /// budgets as [`super::doc::decode_pieces`]: `clean` can consume a whole
+    /// cell and emit nothing, and one six-byte `LABELSST` is free to name the
+    /// same 64 KiB shared string as thousands of others.
     fn decode_cells(records: &[Record<'_>], strings: &[String], budget: usize) -> String {
         let mut out = String::new();
         let mut row_open = false;
@@ -397,8 +337,7 @@ mod xls {
                 REC_LABEL | REC_RSTRING => read_string(&[Segment(rec.body)], &mut 6).ok(),
                 REC_NUMBER => number_at(rec.body, 6).map(fmt_number),
                 REC_RK => rk_at(rec.body, 6).map(fmt_number),
-                // Sheet boundaries: end the line so cells from different
-                // sheets do not run together.
+                // Sheet boundaries: cells from different sheets must not join.
                 REC_EOF | REC_BOF => {
                     if row_open {
                         out.push('\n');
@@ -426,8 +365,8 @@ mod xls {
         body: &'a [u8],
     }
 
-    /// Split the stream into records, stopping at the first header that does
-    /// not fit — a truncated file keeps whatever records were whole.
+    /// Split into records, stopping at the first header that does not fit —
+    /// a truncated file keeps whatever records were whole.
     fn split_records(book: &[u8]) -> Vec<Record<'_>> {
         let mut records = Vec::new();
         let mut i = 0usize;
@@ -446,16 +385,15 @@ mod xls {
     /// and the width flag is re-read at every crossing.
     struct Segment<'a>(&'a [u8]);
 
-    /// The shared-string table, in index order.
-    ///
-    /// Missing or malformed is not fatal: a workbook of nothing but numbers
-    /// has no SST at all, and a damaged one still has readable inline strings.
+    /// The shared-string table, in index order. Missing or malformed is not
+    /// fatal: a numbers-only workbook has no SST at all, and a damaged one
+    /// still has readable inline strings.
     fn shared_strings(records: &[Record<'_>]) -> Vec<String> {
         let Some(sst_pos) = records.iter().position(|r| r.id == REC_SST) else {
             return Vec::new();
         };
-        // The SST and every CONTINUE immediately following it are one logical
-        // buffer, but the segment boundaries stay significant.
+        // The SST plus every CONTINUE following it are one logical buffer,
+        // but the segment boundaries stay significant.
         let mut segments = vec![Segment(records[sst_pos].body)];
         for rec in &records[sst_pos + 1..] {
             if rec.id != REC_CONTINUE {
@@ -470,25 +408,23 @@ mod xls {
         };
         let mut cursor = 8usize;
         let mut strings = Vec::new();
-        // Bounded by the bytes that exist, not by the declared count: `unique`
-        // is attacker-controlled and would otherwise size the loop.
+        // Bounded by the bytes that exist, not by the attacker-controlled
+        // declared count.
         for _ in 0..unique {
             match read_string(&segments, &mut cursor) {
                 Ok(s) => strings.push(s),
-                // A malformed entry ends the table; the ones before it are
-                // still correct, and cells indexing past the end are dropped.
+                // A malformed entry ends the table; earlier ones are still
+                // correct, and cells indexing past the end are dropped.
                 Err(_) => break,
             }
         }
         strings
     }
 
-    /// Read an `XLUnicodeRichExtendedString` starting at `*cursor`, a byte
-    /// offset into the concatenation of `segments`.
-    ///
-    /// The width flag is per-segment, not per-string: when the character data
-    /// crosses into a `CONTINUE`, the continuation begins with a fresh flag
-    /// byte and the remaining characters use that width.
+    /// Read an `XLUnicodeRichExtendedString` at `*cursor`, a byte offset into
+    /// the concatenation of `segments`. The width flag is per-segment, not
+    /// per-string: character data crossing into a `CONTINUE` resumes with a
+    /// fresh flag byte and that width.
     fn read_string(segments: &[Segment<'_>], cursor: &mut usize) -> Result<String, String> {
         let mut at = Cursor {
             segments,
@@ -505,7 +441,6 @@ mod xls {
         let mut text = String::new();
         let mut remaining = cch;
         while remaining > 0 {
-            // How many characters are left in the segment the cursor is in.
             let in_segment = at.remaining_in_segment()? / if wide { 2 } else { 1 };
             let take = remaining.min(in_segment.max(1));
             let bytes = at.take(take * if wide { 2 } else { 1 })?;
@@ -523,14 +458,13 @@ mod xls {
         Ok(text)
     }
 
-    /// A byte cursor over the SST's segments, aware of where they join.
+    /// Byte cursor over the SST's segments, aware of where they join.
     struct Cursor<'a, 'b> {
         segments: &'b [Segment<'a>],
         pos: usize,
     }
 
     impl<'a> Cursor<'a, '_> {
-        /// The segment containing `pos`, and the offset within it.
         fn locate(&self) -> Result<(usize, usize), String> {
             let mut left = self.pos;
             for (i, seg) in self.segments.iter().enumerate() {
@@ -547,8 +481,7 @@ mod xls {
             Ok(self.segments[i].0.len() - off)
         }
 
-        /// `n` bytes, which must not straddle a segment boundary. Callers size
-        /// their reads with [`Cursor::remaining_in_segment`] first.
+        /// `n` bytes, which must not straddle a segment boundary.
         fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
             let (i, off) = self.locate()?;
             let seg = self.segments[i].0;
@@ -585,9 +518,8 @@ mod xls {
         ]))
     }
 
-    /// An `RK` value packs a number into 32 bits: bit 0 says it was scaled by
-    /// 100, bit 1 says it is an integer rather than the top 30 bits of a
-    /// double's mantissa.
+    /// An `RK` packs a number into 32 bits: bit 0 = scaled by 100, bit 1 =
+    /// integer, else the top 30 bits of a double's mantissa.
     fn rk_at(body: &[u8], off: usize) -> Option<f64> {
         let raw = u32_at(body, off)?;
         let mut value = if raw & 0x02 != 0 {
@@ -601,8 +533,7 @@ mod xls {
         Some(value)
     }
 
-    /// Numbers are indexed as the user would type them: whole values without a
-    /// trailing `.0`, so a search for "2024" finds the cell holding 2024.
+    /// Whole values without a trailing `.0`, so "2024" finds the cell.
     fn fmt_number(n: f64) -> String {
         if n.fract() == 0.0 && n.abs() < 1e15 {
             format!("{}", n as i64)
@@ -612,13 +543,10 @@ mod xls {
     }
 }
 
-// .ppt — PowerPoint 97-2003
-//
-// A tree of records, where containers nest and atoms hold data. Slide text
-// sits in two atom types that differ only in width. Rather than follow the
-// slide-persistence directory to visit slides in order, this walks the tree
-// and takes every text atom it finds: order within the file is close enough
-// for an index, and the simpler traversal has far less to get wrong.
+// .ppt — PowerPoint 97-2003: a tree of records where containers nest and
+// atoms hold data; slide text sits in two atom types differing only in
+// width. This walks the whole tree instead of the slide-persistence
+// directory: file order is close enough for an index.
 mod ppt {
     use super::*;
 
@@ -627,15 +555,13 @@ mod ppt {
     /// `CString`, used for titles and notes in some producers.
     pub(super) const CSTRING_ATOM: u16 = 0x0FBA;
 
-    /// A record header is: version/instance u16, type u16, length u32.
+    /// Version/instance u16, type u16, length u32.
     pub(super) const REC_HEADER_LEN: usize = 8;
-    /// A record whose low nibble of the first word is 0xF holds child records
-    /// rather than data.
+    /// Low nibble 0xF in the first word marks a container of child records.
     pub(super) const VERSION_CONTAINER: u16 = 0x000F;
 
-    /// Deepest container nesting followed. Real decks are a handful deep; the
-    /// bound exists so a file that claims to contain itself cannot recurse
-    /// until the stack runs out.
+    /// Real decks are a handful deep; the bound keeps a file that claims to
+    /// contain itself from recursing until the stack runs out.
     pub(super) const MAX_DEPTH: u32 = 32;
 
     pub fn extract<F: Read + std::io::Seek>(
@@ -659,8 +585,7 @@ mod ppt {
             (u16_at(body, i), u16_at(body, i + 2), u32_at(body, i + 4))
         {
             let start = i + REC_HEADER_LEN;
-            // A length that runs past the end is corruption; the records
-            // already read are still good.
+            // A length past the end is corruption; earlier records are good.
             let Some(payload) = body.get(start..start.saturating_add(len as usize)) else {
                 return;
             };

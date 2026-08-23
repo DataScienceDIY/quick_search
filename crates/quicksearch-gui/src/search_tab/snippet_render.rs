@@ -31,17 +31,11 @@ fn snippet_formats(ui: &egui::Ui) -> SnippetFormats {
     }
 }
 
-/// The mark on a snippet that starts partway into its window;
-/// `first_visible_byte` pays for its width in advance.
 const SNIPPET_LEAD: &str = "… ";
 
-/// Append `window[range]` to `job`, highlighting whatever parts of `ranges`
-/// (byte offsets into `window`) fall inside it.
-///
+/// Append `window[range]` to `job`, marking the parts of `ranges` inside it.
 /// Ranges are clipped to the slice, so a caller rendering a string in pieces
-/// can hand each piece the *whole* set: a range inside this one survives, one
-/// straddling an edge survives as the part that is here, and one wholly
-/// outside disappears.
+/// can hand each piece the *whole* set.
 fn append_marked(
     job: &mut LayoutJob,
     fmt: &SnippetFormats,
@@ -66,11 +60,8 @@ fn append_marked(
     }
 }
 
-/// A whole field — a filename — with its matched spans marked.
-///
-/// Wrapping is left at the job's defaults on purpose: `egui::Label` overwrites
-/// only `wrap.max_width`, so this is laid out exactly like the plain string it
-/// replaces, and the cell keeps the height and clipping it had before.
+/// A whole field with its matched spans marked. Wrapping stays at the job's
+/// defaults, so this lays out exactly like the plain string it replaces.
 pub(super) fn marked_field_job(ui: &egui::Ui, text: &str, ranges: &[(usize, usize)]) -> LayoutJob {
     let fmt = snippet_formats(ui);
     let mut job = LayoutJob::default();
@@ -78,11 +69,10 @@ pub(super) fn marked_field_job(ui: &egui::Ui, text: &str, ranges: &[(usize, usiz
     job
 }
 
-/// The byte offset in `snip.window` that rendering has to start at for the
-/// first match to land on a row that survives `max_rows`; `0` when it
-/// already does. epaint stops at `wrap.max_rows` and *every* `\n` costs a
-/// row, blank line or not, so a ragged lead-in can spend the whole row
-/// budget before layout reaches the match.
+/// The byte offset rendering must start at for the first match to land on a
+/// row that survives `max_rows`. epaint stops at `wrap.max_rows` and *every*
+/// `\n` costs a row, so a ragged lead-in can spend the whole budget before
+/// layout reaches the match.
 fn first_visible_byte(
     ui: &egui::Ui,
     snip: &Snippet,
@@ -91,14 +81,11 @@ fn first_visible_byte(
     wrap_width: f32,
 ) -> usize {
     let Some(&(match_start, _)) = snip.ranges.first() else {
-        return 0; // a head-of-file window, with nothing to keep on screen
+        return 0; // head-of-file window
     };
 
-    // The rendered job pays for a leading mark this probe does not, so the
-    // probe wraps to a narrower width — a point narrower still, since epaint
-    // rounds `wrap.max_width` before laying out. Every rendered row then
-    // holds at least what the probe row starting at the same character held,
-    // so the match cannot drift *down* a row when the job is rebuilt.
+    // The rendered job pays for a leading mark this probe does not: the
+    // probe wraps narrower, so the match cannot drift *down* a row on rebuild.
     let lead_width = ui.fonts(|f| {
         SNIPPET_LEAD
             .chars()
@@ -110,19 +97,17 @@ fn first_visible_byte(
     probe.append(&snip.window, 0.0, fmt.normal.clone());
     let galley = ui.fonts(|f| f.layout_job(probe));
 
-    // Cursors index characters; snippet ranges are byte offsets. epaint
-    // counts the `\n` that ends a row, so the two spaces line up 1:1.
+    // Cursors index characters; snippet ranges are byte offsets.
     let cursor = egui::text::CCursor {
         index: snip.window[..match_start].chars().count(),
-        // At a wrap, the character belongs to the row it is drawn on, not
-        // the one it was pushed off.
+        // At a wrap, the character belongs to the row it is drawn on.
         prefer_next_row: true,
     };
     let match_row = galley.layout_from_cursor(cursor).row;
 
-    // epaint trades a glyph or two off the end of the last visible row for
-    // its own overflow ellipsis, so a match sitting there only counts as
-    // visible when there was nothing below it to elide in the first place.
+    // epaint trades the end of the last visible row for its own overflow
+    // ellipsis, so a match sitting there only counts as visible when there
+    // was nothing below it to elide.
     let visible_rows = if galley.rows.len() > max_rows {
         max_rows.saturating_sub(1)
     } else {
@@ -132,8 +117,7 @@ fn first_visible_byte(
         return 0;
     }
 
-    // Keep a third of the budget as lead-in so the hit is not pinned to the
-    // top edge.
+    // A third of the budget as lead-in, so the hit is not pinned to the top.
     let mut cursor = cursor;
     for _ in 0..max_rows / 3 {
         // `Some(0.0)` asks for the row above, not the character above.
@@ -146,14 +130,11 @@ fn first_visible_byte(
         .map_or(snip.window.len(), |(i, _)| i)
 }
 
-/// Build a highlighted snippet LayoutJob from byte ranges, wrapped to at
-/// most `max_rows` and started far enough into the window that the first
-/// match survives the cap.
+/// Wrapped to `max_rows`, started far enough in that the first match survives.
 pub(super) fn snippet_job(ui: &egui::Ui, snip: &Snippet, max_rows: usize) -> LayoutJob {
     let fmt = snippet_formats(ui);
-    // In a top-down `Ui`, `ui.label` overwrites `wrap.max_width` with exactly
-    // `ui.available_width()`; setting it here anyway lets `first_visible_byte`
-    // (and a test) lay out the rows the user will see.
+    // `ui.label` overwrites `wrap.max_width` with `ui.available_width()`;
+    // setting it anyway lets `first_visible_byte` lay out the real rows.
     let wrap_width = ui.available_width();
     let start = first_visible_byte(ui, snip, &fmt, max_rows, wrap_width);
 
@@ -176,30 +157,22 @@ pub(super) fn snippet_job(ui: &egui::Ui, snip: &Snippet, max_rows: usize) -> Lay
     job
 }
 
-/// The Content Match column cell: one line with the (first) matched span
-/// centered and an equal amount of context on both sides, trimmed to what fits
-/// the column width.
-///
-/// Only ever called with a content snippet. Name and path matches are
-/// highlighted in their own columns and leave a dash here, so the bracketed
-/// `[whole field]` rendering this used to carry is gone.
+/// The Content Match column cell: one line with the first matched span
+/// centered and equal context on both sides, trimmed to the column width.
 pub(super) fn centered_match_job(ui: &egui::Ui, snip: &Snippet, width_px: f32) -> LayoutJob {
     let fmt = snippet_formats(ui);
 
-    // Newlines force line breaks even in a one-row LayoutJob; flatten them
-    // to spaces — a byte-for-byte ASCII replacement, so the match ranges
-    // stay valid. The mouseover renders the original window untouched.
+    // Newlines force breaks even in a one-row LayoutJob; flatten them to
+    // spaces — byte-for-byte, so the match ranges stay valid.
     let flattened: Option<String> = snip
         .window
         .contains(['\n', '\r', '\t'])
         .then(|| snip.window.replace(['\n', '\r', '\t'], " "));
     let window = flattened.as_deref().unwrap_or(&snip.window);
 
-    // The budget is in pixels, summed from the font's own glyph advances:
-    // the centered-and-justified layout puts egui in Extend mode, which lays
-    // the job out at infinite width, and `Column::clip` then trims a
-    // *centered* overflow from both ends at once — silently, taking the
-    // highlighted match with it.
+    // The budget is in pixels: the centered layout puts egui in Extend mode
+    // (infinite width), and `Column::clip` then trims a *centered* overflow
+    // from both ends at once — silently, taking the match with it.
     let (start, end, decorate) = ui.fonts(|f| {
         let font_id = &fmt.normal.font_id;
         let width_of = |c: char| f.glyph_width(font_id, c);
@@ -214,29 +187,24 @@ pub(super) fn centered_match_job(ui: &egui::Ui, snip: &Snippet, width_px: f32) -
         if fits_within(window, width_px - marks, width_of) {
             return (0, window.len(), true);
         }
-
-        // Something has to go, so either end may gain a mark; reserve for
-        // both so a cut never overflows the column.
+        // Either end may gain a mark; reserve for both.
         let budget = width_px - 2.0 * ellipsis;
         let Some(&(a, b)) = snip.ranges.first() else {
             // No ranges (shouldn't happen for match cells) — head trim.
             return (0, take_forward(window, 0, budget.max(0.0), width_of), true);
         };
         if budget <= 0.0 {
-            // A column narrower than its own punctuation: spend every point
-            // on the hit and drop the decoration.
+            // Narrower than its own punctuation: spend everything on the hit.
             return (a, take_forward(window, a, width_px, width_of), false);
         }
         if !fits_within(&window[a..b], budget, width_of) {
-            // A hit wider than the whole column — a greedy regex or wildcard
-            // match. Its beginning is the part that has to survive.
+            // A hit wider than the column: its beginning has to survive.
             return (a, take_forward(window, a, budget, width_of), true);
         }
         let match_w: f32 = window[a..b].chars().map(width_of).sum();
 
-        // Equal context on both sides, grown outward one character at a
-        // time; whichever side is currently narrower is fed first, so the
-        // leftover from a short side flows to the other.
+        // Equal context on both sides, grown outward a character at a time;
+        // the narrower side is fed first.
         let (mut start, mut end) = (a, b);
         let (mut before_w, mut after_w) = (0.0f32, 0.0f32);
         loop {
@@ -248,8 +216,7 @@ pub(super) fn centered_match_job(ui: &egui::Ui, snip: &Snippet, width_px: f32) -
             if !prev_fits && !next_fits {
                 break;
             }
-            // The preferred side wins when it fits; otherwise the other one
-            // does, since at least one of them just did.
+            // The preferred side wins when it fits; otherwise the other just did.
             let take_prev = if before_w <= after_w {
                 prev_fits
             } else {
@@ -282,15 +249,9 @@ pub(super) fn centered_match_job(ui: &egui::Ui, snip: &Snippet, width_px: f32) -
 }
 
 /// The Path column cell: middle-elided to `width_px`, with whatever of a
-/// path-tier match survives the cut highlighted.
-///
-/// The path reads at full strength — it is the one column that identifies a
-/// result on its own. Only the elision mark is weak, since it is punctuation
-/// this renderer added rather than anything the file is named.
-///
-/// Returns the job and whether anything was actually elided — the caller's
-/// trigger for a full-path tooltip, since egui offers one only when *it* did
-/// the eliding and it is handed an already-shortened string.
+/// path-tier match survives the cut highlighted; only the elision mark is
+/// weak. Returns the job and whether anything was elided — the caller's
+/// trigger for a full-path tooltip.
 pub(super) fn path_cell_job(
     ui: &egui::Ui,
     path: &str,
@@ -301,13 +262,10 @@ pub(super) fn path_cell_job(
     let fmt = snippet_formats(ui);
     let mut job = LayoutJob::default();
     match crate::ui_util::middle_elide_cut(ui, path, width_px, font_id) {
-        // It fits: the whole path, marked — which is exactly
-        // [`marked_field_job`].
         None => (marked_field_job(ui, path, ranges), false),
-        // The two surviving ends are appended straight from `path` at their
-        // original offsets: `append_marked` clips the ranges to each end, so a
-        // match that fell in the dropped middle drops with it rather than
-        // landing on whatever glyphs moved into those offsets.
+        // The surviving ends keep their original offsets: `append_marked`
+        // clips the ranges to each end, so a match in the dropped middle
+        // drops with it rather than landing on the glyphs that moved in.
         Some((head, tail)) => {
             append_marked(&mut job, &fmt, path, ranges, 0..head);
             job.append("…", 0.0, fmt.weak.clone());
@@ -317,8 +275,6 @@ pub(super) fn path_cell_job(
     }
 }
 
-/// Whether the whole of `text` fits in `budget` pixels; stops at the first
-/// character that does not.
 fn fits_within(text: &str, budget: f32, width_of: impl Fn(char) -> f32) -> bool {
     let mut used = 0.0;
     for c in text.chars() {
@@ -330,8 +286,6 @@ fn fits_within(text: &str, budget: f32, width_of: impl Fn(char) -> f32) -> bool 
     true
 }
 
-/// The byte offset one past the last character of `text[from..]` that still
-/// fits in `budget` pixels.
 fn take_forward(text: &str, from: usize, budget: f32, width_of: impl Fn(char) -> f32) -> usize {
     let mut end = from;
     let mut used = 0.0;

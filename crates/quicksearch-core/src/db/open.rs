@@ -1,8 +1,6 @@
 //! Open-or-recreate: the sole entry point into the on-disk database.
-//!
-//! **Policy**: any schema mismatch — wrong `schema_info.version`, wrong
-//! stored `tokenize` string, absent `schema_info` table — wipes the database
-//! file and recreates it from scratch. There are **no** in-place migrations.
+//! **Policy**: any schema mismatch wipes the database file and recreates it
+//! from scratch. There are **no** in-place migrations.
 
 use std::path::Path;
 
@@ -14,22 +12,18 @@ use super::schema::{
 };
 use crate::security::IndexKey;
 
-/// Prefix tagging every "the key doesn't fit this file" error. Callers use
-/// it to tell a wrong password apart from real corruption or schema drift:
-/// the GUI re-prompts, the CLI retries, and — critically — nothing treats
-/// it as a reason to wipe or "recover" the database.
+/// Prefix tagging every "the key doesn't fit this file" error, telling a
+/// wrong password apart from corruption or schema drift — critically, nothing
+/// treats it as a reason to wipe or "recover" the database.
 pub const KEY_MISMATCH_PREFIX: &str = "KEY_MISMATCH: ";
 
-/// Bump this whenever [`SCHEMA_CURRENT`] or [`fts_create_sql`] changes in a
-/// way that makes an old DB unreadable — or when stored, classifier-derived
-/// values go stale: `files.mime`, `files.type` and `content_state` are
-/// computed at walk time and never re-derived for unchanged files, so a
-/// classification change needs the wipe to apply everywhere.
+/// Bump on any schema change — and on classifier changes: `files.mime`,
+/// `files.type` and `content_state` are computed at walk time and never
+/// re-derived for unchanged files, so only the wipe applies them everywhere.
 pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
-/// Open `db_path` and ensure the on-disk schema matches this build; if it
-/// doesn't (including a changed `tokenizer`), delete the file and recreate it
-/// empty — callers will need to re-index.
+/// Open `db_path`; on any schema/tokenizer mismatch, delete the file and
+/// recreate it empty — callers will need to re-index.
 pub fn open_or_recreate(db_path: &str, tokenizer: &str) -> Result<Connection, String> {
     open_or_recreate_keyed(db_path, tokenizer, super::key::process_key().as_ref())
 }
@@ -48,11 +42,9 @@ pub(crate) fn open_or_recreate_keyed(
     }
     let conn = Connection::open(db_path)
         .map_err(|e| format!("Failed to open database at {}: {}", db_path, e))?;
-    // Before a single row is written. SQLite creates the file 0644 and hands
-    // that mode on to `-wal` and `-shm`, so on a default umask every other
-    // user on the machine could read the index — which holds the names and
-    // full text of everything under the configured roots, including files
-    // whose own permissions are 0600.
+    // Before a single row is written: SQLite creates the file 0644 (inherited
+    // by `-wal`/`-shm`), and the index holds the full text of files whose own
+    // permissions are 0600.
     crate::platform::restrict_to_owner(&path);
     key_and_probe(&conn, db_path, key)?;
     conn.execute_batch(PRAGMAS_FAST)
@@ -72,40 +64,34 @@ pub(crate) fn open_or_recreate_keyed(
     Ok(conn)
 }
 
-/// Open an *existing* index without ever recreating it: no
-/// `SQLITE_OPEN_CREATE`, and any schema mismatch is an error instead of a
-/// wipe. The on-disk FTS tokenizer is used as-is. Every *consumer* (search,
-/// status, size, `clear`) uses this; only the indexer's own write path uses
+/// Open an *existing* index: any schema mismatch is an error instead of a
+/// wipe. Every *consumer* uses this; only the indexer's own write path uses
 /// [`open_or_recreate`].
 pub fn open_existing(db_path: &str, write: bool) -> Result<Connection, String> {
     open_existing_keyed(db_path, write, super::key::process_key().as_ref())
 }
 
-/// [`open_existing`] with an explicit pragma profile, on the process key.
 fn open_profiled(db_path: &str, write: bool, pragmas: &str) -> Result<Connection, String> {
     open_keyed_with_pragmas(db_path, write, super::key::process_key().as_ref(), pragmas)
 }
 
-/// A read-only connection for one walk's row prefetcher; pragma profile
-/// [`PRAGMAS_WALK_READER`].
+/// A read-only connection for one walk's row prefetcher.
 pub fn open_walk_reader(db_path: &str) -> Result<Connection, String> {
     open_profiled(db_path, false, PRAGMAS_WALK_READER)
 }
 
-/// The search worker's connection, held across requests; pragma profile
-/// [`PRAGMAS_SEARCH`].
+/// The search worker's connection, held across requests.
 pub fn open_search_reader(db_path: &str) -> Result<Connection, String> {
     open_profiled(db_path, false, PRAGMAS_SEARCH)
 }
 
-/// The coordinator's write connection for watcher events and reconciles;
-/// pragma profile [`PRAGMAS_INCREMENTAL`].
+/// The coordinator's write connection for watcher events and reconciles.
 pub fn open_incremental_writer(db_path: &str) -> Result<Connection, String> {
     open_profiled(db_path, true, PRAGMAS_INCREMENTAL)
 }
 
-/// A writable connection for post-run compaction, and the only one that may
-/// VACUUM; pragma profile [`PRAGMAS_MAINTENANCE`].
+/// A writable connection for post-run compaction; the only one that may
+/// VACUUM.
 pub fn open_maintenance(db_path: &str) -> Result<Connection, String> {
     open_profiled(db_path, true, PRAGMAS_MAINTENANCE)
 }
@@ -152,21 +138,15 @@ fn open_keyed_with_pragmas(
 }
 
 /// Cheaply check that the process key (or its absence) actually opens the
-/// index; a wrong password errors with [`KEY_MISMATCH_PREFIX`].
-///
-/// Answers **only** the key question — not [`open_existing`]'s schema check.
-/// Conflating the two made every schema bump present itself to password users
-/// as an unlock failure with no way past the gate.
+/// index. Answers **only** the key question, not the schema check: conflating
+/// the two made every schema bump look like an unlock failure.
 pub fn verify_process_key(db_path: &str) -> Result<(), String> {
     verify_key(db_path, super::key::process_key().as_ref())
 }
 
-/// Whether the next indexing run will discard and rebuild an existing index
-/// written under a different schema version.
-///
-/// `false` for anything this cannot positively establish (no file, a key that
-/// does not open it, an unqueryable database): announcing a reset that is not
-/// happening would be worse than saying nothing.
+/// Whether the next indexing run will discard and rebuild an existing index.
+/// `false` for anything this cannot positively establish: announcing a reset
+/// that is not happening would be worse than saying nothing.
 pub fn index_needs_rebuild(db_path: &str) -> bool {
     let Ok(conn) = Connection::open_with_flags(
         db_path,
@@ -195,21 +175,15 @@ pub(crate) fn verify_key(db_path: &str, key: Option<&IndexKey>) -> Result<(), St
 /// Apply the SQLCipher key (if any) and force the first page off disk.
 ///
 /// Ordering is load-bearing twice over: SQLCipher requires `PRAGMA key`
-/// before anything else touches the file (our fast-path pragmas include
-/// `journal_mode = WAL`, which reads the header), and the probe must run
-/// before any schema comparison so that a wrong or missing key surfaces as
-/// a tagged [`KEY_MISMATCH_PREFIX`] error — never as a "schema mismatch"
-/// that [`open_or_recreate`] would answer by wiping the file.
-///
-/// The raw-key `x'…'` form bypasses SQLCipher's per-connection PBKDF2
-/// (hundreds of ms), so the expensive KDF happens once at unlock, not per
-/// open.
+/// before anything else touches the file, and the probe must run before any
+/// schema comparison so a wrong key surfaces as [`KEY_MISMATCH_PREFIX`] —
+/// never as a "schema mismatch" that [`open_or_recreate`] answers by wiping.
+/// The raw-key `x'…'` form bypasses SQLCipher's per-connection PBKDF2.
 fn key_and_probe(conn: &Connection, db_path: &str, key: Option<&IndexKey>) -> Result<(), String> {
     if let Some(key) = key {
-        // `cipher_log_level = NONE` mutes SQLCipher's stderr HMAC-failure
-        // trace on every wrong-password attempt; the condition still surfaces
-        // as SQLITE_NOTADB. It must follow `PRAGMA key`, which has to be the
-        // first statement on the connection.
+        // `cipher_log_level = NONE` mutes SQLCipher's stderr HMAC trace on
+        // wrong-password attempts; it must follow `PRAGMA key`, which has to
+        // be the first statement on the connection.
         conn.execute_batch(&format!(
             "PRAGMA key = \"x'{}'\"; PRAGMA cipher_log_level = NONE;",
             key.to_hex()
@@ -225,9 +199,8 @@ fn key_and_probe(conn: &Connection, db_path: &str, key: Option<&IndexKey>) -> Re
     }
 }
 
-/// SQLITE_NOTADB is what an undecryptable first page looks like: with the
-/// wrong key (or none) the decrypted header bytes are noise, and SQLite
-/// reports "file is not a database".
+/// SQLITE_NOTADB is what an undecryptable first page looks like: the
+/// decrypted header bytes are noise.
 fn is_notadb(e: &rusqlite::Error) -> bool {
     matches!(
         e,
@@ -241,28 +214,21 @@ fn is_notadb(e: &rusqlite::Error) -> bool {
     )
 }
 
-/// Why a keyed open failed, as something the caller can branch on.
-///
-/// The three cases want three different things from a user — retype the
-/// password, rebuild the index, supply a password at all — and only one of
-/// them is "wrong password". They used to be distinguishable only by reading
-/// the English in the message, which breaks the moment a database path
-/// happens to contain that English.
+/// Why a keyed open failed, as something the caller can branch on — the three
+/// cases want three different things from a user, and matching on message
+/// prose breaks the moment a database path contains that prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyMismatch {
     /// A key was applied and the file did not accept it.
     WrongPassword,
-    /// A key was applied but the file on disk is not encrypted at all —
-    /// protection was enabled and the rebuild that would encrypt it did not
-    /// finish.
+    /// A key was applied but the file is not encrypted at all — the rebuild
+    /// that would encrypt it did not finish.
     NotEncrypted,
     /// No key was applied and the file wants one.
     PasswordRequired,
 }
 
 impl KeyMismatch {
-    /// The machine-readable token carried in the message, between
-    /// [`KEY_MISMATCH_PREFIX`] and the human detail.
     fn token(self) -> &'static str {
         match self {
             KeyMismatch::WrongPassword => "wrong-password",
@@ -281,10 +247,8 @@ impl KeyMismatch {
     }
 }
 
-/// Split a tagged mismatch message into its cause and the human detail.
-///
-/// `None` for any message that is not one — including a `KEY_MISMATCH_PREFIX`
-/// message from an older build, which callers should treat as they always did.
+/// Split a tagged mismatch message into its cause and the human detail;
+/// `None` for any message that is not one.
 pub fn key_mismatch_parts(message: &str) -> Option<(KeyMismatch, &str)> {
     let rest = message.strip_prefix(KEY_MISMATCH_PREFIX)?;
     let (token, detail) = rest.split_once(' ')?;
@@ -294,9 +258,7 @@ pub fn key_mismatch_parts(message: &str) -> Option<(KeyMismatch, &str)> {
 
 fn key_mismatch_message(db_path: &str, had_key: bool) -> String {
     // An unencrypted SQLite file still has its plaintext magic; sniffing it
-    // distinguishes "wrong password" from "protection is enabled but the
-    // index was never encrypted" (e.g. a crash between saving the config
-    // and rebuilding the index).
+    // distinguishes "wrong password" from "the index was never encrypted".
     let plaintext = std::fs::File::open(db_path)
         .ok()
         .and_then(|mut f| {
@@ -321,9 +283,6 @@ fn key_mismatch_message(db_path: &str, had_key: bool) -> String {
             "the index is password-protected; a password is required",
         ),
     };
-    // The token sits between the prefix and the detail so that every existing
-    // `starts_with(KEY_MISMATCH_PREFIX)` test still holds, while a caller that
-    // needs the cause can have it without reading prose.
     format!(
         "{}{}: index at {}: {}",
         KEY_MISMATCH_PREFIX,
@@ -333,39 +292,25 @@ fn key_mismatch_message(db_path: &str, had_key: bool) -> String {
     )
 }
 
-/// True iff the DB has a `schema_info` table whose `version` equals
-/// [`CURRENT_SCHEMA_VERSION`]. Ignores the tokenizer — that's only the
-/// owner's concern.
 /// Prefix tagging the "this file is not a QuickSearch index" refusal, so a
 /// caller can tell it from the schema drift that legitimately rebuilds.
 pub const FOREIGN_DB_PREFIX: &str = "FOREIGN_DB: ";
 
-/// Tables left behind by the pre-`schema_info` layout, which is the only kind
-/// of index of ours that [`has_our_schema_info`] cannot recognise.
-///
-/// `files` is the only one guaranteed present across those layouts, and it is
-/// the loose end here: another application's database with a table called
-/// `files` would still be taken for an ancient index of ours and wiped.
-/// Refusing a genuine legacy index is the worse failure of the two, so it
-/// stays — narrowed by the fact that anything with a `schema_info` of our
-/// shape is already decided before this list is consulted.
+/// Tables left behind by the pre-`schema_info` layout. `files` is the loose
+/// end: another application's database with a table called `files` would be
+/// taken for an ancient index of ours and wiped — but refusing a genuine
+/// legacy index is the worse failure of the two, so it stays.
 const LEGACY_TABLES: &[&str] = &["files", "files_fts", "documents_text", "failed_files"];
 
-/// Whether `schema_info` exists *and* is shaped like ours.
-///
-/// The shape, not the contents: preparing the statement succeeds only if the
-/// table has both columns, and an index whose creation was interrupted before
-/// the version row landed is still ours. A foreign database that happens to
-/// use the name for something else is not.
+/// Whether `schema_info` exists *and* is shaped like ours. The shape, not the
+/// contents: an index whose creation was interrupted before the version row
+/// landed is still ours; a foreign table reusing the name is not.
 fn has_our_schema_info(conn: &Connection) -> bool {
     conn.prepare("SELECT key, value FROM schema_info").is_ok()
 }
 
-/// Whether the file is one of ours, or empty enough to become one.
-///
-/// `sqlite_master` is empty for a file SQLite has just created and for a
-/// zero-length one, which is the "ours to create" case. Internal `sqlite_%`
-/// names are excluded so an autoindex or a stat table cannot make an
+/// Whether the file is one of ours, or empty enough to become one. Internal
+/// `sqlite_%` names are excluded so an autoindex cannot make an
 /// otherwise-empty file look occupied.
 fn is_ours_or_empty(conn: &Connection) -> Result<bool, String> {
     if has_our_schema_info(conn) {
@@ -388,8 +333,7 @@ fn is_ours_or_empty(conn: &Connection) -> Result<bool, String> {
     Ok(!any)
 }
 
-/// The refusal message, naming a few of the tables that are in the way so the
-/// user can recognise whose file they pointed at.
+/// The refusal message, naming a few of the tables in the way.
 fn foreign_database_message(conn: &Connection) -> Result<String, String> {
     let mut stmt = conn
         .prepare(
@@ -417,10 +361,6 @@ fn foreign_database_message(conn: &Connection) -> Result<String, String> {
 }
 
 fn schema_version_current(conn: &Connection) -> Result<bool, String> {
-    // The shape check rather than a name lookup: a table called `schema_info`
-    // with other columns belongs to some other program, and reading `value`
-    // out of it would fail the open with a SQL error instead of the refusal
-    // the caller can act on.
     if !has_our_schema_info(conn) {
         return Ok(false);
     }
@@ -440,14 +380,10 @@ fn schema_version_current(conn: &Connection) -> Result<bool, String> {
 /// effective-tokenizer string this caller asked for.
 fn db_matches_current(conn: &Connection, tokenizer: &str) -> Result<bool, String> {
     if !schema_version_current(conn)? {
-        // Refuse rather than wipe unless the file is recognisably ours. The
-        // wipe policy is about replacing an index this program wrote under an
-        // older layout, and `database_path` is a free-text field with no
-        // picker and no confirmation — a typo naming some other
-        // application's SQLite file would otherwise delete it, and its `-wal`
-        // and `-shm` with it, on the next indexing run. An older layout of
-        // ours still wipes, and so does a file with no tables at all, which
-        // is ours to create.
+        // Refuse rather than wipe unless the file is recognisably ours:
+        // `database_path` is free text with no confirmation, and a typo
+        // naming some other application's SQLite file would otherwise delete
+        // it on the next indexing run.
         if !is_ours_or_empty(conn)? {
             return Err(foreign_database_message(conn)?);
         }
@@ -466,22 +402,19 @@ fn db_matches_current(conn: &Connection, tokenizer: &str) -> Result<bool, String
     Ok(stored_tokenize.as_deref() == Some(&*want_tokenize))
 }
 
-/// Drop the current connection, delete the DB file + its WAL/SHM/journal
-/// sidecars, reopen a fresh file, re-apply key and pragmas. Re-keying here
-/// is essential: a rebuild of a protected index must come back encrypted,
-/// never silently plaintext.
+/// Delete the DB file + sidecars, reopen a fresh file, re-apply key and
+/// pragmas. Re-keying here is essential: a rebuild of a protected index must
+/// come back encrypted, never silently plaintext.
 fn wipe_and_reopen(
     conn: Connection,
     path: &Path,
     key: Option<&IndexKey>,
 ) -> Result<Connection, String> {
     drop(conn);
-    // Before the delete, and even if the removal below fails partway: see
-    // [`super::bump_index_epoch`].
+    // Before the delete, even if the removal fails partway.
     super::bump_index_epoch();
     // `remove_file_retrying` matters on Windows, where a delete fails while
-    // *any* handle is open — most often an antivirus scanner reading the file
-    // in the moment after we closed it.
+    // *any* handle is open — most often an antivirus scanner.
     match crate::platform::remove_file_retrying(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -504,8 +437,6 @@ fn wipe_and_reopen(
     }
     let conn = Connection::open(path)
         .map_err(|e| format!("Failed to reopen database after rebuild: {}", e))?;
-    // A rebuild creates the file afresh, so it needs narrowing again for the
-    // same reason the first open does.
     crate::platform::restrict_to_owner(path);
     key_and_probe(&conn, &path.to_string_lossy(), key)?;
     conn.execute_batch(PRAGMAS_FAST)

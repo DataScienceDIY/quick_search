@@ -7,7 +7,6 @@ use crate::mime::guess_mime_from_head;
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// A path that does not exist yet — these tests build the tree themselves.
 /// The removed `extract_scope_prepare`: the oversize sweep, then the count.
 fn extract_scope_prepare(
     conn_mutex: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
@@ -32,23 +31,20 @@ fn count_normal_small_tree() {
     }
     let cancel = AtomicBool::new(false);
     let n = count_tree_entries_fast(root.to_str().unwrap(), &cancel).unwrap();
-    // The subdir plus the three files. Unix counts through `find`, which
-    // also lists the root it was given; the Windows directory read only sees
-    // entries *inside* a directory. Both are fine for a progress estimate.
+    // Unix counts through `find`, which also lists the root it was given;
+    // the Windows directory read only sees entries *inside* it.
     assert_eq!(n, if cfg!(windows) { 4 } else { 5 });
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The Windows fast path must agree with a plain walk exactly. The tree is
-/// wider than one 64 KiB buffer of directory data, so the resumption between
-/// `GetFileInformationByHandleEx` calls is exercised.
+/// The Windows fast path must agree with a plain walk exactly; the tree is
+/// wider than one 64 KiB buffer so the resumption path is exercised.
 #[cfg(windows)]
 #[test]
 fn the_bulk_directory_read_agrees_with_a_plain_walk() {
     let root = tmp("count-oracle");
     std::fs::create_dir_all(root.join("empty")).unwrap();
     std::fs::create_dir_all(root.join("a/b/c")).unwrap();
-    // Long names so the chained records fill more than one 64 KiB buffer.
     for i in 0..600 {
         let name = format!("{}-{:04}.txt", "padding".repeat(12), i);
         std::fs::write(root.join(&name), b"x").unwrap();
@@ -84,8 +80,7 @@ fn the_bulk_directory_read_stops_when_cancelled() {
 
 #[test]
 fn count_cancelled_returns_promptly() {
-    // A pre-set token must kill the subprocesses on the first poll —
-    // "/" would otherwise take minutes to scan.
+    // A pre-set token must kill the subprocesses on the first poll.
     let cancel = AtomicBool::new(true);
     let started = std::time::Instant::now();
     let result = count_tree_entries_fast("/", &cancel);
@@ -105,8 +100,7 @@ fn count_cancelled_returns_promptly() {
 }
 
 /// If these two ever disagree, a file the walk wrote off as NA would
-/// silently never be full-text indexed. Fails the moment someone edits one
-/// predicate and not the other.
+/// silently never be full-text indexed.
 #[test]
 fn content_extractable_is_decide_contents_not_applicable() {
     let root = tmp("extractable");
@@ -114,10 +108,8 @@ fn content_extractable_is_decide_contents_not_applicable() {
     let mut cfg = Config::default();
     let registry = Registry::default_set();
 
-    // Real files, because `decide_content` runs the extractor for anything
-    // it claims. The last two are identical non-UTF-8 bytes behind a known
-    // and an unknown extension, so both sides of the claimed/unclaimed line
-    // are exercised.
+    // The last two are identical non-UTF-8 bytes behind a known and an
+    // unknown extension, so both sides of the claimed line are exercised.
     let legacy = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9.";
     let cases: [(&str, &[u8]); 12] = [
         ("notes.txt", b"plain bytes with no magic"),
@@ -138,8 +130,7 @@ fn content_extractable_is_decide_contents_not_applicable() {
         std::fs::write(&p, body).unwrap();
     }
 
-    // Once with the filter off (the default: everything the registry
-    // claims), once with it narrowed to `.txt`.
+    // Once with the filter off, once narrowed to `.txt`.
     for filter in [Vec::new(), vec!["txt".to_string()]] {
         cfg.indexing.content_extensions = filter.clone();
         for (name, body) in cases {
@@ -198,8 +189,7 @@ fn prepare_file_record_marks_only_claimable_files() {
         "binary content: no MIME, no extractor"
     );
 
-    // Over `maximum_text_file_size`, so the content pass would never read
-    // it even though plaintext claims the MIME.
+    // Over `maximum_text_file_size`, so the content pass never reads it.
     let mut small_cap = Config::default();
     small_cap.processing.maximum_text_file_size = 1024;
     assert!(!needs(&small_cap, "huge.txt"));
@@ -213,9 +203,8 @@ fn prepare_file_record_marks_only_claimable_files() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The headline regression test: the number the manage-index tab shows as
-/// the extraction denominator, measured where `indexing.rs` measures it —
-/// after the walk's inserts, before any content pass runs.
+/// The number the manage-index tab shows as the extraction denominator,
+/// measured where `indexing.rs` measures it.
 #[test]
 fn extract_scope_counts_only_files_an_extractor_claims() {
     let root = tmp("denominator");
@@ -223,9 +212,8 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
     let mut db = root.clone();
     db.set_extension("sqlite");
 
-    // 4 files an extractor claims (README via the extensionless text
-    // sniff), 5 it never will — the unclaimed set gets NUL bodies so
-    // neither the extension tables nor the sniff have anything to say.
+    // 4 files an extractor claims (README via the text sniff), 5 it never
+    // will — the unclaimed set gets NUL bodies.
     let claimed = ["a.txt", "b.json", "c.mp3", "README"];
     let unclaimed = ["d.mp4", "e.zip", "f.bin", "g.exe", "h"];
     for name in claimed.iter() {
@@ -257,8 +245,7 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
     let cursor = ExtractCursor::for_root(root.to_str().unwrap());
     let scope = extract_scope_prepare(&conn_mutex, &cursor, &config).unwrap();
 
-    // `extract_total` in the GUI. The three small text-ish files were
-    // finished inline by the walk so they land in `already_done`; the mp3
+    // The three small text files were finished inline by the walk; the mp3
     // needs the disk pass. Either way the denominator is the claimed set.
     assert_eq!(
         (scope.pending, scope.already_done),
@@ -278,11 +265,9 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
     std::fs::remove_file(&db).ok();
 }
 
-/// A `find` that fails writes nothing, and `wc -l` then reads EOF, prints `0`
-/// and exits *successfully* — so checking only the last process in the
-/// pipeline reported a tree of zero entries. That answer is indistinguishable
-/// from a real empty tree, and it is what kept the non-GNU `-printf` fallback
-/// from ever running: it is an `.or_else` on the error this used to swallow.
+/// A `find` that fails writes nothing, and `wc -l` prints `0` and exits
+/// *successfully* — checking only the terminal process reported a tree of
+/// zero entries and kept the non-GNU `-printf` fallback from ever running.
 #[test]
 #[cfg(unix)]
 fn a_failing_find_is_an_error_not_a_count_of_zero() {
@@ -296,9 +281,8 @@ fn a_failing_find_is_an_error_not_a_count_of_zero() {
     );
 }
 
-/// An empty directory really does count zero (one entry on Unix, the root
-/// `find` lists itself) — the error above must not have been bought by
-/// calling every small answer a failure.
+/// An empty directory really does count zero — the error above must not be
+/// bought by calling every small answer a failure.
 #[test]
 fn an_empty_tree_still_counts() {
     let root = tmp("count-empty");

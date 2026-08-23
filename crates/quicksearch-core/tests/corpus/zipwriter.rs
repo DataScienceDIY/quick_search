@@ -1,24 +1,15 @@
-//! A minimal ZIP writer, stored (uncompressed) entries only.
-//!
-//! Exists so the pptx and ODF containers are not built by `zip` 0.6 — the same
-//! crate `extract::office` reads them back with. It is about sixty lines of
-//! well-specified structure (APPNOTE 4.3), which is a smaller thing to get
-//! wrong than the agreement it is here to test.
-//!
-//! Stored rather than deflated because the reader accepts both (see the `zip`
-//! entry in `Cargo.toml`) and stored needs no compressor. `crc32fast` supplies
-//! the one field that cannot be hand-waved.
-//!
-//! No zip64, no data descriptors, no unicode path extra field: every corpus
-//! member has an ASCII name and is a few kilobytes.
+//! A minimal ZIP writer, stored entries only: the pptx and ODF containers
+//! must not be built by `zip` 0.6, the crate `extract::office` reads them
+//! back with. Sixty lines of well-specified structure (APPNOTE 4.3) is a
+//! smaller thing to get wrong than the agreement it tests; `crc32fast`
+//! supplies the one field that cannot be hand-waved. No zip64, no data
+//! descriptors, no unicode extra field.
 
-/// One member of the archive.
 pub struct Entry<'a> {
     pub name: &'a str,
     pub body: &'a [u8],
 }
 
-/// Serialize `entries` into a complete `.zip`.
 pub fn archive(entries: &[Entry<'_>]) -> Vec<u8> {
     let mut out = Vec::new();
     // (crc, size, local header offset) per entry, for the central directory.
@@ -31,9 +22,8 @@ pub fn archive(entries: &[Entry<'_>]) -> Vec<u8> {
         out.extend_from_slice(&20u16.to_le_bytes()); // version needed
         out.extend_from_slice(&0u16.to_le_bytes()); // flags
         out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
-                                                    // A fixed DOS timestamp — 1980-01-01 00:00:00, the epoch of the
-                                                    // format. Nothing reads it, and a real clock would make two runs of
-                                                    // the same seed produce different bytes.
+                                                    // A fixed DOS timestamp (1980-01-01, the format's epoch): a real
+                                                    // clock would make two runs of the same seed produce different bytes.
         out.extend_from_slice(&0u16.to_le_bytes()); // time
         out.extend_from_slice(&0x0021u16.to_le_bytes()); // date
         out.extend_from_slice(&crc.to_le_bytes());
@@ -80,11 +70,9 @@ pub fn archive(entries: &[Entry<'_>]) -> Vec<u8> {
     out
 }
 
-/// Escape `s` for XML character data.
-///
-/// The corpus plants `&` and `<` nowhere by default, but the writers below
-/// route every piece of body text through this so a future sentence
-/// containing one cannot silently produce an unparseable container.
+/// Escape `s` for XML character data. The corpus plants `&` and `<` nowhere
+/// by default, but every piece of body text routes through this so a future
+/// sentence containing one cannot silently break the container.
 pub fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

@@ -5,24 +5,15 @@ use crate::app::Tab;
 /// One scenario command. Line-based script, `#` comments outside strings:
 ///
 /// ```text
-/// wait_ms INT
-/// type "STRING" [cps FLOAT]        # default 7 chars/sec
-/// clear_query | focus_search
-/// window INT INT                   # resize to width x height, in the same
-///                                  # logical points as the startup size
-/// hover_match INT                  # pin the pointer over the Nth visible
-///                                  # Content Match cell (0-based) until
-///                                  # hover_off. Counts every visible row,
-///                                  # including those showing a dash.
-/// hover_off                        # release the pinned pointer
+/// wait_ms INT | clear_query | focus_search | hover_off | quit
+/// type "STRING" [cps FLOAT]   # cps defaults to 7
+/// window INT INT              # logical points, as the startup size
+/// hover_match INT             # pin the pointer over the Nth visible Content
+///                             # Match cell (0-based, dashes counted)
 /// tab (search|manage|duplicates|logs|help|settings)
-/// wait_index_running [max INT]     # caps in ms; a capped wait cannot fail
-/// wait_index_idle    [max INT]
-/// wait_search_done   [max INT]
-/// wait_dups_done     [max INT]
-/// record_start NAME | record_stop  # NAME: [A-Za-z0-9._-]+, no separators
-/// screenshot NAME
-/// quit
+/// wait_(index_running|index_idle|search_done|dups_done) [max INT]
+///                             # caps in ms; a capped wait cannot fail
+/// record_start NAME | record_stop | screenshot NAME   # NAME: [A-Za-z0-9._-]+
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Cmd {
@@ -57,8 +48,6 @@ enum Token {
     Str(String),
 }
 
-/// Split one line into bare words and quoted strings. `#` starts a comment
-/// except inside a string; `\"` and `\\` are the only escapes.
 fn tokenize(line: &str, line_no: usize) -> Result<Vec<Token>, ParseError> {
     let err = |msg: String| ParseError { line: line_no, msg };
     let mut tokens = Vec::new();
@@ -260,8 +249,7 @@ fn parse_int(what: &str, w: &str, line_no: usize) -> Result<u64, ParseError> {
     })
 }
 
-/// Output names stay inside `$QS_CAPTURE_OUT`: a plain filename stem, the
-/// driver appends the extension.
+/// A plain filename stem inside `$QS_CAPTURE_OUT`; the driver adds the suffix.
 fn parse_name(w: &str, line_no: usize) -> Result<String, ParseError> {
     let ok = !w.is_empty()
         && w.chars()
@@ -367,7 +355,6 @@ mod tests {
                 cps: 7.0
             }
         );
-        // `#` inside a quoted string is content, not a comment.
         assert_eq!(
             parse_one(r##"type "a # b""##),
             Cmd::Type {
@@ -464,8 +451,7 @@ mod tests {
         assert!(e.msg.contains("quoted"), "got: {}", e.msg);
     }
 
-    /// The scenario that ships in packaging/ must always parse — this pins
-    /// the file to the grammar so neither can drift without failing tests.
+    /// Pins packaging/capture-scenario.txt to the grammar; neither may drift.
     #[test]
     fn the_shipped_scenario_parses() {
         let src = include_str!("../../../../packaging/capture-scenario.txt");

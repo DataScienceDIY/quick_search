@@ -11,12 +11,10 @@ description = "Fast full-text search across your files: desktop app and terminal
 name = "quicksearch"
 path = "src/main.rs"
 
-# Terminal search lives in its own binary because the two want opposite
-# Windows subsystems: a GUI built as a console app flashes a console window on
-# every launch, and a console tool built as a GUI app cannot write to the shell
-# that invoked it (cmd and PowerShell do not even wait for it). Splitting is
-# the only arrangement that is correct in both cases. On Unix the distinction
-# does not exist and `quicksearch` still does both.
+# Terminal search is its own binary because the two need opposite Windows
+# subsystems: a GUI console app flashes a console on launch; a console tool
+# built as a GUI app cannot write to the invoking shell. On Unix the
+# distinction does not exist and `quicksearch` still does both.
 [[bin]]
 name = "quicksearch-cli"
 path = "src/cli_main.rs"
@@ -43,18 +41,13 @@ eframe = { version = "0.32", default-features = false, features = [
     "glow",
     "persistence",
 ] }
-# `default-features = false` for one feature, `default_fonts`, which embeds
-# four TTFs totalling 1,407,752 bytes - 38% of `.rodata`. The
-# `default-features = false` on eframe above does not cover it: feature
-# resolution unions the two declarations, so naming egui plainly here switched
-# it back on for the whole graph. `src/fonts.rs` installs the two faces the app
-# actually paints with; the two emoji faces, 736,668 bytes of it, are gone.
-# `persistence`/`serde` still reach egui through eframe, so nothing else moves.
+# `default-features = false` for one feature, `default_fonts` (~1.4 MB of
+# embedded TTFs; `src/fonts.rs` installs the faces actually painted). eframe's
+# `default-features = false` above does NOT cover this: feature resolution
+# unions the declarations, so naming egui plainly switches it back on.
 egui = { version = "0.32", default-features = false }
-# Only `Column`/`TableBuilder` are used. The lone default feature is
-# `dep:mime_guess2`, for an image loader that is never registered - the linker
-# already dropped every byte of it, so this compiles one crate less and ships
-# the same bytes.
+# Only `Column`/`TableBuilder` are used; the lone default feature is an image
+# loader that is never registered, so this compiles one crate less.
 egui_extras = { version = "0.32", default-features = false }
 rfd = "0.15"
 open = "5"

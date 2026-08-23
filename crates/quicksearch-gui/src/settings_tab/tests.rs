@@ -1,6 +1,6 @@
 use super::*;
 
-// All headless-safe: `keychain_active` only probes the OS keychain when
+// Headless-safe: `keychain_active` only probes the OS keychain when
 // `use_keychain` is set, and no test here sets it.
 
 #[test]
@@ -24,8 +24,7 @@ fn an_edited_draft_is_dirty_until_discarded() {
     assert!(!w.is_dirty(&cfg), "the draft is gone");
 }
 
-/// The Security block and the mode buttons act on the live config while
-/// the tab is on screen; the stale copies in the draft are not edits.
+/// The stale copies of live-config fields in the draft are not edits.
 #[test]
 fn live_security_and_mode_changes_are_not_dirty() {
     let mut w = SettingsTab::new();
@@ -36,10 +35,8 @@ fn live_security_and_mode_changes_are_not_dirty() {
     assert!(!w.is_dirty(&cfg));
 }
 
-/// Leaving the tab drops the draft, so the next visit stages the config as
-/// it stands *then*. Without this an edit made on the Manage Index tab in
-/// between would be reverted by a later Apply: `pin_live_fields` protects
-/// the fields saved live, but not the indexed folders or the filters.
+/// Without the restage, an edit made on Manage Index in between would be
+/// reverted by a later Apply — `pin_live_fields` does not cover the filters.
 #[test]
 fn a_draft_is_restaged_from_the_live_config_after_leaving() {
     let mut w = SettingsTab::new();
@@ -57,9 +54,7 @@ fn a_draft_is_restaged_from_the_live_config_after_leaving() {
     );
 }
 
-/// A key capture in progress cannot outlive the tab: the app stops asking
-/// [`SettingsTab::capturing_hotkey`] once another tab is up, and the button
-/// must not be waiting when the tab comes back either.
+/// A key capture in progress cannot outlive the tab.
 #[test]
 fn leaving_the_tab_ends_a_shortcut_capture() {
     let mut w = SettingsTab::new();
@@ -72,8 +67,7 @@ fn leaving_the_tab_ends_a_shortcut_capture() {
 
 use crate::test_ui::{click_at, painted_text, painted_text_center};
 
-/// One frame of the shortcut control on its own, outside the tab's
-/// scroll area so it is never below the fold.
+/// Outside the tab's scroll area so it is never below the fold.
 fn run_hotkey_edit(
     ctx: &egui::Context,
     setting: &mut String,
@@ -90,8 +84,6 @@ fn run_hotkey_edit(
     out
 }
 
-/// One frame of the color scheme control on its own, for the same reason
-/// as [`run_hotkey_edit`].
 fn run_color_scheme_edit(
     ctx: &egui::Context,
     setting: &mut String,
@@ -107,8 +99,7 @@ fn run_color_scheme_edit(
     out
 }
 
-/// The dropdown says which scheme is in force and writes the one that is
-/// picked; what it shows and what it stores are not the same string.
+/// What the dropdown shows and what it stores are not the same string.
 #[test]
 fn the_color_scheme_box_shows_and_sets_the_scheme() {
     let ctx = crate::test_ui::ctx();
@@ -132,13 +123,10 @@ fn the_color_scheme_box_shows_and_sets_the_scheme() {
     );
 }
 
-/// A hand-edited config can hold anything. The box reports what the app
-/// will actually do with it rather than echoing it back.
 #[test]
 fn an_unknown_scheme_reads_as_dark() {
     assert_eq!(scheme_label("dark"), "Dark");
     assert_eq!(scheme_label("light"), "Light");
-    // Human-spelled values are still honoured.
     assert_eq!(scheme_label("  LIGHT "), "Light");
     for nonsense in ["", "drak", "system", "auto"] {
         assert_eq!(scheme_label(nonsense), "Dark", "{:?}", nonsense);
@@ -163,8 +151,6 @@ const CTRL_ALT: egui::Modifiers = egui::Modifiers {
     command: true,
 };
 
-/// Click the button, press a combination, and the setting is what was
-/// pressed.
 #[test]
 fn the_shortcut_button_binds_what_was_pressed() {
     let ctx = crate::test_ui::ctx();
@@ -195,8 +181,6 @@ fn the_shortcut_button_binds_what_was_pressed() {
     assert!(!capturing, "a bound press ends the capture");
 }
 
-/// Escape backs out, and a press that could not be a shortcut is waited
-/// through rather than treated as one.
 #[test]
 fn capture_ignores_what_it_cannot_bind_and_escape_cancels() {
     let ctx = crate::test_ui::ctx();
@@ -234,14 +218,12 @@ fn clear_switches_the_shortcut_off() {
     run_hotkey_edit(&ctx, &mut setting, &mut capturing, click_at(clear));
     assert_eq!(setting, "");
 
-    // With no shortcut set there is nothing to clear, and the button
-    // says what the state is rather than going blank.
+    // The button says what the state is rather than going blank.
     let empty = run_hotkey_edit(&ctx, &mut setting, &mut capturing, vec![]);
     assert!(painted_text(&empty).iter().any(|t| t == "None"));
 }
 
-/// The draft is what the button shows, but the registration is what the
-/// app is actually holding, and until Apply they can disagree.
+/// Until Apply, the draft and the live registration can disagree.
 #[test]
 fn an_unapplied_shortcut_says_it_is_not_in_force_yet() {
     let ctx = crate::test_ui::ctx();
@@ -253,12 +235,11 @@ fn an_unapplied_shortcut_says_it_is_not_in_force_yet() {
         painted_text(&out).join("\n")
     };
     assert!(run("Ctrl+Alt+K", "Ctrl+Shift+F").contains("Apply and Save"));
-    // Matching, and nothing registered in a test process: nothing to say.
+    // Matching, and nothing registered in a test process.
     assert_eq!(run("Ctrl+Shift+F", "Ctrl+Shift+F"), "");
 }
 
-/// Every row of every section, with the tip it must show; this table is
-/// what makes a row with the *wrong* tooltip impossible.
+/// Every row with the tip it must show, so a wrong tooltip is impossible.
 const ROWS: &[(Section, &str, &tips::Tip)] = &[
     (
         Section::Indexing,
@@ -314,8 +295,7 @@ const ROWS: &[(Section, &str, &tips::Tip)] = &[
     (Section::Search, "Live results", &tips::LIVE_RESULTS),
 ];
 
-/// Hovering a row's name paints that row's own explanation. Rendered
-/// without the tab's scroll area so nothing sits below the fold.
+/// Rendered without the tab's scroll area so nothing sits below the fold.
 #[test]
 fn every_row_shows_its_own_tip() {
     for (section, label, tip) in ROWS {
@@ -337,14 +317,12 @@ fn every_row_shows_its_own_tip() {
         let pos =
             painted_text_center(&first, label).unwrap_or_else(|| panic!("{label} was not painted"));
 
-        // Enough of the body to be unique, and short enough to survive
-        // an edit to the sentence it starts.
+        // Enough of the body to be unique.
         let opening: String = tip.body.chars().take(40).collect();
         let mut out = run(vec![egui::Event::PointerMoved(pos)]);
         let mut found = false;
         for _ in 0..3 {
-            // The tooltip is an area of its own, so it can land a frame
-            // late.
+            // The tooltip is its own area, so it can land a frame late.
             if painted_text(&out).join("\n").contains(&opening) {
                 found = true;
                 break;
@@ -355,8 +333,7 @@ fn every_row_shows_its_own_tip() {
     }
 }
 
-/// Hovering a setting's *name* explains it, not just its control. The
-/// wiring is under test, so tooltip timing is turned off.
+/// Hovering a setting's *name* explains it, not just its control.
 #[test]
 fn hovering_a_setting_label_explains_it() {
     let ctx = crate::test_ui::ctx();
@@ -380,7 +357,6 @@ fn hovering_a_setting_label_explains_it() {
     let target =
         painted_text_center(&full, "Tokenizer").expect("the Tokenizer label was not painted");
 
-    // The tooltip is an area of its own, so it can land a frame late.
     let mut out = run(&mut w, vec![egui::Event::PointerMoved(target)]);
     for _ in 0..3 {
         let painted = painted_text(&out).join("\n");
@@ -394,8 +370,6 @@ fn hovering_a_setting_label_explains_it() {
     panic!("no tooltip appeared over the Tokenizer label");
 }
 
-/// One real frame of the tab in a headless context: it renders, and the
-/// Apply & Save click comes back out as `applied`.
 #[test]
 fn the_tab_renders_and_apply_reports_the_draft() {
     let ctx = crate::test_ui::ctx();
@@ -436,8 +410,6 @@ fn the_tab_renders_and_apply_reports_the_draft() {
     );
 }
 
-/// One frame of the column picker on its own, outside the tab's scroll
-/// area so it is never below the fold — the same shape as [`run_hotkey_edit`].
 fn run_columns(
     ctx: &egui::Context,
     current: &ColumnsConfig,
@@ -454,10 +426,8 @@ fn run_columns(
     (picked, full)
 }
 
-/// The Settings copy of the column picker acts on the *live* config, not the
-/// draft — the same arrangement the Security block uses, and the reason it and
-/// the table header's menu cannot end up disagreeing. So it reports a change
-/// the moment a box moves, with no Apply.
+/// The picker acts on the *live* config, so it reports a change the moment
+/// a box moves, with no Apply.
 #[test]
 fn the_columns_block_reports_a_change_immediately() {
     let ctx = crate::test_ui::ctx();
@@ -471,7 +441,6 @@ fn the_columns_block_reports_a_change_immediately() {
     let (picked, _) = run_columns(&ctx, &current, click_at(target));
     let picked = picked.expect("the click reported nothing");
     assert!(picked.size, "clicking Size did not switch it on");
-    // Only that one moved.
     assert_eq!(
         picked,
         ColumnsConfig {
@@ -481,9 +450,8 @@ fn the_columns_block_reports_a_change_immediately() {
     );
 }
 
-/// The path is not offered: it is the one column that identifies a result on
-/// its own. It is shown checked and greyed rather than left out, so the
-/// question "why can I not remove it?" has an answer on screen.
+/// The path is shown checked and greyed rather than left out, so "why can
+/// I not remove it?" has an answer on screen.
 #[test]
 fn the_columns_block_offers_every_column_but_the_path() {
     let ctx = crate::test_ui::ctx();
@@ -496,15 +464,12 @@ fn the_columns_block_offers_every_column_but_the_path() {
         );
     }
 
-    // Clicking it does nothing, because it is disabled.
     let target = painted_text_center(&full, "Path").expect("no Path entry");
     let (picked, _) = run_columns(&ctx, &ColumnsConfig::default(), click_at(target));
     assert!(picked.is_none(), "the path column was switched off");
 }
 
-/// One frame of the Security block on its own, in the shape of
-/// [`run_columns`]. `keychain_active` is passed straight through, so nothing
-/// here touches the OS keychain.
+/// `keychain_active` is passed straight through: nothing touches the OS keychain.
 fn run_security(
     ctx: &egui::Context,
     current: &Config,
@@ -521,8 +486,7 @@ fn run_security(
     (action, full)
 }
 
-/// An unprotected index has no key at all, so there is nothing the button
-/// could show and it is left out rather than shown dead.
+/// An unprotected index has no key, so the button is left out, not shown dead.
 #[test]
 fn the_key_button_appears_only_while_the_index_is_encrypted() {
     let ctx = crate::test_ui::ctx();
@@ -548,8 +512,7 @@ fn the_key_button_appears_only_while_the_index_is_encrypted() {
     );
 }
 
-/// The click only asks for the flow; the password confirmation and the reveal
-/// both live in the app, so nothing about the key is decided here.
+/// The click only asks for the flow; the reveal lives in the app.
 #[test]
 fn clicking_the_key_button_reports_show_key() {
     let ctx = crate::test_ui::ctx();
@@ -569,9 +532,7 @@ fn clicking_the_key_button_reports_show_key() {
     assert_eq!(action, Some(SecurityAction::ShowKey));
 }
 
-/// Columns are live state, so a draft taken before one changed must not carry
-/// the old set back on Apply — `app::pin_live_fields` is what prevents that,
-/// and this is the assertion that it covers this field.
+/// The assertion that `app::pin_live_fields` covers the columns field.
 #[test]
 fn a_stale_draft_cannot_revert_the_columns() {
     let mut w = SettingsTab::new();

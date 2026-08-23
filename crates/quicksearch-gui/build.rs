@@ -1,15 +1,7 @@
-//! Build identity for the two binaries.
-//!
-//! Bakes the commit the tree was built from into `QS_COMMIT`, and on Windows
-//! compiles a VERSIONINFO resource so the `.exe` reports a version in
-//! Explorer's Properties rather than nothing at all.
-//!
-//! The version number itself is not handled here: `env!("CARGO_PKG_VERSION")`
-//! already carries `[workspace.package] version`, which is the one source of
-//! truth the CI tag check, build-deb.sh and build-installer.sh all read.
-//!
-//! No dependencies on purpose — a build script that pulled a crate in would
-//! land in Cargo.lock, and every build in this repo runs `--locked`.
+//! Build identity: bakes the commit into `QS_COMMIT`, and on Windows
+//! compiles a VERSIONINFO resource so Explorer's Properties shows a version.
+//! No dependencies on purpose — a build-script crate would land in
+//! Cargo.lock, and every build here runs `--locked`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -33,12 +25,9 @@ fn main() {
 
 // ------------------------------------------------------------- commit ----
 
-/// The short commit hash: `QS_COMMIT` first, then git, then [`UNKNOWN`].
-///
-/// CI sets `QS_COMMIT` from the event's SHA rather than letting this shell out
-/// to git, because `actions/checkout` leaves a shallow clone owned by another
-/// user — the SHA the runner already knows is both cheaper and more trustworthy
-/// than anything read back out of that tree.
+/// The short commit hash: `QS_COMMIT` first (CI sets it — `actions/checkout`
+/// leaves a shallow clone owned by another user, so git can't be trusted
+/// there), then git, then [`UNKNOWN`].
 fn resolve_commit() -> String {
     println!("cargo::rerun-if-env-changed=QS_COMMIT");
     watch_git_head();
@@ -57,9 +46,8 @@ fn resolve_commit() -> String {
     git_commit().unwrap_or_else(|| UNKNOWN.to_string())
 }
 
-/// The first [`SHORT_LEN`] characters, lowercased, or `None` when `raw` is not
-/// a hex hash. Accepts a full 40-character SHA (what CI passes) and an already
-/// abbreviated one alike.
+/// The first [`SHORT_LEN`] characters, lowercased; `None` when `raw` is not
+/// a hex hash. Accepts full and abbreviated SHAs alike.
 fn short_hash(raw: &str) -> Option<String> {
     if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
@@ -140,9 +128,8 @@ const BINARIES: [(&str, &str); 2] = [
 /// The string values mirror `packaging/quicksearch.nsi` so the app and the
 /// installer that ships it never disagree about who published what.
 fn emit_version_resource(commit: &str) {
-    // rust-toolchain.toml lists x86_64-pc-windows-gnu and nothing else, and
-    // windres is what compiles a .rc there. An MSVC target would need rc.exe
-    // and a different invocation, so it is skipped rather than half-supported.
+    // Only the gnu target (rust-toolchain.toml's Windows target); MSVC would
+    // need rc.exe and a different invocation.
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("gnu") {
         return;
     }
@@ -194,10 +181,9 @@ END
         std::fs::write(&rc_path, rc).expect("OUT_DIR is writable");
         compile_resource(&rc_path, &res_path);
 
-        // Per-binary, because OriginalFilename differs between the two. Linked
-        // as a plain object rather than through a static library: nothing
-        // references a resource by symbol, so an archive member holding one
-        // would be dropped as unused.
+        // Per-binary (OriginalFilename differs). A plain object, not a static
+        // library: nothing references a resource by symbol, so an archive
+        // member holding one would be dropped as unused.
         println!("cargo::rustc-link-arg-bin={bin}={}", res_path.display());
     }
 }

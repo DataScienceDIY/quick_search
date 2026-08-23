@@ -1,12 +1,10 @@
 //! `key op value` filters → composable SQL fragments.
 //!
-//! One filter becomes one [`FilterFragment`]: a WHERE fragment over table alias
-//! `f` with anonymous `?` placeholders, plus the values to bind. The search
-//! cascade ANDs those fragments onto every stage's query, so they have to
-//! compose by plain appending — which anonymous placeholders do and numbered
-//! ones would not.
+//! One filter becomes one [`FilterFragment`] over table alias `f` with
+//! anonymous `?` placeholders — the cascade ANDs fragments onto every stage,
+//! so they must compose by plain appending, which numbered ones would not.
 
-use super::ast::Op;
+use super::Op;
 use crate::mime::FileType;
 
 #[derive(Debug, Clone)]
@@ -36,10 +34,8 @@ impl std::fmt::Display for TranslateError {
 
 impl std::error::Error for TranslateError {}
 
-/// Escape a phrase for FTS5 MATCH. FTS5 itself uses doubled quotes for
-/// literal quotes inside a quoted phrase; wrapping in quotes renders all
-/// other MATCH metacharacters (`( ) * :` etc.) inert. Injection-safe by
-/// construction.
+/// Escape a phrase for FTS5 MATCH: quotes doubled, wrapping quotes render
+/// all other MATCH metacharacters inert. Injection-safe by construction.
 pub fn quote_phrase(s: &str) -> String {
     let mut buf = String::with_capacity(s.len() + 2);
     buf.push('"');
@@ -53,15 +49,13 @@ pub fn quote_phrase(s: &str) -> String {
     buf
 }
 
-/// A structured-filter fragment over table alias `f`: SQL with anonymous
-/// `?` placeholders plus the values they bind.
+/// SQL with anonymous `?` placeholders over alias `f`, plus bound values.
 #[derive(Debug, Clone)]
 pub struct FilterFragment {
     pub sql: String,
     pub params: Vec<rusqlite::types::Value>,
 }
 
-/// Whether `key` is a recognized structured-filter property.
 pub fn is_filter_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().as_str(),
@@ -77,11 +71,9 @@ pub fn is_filter_key(key: &str) -> bool {
     )
 }
 
-/// Translate one `key op value` filter into a [`FilterFragment`]. The single
-/// source of filter semantics, reached through [`super::split`].
-///
-/// `glob` marks a value whose unquoted `*` should act as a wildcard — only
-/// `name:`/`filename:` honor it; every other key treats the star literally.
+/// Translate one `key op value` filter — the single source of filter
+/// semantics. `glob` marks a value whose unquoted `*` acts as a wildcard;
+/// only `name:`/`filename:` honor it.
 pub fn build_filter(
     key: &str,
     op: Op,
@@ -141,17 +133,12 @@ pub fn build_filter(
             eq_like_only(op)?;
             let base = normalize_folder_value(value);
             if base.is_empty() {
-                // "everything". On Unix the old `parent = '/' OR parent LIKE
-                // '/%'` happened to match every absolute path; Windows has no
-                // single root, so say it directly rather than by accident.
+                // "everything": Windows has no single root, so say it directly.
                 return Ok(frag("1=1", Vec::new()));
             }
-            // One `LIKE`, where this used to need `parent = ? OR parent LIKE ?`
-            // with the collation spelled out to stop the two halves disagreeing
-            // about `C:\Users` versus `c:\users`. Every stored parent now ends
-            // in a separator, so `dir + SEP + %` matches the folder's own files
-            // (`%` matching nothing) as well as its subdirectories', and the
-            // `=` half has nothing left to do.
+            // Every stored parent ends in a separator, so `dir + SEP + %`
+            // matches the folder's own files (`%` matching nothing) as well
+            // as its subdirectories', with no `parent = ?` half.
             Ok(frag(
                 "f.parent LIKE ? ESCAPE '\\'",
                 vec![Value::Text(like_subtree_pattern(&base))],
@@ -164,9 +151,8 @@ pub fn build_filter(
                     op,
                 });
             }
-            // With `glob`, each `*` becomes an unescaped `%`; the pieces
-            // around it still get `%`/`_`/`\` escaped so user metacharacters
-            // stay literal either way.
+            // Each `*` becomes an unescaped `%`; the pieces around it still
+            // get escaped so user metacharacters stay literal.
             let pattern = if glob && value.contains('*') {
                 value
                     .split('*')
@@ -201,32 +187,18 @@ pub fn escape_like(s: &str) -> String {
     out
 }
 
-/// Tidy a user-supplied folder value: trim it, and drop any trailing
-/// separator, of either flavour — that is how people naturally write a
-/// directory, and either may show up on Windows.
-///
-/// Empty out means "every folder", which is what a bare `/` or a blank value
-/// comes to; [`build_filter`] turns that into `1=1`.
-///
-/// It used to special-case a bare drive (`C:` → `C:\`), because the filter's
-/// `parent = ?` half had to match the stored spelling exactly. That half is
-/// gone, and [`like_subtree_pattern`] puts the separator back itself, so both
-/// spellings now produce the same pattern.
+/// Trim and drop a trailing separator of either flavour. Empty out means
+/// "every folder"; [`build_filter`] turns that into `1=1`.
 fn normalize_folder_value(value: &str) -> String {
     value.trim().trim_end_matches(['/', '\\']).to_string()
 }
 
 /// A `LIKE ... ESCAPE '\'` pattern matching `dir`'s own files and everything
-/// beneath it.
-///
-/// The separator is escaped along with the base, because on Windows the
-/// separator *is* the escape character — a hand-written `format!("{}/%", dir)`
-/// is wrong twice over there: wrong separator, and the one it emits would be
-/// swallowed as an escape.
-///
-/// SQLite's `patternCompare` takes the character after the escape literally
-/// whatever it is, so a doubled `\` is well defined here; the folklore that an
-/// escape must be followed by `%`, `_` or itself does not apply.
+/// beneath it. The separator is escaped along with the base, because on
+/// Windows the separator *is* the escape character. SQLite takes the
+/// character after an escape literally whatever it is, so a doubled `\` is
+/// well defined; the folklore that an escape must be followed by `%`, `_` or
+/// itself does not apply.
 pub fn like_subtree_pattern(dir: &str) -> String {
     format!(
         "{}{}%",
@@ -247,16 +219,14 @@ fn parse_date_to_unix(s: &str) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1970..=9999).contains(&y) {
         return None;
     }
-    // Against the real month length, not a flat 1..=31: `civil_to_unix` happily
-    // rolls 2024-02-31 over into March, so a typo would silently filter on a
-    // date the user never typed rather than being reported.
+    // Real month lengths: `civil_to_unix` rolls 2024-02-31 into March, and a
+    // typo would silently filter on a date the user never typed.
     if d < 1 || d > days_in_month(y, m) {
         return None;
     }
     Some(civil_to_unix(y, m as i64, d as i64))
 }
 
-/// Days in a Gregorian month, February by the leap rule.
 fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -314,15 +284,10 @@ mod tests {
     #[test]
     fn path_filter_covers_the_folder_and_its_subtree() {
         let f = frag("path", Op::Contains, "/home/me/docs");
-        // One `LIKE`, and one bound value: since every stored parent ends in a
-        // separator, `dir + SEP + %` reaches the folder's own files as well as
-        // its subdirectories'. The `parent = ?` half this used to need — and
-        // the explicit collation that went with it — is gone.
         assert!(f.sql.contains("f.parent LIKE ?"), "{}", f.sql);
         assert!(!f.sql.contains("f.parent = ?"), "{}", f.sql);
         assert_eq!(f.params.len(), 1);
-        // The LIKE must declare its escape character; without the clause a
-        // Windows separator would be eaten as an escape.
+        // Without ESCAPE a Windows separator would be eaten as an escape.
         assert!(f.sql.contains("ESCAPE '\\'"), "{}", f.sql);
     }
 
@@ -340,17 +305,12 @@ mod tests {
             build_filter("type", Op::Contains, "NotAThing", false),
             Err(TranslateError::UnknownProperty(_))
         ));
-        // Only `name:` accepts a bare `contains`; an ordering operator on it
-        // is meaningless.
         assert!(matches!(
             build_filter("name", Op::Ge, "report", false),
             Err(TranslateError::UnsupportedOp { .. })
         ));
     }
 
-    /// `civil_to_unix` rolls an impossible day over into the next month, so a
-    /// typo would otherwise filter on a date the user never typed — silently,
-    /// since the query still runs.
     #[test]
     fn impossible_dates_are_rejected_rather_than_rolled_over() {
         for bad in [
@@ -396,9 +356,8 @@ mod tests {
         }
     }
 
-    /// The subtree pattern is the one place the separator and the LIKE escape
-    /// character collide (on Windows they are the same byte), so it is checked
-    /// against real SQLite rather than by string comparison.
+    /// The one place the separator and the LIKE escape collide (on Windows
+    /// they are the same byte), so it is checked against real SQLite.
     #[test]
     fn like_subtree_pattern_matches_only_the_subtree() {
         use std::path::MAIN_SEPARATOR as SEP;
@@ -408,8 +367,7 @@ mod tests {
             .unwrap();
 
         let base = format!("{}a{}b", root_prefix(), SEP);
-        // Stored parents always end in a separator, so each row here is spelled
-        // the way the indexer would spell it.
+        // Each row is spelled the way the indexer would: trailing separator.
         let rows = [
             format!("{}{}sub{}", base, SEP, SEP),            // inside
             format!("{}{}sub{}deep{}", base, SEP, SEP, SEP), // deeper
@@ -429,9 +387,8 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        // Three, not two: the trailing separator is what brings the folder's
-        // *own* files in, which is why the filter needs no second predicate.
-        // The prefix sibling and the parent stay out.
+        // Three, not two: the trailing separator brings the folder's *own*
+        // files in; the prefix sibling and the parent stay out.
         assert_eq!(matched, 3, "the subtree of {}, and only that", base);
     }
 
@@ -465,11 +422,9 @@ mod tests {
 
     #[test]
     fn folder_value_normalization() {
-        // Trailing separators of either flavour are stripped.
         assert_eq!(normalize_folder_value("/home/me/"), "/home/me");
         assert_eq!(normalize_folder_value(r"C:\Users\me\"), r"C:\Users\me");
-        // A bare drive and a rooted one now normalize alike: the pattern
-        // builder puts the separator back either way.
+        // A bare drive and a rooted one normalize alike.
         assert_eq!(normalize_folder_value("C:"), "C:");
         assert_eq!(normalize_folder_value(r"C:\"), "C:");
         assert_eq!(
@@ -488,7 +443,6 @@ mod tests {
         assert!(frag.params.is_empty(), "no placeholders to renumber");
     }
 
-    /// An absolute-path prefix for the running platform.
     fn root_prefix() -> String {
         if cfg!(windows) {
             r"C:\".to_string()

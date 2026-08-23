@@ -11,8 +11,6 @@ fn wait_for<F: Fn() -> bool>(what: &str, timeout: Duration, check: F) {
     panic!("timed out waiting for {}", what);
 }
 
-/// A coordinator whose wake-up goes nowhere; wake-up tests pass their own
-/// sink.
 fn start_coord(config: Config) -> IndexCoordinator {
     IndexCoordinator::start(config, Arc::new(|| {})).unwrap()
 }
@@ -49,7 +47,6 @@ impl Fixture {
         }
     }
 
-    /// What a run starting now would still find to reconcile.
     fn outstanding_work(&self, config: &Config) -> IndexWork {
         crate::scope::outstanding_work(&self.db.to_string_lossy(), config).unwrap()
     }
@@ -64,8 +61,6 @@ impl Fixture {
         .ok()
     }
 
-    /// Leave a real, complete index on disk and stop — the starting point
-    /// for every test about what the *next* launch does.
     fn seed_index(&self) {
         let mut manual = self.config.clone();
         manual.indexing.auto_index = false;
@@ -77,7 +72,6 @@ impl Fixture {
         coord.shutdown();
     }
 
-    /// Rewrite the stamp the periodic scheduler measures against.
     fn stamp_last_index(&self, ts: u64) {
         let conn = db::open_existing(&self.db.to_string_lossy(), true).unwrap();
         db::repo::set_last_full_index(&conn, ts).unwrap();
@@ -100,6 +94,7 @@ fn manual_mode_starts_idle_and_reindex_now_round_trips() {
     assert_eq!(coord.state().mode, IndexMode::ManualStopped);
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(f.file_count(), -1, "no run without a command");
+    assert!(!coord.is_indexing(), "nothing claimed the database yet");
 
     coord.reindex_now();
     wait_for("run to complete", Duration::from_secs(20), || {
@@ -107,10 +102,13 @@ fn manual_mode_starts_idle_and_reindex_now_round_trips() {
         s.last_full_index.is_some() && s.mode == IndexMode::ManualStopped
     });
     assert_eq!(f.file_count(), 1);
+    // The cheap predicate and the full status must never disagree — a GUI
+    // polling `is_indexing` decides cache lifetime by its falling edge.
+    assert!(!coord.is_indexing());
+    assert!(matches!(coord.state().activity, IndexingStatus::Idle));
     coord.shutdown();
 }
 
-/// Closing the window during a prune must not wait the prune out.
 #[test]
 fn shutdown_during_a_prune_does_not_wait_for_it() {
     let f = Fixture::new(false);
@@ -140,15 +138,12 @@ fn shutdown_during_a_prune_does_not_wait_for_it() {
         "shutdown waited {:?} for the prune",
         took
     );
-    // The work was left unfinished, not raced through.
     assert!(
         f.outstanding_work(&narrowed).touches_index(),
         "the prune ran to completion, so this proves nothing about waiting"
     );
 }
 
-/// A narrowed filter is applied to the stored index without a prompt and
-/// without a run — including in manual mode.
 #[test]
 fn manual_mode_prunes_a_narrowed_filter_without_running() {
     let f = Fixture::new(false);
@@ -187,8 +182,6 @@ fn manual_mode_prunes_a_narrowed_filter_without_running() {
     coord.shutdown();
 }
 
-/// A prune that finishes must record what it reconciled against, or every
-/// later run rescans every row to redo work already done.
 #[test]
 fn a_completed_prune_records_what_it_reconciled() {
     let f = Fixture::new(false);
@@ -228,8 +221,6 @@ fn a_completed_prune_records_what_it_reconciled() {
     coord.shutdown();
 }
 
-/// A finished prune keeps reporting itself, so a millisecond prune is
-/// still visible.
 #[test]
 fn a_finished_prune_keeps_reporting_itself_for_a_while() {
     let f = Fixture::new(false);
@@ -257,7 +248,6 @@ fn a_finished_prune_keeps_reporting_itself_for_a_while() {
     coord.shutdown();
 }
 
-/// A summary is a report of what just happened, not a state the app sits in.
 #[test]
 fn a_summary_stops_being_fresh_once_the_linger_is_up() {
     let now = Instant::now();
@@ -270,8 +260,6 @@ fn a_summary_stops_being_fresh_once_the_linger_is_up() {
     assert!(!summary_is_fresh(now, now + RECONCILE_SUMMARY_LINGER * 60));
 }
 
-/// Settings only a rebuild can satisfy stay at the values the index was
-/// *built* with: stamping them would clear a rebuild the user declined.
 #[test]
 fn a_prune_never_records_settings_only_a_rebuild_can_satisfy() {
     let f = Fixture::new(false);
@@ -286,15 +274,11 @@ fn a_prune_never_records_settings_only_a_rebuild_can_satisfy() {
     });
     let built_with = f.stored_value("hash_length").unwrap();
 
-    // Change the hash length and decline the rebuild it needs: the
-    // coordinator's copy now disagrees with the stored hashes.
     let mut rebuilt = f.config.clone();
     rebuilt.processing.hash_length = f.config.processing.hash_length * 2;
     coord.apply_config(rebuilt.clone());
     std::thread::sleep(Duration::from_millis(500));
 
-    // An unrelated reconcilable edit; its stamp must not carry the hash
-    // length.
     let mut narrowed = rebuilt.clone();
     narrowed.indexing.ignore_patterns.push("*.log".into());
     coord.apply_config(narrowed);
@@ -314,8 +298,6 @@ fn a_prune_never_records_settings_only_a_rebuild_can_satisfy() {
     coord.shutdown();
 }
 
-/// Widening deletes nothing; the walk starts on its own and returns manual
-/// mode to stopped, the way `reindex_now` does.
 #[test]
 fn manual_mode_reindexes_a_widened_filter_and_returns_to_stopped() {
     let f = Fixture::new(false);
@@ -394,8 +376,6 @@ fn fast_watcher() -> WatcherConfig {
     }
 }
 
-/// The interval is measured against the on-disk stamp, so time spent
-/// closed counts: come back late and the reindex is owed on the first tick.
 #[test]
 fn a_lapsed_stamp_starts_a_run_at_startup() {
     let mut f = Fixture::new(false);
@@ -416,8 +396,6 @@ fn a_lapsed_stamp_starts_a_run_at_startup() {
     coord.shutdown();
 }
 
-/// A stamp still inside the interval is not due; a launch must leave it
-/// alone.
 #[test]
 fn a_fresh_stamp_waits_out_the_interval() {
     let mut f = Fixture::new(false);
@@ -439,8 +417,7 @@ fn a_fresh_stamp_waits_out_the_interval() {
     coord.shutdown();
 }
 
-/// A stamp ahead of the clock (NTP correction, migrated index) must read
-/// as due, not "just indexed".
+/// A stamp ahead of the clock happens: NTP correction, migrated index.
 #[test]
 fn a_stamp_from_the_future_is_treated_as_due() {
     let mut f = Fixture::new(false);
@@ -462,8 +439,6 @@ fn a_stamp_from_the_future_is_treated_as_due() {
     coord.shutdown();
 }
 
-/// A *scheduled* run must wake the frontend: nothing the user did starts
-/// it, so no repaint would otherwise observe it.
 #[test]
 fn a_run_it_schedules_itself_wakes_the_frontend() {
     use std::sync::atomic::AtomicUsize;
@@ -494,8 +469,6 @@ fn a_run_it_schedules_itself_wakes_the_frontend() {
     let during = wakes.load(Ordering::Relaxed);
     assert!(during > 0, "the run started without waking the frontend");
 
-    // The wake is an edge into work, not a heartbeat: an idle coordinator
-    // must not wake the frontend once per tick.
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(
         wakes.load(Ordering::Relaxed),
@@ -508,7 +481,6 @@ fn a_run_it_schedules_itself_wakes_the_frontend() {
 // --- targeted updates (see `IndexCoordinator::update_paths`) --------------
 
 impl Fixture {
-    /// The `mtime` the index holds for one path, or `None` if it has no row.
     fn stored_mtime(&self, path: &std::path::Path) -> Option<i64> {
         let conn = db::open_existing(&self.db.to_string_lossy(), false).ok()?;
         conn.query_row(
@@ -520,9 +492,6 @@ impl Fixture {
     }
 }
 
-/// The point of the whole thing: the frontend has just read a file the user is
-/// looking at, and the index catches up even though indexing is stopped — with
-/// no watcher running and no full run scheduled.
 #[test]
 fn update_paths_indexes_one_file_with_indexing_stopped() {
     let f = Fixture::new(false);
@@ -550,9 +519,6 @@ fn update_paths_indexes_one_file_with_indexing_stopped() {
     coord.shutdown();
 }
 
-/// The same call is how a row is *validated*: submitting a path the index
-/// already agrees with must not rewrite it, which is what makes it cheap
-/// enough for the frontend to submit whatever it just looked at.
 #[test]
 fn update_paths_leaves_a_row_that_already_agrees_alone() {
     let f = Fixture::new(false);
@@ -571,9 +537,6 @@ fn update_paths_leaves_a_row_that_already_agrees_alone() {
     coord.shutdown();
 }
 
-/// A path outside every indexed root is not the index's to hold, however it
-/// was submitted: a result renamed into an un-indexed folder must not follow
-/// the row into the index at its new home.
 #[test]
 fn update_paths_ignores_a_path_outside_every_root() {
     let f = Fixture::new(false);
@@ -581,7 +544,6 @@ fn update_paths_ignores_a_path_outside_every_root() {
     f.seed_index();
     assert_eq!(f.file_count(), 1);
 
-    // A sibling of the indexed tree, under the same scratch parent.
     let outside = f.dir.parent().unwrap().join("elsewhere");
     std::fs::create_dir_all(&outside).unwrap();
     let stray = outside.join("moved-here.txt");
@@ -601,8 +563,6 @@ fn update_paths_ignores_a_path_outside_every_root() {
     std::fs::remove_dir_all(&outside).ok();
 }
 
-/// A row whose file has gone leaves the index too — the frontend hands over
-/// the path, not a verb, so the coordinator decides from what is on disk.
 #[test]
 fn update_paths_removes_a_row_whose_file_is_gone() {
     let f = Fixture::new(false);
@@ -621,9 +581,6 @@ fn update_paths_removes_a_row_whose_file_is_gone() {
     coord.shutdown();
 }
 
-/// The single-writer rule still holds: a targeted update submitted while a
-/// full run owns the database waits for it rather than opening a second
-/// writer beside it.
 #[test]
 fn update_paths_waits_for_a_full_run_rather_than_racing_it() {
     let f = Fixture::new(false);
@@ -658,13 +615,11 @@ fn auto_mode_runs_initial_index_and_applies_watcher_events() {
         coord.state().last_full_index.is_some() && f.file_count() == 1
     });
 
-    // New file → watcher event → incremental application.
     std::fs::write(f.dir.join("later.txt"), "arrived later").unwrap();
     wait_for("incremental add", Duration::from_secs(20), || {
         f.file_count() == 2
     });
 
-    // Deletion sweeps the row.
     std::fs::remove_file(f.dir.join("later.txt")).unwrap();
     wait_for("incremental remove", Duration::from_secs(20), || {
         f.file_count() == 1
@@ -673,8 +628,6 @@ fn auto_mode_runs_initial_index_and_applies_watcher_events() {
     coord.shutdown();
 }
 
-/// A healthy watcher reports its own size for the GUI's "watching N
-/// folders".
 #[test]
 fn auto_mode_reports_an_active_watcher() {
     let f = Fixture::new(true);
@@ -691,8 +644,6 @@ fn auto_mode_reports_an_active_watcher() {
     coord.shutdown();
 }
 
-/// Exceeding the watch budget must surface as `Disabled`, and the periodic
-/// reindex must keep the index fresh.
 #[test]
 fn exceeding_the_watch_cap_disables_updates_but_keeps_indexing() {
     let f = Fixture::new(true);
@@ -719,8 +670,6 @@ fn exceeding_the_watch_cap_disables_updates_but_keeps_indexing() {
         other => panic!("expected Disabled, got {:?}", other),
     }
 
-    // Periodic reindex is the fallback and must still run: mode stays
-    // Auto, only the watcher is off.
     assert_eq!(coord.state().mode, IndexMode::Auto);
     wait_for(
         "full run despite no watcher",
@@ -776,7 +725,6 @@ fn manual_stop_drops_watcher_and_events() {
     coord.shutdown();
 }
 
-/// A config whose `auto_index` disagrees with the running mode switches it.
 #[test]
 fn applying_a_config_switches_the_mode_to_match_auto_index() {
     let f = Fixture::new(true);
@@ -806,8 +754,6 @@ fn applying_a_config_switches_the_mode_to_match_auto_index() {
 
 #[test]
 fn apply_config_with_new_root_then_reindex_indexes_it() {
-    // Add directories, apply, "Start indexing now": the run must pick up
-    // the new roots promptly.
     let f = Fixture::new(true);
     std::fs::write(f.dir.join("first.txt"), "one").unwrap();
     let coord = start_coord_watching(f.config.clone(), fast_watcher());
@@ -838,7 +784,6 @@ fn apply_config_with_new_root_then_reindex_indexes_it() {
     std::fs::remove_dir_all(&extra_root).ok();
 }
 
-/// Only the removal root needs applying — its range sweep covers the rest.
 #[test]
 fn collapsing_reduces_a_tree_deletion_to_its_root() {
     let mut pending = HashMap::new();
@@ -854,7 +799,6 @@ fn collapsing_reduces_a_tree_deletion_to_its_root() {
             FsEvent::Remove(dir.join(format!("sub{}", i % 5))),
         );
     }
-    // Not under the removed tree, and not a removal: both must survive.
     enqueue(&mut pending, FsEvent::Remove(PathBuf::from("/x/treehouse")));
     enqueue(&mut pending, FsEvent::Create(dir.join("reborn.txt")));
 
@@ -885,8 +829,6 @@ fn collapsing_a_queue_without_removals_is_a_no_op() {
     assert_eq!(pending.len(), 2);
 }
 
-/// Deleting a populated directory must land as one queued removal, not one
-/// per file, and the rows must actually go.
 #[test]
 fn a_deleted_directory_is_applied_as_a_single_collapsed_removal() {
     let f = Fixture::new(true);
@@ -913,8 +855,6 @@ fn a_deleted_directory_is_applied_as_a_single_collapsed_removal() {
     coord.shutdown();
 }
 
-/// The queue must not be applied while a full run owns the database, and
-/// the events must survive to be applied once it finishes.
 #[test]
 fn a_deletion_during_a_full_run_is_queued_then_applied() {
     let f = Fixture::new(false); // manual: runs happen only when asked
@@ -930,7 +870,6 @@ fn a_deletion_during_a_full_run_is_queued_then_applied() {
         coord.state().last_full_index.is_some() && f.file_count() == 300
     });
 
-    // Auto mode so the watcher is live, then delete while a run is going.
     coord.set_mode(IndexMode::Auto);
     wait_for("watcher active", Duration::from_secs(30), || {
         matches!(coord.state().watcher, WatcherStatus::Active { .. })
@@ -948,15 +887,10 @@ fn a_deletion_during_a_full_run_is_queued_then_applied() {
     coord.shutdown();
 }
 
-/// A path that cannot be read is not a path that is gone.
-///
-/// `update_paths` is fed by the frontend from the rows it is displaying, and
-/// its `Remove` verb takes the row *and its whole subtree*. `is_file()` cannot
-/// tell "not a regular file" from "I could not look", so an unreadable file —
-/// a network share that dropped, a removable drive unplugged with its results
-/// on screen, a directory another process just chmod'd — used to read as a
-/// deletion. The next full run cannot undo it: an unreachable root is recorded
-/// unreadable rather than re-walked.
+/// `is_file()` cannot tell "not a regular file" from "I could not look", so an
+/// unreadable file (dropped network share, unplugged drive) used to read as a
+/// deletion — one the next full run cannot undo, because an unreachable root
+/// is recorded unreadable, not re-walked.
 #[test]
 fn an_unreadable_path_is_not_treated_as_deleted() {
     let dir = crate::testutil::scratch_dir("verb");
@@ -976,7 +910,6 @@ fn an_unreadable_path_is_not_treated_as_deleted() {
     // A directory is not something the walk indexes, so it is still a Remove.
     assert!(matches!(verb_for(dir.clone()), Some(FsEvent::Remove(_))));
 
-    // The case that matters: the file is there, and unreadable.
     let locked = dir.join("locked");
     std::fs::create_dir_all(&locked).unwrap();
     let hidden = locked.join("file.txt");
@@ -1037,8 +970,6 @@ fn clear_index_deletes_db_and_stays_manual() {
     });
     assert_eq!(coord.state().last_full_index, None);
 
-    // Give the (now manual) coordinator a few ticks: the index must
-    // stay deleted rather than being rebuilt by the scheduler.
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(f.file_count(), -1, "cleared index must stay cleared");
 

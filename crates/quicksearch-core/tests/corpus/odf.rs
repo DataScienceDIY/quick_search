@@ -1,22 +1,16 @@
 //! The three OpenDocument corpus files: `.odt`, `.ods`, `.odp`.
 //!
-//! No Rust crate writes ODF, so these are assembled from
-//! [`super::zipwriter`] and `format!` — independent of the `zip` 0.6 and
-//! `quick-xml` the reader uses.
-//!
-//! The `mimetype` member comes first and uncompressed, as the ODF packaging
-//! spec requires and as LibreOffice writes it. `extract::office` locates
-//! `content.xml` by name and never looks at it, but a package that violates
-//! the spec is not the thing the corpus is supposed to be testing against.
+//! No Rust crate writes ODF, so these are assembled from [`super::zipwriter`]
+//! and `format!` — independent of the `zip` 0.6 and `quick-xml` the reader
+//! uses. The `mimetype` member comes first and uncompressed, as the
+//! packaging spec requires and as LibreOffice writes it.
 
 use std::path::Path;
 
 use super::zipwriter::{self, xml_escape, Entry};
 use super::{BodyFn, Charset, Lcg, Sample};
 
-/// Namespace declarations shared by all three documents. Only `office` and
-/// `text` are load-bearing for extraction; `table` is needed for the
-/// spreadsheet's grid.
+/// Only `office` and `text` are load-bearing; `table` is for the grid.
 const NS: &str = "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" \
      xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" \
      xmlns:table=\"urn:oasis:names:tc:opendocument:xmlns:table:1.0\" \
@@ -29,7 +23,6 @@ pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec
     odp(dir, lcg, body, out);
 }
 
-/// Package `content.xml` as an ODF container with the right `mimetype`.
 fn package(dir: &Path, name: &str, mime: &str, content: &str) -> std::path::PathBuf {
     let entries = [
         Entry {
@@ -44,13 +37,9 @@ fn package(dir: &Path, name: &str, mime: &str, content: &str) -> std::path::Path
     super::write_file(dir, name, &zipwriter::archive(&entries))
 }
 
-/// Prose, alternating `<text:h>` and `<text:p>` and wrapping one sentence in a
-/// `<text:span>`.
-///
-/// The span is the interesting case: `ODF_TEXT` lists `text:span` as
-/// text-bearing but *not* paragraph-breaking, and the reader counts open
-/// text elements rather than flagging them. A span nested in a paragraph is
-/// what distinguishes those two behaviours.
+/// Prose alternating `<text:h>` and `<text:p>`, with one sentence in a
+/// `<text:span>` — text-bearing but *not* paragraph-breaking, which is what
+/// distinguishes counting open text elements from flagging them.
 fn odt(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
     let b = body(lcg, Charset::Unicode);
     let mut xml = String::new();
@@ -80,8 +69,7 @@ fn odt(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) 
     out.push(Sample::prose(path, "odt", &b, false));
 }
 
-/// One sentence per cell, one cell per row — the same shape as the `.xlsx`,
-/// read by `ODF_SHEET` with its `Some(' ')` cell separator.
+/// One sentence per cell, one per row — the `.xlsx` shape.
 fn ods(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
     let b = body(lcg, Charset::Unicode);
     let rows: String = b
@@ -110,15 +98,13 @@ fn ods(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) 
     out.push(Sample::prose(path, "ods", &b, false));
 }
 
-/// Sentences across two `<draw:page>`s, in text boxes — the shape LibreOffice
-/// writes and the shape `ODF_TEXT` reads, since `.odp` and `.odt` share a spec.
+/// Sentences across two `<draw:page>`s; `.odp` and `.odt` share a spec.
 fn odp(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
     const PAGES: usize = 2;
     let b = body(lcg, Charset::Unicode);
     let mut xml = String::new();
-    // Contiguous halves rather than round-robin: the reader concatenates
-    // pages in document order, so this keeps the expectation equal to
-    // `b.sentences` and leaves the reordering check to the `.pptx`.
+    // Contiguous halves: pages concatenate in document order, keeping the
+    // expectation equal to `b.sentences`; the `.pptx` does the reorder check.
     let per_page = b.sentences.len().div_ceil(PAGES);
     for (page, chunk) in b.sentences.chunks(per_page).enumerate() {
         let frames: String = chunk

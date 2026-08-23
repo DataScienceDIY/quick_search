@@ -1,19 +1,10 @@
-//! SQL strings for the current schema, versioned by
-//! [`super::open::CURRENT_SCHEMA_VERSION`]; there is no upgrade path.
+//! SQL strings for the current schema; there is no upgrade path.
 //!
 //! # Pragma profiles
 //!
-//! One profile per kind of connection; the field that differs is almost
-//! always `cache_size`.
-//!
-//! **A negative `cache_size` is KiB; a positive one would be a page count**
-//! (and SQLCipher reserves per-page IV/HMAC bytes, so pages never convert to
-//! bytes by a clean multiply). The ceiling is not a reservation, but page
-//! cache is `malloc`ed in 4 KiB units — far below glibc's mmap threshold —
-//! so a filled cache is arena memory: closing the connection returns it to
-//! the arena, not the kernel. That is why these numbers appear in an *idle*
-//! process's footprint, and why [`crate::platform::release_free_heap`]
-//! exists alongside them.
+//! **A negative `cache_size` is KiB; a positive one would be a page count.**
+//! A filled cache is glibc arena memory that outlives the connection — see
+//! [`crate::platform::release_free_heap`].
 //!
 //! | Profile | Connection | Lifetime | Cache |
 //! |---|---|---|---|
@@ -24,20 +15,12 @@
 //! | [`PRAGMAS_MAINTENANCE`] | VACUUM | one bulk copy | 8 MiB |
 //! | [`PRAGMAS_WALK_READER`] | per-root walk prefetch and content feeder | the run | 1 MiB |
 //!
-//! `PRAGMA mmap_size` is absent from all of them: SQLCipher's codec disables
-//! mmap at runtime only when a key is set, mapped pages still count in
-//! `VmRSS`, and using it would make memory behaviour differ between
-//! protected and unprotected installs.
+//! `PRAGMA mmap_size` is absent from all of them: it would make memory
+//! behaviour differ between protected and unprotected installs.
 
 /// The bulk indexer's write connection: one per run, dies with it.
-///
-/// `synchronous = NORMAL` under WAL risks only the last commit on power
-/// loss — acceptable for an index re-derivable from disk. The two writers
-/// (full runs, coordinator) are serialized by design; `busy_timeout` is a
-/// backstop. A clean shutdown truncates the WAL via
-/// [`super::repo::checkpoint_and_close`] and a long run truncates it
-/// periodically (see `maximum_wal_size`) — SQLite's own autocheckpoint
-/// backfills but cannot reset a log that readers are touching.
+/// `synchronous = NORMAL` under WAL risks only the last commit on power loss
+/// — acceptable for an index re-derivable from disk.
 pub const PRAGMAS_FAST: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -47,14 +30,10 @@ pub const PRAGMAS_FAST: &str = "
     PRAGMA foreign_keys = ON;
 ";
 
-/// Pragmas for the connection that compacts the index after a run.
-///
 /// [`PRAGMAS_FAST`] but with `temp_store = FILE`: SQLCipher is compiled
 /// `-DSQLITE_TEMP_STORE=2`, under which anything but an explicit `FILE` puts
 /// temporary databases in memory — and VACUUM builds the replacement database
-/// there, so the indexer's profile would hold a rebuilt multi-gigabyte index
-/// in RAM. See [`super::repo::maintain`], which also points the temp
-/// directory at the index's own volume.
+/// there, so the indexer's profile would hold a multi-gigabyte index in RAM.
 pub const PRAGMAS_MAINTENANCE: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -64,14 +43,8 @@ pub const PRAGMAS_MAINTENANCE: &str = "
     PRAGMA foreign_keys = ON;
 ";
 
-/// The coordinator's long-lived write connection.
-///
-/// The one connection that lives as long as the process, so whatever its
-/// cache reaches, it holds — and [`super::super::scope::advance`] runs a
-/// forward-only scan of `files` through it after a config change, exactly
-/// the pattern that fills a cache to its ceiling. It is also dropped
-/// outright when the coordinator settles (see `Inner::go_idle`); this
-/// profile bounds what it can reach *before* then.
+/// The coordinator's long-lived write connection — whatever its cache
+/// reaches it holds until the coordinator settles, so this bounds it.
 pub const PRAGMAS_INCREMENTAL: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -81,31 +54,10 @@ pub const PRAGMAS_INCREMENTAL: &str = "
     PRAGMA foreign_keys = ON;
 ";
 
-/// The search worker's connection, held across a typing session (see
-/// [`crate::search`]): the cache is there to still be warm when the next
-/// character arrives.
-///
-/// **The one profile that is deliberately large, and the size is measured
-/// rather than reasoned.** `tests/search_perf.rs` sweeps it; on an encrypted
-/// index the curve is not a gradient but a cliff, and the cliff is at the
-/// working set:
-///
-/// | ceiling | warm, unencrypted | warm, encrypted |
-/// |---|---|---|
-/// | 32–40 MiB | ~19 ms | **~19 ms** |
-/// | 1–16 MiB | ~20 ms | **~47 ms** |
-///
-/// Unencrypted, the ceiling makes no difference at all — a miss is a `pread`
-/// from the OS page cache and a `memcpy`. Encrypted, SQLCipher caches pages
-/// *decrypted*, so a hit skips an AES-CBC decrypt and an HMAC-SHA512 verify
-/// per 4 KiB; below the working set every warm query pays for all of them
-/// again, which is the 2.5× above.
-///
-/// The ceiling only stands while someone is searching: the worker releases
-/// the connection after [`crate::search`]'s idle window, and
-/// [`crate::platform::release_free_heap`] returns the pages. The knee tracks
-/// index size; if a larger index ever needs it, the fix is a bigger number
-/// here, informed by the same test.
+/// The search worker's connection, held across a typing session. The one
+/// deliberately large profile: SQLCipher caches pages *decrypted*, so on an
+/// encrypted index an undersized cache re-pays AES-CBC + HMAC per 4 KiB and
+/// warm queries run ~2.5× slower (`benches/search_perf.rs` sweeps it).
 pub const PRAGMAS_SEARCH: &str = "
     PRAGMA busy_timeout = 5000;
     PRAGMA cache_size = -32768;
@@ -113,10 +65,8 @@ pub const PRAGMAS_SEARCH: &str = "
     PRAGMA foreign_keys = ON;
 ";
 
-/// Pragmas safe to apply on a read-only connection, where `journal_mode`
-/// and `synchronous` can't be changed on the file. The *one-shot* readers
-/// (CLI query helpers, duplicates scan, the coordinator's small reads): each
-/// opens, runs a single query, and closes.
+/// The *one-shot* readers. Pragmas safe on a read-only connection, where
+/// `journal_mode` and `synchronous` can't be changed on the file.
 pub const PRAGMAS_READONLY: &str = "
     PRAGMA busy_timeout = 5000;
     PRAGMA cache_size = -4096;
@@ -124,23 +74,11 @@ pub const PRAGMAS_READONLY: &str = "
     PRAGMA foreign_keys = ON;
 ";
 
-/// Pragmas for a root's own reader: the walk's row prefetch, and then the
-/// content pass's feeder ([`crate::content`]), which reuses this profile for
-/// the rest of the run.
-///
-/// Two of these can exist per indexing root, so the cache size is multiplied
-/// by the root count. 1 MiB is sized for the walk's queries, which each read
-/// one range of `idx_files_parent` once and never revisit it — plus, since
-/// that index stopped carrying `mtime`, one table-row fetch per entry in the
-/// range. Those land on a handful of pages while a directory's rows stay
-/// rowid-adjacent; **this is the number to raise** if a tree churned across
-/// many incremental runs ever scatters them far enough to matter. The feeder's
-/// paging is the same shape, but its one-off `count_extract_scope` at pass
-/// start is not: that scans the root's whole path range fetching a row per
-/// entry, so on a large root it is a cold read all the way through. It is
-/// deliberately here rather than on the writer — the writer holding still for
-/// it stopped every other root's walk — and this is the connection that pays
-/// for that, once per root.
+/// A root's own reader: the walk's row prefetch, then the content pass's
+/// feeder. Two can exist per root, so the cache multiplies by root count;
+/// **this is the number to raise** if the prefetcher ever falls behind. The
+/// feeder's cold scan is deliberately paid here, not on the writer — the
+/// writer holding still for it stopped every other root's walk.
 pub const PRAGMAS_WALK_READER: &str = "
     PRAGMA busy_timeout = 5000;
     PRAGMA cache_size = -1024;
@@ -148,29 +86,17 @@ pub const PRAGMAS_WALK_READER: &str = "
     PRAGMA foreign_keys = ON;
 ";
 
-/// The full current schema, applied to a fresh or just-wiped DB.
-///
-/// FTS5 is *contentless* (see [`fts_create_sql`]): the inverted index is
-/// kept but column values aren't stored. Canonical extracted text lives in
-/// `documents_text`, zstd-compressed; snippets are rendered in Rust from it
-/// (see `crate::snippet`).
+/// The full current schema, applied to a fresh or just-wiped DB. FTS5 is
+/// *contentless* (see [`fts_create_sql`]); canonical extracted text lives in
+/// `documents_text`, zstd-compressed.
 pub const SCHEMA_CURRENT: &str = r#"
 CREATE TABLE schema_info (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
--- **There is no `path` column.** A file's path is `parent || name`, and
--- storing it a third time cost ~43% of the per-row footprint: over a
--- 400k-file corpus (avg path 77 bytes, parent 59, name 17) ~394 bytes/row
--- against the ~226 below, or ~170 MB per million files. It also widened the
--- row by a third, and three of the search cascade's passes scan every row —
--- on an encrypted index each extra page is an AES-CBC decrypt and an
--- HMAC-SHA512 verify. Reassembling a path is a `push_str` in the one place
--- that needs one (`file_handling::split_db_path` is the inverse).
---
 -- `parent` always ends in the platform separator; see `dir_to_db_parent` for
--- why the whole design turns on that.
+-- why the design requires that.
 CREATE TABLE files (
     id            INTEGER PRIMARY KEY,
     name          TEXT    NOT NULL,
@@ -249,10 +175,7 @@ CREATE TABLE config_validation (
 /// mode — snippets are rendered in Rust from `documents_text` instead.
 ///
 /// **One column, deliberately.** Document bodies are the only thing anything
-/// ever MATCHes: the cascade pins its query to the body
-/// (`crate::search::cascade::passes`) and filename ranks come from scanning
-/// `files.name`, which the trigram index of a `name` column here would only
-/// duplicate — at (len − 2) postings per file indexed.
+/// ever MATCHes; a `name` column would cost (len − 2) postings per file.
 pub fn fts_create_sql(tokenizer: &str) -> String {
     let effective = effective_tokenizer(tokenizer);
     format!(
@@ -266,10 +189,9 @@ pub fn fts_create_sql(tokenizer: &str) -> String {
     )
 }
 
-/// Map a user-facing tokenizer name to the actual FTS5 option string we
-/// apply. The default `trigram` gets `remove_diacritics 1` appended so an
-/// ASCII query like `cafe` matches indexed `café`; any explicit option
-/// string is used verbatim.
+/// Map a user-facing tokenizer name to the FTS5 option string applied: plain
+/// `trigram` gets `remove_diacritics 1` (so `cafe` matches `café`); any
+/// explicit option string is used verbatim.
 pub fn effective_tokenizer(tokenizer: &str) -> String {
     let trimmed = tokenizer.trim();
     if trimmed.eq_ignore_ascii_case("trigram") {

@@ -23,7 +23,8 @@ readonly PKG=quicksearch
 # `quicksearch` does both jobs, but the README and the shared man page name
 # `quicksearch-cli` too, so it has to exist wherever the docs are installed.
 readonly BINARIES=(quicksearch quicksearch-cli)
-readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
+parse_args "$@"
 readonly ICON_SRC="$REPO_ROOT/crates/quicksearch-gui/assets/icons"
 readonly ICON_SVG="$ICON_SRC/quicksearch_icon.svg"
 readonly METAINFO=com.karsttech.quicksearch.metainfo.xml
@@ -52,11 +53,6 @@ for tool in dpkg-deb dpkg desktop-file-validate objdump gzip; do
 done
 [ "$do_strip" -eq 0 ] || command -v strip >/dev/null 2>&1 || die "missing strip (install binutils, or pass --no-strip)"
 
-# Version comes from [workspace.package] so the package can never drift from the
-# crate version.
-version="$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' "$REPO_ROOT/Cargo.toml")"
-[ -n "$version" ] || die "could not read version from Cargo.toml"
-
 # No Debian revision: QuickSearch is only ever packaged from its own source, so
 # the version is native (no hyphen) and the .deb is named for the crate version
 # alone, matching the Windows installer.
@@ -68,8 +64,7 @@ deb="$out_dir/${PKG}_${version}_${arch}.deb"
 # ---------------------------------------------------------------- build ----
 
 if [ "$do_build" -eq 1 ]; then
-    say "Building quicksearch $version (release)"
-    ( cd "$REPO_ROOT" && cargo build --release -p quicksearch-gui )
+    build_host_release
 fi
 
 for bin in "${BINARIES[@]}"; do

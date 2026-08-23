@@ -16,8 +16,7 @@ fn main() {
         let path = Path::new(&arg);
         println!("=== {} ===", path.display());
         match quicksearch_core::extract::office::OfficeExtractor.extract(path) {
-            Ok(content) => {
-                let text = content.text;
+            Ok(text) => {
                 println!("{} chars", text.chars().count());
                 let preview: String = text.chars().take(400).collect();
                 println!("{}", preview);

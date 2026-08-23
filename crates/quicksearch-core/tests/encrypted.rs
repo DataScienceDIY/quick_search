@@ -1,11 +1,6 @@
-//! End-to-end index encryption through the public API: the process-global
-//! key, a real indexing run over a real tree, and the enable→disable
-//! rebuild cycle.
-//!
-//! Lives in its own integration-test binary on purpose: it mutates the
-//! process-global key, which unit tests (sharing one process) must never
-//! do. Everything runs inside a single #[test] so the key transitions are
-//! strictly ordered.
+//! End-to-end index encryption through the public API. Lives in its own
+//! integration-test binary: it mutates the process-global key, which unit
+//! tests must never do; a single #[test] keeps the transitions ordered.
 
 use std::path::Path;
 
@@ -17,12 +12,8 @@ use quicksearch_core::security::{derive_key, salt_from_hex};
 mod common;
 use common::scratch_dir as tmp_dir;
 
-/// Run one full index over `root` and wait for the completion marker,
-/// reading it through the keyed open so the poll works on encrypted indexes.
-///
-/// The marker is deliberately *not* cleared first: this suite indexes into a
-/// database whose enable/disable rebuild cycle it is itself testing, and each
-/// rebuild already starts from a fresh file.
+/// Index `root` and wait for the marker through the keyed open. The marker
+/// is deliberately not cleared: each rebuild starts from a fresh file.
 fn index_once(root: &Path, db_path: &Path, config: &Config) {
     common::IndexOnce {
         db: db_path,
@@ -82,12 +73,10 @@ fn encrypted_index_lifecycle() {
 
     // --- Optimizing a keyed index: VACUUM keeps it encrypted. ---
     //
-    // VACUUM rewrites the whole file through a temporary database that
-    // SQLCipher has to key from the main one. If it did not, the rewrite would
-    // hand back a plaintext index — silently, and only for protected users.
-    //
-    // The slack is manufactured: this tree is two files, and `maintain` only
-    // rewrites a file with something to reclaim.
+    // VACUUM rewrites the file through a temp database SQLCipher must key
+    // from the main one; otherwise the rewrite hands back a plaintext index.
+    // The slack is manufactured: `maintain` only rewrites with something to
+    // reclaim.
     {
         let conn = db::open_existing(&db_path.to_string_lossy(), true).unwrap();
         conn.execute_batch(
@@ -137,17 +126,10 @@ fn encrypted_index_lifecycle() {
 
     // --- A stale schema must not read as a locked index. ---
     //
-    // The reported failure: after a schema bump, a password-protected install
-    // could not start at all — the correct password was rejected with
-    // "not a compatible QuickSearch index (schema v4 expected)", because the
-    // unlock gate verified the key by opening the index the way a *consumer*
-    // does, which also insists the schema be current. An unprotected install
-    // in the same state starts and rebuilds on its first run; the protected
-    // one had no way past the gate.
-    //
-    // Whether the schema is current belongs to the indexer, which answers it
-    // by wiping and rebuilding. Unlocking only has to answer "does this key
-    // open the file?".
+    // After a schema bump the unlock gate rejected the correct password by
+    // opening the index the way a *consumer* does, which insists the schema
+    // be current — that belongs to the indexer; unlocking only answers
+    // "does this key open the file?".
     {
         db::set_process_key(Some(key.clone()));
         // Age the stored schema, exactly as a version bump would.
@@ -159,17 +141,12 @@ fn encrypted_index_lifecycle() {
         .unwrap();
         drop(conn);
 
-        // The right password still unlocks...
         db::verify_process_key(&db_path.to_string_lossy())
             .expect("a stale schema must not make the correct password look wrong");
-        // ...and the wrong one is still refused, with the same tagged error —
-        // the relaxation must not have turned the check into a rubber stamp.
         db::set_process_key(Some(wrong_key.clone()));
         let err = db::verify_process_key(&db_path.to_string_lossy()).unwrap_err();
         assert!(err.starts_with(db::KEY_MISMATCH_PREFIX), "got: {err}");
 
-        // Consumers still refuse a stale index, which is what sends the
-        // indexer down its rebuild path.
         db::set_process_key(Some(key.clone()));
         let err = db::open_existing(&db_path.to_string_lossy(), false).unwrap_err();
         assert!(
@@ -177,8 +154,6 @@ fn encrypted_index_lifecycle() {
             "got: {err}"
         );
 
-        // And the rebuild comes back encrypted and searchable under the same
-        // key, so the whole path a real user walks is covered.
         index_once(&root, &db_path, &config);
         assert_ne!(&header(&db_path), b"SQLite format 3\0");
         assert_eq!(match_count(&db_path, "zebrapayload"), 1);

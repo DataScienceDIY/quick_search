@@ -1,22 +1,12 @@
-//! Password → SQLCipher key derivation for the optional index encryption.
-//!
-//! The chain is small: `key = Argon2id(password, salt)`, used directly as
-//! the SQLCipher raw key. The salt is 16 random bytes generated once, when a
-//! password is set, and stored as hex in the config file — it exists to make
-//! the derivation unique per install, not to be secret. Argon2id is what
-//! makes offline brute-force expensive; SQLCipher's own KDF is bypassed
-//! (raw-key form) so the cost is paid once per unlock, not per connection.
-//!
-//! Callers own password hygiene: hold the raw password in a
-//! [`zeroize::Zeroizing`] buffer, call [`derive_key`], and drop the buffer
-//! immediately. Nothing in this module stores or logs the password.
+//! Password → SQLCipher key derivation: `key = Argon2id(password, salt)`,
+//! used directly as the raw key so the KDF cost is paid once per unlock, not
+//! per connection. The salt is per-install, not secret. Callers own password
+//! hygiene: hold it in a [`zeroize::Zeroizing`] buffer and drop it fast.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Length in bytes of the per-install KDF salt stored (hex) in the config.
 pub const SALT_LEN: usize = 16;
-/// Length in bytes of the derived SQLCipher raw key.
 pub const KEY_LEN: usize = 32;
 
 /// Argon2id cost parameters. Changing any of these changes every derived
@@ -39,13 +29,12 @@ impl std::fmt::Debug for IndexKey {
 }
 
 impl IndexKey {
-    /// Lowercase hex, suitable for SQLCipher's raw-key `PRAGMA key = "x'…'"`
-    /// form and for keychain storage.
+    /// Lowercase hex, for SQLCipher's raw-key form and keychain storage.
     pub fn to_hex(&self) -> String {
         hex_encode(&self.0)
     }
 
-    /// Strict inverse of [`IndexKey::to_hex`]: exactly 64 hex digits, any case.
+    /// Strict inverse of [`IndexKey::to_hex`]: exactly 64 hex digits.
     pub fn from_hex(hex: &str) -> Result<IndexKey, String> {
         let bytes = hex_decode(hex)?;
         let arr: [u8; KEY_LEN] = bytes
@@ -68,8 +57,7 @@ pub fn salt_to_hex(salt: &[u8; SALT_LEN]) -> String {
 }
 
 /// Strict decode of a config-stored salt: exactly 32 hex digits. Anything
-/// else — wrong length, non-hex bytes, a hand-crafted oversized value — is
-/// an error, never silently truncated or padded.
+/// else is an error, never silently truncated or padded.
 pub fn salt_from_hex(hex: &str) -> Result<[u8; SALT_LEN], String> {
     let bytes = hex_decode(hex)?;
     bytes
@@ -78,7 +66,6 @@ pub fn salt_from_hex(hex: &str) -> Result<[u8; SALT_LEN], String> {
 }
 
 /// Derive the SQLCipher key from a password and the per-install salt.
-/// Deterministic: same inputs always yield the same key.
 pub fn derive_key(password: &str, salt: &[u8; SALT_LEN]) -> IndexKey {
     let params = Params::new(ARGON2_MEM_KIB, ARGON2_ITERS, ARGON2_LANES, Some(KEY_LEN))
         .expect("static Argon2 params are valid");
@@ -140,8 +127,6 @@ mod tests {
 
     #[test]
     fn empty_and_unicode_passwords_derive() {
-        // SQLCipher accepts any 32-byte key; the password's content is the
-        // user's business, including empty or emoji.
         let salt = generate_salt();
         let _ = derive_key("", &salt);
         let _ = derive_key("på55wörd 🗝️", &salt);
@@ -161,14 +146,11 @@ mod tests {
         let hex = salt_to_hex(&salt);
         assert_eq!(hex.len(), SALT_LEN * 2);
         assert_eq!(salt_from_hex(&hex).unwrap(), salt);
-        // Uppercase input decodes too.
         assert_eq!(salt_from_hex(&hex.to_uppercase()).unwrap(), salt);
     }
 
     #[test]
     fn malformed_salts_are_rejected() {
-        // Too short / too long / odd length / non-hex — all hostile-config
-        // shapes, all hard errors.
         assert!(salt_from_hex("").is_err());
         assert!(salt_from_hex("abcd").is_err());
         assert!(salt_from_hex(&"ab".repeat(SALT_LEN + 1)).is_err());

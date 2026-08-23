@@ -1,14 +1,11 @@
-//! The Settings tab: every configuration control the GUI offers, grouped
-//! into sections. Edits happen on a draft; Apply validates, saves, and hands
-//! the new config to the app.
+//! The Settings tab. Edits happen on a draft; Apply validates, saves, and
+//! hands the new config to the app.
 
 use crate::keychain;
 use crate::tips::{self, tip_row, Tipped};
 use crate::ui_util::hint;
 use quicksearch_core::config::{ColumnsConfig, Config};
 
-/// A [`tip_row`] holding one numeric [`egui::DragValue`] — the shape of most
-/// rows in the config editor.
 fn drag_row<N: egui::emath::Numeric>(
     ui: &mut egui::Ui,
     label: &str,
@@ -28,8 +25,7 @@ enum Section {
     Search,
 }
 
-/// A click in the Security block. These are not draft edits: every action
-/// runs its own explicit flow in the app.
+/// Not draft edits: every action runs its own explicit flow in the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecurityAction {
     Enable,
@@ -39,24 +35,18 @@ pub enum SecurityAction {
     ShowKey,
 }
 
-/// What one frame of the Settings tab produced.
 #[derive(Default)]
 pub struct SettingsOutput {
-    /// "Apply & Save" was clicked with this draft.
     pub applied: Option<Config>,
-    /// A Security block action was clicked.
     pub security: Option<SecurityAction>,
-    /// The Columns block changed. Like Security, it edits the live config
-    /// rather than the draft, so it takes effect without Apply.
+    /// Like Security, edits the live config, so it takes effect without Apply.
     pub columns: Option<ColumnsConfig>,
 }
 
 pub struct SettingsTab {
-    /// The staged config, built from the live one the first frame the tab is
-    /// shown and dropped again when it is left.
+    /// Staged the first frame the tab is shown; dropped when it is left.
     draft: Option<Config>,
-    /// Cached answer from [`SettingsTab::keychain_active`], with the
-    /// `use_keychain` preference it was probed under.
+    /// The `use_keychain` preference the cached probe answer was taken under.
     keychain_probed_for: Option<bool>,
     keychain_active: bool,
     /// The search-shortcut button is waiting for a key press to bind.
@@ -73,17 +63,14 @@ impl SettingsTab {
         }
     }
 
-    /// Whether the shortcut button is reading a key press right now, so the
-    /// app can hold the shortcut it is about to replace. The app gates this
-    /// on the tab being the one on screen. See
-    /// [`crate::unlock::Gate::handle_hotkey`].
+    /// Whether the shortcut button is reading a key press, so the app can
+    /// hold the shortcut it is about to replace.
     pub fn capturing_hotkey(&self) -> bool {
         self.capturing_hotkey
     }
 
-    /// Whether the draft differs from the live config. The fields the app
-    /// pins on apply are neutralized first, so the Security block never
-    /// makes the tab read as dirty.
+    /// The fields the app pins on apply are neutralized first, so the
+    /// Security block never makes the tab read as dirty.
     pub fn is_dirty(&self, current: &Config) -> bool {
         let Some(draft) = &self.draft else {
             return false;
@@ -93,33 +80,27 @@ impl SettingsTab {
         d != *current
     }
 
-    /// The draft as it stands, for the app's unsaved-changes guard.
     pub fn draft_config(&self) -> Option<Config> {
         self.draft.clone()
     }
 
-    /// Drop the draft: Discard, or leaving the tab. The next frame that
-    /// shows the tab stages a fresh copy of the live config, which is what
-    /// keeps a draft from going stale against edits made on Manage Index.
+    /// Drop the draft; the next frame stages a fresh copy of the live
+    /// config, which keeps a draft from going stale against other tabs.
     pub fn discard(&mut self) {
         self.draft = None;
         self.capturing_hotkey = false;
         self.keychain_probed_for = None;
     }
 
-    /// Take a draft if there is none: the first frame the tab is shown, and
-    /// the first frame after it was left.
     fn stage(&mut self, current: &Config) {
         if self.draft.is_none() {
             self.draft = Some(current.clone());
         }
     }
 
-    /// True when this index's key really is in the OS keychain: the
-    /// preference is on *and* the keychain answers with an entry (a dead
-    /// daemon, a locked keyring or a denied prompt all read as "no").
-    /// Probed when the tab is entered and when the preference changes — a
-    /// keychain read is an IPC round trip.
+    /// True when the key really is in the OS keychain: the preference is on
+    /// *and* the keychain answers (a dead daemon or locked keyring reads as
+    /// "no"). Probed sparingly — a keychain read is an IPC round trip.
     fn keychain_active(&mut self, current: &Config) -> bool {
         if self.keychain_probed_for != Some(current.security.use_keychain) {
             let db_path = current.resolved_database_path();
@@ -130,7 +111,6 @@ impl SettingsTab {
         self.keychain_active
     }
 
-    /// Render; reports an applied draft config and/or a security action.
     pub fn ui(&mut self, ui: &mut egui::Ui, current: &Config) -> SettingsOutput {
         self.stage(current);
         let mut out = SettingsOutput::default();
@@ -142,8 +122,7 @@ impl SettingsTab {
         let scroll = egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                // Cap the column like a document page: a maximized window
-                // would otherwise stretch every hint into one long line.
+                // A maximized window would stretch every hint into one line.
                 ui.set_max_width(620.0);
 
                 ui.heading(egui::RichText::new("Paths").strong());
@@ -196,14 +175,12 @@ impl SettingsTab {
                 hotkey_note(ui, &draft.ui.search_hotkey, &current.ui.search_hotkey);
                 ui.separator();
 
-                // Security acts on the live config, not the draft. The KDF
-                // salt is never shown here or anywhere else in the GUI.
+                // Security acts on the live config, not the draft; the KDF
+                // salt is never shown anywhere in the GUI.
                 ui.heading(egui::RichText::new("Security").strong());
                 out.security = security_ui(ui, current, keychain_active);
                 ui.separator();
 
-                // Last in the scroll, where the Manage Index tab also puts
-                // it, so the two draft-backed editors read the same way.
                 let p = crate::color::palette(ui.visuals().dark_mode);
                 ui.horizontal(|ui| {
                     let apply = ui
@@ -215,8 +192,7 @@ impl SettingsTab {
                     if apply.clicked() {
                         out.applied = Some(draft.clone());
                     }
-                    // Comes and goes with the dirty state; keep it off the
-                    // ids of the hint that follows.
+                    // Comes and goes with the dirty state.
                     crate::ui_util::stable_section(ui, |ui| {
                         if dirty {
                             ui.label(
@@ -239,12 +215,9 @@ impl SettingsTab {
     }
 }
 
-/// The color schemes, as stored (lowercase) and as shown.
 const COLOR_SCHEMES: [(&str, &str); 2] = [("dark", "Dark"), ("light", "Light")];
 
-/// What the dropdown shows for a stored value, resolved through
-/// [`crate::app::theme_for`] so the box says what the app will actually do
-/// — including with a value it does not recognise.
+/// Via [`crate::app::theme_for`], so the box says what the app will actually do.
 fn scheme_label(value: &str) -> &'static str {
     match crate::app::theme_for(value) {
         egui::Theme::Dark => "Dark",
@@ -252,8 +225,6 @@ fn scheme_label(value: &str) -> &'static str {
     }
 }
 
-/// The color scheme dropdown. Returns the box, which is what the row's
-/// tooltip hangs off.
 fn color_scheme_edit(ui: &mut egui::Ui, setting: &mut String) -> egui::Response {
     egui::ComboBox::from_id_salt("cfg-color-scheme")
         .selected_text(scheme_label(setting))
@@ -265,9 +236,8 @@ fn color_scheme_edit(ui: &mut egui::Ui, setting: &mut String) -> egui::Response 
         .response
 }
 
-/// The search shortcut's control: a button showing the current binding that
-/// turns into a key-press reader when clicked, and a Clear beside it.
-/// Returns the button, which is what the row's tooltip hangs off.
+/// A button showing the current binding that turns into a key-press reader
+/// when clicked, and a Clear beside it.
 fn hotkey_edit(ui: &mut egui::Ui, setting: &mut String, capturing: &mut bool) -> egui::Response {
     let p = crate::color::palette(ui.visuals().dark_mode);
     ui.horizontal(|ui| {
@@ -310,11 +280,10 @@ fn hotkey_edit(ui: &mut egui::Ui, setting: &mut String, capturing: &mut bool) ->
     .inner
 }
 
-/// One frame of shortcut capture: `Some(Some(binding))` for a press worth
-/// binding, `Some(None)` for a cancel, `None` while nothing usable has
-/// arrived. Raw events, because egui's shortcut matching cannot report an
-/// arbitrary combination; invalid presses (a bare letter) are ignored, not
-/// treated as a cancel.
+/// One frame of capture: `Some(Some(binding))` for a press worth binding,
+/// `Some(None)` for a cancel, `None` while nothing usable arrived. Raw
+/// events, because egui's shortcut matching cannot report an arbitrary
+/// combination; invalid presses are ignored, not treated as a cancel.
 fn read_capture(ui: &egui::Ui) -> Option<Option<crate::hotkey::Binding>> {
     ui.input(|i| {
         for event in &i.events {
@@ -338,9 +307,8 @@ fn read_capture(ui: &egui::Ui) -> Option<Option<crate::hotkey::Binding>> {
     })
 }
 
-/// What the shortcut is really doing, under the Interface grid. Silent
-/// while registered and working; a line appears only when what is on the
-/// button is not what is in force.
+/// Silent while registered and working; a line appears only when what is on
+/// the button is not what is in force.
 fn hotkey_note(ui: &mut egui::Ui, draft: &str, live: &str) {
     use crate::hotkey::Status;
     let (text, color) = if draft.trim() != live.trim() {
@@ -368,7 +336,6 @@ fn hotkey_note(ui: &mut egui::Ui, draft: &str, live: &str) {
             ),
         }
     };
-    // Comes and goes with the state; keep it off the ids of what follows.
     crate::ui_util::stable_section(ui, |ui| {
         if text.is_empty() {
             return;
@@ -381,20 +348,15 @@ fn hotkey_note(ui: &mut egui::Ui, draft: &str, live: &str) {
     });
 }
 
-/// The Search-tab column picker, mirroring the right-click menu on the table
-/// headers. Returns the new set when a checkbox moved.
-///
-/// Acts on the **live** config, not the draft, for the same reason the
-/// Security block does: the header menu writes columns the instant they
-/// change, and a draft-backed copy here would silently revert that on the next
-/// Apply. `app::pin_live_fields` keeps the draft out of this field entirely.
+/// The Search-tab column picker, mirroring the header right-click menu.
+/// Acts on the **live** config: the header menu writes columns the instant
+/// they change, and a draft-backed copy here would silently revert that on
+/// the next Apply.
 fn columns_ui(ui: &mut egui::Ui, current: &ColumnsConfig) -> Option<ColumnsConfig> {
     let mut next = current.clone();
     ui.label("Search columns").on_hover_text(tips::COLUMNS.body);
     ui.horizontal_wrapped(|ui| {
         ui.checkbox(&mut next.name, "Name").tip(&tips::COLUMNS);
-        // Checked and greyed rather than absent: an omitted entry reads as an
-        // oversight, a disabled one answers the question.
         ui.add_enabled(false, egui::Checkbox::new(&mut true, "Path"))
             .on_disabled_hover_text(
                 "The path is always shown — it is the only column that \
@@ -414,7 +376,7 @@ fn columns_ui(ui: &mut egui::Ui, current: &ColumnsConfig) -> Option<ColumnsConfi
     (next != *current).then_some(next)
 }
 
-/// The Security block: status plus action buttons. Never renders the salt.
+/// Never renders the salt.
 fn security_ui(
     ui: &mut egui::Ui,
     current: &Config,
@@ -446,7 +408,6 @@ fn security_ui(
                 action = Some(SecurityAction::Disable);
             }
         });
-        // Its own row: three buttons do not fit the window's width.
         if ui
             .button("Show database key…")
             .tip(&tips::SHOW_KEY)
@@ -479,18 +440,16 @@ fn security_ui(
     action
 }
 
-/// The per-section config controls of the Settings tab. Every row goes
-/// through [`crate::tips::tip_row`], so a setting cannot arrive here
-/// without a tooltip.
+/// Every row goes through [`crate::tips::tip_row`], so a setting cannot
+/// arrive here without a tooltip.
 fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
     match section {
         Section::Indexing => {
             egui::Grid::new("cfg-indexing")
                 .num_columns(2)
                 .show(ui, |ui| {
-                    // Automatic vs manual is absent: it is live state switched
-                    // on the Manage Index tab, and a staged copy here would
-                    // fight those buttons.
+                    // Automatic vs manual is absent: it is live state, and a
+                    // staged copy would fight the Manage Index buttons.
                     tip_row(ui, "Full reindex every", &tips::REINDEX_INTERVAL, |ui| {
                         ui.horizontal(|ui| {
                             ui.add(
@@ -627,8 +586,7 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                     ui.checkbox(&mut config.search.live_results, "")
                 });
             });
-            // The warning comes and goes as the value is edited; keep it off
-            // the ids of what follows (`ui_util::stable_section`).
+            // The warning comes and goes as the value is edited.
             crate::ui_util::stable_section(ui, |ui| {
                 if let Some(warning) = config.search.fuzzy_edits_warning() {
                     ui.colored_label(ui.visuals().warn_fg_color, warning);

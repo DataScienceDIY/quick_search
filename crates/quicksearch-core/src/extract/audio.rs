@@ -1,6 +1,5 @@
-//! Audio tag extraction via [`lofty`]. Concatenates the searchable tag
-//! values — title, artist, album, genre, comment — into `text` so full-text
-//! search works across them.
+//! Audio tag extraction via [`lofty`]: title, artist, album, genre, and
+//! comment concatenate into the searchable `text`.
 
 use std::path::Path;
 
@@ -10,7 +9,7 @@ use lofty::{
     tag::{Accessor, ItemKey},
 };
 
-use super::{ExtractError, ExtractedContent, Extractor};
+use super::{ExtractError, Extractor};
 
 pub struct AudioExtractor;
 
@@ -19,15 +18,12 @@ impl Extractor for AudioExtractor {
         mime.starts_with("audio/")
     }
 
-    fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError> {
+    fn extract(&self, path: &Path) -> Result<String, ExtractError> {
         let tagged = Probe::open(path)
             .map_err(|e| format!("lofty probe {}: {}", path.display(), e))?
             .read()
             .map_err(|e| format!("lofty read {}: {}", path.display(), e))?;
 
-        // properties (parked): year, track and duration went to the property
-        // map alone and never reached `text`, so nothing collects them now.
-        // See `super::ExtractedContent`.
         let mut pieces: Vec<String> = Vec::new();
         if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
             let mut push = |value: Option<String>| {
@@ -35,9 +31,7 @@ impl Extractor for AudioExtractor {
                     pieces.push(v);
                 }
             };
-            // `ItemKey` first, falling back to the `Accessor` shortcut for the
-            // three fields that have one — a tag can carry the value under
-            // either.
+            // A tag can carry a value under `ItemKey` or the `Accessor` shortcut.
             push(
                 tag.get_string(&ItemKey::TrackTitle)
                     .filter(|v| !v.is_empty())
@@ -60,7 +54,7 @@ impl Extractor for AudioExtractor {
             push(tag.get_string(&ItemKey::Comment).map(str::to_string));
         }
 
-        Ok(ExtractedContent::with_text(pieces.join(" ")))
+        Ok(pieces.join(" "))
     }
 }
 
@@ -68,9 +62,8 @@ impl Extractor for AudioExtractor {
 mod tests {
     use super::*;
 
-    /// A minimal but real MPEG file: an ID3v2.3 tag carrying `frames`
-    /// (`("TPE1", "…")` and friends), followed by one silent MPEG-1 Layer III
-    /// frame so the probe recognizes the format from its content.
+    /// An ID3v2.3 tag carrying `frames`, then silent MPEG frames so the probe
+    /// recognizes the format from content.
     fn write_mp3(tag: &str, frames: &[(&str, &str)]) -> std::path::PathBuf {
         let mut body = Vec::new();
         for (id, value) in frames {
@@ -96,9 +89,8 @@ mod tests {
         ]);
         out.extend_from_slice(&body);
 
-        // MPEG-1 Layer III, 128 kbps, 44.1 kHz, no padding: 417-byte frames.
-        // Four of them, because the probe confirms a sync word by finding the
-        // next frame where the first one says it will be.
+        // MPEG-1 Layer III, 128 kbps, 44.1 kHz, no padding: 417-byte frames;
+        // the probe confirms sync by finding the next frame where the first says.
         for _ in 0..4 {
             out.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
             out.resize(out.len() + 413, 0);
@@ -109,9 +101,6 @@ mod tests {
         path
     }
 
-    /// The searchable text is assembled from the tag values, which is the
-    /// only reason audio files are full-text indexed at all. Pins the
-    /// rewrite that dropped the property map this used to be built from.
     #[test]
     fn tag_values_become_searchable_text() {
         let path = write_mp3(
@@ -126,24 +115,20 @@ mod tests {
         let out = AudioExtractor.extract(&path).expect("extract");
         for expected in ["Blue Monday", "New Order", "Power Corruption", "Synthpop"] {
             assert!(
-                out.text.contains(expected),
+                out.contains(expected),
                 "{:?} missing from {:?}",
                 expected,
-                out.text
+                out
             );
         }
-        // Title first, then artist, album, genre — a stable order so the
-        // stored text does not churn between runs.
-        assert_eq!(out.text, "Blue Monday New Order Power Corruption Synthpop");
+        assert_eq!(out, "Blue Monday New Order Power Corruption Synthpop");
     }
 
-    /// No tags at all is a successful extraction with nothing to store, not
-    /// a failure — `set_content_done` writes no sidecar row for it.
     #[test]
     fn an_untagged_file_yields_empty_text() {
         let path = write_mp3("audio-untagged", &[]);
         let out = AudioExtractor.extract(&path).expect("extract");
-        assert!(out.text.is_empty(), "unexpected text {:?}", out.text);
+        assert!(out.is_empty(), "unexpected text {:?}", out);
     }
 
     #[test]

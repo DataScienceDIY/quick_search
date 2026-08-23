@@ -1,71 +1,29 @@
 //! Text detection and charset decoding, shared by the MIME sniff and the
-//! plaintext extractor.
+//! plaintext extractor — one classifier, so they cannot drift.
+//! [`decode_text`] decodes every class but `Binary`; [`looks_like_text`]
+//! accepts only `Utf8` and `Bom`, the classes with positive proof.
 //!
-//! Both callers route through one classifier so they cannot drift, but they
-//! accept different amounts of it, because they are answering different
-//! questions:
-//!
-//! - [`decode_text`] is asked "this file is text — render it". Something
-//!   else already established that, usually the extension. Every class but
-//!   `Binary` decodes unconditionally.
-//! - [`looks_like_text`] is asked "is this text at all?", by a caller that
-//!   has *no other evidence*: no known extension, no magic bytes. It
-//!   accepts only `Utf8` and `Bom`, the two classes that carry positive
-//!   proof.
-//!
-//! Classification order is load-bearing:
-//!
-//! 1. **BOM** ([`encoding_rs::Encoding::for_bom`]) — before the binary
-//!    guard, because UTF-16 text is full of NUL bytes the guard would
-//!    reject.
-//! 2. **Binary guard** — any NUL byte, or control bytes (outside
-//!    `\t \n \r`, with ESC tolerated for ANSI-colored logs) above 10% of
-//!    the buffer. UTF-16 without a BOM fails here by design.
-//! 3. **Strict UTF-8** — with one tolerance for the sniff: a head is a
-//!    prefix of the file (indexing hashes the first `hash_length` bytes and
-//!    sniffs the same buffer), so a multibyte sequence cut off by the end
-//!    of the buffer does not disqualify it.
-//! 4. **Legacy** — everything else. [`decode_text`] runs charset detection
-//!    (chardetng, windows-1252 floor) and decodes with replacement. The
-//!    sniff **rejects** this class, and that asymmetry is the whole point:
-//!    chardetng's windows-1252 floor means it never fails, so treating
-//!    `Legacy` as proof of text makes the sniff unfalsifiable. The binary
-//!    guard only rejects NUL and control bytes, so any format built out of
-//!    `0x80-0xFF` — protobuf varints, packed binary telemetry — walks
-//!    straight through it and gets stored as mojibake. Measured on a
-//!    99k-file tree, that one leak was 93% of all extracted text; the
-//!    legitimate `Legacy`-decoding files it costs us are the ones with no
-//!    extension *and* no magic bytes, which measured 5 files and 0.1 MB.
-//!    A file with a known text extension is unaffected: it is typed by
-//!    `mime_guess`, never reaches the sniff, and still decodes as legacy.
-//!
-//! The sniff sees only the head, so a file with a text head and a binary
-//! tail classifies as text and then fails the whole-file decode; that lands
-//! as a FAILED row with a reason, the normal shape of head-based
-//! classification.
+//! Classification order is load-bearing: **BOM** first (UTF-16 is full of
+//! NULs the binary guard would reject), then the binary guard, then strict
+//! UTF-8, then `Legacy`. The sniff rejects `Legacy` on purpose: chardetng's
+//! windows-1252 floor never fails, so accepting it makes the sniff
+//! unfalsifiable and stores NUL-free binary formats as mojibake.
 
-/// How much of a file the charset detector is shown.
-///
-/// chardetng scores byte frequencies against a model per encoding; the answer
-/// stops moving well inside this. Reading further is a second full pass over
-/// the file for no change in the verdict.
+/// How much of a file the charset detector is shown; chardetng's answer
+/// stops moving well inside this.
 const DETECT_PREFIX: usize = 64 * 1024;
 
 use std::path::Path;
 
 enum TextClass {
-    /// Strict UTF-8 (modulo the truncated-tail tolerance).
     Utf8,
-    /// Starts with a BOM; decode with this encoding.
     Bom(&'static encoding_rs::Encoding),
     /// Not UTF-8 but passes the binary guard: charset detection will decode.
     Legacy,
-    /// Fails the binary guard.
     Binary,
 }
 
-/// Control bytes tolerated in text: ordinary whitespace, plus ESC because
-/// ANSI-colored logs are text worth indexing.
+/// Ordinary whitespace, plus ESC because ANSI-colored logs are text.
 fn is_benign_control(b: u8) -> bool {
     matches!(b, b'\t' | b'\n' | b'\r' | 0x1B)
 }
@@ -77,9 +35,8 @@ fn classify(bytes: &[u8], truncated: bool) -> TextClass {
         return TextClass::Bom(enc);
     }
 
-    // Binary guard. NUL never appears in text of any supported encoding
-    // (UTF-16 was handled above, by BOM or not at all); a run of other
-    // control bytes marks compressed or machine data that merely lacks NULs.
+    // Binary guard: NUL never appears in text of any supported encoding
+    // (UTF-16 was handled above, by BOM or not at all).
     let mut suspect = 0usize;
     for &b in bytes {
         if b == 0 {
@@ -106,24 +63,16 @@ fn classify(bytes: &[u8], truncated: bool) -> TextClass {
 /// Whether `head` — a possibly-truncated prefix of a file — is *provably*
 /// text: valid UTF-8, or BOM-marked.
 ///
-/// The sniff behind [`crate::mime::guess_mime_from_head`]'s `text/plain`
-/// catch-all; see the module docs on why `TextClass::Legacy` is rejected
-/// here but accepted by [`decode_text`].
-///
 /// An empty head proves nothing and answers `false`; without that guard
-/// `classify` would call it valid UTF-8 and every zero-size procfs file
-/// would become `text/plain`.
+/// every zero-size procfs file would become `text/plain`.
 pub fn looks_like_text(head: &[u8]) -> bool {
     !head.is_empty() && matches!(classify(head, true), TextClass::Utf8 | TextClass::Bom(_))
 }
 
-/// Decode a complete file's bytes to UTF-8 for storage.
-///
-/// Accepts every class [`looks_like_text`] does and `Legacy` besides: by the
-/// time this runs, something has already decided the file is text — usually
-/// its extension, which is evidence the sniff does not have — so a
-/// windows-1252 `.txt` or a Shift-JIS `.csv` still decodes here. `path` is
-/// used only to name the file in the error.
+/// Decode a complete file's bytes to UTF-8 for storage. Accepts `Legacy`
+/// besides what [`looks_like_text`] does: by the time this runs, something —
+/// usually the extension — has already decided the file is text, so a
+/// windows-1252 `.txt` or Shift-JIS `.csv` still decodes.
 pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
     if bytes.is_empty() {
         return Ok(String::new());
@@ -132,8 +81,7 @@ pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
         // Cannot fail: classify ran strict validation with truncated=false.
         TextClass::Utf8 => Ok(String::from_utf8(bytes).expect("classified as UTF-8")),
         TextClass::Bom(enc) => {
-            // BOM-aware decode: strips the BOM, replaces malformed
-            // sequences (e.g. a truncated trailing code unit) with U+FFFD.
+            // Strips the BOM, replaces malformed sequences with U+FFFD.
             let (text, _, _) = enc.decode(&bytes);
             Ok(text.into_owned())
         }
@@ -141,12 +89,8 @@ pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
             // ISO-2022-JP detection is safe here: the browser caveat about
             // it concerns script-running web content, not indexed files.
             let mut det = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
-            // A prefix, not the whole file. The detector is scoring byte
-            // frequencies against per-encoding models, and those converge in
-            // kilobytes — feeding it a 200 MiB log costs a full extra pass
-            // over it to reach the same answer. `last` stays false because
-            // there may be more: it only tells the detector this is not the
-            // end of the input, which is exactly right for a prefix.
+            // A prefix, not the whole file: the detector converges in
+            // kilobytes, and a 200 MiB log would cost a full extra pass.
             let prefix = &bytes[..bytes.len().min(DETECT_PREFIX)];
             det.feed(prefix, prefix.len() == bytes.len());
             // Deny UTF-8: strict UTF-8 was already ruled out, so a UTF-8
@@ -161,15 +105,10 @@ pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
 
 /// Replace control characters with `U+FFFD`, borrowing when there are none.
 ///
-/// Filenames may contain any byte but NUL and the separator, and extracted
-/// text is whatever was in the file — so both can carry terminal escape
-/// sequences. Printed raw they rewrite the line, retitle the window, or on a
-/// terminal with OSC 52 enabled put text of the writer's choosing on the
-/// user's clipboard. `ls` has scrubbed for this reason for decades.
-///
-/// Tab survives: it is a legitimate part of a filename and harmless. So does
-/// everything above C1 — this is not a general sanitiser, and the point is to
-/// stay byte-for-byte faithful wherever there is nothing dangerous to remove.
+/// Filenames and extracted text can carry terminal escape sequences; printed
+/// raw they rewrite the line, retitle the window, or via OSC 52 put text of
+/// the writer's choosing on the user's clipboard. Tab survives, as does
+/// everything above C1 — this is not a general sanitiser.
 pub fn scrub_controls(s: &str) -> std::borrow::Cow<'_, str> {
     fn dangerous(c: char) -> bool {
         (c.is_control() && c != '\t') || ('\u{80}'..='\u{9f}').contains(&c)
@@ -235,14 +174,9 @@ mod tests {
         assert_eq!(decode_text(body, &p()).unwrap(), src);
     }
 
-    /// Legacy charsets decode, but do not *sniff*: a `.txt` extension routes
-    /// these bytes to `decode_text` and they render correctly, while the
-    /// same bytes with no extension and no magic are not text enough to
-    /// adopt on their own.
+    /// Legacy charsets decode, but do not *sniff*.
     #[test]
     fn windows_1252_decodes_but_does_not_sniff() {
-        // A sentence long enough for chardetng to settle on a Western
-        // single-byte encoding.
         let body = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9.".to_vec();
         assert!(
             !looks_like_text(&body),
@@ -254,9 +188,7 @@ mod tests {
         );
     }
 
-    /// Detection reads a bounded prefix, so a file far larger than it still
-    /// decodes as the encoding its head implies — and the tail is decoded in
-    /// full regardless, since only the *detector*'s input is bounded.
+    /// Only the *detector*'s input is bounded; the tail is decoded in full.
     #[test]
     fn detection_prefix_is_bounded_and_the_tail_still_decodes() {
         let head = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9. ";
@@ -264,7 +196,6 @@ mod tests {
         while body.len() < DETECT_PREFIX * 3 {
             body.extend_from_slice(head);
         }
-        // A marker past the detector's window: it must survive the decode.
         body.extend_from_slice(b"caf\xe9-tail-marker");
         let out = decode_text(body, &p()).unwrap();
         assert!(
@@ -274,8 +205,6 @@ mod tests {
         assert!(out.starts_with("Le café près"), "got {:?}", &out[..24]);
     }
 
-    /// The prefix bound must not change the verdict for a file smaller than
-    /// it — the whole buffer is still what the detector sees.
     #[test]
     fn detection_prefix_leaves_short_files_alone() {
         let body = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9.".to_vec();
@@ -288,7 +217,6 @@ mod tests {
 
     #[test]
     fn shift_jis_decodes_but_does_not_sniff() {
-        // "日本語のテキストです。これはシフトJISでエンコードされています。"
         let src = "日本語のテキストです。これはシフトJISでエンコードされています。";
         let (encoded, _, had_errors) = encoding_rs::SHIFT_JIS.encode(src);
         assert!(!had_errors);
@@ -319,7 +247,6 @@ mod tests {
 
     #[test]
     fn ansi_log_is_text() {
-        // ESC-heavy colored log output stays text.
         let body =
             b"\x1b[31mERROR\x1b[0m something failed\n\x1b[33mWARN\x1b[0m retrying\n".to_vec();
         assert!(looks_like_text(&body));
@@ -342,9 +269,8 @@ mod tests {
         assert_eq!(decode_text(Vec::new(), &p()).unwrap(), "");
     }
 
-    /// UTF-16 without a BOM is out of scope: its NULs trip the binary
-    /// guard. This test documents the decision rather than a limitation we
-    /// intend to lift.
+    /// UTF-16 without a BOM is out of scope by decision: its NULs trip the
+    /// binary guard.
     #[test]
     fn utf16_without_bom_is_rejected() {
         let mut body = Vec::new();
@@ -356,9 +282,8 @@ mod tests {
     }
 
     /// Every head the sniff accepts must decode — the invariant that makes
-    /// "sniffed as text/plain" safe to act on. The `expect_sniff` column
-    /// pins which side of the UTF-8 line each head falls on, so a head that
-    /// silently stops being sniffed can't quietly weaken this test.
+    /// "sniffed as text/plain" safe to act on. The `expect_sniff` column pins
+    /// each head's side of the line so a change can't quietly weaken this.
     #[test]
     fn sniffed_text_is_guaranteed_decodable() {
         let heads: Vec<(bool, Vec<u8>)> = vec![
@@ -390,13 +315,10 @@ mod tests {
         }
     }
 
-    /// The regression this guard exists for. Protobuf wire format is varint
-    /// field tags and lengths — bytes in `0x80-0xFF`, which are neither NUL
-    /// nor control bytes, so the binary guard passes them and chardetng's
-    /// windows-1252 floor then "decodes" them into mojibake that never
-    /// fails. On a real 99k-file tree this single hole was 93% of all
-    /// extracted text. Bytes below are the head of an actual `.pb` GPS log:
-    /// varint-framed records wrapping ASCII NMEA sentences.
+    /// The regression this guard exists for: protobuf wire bytes clear the
+    /// binary guard, and chardetng's windows-1252 floor then "decodes" them
+    /// into mojibake. On a real 99k-file tree this single hole was 93% of
+    /// all extracted text.
     #[test]
     fn protobuf_head_is_not_text() {
         let mut body = b"\x10\n\x02v1\x10\x01\x18\xe2\xe3\xfc\xd3\x9d\xca\x97\xe4\x189\x08\
@@ -406,8 +328,6 @@ mod tests {
         body.extend_from_slice(b"\x18\xe3e>\x08\xeb\xac\xfb\xd2\x9e\xca\x97\xe4\x18\x12/");
         body.extend_from_slice(b"$GNGSA,M,1,,,,,,,,,,,,,99.99,99.99,99.99,1*3F\r\n");
 
-        // It clears the binary guard — that is exactly why the guard alone
-        // was not enough — but it is not valid UTF-8, so the sniff declines.
         assert!(
             !looks_like_text(&body),
             "protobuf must not be adopted as text/plain"

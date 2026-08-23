@@ -24,6 +24,7 @@ fn group(paths: &[&str]) -> DuplicateGroup {
 fn loaded(paths: &[&str]) -> DuplicatesTab {
     DuplicatesTab {
         state: DupState::Loaded(LoadedGroups::new(vec![group(paths)])),
+        sort: DupSort::default(),
     }
 }
 
@@ -173,11 +174,143 @@ fn a_member_row_offers_the_verification_too() {
     );
 }
 
+/// A group named by its first member, with the waste that decides the
+/// default order set by hand.
+fn sized_group(name: &str, redundant: i64) -> DuplicateGroup {
+    let mut group = group(&[&format!("/a/{name}"), &format!("/b/{name}")]);
+    group.hash = name.as_bytes().to_vec();
+    group.redundant_size = redundant;
+    group
+}
+
+/// The names of the groups, in the order the tab would list them.
+fn listed(groups: Vec<DuplicateGroup>, sort: DupSort) -> Vec<String> {
+    let mut loaded = LoadedGroups::new(groups);
+    loaded.sort(sort);
+    loaded
+        .order
+        .iter()
+        .map(|&i| loaded.groups[i].members[0].1.clone())
+        .collect()
+}
+
+#[test]
+fn the_default_order_is_the_one_the_scan_returned() {
+    let groups = vec![
+        sized_group("big.txt", 900),
+        sized_group("small.jpg", 10),
+        sized_group("middling.txt", 100),
+    ];
+    assert_eq!(
+        listed(groups, DupSort::Reclaimable),
+        ["big.txt", "small.jpg", "middling.txt"],
+        "the query already ordered these; the tab must not reshuffle them"
+    );
+}
+
+#[test]
+fn sorting_by_extension_gathers_the_extensions_together() {
+    let groups = vec![
+        sized_group("b.txt", 10),
+        sized_group("a.jpg", 20),
+        sized_group("a.txt", 30),
+        sized_group("b.jpg", 40),
+    ];
+    assert_eq!(
+        listed(groups, DupSort::Extension),
+        // .jpg before .txt, and within each the bigger waste first.
+        ["b.jpg", "a.jpg", "a.txt", "b.txt"]
+    );
+}
+
+/// Files without one are a category of their own, and not an interesting
+/// one; they go after every extension rather than in front of "a".
+#[test]
+fn groups_without_an_extension_sort_last() {
+    let groups = vec![
+        sized_group("README", 900),
+        sized_group("notes.zzz", 10),
+        sized_group("Makefile", 800),
+    ];
+    assert_eq!(
+        listed(groups, DupSort::Extension),
+        ["notes.zzz", "README", "Makefile"]
+    );
+}
+
+#[test]
+fn extension_matching_ignores_case() {
+    let groups = vec![
+        sized_group("shot.JPG", 10),
+        sized_group("scan.jpg", 20),
+        sized_group("note.txt", 30),
+    ];
+    assert_eq!(
+        listed(groups, DupSort::Extension),
+        ["scan.jpg", "shot.JPG", "note.txt"],
+        "one extension, spelled two ways, is still one extension"
+    );
+}
+
+/// Switching back is switching back, not a second arbitrary order.
+#[test]
+fn the_order_returns_when_the_choice_does() {
+    let groups = vec![
+        sized_group("big.txt", 900),
+        sized_group("small.jpg", 10),
+        sized_group("middling.txt", 100),
+    ];
+    let mut loaded = LoadedGroups::new(groups);
+    loaded.sort(DupSort::Extension);
+    loaded.sort(DupSort::Reclaimable);
+    let names: Vec<&str> = loaded
+        .order
+        .iter()
+        .map(|&i| loaded.groups[i].members[0].1.as_str())
+        .collect();
+    assert_eq!(names, ["big.txt", "small.jpg", "middling.txt"]);
+}
+
+/// End to end: the choice reaches the list, and reordering what is already
+/// loaded is not a reason to go back to the database.
+#[test]
+fn choosing_an_order_relists_without_rescanning() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = DuplicatesTab {
+        state: DupState::Loaded(LoadedGroups::new(vec![
+            sized_group("b.txt", 900),
+            sized_group("a.jpg", 10),
+        ])),
+        sort: DupSort::default(),
+    };
+
+    let order_on_screen = |out: &egui::FullOutput| -> Vec<String> {
+        painted_text(out)
+            .into_iter()
+            .filter(|t| t.contains("reclaimable"))
+            .collect()
+    };
+    let (out, _) = frame(&ctx, &mut tab, false, Vec::new());
+    let before = order_on_screen(&out);
+    assert!(before[0].contains("b.txt"), "{before:?}");
+
+    tab.sort = DupSort::Extension;
+    let (out, actions) = frame(&ctx, &mut tab, false, Vec::new());
+    let after = order_on_screen(&out);
+    assert!(after[0].contains("a.jpg"), "{after:?}");
+    assert!(
+        !actions.refresh,
+        "reordering what is loaded must not ask for another scan"
+    );
+    assert_eq!(before.len(), after.len(), "a group went missing");
+}
+
 #[test]
 fn an_empty_result_says_so_rather_than_showing_an_empty_list() {
     let ctx = crate::test_ui::ctx();
     let mut tab = DuplicatesTab {
         state: DupState::Loaded(LoadedGroups::new(Vec::new())),
+        sort: DupSort::default(),
     };
     let painted = painted_text(&frame(&ctx, &mut tab, false, Vec::new()).0);
     assert!(

@@ -1,10 +1,9 @@
 //! The three OOXML corpus files: `.docx`, `.xlsx`, `.pptx`.
 //!
-//! `docx-rs` and `rust_xlsxwriter` are complete, independent implementations
-//! of their formats — including the container, since `docx-rs` carries `zip`
-//! 8.x against the 0.6 `extract::office` reads with. There is no comparable
-//! crate for PowerPoint, so the `.pptx` is assembled from [`super::zipwriter`]
-//! and `format!`, which is independent of both `zip` 0.6 and `quick-xml`.
+//! `docx-rs` and `rust_xlsxwriter` are complete independent implementations,
+//! container included (`docx-rs` carries `zip` 8.x against the 0.6 the
+//! reader uses). No comparable crate exists for PowerPoint, so the `.pptx`
+//! is assembled from [`super::zipwriter`] and `format!`.
 
 use std::path::Path;
 
@@ -17,8 +16,6 @@ pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec
     pptx(dir, lcg, body, out);
 }
 
-/// One paragraph per sentence, one run per paragraph — so each sentence lands
-/// in a single `<w:t>` and reaches the reader contiguous.
 fn docx(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
     use docx_rs::*;
 
@@ -33,11 +30,8 @@ fn docx(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>)
     out.push(Sample::prose(path, "docx", &b, false));
 }
 
-/// One sentence per cell, one cell per row.
-///
-/// `rust_xlsxwriter` puts strings in a real `xl/sharedStrings.xml` table and
-/// has the cells index into it, which is the path `extract_xlsx` exists for —
-/// an inline-string writer would leave the shared-string reader untested.
+/// `rust_xlsxwriter` uses a real `xl/sharedStrings.xml` table — the path
+/// `extract_xlsx` exists for; an inline-string writer would leave it untested.
 fn xlsx(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
     use rust_xlsxwriter::Workbook;
 
@@ -54,9 +48,7 @@ fn xlsx(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>)
     out.push(Sample::prose(path, "xlsx", &b, false));
 }
 
-/// Sentences dealt across three slides, so `extract_pptx`'s per-slide loop and
-/// its `--- New Slide ---` marker are both exercised rather than a single
-/// slide's happy path.
+/// Dealt across three slides: the per-slide loop and its `--- New Slide ---` marker.
 fn pptx(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
     const SLIDES: usize = 3;
     let b = body(lcg, Charset::Unicode);
@@ -100,9 +92,8 @@ fn pptx(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>)
 
     let path = super::write_file(dir, "deck.pptx", &zipwriter::archive(&entries));
 
-    // Dealing round-robin means slide order, not sentence order, decides what
-    // the reader emits — so the expectation has to be rebuilt in the order the
-    // slides are read, not copied from `b.sentences`.
+    // Round-robin dealing means slide order decides emission, so the
+    // expectation is rebuilt in read order, not copied from `b.sentences`.
     let mut expected = Vec::with_capacity(b.sentences.len());
     for slide in 0..SLIDES {
         expected.extend(b.sentences.iter().skip(slide).step_by(SLIDES).cloned());
@@ -116,10 +107,7 @@ fn pptx(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>)
     });
 }
 
-/// A `[Content_Types].xml` good enough to make the archive a real package.
-/// The reader never opens it — it goes straight for `ppt/slides/slide*.xml` —
-/// but a package without one is not a `.pptx`, and the corpus should not be
-/// asserting against something no other tool would accept.
+/// The reader never opens `[Content_Types].xml`, but without one no other tool accepts the package.
 const CONTENT_TYPES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
      <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
      <Default Extension=\"xml\" ContentType=\"application/xml\"/>\

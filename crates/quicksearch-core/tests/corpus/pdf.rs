@@ -1,18 +1,10 @@
-//! The PDF corpus file, written with `pdf-writer`.
+//! The PDF corpus file, written with `pdf-writer` (typst), which shares no
+//! code with the `pdf-extract`/`lopdf` the reader parses with.
 //!
-//! `pdf-writer` is typst's low-level writer. It shares no code with
-//! `pdf-extract` — in particular no `lopdf`, which is what `extract::pdf`
-//! parses with and what the unit tests in `src/extract/pdf.rs` build their
-//! fixtures with.
-//!
-//! # Why the text is Latin-1
-//!
-//! Helvetica is one of the fourteen fonts every PDF reader ships, so no font
-//! file has to be embedded and no glyph can be missing for the wrong reason.
-//! Its repertoire under `WinAnsiEncoding` is cp1252 — which covers the
-//! corpus's Latin-1 phrase and cannot express its Greek one. Hence
-//! [`Charset::Latin1`]: demanding Greek here would be asserting against a
-//! limit of the fixture rather than of the extractor.
+//! The text is Latin-1: Helvetica is a base-14 font, so nothing is embedded
+//! and no glyph can be missing for the wrong reason; its repertoire under
+//! `WinAnsiEncoding` is cp1252, which cannot express the Greek phrase —
+//! demanding it would assert against the fixture, not the extractor.
 
 use std::path::Path;
 
@@ -42,8 +34,7 @@ pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec
     page.finish();
 
     // Without an explicit encoding the font falls back to StandardEncoding,
-    // whose upper half is not Latin-1 at all — `é` would come back as an
-    // acute accent on its own.
+    // whose upper half is not Latin-1 — `é` would come back as a bare accent.
     pdf.type1_font(font_id)
         .base_font(Name(b"Helvetica"))
         .encoding_predefined(Name(b"WinAnsiEncoding"));
@@ -51,8 +42,7 @@ pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec
     let mut content = Content::new();
     content.begin_text();
     content.set_font(font_name, 12.0);
-    // Leading set once, then one `next_line` per sentence: each sentence is a
-    // single `Tj` so nothing can be interleaved into the middle of one.
+    // One `Tj` per sentence, so nothing can interleave into the middle of one.
     content.set_leading(16.0);
     content.next_line(56.0, 780.0);
     for (i, sentence) in b.sentences.iter().enumerate() {

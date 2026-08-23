@@ -25,8 +25,7 @@ pub fn fmt_mtime(unix_secs: i64) -> String {
     }
 }
 
-/// Relative time for recent events, absolute for old ones: "just now",
-/// "5 min ago", "3 h ago", else `YYYY-MM-DD HH:MM`.
+/// "just now", "5 min ago", "3 h ago", then `YYYY-MM-DD HH:MM`.
 pub fn fmt_ago(unix_secs: u64) -> String {
     let age = quicksearch_core::log::now_unix().saturating_sub(unix_secs);
     if age < 60 {
@@ -40,16 +39,10 @@ pub fn fmt_ago(unix_secs: u64) -> String {
     }
 }
 
-/// A configured interval as a phrase to drop after "every": `90 min`,
-/// `24 h`, `3 days`.
+/// An interval as a phrase to follow "every": `90 min`, `24 h`, `3 days`.
 pub fn fmt_interval(minutes: u64) -> String {
-    // The same clamp the scheduler applies. Zero is only reachable from a
-    // hand-edited config — the spinner's floor is 5 — and it used to read
-    // "run", from a time when the scheduler took it as always-due. It no
-    // longer does (`coordinator::inner::periodic_due` raises it to one
-    // minute, because "reindex continuously" is not a setting anyone wants
-    // and manual mode is how you say "never"), so saying "run" here would
-    // describe a behaviour the app does not have.
+    // The same clamp `coordinator::inner::periodic_due` applies; the two
+    // must not describe different behaviour.
     let minutes = minutes.max(1);
     if minutes < 60 {
         return format!("{} min", minutes);
@@ -69,7 +62,7 @@ pub fn fmt_interval(minutes: u64) -> String {
     format!("{} h {} min", minutes / 60, minutes % 60)
 }
 
-/// Group thousands for counts: `1,234,567`.
+/// `1,234,567`.
 pub fn group_thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -82,8 +75,7 @@ pub fn group_thousands(n: u64) -> String {
     out
 }
 
-/// Files/sec display. Never renders a nonzero rate as "0.0": slow rates
-/// switch to a per-minute figure.
+/// Files/sec. A nonzero rate never renders as "0.0": slow rates go per-minute.
 pub fn fmt_rate(files_per_sec: f64) -> String {
     if files_per_sec <= 0.0 {
         "0 files/s".to_string()
@@ -106,8 +98,7 @@ pub fn fmt_elapsed(d: std::time::Duration) -> String {
     }
 }
 
-/// A running clock: `0:07`, `4:32`, `1:04:12`. Seconds are always two
-/// digits so the text does not change width every tick.
+/// A running clock: `0:07`, `4:32`, `1:04:12`; fixed-width seconds.
 pub fn fmt_duration_clock(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
@@ -118,9 +109,8 @@ pub fn fmt_duration_clock(d: std::time::Duration) -> String {
     }
 }
 
-/// What a finished configuration reconciliation did, in one line. A clause
-/// whose count is zero is left out rather than printed as "0", and a pass
-/// that found nothing to change still reports that it ran.
+/// What a finished reconciliation did, in one line. A zero clause is left
+/// out, and a pass that changed nothing still reports that it ran.
 pub fn fmt_reconcile_summary(deleted: usize, recontented: usize) -> String {
     let entries = |n: usize| {
         format!(
@@ -142,9 +132,8 @@ pub fn fmt_reconcile_summary(deleted: usize, recontented: usize) -> String {
     format!("Configuration change applied · {}", parts.join(" · "))
 }
 
-/// Middle-truncate a path to at most `max_chars` characters. Char-count
-/// based and `Ui`-free; rows with a real pixel budget use the width-aware
-/// `ui_util::middle_elide` instead.
+/// Middle-truncate to at most `max_chars` characters, `Ui`-free; rows with a
+/// pixel budget use the width-aware `ui_util::middle_elide`.
 pub fn middle_truncate(s: &str, max_chars: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max_chars || max_chars < 5 {
@@ -174,15 +163,12 @@ mod tests {
 
     #[test]
     fn intervals() {
-        // Clamped, exactly as `periodic_due` clamps it: the two must not
-        // describe different behaviour.
         assert_eq!(fmt_interval(0), "1 min");
         assert_eq!(fmt_interval(1), "1 min");
         assert_eq!(fmt_interval(59), "59 min");
         assert_eq!(fmt_interval(60), "1 h", "the shipped default");
         assert_eq!(fmt_interval(90), "1 h 30 min");
         assert_eq!(fmt_interval(120), "2 h");
-        // A whole day is the one multiple-of-1440 case that stays in hours.
         assert_eq!(fmt_interval(1440), "24 h");
         assert_eq!(fmt_interval(2880), "2 days");
         assert_eq!(fmt_interval(10_080), "7 days");

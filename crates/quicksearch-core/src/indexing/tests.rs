@@ -7,9 +7,8 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    // Canonical: the temp dir itself may sit behind a symlink
-    // (/tmp -> /private/tmp), and these tests compare walked paths
-    // against the root they passed in.
+    // Canonical: the temp dir may sit behind a symlink (/tmp -> /private/tmp)
+    // and these tests compare walked paths against the root they passed in.
     crate::testutil::scratch_dir_canonical(tag)
 }
 
@@ -76,8 +75,6 @@ fn a_root_without_an_override_gets_no_entry() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The progress line reports whichever pool the root's current phase is
-/// running; a walk pool that already exited must not be read.
 #[test]
 fn worker_counts_follow_the_phase() {
     let dir = tmp_dir("phase-workers");
@@ -137,10 +134,7 @@ fn worker_counts_follow_the_phase() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The writer's extraction turn is bounded by its slice, not by what is
-/// ready: rows the slice does not reach are carried to the next turn, and the
-/// root is not `Done` until they have all landed. Pinned with a zero slice,
-/// under which every turn writes exactly one row.
+/// Pinned with a zero slice, under which every turn writes exactly one row.
 #[test]
 fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
     use super::pipeline::RunCx;
@@ -154,8 +148,6 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
     let mut conn = db::open_or_recreate(&db_path, "trigram").unwrap();
     let tree = dir.join("tree");
     std::fs::create_dir_all(&tree).unwrap();
-    // Five rows the walk would have written, whose extracted text is
-    // hand-built below rather than read back — the pass is not the subject.
     let mut ready: Vec<ExtractedRow> = Vec::new();
     {
         let tx = conn.transaction().unwrap();
@@ -166,10 +158,8 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
                 &tx,
                 &NewFile {
                     name: &format!("f{}.txt", i),
-                    // `dir_to_db_parent`, not `to_string_lossy`: a stored
-                    // parent always ends in a separator, and a row spelled
-                    // without one sorts below every `ExtractCursor` range that
-                    // should contain it.
+                    // A stored parent always ends in a separator; without one
+                    // the row sorts below every `ExtractCursor` range.
                     parent: &crate::file_handling::dir_to_db_parent(&tree),
                     size: 22,
                     mtime: 1,
@@ -258,7 +248,6 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
             p.ready.len()
         );
         if !progressed {
-            // The empty pass has not reported `Finished` yet.
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -279,8 +268,6 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
         )
         .unwrap();
     assert_eq!(done, 5, "every row reached the index");
-    // The empty pass counted its (empty) range, so the totals are known and
-    // the snapshot reports this run's rows on top of the range's zero.
     assert_eq!(p.snapshot().extracted, 5);
     assert_eq!(p.snapshot().extract_total, Some(0));
 
@@ -288,8 +275,6 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// One full run over `config`'s roots, driven directly so the caller owns
-/// the stop flag. Returns when the run does.
 fn run_with(config: &Config, db_path: &str, stop: &Arc<AtomicBool>) -> Result<(), String> {
     IndexingService::run_indexing(
         &Arc::new(Mutex::new(IndexingStatus::Idle)),
@@ -306,30 +291,25 @@ fn outstanding_work(db_path: &str, config: &Config) -> crate::config::IndexWork 
     crate::scope::outstanding_work(db_path, config).unwrap()
 }
 
-/// The count `root`'s last clean walk recorded, if any.
 fn stored_walk_count(db_path: &str, root: &str) -> Option<usize> {
     let conn = db::open_existing(db_path, false).unwrap();
     crate::db::repo::get_root_walk_count(&conn, root)
 }
 
-/// What the last completed run counted under `root`, if any.
 fn stored_root_counts(db_path: &str, root: &str) -> Option<crate::db::repo::RootCounts> {
     let conn = db::open_existing(db_path, false).unwrap();
     crate::db::repo::get_root_counts(&conn, root)
 }
 
-/// A walk that could not read part of its tree must not record its count:
-/// the figure is the next run's progress denominator, and nothing ever
-/// re-derives it.
-///
-/// Unix only: on Windows the `icacls` deny ACE does not bind the owning
-/// process reliably enough to test against.
+/// The recorded figure is the next run's progress denominator, and nothing
+/// ever re-derives it.
+/// Unix only: a Windows `icacls` deny ACE does not bind the owning process
+/// reliably enough to test against.
 #[cfg(unix)]
 #[test]
 fn an_unreadable_directory_keeps_the_walk_count_unrecorded() {
     let dir = tmp_dir("unreadable-count");
-    // The tree is a subdirectory, so the index and its WAL sidecars do not
-    // sit inside the root being walked and count as files.
+    // A subdirectory, so the index and its sidecars are not under the root.
     let tree = dir.join("tree");
     std::fs::create_dir_all(&tree).unwrap();
     std::fs::write(tree.join("visible.txt"), "indexed").unwrap();
@@ -355,8 +335,6 @@ fn an_unreadable_directory_keeps_the_walk_count_unrecorded() {
         "a walk that could not read a directory saw only part of the tree"
     );
 
-    // And the same tree, readable, does record one — otherwise the
-    // assertion above would hold for a guard that never records anything.
     run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
     assert_eq!(
         stored_walk_count(&db_path, &root),
@@ -367,8 +345,6 @@ fn an_unreadable_directory_keeps_the_walk_count_unrecorded() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A run the stop flag cut short is the other way a walk comes back with a
-/// partial count.
 #[test]
 fn a_stopped_run_keeps_the_walk_count_unrecorded() {
     let dir = tmp_dir("stopped-count");
@@ -381,24 +357,16 @@ fn a_stopped_run_keeps_the_walk_count_unrecorded() {
     config.paths.database_path = db_path.clone();
     let root = normalize_root_string(&dir.to_string_lossy());
 
-    // Already set, so the run stops at its first check — the deterministic
-    // stand-in for a shutdown part-way through a walk.
     run_with(&config, &db_path, &Arc::new(AtomicBool::new(true))).unwrap();
     assert_eq!(stored_walk_count(&db_path, &root), None);
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A completed run records what each root holds, so the folder list can show
-/// it once the run's own per-root progress rows are gone.
-///
-/// The extension whitelist is narrowed to `txt` so the split between the two
-/// figures is the test's to decide rather than the default list's.
 #[test]
 fn a_completed_run_records_what_each_root_holds() {
     let dir = tmp_dir("root-counts");
-    // A subdirectory, so the index and its WAL sidecars are not themselves
-    // files under the root being counted.
+    // A subdirectory, so the index and its sidecars are not under the root.
     let tree = dir.join("tree");
     std::fs::create_dir_all(&tree).unwrap();
     std::fs::write(tree.join("a.txt"), "alpha body").unwrap();
@@ -421,8 +389,6 @@ fn a_completed_run_records_what_each_root_holds() {
         "every file under the root, and the two the whitelist let through"
     );
 
-    // And they describe the index rather than the walk: the same two numbers
-    // read straight off the tables the folder list is standing in for.
     let conn = db::open_existing(&db_path, false).unwrap();
     let files: i64 = conn
         .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
@@ -436,10 +402,8 @@ fn a_completed_run_records_what_each_root_holds() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A stopped run counted part of a tree it was still changing, so the figures
-/// it would store are worse than the ones already there. Pinned in both
-/// directions: a guard that simply never stored anything would satisfy the
-/// negative half on its own.
+/// Pinned in both directions: a guard that simply never stored anything
+/// would satisfy the negative half on its own.
 #[test]
 fn a_stopped_run_keeps_the_recorded_counts() {
     let dir = tmp_dir("stopped-root-counts");
@@ -457,8 +421,6 @@ fn a_stopped_run_keeps_the_recorded_counts() {
     let after_run = stored_root_counts(&db_path, &root).expect("recorded");
     assert_eq!(after_run.files, 1);
 
-    // Two more files, then a run that stops at its first check — the
-    // deterministic stand-in for a shutdown part-way through.
     std::fs::write(tree.join("b.txt"), "beta body").unwrap();
     std::fs::write(tree.join("c.txt"), "gamma body").unwrap();
     run_with(&config, &db_path, &Arc::new(AtomicBool::new(true))).unwrap();
@@ -468,16 +430,14 @@ fn a_stopped_run_keeps_the_recorded_counts() {
         "a stopped run leaves the last completed run's figures alone"
     );
 
-    // The same tree, run to completion, does move them.
     run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
     assert_eq!(stored_root_counts(&db_path, &root).unwrap().files, 3);
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A reconcile the stop flag cut short must leave the stored fingerprint
-/// alone: stamping it would tell every later run the index already matches,
-/// and nothing would ever revisit the rows the scan had not reached.
+/// Stamping the fingerprint would tell every later run the index already
+/// matches, and nothing would revisit the rows the scan had not reached.
 #[test]
 fn an_interrupted_reconcile_records_nothing() {
     let dir = tmp_dir("interrupted-reconcile");
@@ -496,8 +456,6 @@ fn an_interrupted_reconcile_records_nothing() {
     let pending = outstanding_work(&db_path, &narrowed);
     assert!(pending.touches_index(), "the narrowing has rows to remove");
 
-    // Already set, so the reconcile aborts on its first check — the
-    // deterministic stand-in for a shutdown mid-scan.
     run_with(&narrowed, &db_path, &Arc::new(AtomicBool::new(true))).unwrap();
     assert_eq!(
         outstanding_work(&db_path, &narrowed),
@@ -505,7 +463,6 @@ fn an_interrupted_reconcile_records_nothing() {
         "the same work is still owed"
     );
 
-    // And the run that is allowed to finish both applies and records it.
     run_with(&narrowed, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
     assert!(
         outstanding_work(&db_path, &narrowed).is_empty(),
@@ -515,7 +472,6 @@ fn an_interrupted_reconcile_records_nothing() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A root's progress with only the fields the denominator rules read.
 fn progress(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> RootProgress {
     RootProgress {
         root: "/r".to_string(),
@@ -530,42 +486,24 @@ fn progress(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> RootP
     }
 }
 
+/// An overtaken estimate would pin the bar at 100% and read as a hang; past
+/// the walk the exact count wins — `find` counts tree entries where `walked`
+/// counts walkable files, so the estimate reads far high.
 #[test]
-fn a_walking_root_falls_back_to_the_find_estimate() {
-    let p = progress(RootPhase::Walking, 100, Some(1000));
-    assert_eq!(p.walk_denominator(), Some(1000));
-}
-
-#[test]
-fn a_walking_root_without_a_count_yet_has_no_denominator() {
-    let p = progress(RootPhase::Walking, 100, None);
-    assert_eq!(p.walk_denominator(), None);
-}
-
-/// An estimate the walk has already overtaken is provably wrong, and a bar
-/// pinned at 100% while the walk is still running reads as a hang.
-#[test]
-fn an_overtaken_estimate_is_raised_to_the_walked_count() {
-    let p = progress(RootPhase::Walking, 1500, Some(1000));
-    assert_eq!(p.walk_denominator(), Some(1500));
-}
-
-/// `find` counts tree entries where `walked` counts only walkable files, so
-/// the estimate reads far high; once the walk ends the estimate must go.
-#[test]
-fn a_root_past_its_walk_uses_the_exact_count() {
-    for phase in [RootPhase::Extracting, RootPhase::Done] {
+fn the_walk_denominator_prefers_the_best_available_count() {
+    for (label, phase, walked, estimate, want) in [
+        ("estimate", RootPhase::Walking, 100, Some(1000), Some(1000)),
+        ("no count yet", RootPhase::Walking, 100, None, None),
+        ("overtaken", RootPhase::Walking, 1500, Some(1000), Some(1500)),
+        ("exact", RootPhase::Extracting, 261_088, Some(6_677_062), Some(261_088)),
+        ("exact, no estimate", RootPhase::Extracting, 261_088, None, Some(261_088)),
+        ("done", RootPhase::Done, 261_088, Some(6_677_062), Some(261_088)),
+        ("done, no estimate", RootPhase::Done, 261_088, None, Some(261_088)),
+    ] {
         assert_eq!(
-            progress(phase, 261_088, Some(6_677_062)).walk_denominator(),
-            Some(261_088),
-            "{:?} must not keep the estimate",
-            phase
-        );
-        assert_eq!(
-            progress(phase, 261_088, None).walk_denominator(),
-            Some(261_088),
-            "{:?} needs no estimate to have landed",
-            phase
+            progress(phase, walked, estimate).walk_denominator(),
+            want,
+            "{label}"
         );
     }
 }
@@ -584,9 +522,7 @@ fn overall_progress_sums_both_halves_of_every_root() {
     assert_eq!(o.total, Some(1900));
 }
 
-/// A root whose content pass has not counted its range yet contributes only
-/// its walk — to both halves, so processed and total stay in step and the
-/// bar cannot jump when the count lands.
+/// Counted into both halves, so the bar cannot jump when the count lands.
 #[test]
 fn an_uncounted_extraction_contributes_only_its_walk() {
     let mut counting = progress(RootPhase::Extracting, 500, None);
@@ -607,8 +543,6 @@ fn one_uncounted_walking_root_leaves_the_whole_total_unknown() {
     assert_eq!(o.fraction(), None);
 }
 
-/// Roots past their walk carry their own totals, so a run whose counts
-/// never landed still gains a percentage once the walks end.
 #[test]
 fn a_run_past_its_walks_needs_no_estimate_at_all() {
     let roots = [
@@ -618,9 +552,8 @@ fn a_run_past_its_walks_needs_no_estimate_at_all() {
     assert_eq!(overall_progress(&roots).total, Some(15));
 }
 
-/// The regression: with the `find` estimate held past the walk, the run
-/// below finished at 7,999,707 / 10,562,418 = 76% and the bar never
-/// filled. These are the real figures from that run.
+/// Regression: with the `find` estimate held past the walk, this run finished
+/// at 7,999,707 / 10,562,418 = 76% and the bar never filled; real figures.
 #[test]
 fn a_finished_run_reaches_exactly_one_hundred_percent() {
     let roots: Vec<RootProgress> = [
@@ -645,17 +578,18 @@ fn a_finished_run_reaches_exactly_one_hundred_percent() {
     assert_eq!(o.fraction(), Some(1.0));
 }
 
+/// `walked` can outrun a denominator that was exact when taken — a root
+/// re-walked through symlink aliases — and must stop the bar at full.
 #[test]
-fn a_run_with_nothing_to_do_has_no_fraction_to_show() {
+fn overall_progress_edge_cases() {
+    let o = overall_progress(&[]);
+    assert_eq!(o.processed, 0);
+    assert_eq!(o.total, Some(0));
+
     let o = overall_progress(&[progress(RootPhase::Done, 0, None)]);
     assert_eq!(o.total, Some(0));
     assert_eq!(o.fraction(), None, "no division by zero");
-}
 
-/// `walked` can outrun a denominator that was exact when taken — a root
-/// re-walked through symlink aliases, say. The bar must stop at full.
-#[test]
-fn the_fraction_never_exceeds_one() {
     let mut p = progress(RootPhase::Done, 10, None);
     p.extracted = 100;
     // A counted scope the writes then overran; an uncounted one would be
@@ -664,71 +598,32 @@ fn the_fraction_never_exceeds_one() {
     let o = overall_progress(&[p]);
     assert_eq!(o.processed, 110);
     assert_eq!(o.total, Some(10));
-    assert_eq!(o.fraction(), Some(1.0));
+    assert_eq!(o.fraction(), Some(1.0), "the bar stops at full");
 }
 
+/// A safety valve, not a second tuning knob: the wal-index is reached through
+/// an mmap, so a write the filesystem cannot back is a SIGBUS, not a clean
+/// failure. `0` means "never force a checkpoint"; bounded by the volume like
+/// any other value, it keeps that meaning without a special case.
 #[test]
-fn a_run_with_no_roots_is_complete_rather_than_unknown() {
-    let o = overall_progress(&[]);
-    assert_eq!(o.processed, 0);
-    assert_eq!(o.total, Some(0));
-}
-
-/// A roomy volume leaves `maximum_wal_size` exactly as configured: this is a
-/// safety valve, not a second tuning knob.
-#[test]
-fn a_roomy_volume_does_not_move_the_checkpoint_threshold() {
+fn the_wal_cap_is_bounded_by_the_volume() {
     use super::pipeline::wal_cap_for_free;
-    let configured = 512 * 1024 * 1024;
-    assert_eq!(
-        wal_cap_for_free(configured, 500 * 1024 * 1024 * 1024),
-        configured
-    );
-    // Exactly enough: floor plus four times the log.
-    let just_enough = 128 * 1024 * 1024 + configured * 4;
-    assert_eq!(wal_cap_for_free(configured, just_enough), configured);
-}
-
-/// A tight volume checkpoints sooner, so the log cannot grow into the space
-/// that is left. Running out is not a clean failure — the wal-index is reached
-/// through an mmap, and a write the filesystem cannot back is a SIGBUS.
-#[test]
-fn a_tight_volume_lowers_the_checkpoint_threshold() {
-    use super::pipeline::wal_cap_for_free;
-    let configured = 512 * 1024 * 1024;
-    // 1 GiB free: 896 MiB above the floor, a quarter of which is 224 MiB.
-    let got = wal_cap_for_free(configured, 1024 * 1024 * 1024);
-    assert_eq!(got, 224 * 1024 * 1024);
-    assert!(got < configured);
-}
-
-/// `0` means "never force a checkpoint", which is a performance choice and not
-/// a licence to fill the disk — so it is bounded by the volume like any other
-/// value. On a roomy disk that bound is larger than any run's log, which is
-/// how the setting keeps its meaning without a second rule to special-case it.
-#[test]
-fn disabled_checkpoints_are_still_bounded_by_the_volume() {
-    use super::pipeline::wal_cap_for_free;
-    let roomy = wal_cap_for_free(0, 500 * 1024 * 1024 * 1024);
-    assert!(
-        roomy > 100 * 1024 * 1024 * 1024,
-        "effectively never on a roomy disk, got {} bytes",
-        roomy
-    );
-    let tight = wal_cap_for_free(0, 1024 * 1024 * 1024);
-    assert_eq!(tight, 224 * 1024 * 1024, "a tight one checkpoints anyway");
-}
-
-/// Below the floor there is nothing sensible left to divide, and the run is
-/// about to be stopped by the in-run check anyway — so the threshold bottoms
-/// out at the same floor a configured value is raised to, never at zero.
-#[test]
-fn a_full_volume_bottoms_out_at_the_minimum_rather_than_zero() {
-    use super::pipeline::wal_cap_for_free;
-    for free in [0, 1024, 127 * 1024 * 1024] {
-        assert_eq!(
-            wal_cap_for_free(512 * 1024 * 1024, free),
-            crate::config::MINIMUM_WAL_SIZE
-        );
+    let configured: u64 = 512 * 1024 * 1024;
+    for (label, cfg, free, want) in [
+        ("roomy", configured, 500 * 1024 * 1024 * 1024, configured),
+        // Exactly enough: floor plus four times the log.
+        ("just enough", configured, 128 * 1024 * 1024 + configured * 4, configured),
+        // 1 GiB free: 896 MiB above the floor, a quarter of which is 224 MiB.
+        ("tight", configured, 1024 * 1024 * 1024, 224 * 1024 * 1024),
+        ("disabled, tight", 0, 1024 * 1024 * 1024, 224 * 1024 * 1024),
+        ("full", configured, 0, crate::config::MINIMUM_WAL_SIZE),
+        ("nearly full", configured, 1024, crate::config::MINIMUM_WAL_SIZE),
+        ("at the floor", configured, 127 * 1024 * 1024, crate::config::MINIMUM_WAL_SIZE),
+    ] {
+        assert_eq!(wal_cap_for_free(cfg, free), want, "{label}");
     }
+    assert!(
+        wal_cap_for_free(0, 500 * 1024 * 1024 * 1024) > 100 * 1024 * 1024 * 1024,
+        "disabled checkpoints on a roomy disk are effectively never"
+    );
 }

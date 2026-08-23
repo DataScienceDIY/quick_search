@@ -1,10 +1,7 @@
 //! End-to-end timing and syscall accounting for a full indexing run.
 //!
-//! [`walkprobe`](walkprobe.rs) covers phase 1 alone, without a database. This
-//! covers the whole pipeline — parallel walk, `files` writes, and content
-//! extraction — because the interesting redundancy lives *between* the two
-//! phases: the walk reads a file's head to hash it and sniff its MIME, and
-//! extraction then reopens the same file and reads it again.
+//! [`walkprobe`](walkprobe.rs) covers phase 1 alone; this covers the whole
+//! pipeline — parallel walk, `files` writes, and content extraction.
 //!
 //! ```text
 //! cargo build -p quicksearch-core --example indexprobe --release
@@ -13,12 +10,9 @@
 //! ./target/release/examples/indexprobe warm /tmp/qs-bench /tmp/qs-bench.db
 //! ```
 //!
-//! `cold` deletes the database first, so every file is new: the walk hashes
-//! it and extraction reads it. `warm` re-runs over the existing database with
-//! the tree untouched, which is the case that has to stay at one `stat` per
-//! file — see [`crate::file_handling::classify_for_indexing`].
-//!
-//! For syscalls per file, trace a run and bucket by the tree's paths:
+//! `cold` deletes the database first; `warm` re-runs untouched — the case
+//! that must stay at one `stat` per file. The run modes inspect nothing
+//! themselves, so every syscall a trace attributes to the tree is the indexer's:
 //!
 //! ```text
 //! strace -f -y -o /tmp/t.log \
@@ -27,36 +21,26 @@
 //! grep -oP '^\d+ \K[a-z0-9_]+' <(grep '/tmp/qs-bench/' /tmp/t.log) | sort | uniq -c
 //! ```
 //!
-//! Group by thread id instead (`grep -oP '^\d+ [a-z0-9_]+'`) to see the split
-//! between the walk workers and the extraction thread.
-//!
-//! The run modes deliberately do no filesystem inspection of their own — no
-//! progress walk, no size survey — so that every syscall the trace attributes
-//! to the tree came from the indexer. The size histogram is printed by `gen`.
+//! `QSB_HASH_LENGTH` overrides `[processing] hash_length` for a run — how
+//! [`hashprobe`](hashprobe.rs) gets its end-to-end column.
+
+mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use common::{evict, mib, Io};
+
 // ---------------------------------------------------------------------------
 // Allocation accounting
 // ---------------------------------------------------------------------------
 
-/// `System`, counting. A global allocator is **per binary**, so this affects
-/// only this probe — the shipped `quicksearch` is untouched.
-///
-/// Global atomics rather than the per-thread `Cell`s `tests/search_alloc.rs`
-/// uses, and for the opposite reason. There the work was synchronous on one
-/// thread and other *tests* ran concurrently, so per-thread counting was both
-/// necessary and more precise. Here the work is spread over a walk pool, an
-/// extraction pool, a feeder and a writer — per-thread counting would report a
-/// fraction of it — and nothing else is running in this process, so a global
-/// count is exactly the run.
-///
-/// The atomics cost every allocation a contended RMW, which is real overhead
-/// and shows in the wall-clock line. That is acceptable because both sides of a
-/// before/after comparison carry the same instrumentation; it is not acceptable
-/// to quote these timings against numbers from an uninstrumented build.
+/// `System`, counting — per binary, so the shipped `quicksearch` is
+/// untouched. Global atomics, not `search_alloc`'s per-thread `Cell`s: the
+/// work spreads over several pools and nothing else runs here, so a global
+/// count is exactly the run. The contended RMW is fine when both sides of a
+/// comparison carry it; never quote against an uninstrumented build.
 struct Counting;
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -110,46 +94,21 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// Peak resident set size, from the kernel's own high-water mark. Unlike a
-/// sampled figure this cannot miss a spike.
-fn vm_hwm_bytes() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmHWM:"))?
-                .split_whitespace()
-                .nth(1)?
-                .parse::<u64>()
-                .ok()
-        })
-        .map(|kib| kib * 1024)
-        .unwrap_or(0)
-}
 use std::time::{Duration, Instant};
 
 use quicksearch_core::config::Config;
 use quicksearch_core::indexing::{IndexingService, IndexingStatus};
 
-/// Files whose head the walk reads in full at the default 8 KiB
-/// `hash_length`, i.e. the ones extraction never needs to reopen.
+/// Files whose head the walk reads in full — never reopened.
 const SMALL_TEXT: usize = 800;
 /// Text files past `hash_length`, which extraction must still read.
 const LARGE_TEXT: usize = 100;
-/// No extractor claims these, so extraction resolves them without touching
-/// the disk. A control group: their cost must not move.
+/// Unclaimed by any extractor — a control group whose cost must not move.
 const BINARY: usize = 100;
 
-/// Scale the generated tree by an integer factor (`QSB_SCALE`), keeping the
-/// mix between the three groups fixed.
-///
-/// The default thousand files is enough to exercise every code path and far
-/// too few to measure any of them: a run that size is dominated by fixed
-/// start-up — opening the index, the config reconcile — and its per-file
-/// figures carry the whole of SQLite's and FTS5's fixed structure spread over
-/// a thousand rows. Anything claiming to be a per-file cost needs a tree where
-/// the fixed part has been amortised away, and the difference between two
-/// scales is the only way to tell the two apart.
+/// Scale the generated tree (`QSB_SCALE`), keeping the mix fixed: the
+/// default thousand files is dominated by fixed start-up, and the difference
+/// between two scales is the only way to separate it from per-file cost.
 fn scale() -> usize {
     std::env::var("QSB_SCALE")
         .ok()
@@ -197,8 +156,7 @@ const WORDS: &[&str] = &[
     "today",
 ];
 
-/// Deterministic so two runs index byte-identical trees and their timings are
-/// comparable. Plain LCG — this only has to spread, not to be random.
+/// Deterministic, so two runs index byte-identical trees.
 struct Rng(u64);
 
 impl Rng {
@@ -220,11 +178,20 @@ fn main() {
     let tree = PathBuf::from(
         std::env::args()
             .nth(2)
-            .expect("usage: indexprobe <gen|cold|warm> <tree> [db]"),
+            .expect("usage: indexprobe <gen|evict|cold|warm> <tree> [db]"),
     );
 
     match mode.as_str() {
         "gen" => generate(&tree),
+        "evict" => {
+            let db = std::env::args().nth(3).map(PathBuf::from);
+            let (files, bytes) = evict(&tree, db.as_deref());
+            eprintln!(
+                "evicted {} files ({}) from the page cache",
+                files,
+                mib(bytes)
+            );
+        }
         "cold" | "warm" => {
             let db = PathBuf::from(
                 std::env::args()
@@ -239,14 +206,12 @@ fn main() {
             run(&mode, &tree, &db);
         }
         _ => {
-            eprintln!("usage: indexprobe <gen|cold|warm> <tree> [db]");
+            eprintln!("usage: indexprobe <gen|evict|cold|warm> <tree> [db]");
             std::process::exit(2);
         }
     }
 }
 
-/// Build a tree with a size mix that separates the three code paths, and
-/// report it so results are self-describing.
 fn generate(tree: &Path) {
     let _ = std::fs::remove_dir_all(tree);
     std::fs::create_dir_all(tree).expect("create tree");
@@ -256,8 +221,6 @@ fn generate(tree: &Path) {
     let scale = scale();
     let (small_text, large_text, binary) = (SMALL_TEXT * scale, LARGE_TEXT * scale, BINARY * scale);
 
-    // Spread across subdirectories so the walk does real directory work
-    // rather than one enormous readdir.
     for i in 0..small_text {
         let dir = tree.join(format!("src/mod{}", i % (40 * scale)));
         std::fs::create_dir_all(&dir).expect("mkdir");
@@ -319,104 +282,26 @@ fn prose(rng: &mut Rng, target: usize) -> String {
     s
 }
 
-/// The kernel's own accounting for this process, from `/proc/self/io`.
-///
-/// `read_bytes`/`write_bytes` are what actually reached the block layer, so
-/// they are the figures that describe the *disk* rather than the page cache —
-/// a warm re-read shows as `rchar` without moving `read_bytes`. `syscr`/`syscw`
-/// count the calls regardless, which is what separates "we read a lot" from
-/// "we read a little, many times".
-///
-/// Zero everywhere on a filesystem that does not report it (virtiofs, some
-/// network mounts); the caller says so rather than printing a confident 0.
-#[derive(Default, Clone, Copy)]
-struct Io {
-    rchar: u64,
-    wchar: u64,
-    syscr: u64,
-    syscw: u64,
-    read_bytes: u64,
-    write_bytes: u64,
-    cancelled: u64,
-}
-
-impl Io {
-    fn read() -> Io {
-        let mut io = Io::default();
-        let Ok(text) = std::fs::read_to_string("/proc/self/io") else {
-            return io;
-        };
-        for line in text.lines() {
-            let Some((key, value)) = line.split_once(':') else {
-                continue;
-            };
-            let Ok(value) = value.trim().parse::<u64>() else {
-                continue;
-            };
-            match key {
-                "rchar" => io.rchar = value,
-                "wchar" => io.wchar = value,
-                "syscr" => io.syscr = value,
-                "syscw" => io.syscw = value,
-                "read_bytes" => io.read_bytes = value,
-                "write_bytes" => io.write_bytes = value,
-                "cancelled_write_bytes" => io.cancelled = value,
-                _ => {}
-            }
-        }
-        io
-    }
-
-    fn since(&self, start: &Io) -> Io {
-        Io {
-            rchar: self.rchar.saturating_sub(start.rchar),
-            wchar: self.wchar.saturating_sub(start.wchar),
-            syscr: self.syscr.saturating_sub(start.syscr),
-            syscw: self.syscw.saturating_sub(start.syscw),
-            read_bytes: self.read_bytes.saturating_sub(start.read_bytes),
-            write_bytes: self.write_bytes.saturating_sub(start.write_bytes),
-            cancelled: self.cancelled.saturating_sub(start.cancelled),
-        }
-    }
-}
-
-fn mib(bytes: u64) -> String {
-    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-}
-
-/// What the write-ahead log did during a run, sampled from outside the process.
-///
-/// The interesting part of write amplification is not the total — that is one
-/// number from `/proc/self/io` — but how it splits between **frames appended to
-/// the log** and **pages copied back into the database** by a checkpoint. The
-/// two want opposite fixes: more frames means the load is rewriting pages, and
-/// more copy-back means it is checkpointing too often. A page rewritten five
-/// times between two checkpoints costs five frames and *one* copy-back, so
-/// checkpointing less often can be strictly cheaper — which is the opposite of
-/// what "keep the log small" suggests.
-///
-/// Sampled rather than instrumented: the log is a file, its size is a `stat`,
-/// and a checkpoint truncates it. Growth between samples is frames appended; a
-/// drop is a checkpoint, and the size it dropped *from* bounds what that
-/// checkpoint copied. Nothing in the library has to know it is being watched.
+/// What the WAL did during a run, sampled from outside the process: growth
+/// between samples is frames appended, a drop is a checkpoint, and the size
+/// it dropped *from* bounds the copy-back. The split matters: more frames
+/// means the load rewrites pages, more copy-back means checkpointing too
+/// often — checkpointing less can be strictly cheaper.
 #[derive(Default, Clone, Copy)]
 struct WalStats {
-    /// Largest the log ever got.
     peak: u64,
-    /// Sum of every increase — bytes appended to the log over the run.
     appended: u64,
-    /// Sum of the size before each truncation — an upper bound on the bytes
-    /// each checkpoint wrote back into the database.
+    /// Sum of sizes before each truncation — bounds checkpoint copy-back.
     copied_back: u64,
     checkpoints: u64,
 }
 
-/// Watch `path` until `stop` is set, at `SAMPLE`.
-///
-/// One millisecond, because a checkpoint of a small log is quick and a sampler
-/// that misses the rise and the fall reports neither. It costs one `stat` per
-/// millisecond, which is nothing next to what is being measured.
-fn sample_wal(path: PathBuf, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::thread::JoinHandle<WalStats> {
+/// Watch `path` until `stop`, at `SAMPLE` (1 ms): a sampler that misses a
+/// small log's rise and fall reports neither.
+fn sample_wal(
+    path: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<WalStats> {
     const SAMPLE: Duration = Duration::from_millis(1);
     std::thread::spawn(move || {
         let mut stats = WalStats::default();
@@ -426,8 +311,7 @@ fn sample_wal(path: PathBuf, stop: std::sync::Arc<std::sync::atomic::AtomicBool>
             if now > last {
                 stats.appended += now - last;
             } else if now < last {
-                // A shrink is a checkpoint landing the log. `last` is the most
-                // recent size seen before it, so it bounds the copy-back.
+                // A shrink is a checkpoint; `last` bounds its copy-back.
                 stats.checkpoints += 1;
                 stats.copied_back += last;
             }
@@ -439,7 +323,6 @@ fn sample_wal(path: PathBuf, stop: std::sync::Arc<std::sync::atomic::AtomicBool>
     })
 }
 
-/// Size of the index and the sidecars it leaves behind.
 fn db_sizes(db: &Path) -> (u64, u64) {
     let len = |p: PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
     (
@@ -448,13 +331,24 @@ fn db_sizes(db: &Path) -> (u64, u64) {
     )
 }
 
-fn run(mode: &str, tree: &Path, db: &Path) {
-    let config = Config::default();
+/// `[processing] hash_length` for this run, from `QSB_HASH_LENGTH`: charged
+/// to the walk, credited back by the content pass, so the knob has to be
+/// swept end-to-end. Out-of-range values are clamped, with a warning.
+fn hash_length_override() -> Option<usize> {
+    std::env::var("QSB_HASH_LENGTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
 
-    // `run_indexing` writes this marker only on a successful finish, so it is
-    // the one unambiguous completion signal — polling the status enum races,
-    // because a small tree finishes between two polls and `Idle` then means
-    // both "not started" and "already done".
+fn run(mode: &str, tree: &Path, db: &Path) {
+    let mut config = Config::default();
+    if let Some(n) = hash_length_override() {
+        config.processing.hash_length = n;
+    }
+    let hash_length = config.processing.hash_length;
+
+    // The marker is the one unambiguous completion signal; polling the
+    // status enum races on a small tree.
     if db.exists() {
         let conn = rusqlite::Connection::open(db).expect("open db");
         conn.execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
@@ -503,16 +397,14 @@ fn run(mode: &str, tree: &Path, db: &Path) {
     wal_stop.store(true, Ordering::Relaxed);
     let wal = wal_sampler.join().unwrap_or_default();
 
-    // Count what was actually indexed rather than assuming `gen`'s tree.
-    // The constants describe the tree this probe builds; pointing it at any
-    // other one made the rate a fiction.
+    // Count what was actually indexed rather than assuming `gen`'s tree —
+    // pointing the probe elsewhere made the rate a fiction.
     let total = rusqlite::Connection::open(db)
         .ok()
         .and_then(|c| quicksearch_core::db::repo::row_count(&c).ok())
         .unwrap_or(0);
 
-    // Read after `stop_indexing`, so the optimize pass's checkpoint — which is
-    // where a run's dirty pages actually reach the file — is inside the totals.
+    // Read after `stop_indexing`, so the optimize pass's checkpoint is inside the totals.
     let io = Io::read().since(&io_start);
     let (db_after, wal_after) = db_sizes(db);
     let per_file = |n: u64| {
@@ -524,15 +416,15 @@ fn run(mode: &str, tree: &Path, db: &Path) {
     };
 
     eprintln!(
-        "\n{}: {:?} ({:.0} files/sec over {} files)",
+        "\n{}: {:?} ({:.0} files/sec over {} files, hash_length {})",
         mode,
         elapsed,
         total as f64 / elapsed.as_secs_f64(),
-        total
+        total,
+        hash_length,
     );
 
-    // The pipeline logs one line per root per phase; they are the walk/extract
-    // split without a `perf` session.
+    // One log line per root per phase: the walk/extract split without `perf`.
     for line in quicksearch_core::log::snapshot() {
         let m = &line.text;
         if m.contains("walk done")
@@ -559,7 +451,7 @@ fn run(mode: &str, tree: &Path, db: &Path) {
         allocs as f64 / total.max(1) as f64,
         mib(ALLOC_BYTES.load(Ordering::Relaxed)),
         mib(PEAK_LIVE.load(Ordering::Relaxed)),
-        mib(vm_hwm_bytes()),
+        mib(common::vm_hwm().unwrap_or(0)),
     );
     eprintln!(
         "  index   {} -> {}   wal {} -> {}",

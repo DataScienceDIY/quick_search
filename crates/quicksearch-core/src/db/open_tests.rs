@@ -41,7 +41,6 @@ fn reopen_is_idempotent() {
 
 #[test]
 fn older_versioned_db_is_wiped_and_recreated() {
-    // A DB from a prior schema version is wiped, not migrated.
     let p = tmp_db_path();
     {
         let conn = Connection::open(&p).unwrap();
@@ -79,7 +78,6 @@ fn older_versioned_db_is_wiped_and_recreated() {
 
 #[test]
 fn legacy_layout_db_is_wiped_and_recreated() {
-    // Pre-A layout with no `schema_info` at all. Same policy — wipe.
     let p = tmp_db_path();
     {
         let conn = Connection::open(&p).unwrap();
@@ -99,8 +97,7 @@ fn legacy_layout_db_is_wiped_and_recreated() {
         .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0);
-    // New columns should exist (just prepare the SELECT — an
-    // unknown column name would parse-error here).
+    // An unknown column name would parse-error here.
     conn.query_row(
         "SELECT content_state, type, mime FROM files LIMIT 0",
         [],
@@ -158,8 +155,6 @@ fn tokenizer_drift_wipes_db() {
 
 #[test]
 fn open_existing_reads_nondefault_tokenizer_without_wiping() {
-    // An index built with a non-default tokenizer, opened by a consumer that
-    // only knows "trigram": `open_existing` must read it as-is, never wipe.
     let p = tmp_db_path();
     {
         let conn = open_or_recreate(p.to_str().unwrap(), "unicode61").unwrap();
@@ -169,8 +164,6 @@ fn open_existing_reads_nondefault_tokenizer_without_wiping() {
             [],
         )
         .unwrap();
-        // Seed the FTS index (rowid = the files row we just inserted) so a
-        // MATCH query can be exercised against the on-disk tokenizer.
         conn.execute(
             "INSERT INTO searchabletext (rowid, text) \
              VALUES (last_insert_rowid(), 'hello world')",
@@ -187,8 +180,6 @@ fn open_existing_reads_nondefault_tokenizer_without_wiping() {
         files, 1,
         "open_existing must not wipe a non-default-tokenizer DB"
     );
-    // The on-disk tokenizer is used as-is: a MATCH against the stored term
-    // returns the row.
     let hits: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH 'hello'",
@@ -197,8 +188,7 @@ fn open_existing_reads_nondefault_tokenizer_without_wiping() {
         )
         .unwrap();
     assert_eq!(hits, 1);
-    // And the stored tokenizer is still the non-default one — proof we
-    // neither rewrote the FTS table nor reset schema_info.
+    // Proof we neither rewrote the FTS table nor reset schema_info.
     let tok: String = conn
         .query_row(
             "SELECT value FROM schema_info WHERE key='tokenize'",
@@ -213,8 +203,6 @@ fn open_existing_reads_nondefault_tokenizer_without_wiping() {
 
 #[test]
 fn open_or_recreate_creates_missing_parent_dirs() {
-    // Fresh installs point at ~/.local/share/quicksearch/… which
-    // doesn't exist yet; the owner open must create it.
     let dir = crate::testutil::scratch_dir("mkdir");
     let db = dir.join("nested/deeper/index.sqlite");
     let conn = open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
@@ -233,8 +221,7 @@ fn writable_opens_use_wal_and_it_persists() {
             .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
     }
-    // WAL is persistent in the file: a later read-only consumer sees it
-    // without being able to (or needing to) set it.
+    // WAL is persistent in the file: a later read-only consumer sees it.
     let conn = open_existing(p.to_str().unwrap(), false).unwrap();
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
@@ -244,10 +231,8 @@ fn writable_opens_use_wal_and_it_persists() {
     std::fs::remove_file(&p).ok();
 }
 
-/// SQLCipher is compiled `-DSQLITE_TEMP_STORE=2`, under which temporary
-/// databases live in memory for any `temp_store` but an explicit `FILE` (1);
-/// VACUUM builds the replacement index there, so the maintenance profile must
-/// keep temporaries on disk.
+/// Under `-DSQLITE_TEMP_STORE=2`, VACUUM builds the replacement index in
+/// memory unless `temp_store` is explicitly `FILE`.
 #[test]
 fn maintenance_opens_keep_temporaries_on_disk() {
     let p = tmp_db_path();
@@ -265,8 +250,8 @@ fn maintenance_opens_keep_temporaries_on_disk() {
         .unwrap();
     assert_eq!(store, 1, "maintenance must build its temporaries on disk");
 
-    // And the directory those temporaries land in is steerable, which is
-    // what keeps them off a RAM-backed /tmp. Deprecated but present.
+    // The directory those temporaries land in is steerable — what keeps
+    // them off a RAM-backed /tmp.
     let dir = p.parent().unwrap().to_string_lossy().into_owned();
     conn.execute_batch(&format!("PRAGMA temp_store_directory = '{}';", dir))
         .unwrap();
@@ -281,9 +266,8 @@ fn maintenance_opens_keep_temporaries_on_disk() {
     std::fs::remove_file(&p).ok();
 }
 
-/// Drives the GUI's "your index is being reset" modal, so a false positive
-/// announces a wipe that is not happening and a false negative lets one
-/// happen in silence.
+/// Drives the GUI's "your index is being reset" modal: a false positive
+/// announces a wipe that is not happening.
 #[test]
 fn index_needs_rebuild_only_when_the_schema_really_differs() {
     let p = tmp_db_path();
@@ -300,7 +284,6 @@ fn index_needs_rebuild_only_when_the_schema_really_differs() {
         "a current index is not going to be rebuilt"
     );
 
-    // Age it, exactly as a version bump does.
     {
         let conn = open_existing(p.to_str().unwrap(), true).unwrap();
         conn.execute(
@@ -311,7 +294,6 @@ fn index_needs_rebuild_only_when_the_schema_really_differs() {
     }
     assert!(index_needs_rebuild(p.to_str().unwrap()));
 
-    // A pre-`schema_info` layout counts too.
     std::fs::remove_file(&p).ok();
     {
         let conn = Connection::open(&p).unwrap();
@@ -338,8 +320,6 @@ fn open_existing_errors_on_missing_file() {
 
 #[test]
 fn open_existing_errors_on_version_mismatch_without_wiping() {
-    // A consumer opening a stale-schema DB must error and leave the file
-    // untouched.
     let p = tmp_db_path();
     {
         let conn = Connection::open(&p).unwrap();
@@ -390,11 +370,9 @@ fn keyed_create_reopen_and_header_is_encrypted() {
         )
         .unwrap();
     }
-    // Encrypted at rest: the plaintext SQLite magic must be gone.
     let head = &file_bytes(&p)[..16];
     assert_ne!(head, b"SQLite format 3\0", "file must not be plaintext");
 
-    // Reopens with the same key, both owner and consumer paths.
     {
         let conn = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&key)).unwrap();
         let n: i64 = conn
@@ -430,8 +408,7 @@ fn wrong_key_errors_without_wiping() {
             open_existing_keyed(p.to_str().unwrap(), write, Some(&test_key(0xb2))).unwrap_err();
         assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     }
-    // The owner path must error too — a wrong key is never a "schema
-    // mismatch" to answer with a wipe.
+    // A wrong key is never a "schema mismatch" to answer with a wipe.
     let err =
         open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&test_key(0xb2))).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
@@ -476,8 +453,7 @@ fn key_on_plaintext_db_errors_without_wiping() {
 
 #[test]
 fn schema_mismatch_under_key_wipes_and_recreates_encrypted() {
-    // The one case where the owner *should* still wipe: right key,
-    // stale schema. The replacement must come back encrypted.
+    // Right key, stale schema: the replacement must come back encrypted.
     let p = tmp_db_path();
     let key = test_key(0xa1);
     {
@@ -515,8 +491,6 @@ fn schema_mismatch_under_key_wipes_and_recreates_encrypted() {
 
 #[test]
 fn garbage_file_with_key_reports_mismatch_not_corruption() {
-    // A replaced index file (random bytes, no SQLite header) must surface as
-    // KEY_MISMATCH — indistinguishable from a wrong key — and never wipe.
     let p = tmp_db_path();
     std::fs::write(&p, [0x5a; 4096]).unwrap();
     let before = file_bytes(&p);
@@ -547,29 +521,22 @@ fn open_existing_rw_allows_delete() {
     std::fs::remove_file(&p).ok();
 }
 
-/// The index, and the WAL and SHM it hands its mode to, must not be readable
-/// by other users on the machine.
-///
-/// SQLite creates its database file 0644 and copies that mode to `-wal` and
-/// `-shm`; with the near-universal umask 022 that leaves the names and full
-/// text of everything under the configured roots — including documents whose
-/// own files are 0600 — readable by every account on a shared machine. The
-/// README's carve-out is about other *processes of the same user*, not other
-/// users, so nothing else covers this.
+/// SQLite creates its database 0644 (copied to `-wal`/`-shm`); under umask
+/// 022 that leaves the full text of 0600 documents readable by every account
+/// on the machine.
 #[cfg(unix)]
 #[test]
 fn a_fresh_index_and_its_sidecars_are_owner_only() {
     use std::os::unix::fs::PermissionsExt;
 
-    // A directory that does not exist yet, so the creation path is the one
-    // under test: an existing directory keeps whatever mode its owner chose.
+    // A directory that does not exist yet, so the creation path is under
+    // test: an existing directory keeps whatever mode its owner chose.
     let p = tmp_db_path()
         .parent()
         .unwrap()
         .join("data")
         .join("index.sqlite");
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-    // A write, so the WAL and SHM exist to be checked.
     conn.execute(
         "INSERT INTO files (name, parent, size, mtime) \
          VALUES ('a', '/', 0, 0)",
@@ -591,23 +558,16 @@ fn a_fresh_index_and_its_sidecars_are_owner_only() {
             assert_eq!(mode_of(&sidecar), 0o600, "sidecar {}", sidecar.display());
         }
     }
-    // And the directory created for it, which would otherwise take the umask
-    // and let any account list what is indexed.
+    // The created directory would otherwise take the umask.
     assert_eq!(mode_of(p.parent().unwrap()), 0o700);
 
     drop(conn);
     std::fs::remove_file(&p).ok();
 }
 
-/// `maintain` must work on a *keyed* index, which is the one case the pragma
-/// it reads does not answer with an integer.
-///
-/// SQLCipher intercepts `PRAGMA page_size` on a keyed connection, answers with
-/// `cipher_page_size`, and hands that back as TEXT. Reading it straight into an
-/// `i64` failed there and only there — so every unencrypted test passed while
-/// every index with a password set silently skipped both its VACUUM and its
-/// `PRAGMA optimize`. The assertion is simply that the call succeeds: it has to
-/// get past all three pragma reads to return at all.
+/// `maintain` must work on a *keyed* index — the one case where SQLCipher
+/// answers `PRAGMA page_size` as TEXT. Every unencrypted test passed while
+/// every password-protected index silently skipped its VACUUM and optimize.
 #[test]
 fn maintain_reads_its_pragmas_on_a_keyed_index() {
     let p = tmp_db_path();
@@ -623,17 +583,14 @@ fn maintain_reads_its_pragmas_on_a_keyed_index() {
     }
     let conn = open_keyed_with_pragmas(p.to_str().unwrap(), true, Some(&key), PRAGMAS_MAINTENANCE)
         .unwrap();
-    // A two-row index has no slack worth reclaiming, so `false` is the
-    // expected answer — what matters is that it is an answer and not an error.
+    // What matters is an answer, not an error; a tiny index has no slack.
     assert_eq!(
         crate::db::repo::maintain(&conn, &dir),
         Ok(false),
         "maintain must not fail on a keyed index"
     );
 
-    // And the value itself has to be usable, not merely readable: a page size
-    // that parsed as 0 would size the free-space check at zero bytes and wave
-    // through a VACUUM that cannot fit.
+    // A page size parsed as 0 would size the free-space check at zero bytes.
     assert!(
         crate::db::repo::pragma_number(&conn, "page_size").unwrap() >= 512,
         "a real page size, not a silent zero"
@@ -643,10 +600,9 @@ fn maintain_reads_its_pragmas_on_a_keyed_index() {
     std::fs::remove_file(&p).ok();
 }
 
-/// `database_path` is a free-text field in Settings with no picker and no
-/// confirmation. A typo naming another application's database used to delete
-/// it — and its `-wal` and `-shm` — on the next indexing run, because "no
-/// `schema_info` table" was read as "an old index of ours".
+/// A typo naming another application's database used to delete it on the
+/// next indexing run, because "no `schema_info`" read as "an old index of
+/// ours".
 #[test]
 fn a_foreign_database_is_refused_not_wiped() {
     let p = tmp_db_path();
@@ -670,7 +626,6 @@ fn a_foreign_database_is_refused_not_wiped() {
         "the message must name what is in the way: {err}"
     );
 
-    // The row is still there — the point of the whole exercise.
     let conn = Connection::open(&p).unwrap();
     let url: String = conn
         .query_row("SELECT url FROM moz_places", [], |r| r.get(0))
@@ -680,9 +635,7 @@ fn a_foreign_database_is_refused_not_wiped() {
     std::fs::remove_file(&p).ok();
 }
 
-/// The refusal must not extend to a file that is genuinely ours to create:
-/// an empty database is what SQLite leaves behind for a path nothing has
-/// written yet.
+/// The refusal must not extend to a file that is genuinely ours to create.
 #[test]
 fn an_empty_database_file_is_still_ours_to_build() {
     let p = tmp_db_path();
@@ -701,8 +654,8 @@ fn an_empty_database_file_is_still_ours_to_build() {
     std::fs::remove_file(&p).ok();
 }
 
-/// Each pre-`schema_info` table name marks a file as ours, and so is wiped
-/// rather than refused — the legacy-layout policy depends on exactly that.
+/// Each pre-`schema_info` table name marks a file as ours — wiped, not
+/// refused.
 #[test]
 fn a_legacy_table_marks_a_file_as_ours() {
     for table in LEGACY_TABLES {
@@ -719,8 +672,8 @@ fn a_legacy_table_marks_a_file_as_ours() {
     }
 }
 
-/// A `schema_info` with our columns but no version row is an index whose
-/// creation was interrupted. It is ours, and rebuilding it is right.
+/// A `schema_info` with our columns but no version row is an interrupted
+/// creation: ours, and rebuilding it is right.
 #[test]
 fn a_schema_info_without_a_version_row_is_still_ours() {
     let p = tmp_db_path();
@@ -737,10 +690,7 @@ fn a_schema_info_without_a_version_row_is_still_ours() {
     std::fs::remove_file(&p).ok();
 }
 
-/// A table that merely *shares the name* `schema_info` is not ours. Matching
-/// on the name alone used to fail the open with a raw SQL error about a
-/// missing column, which is neither a refusal the caller can act on nor a
-/// message anyone could act on either.
+/// A table that merely *shares the name* `schema_info` is not ours.
 #[test]
 fn a_foreign_schema_info_is_refused() {
     let p = tmp_db_path();

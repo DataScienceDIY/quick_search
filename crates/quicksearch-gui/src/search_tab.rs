@@ -13,6 +13,7 @@ use quicksearch_core::snippet::Snippet;
 use crate::color::rank_tier_color;
 use crate::format::{fmt_elapsed, fmt_mtime, human_size};
 use crate::platform;
+use crate::spotlight::{Spot, Spotlit};
 
 mod help_window;
 mod ignore_dialog;
@@ -25,17 +26,13 @@ use ignore_dialog::dir_ignore_pattern;
 pub use ignore_dialog::IgnoreDialog;
 use snippet_render::{centered_match_job, marked_field_job, path_cell_job, snippet_job};
 
-/// Fixed width (points) of the query strip's status slot, sized for the
-/// longest `fmt_elapsed` output, so the query box never resizes.
+/// Sized for the longest `fmt_elapsed` output, so the query box never resizes.
 const STATUS_SLOT_WIDTH: f32 = 52.0;
 
-/// Points reserved inside the query box for the repeat-search button, held
-/// whether or not the button is showing: a text field whose contents shift
-/// sideways every time a search finishes is worse than 20 lost points.
+/// Repeat-button gutter, held whether or not it shows so text never shifts.
 const REPEAT_SLOT_W: i8 = 20;
 
-/// Width (points) of the Fuzzy label-plus-box slot, sized to hold both with a
-/// little slack so the strip's spacing does not depend on the font.
+/// Fuzzy label-plus-box slot, with slack so spacing does not depend on the font.
 const FUZZY_SLOT_WIDTH: f32 = 66.0;
 
 /// Shared by the Fuzzy checkbox and its label, which are separate widgets so
@@ -43,13 +40,11 @@ const FUZZY_SLOT_WIDTH: f32 = 66.0;
 /// unconditionally, so no layout direction can flip them.
 const FUZZY_HINT: &str = "Also run fuzzy filename and full-text passes (slower)";
 
-/// What the Content Match column shows for a row that did not match on
-/// content. An em dash, not a hyphen: at body size `-` reads as a typo and `–`
-/// is indistinguishable from one.
+/// An em dash, not a hyphen: at body size `-` reads as a typo.
 const NO_CONTENT_MATCH: &str = "—";
 
-/// How long the visible rows must hold still before they are watched. Scrolling
-/// through a long result list would otherwise re-register on every frame.
+/// Hold-still time before visible rows are watched, so a scroll does not
+/// re-register every frame.
 const LIVE_ARM_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Seconds for the old results to fade out; the swap waits on this.
@@ -73,24 +68,16 @@ pub enum SortKey {
 pub struct SearchActions {
     /// Re-run the search immediately (not debounced).
     pub rerun: bool,
-    /// Persist an ignore pattern into the config.
     pub persist_ignore: Option<String>,
-    /// The fuzzy toggle changed; remember it in the config.
     pub save_fuzzy_default: Option<bool>,
-    /// The column picker changed; remember it in the config.
     pub save_columns: Option<ColumnsConfig>,
     /// Replace the live-result watch set. `Some(vec![])` clears it; `None`
     /// leaves whatever is registered alone.
     pub live_targets: Option<Vec<Target>>,
 }
 
-/// Whether the live watchers should be pointed at the visible rows this frame.
-///
-/// Every clause earns its place. `settled` folds in three things — no search
-/// running, no edit pending, and the reveal animation finished — because
-/// watching rows that do not correspond to the text in the box would re-cut
-/// their snippets against the wrong query. The delay is what stops a scroll
-/// from re-registering on every frame.
+/// Whether to point the live watchers at the visible rows this frame:
+/// unsettled rows would re-cut snippets against the wrong query.
 fn should_arm(
     enabled: bool,
     armed_already: bool,
@@ -104,13 +91,9 @@ fn should_arm(
         && changed_at.is_some_and(|t| now.duration_since(t) >= LIVE_ARM_DELAY)
 }
 
-/// Whether two target lists ask for the same watches.
-///
-/// Compares what decides *what is watched* and nothing else. `Target` also
-/// carries the size and modified time the row is displaying, but those are
-/// only the baseline for the watcher's arm-time sweep — re-registering every
-/// inotify watch because a file's size moved would tear down and rebuild the
-/// whole set on every write.
+/// Whether two target lists ask for the same watches. Size/mtime are not
+/// compared: they are only the baseline for the arm-time sweep, and
+/// re-registering because a size moved would rebuild the set on every write.
 fn same_watch_set(a: &[Target], b: &[Target]) -> bool {
     a.len() == b.len()
         && a.iter()
@@ -118,12 +101,9 @@ fn same_watch_set(a: &[Target], b: &[Target]) -> bool {
             .all(|(x, y)| x.path == y.path && x.text == y.text)
 }
 
-/// Recolour a laid-out cell as "the file behind this row is gone".
-///
-/// The Name column says so with a `RichText`, but that column is optional —
-/// with it hidden, a struck-through name is no indication at all. Every other
-/// column carries its own share instead of relying on it. Match highlighting
-/// goes with it: nothing about a file that is not there is still a hit.
+/// Recolour a laid-out cell as "the file behind this row is gone". Every
+/// column carries its own share: the Name column is optional, so its
+/// strikethrough alone is no indication.
 fn mark_missing_job(ui: &egui::Ui, job: &mut egui::text::LayoutJob, strike: bool) {
     let color = ui.visuals().weak_text_color();
     for section in &mut job.sections {
@@ -137,43 +117,29 @@ fn mark_missing_job(ui: &egui::Ui, job: &mut egui::text::LayoutJob, strike: bool
     }
 }
 
-/// The watch target a row asks for.
 fn target_for(hit: &SearchHit) -> Target {
     Target {
         path: hit.path.clone(),
-        // Only a row showing body text needs its snippet re-cut — and the
-        // watcher has to know which matcher cut it; a filename match costs
-        // one metadata call per change and never opens the file.
+        // The watcher has to know which matcher cut the snippet; a filename
+        // match never opens the file.
         text: hit.content_tier(),
-        // What the row is *displaying*, which on a fresh result is whatever
-        // the index said. Sweeping the disk against it at arm time is what
-        // turns "watch these rows" into "and tell me if the index was already
-        // out of date about them".
+        // The displayed baseline: sweeping the disk against it at arm time
+        // catches an index that was already out of date.
         size: hit.size,
         mtime: hit.mtime,
     }
 }
 
-/// Which of the two kinds a results column is, in the sense every table
-/// library means it: `QHeaderView::Interactive` against `Stretch`, AG Grid's
-/// plain `width` against `flex`, GTK's `expand`.
-///
-/// Columns holding variable-length text flex, so a wider window gives them the
-/// room; the ones holding a number or a date do not, because 52 points is as
-/// much Rank as there will ever be to read.
+/// The two kinds every table library has: `QHeaderView::Interactive` against
+/// `Stretch`, AG Grid's `width` against `flex`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColumnKind {
-    /// Keeps whatever width it was last given, and can be dragged to another.
     Fixed,
     /// Shares the space the fixed columns leave, in proportion to its current
-    /// width — which is also its weight, so a column dragged to a new width
-    /// keeps that *share* through the next window resize rather than those
-    /// pixels.
+    /// width — so a dragged column keeps its *share* through a window resize.
     Flex,
 }
 
-/// One results column's fixed characteristics: which kind it is, how narrow it
-/// may ever get, and how wide it starts before anyone has dragged anything.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ColumnPlan {
     kind: ColumnKind,
@@ -183,28 +149,20 @@ struct ColumnPlan {
 
 /// Lay the columns out across `budget`: the standard fixed/flex allocation.
 ///
-/// The fixed columns take their current width off the top and the flex ones
-/// share what is left, in proportion to `current` — which doubles as their
-/// weight. A flex column that would land under its floor is pinned there and
-/// drops out of the split, and the rest re-share, repeatedly, since pinning
-/// one can push another under. AG Grid states the same rule: "if a column with
-/// flex is being constrained by its minWidth/maxWidth rules, other flex
-/// columns should take up the remaining available space".
+/// Fixed columns take their width off the top; flex ones share the rest in
+/// proportion to `current`. A flex column that would land under its floor is
+/// pinned there and drops out of the split, repeatedly, since pinning one can
+/// push another under — AG Grid states the same rule: "if a column with flex
+/// is being constrained by its minWidth/maxWidth rules, other flex columns
+/// should take up the remaining available space". Once every flex column is
+/// at its floor the fixed ones join the split; past that the floors are
+/// returned and the table overflows honestly.
 ///
-/// Once the flex columns are all at their floors there is nothing left to give
-/// and the fixed ones have to shrink too, so they join the split rather than
-/// letting the table overflow. Past that — the floors alone over budget — the
-/// window is narrower than the table can be, and the floors are returned:
-/// overflowing honestly beats collapsing a column to nothing.
-///
-/// Doing this here rather than with `Column::remainder()` is forced.
-/// `egui_extras` reloads a **resizable** column as `Size::exact(stored_width)`
-/// and drops its `width_range`, so a remainder stops being one the moment the
-/// table is resizable; and only the *last* column gets the fill-the-remainder
-/// special case, so a second flex column could never absorb anything. Marking
-/// a flex column `resizable(false)` is worse still — that path floors it at
-/// `max_used`, which for a clipped column is its own laid-out width, so it
-/// grows and never shrinks (emilk/egui#8048, fixed upstream in 0.35).
+/// Not `Column::remainder()`: `egui_extras` reloads a **resizable** column as
+/// `Size::exact(stored_width)` and drops its `width_range`, and only the
+/// *last* column gets the fill-the-remainder case. `resizable(false)` is
+/// worse still — that path floors a clipped column at its own laid-out width,
+/// so it grows and never shrinks (emilk/egui#8048, fixed upstream in 0.35).
 fn fit_widths(current: &[f32], plans: &[ColumnPlan], budget: f32) -> Vec<f32> {
     debug_assert_eq!(current.len(), plans.len());
     let floor_total: f32 = plans.iter().map(|p| p.floor).sum();
@@ -217,9 +175,6 @@ fn fit_widths(current: &[f32], plans: &[ColumnPlan], budget: f32) -> Vec<f32> {
         .zip(current)
         .map(|(p, &w)| w.max(p.floor))
         .collect();
-    // The columns still sharing what is left. Fixed ones are not in the split
-    // at all until the flex ones have nothing left to give; the rest have been
-    // pinned to a floor.
     let mut free: Vec<usize> = (0..plans.len())
         .filter(|&i| plans[i].kind == ColumnKind::Flex)
         .collect();
@@ -242,11 +197,8 @@ fn fit_widths(current: &[f32], plans: &[ColumnPlan], budget: f32) -> Vec<f32> {
             .map(|i| out[i])
             .sum();
         let share_budget = budget - taken;
-        // The weight is the width as it stands, not as it will be clamped:
-        // floors decide what a column *gets*, never what it is owed.
+        // Floors decide what a column *gets*, never what it is owed.
         let share: f32 = free.iter().map(|&i| current[i]).sum();
-        // Nothing to take proportions from (a first frame, or every free
-        // column measured zero): split what is left evenly.
         let widths: Vec<f32> = if share > 0.0 {
             free.iter()
                 .map(|&i| current[i] / share * share_budget)
@@ -269,27 +221,19 @@ fn fit_widths(current: &[f32], plans: &[ColumnPlan], budget: f32) -> Vec<f32> {
     }
 }
 
-/// [`fit_widths`], holding one column at the width the pointer just gave it.
-///
-/// A drag is the user stating a width, so the layout takes it as given and the
-/// others absorb the difference; refitting the dragged column too would fight
-/// the pointer. It is still bounded — held no wider than leaves every other
-/// column its floor — so a drag can never make the table overflow.
+/// [`fit_widths`], holding one column at the width the pointer just gave it;
+/// refitting the dragged column too would fight the pointer. Still bounded,
+/// so a drag can never make the table overflow.
 fn fit_around(current: &[f32], plans: &[ColumnPlan], budget: f32, held: Option<usize>) -> Vec<f32> {
     let Some(held) = held.filter(|&i| i < plans.len()) else {
         return fit_widths(current, plans, budget);
     };
-    // Everything up to and including the dragged column keeps the width it
-    // has; only what lies to its right gives way.
-    //
-    // This is the whole of what makes a drag controllable. `egui_extras` sets
-    // the dragged column to `column_width + pointer.x - x`, and `x` is the
-    // running right edge — which already contains `column_width`, so the
-    // expression is really "put this column's right edge on the pointer,
-    // measured from its left one". Move anything to its left and that left
-    // edge shifts, so the divider resizes on its own and slides out from under
-    // the cursor. Refitting every column but the held one, which is what this
-    // used to do, moved them on every frame of every drag.
+    // Everything up to and including the dragged column keeps its width;
+    // only what lies to its right gives way. `egui_extras` sets the dragged
+    // column to `column_width + pointer.x - x` with `x` the running right
+    // edge — "put this column's right edge on the pointer, measured from its
+    // left one" — so moving anything to its left slides the divider out from
+    // under the cursor.
     let mut out: Vec<f32> = current.to_vec();
     let held_width = current[held].clamp(
         plans[held].floor,
@@ -304,29 +248,18 @@ fn fit_around(current: &[f32], plans: &[ColumnPlan], budget: f32, held: Option<u
 }
 
 /// The widest a column may be dragged: everything the columns to its *right*
-/// could give up, and nothing more.
-///
-/// Only the right-hand side is on offer, for the reason in [`fit_around`] —
-/// taking from the left would move the divider away from the pointer. So the
-/// last column's ceiling is its own width, and its divider is inert: its right
-/// edge is the window's edge, and there is nothing beyond it to trade with.
+/// could give up — taking from the left would move the divider away from the
+/// pointer. The last column's divider is therefore inert.
 fn grow_ceiling(current: &[f32], plans: &[ColumnPlan], budget: f32, i: usize) -> f32 {
     let left: f32 = current[..i].iter().sum();
     let right_floor: f32 = plans[i + 1..].iter().map(|p| p.floor).sum();
     (budget - left - right_floor).max(plans[i].floor)
 }
 
-/// The sort to actually apply: the requested one, or Rank when the column it
-/// keys on is not on screen.
-///
-/// Hiding the column you are sorted by would otherwise strand you in a sort
-/// you can neither see nor click your way out of. Rank is the fallback because
-/// it is what a fresh search uses and it needs no column of its own to mean
-/// something.
+/// The requested sort, or Rank when the column it keys on is hidden — which
+/// would otherwise strand you in a sort you can neither see nor click out of.
 fn effective_sort(sort: (SortKey, bool), cols: &ColumnsConfig) -> (SortKey, bool) {
     let shown = match sort.0 {
-        // The path column is mandatory, and rank ordering is meaningful with
-        // or without its column.
         SortKey::Path | SortKey::Rank => true,
         SortKey::Name => cols.name,
         SortKey::Size => cols.size,
@@ -339,15 +272,10 @@ fn effective_sort(sort: (SortKey, bool), cols: &ColumnsConfig) -> (SortKey, bool
     }
 }
 
-/// Byte ranges into `field` to highlight, or `None` when the hit's snippet is
-/// not that field verbatim.
-///
-/// Core promises that name- and path-tier snippets are the whole field, which
-/// is what lets a column paint its own text and mark the match inside it. This
-/// re-checks rather than trusting: ranges cut for a *window* would index the
-/// wrong glyphs here, and painting a confidently wrong highlight is worse than
-/// painting none. Cheap per visible row — the table is virtualized and a name
-/// or a path is short.
+/// Byte ranges into `field` to highlight, or `None` when the hit's snippet
+/// is not that field verbatim. Re-checks rather than trusting core: ranges
+/// cut for a *window* would index the wrong glyphs here, and a confidently
+/// wrong highlight is worse than none.
 fn whole_field_ranges<'a>(snip: Option<&'a Snippet>, field: &str) -> Option<&'a [(usize, usize)]> {
     let snip = snip?;
     if snip.truncated_start || snip.truncated_end || snip.window != field {
@@ -361,9 +289,8 @@ fn whole_field_ranges<'a>(snip: Option<&'a Snippet>, field: &str) -> Option<&'a 
         .then_some(snip.ranges.as_slice())
 }
 
-/// Add `incoming` to `set`, keeping at most `limit` of them — the best by
-/// **rank**, whatever column the table is currently sorted by, so a good hit
-/// found late in a scan still displaces a bad one found early.
+/// Add `incoming` to `set`, keeping the best `limit` by **rank**, whatever
+/// the table is sorted by — a good hit found late displaces a bad early one.
 fn admit(set: &mut Vec<SearchHit>, incoming: Vec<SearchHit>, limit: usize, limited: &mut bool) {
     set.extend(incoming);
     if set.len() > limit {
@@ -373,7 +300,6 @@ fn admit(set: &mut Vec<SearchHit>, incoming: Vec<SearchHit>, limit: usize, limit
     }
 }
 
-/// egui_extras cell wrapper: one widget, centered and filling the cell.
 fn centered_cell<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.with_layout(
         egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
@@ -385,25 +311,17 @@ fn centered_cell<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R
 pub struct SearchTab {
     pub query: String,
     pub fuzzy: bool,
-    /// Which columns to paint, mirrored from `[search.columns]`.
     pub columns: ColumnsConfig,
-    /// Mirrored from `[search] live_results`.
     pub live_enabled: bool,
-    /// The rows rendered last frame — the "visually shown" set — as the
-    /// targets they would be watched as.
-    ///
-    /// Targets rather than row indices because a row's path is what the
-    /// watcher keys on, and a rename changes the path without moving the row:
-    /// keyed on indices, a renamed row would never be re-armed and would stop
-    /// tracking after its first move.
+    /// The rows rendered last frame, as watch targets. Targets rather than
+    /// row indices: the watcher keys on path, and a renamed row keyed by
+    /// index would never re-arm.
     live_wanted: Vec<Target>,
-    /// The targets the watcher is currently registered for.
     live_armed: Vec<Target>,
     /// When `live_wanted` last changed; the arm delay runs from here.
     live_changed_at: Option<Instant>,
-    /// Files that have vanished from under a row on screen, by `file_id`.
-    /// The row stays put and is struck through rather than being removed —
-    /// dropping it would shift every index below it while someone is reading.
+    /// Files that vanished from under a row on screen, by `file_id`. The row
+    /// stays put, struck through — dropping it would shift rows mid-read.
     gone: std::collections::HashSet<i64>,
     /// Set on every edit; the app fires the search after the debounce.
     pub pending_edit: Option<Instant>,
@@ -413,9 +331,8 @@ pub struct SearchTab {
     staging: Vec<SearchHit>,
     /// True from search start until the staged set has been swapped in.
     swap_pending: bool,
-    /// How much of the results section the reveal still hides: 1 at the swap, 0 fully shown.
+    /// How much of the section the reveal still hides: 1 at the swap, 0 shown.
     wipe: f32,
-    /// The section's own opacity for the fade/wipe transition.
     fade: f32,
     /// Display permutation over `results`.
     order: Vec<u32>,
@@ -423,42 +340,30 @@ pub struct SearchTab {
     sort_dirty: bool,
     pub selected: Option<u32>,
     pub running: bool,
-    /// When the in-flight search was submitted.
     search_started: Option<Instant>,
-    /// Wall time of the last completed search (all cascade passes).
     elapsed: Option<std::time::Duration>,
     pub limited: bool,
     pub error: Option<String>,
     pub session_ignores: Vec<String>,
     pub ignore_dialog: Option<IgnoreDialog>,
     pub help_open: bool,
-    /// Each results column's width as it was actually laid out last frame,
-    /// and the width the table had to lay them out in.
-    ///
-    /// Measured rather than remembered: once the table is resizable
-    /// `egui_extras` owns the widths and offers no way to read them back, and
-    /// this is what [`fit_widths`] needs to keep the user's proportions
-    /// across a window resize.
+    /// Each column's width as actually laid out last frame. Measured, not
+    /// remembered: once the table is resizable `egui_extras` owns the widths
+    /// and offers no way to read them back.
     col_widths: Vec<f32>,
     /// The widths asked for last frame. A column that came back a different
     /// width is the one under the pointer — `egui_extras` offers no way to ask.
     col_wanted: Vec<f32>,
-    /// The column being dragged, held for the length of the drag.
-    ///
-    /// Re-deciding it every frame does not work: the table lays out from the
-    /// widths it stored a frame earlier, so on the frames where the lag has
-    /// caught up there is nothing to tell a drag from a settled layout, and
-    /// the ceiling that keeps the drag inside the window would come and go.
+    /// The column being dragged, held for the drag's length. Re-deciding per
+    /// frame fails: the table lays out from widths stored a frame earlier,
+    /// so a settled layout is indistinguishable from a drag on some frames.
     col_drag: Option<usize>,
-    /// Display-row index hovered last frame; tracked via `contains_pointer()`
-    /// because `row.response().hovered()` is false whenever a selectable label
-    /// wins the hit-test.
+    /// Hovered display-row, via `contains_pointer()`: `row.response()
+    /// .hovered()` is false whenever a selectable label wins the hit-test.
     hovered_row: Option<usize>,
     focus_query: bool,
-    /// Query syntax-highlight segments, cached per text.
     highlight: crate::query_highlight::HighlightCache,
-    /// Screen rects of last frame's Content Match cells, in display order — the
-    /// capture driver's hover targets.
+    /// Last frame's Content Match cell rects — the capture driver's targets.
     #[cfg(feature = "capture")]
     pub(crate) capture_match_rects: Vec<egui::Rect>,
 }
@@ -504,21 +409,14 @@ impl SearchTab {
         }
     }
 
-    /// Pre-fill the query and let the normal debounce path run it.
     pub fn seed(&mut self, query: String) {
         self.query = query;
         self.pending_edit = Some(Instant::now());
     }
 
     /// Whether what the table shows corresponds to the text in the query box:
-    /// the query executed, the swap landed, and the reveal finished.
-    ///
-    /// Two things need exactly this. Arming the live watchers does, because
-    /// watching rows that do not match the box would re-cut their snippets
-    /// against the wrong query; and the capture driver's `wait_search_done`
-    /// does, because a screenshot mid-reveal catches a half-drawn table. They
-    /// were the same expression written twice, one of them behind the capture
-    /// feature and so absent from every test build.
+    /// the query executed, the swap landed, and the reveal finished. Shared
+    /// by live-watch arming and the capture driver's `wait_search_done`.
     pub(crate) fn settled(&self) -> bool {
         !self.running && self.pending_edit.is_none() && self.fade_settled()
     }
@@ -528,27 +426,21 @@ impl SearchTab {
         self.focus_query = true;
     }
 
-    /// Re-sort before the next paint. Needed when the columns change from
-    /// outside the tab: hiding the sorted column demotes the sort to Rank
-    /// (see [`effective_sort`]), and the order has to be rebuilt for it.
+    /// Re-sort before the next paint — needed when the columns change from
+    /// outside the tab (see [`effective_sort`]).
     pub(crate) fn mark_sort_dirty(&mut self) {
         self.sort_dirty = true;
     }
 
-    /// Screen rect of the Nth visible Content Match cell from the last rendered
-    /// frame, if that many are on screen.
     #[cfg(feature = "capture")]
     pub(crate) fn capture_match_cell(&self, n: usize) -> Option<egui::Rect> {
         self.capture_match_rects.get(n).copied()
     }
 
-    /// A new search was submitted under `generation`; its hits stage until
-    /// the old results fade out.
+    /// The new search's hits stage until the old results fade out.
     pub fn on_search_started(&mut self, generation: u64) {
         self.generation = generation;
         self.staging.clear();
-        // The watches belong to the results being replaced. The app drops the
-        // registration itself; this is the tab-side half.
         self.live_armed.clear();
         self.live_wanted.clear();
         self.live_changed_at = None;
@@ -561,8 +453,6 @@ impl SearchTab {
         self.error = None;
     }
 
-    /// Nothing left to animate: the section is fully on screen and no result
-    /// swap is waiting on it.
     fn fade_settled(&self) -> bool {
         !self.swap_pending && self.wipe <= 0.0 && self.fade >= 1.0
     }
@@ -588,7 +478,6 @@ impl SearchTab {
             SearchUpdate::Started { .. } => {}
             SearchUpdate::Hits { hits, .. } => {
                 if self.swap_pending {
-                    // Old results are still fading out; hold the new ones.
                     admit(&mut self.staging, hits, display_limit, &mut self.limited);
                 } else {
                     // Admitting a batch may reorder or drop rows out from
@@ -604,8 +493,6 @@ impl SearchTab {
                             .position(|h| h.file_id == id)
                             .map(|i| i as u32)
                     });
-                    // Hits arrive in scan order, not rank order; re-sort on
-                    // every batch.
                     self.sort_dirty = true;
                 }
             }
@@ -622,22 +509,19 @@ impl SearchTab {
         }
     }
 
-    /// Apply one live filesystem update to the row it names.
-    ///
-    /// Rows are found by path — the same key the watcher was armed with. The
-    /// display order, the selection and `file_id` are all left alone: a row
-    /// that jumps or vanishes under the pointer while someone is reading it is
-    /// worse than a row that is briefly out of position.
+    /// Apply one live filesystem update to the row it names (found by path —
+    /// the key the watcher was armed with). Display order, selection and
+    /// `file_id` are left alone: a row that jumps under the pointer is worse
+    /// than one briefly out of position.
     pub fn apply_live(&mut self, update: LiveUpdate) {
         match update {
             LiveUpdate::Renamed { path, to, name } => {
                 let Some(hit) = self.results.iter_mut().find(|h| h.path == path) else {
                     return;
                 };
-                // A name- or path-tier snippet *is* the old field, so it has
-                // to be rewritten. The marks go with it: nothing here says the
-                // new name still matches the query, and an unhighlighted new
-                // name is the honest rendering of that.
+                // A name/path-tier snippet *is* the old field, so it is
+                // rewritten; the marks go with it — nothing here says the new
+                // name still matches the query.
                 let field = hit.match_field();
                 if let Some(snip) = hit.snippet.as_mut() {
                     match field {
@@ -669,9 +553,8 @@ impl SearchTab {
                 hit.size = size;
                 hit.mtime = mtime;
                 match window {
-                    // Either not a body-text row, or one whose body could not
-                    // be re-read. Both mean the cell is better left as it is
-                    // than blanked on no evidence.
+                    // Not a body-text row, or its body could not be re-read:
+                    // better left as is than blanked on no evidence.
                     WindowUpdate::Unchanged => {}
                     WindowUpdate::Cut(snippet) => hit.snippet = Some(snippet),
                     WindowUpdate::NoMatch => hit.snippet = None,
@@ -686,11 +569,8 @@ impl SearchTab {
         }
     }
 
-    /// Whether `live_wanted` already describes exactly these rows.
-    ///
-    /// Compared field by field rather than by building the targets and
-    /// testing equality, because the common frame is "nothing moved" and
-    /// that frame must allocate nothing at all.
+    /// Whether `live_wanted` already describes exactly these rows. Compared
+    /// field by field: the common frame is "nothing moved" and must not allocate.
     fn live_wanted_current(&self, visible: &[u32]) -> bool {
         visible.len() == self.live_wanted.len()
             && visible.iter().zip(&self.live_wanted).all(|(&ix, want)| {
@@ -714,9 +594,7 @@ impl SearchTab {
         if self.query.trim().is_empty() && self.results.is_empty() {
             return None;
         }
-        // The `+` is the whole warning here: it says the count is a floor.
-        // The reason and the remedy live in the tab body's own notice, which
-        // has room for a sentence; the status bar does not.
+        // The `+` says the count is a floor.
         Some(format!(
             "{}{} results",
             self.results.len(),
@@ -742,8 +620,7 @@ impl SearchTab {
                 SortKey::Modified => a.mtime.cmp(&b.mtime),
             };
             let ord = if ascending { ord } else { ord.reverse() };
-            // Tie-break on the unique path so equal keys don't shuffle as
-            // batches stream in.
+            // Tie-break on the unique path so equal keys don't shuffle.
             ord.then_with(|| a.path.cmp(&b.path))
         });
         // Selection follows the file, not the visual slot.
@@ -756,12 +633,10 @@ impl SearchTab {
         self.sort_dirty = false;
     }
 
-    /// One column header: its label, the sort indicator when it is the active
-    /// key, the click that re-keys the sort, and the right-click menu that
-    /// picks columns. `key` is `None` for a header that does not sort.
-    ///
-    /// The sort indicator is a painter-drawn triangle: the default egui fonts
-    /// have no ▲/▼ glyphs — they render as boxes.
+    /// One column header: label, sort indicator, sort click, and the
+    /// column-picker context menu (`key` is `None` for a non-sorting header).
+    /// The indicator is a painter-drawn triangle: the default egui fonts have
+    /// no ▲/▼ glyphs — they render as boxes.
     fn header_cell(
         &mut self,
         ui: &mut egui::Ui,
@@ -819,26 +694,21 @@ impl SearchTab {
                 self.sort_dirty = true;
             }
         }
-        // Every header carries the same picker, so a right-click lands wherever
-        // the pointer happens to be along the row.
+        // Every header carries the same picker.
         response.context_menu(|ui| {
             let mut next = self.columns.clone();
             ui.label(hint("Columns"));
-            let row = |ui: &mut egui::Ui, on: &mut bool, label: &str| {
-                ui.checkbox(on, label);
-            };
-            row(ui, &mut next.name, "Name");
-            // Shown checked and greyed rather than omitted: an absent entry
-            // reads as an oversight, a disabled one answers the question.
-            ui.add_enabled(false, egui::Checkbox::new(&mut true, "Path"))
+            ui.checkbox(&mut next.name, "Name");
+            let mut always_on = true;
+            ui.add_enabled(false, egui::Checkbox::new(&mut always_on, "Path"))
                 .on_disabled_hover_text(
                     "The path is always shown — it is the only column that \
                      identifies a result on its own.",
                 );
-            row(ui, &mut next.content_match, "Content Match");
-            row(ui, &mut next.size, "Size");
-            row(ui, &mut next.modified, "Modified");
-            row(ui, &mut next.rank, "Rank");
+            ui.checkbox(&mut next.content_match, "Content Match");
+            ui.checkbox(&mut next.size, "Size");
+            ui.checkbox(&mut next.modified, "Modified");
+            ui.checkbox(&mut next.rank, "Rank");
             if next != self.columns {
                 self.columns = next.clone();
                 self.sort_dirty = true;
@@ -850,17 +720,19 @@ impl SearchTab {
     pub fn ui(&mut self, ui: &mut egui::Ui) -> SearchActions {
         let mut actions = SearchActions::default();
 
-        // --- Query strip: the syntax-help button anchors the left edge, then
-        // everything else is laid out right to left with the query box taking
-        // whatever is left of the row. --------------------------------------
+        // --- Query strip ----------------------------------------------------
         ui.horizontal(|ui| {
-            if ui.button("?").on_hover_text("Query syntax help").clicked() {
+            if ui
+                .button("?")
+                .on_hover_text("Query syntax help")
+                .spot(Spot::QueryHelp)
+                .clicked()
+            {
                 self.help_open = !self.help_open;
             }
-            // Sized to what the `?` left behind, not `with_layout`: a
-            // right-to-left child takes the row's *full* width, so after the
-            // button has advanced the cursor its right edge lands a button's
-            // width past the panel and the rightmost widget falls off screen.
+            // A right-to-left child takes the row's *full* width, so after
+            // the `?` advanced the cursor the rightmost widget would fall off
+            // screen; size to what is left instead.
             let rest = egui::vec2(
                 (ui.max_rect().right() - ui.next_widget_position().x).max(0.0),
                 ui.available_height(),
@@ -869,39 +741,33 @@ impl SearchTab {
                 rest,
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
-                    // The label is a separate widget from the box so it can sit on
-                    // the left: in a right-to-left layout the first widget added is
-                    // the rightmost, and `egui::Checkbox` pushes its own icon
-                    // leftmost whatever the direction, so the two have to be
-                    // separate widgets in this order. Sensing clicks on the label
-                    // keeps the target the combined widget used to have.
-                    // The pair gets its own fixed-width, left-to-right slot,
-                    // the way the status slot below does. A bare `ui.horizontal`
-                    // here would be laid out by the surrounding right-to-left
-                    // strip and land its contents past the panel's edge.
-                    //
-                    // Two widgets rather than one because `egui::Checkbox`
-                    // pushes its own icon leftmost whatever the direction — and
-                    // sensing clicks on the label keeps the target the combined
-                    // widget gave it for free.
+                    // Two widgets, label first — see [`FUZZY_HINT`]. The pair
+                    // needs its own fixed-width LTR slot, or the RTL strip
+                    // would land it past the panel's edge.
                     let toggled = ui
                         .allocate_ui_with_layout(
                             egui::vec2(FUZZY_SLOT_WIDTH, ui.spacing().interact_size.y),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 let mut toggled = false;
-                                if ui
+                                let label = ui
                                     .add(egui::Label::new("Fuzzy").sense(egui::Sense::click()))
-                                    .on_hover_text(FUZZY_HINT)
-                                    .clicked()
-                                {
+                                    .on_hover_text(FUZZY_HINT);
+                                if label.clicked() {
                                     self.fuzzy = !self.fuzzy;
                                     toggled = true;
                                 }
-                                toggled
-                                    | ui.add(egui::Checkbox::without_text(&mut self.fuzzy))
-                                        .on_hover_text(FUZZY_HINT)
-                                        .changed()
+                                let checkbox = ui
+                                    .add(egui::Checkbox::without_text(&mut self.fuzzy))
+                                    .on_hover_text(FUZZY_HINT);
+                                // The pair: the tour's page names the word as
+                                // much as the box beside it.
+                                crate::spotlight::mark(
+                                    ui.ctx(),
+                                    Spot::FuzzyToggle,
+                                    label.rect.union(checkbox.rect),
+                                );
+                                toggled | checkbox.changed()
                             },
                         )
                         .inner;
@@ -916,8 +782,7 @@ impl SearchTab {
                         egui::vec2(STATUS_SLOT_WIDTH, ui.spacing().interact_size.y),
                         egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            // Hold the width from the inside — the child otherwise
-                            // shrinks to its content.
+                            // The child otherwise shrinks to its content.
                             ui.set_min_width(STATUS_SLOT_WIDTH);
                             if self.running {
                                 ui.add(egui::Spinner::new().size(16.0));
@@ -938,13 +803,9 @@ impl SearchTab {
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.query)
                             .desired_width(width.max(120.0))
-                            // The gutter is held whether or not the button is
-                            // showing. `TextEdit` sizes its frame as
-                            // `wrap_width + margin`, with `wrap_width` capped by
-                            // what is available, so widening the right margin
-                            // leaves the outer box exactly where it was and only
-                            // insets the text — which is what keeps the query from
-                            // shifting sideways every time a search finishes.
+                            // Widening the right margin insets the text
+                            // without moving the outer box, so the query never
+                            // shifts sideways when a search finishes.
                             .margin(egui::Margin {
                                 right: 4 + REPEAT_SLOT_W,
                                 ..egui::Margin::symmetric(4, 2)
@@ -954,10 +815,11 @@ impl SearchTab {
                             )
                             .layouter(&mut layouter),
                     );
+                    let response = response.spot(Spot::SearchBar);
                     if self.focus_query {
                         response.request_focus();
-                        // Select the existing text, written straight to widget
-                        // state so the selection is in place the frame focus lands.
+                        // Written straight to widget state so the selection is
+                        // in place the frame focus lands.
                         if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
                             let all = egui::text::CCursorRange::two(
                                 egui::text::CCursor::new(0),
@@ -970,20 +832,15 @@ impl SearchTab {
                     }
                     if response.changed() {
                         self.pending_edit = Some(Instant::now());
-                        // The watches belong to the results the old query
-                        // produced. Dropping them here rather than at the next
-                        // search means they go the instant the query stops
+                        // The watches go the instant the query stops
                         // describing what is on screen.
                         self.reset_live();
                         actions.live_targets = Some(Vec::new());
                     }
 
-                    // Read *after* the edit above, so a keystroke hides the button
-                    // on its own frame. `pending_edit.is_none()` is also what makes
-                    // "repeat the last search" and "run what is in the box" the
-                    // same thing: the flag is set on every edit and cleared in the
-                    // same statement that fires the search, so whenever this is
-                    // true the box holds exactly what last executed.
+                    // Read *after* the edit above, so a keystroke hides the
+                    // button on its own frame. `pending_edit.is_none()` means
+                    // the box holds exactly what last executed.
                     let show_repeat = !self.running
                         && self.elapsed.is_some()
                         && self.pending_edit.is_none()
@@ -997,15 +854,11 @@ impl SearchTab {
                             response.rect.right_bottom(),
                         )
                         .shrink(2.0);
-                        // `place`, not `put`: `put` advances the cursor, which in
-                        // this right-to-left row would shove the query box sideways.
-                        //
-                        // This must stay *after* the TextEdit. egui derives widget
-                        // ids from how many widgets precede them, so a button that
-                        // comes and goes ahead of the box would rename it every
-                        // time a search finished — and a TextEdit whose id changes
-                        // loses focus and its in-progress edit. Nothing follows the
-                        // button here, so the ordering alone is the fix.
+                        // `place`, not `put`: `put` advances the cursor and
+                        // would shove the query box sideways. This must stay
+                        // *after* the TextEdit: egui derives widget ids from
+                        // how many widgets precede them, and a TextEdit whose
+                        // id changes loses focus and its in-progress edit.
                         if ui
                             .place(slot, egui::Button::new("↻").frame_when_inactive(false))
                             .on_hover_text("Run this search again")
@@ -1055,21 +908,18 @@ impl SearchTab {
             && !self.swap_pending
             && self.results.is_empty()
             && !self.query.trim().is_empty()
-            && self.error.is_none()
         {
             ui.label(hint("No results."));
         }
 
-        // Repaints have to be asked for by hand, since the fade/wipe values
-        // are ours rather than the animation manager's — and the swap frame
-        // needs one too.
+        // Repaints must be asked for by hand: the fade/wipe values are ours,
+        // not the animation manager's.
         self.advance_fade(ui.input(|i| i.stable_dt));
         if self.swap_pending && self.fade <= 0.0 {
             self.results = std::mem::take(&mut self.staging);
             self.selected = None;
             self.swap_pending = false;
             self.wipe = 1.0;
-            // Staged hits arrived in scan order; re-sort.
             self.sort_dirty = true;
         }
         if !self.fade_settled() {
@@ -1080,14 +930,12 @@ impl SearchTab {
             self.resort();
         }
 
-        // Section-wide opacity; modal windows and the notices above render at
-        // full opacity on their own layers.
+        // Section-wide opacity; modals and the notices above have their own layers.
         ui.set_opacity(self.fade);
 
         // --- Results table ------------------------------------------------
-        // Reserve room for the preview strip; only content matches get one.
-        // Driven by the selection rather than by the column, so the snippet
-        // stays reachable even with the Content Match column switched off.
+        // Preview strip, driven by the selection so the snippet stays
+        // reachable even with the Content Match column switched off.
         let preview_snippet: Option<Snippet> = self
             .selected
             .and_then(|i| self.results.get(i as usize))
@@ -1096,10 +944,8 @@ impl SearchTab {
         let preview_height = if preview_snippet.is_some() { 44.0 } else { 0.0 };
         let table_height = (ui.available_height() - preview_height).max(60.0);
 
-        // Shown whenever it is picked, whatever the results turned out to be.
-        // A result set that matched only on names gets a column of em dashes,
-        // which is the honest reading of "no content match here" — hiding the
-        // column instead would make a checked box mean nothing.
+        // Shown whenever picked: a names-only result set gets em dashes —
+        // hiding the column would make a checked box mean nothing.
         let show_match = self.columns.content_match;
         let cols = self.columns.clone();
 
@@ -1108,16 +954,14 @@ impl SearchTab {
         let mut open_ignore_dialog: Option<usize> = None;
         let mut hovered_now: Option<usize> = None;
         let mut picked: Option<ColumnsConfig> = None;
-        // egui_extras invokes the body closure only for the rows it actually
-        // renders, so collecting here *is* the "visually shown, not all
-        // returned" set, for free.
+        // egui_extras invokes the body closure only for rendered rows, so
+        // collecting here *is* the visually-shown set.
         let mut visible_now: Vec<u32> = Vec::new();
         let order = std::mem::take(&mut self.order);
         #[cfg(feature = "capture")]
         let mut capture_match_rects: Vec<egui::Rect> = Vec::new();
 
-        // Top of the wiped section; its bottom is known only after the
-        // preview strip is laid out.
+        // Top of the wiped section; the bottom is known after the preview strip.
         let section_top = ui.cursor().top();
 
         // What each enabled column may never go under, and what it starts at.
@@ -1136,10 +980,8 @@ impl SearchTab {
         if show_match {
             plans.push(flex(120.0, 320.0));
         }
-        // Natural widths, and no reason to grow: a date is as long as a date.
-        // The floor is under the natural width all the same, so a window too
-        // narrow for the table squeezes these before anything runs off the
-        // edge — the flex columns give first, and only then these.
+        // Natural widths; the floor is below them so a too-narrow window
+        // squeezes these only after the flex columns give.
         for (on, floor, w) in [
             (cols.size, 52.0, 72.0),
             (cols.modified, 78.0, 110.0),
@@ -1154,37 +996,24 @@ impl SearchTab {
             }
         }
 
-        // What the columns themselves have to divide up: the width the table
-        // is given, less what the table spends around them. Both parts are
-        // read from the style rather than inferred from where the columns
-        // ended up last frame — inferring it is a feedback loop, since a
-        // frame in which the columns do not fill the width reads as a frame
-        // with more overhead, which shrinks the budget, which keeps them from
-        // filling it. `egui_extras` charges the same two: the scrollbar comes
-        // off `available_rect_before_wrap`, and `Sizing::to_lengths` bills
-        // one spacing between each pair of columns.
+        // Budget = table width minus scrollbar and inter-column spacing, read
+        // from the style: inferring it from where the columns ended up last
+        // frame is a feedback loop that keeps them from filling the width.
         let table_avail = ui.available_width();
         let stale = self.col_widths.len() != plans.len();
         let gaps = plans.len().saturating_sub(1) as f32 * ui.spacing().item_spacing.x;
         let budget = (table_avail - ui.spacing().scroll.allocated_width() - gaps).max(0.0);
-        // A column toggled on or off means egui_extras has dropped the stored
-        // widths anyway, so start from the plan.
+        // A toggled column means egui_extras dropped the stored widths anyway.
         let current: Vec<f32> = if stale {
             plans.iter().map(|p| p.initial).collect()
         } else {
             self.col_widths.clone()
         };
 
-        // Which column the pointer is on, if any: the one egui_extras sized
-        // differently from what was asked for. There is no way to ask it
-        // directly, and it has to be left alone — refitting a column while it
-        // is being dragged fights the pointer.
-        //
-        // Gated on a held button because a width can differ from the request
-        // for a duller reason: egui_extras lays a frame out from the widths it
-        // stored at the end of the *previous* one, so every refit shows up a
-        // frame late and would otherwise read as a drag. Nothing can be
-        // dragged with nothing pressed, which settles it.
+        // The dragged column is the one egui_extras sized differently from
+        // the request — there is no way to ask. Gated on a held button:
+        // layout runs from widths stored a frame earlier, so every refit
+        // shows up a frame late and would otherwise read as a drag.
         if !ui.input(|i| i.pointer.any_down()) {
             self.col_drag = None;
         } else if self.col_drag.is_none() && !stale && self.col_wanted.len() == plans.len() {
@@ -1196,12 +1025,9 @@ impl SearchTab {
         let dragged = self.col_drag.filter(|&i| i < plans.len());
         let targets = fit_around(&current, &plans, budget, dragged);
 
-        // `width_range` is the only handle on a resizable table's widths, and
-        // the clamp it drives is what actually moves them — so a column that
-        // has to move is pinned, and one already where it belongs is left free
-        // to be dragged. Pinning only what must move is what keeps a drag able
-        // to start: were every column pinned to its target, no drag could ever
-        // produce the first pixel of movement that identifies it.
+        // `width_range` is the only handle on a resizable table's widths.
+        // Pinning only what must move keeps a drag able to start: pinned
+        // everywhere, no drag could produce the first pixel that identifies it.
         let ranges: Vec<(f32, f32)> = targets
             .iter()
             .zip(&current)
@@ -1209,21 +1035,17 @@ impl SearchTab {
             .enumerate()
             .map(|(i, ((&target, &width), plan))| {
                 match dragged {
-                    // Left of the divider, and so not the drag's to touch: held
-                    // exactly where it is, because the divider's position is
-                    // measured from this column's edge. See `fit_around`.
+                    // Left of the divider: held, see `fit_around`.
                     Some(held) if i < held => (width, width),
-                    // The dragged column itself follows the pointer, as far as
-                    // the columns to its right can pay for.
+                    // The dragged column follows the pointer.
                     Some(held) if i == held => {
                         (plan.floor, grow_ceiling(&current, &plans, budget, i))
                     }
-                    // Right of the divider: absorbing, so pinned to its share.
+                    // Right of the divider: absorbing, pinned to its share.
                     Some(_) => (target, target),
                     None if (target - width).abs() > 0.5 => (target, target),
-                    // Settled, so left free for a drag to start on — with the
-                    // ceiling it will be held to once it does, rather than a
-                    // looser one that would let the first frame jump.
+                    // Settled: free for a drag to start on, under the same
+                    // ceiling it will be held to once it does.
                     None => (plan.floor, grow_ceiling(&current, &plans, budget, i)),
                 }
             })
@@ -1233,9 +1055,8 @@ impl SearchTab {
         let mut measured: Vec<f32> = Vec::with_capacity(plans.len());
         let table_scroll = ui
             .push_id("results", |ui| {
-                // Changing the column count makes egui_extras drop any widths
-                // the user had dragged. That is the cost of the picker, and a
-                // deliberate action on their part, so it is not worked around.
+                // Changing the column count makes egui_extras drop dragged
+                // widths; the picker is a deliberate action, not worked around.
                 let mut table = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
@@ -1253,12 +1074,18 @@ impl SearchTab {
 
                 table
                     .header(text_height + 4.0, |mut header| {
-                        // Each header cell reports its column's laid-out
-                        // width — the only way to read back what a resizable
-                        // table decided, and what the next frame refits from.
+                        // Each header cell reports its laid-out width — the
+                        // only way to read back what a resizable table decided.
                         let mut head = |sort, label, measured: &mut Vec<f32>| {
                             header.col(|ui| {
                                 measured.push(ui.max_rect().width());
+                                if sort == Some(SortKey::Rank) {
+                                    crate::spotlight::mark(
+                                        ui.ctx(),
+                                        Spot::RankColumn,
+                                        ui.max_rect(),
+                                    );
+                                }
                                 self.header_cell(ui, sort, label, &mut picked)
                             });
                         };
@@ -1290,16 +1117,12 @@ impl SearchTab {
                             let missing = self.gone.contains(&hit.file_id);
 
                             // Selectable labels win egui's hit-test over the
-                            // row, so union their responses into the row's or
-                            // clicks over glyphs would miss.
+                            // row; union their responses or clicks over glyphs miss.
                             let mut cell_responses: Vec<egui::Response> = Vec::new();
 
                             let field = hit.match_field();
                             if cols.name {
                                 row.col(|ui| {
-                                    // A filename match is highlighted here
-                                    // rather than in the Content Match column,
-                                    // which shows a dash for it instead.
                                     let marks = (field == MatchField::Name)
                                         .then(|| {
                                             whole_field_ranges(hit.snippet.as_ref(), &hit.name)
@@ -1307,12 +1130,6 @@ impl SearchTab {
                                         .flatten()
                                         .unwrap_or(&[]);
                                     let mut job = marked_field_job(ui, &hit.name, marks);
-                                    // A file that has gone from under the row
-                                    // reads as struck through rather than
-                                    // disappearing, so nothing below it moves
-                                    // while it is being read. Same helper the
-                                    // other columns use, so one concept has
-                                    // one rendering.
                                     if missing {
                                         mark_missing_job(ui, &mut job, true);
                                     }
@@ -1321,37 +1138,29 @@ impl SearchTab {
                             }
                             row.col(|ui| {
                                 // Center-elided: egui's own truncation would
-                                // drop the deepest directories. Sizing-pass
-                                // cell rects are not final, so don't measure
-                                // against them.
+                                // drop the deepest directories.
                                 let marks = (field == MatchField::Path)
                                     .then(|| whole_field_ranges(hit.snippet.as_ref(), &hit.path))
                                     .flatten()
                                     .unwrap_or(&[]);
                                 let (mut job, elided) = if ui.is_sizing_pass() {
-                                    // Nothing to elide against, so this is
-                                    // the plain marked field.
+                                    // Sizing-pass rects are not final: don't elide.
                                     (marked_field_job(ui, &hit.path, marks), false)
                                 } else {
                                     path_cell_job(
                                         ui,
                                         &hit.path,
                                         marks,
-                                        // A point of slack against rounding
-                                        // disagreements with egui's layout.
+                                        // Slack against egui layout rounding.
                                         ui.available_width() - 1.0,
                                         &body_font,
                                     )
                                 };
-                                // The path *is* the thing that no longer
-                                // exists, so it is struck through like the
-                                // name rather than merely dimmed.
                                 if missing {
                                     mark_missing_job(ui, &mut job, true);
                                 }
-                                // egui offers a full-text tooltip only when
-                                // *it* elided the galley — and it is handed
-                                // the already-shortened string here.
+                                // egui offers its own full-text tooltip only
+                                // when *it* elided the galley.
                                 let mut response =
                                     ui.add(egui::Label::new(job).show_tooltip_when_elided(false));
                                 if elided {
@@ -1369,9 +1178,8 @@ impl SearchTab {
                                         Some(snip) => {
                                             let width = ui.available_width();
                                             let mut job = centered_match_job(ui, snip, width);
-                                            // Dimmed, not struck through: the
-                                            // text is what the file *held*,
-                                            // not a name that has gone stale.
+                                            // Dimmed, not struck: the text is
+                                            // what the file *held*.
                                             if missing {
                                                 mark_missing_job(ui, &mut job, false);
                                             }
@@ -1386,9 +1194,6 @@ impl SearchTab {
                                             }
                                             response
                                         }
-                                        // No tooltip: for a name hit it would
-                                        // restate the filename already on
-                                        // screen, highlighted, two columns left.
                                         None => centered_cell(ui, |ui| {
                                             ui.label(egui::RichText::new(NO_CONTENT_MATCH).weak())
                                         }),
@@ -1408,9 +1213,7 @@ impl SearchTab {
                             }
                             if cols.modified {
                                 row.col(|ui| {
-                                    // Recency colouring says "this file was
-                                    // touched recently", which is a claim
-                                    // about a file that still exists.
+                                    // Recency is a claim about a file that still exists.
                                     let color = if missing {
                                         ui.visuals().weak_text_color()
                                     } else {
@@ -1426,6 +1229,13 @@ impl SearchTab {
                             }
                             if cols.rank {
                                 row.col(|ui| {
+                                    // Unioned with the header and the other
+                                    // rows: the tour points at the column.
+                                    crate::spotlight::mark(
+                                        ui.ctx(),
+                                        Spot::RankColumn,
+                                        ui.max_rect(),
+                                    );
                                     let response = centered_cell(ui, |ui| {
                                         ui.label(
                                             egui::RichText::new(format!(" {:.2} ", hit.rank))
@@ -1474,8 +1284,7 @@ impl SearchTab {
                     })
             })
             .inner;
-        // Sizing passes lay out a throwaway sample; taking their widths would
-        // feed the next refit a measurement of nothing.
+        // Sizing passes lay out a throwaway sample; don't refit from them.
         if measured.len() == plans.len() {
             self.col_widths = measured;
         }
@@ -1487,18 +1296,15 @@ impl SearchTab {
         // --- Live results: watch what is on screen once it holds still -----
         {
             let now = Instant::now();
-            // Rebuilt only when it actually differs: this runs every frame,
-            // and cloning a screenful of paths each time would be a steady
-            // drip of allocation for nothing.
+            // Rebuilt only when it differs: this runs every frame.
             if !self.live_wanted_current(&visible_now) {
                 let rebuilt: Vec<Target> = visible_now
                     .iter()
                     .filter_map(|&ix| self.results.get(ix as usize))
                     .map(target_for)
                     .collect();
-                // Only a different watch *set* restarts the arm delay. A row
-                // whose size or modified time moved under it needs a fresh
-                // baseline for the next sweep, not a fresh registration.
+                // Only a different watch *set* restarts the arm delay: a
+                // moved size/mtime needs a fresh baseline, not a re-register.
                 if !same_watch_set(&rebuilt, &self.live_wanted) {
                     self.live_changed_at = Some(now);
                 }
@@ -1516,9 +1322,8 @@ impl SearchTab {
                 self.live_armed = self.live_wanted.clone();
                 actions.live_targets = Some(self.live_wanted.clone());
             } else if settled && !armed_already {
-                // Once the reveal settles nothing else asks for frames, so a
-                // bare `Instant` deadline would never come due. Same shape as
-                // the search debounce in `app::tick_debounce`.
+                // Once settled nothing else asks for frames, so a bare
+                // `Instant` deadline would never come due.
                 if let Some(changed) = self.live_changed_at {
                     let waited = now.duration_since(changed);
                     ui.ctx()
@@ -1568,9 +1373,8 @@ impl SearchTab {
     }
 }
 
-/// Timestamp color: fresh files get a green tint that fades into the weak
-/// text color over ~2 years on a log scale. The fade runs through OKLab —
-/// blending sRGB bytes instead dips through a darker, muddier green.
+/// Fresh files get a green tint fading to weak text over ~2 years on a log
+/// scale, through OKLab — blending sRGB dips through a muddier green.
 fn recency_color(ui: &egui::Ui, mtime: i64) -> egui::Color32 {
     let now = quicksearch_core::log::now_unix() as i64;
     let age_hours = ((now - mtime).max(0) as f32 / 3600.0).max(1.0);

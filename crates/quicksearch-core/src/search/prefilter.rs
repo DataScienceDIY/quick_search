@@ -1,32 +1,13 @@
-//! Turning "something that must be present" into a SQL narrowing.
-//!
-//! Three of the cascade's passes would otherwise read the whole index on every
-//! keystroke: the fuzzy full-text pass decompresses every stored document, and
-//! the two `regex:` passes run the user's regex over every name, every path and
-//! every document. In each case there is a set of literal strings of which **at
-//! least one must occur** in anything the pass can accept, and that set is
-//! enough to make the database do the rejecting instead.
-//!
-//! Where the sets come from differs; what is done with them does not, which is
-//! why they meet here:
-//!
-//! * the fuzzy pass splits its term into `k + 1` chunks, at most `k` of which
-//!   an in-budget match can damage — see
-//!   [`crate::search::fuzzy::pigeonhole_chunks`];
-//! * a `regex:` query hands its pattern to the same literal analysis the regex
-//!   engine uses to build its own prefilter — see
-//!   [`crate::query::pattern::RegexQuery`].
+//! Turning "something that must be present" into a SQL narrowing for the
+//! fuzzy and `regex:` passes, which would otherwise scan the whole index.
 //!
 //! # The one rule
 //!
 //! A prefilter must be a **superset** of what the pass accepts. It may admit
-//! rows the pass then rejects — every candidate is verified afterwards exactly
-//! as before, so ranking and results do not change, only how many rows are
-//! looked at. It must never exclude a row the pass would have accepted, because
-//! that failure has no symptom: the file simply stops appearing, and no error
-//! is raised anywhere.
-//!
-//! Everything below is guards in service of that rule.
+//! rows the pass then rejects — every candidate is verified afterwards, so
+//! results do not change, only how many rows are looked at. It must never
+//! exclude a row the pass would have accepted, because that failure has no
+//! symptom: the file simply stops appearing, and no error is raised anywhere.
 
 use rusqlite::types::Value;
 
@@ -34,18 +15,13 @@ use crate::query::translator::{escape_like, quote_phrase};
 
 /// Characters in the smallest unit the FTS5 trigram index can be queried for.
 ///
-/// A phrase shorter than this matches no token at all, so a prefilter built
-/// from one would return the empty set rather than a superset — the exact
-/// failure the module note forbids. It bounds [`Required::fts_expr`] only:
-/// `LIKE` has no such floor, which is why the two predicates guard separately.
+/// A shorter phrase matches no token at all, so a prefilter built from one
+/// would return the empty set rather than a superset. Bounds
+/// [`Required::fts_expr`] only; `LIKE` has no such floor.
 pub const TRIGRAM_FLOOR: usize = 3;
 
-/// Most literals worth OR-ing together.
-///
-/// A case-insensitive pattern expands combinatorially — `(?i)FOO` extracts as
-/// eight literals — and each one costs a term in the MATCH expression or two
-/// `LIKE`s per row. Past some width the filter stops being cheaper than the
-/// scan it replaces, and falling back to the scan is always correct.
+/// Most literals worth OR-ing together; past this the filter stops being
+/// cheaper than the scan it replaces, and falling back is always correct.
 const MAX_LITERALS: usize = 32;
 
 /// Literals of which at least one occurs in anything the query can match.
@@ -54,13 +30,8 @@ pub struct Required(Vec<String>);
 
 impl Required {
     /// `None` when the set cannot constrain anything: empty, too wide to be
-    /// worth it, or containing an empty literal.
-    ///
-    /// The empty-literal case is the one that matters. A literal set containing
-    /// `""` says "a match may begin with nothing", which is not a constraint at
-    /// all — building a filter from it would narrow to rows containing the
-    /// empty string, which is a statement SQL is entitled to answer any way it
-    /// likes. Callers see `None` and scan.
+    /// worth it, or containing an empty literal (`""` says "a match may begin
+    /// with nothing" — no constraint at all). Callers see `None` and scan.
     pub fn new(literals: Vec<String>) -> Option<Required> {
         if literals.is_empty() || literals.len() > MAX_LITERALS {
             return None;
@@ -77,25 +48,14 @@ impl Required {
 
     /// A `searchabletext MATCH` expression: `(text: "a" OR text: "b" …)`.
     ///
-    /// `None` when any literal is shorter than [`TRIGRAM_FLOOR`] **characters**.
-    /// Characters, not bytes: `café` is five bytes and four characters, and
-    /// `日本` is six bytes and two — the tokenizer indexes character triples, so
-    /// a byte-length test would admit a phrase that matches no token.
-    ///
-    /// Every literal goes through [`quote_phrase`], which is what makes this
-    /// safe for text the user typed: a literal can contain `"`, `*`, `:`,
-    /// `NEAR` and the rest of FTS5's syntax, and unquoted that is a syntax
-    /// error rather than a search.
-    ///
-    /// The index folds case and strips diacritics (`remove_diacritics 1`), so
-    /// it matches *more* than the literal as written. That direction is the
-    /// harmless one.
+    /// `None` when any literal is shorter than [`TRIGRAM_FLOOR`]
+    /// **characters** — the tokenizer indexes character triples, so a
+    /// byte-length test would admit a phrase that matches no token.
+    /// [`quote_phrase`] renders FTS5 syntax in user text inert; the index
+    /// folds case and diacritics, so it matches *more* than the literal as
+    /// written — the harmless direction.
     pub fn fts_expr(&self) -> Option<String> {
-        if self
-            .0
-            .iter()
-            .any(|l| l.chars().count() < TRIGRAM_FLOOR)
-        {
+        if self.0.iter().any(|l| l.chars().count() < TRIGRAM_FLOOR) {
             return None;
         }
         Some(format!(
@@ -111,32 +71,15 @@ impl Required {
     /// A predicate over the `files` columns, plus the values it binds:
     /// `(f.name LIKE ? OR f.parent LIKE ? OR …)`.
     ///
-    /// `None` when any literal contains a path separator.
-    ///
-    /// # Why the separator matters
-    ///
-    /// There is no `path` column — a file's path is `parent || name` — so a
-    /// literal has to be looked for in the two columns separately. An
-    /// occurrence in the concatenation lies wholly inside `parent`, wholly
-    /// inside `name`, or spans the join. A spanning occurrence necessarily
-    /// covers the byte before the boundary, and that byte is `parent`'s last,
-    /// which is always a separator (see
-    /// [`crate::file_handling::dir_to_db_parent`]). So a literal with no
-    /// separator in it cannot span the join and the two-column test sees it
-    /// wherever it is — while a literal *with* one might sit exactly across the
-    /// boundary, be invisible to both `LIKE`s, and take its row with it.
-    ///
-    /// All-or-nothing on purpose: the set is an OR, so a row whose only present
-    /// literal is the untestable one would be dropped. One bad literal
-    /// therefore disqualifies the whole predicate rather than being skipped.
-    ///
-    /// No trigram floor here — `LIKE '%ab%'` is a perfectly good filter.
+    /// `None` when any literal contains a path separator: a path is
+    /// `parent || name`, and an occurrence spanning the join would be
+    /// invisible to both per-column `LIKE`s and take its row with it. A
+    /// separator-free literal cannot span the join, because `parent`'s last
+    /// byte is always a separator ([`crate::file_handling::dir_to_db_parent`]).
+    /// The set is an OR, so one untestable literal disqualifies the whole
+    /// predicate. No trigram floor here — `LIKE '%ab%'` is a fine filter.
     pub fn like_predicate(&self) -> Option<(String, Vec<Value>)> {
-        if self
-            .0
-            .iter()
-            .any(|l| l.contains(std::path::MAIN_SEPARATOR))
-        {
+        if self.0.iter().any(|l| l.contains(std::path::MAIN_SEPARATOR)) {
             return None;
         }
         let mut clauses = Vec::with_capacity(self.0.len());
@@ -162,19 +105,23 @@ mod tests {
     #[test]
     fn a_set_that_cannot_constrain_is_rejected() {
         assert!(req(&[]).is_none(), "nothing to filter on");
-        assert!(req(&["abc", ""]).is_none(), "an empty literal is no constraint");
+        assert!(
+            req(&["abc", ""]).is_none(),
+            "an empty literal is no constraint"
+        );
         let wide: Vec<String> = (0..MAX_LITERALS + 1).map(|i| format!("lit{i}")).collect();
         assert!(Required::new(wide).is_none(), "too wide to be worth it");
     }
 
     #[test]
     fn the_trigram_floor_counts_characters_not_bytes() {
-        // Four characters, five bytes: usable.
         assert!(req(&["café"]).unwrap().fts_expr().is_some());
-        // Two characters, six bytes: a byte test would wrongly admit this.
         assert!(req(&["日本"]).unwrap().fts_expr().is_none());
         assert!(req(&["ab"]).unwrap().fts_expr().is_none());
-        assert!(req(&["abc", "de"]).unwrap().fts_expr().is_none(), "all of them");
+        assert!(
+            req(&["abc", "de"]).unwrap().fts_expr().is_none(),
+            "all of them"
+        );
     }
 
     #[test]

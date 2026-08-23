@@ -1,19 +1,12 @@
-//! The Wayland half of the search shortcut: `org.freedesktop.portal.GlobalShortcuts`.
+//! The Wayland half of the shortcut: `org.freedesktop.portal.GlobalShortcuts`.
 //!
-//! Wayland deliberately gives an application no way to grab a key it does not
-//! already have focus for, so the shortcut is registered with the desktop
-//! instead and the desktop tells us when it fires. The consequence worth
-//! knowing is that **the desktop owns the binding**: what we send is a
-//! `preferred_trigger`, and the compositor is free to bind something else, to
-//! ask the user first, or to let them change it later in its own settings.
-//! What it actually bound comes back as a human-readable
-//! `trigger_description`, which is what the Settings tab shows.
+//! **The desktop owns the binding**: what we send is a `preferred_trigger`,
+//! and the compositor may bind something else or ask the user; what it bound
+//! comes back as a `trigger_description`, which the Settings tab shows.
 //!
-//! All of this lives on its own thread. The portal is D-Bus, so every call
-//! is a round trip that could block for as long as a dialog stays on screen,
-//! and none of that may happen on the UI thread. The thread outlives the
-//! binding: the session has to stay open for activations to keep arriving,
-//! and dropping it is how a rebind starts over.
+//! All of this lives on its own thread — a portal call is a D-Bus round trip
+//! that can block as long as a dialog stays up. The session must stay open
+//! for activations to keep arriving; dropping it is how a rebind starts over.
 
 use std::sync::{Arc, Mutex};
 
@@ -25,24 +18,21 @@ use futures_util::StreamExt;
 
 use super::Status;
 
-/// Our only shortcut. The portal keys activations by this id, and it is what
-/// a desktop's shortcut settings lists the entry under.
+/// The portal keys activations by this id; the desktop lists the entry by it.
 const SHORTCUT_ID: &str = "search";
 
 /// Shown next to the key in the desktop's shortcut settings.
 const SHORTCUT_DESCRIPTION: &str = "Focus the QuickSearch search box";
 
 pub(super) struct Portal {
-    /// `Some(trigger)` binds, `None` unbinds. Unbounded because a send
-    /// happens on the UI thread and must never block it.
+    /// `Some(trigger)` binds, `None` unbinds. Unbounded: sends happen on
+    /// the UI thread and must never block it.
     tx: mpsc::UnboundedSender<Option<String>>,
     status: Arc<Mutex<Status>>,
 }
 
 impl Portal {
-    /// Start the portal thread. It runs until the process exits; there is
-    /// nothing to shut down, since the session's only resource is a D-Bus
-    /// connection the OS reclaims.
+    /// The thread runs until the process exits; nothing to shut down.
     pub(super) fn new(ctx: &egui::Context) -> Portal {
         let (tx, rx) = mpsc::unbounded();
         let status = Arc::new(Mutex::new(Status::Pending));
@@ -55,8 +45,8 @@ impl Portal {
             .name("quicksearch-hotkey-portal".to_string())
             .spawn(move || pollster::block_on(run(ctx, status, rx)))
         {
-            // Not worth taking the app down for — but the status must say
-            // so, or the Settings tab shows "Waiting for your desktop…" forever.
+            // The status must say so, or the Settings tab shows
+            // "Waiting for your desktop…" forever.
             quicksearch_core::log_warn!("global shortcut portal thread: {}", e);
             *lock_ok(&portal.status) =
                 Status::Error(format!("the shortcut thread could not be started: {}", e));
@@ -64,8 +54,8 @@ impl Portal {
         portal
     }
 
-    /// Ask for a new binding, or for none at all. Returns immediately; the
-    /// answer lands in [`Portal::status`] whenever the desktop gets to it.
+    /// Returns immediately; the answer lands in [`Portal::status`]
+    /// whenever the desktop gets to it.
     pub(super) fn bind(&self, trigger: Option<String>) {
         *lock_ok(&self.status) = match trigger {
             Some(_) => Status::Pending,
@@ -79,8 +69,7 @@ impl Portal {
     }
 }
 
-/// Lock, ignoring poisoning: the status is a whole-value slot shared with
-/// the portal thread, and a panic there must not take the UI thread with it.
+/// Ignore poisoning: a portal-thread panic must not take the UI thread too.
 fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -90,14 +79,11 @@ async fn run(
     status: Arc<Mutex<Status>>,
     mut commands: mpsc::UnboundedReceiver<Option<String>>,
 ) {
-    // `'static`: the proxy owns its D-Bus connection, so nothing here
-    // borrows from a local.
     let shortcuts: GlobalShortcuts<'static> = match GlobalShortcuts::new().await {
         Ok(s) => s,
         Err(e) => return fail(&ctx, &status, unavailable(&e)),
     };
-    // A D-Bus signal match on the interface, not on a session, so it
-    // survives the rebinds below.
+    // A signal match on the interface, not a session: survives rebinds.
     let activated = match shortcuts.receive_activated().await {
         Ok(s) => s,
         Err(e) => return fail(&ctx, &status, unavailable(&e)),
@@ -108,12 +94,10 @@ async fn run(
     loop {
         match select(activated.next(), commands.next()).await {
             Either::Left((Some(_), _)) => {
-                // Which shortcut it was does not need checking: this session
-                // has exactly one.
+                // No id check needed: this session has exactly one shortcut.
                 super::fire(&ctx);
             }
-            // The portal went away (it was restarted, or the bus dropped).
-            // Nothing left to listen to, and the session is already dead.
+            // The portal went away; the session is already dead.
             Either::Left((None, _)) => {
                 return fail(
                     &ctx,
@@ -122,8 +106,8 @@ async fn run(
                 )
             }
             Either::Right((Some(trigger), _)) => {
-                // A rebind is a new session, not a second `BindShortcuts`:
-                // the portal treats a session's shortcuts as fixed once bound.
+                // A rebind is a new session: the portal treats a session's
+                // shortcuts as fixed once bound.
                 if let Some(old) = session.take() {
                     let _ = old.close().await;
                 }
@@ -145,15 +129,13 @@ async fn run(
                 };
                 session = next;
             }
-            // The registry dropped the sender, which only happens on the way
-            // out.
+            // The registry dropped the sender: we are on the way out.
             Either::Right((None, _)) => return,
         }
     }
 }
 
-/// Open a session and bind the trigger, returning the desktop's own wording
-/// for the key it settled on.
+/// Bind the trigger; returns the desktop's own wording for what it settled on.
 async fn bind(
     shortcuts: &GlobalShortcuts<'static>,
     trigger: &str,
@@ -165,8 +147,7 @@ async fn bind(
         .bind_shortcuts(&session, &[shortcut], None)
         .await?;
     let bound = request.response()?;
-    // A desktop that binds the shortcut but describes it as nothing is not
-    // worth a special case: the preferred trigger is then the honest answer.
+    // A blank description falls back to the preferred trigger.
     let description = bound
         .shortcuts()
         .iter()
@@ -177,7 +158,6 @@ async fn bind(
     Ok((session, description))
 }
 
-/// Turn a portal failure into something worth putting in front of a user.
 fn unavailable(e: &ashpd::Error) -> String {
     match e {
         ashpd::Error::PortalNotFound(_) => {
@@ -194,7 +174,6 @@ fn unavailable(e: &ashpd::Error) -> String {
 
 fn set(ctx: &egui::Context, status: &Mutex<Status>, next: Status) {
     *lock_ok(status) = next;
-    // The Settings tab may be on screen and waiting for this.
     ctx.request_repaint();
 }
 

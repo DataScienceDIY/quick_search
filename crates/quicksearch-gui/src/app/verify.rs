@@ -1,10 +1,6 @@
 //! Byte-for-byte verification of one duplicate group, and the modal that
-//! reports it.
-//!
-//! The Duplicates tab groups by a hash of each file's size and head, which is
-//! all the indexer ever reads (see [`quicksearch_core::verify`]). This is the
-//! second opinion, asked for one group at a time, and it exists because the
-//! action it precedes is usually deletion.
+//! reports it. Grouping only hashes each file's size and head, so this is the
+//! second opinion — asked for before what usually follows it, deletion.
 
 use super::*;
 
@@ -20,8 +16,8 @@ const MODAL_WIDTH: f32 = 560.0;
 pub(crate) enum VerifyState {
     Running {
         bytes_read: u64,
-        /// Zero until the worker's first progress update lands, which is what
-        /// puts the bar in its indeterminate state to begin with.
+        /// Zero until the worker's first update lands; the bar is
+        /// indeterminate until then.
         bytes_total: u64,
     },
     Done(Box<VerifyReport>),
@@ -45,9 +41,7 @@ impl VerifyModal {
     }
 }
 
-/// One line of the report: what happened to `path`, in the words the modal
-/// paints. Split out from the rendering so the wording is testable without a
-/// frame.
+/// One line of the report, in the words the modal paints.
 pub(crate) fn verdict_line(verdict: &MemberVerdict, reference: bool) -> String {
     match verdict {
         MemberVerdict::Identical if reference => "compared against".to_string(),
@@ -86,7 +80,6 @@ pub(crate) fn summary_line(report: &VerifyReport) -> String {
 }
 
 impl QuickSearchApp {
-    /// Drain the worker and fold its updates into the modal.
     pub(super) fn drain_verify(&mut self) {
         use std::sync::mpsc::TryRecvError;
         let Some(job) = &self.backend.verify_job else {
@@ -121,8 +114,7 @@ impl QuickSearchApp {
                     break;
                 }
                 Err(TryRecvError::Empty) => break,
-                // The worker died without a terminal update. Nothing else can
-                // arrive, so say so rather than spinning on an empty channel.
+                // The worker died without a terminal update.
                 Err(TryRecvError::Disconnected) => {
                     if let Some(modal) = &mut self.verify {
                         if matches!(modal.state, VerifyState::Running { .. }) {
@@ -150,9 +142,8 @@ impl QuickSearchApp {
     }
 }
 
-/// Paint the modal; `true` when its dismiss button was clicked. A free
-/// function rather than a method so it can be rendered against a bare
-/// context, without an app and the index behind it.
+/// Paint the modal; `true` when its dismiss button was clicked. Takes a bare
+/// context, so a test can render it without an app or an index.
 pub(crate) fn verify_modal(ctx: &egui::Context, modal: &VerifyModal) -> bool {
     centered_modal(ctx, "Verify duplicates", |ui| {
         ui.set_max_width(MODAL_WIDTH);
@@ -165,8 +156,6 @@ pub(crate) fn verify_modal(ctx: &egui::Context, modal: &VerifyModal) -> bool {
                     "Comparing {} files byte for byte…",
                     modal.paths.len()
                 ));
-                // No denominator until the first update lands, which is what
-                // the indeterminate bar is for.
                 let fraction =
                     (*bytes_total > 0).then(|| (*bytes_read as f64 / *bytes_total as f64) as f32);
                 progress_bar(ui, fraction, MODAL_WIDTH);
@@ -198,8 +187,7 @@ pub(crate) fn verify_modal(ctx: &egui::Context, modal: &VerifyModal) -> bool {
                     ));
                 }
                 ui.add_space(6.0);
-                // Listed even when everything matched: it is the record of
-                // what was actually read.
+                // Listed even when everything matched: what was read.
                 egui::ScrollArea::vertical()
                     .max_height(260.0)
                     .auto_shrink([false, true])
