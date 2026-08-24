@@ -27,7 +27,10 @@ pub enum MemberVerdict {
     DiffersAt(u64),
     /// Lengths disagree, so nothing was read. Within a duplicate group this
     /// can only mean a stale index — the hash covers the size.
-    LengthDiffers { len: u64, reference_len: u64 },
+    LengthDiffers {
+        len: u64,
+        reference_len: u64,
+    },
     Unreadable(String),
 }
 

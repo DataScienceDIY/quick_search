@@ -69,7 +69,10 @@ fn render_perf() {
     for (label, mut tab) in [
         ("empty (floor)", new_tab()),
         ("1000 rows, name only", tab_with_results(1000)),
-        ("1000 rows, content snippets", tab_with_content_snippets(1000)),
+        (
+            "1000 rows, content snippets",
+            tab_with_content_snippets(1000),
+        ),
     ] {
         for _ in 0..10 {
             timed_frame(&ctx, &mut tab);

@@ -42,7 +42,9 @@ pub enum Applied {
     Done,
     /// Budget spent. What was written is committed; the caller should re-queue
     /// the same event with `resume_from` set to `done`.
-    Unfinished { done: usize },
+    Unfinished {
+        done: usize,
+    },
 }
 
 /// Apply one filesystem event to the index. Missing files are treated as

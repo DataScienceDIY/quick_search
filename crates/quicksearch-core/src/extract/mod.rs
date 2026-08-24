@@ -88,11 +88,7 @@ impl Registry {
     /// caller cannot forget. This cannot help with a stack overflow, which
     /// aborts rather than unwinding — see `vendor/pdf-extract`, which bounds
     /// the recursion that made that reachable.
-    pub fn extract(
-        &self,
-        path: &Path,
-        mime: &str,
-    ) -> Result<Option<String>, ExtractError> {
+    pub fn extract(&self, path: &Path, mime: &str) -> Result<Option<String>, ExtractError> {
         let Some(extractor) = self.find(mime) else {
             return Ok(None);
         };

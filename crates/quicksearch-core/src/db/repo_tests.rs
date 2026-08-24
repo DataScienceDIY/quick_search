@@ -1182,9 +1182,8 @@ fn deleting_a_file_row_cascades_the_fk_tables() {
     let (_dir, path) = tmp_path();
     let mut conn = open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
     let ids = seeded(&mut conn, &["/casc/a.txt", "/casc/b.txt"]);
-    let count = |conn: &Connection, sql: &str| -> i64 {
-        conn.query_row(sql, [], |r| r.get(0)).unwrap()
-    };
+    let count =
+        |conn: &Connection, sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     {
         let tx = conn.transaction().unwrap();
         set_content_failed(&tx, ids["/casc/b.txt"], "boom").unwrap();
@@ -1229,15 +1228,17 @@ fn retry_failed_files_resets_state_and_clears_records() {
     tx.commit().unwrap();
 
     let state = |id: i64| -> i64 {
-        conn.query_row(
-            "SELECT content_state FROM files WHERE id = ?1",
-            [id],
-            |r| r.get(0),
-        )
+        conn.query_row("SELECT content_state FROM files WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
         .unwrap()
     };
     assert_eq!(state(ids["/retry/bad.txt"]), STATE_PENDING);
-    assert_eq!(state(ids["/retry/good.txt"]), STATE_DONE, "done rows untouched");
+    assert_eq!(
+        state(ids["/retry/good.txt"]),
+        STATE_DONE,
+        "done rows untouched"
+    );
     let failures: i64 = conn
         .query_row("SELECT COUNT(*) FROM failed_files", [], |r| r.get(0))
         .unwrap();
@@ -1267,7 +1268,11 @@ fn a_changed_file_clears_its_failure_record() {
                 parent: "/chg/",
                 size: 2,
                 mtime: 9,
-                mime: if needs_content { Some("text/plain") } else { None },
+                mime: if needs_content {
+                    Some("text/plain")
+                } else {
+                    None
+                },
                 ftype: FileType::TEXT,
                 hash: None,
                 needs_content,
@@ -1284,11 +1289,9 @@ fn a_changed_file_clears_its_failure_record() {
     let b = update(&mut conn, "b.txt", true);
 
     let state = |id: i64| -> i64 {
-        conn.query_row(
-            "SELECT content_state FROM files WHERE id = ?1",
-            [id],
-            |r| r.get(0),
-        )
+        conn.query_row("SELECT content_state FROM files WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
         .unwrap()
     };
     assert_eq!(state(a), STATE_NA);

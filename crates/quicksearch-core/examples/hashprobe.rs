@@ -835,5 +835,4 @@ mod tests {
         assert_eq!(stat.reported_pairs, 10_000 * 9_999 / 2);
         assert_eq!(stat.fp_pairs, 0);
     }
-
 }

@@ -59,9 +59,13 @@ pub enum WatcherStatus {
     /// Registration in flight — it walks every root, so this can last
     /// minutes on large or networked trees.
     Starting,
-    Active { dirs: usize },
+    Active {
+        dirs: usize,
+    },
     /// Live updates unavailable; the periodic reindex is the only refresh.
-    Disabled { reason: WatchError },
+    Disabled {
+        reason: WatchError,
+    },
 }
 
 /// A config reconciliation the coordinator applies between runs.

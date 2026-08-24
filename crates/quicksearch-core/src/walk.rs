@@ -14,8 +14,6 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::UNIX_EPOCH;
 
-use sha2::{Digest, Sha256};
-
 use crate::config::{Config, IgnoreSet};
 use crate::extract::Registry;
 use crate::file_handling::{
@@ -47,8 +45,6 @@ pub struct WalkedFile {
     pub path: String,
     pub action: FileIndexAction,
     pub record: Option<OwnedNewFile>,
-    /// 128-bit truncated SHA-256 of the path, for the duplicate-visit set.
-    pub digest: u128,
     /// True when this file was reached by resolving a symlink. Its row is
     /// invisible to its real parent's reconciliation, so the caller must
     /// exempt it from the vanished-directory sweep.
@@ -57,12 +53,11 @@ pub struct WalkedFile {
 
 impl WalkedFile {
     /// Seen, but with nothing to write: the row stays.
-    fn skipped(path: String, digest: u128, aliased: bool) -> Self {
+    fn skipped(path: String, aliased: bool) -> Self {
         WalkedFile {
             path,
             action: FileIndexAction::Skip,
             record: None,
-            digest,
             aliased,
         }
     }
@@ -344,17 +339,6 @@ enum Known<'a> {
     Exact(Option<u64>),
 }
 
-/// 128-bit truncated SHA-256 of a path, for the writer's duplicate-visit set.
-/// 16 bytes is ~4e-26 collision probability at 7M paths (8 would be ~1e-6),
-/// and a collision silently drops a real file. Cryptographic because shared
-/// filenames are attacker-supplied: a chosen pair could hide one file.
-pub fn path_digest(path: &str) -> u128 {
-    let digest = Sha256::digest(path.as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    u128::from_be_bytes(bytes)
-}
-
 /// At most one `stat`, then classify; only files that will be written get
 /// opened, and small text files are finished outright. "At most": on Windows
 /// [`PendingFile::cached`] may already hold the answer.
@@ -362,20 +346,19 @@ fn prepare(file: PendingFile, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
     let PendingFile { path, cached } = file;
     // Every route here has already screened the path for UTF-8:
     // `path_to_db_string` is lossy, and a lossy string would key another
-    // file's row and could consume its digest.
+    // file's row.
     debug_assert!(
         path.to_str().is_some(),
         "an unrepresentable path reached prepare(): {:?}",
         path
     );
     let db_path = path_to_db_string(&path);
-    let digest = path_digest(&db_path);
     let aliased = matches!(known, Known::Exact(_));
 
     let Ok(meta) = crate::platform::metadata_or_stat(&path, cached) else {
         // Seen but unreadable: a transient stat failure must not read as
         // "deleted".
-        return WalkedFile::skipped(db_path, digest, aliased);
+        return WalkedFile::skipped(db_path, aliased);
     };
     let Some(mtime) = meta
         .modified()
@@ -383,7 +366,7 @@ fn prepare(file: PendingFile, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())
     else {
-        return WalkedFile::skipped(db_path, digest, aliased);
+        return WalkedFile::skipped(db_path, aliased);
     };
 
     let action = match known {
@@ -410,7 +393,6 @@ fn prepare(file: PendingFile, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
         path: db_path,
         action,
         record,
-        digest,
         aliased,
     }
 }
@@ -544,6 +526,21 @@ impl ParallelWalk {
     /// Cloneable worker-activity handle; permanently zero once workers exit.
     pub fn worker_stats(&self) -> WorkerStats {
         self.shared.stats.clone()
+    }
+
+    /// How many directories the walk has queued and roughly what their paths
+    /// own on the heap — the set is live for the whole run, so it is one of
+    /// the few structures that tracks the tree. Locks the queue and walks it,
+    /// so it belongs to the census and nothing else.
+    #[cfg(feature = "probe")]
+    pub fn seen_dirs_footprint(&self) -> (usize, u64) {
+        let q = crate::lock_ok(&self.shared.queue);
+        let bytes: u64 = q
+            .seen_dirs
+            .iter()
+            .map(|d| (d.as_os_str().len() + std::mem::size_of::<PathBuf>()) as u64)
+            .sum();
+        (q.seen_dirs.len(), bytes)
     }
 
     /// Join the workers and report whether every one finished cleanly. A dead

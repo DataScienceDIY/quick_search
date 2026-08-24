@@ -11,6 +11,14 @@ description = "Indexing, storage and search engine behind QuickSearch."
 name = "quicksearch_core"
 path = "src/lib.rs"
 
+# Off by default and never enabled by a shipped build. `probe` turns on the
+# indexing run's structure census (`indexing::pipeline`), which attributes
+# peak memory to a *structure*; `smaps` can only attribute it to a mapping,
+# and every one of these lives in the same anonymous heap. Built for the
+# `memprobe` example, which reads the census off stderr.
+[features]
+probe = []
+
 # Several dependencies below are named directly despite already being in the
 # lockfile transitively ("transitive already"): they compile nothing new.
 [dependencies]

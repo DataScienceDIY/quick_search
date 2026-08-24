@@ -115,7 +115,8 @@ fn head_extraction_agrees_with_reading_the_file() {
             .expect("claimed");
 
         assert_eq!(
-            from_head, from_disk,
+            from_head,
+            from_disk,
             "{} head and disk extraction disagree",
             ctx(sample)
         );

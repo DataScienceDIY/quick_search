@@ -94,11 +94,7 @@ impl Extractor for PlaintextExtractor {
         decode(read_sized(&mut f, size, MAX_READ, path)?, path)
     }
 
-    fn extract_from_head(
-        &self,
-        path: &Path,
-        head: &[u8],
-    ) -> Option<Result<String, ExtractError>> {
+    fn extract_from_head(&self, path: &Path, head: &[u8]) -> Option<Result<String, ExtractError>> {
         Some(decode(head.to_vec(), path))
     }
 }

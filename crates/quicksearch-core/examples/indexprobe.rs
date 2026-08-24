@@ -23,6 +23,11 @@
 //!
 //! `QSB_HASH_LENGTH` overrides `[processing] hash_length` for a run — how
 //! [`hashprobe`](hashprobe.rs) gets its end-to-end column.
+//!
+//! `QSB_KEY=<64 hex digits>` measures an encrypted index. It is not optional
+//! dressing: without a key installed this probe polls the completion marker
+//! through a plain open, which an encrypted index cannot answer, so the run
+//! reports a three-hour hang instead of its actual time.
 
 mod common;
 
@@ -340,17 +345,51 @@ fn hash_length_override() -> Option<usize> {
         .and_then(|v| v.parse().ok())
 }
 
+/// `QSB_KEY=<64 hex digits>` measures an *encrypted* index: the key is
+/// installed process-wide before any connection exists, exactly as the GUI
+/// does after an unlock. Raw hex rather than a password, so no Argon2id
+/// derivation lands inside a timed run.
+fn install_key() -> bool {
+    match std::env::var("QSB_KEY") {
+        Ok(hex) => {
+            let key = quicksearch_core::security::IndexKey::from_hex(hex.trim())
+                .expect("QSB_KEY must be 64 hex digits");
+            quicksearch_core::db::set_process_key(Some(key));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Open the index the way this run's key demands.
+///
+/// **A plain open cannot read an encrypted index**, and
+/// [`get_last_full_index`](quicksearch_core::db::repo::get_last_full_index)
+/// reports that failure as `None` — indistinguishable from "not finished
+/// yet". Polling an encrypted run through a plain open therefore never
+/// observes its own completion and sits here until the deadline, which reads
+/// as an indexing slowdown of several orders of magnitude rather than as the
+/// probe defect it is.
+fn probe_open(db: &Path, keyed: bool) -> Option<rusqlite::Connection> {
+    if keyed {
+        quicksearch_core::db::open_existing(&db.to_string_lossy(), false).ok()
+    } else {
+        rusqlite::Connection::open(db).ok()
+    }
+}
+
 fn run(mode: &str, tree: &Path, db: &Path) {
     let mut config = Config::default();
     if let Some(n) = hash_length_override() {
         config.processing.hash_length = n;
     }
     let hash_length = config.processing.hash_length;
+    let keyed = install_key();
 
     // The marker is the one unambiguous completion signal; polling the
     // status enum races on a small tree.
     if db.exists() {
-        let conn = rusqlite::Connection::open(db).expect("open db");
+        let conn = probe_open(db, keyed).expect("open db");
         conn.execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
             .expect("clear marker");
     }
@@ -374,14 +413,17 @@ fn run(mode: &str, tree: &Path, db: &Path) {
         )
         .expect("start indexing");
 
-    let deadline = Instant::now() + Duration::from_secs(600);
+    // Generous, like `memprobe`'s: the scale sweep this probe exists for runs
+    // hundreds of thousands of files, and a run that times out reports
+    // nothing. Past this is a hang, not a slow disk.
+    let deadline = Instant::now() + Duration::from_secs(3 * 3600);
     let mut done = false;
     while Instant::now() < deadline {
         if let IndexingStatus::Error(e) = service.get_status() {
             panic!("indexing failed: {}", e);
         }
         if db.exists() {
-            if let Ok(conn) = rusqlite::Connection::open(db) {
+            if let Some(conn) = probe_open(db, keyed) {
                 if quicksearch_core::db::repo::get_last_full_index(&conn).is_some() {
                     done = true;
                     break;
@@ -391,7 +433,11 @@ fn run(mode: &str, tree: &Path, db: &Path) {
         std::thread::sleep(Duration::from_millis(5));
     }
     let elapsed = start.elapsed();
-    assert!(done, "indexing did not finish within the timeout");
+    assert!(
+        done,
+        "indexing did not finish within the timeout (keyed = {})",
+        keyed
+    );
     // The run's last checkpoint happens inside here, so the sampler outlives it.
     service.stop_indexing().expect("stop");
     wal_stop.store(true, Ordering::Relaxed);
@@ -399,8 +445,7 @@ fn run(mode: &str, tree: &Path, db: &Path) {
 
     // Count what was actually indexed rather than assuming `gen`'s tree —
     // pointing the probe elsewhere made the rate a fiction.
-    let total = rusqlite::Connection::open(db)
-        .ok()
+    let total = probe_open(db, keyed)
         .and_then(|c| quicksearch_core::db::repo::row_count(&c).ok())
         .unwrap_or(0);
 

@@ -247,6 +247,11 @@ pub struct SeedSpec {
     /// Document bodies carrying [`BODY_TERM`]; sized by the caller to stay
     /// under the display limit.
     pub body_term_docs: usize,
+    /// One row in every `dup_every` repeats its predecessor's content hash,
+    /// giving [`crate::search::find_duplicate_groups`] real groups to rank.
+    /// `0` leaves every hash NULL — the shape the search harnesses seed, and
+    /// the one whose row width their numbers were taken against.
+    pub dup_every: usize,
 }
 
 impl Default for SeedSpec {
@@ -261,6 +266,7 @@ impl Default for SeedSpec {
             needle_names: 50,
             needle_docs: 50,
             body_term_docs: 500,
+            dup_every: 0,
         }
     }
 }
@@ -289,6 +295,21 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
         };
         // Stored parents always end in a separator; see `dir_to_db_parent`.
         let dir = format!("/seed/{:03}/", i % spec.dirs.max(1));
+        // Every `dup_every`-th row takes the hash of the one before it, so the
+        // groups are pairs of equal-sized rows — the shape `find_duplicate_groups`
+        // prices, since a hash covers the size.
+        let hash = (spec.dup_every > 0).then(|| {
+            let group = if i % spec.dup_every == spec.dup_every - 1 {
+                i.saturating_sub(1)
+            } else {
+                i
+            };
+            let mut bytes = [0u8; 32];
+            for (b, slot) in bytes.iter_mut().enumerate() {
+                *slot = ((group as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (b % 8 * 8)) as u8;
+            }
+            bytes
+        });
         let id = insert_file(
             &tx,
             &NewFile {
@@ -298,7 +319,7 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
                 mtime: 1_700_000_000 + i as u64,
                 mime: Some("text/plain"),
                 ftype: FileType::TEXT,
-                hash: None,
+                hash: hash.as_ref().map(|h| h.as_slice()),
                 needs_content: i % spec.content_every.max(1) == 0,
             },
         )

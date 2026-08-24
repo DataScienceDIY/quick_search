@@ -314,7 +314,9 @@ pub fn extract_and_store(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentOutcome {
     /// Text, already truncated to `maximum_text_size`.
-    Done { text: String },
+    Done {
+        text: String,
+    },
     NotApplicable,
     Failed(String),
 }

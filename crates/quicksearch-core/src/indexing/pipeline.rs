@@ -166,6 +166,91 @@ fn per_second(n: usize, elapsed: Duration) -> Option<f64> {
 /// producer wakes it at once.
 const IDLE_BACKOFF: Duration = Duration::from_millis(2);
 
+/// What each run-scoped structure holds, for the `probe` builds only.
+///
+/// Peak RSS is one anonymous heap: `smaps` can say "the heap grew", never
+/// "the stale-candidate list grew". This says which. Sizes are estimates of
+/// the *heap* each structure owns — the point is which one dominates and
+/// whether it tracks the tree, not a byte-exact total. See `examples/memprobe.rs`.
+#[cfg(feature = "probe")]
+mod census {
+    use super::{RootPipeline, RunCx};
+    use crate::testutil::mib;
+    use std::time::{Duration, Instant};
+
+    /// Rare next to a status publish: each line walks every string in the
+    /// run-scoped sets, which is O(tree) work that must not shape what it
+    /// measures.
+    const INTERVAL: Duration = Duration::from_secs(2);
+
+    /// Owned string bytes plus the `String` headers a collection holds.
+    fn strings_bytes<'a>(it: impl Iterator<Item = &'a String>, len: usize) -> u64 {
+        let body: usize = it.map(String::len).sum();
+        body as u64 + (len * std::mem::size_of::<String>()) as u64
+    }
+
+    pub(super) fn due(last: &mut Instant) -> bool {
+        if last.elapsed() < INTERVAL {
+            return false;
+        }
+        *last = Instant::now();
+        true
+    }
+
+    /// One line per structure group: the log collapses embedded newlines, so
+    /// a multi-line report would arrive as one unreadable line.
+    pub(super) fn report(cx: &RunCx<'_>, pipelines: &[RootPipeline], started: Instant) {
+        let at = started.elapsed().as_secs_f64();
+        crate::log_info!(
+            "census t={:.1}s  stale {} ({})  aliased {} ({})",
+            at,
+            cx.stale_candidates.len(),
+            mib(strings_bytes(
+                cx.stale_candidates.iter(),
+                cx.stale_candidates.len()
+            )),
+            cx.aliased_paths.len(),
+            mib(strings_bytes(
+                cx.aliased_paths.iter(),
+                cx.aliased_paths.len()
+            )),
+        );
+        for p in pipelines {
+            let (dirs, dir_bytes) = p.walk.seen_dirs_footprint();
+            let inline = |rows: &[crate::file_handling::OwnedNewFile]| -> u64 {
+                rows.iter()
+                    .map(|r| {
+                        (r.inline_text.as_ref().map_or(0, String::len)
+                            + r.name.len()
+                            + r.parent.len()) as u64
+                    })
+                    .sum()
+            };
+            let ready: u64 = p
+                .ready
+                .iter()
+                .map(|r| {
+                    (crate::file_handling::outcome_body(&r.outcome).map_or(0, str::len)
+                        + r.name.len()) as u64
+                })
+                .sum();
+            crate::log_info!(
+                "census t={:.1}s  {} [{:?}] dirs {} ({})  pending {}+{} ({})  ready {} ({})",
+                at,
+                p.root,
+                p.phase,
+                dirs,
+                mib(dir_bytes),
+                p.pending_inserts.len(),
+                p.pending_updates.len(),
+                mib(inline(&p.pending_inserts) + inline(&p.pending_updates)),
+                p.ready.len(),
+                mib(ready),
+            );
+        }
+    }
+}
+
 fn report_run_warnings() {
     let (failed, suppressed) = crate::file_handling::hash_failure_counts();
     if failed > 0 {
@@ -278,9 +363,6 @@ impl RootPipeline {
                         // The vanished-directory sweep must not read its
                         // parent's absence as proof the file is gone.
                         cx.aliased_paths.insert(file.path.clone());
-                    }
-                    if !cx.seen_paths.insert(file.digest) {
-                        continue;
                     }
                     let Some(rec) = file.record else { continue };
                     if file.action == FileIndexAction::Update {
@@ -473,9 +555,6 @@ pub(super) struct RunCx<'a> {
     /// Writer time one root's turn may take before the round moves on
     /// ([`crate::config::ProcessingConfig::writer_turn_slice_ms`]).
     pub(super) slice: Duration,
-    /// 128-bit path digests, not paths: measured, owning every path string
-    /// again was the single largest allocation in a run.
-    pub(super) seen_paths: HashSet<u128>,
     /// Rows with no file behind them, per-directory plus the vanished sweep.
     pub(super) stale_candidates: Vec<String>,
     /// Paths reached via symlink; their rows may live outside every root.
@@ -498,7 +577,6 @@ impl<'a> RunCx<'a> {
             registry: Arc::new(Registry::default_set()),
             quantum: config.processing.batch_size.max(1),
             slice: Duration::from_millis(config.processing.writer_turn_slice_ms),
-            seen_paths: HashSet::new(),
             stale_candidates: Vec::new(),
             aliased_paths: HashSet::new(),
             stale_cleanup_ok: true,
@@ -673,8 +751,9 @@ impl IndexingService {
         crate::walk::reset_run_warnings();
         crate::file_handling::reset_run_warnings();
 
-        // Canonicalized first so spelling variants collapse to one walk;
-        // nested-root dedup is the `seen_paths` set's job.
+        // Canonicalized first so spelling variants collapse to one walk.
+        // Nested roots need no handling here: the coordinator refuses to
+        // start a run with any (`config::nested_roots`).
         let mut seen_roots = HashSet::new();
         let roots: Vec<String> = paths
             .iter()
@@ -763,6 +842,8 @@ impl IndexingService {
         let aborted;
         let mut cleanup_done = false;
         let mut rr = 0usize;
+        #[cfg(feature = "probe")]
+        let mut last_census = Instant::now();
         let wal_path = format!("{}-wal", db_path);
         let configured_cap = match config.processing.maximum_wal_size {
             0 => 0,
@@ -811,6 +892,11 @@ impl IndexingService {
             }
 
             publish_status(status, run_start, &pipelines);
+
+            #[cfg(feature = "probe")]
+            if census::due(&mut last_census) {
+                census::report(&cx, &pipelines, run_started);
+            }
 
             // After `publish_status`: the checkpoint may block for
             // `busy_timeout`, and it must not sit in front of `stop_indexing`

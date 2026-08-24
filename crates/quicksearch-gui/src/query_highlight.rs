@@ -10,10 +10,10 @@ use std::sync::Arc;
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, Galley, Stroke};
-use quicksearch_core::query::Op;
 use quicksearch_core::query::lexer::{tokenize_spanned, Token};
 use quicksearch_core::query::pattern::RegexQuery;
 use quicksearch_core::query::translator::{build_filter, is_filter_key};
+use quicksearch_core::query::Op;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {

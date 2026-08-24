@@ -483,6 +483,66 @@ fn a_symlink_target_in_an_unwalked_directory_survives_reindexing() {
     assert!(off[0].ends_with("normal.txt"));
 }
 
+/// A target *inside* the root, so the walk reaches it twice — once by reading
+/// its own directory, once by resolving the link. The other two symlink tests
+/// use targets the walk never reaches directly, so this is the only one where
+/// a duplicate visit actually happens.
+///
+/// **This is what replaced the writer's duplicate-visit set.** That set held a
+/// path digest for every walked file — the largest thing a run kept — to stop
+/// a second visit reaching the writer. It was removed once measured: a repeat
+/// visit is already collapsed by `insert_file` being `INSERT OR IGNORE` and
+/// returning `None` for a row that exists, so it can produce neither a second
+/// row nor a second FTS entry. This test is the guard on that claim; it is
+/// expected to fail if `insert_file` ever stops ignoring conflicts.
+#[test]
+#[cfg(unix)]
+fn a_file_reachable_both_directly_and_through_a_link_gets_one_row() {
+    let root = Scratch::dir("alias-dup-root");
+    let db_dir = Scratch::dir("alias-dup-db");
+    let mut config = Config::default();
+    config.indexing.follow_symlinks = true;
+
+    let target = root.join("real/file.txt");
+    touch(&target, b"reachable two ways");
+    std::os::unix::fs::symlink(&target, root.join("link.txt")).unwrap();
+
+    let db = db_dir.join("links-on.sqlite");
+    index_once(&root, &db, &config);
+    let on = rows(&db);
+    assert_eq!(
+        on.len(),
+        1,
+        "one canonical path, one row, however many ways it was reached: {:?}",
+        on
+    );
+    assert!(
+        on[0].0.ends_with("real/file.txt"),
+        "stored under the target"
+    );
+
+    // The link is not a second document: a duplicated visit that reached the
+    // writer twice would tokenize the body twice into a contentless FTS
+    // table, where nothing would later collapse the two.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let hits: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH '\"reachable\"'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hits, 1, "the body is indexed once");
+
+    // Links off: the link is never followed, so the same tree still yields
+    // exactly the one row — the run that skips the set entirely.
+    let db2 = db_dir.join("links-off.sqlite");
+    index_once(&root, &db2, &Config::default());
+    let off = rows(&db2);
+    assert_eq!(off.len(), 1, "only the real file: {:?}", off);
+    assert_eq!(off[0].0, on[0].0, "and the same path as with links on");
+}
+
 #[test]
 #[cfg(unix)]
 fn a_modified_symlink_target_is_updated_not_silently_ignored() {

@@ -166,7 +166,13 @@ fn only_an_empty_duplicates_tab_scans_on_arrival() {
         );
     }
     // No other tab scans, whatever the Duplicates tab is holding.
-    for tab in [Tab::Search, Tab::Manage, Tab::Logs, Tab::Help, Tab::Settings] {
+    for tab in [
+        Tab::Search,
+        Tab::Manage,
+        Tab::Logs,
+        Tab::Help,
+        Tab::Settings,
+    ] {
         assert!(!arrival_starts_dup_scan(tab, &DupState::NotLoaded));
     }
 }
@@ -189,7 +195,10 @@ fn an_index_that_changed_invalidates_what_the_tab_holds() {
     );
 
     // Out of sight: drop it, and let the next visit pay for the rescan.
-    assert_eq!(dup_invalidation(Tab::Search, &loaded()), DupInvalidation::Drop);
+    assert_eq!(
+        dup_invalidation(Tab::Search, &loaded()),
+        DupInvalidation::Drop
+    );
 
     // Nothing to invalidate.
     assert_eq!(

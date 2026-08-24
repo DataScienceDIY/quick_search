@@ -231,9 +231,9 @@ fn a_root_that_resolves_onto_an_unrepresentable_name_is_not_walked() {
     );
 }
 
-/// The pipeline hashes a `WalkedFile`'s path into `seen_paths` before it looks
-/// for a record, so a bad name yielded under its lossy spelling made whichever
-/// of the two files the walk reached second fall out of the index.
+/// A `WalkedFile`'s path is the key its row is written under, so a bad name
+/// yielded under its lossy spelling would claim the twin's row: whichever of
+/// the two files the walk reached second fell out of the index.
 #[test]
 fn a_bad_name_cannot_stand_in_for_its_lossy_twin() {
     let root = tmp_tree("nonutf8-twin");
@@ -489,8 +489,9 @@ fn symlink_loop_terminates() {
 #[test]
 #[cfg(unix)]
 fn symlinked_file_resolves_to_its_target_path() {
-    // The walker dedupes *directories*; the caller's `seen_paths` dedupes
-    // files, so both routes must agree on the canonical path.
+    // The walker dedupes *directories*, not files: a file reached both ways
+    // is yielded twice, so both routes must agree on the canonical path or
+    // the writer would key two different rows for one file.
     let root = tmp_tree("symlink-file");
     touch(&root.join("real/target.txt"));
     fs::create_dir_all(root.join("links")).unwrap();

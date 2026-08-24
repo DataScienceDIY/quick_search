@@ -283,7 +283,16 @@ impl<'a> Cx<'a> {
                 // A name/path hit's snippet is the field itself, span marked.
                 let snip =
                     snippet::whole_field(if is_path_tier { path } else { name }, match_range);
-                row_hit(row, file_id, path, name, rank, rank as u8, Some(snip), is_path_tier)
+                row_hit(
+                    row,
+                    file_id,
+                    path,
+                    name,
+                    rank,
+                    rank as u8,
+                    Some(snip),
+                    is_path_tier,
+                )
             },
         )
     }
@@ -535,7 +544,16 @@ impl<'a> Cx<'a> {
                 };
                 let snip =
                     snippet::whole_field(if is_path_tier { path } else { name }, match_range);
-                row_hit(row, file_id, path, name, rank, rank as u8, Some(snip), is_path_tier)
+                row_hit(
+                    row,
+                    file_id,
+                    path,
+                    name,
+                    rank,
+                    rank as u8,
+                    Some(snip),
+                    is_path_tier,
+                )
             },
         )
     }
@@ -575,7 +593,16 @@ impl<'a> Cx<'a> {
                 let r = clamp_match_range(text, r, SNIPPET_WINDOW_CHARS);
                 snippet::window_around(text, (r.start, r.end), &snippet_opts)
             });
-            row_hit(row, file_id, path, name, 6.0 + count_frac(count), 6, snip, false)
+            row_hit(
+                row,
+                file_id,
+                path,
+                name,
+                6.0 + count_frac(count),
+                6,
+                snip,
+                false,
+            )
         })
     }
 }

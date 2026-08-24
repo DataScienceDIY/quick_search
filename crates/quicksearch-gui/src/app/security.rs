@@ -38,16 +38,9 @@ impl Drop for SecurityPrompt {
 /// Confirm the password, re-derive from it, reveal the installed key.
 /// Nothing here can change the key or the config.
 pub(super) enum KeyPrompt {
-    Confirm {
-        pw: String,
-        wrong: bool,
-    },
-    Deriving {
-        rx: mpsc::Receiver<IndexKey>,
-    },
-    Reveal {
-        display: String,
-    },
+    Confirm { pw: String, wrong: bool },
+    Deriving { rx: mpsc::Receiver<IndexKey> },
+    Reveal { display: String },
 }
 
 impl Drop for KeyPrompt {

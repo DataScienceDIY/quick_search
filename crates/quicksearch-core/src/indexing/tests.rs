@@ -494,11 +494,41 @@ fn the_walk_denominator_prefers_the_best_available_count() {
     for (label, phase, walked, estimate, want) in [
         ("estimate", RootPhase::Walking, 100, Some(1000), Some(1000)),
         ("no count yet", RootPhase::Walking, 100, None, None),
-        ("overtaken", RootPhase::Walking, 1500, Some(1000), Some(1500)),
-        ("exact", RootPhase::Extracting, 261_088, Some(6_677_062), Some(261_088)),
-        ("exact, no estimate", RootPhase::Extracting, 261_088, None, Some(261_088)),
-        ("done", RootPhase::Done, 261_088, Some(6_677_062), Some(261_088)),
-        ("done, no estimate", RootPhase::Done, 261_088, None, Some(261_088)),
+        (
+            "overtaken",
+            RootPhase::Walking,
+            1500,
+            Some(1000),
+            Some(1500),
+        ),
+        (
+            "exact",
+            RootPhase::Extracting,
+            261_088,
+            Some(6_677_062),
+            Some(261_088),
+        ),
+        (
+            "exact, no estimate",
+            RootPhase::Extracting,
+            261_088,
+            None,
+            Some(261_088),
+        ),
+        (
+            "done",
+            RootPhase::Done,
+            261_088,
+            Some(6_677_062),
+            Some(261_088),
+        ),
+        (
+            "done, no estimate",
+            RootPhase::Done,
+            261_088,
+            None,
+            Some(261_088),
+        ),
     ] {
         assert_eq!(
             progress(phase, walked, estimate).walk_denominator(),
@@ -612,13 +642,28 @@ fn the_wal_cap_is_bounded_by_the_volume() {
     for (label, cfg, free, want) in [
         ("roomy", configured, 500 * 1024 * 1024 * 1024, configured),
         // Exactly enough: floor plus four times the log.
-        ("just enough", configured, 128 * 1024 * 1024 + configured * 4, configured),
+        (
+            "just enough",
+            configured,
+            128 * 1024 * 1024 + configured * 4,
+            configured,
+        ),
         // 1 GiB free: 896 MiB above the floor, a quarter of which is 224 MiB.
         ("tight", configured, 1024 * 1024 * 1024, 224 * 1024 * 1024),
         ("disabled, tight", 0, 1024 * 1024 * 1024, 224 * 1024 * 1024),
         ("full", configured, 0, crate::config::MINIMUM_WAL_SIZE),
-        ("nearly full", configured, 1024, crate::config::MINIMUM_WAL_SIZE),
-        ("at the floor", configured, 127 * 1024 * 1024, crate::config::MINIMUM_WAL_SIZE),
+        (
+            "nearly full",
+            configured,
+            1024,
+            crate::config::MINIMUM_WAL_SIZE,
+        ),
+        (
+            "at the floor",
+            configured,
+            127 * 1024 * 1024,
+            crate::config::MINIMUM_WAL_SIZE,
+        ),
     ] {
         assert_eq!(wal_cap_for_free(cfg, free), want, "{label}");
     }

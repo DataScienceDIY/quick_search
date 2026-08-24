@@ -11,6 +11,13 @@
 //! ./target/release/examples/memprobe cold ~ /var/tmp/qs-mem/index.db 250 probe.toml
 //! ```
 //!
+//! **Roots are comma-separated**, because per-root state is what multiplies:
+//! a one-root run cannot show the buffers that exist once per pipeline.
+//!
+//! ```text
+//! ./target/release/examples/memprobe cold /media/shared,/home/me,/usr /var/tmp/qs-mem/index.db
+//! ```
+//!
 //! Trailing arguments: sampling interval in ms (default 100) and a config
 //! file. `cold` deletes the database first; `warm` re-runs against the
 //! finished one. Reading the report: **VmHWM** cannot miss a spike — quote
@@ -18,6 +25,10 @@
 //! a per-file cost. Nothing reported is evictable page cache. `settled RSS`
 //! is what a long-lived process keeps — glibc frees to its arena, so
 //! without `release_free_heap` the peak becomes the floor.
+//!
+//! Built with `--features probe` the indexer also prints a `census` line
+//! naming what its run-scoped structures hold, which is the half `smaps`
+//! cannot answer: a mapping is "heap", never "the stale-candidate list".
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -66,12 +77,22 @@ struct Sample {
 fn main() {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_default();
-    let (Some(root), Some(db)) = (args.next(), args.next()) else {
-        eprintln!("usage: memprobe <cold|warm> <root> <db> [sample_ms] [config.toml]");
+    let (Some(roots), Some(db)) = (args.next(), args.next()) else {
+        eprintln!("usage: memprobe <cold|warm> <root[,root...]> <db> [sample_ms] [config.toml]");
         std::process::exit(2);
     };
     if mode != "cold" && mode != "warm" {
-        eprintln!("usage: memprobe <cold|warm> <root> <db> [sample_ms] [config.toml]");
+        eprintln!("usage: memprobe <cold|warm> <root[,root...]> <db> [sample_ms] [config.toml]");
+        std::process::exit(2);
+    }
+    let roots: Vec<String> = roots
+        .split(',')
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    if roots.is_empty() {
+        eprintln!("memprobe: no roots given");
         std::process::exit(2);
     }
     let interval = Duration::from_millis(
@@ -92,10 +113,10 @@ fn main() {
         }
     }
 
-    run(&mode, &root, &db, interval, config_path.as_deref());
+    run(&mode, &roots, &db, interval, config_path.as_deref());
 }
 
-fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Option<&Path>) {
+fn run(mode: &str, roots: &[String], db: &Path, interval: Duration, config_path: Option<&Path>) {
     // A config file only supplies the knobs that change *what* indexing
     // does; the defaults keep runs comparable.
     let config = match config_path {
@@ -112,9 +133,10 @@ fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Optio
 
     let baseline = rss().expect("read /proc/self/statm");
     eprintln!(
-        "memprobe {}: root={} db={}\n  baseline RSS {} (process before indexing starts)",
+        "memprobe {}: {} root(s)={} db={}\n  baseline RSS {} (process before indexing starts)",
         mode,
-        root,
+        roots.len(),
+        roots.join(" "),
         db.display(),
         mib(baseline)
     );
@@ -122,11 +144,7 @@ fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Optio
     let service = IndexingService::new();
     let start = Instant::now();
     service
-        .start_indexing(
-            vec![root.to_string()],
-            db.to_string_lossy().into_owned(),
-            config,
-        )
+        .start_indexing(roots.to_vec(), db.to_string_lossy().into_owned(), config)
         .expect("start indexing");
 
     let mut samples: Vec<Sample> = Vec::new();

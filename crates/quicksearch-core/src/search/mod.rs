@@ -25,9 +25,24 @@ use crate::snippet::Snippet;
 pub use cascade::Outcome;
 pub use duplicates::{find_duplicate_groups, DuplicateGroup};
 
-/// Idle window before the connection is released: an open reader stops
-/// SQLite resetting the WAL and pins a deleted index's blocks.
-const IDLE_RELEASE: Duration = Duration::from_secs(30);
+/// Idle window before the connection is released.
+///
+/// Long, because releasing throws away [`PRAGMAS_SEARCH`]'s 32 MiB of
+/// decrypted pages and the next keystroke pays to refill them: on a 200k-file
+/// index the first query after a release costs 129 ms unencrypted and 192 ms
+/// encrypted, against ~10 ms warm. Encryption is why the gap widens — a
+/// refill is an AES decrypt plus an HMAC verify per page rather than a
+/// `memcpy`. What the release buys back is the ~42 MiB the trim in
+/// [`Worker::run`] returns, so this trades an idle process floor against
+/// stalling the one keystroke a user is most likely to notice.
+///
+/// It is *not* what lets a rebuild delete the file: `Backend::rebuild_index`
+/// and `clear_index` send [`WorkerMsg::ReleaseConnection`] first, because
+/// Windows fails the delete while any handle is open. Nor does holding a
+/// connection stop the WAL truncating — a read mark lives for the length of a
+/// statement, not of the connection (`db::repo_tests` pins both halves of
+/// that: a checkpoint loses to a reader *mid-query*, not to an idle one).
+const IDLE_RELEASE: Duration = Duration::from_secs(30 * 60);
 
 /// One search result. `rank` is the sort key (lower = better): integer part
 /// = cascade stage (1–11), fraction = tiebreak. Batches arrive rank-ordered

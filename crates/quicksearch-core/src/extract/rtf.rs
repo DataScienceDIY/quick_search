@@ -46,11 +46,7 @@ impl Extractor for RtfExtractor {
     }
 
     /// RTF has no trailer and needs no seeking; a complete head parses like disk.
-    fn extract_from_head(
-        &self,
-        path: &Path,
-        head: &[u8],
-    ) -> Option<Result<String, ExtractError>> {
+    fn extract_from_head(&self, path: &Path, head: &[u8]) -> Option<Result<String, ExtractError>> {
         Some(parse(head.to_vec(), path))
     }
 }

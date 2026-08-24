@@ -10,7 +10,7 @@
 mod corpus;
 
 use divan::Bencher;
-use quicksearch_core::{mime, textenc, walk};
+use quicksearch_core::{mime, textenc};
 
 fn main() {
     divan::main();
@@ -136,21 +136,3 @@ mod mime_sniff {
     }
 }
 
-/// SHA-256 over the path string, per file, every run. Reference only: it
-/// confirms the cost is small enough that the collision-resistance argument
-/// stands.
-mod path_digest {
-    use super::*;
-
-    #[divan::bench]
-    fn per_path(bencher: Bencher) {
-        let rows = corpus::rows();
-        bencher.bench(|| {
-            let mut acc = 0u128;
-            for row in divan::black_box(rows) {
-                acc ^= walk::path_digest(&row.path);
-            }
-            acc
-        });
-    }
-}

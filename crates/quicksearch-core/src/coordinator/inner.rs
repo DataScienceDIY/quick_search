@@ -442,7 +442,11 @@ impl Inner {
     fn apply_queue(&mut self, conn: &mut Connection, targeted: bool) {
         let deadline = Instant::now() + APPLY_BUDGET;
         let chunk = self.config.processing.batch_size.max(1);
-        let queue = if targeted { &self.targeted } else { &self.pending };
+        let queue = if targeted {
+            &self.targeted
+        } else {
+            &self.pending
+        };
 
         let removals: Vec<PathBuf> = queue
             .iter()
@@ -474,7 +478,11 @@ impl Inner {
         }
 
         if Instant::now() < deadline {
-            let queue = if targeted { &self.targeted } else { &self.pending };
+            let queue = if targeted {
+                &self.targeted
+            } else {
+                &self.pending
+            };
             let upserts: Vec<PathBuf> = queue
                 .iter()
                 .filter(|(_, ev)| !is_removal(ev))

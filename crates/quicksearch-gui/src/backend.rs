@@ -43,9 +43,11 @@ pub struct Backend {
 
 impl Backend {
     /// Rebuild, after letting go of everything holding the index open: the
-    /// search worker keeps its connection warm for half a minute, and
-    /// without the release the delete fails on Windows and the rebuild
-    /// silently becomes an ordinary run against the old index.
+    /// search worker keeps its connection warm for half an hour
+    /// (`search::IDLE_RELEASE`), and without the release the delete fails on
+    /// Windows and the rebuild silently becomes an ordinary run against the
+    /// old index. The window is long enough that waiting one out is not a
+    /// fallback — this release is the only thing that makes the delete work.
     pub fn rebuild_index(&self) {
         if let Some(search) = &self.search {
             search.release_connection();
@@ -138,7 +140,8 @@ impl Backend {
         let (tx, rx) = mpsc::channel();
         let db = config.resolved_database_path();
         std::thread::spawn(move || {
-            let result = quicksearch_core::search::find_duplicate_groups(&db.to_string_lossy(), 500);
+            let result =
+                quicksearch_core::search::find_duplicate_groups(&db.to_string_lossy(), 500);
             let _ = tx.send(result);
             ctx.request_repaint();
         });

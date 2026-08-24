@@ -461,11 +461,7 @@ mod tests {
             "angle-bracket entities lost: {:?}",
             out
         );
-        assert!(
-            out.contains('\u{2019}'),
-            "numeric entities lost: {:?}",
-            out
-        );
+        assert!(out.contains('\u{2019}'), "numeric entities lost: {:?}", out);
         assert!(
             !out.contains("&amp;") && !out.contains("&#"),
             "entities left unresolved: {:?}",

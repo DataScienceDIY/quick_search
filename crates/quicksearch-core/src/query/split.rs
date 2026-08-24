@@ -8,10 +8,10 @@
 //! unrecognized `key:value` (`12:30`) reassembles verbatim; `AND`/`OR` pass
 //! through as words, parens are dropped.
 
-use super::Op;
 use super::lexer::{tokenize, Token};
 use super::pattern::{RegexQuery, TermPart, TermPattern};
 use super::translator::{build_filter, is_filter_key, TranslateError};
+use super::Op;
 
 /// The cascade's parsed input: one term string plus composable filter SQL.
 #[derive(Debug, Clone, Default)]
