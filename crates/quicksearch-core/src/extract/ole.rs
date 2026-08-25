@@ -10,20 +10,34 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-/// Ceiling on extracted text from one legacy document: the formats can
-/// declare far more text than they contain, and this earlier, cruder bound
-/// keeps a hostile header from turning into an allocation.
-const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
+use super::Scratch;
 
-pub fn extract_ole_text(path: &Path, extension: &str) -> Result<String, Box<dyn Error>> {
+/// Ceiling on extracted text from one legacy document, from the caller's
+/// [`Limits::text`](super::Limits::text): the formats can declare far more
+/// text than they contain, and this bound keeps a hostile header from turning
+/// into an allocation. It used to be a hardcoded 64 MiB — 256× the largest
+/// result the caller keeps.
+pub fn extract_ole_text(
+    path: &Path,
+    extension: &str,
+    out: &mut String,
+    scratch: &mut Scratch,
+) -> Result<(), Box<dyn Error>> {
+    let budget = scratch.limits().text;
     let mut cfb = cfb::CompoundFile::open(File::open(path)?)
         .map_err(|e| format!("not a readable OLE2 compound file: {}", e))?;
-    match extension {
-        "doc" => doc::extract(&mut cfb),
-        "xls" => xls::extract(&mut cfb),
-        "ppt" => ppt::extract(&mut cfb),
+    let text = match extension {
+        "doc" => doc::extract(&mut cfb, budget),
+        "xls" => xls::extract(&mut cfb, budget),
+        "ppt" => ppt::extract(&mut cfb, budget),
         other => Err(format!("no OLE2 parser for .{}", other).into()),
+    }?;
+    if out.is_empty() {
+        *out = text;
+    } else {
+        out.push_str(&text);
     }
+    Ok(())
 }
 
 fn stream<F: Read + std::io::Seek>(cfb: &mut cfb::CompoundFile<F>, name: &str) -> Option<Vec<u8>> {
@@ -118,6 +132,7 @@ mod doc {
 
     pub fn extract<F: Read + std::io::Seek>(
         cfb: &mut cfb::CompoundFile<F>,
+        budget: usize,
     ) -> Result<String, Box<dyn Error>> {
         let doc = stream(cfb, "WordDocument").ok_or("no WordDocument stream")?;
         let flags = u16_at(&doc, FIB_FLAGS).ok_or("truncated FIB")?;
@@ -137,7 +152,7 @@ mod doc {
             .ok_or("CLX runs past the end of the table stream")?;
         let pieces = piece_table(clx)?;
 
-        let out = decode_pieces(&doc, &pieces, MAX_TEXT_BYTES);
+        let out = decode_pieces(&doc, &pieces, budget);
         if out.trim().is_empty() {
             return Err("no text found in the piece table".into());
         }
@@ -298,12 +313,13 @@ mod xls {
 
     pub fn extract<F: Read + std::io::Seek>(
         cfb: &mut cfb::CompoundFile<F>,
+        budget: usize,
     ) -> Result<String, Box<dyn Error>> {
         // BIFF8 names the stream "Workbook"; BIFF5 and earlier used "Book".
         let book = stream(cfb, "Workbook")
             .or_else(|| stream(cfb, "Book"))
             .ok_or("no Workbook stream")?;
-        extract_from_book(&book, MAX_TEXT_BYTES)
+        extract_from_book(&book, budget)
     }
 
     pub(super) fn extract_from_book(book: &[u8], budget: usize) -> Result<String, Box<dyn Error>> {
@@ -566,18 +582,19 @@ mod ppt {
 
     pub fn extract<F: Read + std::io::Seek>(
         cfb: &mut cfb::CompoundFile<F>,
+        budget: usize,
     ) -> Result<String, Box<dyn Error>> {
         let doc = stream(cfb, "PowerPoint Document").ok_or("no PowerPoint Document stream")?;
         let mut out = String::new();
-        walk(&doc, 0, &mut out);
+        walk(&doc, 0, &mut out, budget);
         if out.trim().is_empty() {
             return Err("no text atoms found in the presentation".into());
         }
         Ok(out)
     }
 
-    fn walk(body: &[u8], depth: u32, out: &mut String) {
-        if depth > MAX_DEPTH || out.len() >= MAX_TEXT_BYTES {
+    fn walk(body: &[u8], depth: u32, out: &mut String, budget: usize) {
+        if depth > MAX_DEPTH || out.len() >= budget {
             return;
         }
         let mut i = 0usize;
@@ -590,7 +607,7 @@ mod ppt {
                 return;
             };
             if version & 0x000F == VERSION_CONTAINER {
-                walk(payload, depth + 1, out);
+                walk(payload, depth + 1, out, budget);
             } else {
                 match rec_type {
                     TEXT_BYTES_ATOM | CSTRING_ATOM if rec_type == CSTRING_ATOM => {

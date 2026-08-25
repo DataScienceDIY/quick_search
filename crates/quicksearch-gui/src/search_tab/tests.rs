@@ -1892,6 +1892,233 @@ fn the_query_strip_reads_help_box_duration_fuzzy() {
     assert!(elapsed < fuzzy, "the duration is not left of Fuzzy");
 }
 
+/// The query strip's timing readout, found by its units. No other cell ends
+/// this way — `human_size` writes " B"/" KB", and the count reads "3 results".
+fn duration_readout(out: &egui::FullOutput) -> String {
+    let painted = painted_text(out);
+    painted
+        .iter()
+        .find(|t| t.ends_with(" ms") || t.ends_with(" s"))
+        .unwrap_or_else(|| panic!("no duration readout among {painted:?}"))
+        .clone()
+}
+
+/// One number cannot separate a search that answered at once and then ground
+/// through its late passes from one that was slow the whole way.
+#[test]
+fn the_readout_reports_the_first_result_and_the_last_pass() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = tab_with_results(1);
+    tab.on_search_started(1);
+    tab.apply_update(
+        SearchUpdate::Hits {
+            generation: 1,
+            hits: vec![hit(1, "alpha_widget_0.txt", 3.0, 116)],
+        },
+        1000,
+    );
+    let first = tab.first_hit.expect("no first-result time recorded");
+    tab.apply_update(
+        SearchUpdate::Completed {
+            generation: 1,
+            total: 1,
+            limited: false,
+        },
+        1000,
+    );
+    assert!(
+        tab.elapsed.expect("no completion time") >= first,
+        "completion came before the first result"
+    );
+
+    let readout = duration_readout(&run_frame(&ctx, &mut tab, vec![]));
+    assert_eq!(
+        readout,
+        crate::format::fmt_search_times(tab.first_hit, tab.elapsed.unwrap()),
+        "the strip is not showing both times"
+    );
+    assert!(readout.contains(" / "), "only one time painted: {readout}");
+}
+
+/// A tab whose search finished, having found `hits` results.
+fn timed_tab(ctx: &egui::Context, hits: usize) -> SearchTab {
+    let mut tab = tab_with_results(hits);
+    tab.on_search_started(1);
+    if hits > 0 {
+        tab.apply_update(
+            SearchUpdate::Hits {
+                generation: 1,
+                hits: (0..hits)
+                    .map(|i| hit(i as i64, &format!("alpha_widget_{i}.txt"), 3.0, 116))
+                    .collect(),
+            },
+            1000,
+        );
+    }
+    tab.apply_update(
+        SearchUpdate::Completed {
+            generation: 1,
+            total: hits,
+            limited: false,
+        },
+        1000,
+    );
+    run_frame(ctx, &mut tab, vec![]);
+    tab
+}
+
+/// The readout as painted, and a point inside it. Taken near its left edge:
+/// the strip's widgets sit close together, and the centre of a short readout
+/// is not reliably the readout's own hit-test.
+fn readout_and_pointer(ctx: &egui::Context, tab: &mut SearchTab) -> (String, egui::Pos2) {
+    let out = run_frame(ctx, tab, vec![]);
+    let readout = duration_readout(&out);
+    let rect = crate::test_ui::painted(&out)
+        .into_iter()
+        .find(|(t, _)| *t == readout)
+        .map(|(_, r)| r)
+        .expect("the readout was not painted");
+    (readout, egui::pos2(rect.left() + 2.0, rect.center().y))
+}
+
+/// Whether hovering `pos` brings up `tip`. The tooltip is its own area, so it
+/// may land a frame or two behind the pointer.
+fn hover_shows(ctx: &egui::Context, tab: &mut SearchTab, pos: egui::Pos2, tip: &str) -> bool {
+    let mut out = run_frame(ctx, tab, vec![egui::Event::PointerMoved(pos)]);
+    for _ in 0..3 {
+        if painted_text(&out).iter().any(|t| t == tip) {
+            return true;
+        }
+        out = run_frame(ctx, tab, vec![]);
+    }
+    false
+}
+
+/// Two bare numbers separated by a slash explain nothing on their own.
+#[test]
+fn hovering_the_readout_says_what_the_times_are() {
+    let ctx = crate::test_ui::ctx();
+    // Testing that the tooltip is wired up, not egui's hover timing.
+    ctx.style_mut(|s| {
+        s.interaction.tooltip_delay = 0.0;
+        s.interaction.show_tooltips_only_when_still = false;
+    });
+
+    let mut tab = timed_tab(&ctx, 1);
+    let (readout, pos) = readout_and_pointer(&ctx, &mut tab);
+    assert!(
+        hover_shows(&ctx, &mut tab, pos, TIMES_TIP),
+        "hovering {readout:?} explained nothing"
+    );
+
+    // Nothing matched: the readout is one number, and says why.
+    let mut tab = timed_tab(&ctx, 0);
+    let (readout, pos) = readout_and_pointer(&ctx, &mut tab);
+    assert!(
+        hover_shows(&ctx, &mut tab, pos, TOTAL_ONLY_TIP),
+        "hovering {readout:?} still promised a first result"
+    );
+}
+
+/// A batch that arrives after the first must not restart the clock, and a
+/// stale generation's batch must not start it at all.
+#[test]
+fn the_first_result_time_is_the_first_one() {
+    let mut tab = tab_with_results(1);
+    tab.on_search_started(2);
+
+    // From the search before this one.
+    tab.apply_update(
+        SearchUpdate::Hits {
+            generation: 1,
+            hits: vec![hit(1, "stale.txt", 3.0, 10)],
+        },
+        1000,
+    );
+    assert_eq!(tab.first_hit, None, "a stale batch started the clock");
+
+    // An empty batch is not a result.
+    tab.apply_update(
+        SearchUpdate::Hits {
+            generation: 2,
+            hits: vec![],
+        },
+        1000,
+    );
+    assert_eq!(tab.first_hit, None, "an empty batch counted as a result");
+
+    tab.apply_update(
+        SearchUpdate::Hits {
+            generation: 2,
+            hits: vec![hit(2, "first.txt", 3.0, 10)],
+        },
+        1000,
+    );
+    let first = tab.first_hit.expect("no first-result time recorded");
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    tab.apply_update(
+        SearchUpdate::Hits {
+            generation: 2,
+            hits: vec![hit(3, "second.txt", 3.0, 10)],
+        },
+        1000,
+    );
+    assert_eq!(tab.first_hit, Some(first), "a later batch moved the clock");
+
+    // And the next search starts over.
+    tab.on_search_started(3);
+    assert_eq!(tab.first_hit, None);
+}
+
+/// Nothing matched, so there was no first result to time.
+#[test]
+fn a_search_that_found_nothing_shows_one_time() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = completed_tab(&ctx);
+    assert_eq!(tab.first_hit, None, "no batch was ever sent");
+    let readout = duration_readout(&run_frame(&ctx, &mut tab, vec![]));
+    assert!(
+        !readout.contains('/'),
+        "a missing time was painted: {readout}"
+    );
+}
+
+/// The fixed slot is what keeps the query box from resizing when a search
+/// finishes; a readout wider than it would shove the box sideways.
+#[test]
+fn the_duration_readout_fits_its_slot() {
+    let ctx = crate::test_ui::ctx();
+    // egui has no fonts until it has run a frame.
+    run_frame(&ctx, &mut new_tab(), vec![]);
+    // Resolved outside the closure: `fonts` holds a lock `style` also wants.
+    let font = egui::TextStyle::Small.resolve(&ctx.style());
+    let ms = std::time::Duration::from_millis;
+    // Every shape the pair takes: both in milliseconds, straddling the unit
+    // boundary, and a search slow enough to be worth complaining about.
+    let over: Vec<(String, f32)> = [
+        (ms(999), ms(999)),
+        (ms(888), ms(12_300)),
+        (ms(12_300), ms(45_600)),
+        (ms(123_400), ms(456_700)),
+    ]
+    .into_iter()
+    .map(|(first, total)| {
+        let text = crate::format::fmt_search_times(Some(first), total);
+        let width = ctx.fonts(|f| {
+            f.layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        });
+        (text, width)
+    })
+    .filter(|(_, width)| *width > STATUS_SLOT_WIDTH)
+    .collect();
+    assert!(
+        over.is_empty(),
+        "past the {STATUS_SLOT_WIDTH} pt slot: {over:?}"
+    );
+}
+
 /// Splitting the widget must not silently lose a click target the combined
 /// `ui.checkbox` had.
 #[test]

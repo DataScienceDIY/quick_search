@@ -11,7 +11,7 @@ use quicksearch_core::search::{MatchField, SearchHit, SearchUpdate};
 use quicksearch_core::snippet::Snippet;
 
 use crate::color::rank_tier_color;
-use crate::format::{fmt_elapsed, fmt_mtime, human_size};
+use crate::format::{fmt_mtime, fmt_search_times, human_size};
 use crate::platform;
 use crate::spotlight::{Spot, Spotlit};
 
@@ -26,8 +26,10 @@ use ignore_dialog::dir_ignore_pattern;
 pub use ignore_dialog::IgnoreDialog;
 use snippet_render::{centered_match_job, marked_field_job, path_cell_job, snippet_job};
 
-/// Sized for the longest `fmt_elapsed` output, so the query box never resizes.
-const STATUS_SLOT_WIDTH: f32 = 52.0;
+/// Sized for the longest `fmt_search_times` output, so the query box never
+/// resizes. The widest pair lays out around 65 pt; the rest is slack, and
+/// `the_duration_readout_fits_its_slot` is what holds this number honest.
+const STATUS_SLOT_WIDTH: f32 = 72.0;
 
 /// Repeat-button gutter, held whether or not it shows so text never shifts.
 const REPEAT_SLOT_W: i8 = 20;
@@ -39,6 +41,16 @@ const FUZZY_SLOT_WIDTH: f32 = 66.0;
 /// the label can sit on the left — `egui::Checkbox` pushes its icon leftmost
 /// unconditionally, so no layout direction can flip them.
 const FUZZY_HINT: &str = "Also run fuzzy filename and full-text passes (slower)";
+
+/// What the pair of times means. The gap between them is the point: the
+/// cascade runs its passes best-match-first, so a search can answer at once
+/// and go on working for a while afterwards.
+const TIMES_TIP: &str = "Time to the first result retrieved / time to search completion. The search runs in passes, \
+                         best matches first, so results keep arriving after the likely-most-useful ones.";
+
+/// The same readout when no result ever arrived: nothing matched, or the
+/// search failed. Either way there is no first result to have timed.
+const TOTAL_ONLY_TIP: &str = "Time to search completion";
 
 /// An em dash, not a hyphen: at body size `-` reads as a typo.
 const NO_CONTENT_MATCH: &str = "—";
@@ -341,6 +353,12 @@ pub struct SearchTab {
     pub selected: Option<u32>,
     pub running: bool,
     search_started: Option<Instant>,
+    /// Time from the search starting to its first hit arriving. Taken when the
+    /// batch lands, not when it is painted: the swap waits on [`FADE_OUT_SECS`],
+    /// which would floor every reading at the same animation constant.
+    first_hit: Option<std::time::Duration>,
+    /// Time from the search starting to the last pass finishing — which is also
+    /// when the display limit was hit, since the cascade stops there.
     elapsed: Option<std::time::Duration>,
     pub limited: bool,
     pub error: Option<String>,
@@ -392,6 +410,7 @@ impl SearchTab {
             selected: None,
             running: false,
             search_started: None,
+            first_hit: None,
             elapsed: None,
             limited: false,
             error: None,
@@ -448,6 +467,7 @@ impl SearchTab {
         self.swap_pending = true;
         self.running = true;
         self.search_started = Some(Instant::now());
+        self.first_hit = None;
         self.elapsed = None;
         self.limited = false;
         self.error = None;
@@ -477,6 +497,11 @@ impl SearchTab {
         match update {
             SearchUpdate::Started { .. } => {}
             SearchUpdate::Hits { hits, .. } => {
+                // An empty batch is not a result; the cascade never sends one,
+                // but the event is public and this is what it would mean.
+                if self.first_hit.is_none() && !hits.is_empty() {
+                    self.first_hit = self.search_started.map(|t| t.elapsed());
+                }
                 if self.swap_pending {
                     admit(&mut self.staging, hits, display_limit, &mut self.limited);
                 } else {
@@ -788,8 +813,13 @@ impl SearchTab {
                                 ui.add(egui::Spinner::new().size(16.0));
                             } else if show_elapsed {
                                 if let Some(elapsed) = self.elapsed {
-                                    ui.label(hint(fmt_elapsed(elapsed)))
-                                        .on_hover_text("Time to run all search passes");
+                                    let tip = if self.first_hit.is_some() {
+                                        TIMES_TIP
+                                    } else {
+                                        TOTAL_ONLY_TIP
+                                    };
+                                    ui.label(hint(fmt_search_times(self.first_hit, elapsed)))
+                                        .on_hover_text(tip);
                                 }
                             }
                         },

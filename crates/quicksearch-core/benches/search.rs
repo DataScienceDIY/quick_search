@@ -336,10 +336,7 @@ mod filename_ladder {
             let last = hay.len().checked_sub(needle.len())?;
             let mut at = 0usize;
             while at <= last {
-                let Some(off) = memchr::memchr2(lo, up, &hay[at..=last]) else {
-                    return None;
-                };
-                let i = at + off;
+                let i = at + memchr::memchr2(lo, up, &hay[at..=last])?;
                 if hay[i..i + needle.len()].eq_ignore_ascii_case(needle) {
                     return Some(i);
                 }

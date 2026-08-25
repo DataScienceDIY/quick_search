@@ -88,6 +88,19 @@ pub struct ProcessingConfig {
     /// checkpoint, in bytes. `0` disables; else raised to [`MINIMUM_WAL_SIZE`].
     /// Needed because autocheckpoint can only *reset* the log when no reader
     /// is mid-query, and a run keeps a reader per root busy throughout.
+    ///
+    /// **Both directions cost something, which is why the default is neither
+    /// end of the range.** A checkpoint blocks the writer for its whole
+    /// copy-back and has to evict every per-root reader first, so a low value
+    /// stalls indexing often. A high one is paid by *readers*: SQLite searches
+    /// the log before every page it fetches from the database file, one hash
+    /// block per 4096 frames, and a page that is not in the log is charged for
+    /// all of them — so a larger log slows the walk prefetchers and every
+    /// search run alongside indexing. It also lengthens WAL recovery after an
+    /// unclean exit, which is read and checksummed frame by frame.
+    ///
+    /// The default trades toward fewer stalls; lower it if searching during a
+    /// run matters more than the run finishing quickly.
     pub maximum_wal_size: u64,
     pub tokenize: String,
     /// When `true` (default), extracted text is stored zstd-compressed in
@@ -124,6 +137,12 @@ pub struct SearchConfig {
     /// Watch the visible search results and show renames, deletions and
     /// content changes as they happen. See [`crate::live`].
     pub live_results: bool,
+    /// Page cache held by the search connection, in MiB. **`0` derives it from
+    /// the index** — see [`crate::db::schema::recommended_search_cache_mib`],
+    /// which sizes it to hold the `files` table because that is what every
+    /// keystroke rescans. Set it only when the derived value is wrong for your
+    /// tree; the GUI shows the recommendation next to the field.
+    pub cache_size_mib: usize,
     pub columns: ColumnsConfig,
 }
 
@@ -200,7 +219,7 @@ impl Default for ProcessingConfig {
             batch_size: 500,
             writer_turn_slice_ms: 100,
             fts_update_batch_size: 1000,
-            maximum_wal_size: 1024 * 1024 * 512,
+            maximum_wal_size: 1024 * 1024 * 1024 * 2,
             tokenize: "trigram".to_string(),
             store_text_for_snippets: true,
         }
@@ -216,6 +235,8 @@ impl Default for SearchConfig {
             results_per_page: 100,
             debounce_ms: 150,
             live_results: true,
+            // Derived from the index; see the field's doc comment.
+            cache_size_mib: 0,
             columns: ColumnsConfig::default(),
         }
     }
@@ -273,6 +294,16 @@ pub struct UiConfig {
     /// typed-out enum would fail to deserialize and take the whole config
     /// file down with it.
     pub color_scheme: String,
+    /// Whether the Settings tab shows the technical settings as well as the
+    /// everyday ones. Off is the default: most of that tab is byte budgets and
+    /// indexer internals that a person who indexed their home folder will
+    /// never need, and cannot evaluate without already knowing how the indexer
+    /// works.
+    ///
+    /// A view preference, not a setting the rest of the program reads — it is
+    /// written the moment the box is ticked, without an Apply, the way the
+    /// column picker is.
+    pub show_advanced_settings: bool,
     /// Whether the first-start tour has been dismissed. `None` means the key
     /// predates the tour, so only a config this version *created* is offered
     /// it.
@@ -292,6 +323,7 @@ impl Default for UiConfig {
             watch_cap_warned_roots: Vec::new(),
             search_hotkey: "Ctrl+Shift+F".to_string(),
             color_scheme: "dark".to_string(),
+            show_advanced_settings: false,
             // `Some(false)`, not `None`: `None` is reserved for a file that
             // predates the key.
             tutorial_seen: Some(false),
@@ -451,12 +483,40 @@ impl Config {
         clamp("[search] display_limit", &mut display_limit, 1, 1_000_000);
         self.search.display_limit = display_limit as usize;
 
+        // 0 is the automatic setting and must survive the clamp; anything else
+        // is held to the range the sweep found useful — under the floor is
+        // slower than automatic would be, over the cap is resident memory for
+        // nothing.
+        if self.search.cache_size_mib != 0 {
+            let mut cache = self.search.cache_size_mib as u64;
+            clamp(
+                "[search] cache_size_mib",
+                &mut cache,
+                crate::db::schema::SEARCH_CACHE_MIN_MIB as u64,
+                crate::db::schema::SEARCH_CACHE_OVERRIDE_MAX_MIB as u64,
+            );
+            self.search.cache_size_mib = cache as usize;
+        }
+
         clamp(
             "[processing] maximum_text_file_size",
             &mut self.processing.maximum_text_file_size,
             1,
             4 * 1024 * 1024 * 1024,
         );
+
+        // Not just the stored text: it is what the extractors size their
+        // buffers from (`extract::Limits`), and those are held per worker
+        // across pools. 16 MiB is far above any document worth full-text
+        // indexing whole and keeps the derived inflation budget sane.
+        let mut text_size = self.processing.maximum_text_size as u64;
+        clamp(
+            "[processing] maximum_text_size",
+            &mut text_size,
+            1,
+            16 * 1024 * 1024,
+        );
+        self.processing.maximum_text_size = text_size as usize;
 
         // Below 262 bytes `infer`'s longest magic-number matcher cannot run.
         let mut hash_length = self.processing.hash_length as u64;

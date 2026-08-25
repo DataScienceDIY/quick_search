@@ -91,9 +91,8 @@ fn encrypted_index_lifecycle() {
         drop(conn);
 
         let conn = db::open::open_maintenance(&db_path.to_string_lossy()).unwrap();
-        let dir = data.to_string_lossy().into_owned();
         assert!(
-            quicksearch_core::db::repo::maintain(&conn, &dir).unwrap(),
+            quicksearch_core::db::repo::maintain(&conn, &db_path.to_string_lossy()).unwrap(),
             "that much slack should have been reclaimed"
         );
         drop(conn);

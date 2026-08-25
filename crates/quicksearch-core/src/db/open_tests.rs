@@ -457,9 +457,17 @@ fn schema_mismatch_under_key_wipes_and_recreates_encrypted() {
     let p = tmp_db_path();
     let key = test_key(0xa1);
     {
+        // Built through `key_and_probe` under an explicit previous profile,
+        // not with a bare `PRAGMA key`. SQLCipher's `cipher_default_*`
+        // settings are process globals that `key_and_probe` writes, so a bare
+        // key here would inherit whatever another test in this binary last
+        // installed and could land the fixture under a layout
+        // `PROFILES_PREVIOUS` does not list — which reads as a wrong password.
+        // Naming the layout is also what the fixture means: this is a file
+        // from an older build.
+        let previous = crate::db::schema::PROFILES_PREVIOUS[0];
         let conn = Connection::open(&p).unwrap();
-        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", key.to_hex()))
-            .unwrap();
+        key_and_probe(&conn, p.to_str().unwrap(), Some(&key), previous).unwrap();
         conn.execute(
             "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             [],
@@ -572,7 +580,6 @@ fn a_fresh_index_and_its_sidecars_are_owner_only() {
 fn maintain_reads_its_pragmas_on_a_keyed_index() {
     let p = tmp_db_path();
     let key = test_key(0xc3);
-    let dir = p.parent().unwrap().to_string_lossy().into_owned();
     {
         let conn = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&key)).unwrap();
         conn.execute(
@@ -585,7 +592,7 @@ fn maintain_reads_its_pragmas_on_a_keyed_index() {
         .unwrap();
     // What matters is an answer, not an error; a tiny index has no slack.
     assert_eq!(
-        crate::db::repo::maintain(&conn, &dir),
+        crate::db::repo::maintain(&conn, p.to_str().unwrap()),
         Ok(false),
         "maintain must not fail on a keyed index"
     );
@@ -595,6 +602,197 @@ fn maintain_reads_its_pragmas_on_a_keyed_index() {
         crate::db::repo::pragma_number(&conn, "page_size").unwrap() >= 512,
         "a real page size, not a silent zero"
     );
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// Write enough text that FTS5 emits several *full* leaves. A corpus of tiny
+/// documents fits in one part-filled leaf, never reaches the inline-payload
+/// limit, and would let the tests below pass on a broken geometry.
+fn seed_searchable_text(conn: &Connection) {
+    let words = crate::testutil::WORDS;
+    conn.execute_batch("BEGIN").unwrap();
+    for doc in 0..200usize {
+        let body: Vec<&str> = (0..150)
+            .map(|w| words[(doc * 31 + w * 7) % words.len()])
+            .collect();
+        conn.execute(
+            "INSERT INTO searchabletext(rowid, text) VALUES (?1, ?2)",
+            params![doc as i64 + 1, body.join(" ")],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+}
+
+/// `(leaf, overflow)` page counts for the FTS5 data table.
+fn fts_page_types(conn: &Connection) -> (i64, i64) {
+    let count = |pagetype: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM dbstat \
+             WHERE name = 'searchabletext_data' AND pagetype = ?1",
+            params![pagetype],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    (count("leaf"), count("overflow"))
+}
+
+fn fts_stored_pgsz(conn: &Connection) -> Option<i64> {
+    conn.query_row(
+        "SELECT v FROM searchabletext_config WHERE k = 'pgsz'",
+        [],
+        |r| r.get(0),
+    )
+    .optional()
+    .unwrap()
+}
+
+/// The inline payload limit for the shipped profile: `page − reserve − 35`,
+/// with SQLCipher's page reserve when keyed.
+fn max_inline(keyed: bool) -> i64 {
+    use crate::db::schema::PROFILE;
+    PROFILE.page_size - PROFILE.reserve(keyed) - 35
+}
+
+/// Assert one index's FTS5 leaves are inline. An overflowed leaf is a second
+/// page fetch and decrypt on every read of it, and it is silent — nothing but
+/// the page counts shows it.
+fn assert_leaves_inline(conn: &Connection, keyed: bool) {
+    let (leaf, overflow) = fts_page_types(conn);
+    assert!(
+        leaf > 20,
+        "the corpus must fill real leaves for this to test anything: {} leaves",
+        leaf
+    );
+    assert_eq!(
+        overflow,
+        0,
+        "{} of {} FTS5 leaves spilled to overflow pages — the derived pgsz is \
+         back above the {}-byte inline limit",
+        overflow,
+        leaf,
+        max_inline(keyed)
+    );
+    // The limit itself, in case `dbstat` is ever unavailable or lies.
+    let widest: i64 = conn
+        .query_row(
+            "SELECT MAX(LENGTH(block)) FROM searchabletext_data",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        widest <= max_inline(keyed),
+        "a {}-byte record cannot sit inline under a {}-byte limit",
+        widest,
+        max_inline(keyed)
+    );
+}
+
+/// SQLCipher reserves bytes of every page for its IV and any authenticator, so
+/// a keyed index's inline payload limit is that much lower than a plain one's
+/// at the same page size. FTS5's own default record size ignores that and,
+/// before `fts_pgsz_for`, sent **every** full keyed leaf to an overflow page —
+/// 12% more file, and a second decrypt per leaf read.
+#[test]
+fn keyed_fts_leaves_stay_inline() {
+    let p = tmp_db_path();
+    let key = test_key(0xd4);
+    let conn = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&key)).unwrap();
+    assert_eq!(
+        fts_stored_pgsz(&conn),
+        Some(crate::db::schema::fts_pgsz_for(
+            crate::db::schema::PROFILE,
+            true
+        )),
+        "a keyed index must pin pgsz at creation"
+    );
+
+    seed_searchable_text(&conn);
+    assert_leaves_inline(&conn, true);
+
+    drop(conn);
+    std::fs::remove_file(&p).ok();
+}
+
+/// The derivation is only worth anything if it clears the limit it is derived
+/// from, at every size `benches/page_geometry.rs` sweeps. Arithmetic only —
+/// the round trip through a real file is the test below.
+#[test]
+fn derived_fts_pgsz_fits_inline_at_every_swept_page_size() {
+    use crate::db::schema::{fts_pgsz_for, HmacMode, Profile};
+    for page_size in [1024i64, 2048, 4096, 8192, 16384, 32768, 65536] {
+        // Every HMAC mode, not just the shipped one: the reserve moves with it
+        // and the derivation has to clear the limit under all of them, or
+        // `benches/cipher_hmac.rs` would be measuring overflow rather than
+        // authentication.
+        for hmac in [HmacMode::Off, HmacMode::Sha256, HmacMode::Sha512] {
+            let profile = Profile { page_size, hmac };
+            for keyed in [false, true] {
+                // What a table leaf holds inline, and what FTS5 actually writes.
+                let max_inline = page_size - profile.reserve(keyed) - 35;
+                let widest_record = fts_pgsz_for(profile, keyed) + 2;
+                assert!(
+                    widest_record <= max_inline,
+                    "page {} hmac={:?} keyed={}: a {}-byte record does not fit in {}",
+                    page_size,
+                    hmac,
+                    keyed,
+                    widest_record,
+                    max_inline
+                );
+                // A pgsz so small the leaves stop holding useful runs would be
+                // a different bug, and a silent one.
+                assert!(
+                    widest_record * 2 > max_inline,
+                    "page {} hmac={:?} keyed={}: {} wastes over half of a {}-byte leaf",
+                    page_size,
+                    hmac,
+                    keyed,
+                    widest_record,
+                    max_inline
+                );
+            }
+        }
+    }
+    // Spelled out so a change to the formula has to be deliberate. The keyed
+    // value is quoted per mode, because that is the number the on-disk format
+    // depends on.
+    let at = |page_size, hmac| Profile { page_size, hmac };
+    assert_eq!(fts_pgsz_for(at(4096, HmacMode::Sha512), true), 3970);
+    assert_eq!(fts_pgsz_for(at(4096, HmacMode::Sha256), true), 4002);
+    assert_eq!(fts_pgsz_for(at(4096, HmacMode::Off), true), 4034);
+    assert_eq!(
+        fts_pgsz_for(at(4096, HmacMode::Sha512), false),
+        4050,
+        "FTS5's own default; a plain file has no reserve, so the mode is moot"
+    );
+}
+
+/// The mirror. A plain index gets a *larger* record than a keyed one at the
+/// same page size, because it has no reserve to give up — the two differ by
+/// exactly that, and both have to land inline.
+#[test]
+fn a_plain_index_gets_the_derived_pgsz_for_its_page_size() {
+    use crate::db::schema::{fts_pgsz_for, PROFILE};
+    let p = tmp_db_path();
+    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    assert_eq!(
+        fts_stored_pgsz(&conn),
+        Some(fts_pgsz_for(PROFILE, false)),
+        "an unencrypted index gets the derivation for its page size"
+    );
+    assert_eq!(
+        fts_pgsz_for(PROFILE, false) - fts_pgsz_for(PROFILE, true),
+        PROFILE.hmac.reserve(),
+        "the plain and keyed records differ by exactly the reserve"
+    );
+
+    seed_searchable_text(&conn);
+    assert_leaves_inline(&conn, false);
 
     drop(conn);
     std::fs::remove_file(&p).ok();

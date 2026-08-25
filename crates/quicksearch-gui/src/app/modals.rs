@@ -93,9 +93,16 @@ impl QuickSearchApp {
         if !self.stale_index_prompt {
             return;
         }
-        if stale_index_window(ctx, self.key_source) {
+        let command = stale_prompt_should_command(
+            self.backend.coordinator.state().mode,
+            self.backend.coordinator.is_indexing(),
+        );
+        if stale_index_window(ctx, self.key_source, command) {
             self.stale_index_prompt = false;
-            self.backend.rebuild_index();
+            if command {
+                self.backend.rebuild_index();
+            }
+            // Either way the index is being replaced under the tab.
             self.dups.state = DupState::NotLoaded;
         }
     }
@@ -431,7 +438,17 @@ fn reconcile_quit_modal(ctx: &egui::Context) -> Option<bool> {
     choice
 }
 
-fn stale_index_window(ctx: &egui::Context, key_source: KeySource) -> bool {
+/// Whether the stale-index button has to command the rebuild itself.
+///
+/// In Auto the coordinator already does: the recreated index has no
+/// `last_full_index`, so its first tick schedules a full run. Sending
+/// `RebuildIndex` on top of that deletes the rebuild in progress and starts
+/// it over from zero. Only manual mode needs the button to do anything.
+pub(super) fn stale_prompt_should_command(mode: IndexMode, indexing: bool) -> bool {
+    mode != IndexMode::Auto && !indexing
+}
+
+fn stale_index_window(ctx: &egui::Context, key_source: KeySource, command: bool) -> bool {
     centered_modal(ctx, "Index reset for this version", |ui| {
         ui.set_max_width(440.0);
         ui.label(
@@ -460,7 +477,8 @@ fn stale_index_window(ctx: &egui::Context, key_source: KeySource) -> bool {
              until the rebuild finishes; progress is on the Manage Index tab.",
         ));
         ui.add_space(4.0);
-        ui.button("Rebuild now").clicked()
+        ui.button(if command { "Rebuild now" } else { "Continue" })
+            .clicked()
     })
     .unwrap_or(false)
 }
@@ -477,10 +495,17 @@ fn display_value(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn frame(ctx: &egui::Context, source: KeySource, events: Vec<egui::Event>) -> bool {
+    fn frame(
+        ctx: &egui::Context,
+        source: KeySource,
+        command: bool,
+        events: Vec<egui::Event>,
+    ) -> bool {
         let input = crate::test_ui::raw_input(SCREEN, events);
         let mut clicked = false;
-        let _ = ctx.run(input, |ctx| clicked = stale_index_window(ctx, source));
+        let _ = ctx.run(input, |ctx| {
+            clicked = stale_index_window(ctx, source, command)
+        });
         clicked
     }
 
@@ -495,27 +520,31 @@ mod tests {
             KeySource::Prompt,
             KeySource::Keychain,
         ] {
-            let ctx = crate::test_ui::ctx();
-            assert!(
-                !frame(&ctx, source, Vec::new()),
-                "an untouched frame must not request a rebuild"
-            );
+            // Both button labels: "Rebuild now" when the click starts the
+            // rebuild, "Continue" when one is already running.
+            for command in [true, false] {
+                let ctx = crate::test_ui::ctx();
+                assert!(
+                    !frame(&ctx, source, command, Vec::new()),
+                    "an untouched frame must not request a rebuild"
+                );
 
-            // The window's height depends on which sentence is shown; sweep.
-            let mut fired = None;
-            'sweep: for y in (230..480).step_by(3) {
-                for x in (250..760).step_by(6) {
-                    let pos = egui::pos2(x as f32, y as f32);
-                    if frame(&ctx, source, click_at(pos)) {
-                        fired = Some(pos);
-                        break 'sweep;
+                // The window's height depends on which sentence is shown; sweep.
+                let mut fired = None;
+                'sweep: for y in (230..480).step_by(3) {
+                    for x in (250..760).step_by(6) {
+                        let pos = egui::pos2(x as f32, y as f32);
+                        if frame(&ctx, source, command, click_at(pos)) {
+                            fired = Some(pos);
+                            break 'sweep;
+                        }
                     }
                 }
+                assert!(
+                    fired.is_some(),
+                    "no clickable button for {source:?} (command: {command})"
+                );
             }
-            assert!(
-                fired.is_some(),
-                "no clickable Rebuild button for {source:?}"
-            );
         }
     }
 

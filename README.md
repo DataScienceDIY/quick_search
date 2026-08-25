@@ -348,14 +348,20 @@ rebuilds the index — there is no in-place conversion.
 - The key is derived as `Argon2id(password, salt)`; the salt is written to
   `config.toml` when the password is set (it is unique, not secret, and
   required — keep it with the config if you copy a protected setup).
+- Pages are AES-256-CBC at an 8192-byte page size, with SQLCipher's
+  per-page HMAC **deliberately disabled** — it only detects tampering by
+  someone who could already read the indexed files directly, and it costs
+  1.78x on search. Confidentiality is unchanged.
 - **Remember on this device** stores the derived key (never the password)
   in the OS keychain — Secret Service/KWallet on Linux, Credential Manager
   on Windows — and skips the prompt. Without a keychain daemon the option
   quietly falls back to prompting.
 - **Show database key** asks for the password, then shows the raw SQLCipher
-  key as `0x…` (64 hex digits) with a copy button, for opening the index in
-  other SQLCipher tools. That key alone reads the index, so treat a copy of
-  it as carefully as the password.
+  key as `0x…` (64 hex digits) with a copy button, alongside the page size
+  and HMAC setting another tool has to be given — on SQLCipher's defaults
+  the index decrypts to noise and every tool calls a correct key wrong.
+  That key alone reads the index, so treat a copy of it as carefully as
+  the password.
 - Scripts can set `QUICKSEARCH_PASSWORD` for non-interactive terminal
   search. Environment variables are readable by other processes of the
   same user (`/proc/<pid>/environ`) — prefer the keychain.
@@ -516,7 +522,12 @@ Synchronous Rust: `std::thread` + `mpsc` channels, no async runtime.
   an optimize pass: checkpoint, VACUUM if the file has at least 20%
   slack, `PRAGMA optimize`, checkpoint again. Progress streams through a
   polled `IndexingStatus` (`Optimizing` during that pass, `Preparing`
-  for everything before the first file is walked).
+  for everything before the first file is walked). The upkeep a run does
+  *between* files — WAL checkpoints, the stale-row sweep, FTS merges,
+  the per-root recount — blocks the writer for as long as it takes, so
+  each announces itself as a `MaintenanceStep` on the published run
+  rather than leaving the per-file counters frozen and reading as a
+  hang.
 - **Scope reconciliation** (`scope.rs`): the index is a cache of what a
   walk under the configured roots would produce, so a configuration
   change is a difference between the two, not a reason to start over.

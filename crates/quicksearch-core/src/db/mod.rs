@@ -11,7 +11,10 @@ pub mod open;
 pub mod repo;
 pub mod schema;
 
-pub use key::{process_key_hex, set_process_key};
+pub use key::{
+    process_key_hex, set_hmac_mode_override, set_page_size_override, set_process_key,
+    set_search_cache_override,
+};
 pub use open::{
     index_needs_rebuild, key_mismatch_parts, open_existing, open_or_recreate, verify_process_key,
     KeyMismatch, CURRENT_SCHEMA_VERSION, FOREIGN_DB_PREFIX, KEY_MISMATCH_PREFIX,

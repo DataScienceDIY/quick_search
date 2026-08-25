@@ -18,7 +18,9 @@ mod progress;
 #[cfg(test)]
 mod tests;
 
-pub use progress::{overall_progress, OverallProgress, ReconcileProgress, RootPhase, RootProgress};
+pub use progress::{
+    overall_progress, MaintenanceStep, OverallProgress, ReconcileProgress, RootPhase, RootProgress,
+};
 
 /// What a run is doing before its first file is walked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +31,9 @@ pub enum PrepStep {
     OpeningIndex,
     /// Re-testing stored rows against a configuration that changed since the last run.
     Reconciling(ReconcileProgress),
+    /// The prologue's remaining database work, once any reconcile has ended:
+    /// stamping the config, retrying failed files, reading the stored counts.
+    Starting,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +48,10 @@ pub enum IndexingStatus {
     Running {
         start_time: Instant,
         roots: Vec<RootProgress>,
+        /// The index upkeep the writer is inside, if any. Run-wide, not
+        /// per-root: while it is set no file is moving and every counter in
+        /// `roots` is the last one published before the step began.
+        maintenance: Option<MaintenanceStep>,
     },
     Stopping,
     /// Compacting and re-analysing the index after a run. Holds the database:
@@ -409,13 +418,7 @@ impl IndexingService {
             }
         };
         let armed = db::InterruptGuard::arm(interrupt, &conn);
-
-        let dir = std::path::Path::new(db_path)
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let outcome = crate::db::repo::maintain(&conn, &dir);
-
+        let outcome = crate::db::repo::maintain(&conn, db_path);
         drop(armed);
         match outcome {
             Ok(true) => crate::log_info!("optimized the index and reclaimed unused space"),

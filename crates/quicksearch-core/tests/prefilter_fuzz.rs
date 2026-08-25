@@ -80,10 +80,10 @@ fn bodies() -> Vec<String> {
         "planning",
     ];
     for d in 0..DOCS {
-        let n = 20 + (lcg.next() as usize % 40);
+        let n = 20 + (lcg.next_u64() as usize % 40);
         let mut body = String::new();
         for _ in 0..n {
-            body.push_str(words[lcg.next() as usize % words.len()]);
+            body.push_str(words[lcg.next_u64() as usize % words.len()]);
             body.push(' ');
         }
         // Fixed shapes beside the random ones: all-one-character, and empty.
@@ -129,13 +129,13 @@ fn oracle_distance(pattern: &[u8], hay: &[u8]) -> usize {
 fn corrupt(chars: &mut Vec<char>, lcg: &mut Lcg) {
     // Includes multi-byte replacements: one character edit, several bytes.
     const REPLACEMENTS: [char; 6] = ['x', 'Q', '7', 'é', '語', '🙂'];
-    let pick = REPLACEMENTS[lcg.next() as usize % REPLACEMENTS.len()];
+    let pick = REPLACEMENTS[lcg.next_u64() as usize % REPLACEMENTS.len()];
     if chars.is_empty() {
         chars.push(pick);
         return;
     }
-    let at = lcg.next() as usize % chars.len();
-    match lcg.next() % 3 {
+    let at = lcg.next_u64() as usize % chars.len();
+    match lcg.next_u64() % 3 {
         0 => chars[at] = pick,       // substitution
         1 => chars.insert(at, pick), // insertion
         _ => {
@@ -154,7 +154,7 @@ fn substring_of<'a>(body: &'a str, len: usize, lcg: &mut Lcg) -> Option<&'a str>
     if chars < len || len == 0 {
         return None;
     }
-    let start = lcg.next() as usize % (chars - len + 1);
+    let start = lcg.next_u64() as usize % (chars - len + 1);
     Some(&body[bounds[start]..bounds[start + len]])
 }
 
@@ -175,7 +175,7 @@ fn a_surviving_chunk_always_remains_after_k_edits() {
     for &cap in &CAPS {
         for len in sweep_lengths() {
             for _ in 0..ITERS_PER_LEN {
-                let body = &bodies[lcg.next() as usize % bodies.len()];
+                let body = &bodies[lcg.next_u64() as usize % bodies.len()];
                 let Some(original) = substring_of(body, len, &mut lcg) else {
                     continue;
                 };
@@ -183,7 +183,7 @@ fn a_surviving_chunk_always_remains_after_k_edits() {
                     continue;
                 };
                 let mut chars: Vec<char> = original.chars().collect();
-                let edits = lcg.next() as usize % (k + 1);
+                let edits = lcg.next_u64() as usize % (k + 1);
                 for _ in 0..edits {
                     corrupt(&mut chars, &mut lcg);
                 }
@@ -342,7 +342,7 @@ fn a_corrupted_substring_still_finds_the_document_it_came_from() {
     for &cap in caps() {
         for len in sweep_lengths() {
             for _ in 0..iters_per_len() {
-                let doc = lcg.next() as usize % bodies.len();
+                let doc = lcg.next_u64() as usize % bodies.len();
                 let body = &bodies[doc];
                 let Some(original) = substring_of(body, len, &mut lcg) else {
                     continue;
@@ -353,7 +353,7 @@ fn a_corrupted_substring_still_finds_the_document_it_came_from() {
                 let edits = if planned == 0 {
                     0
                 } else {
-                    lcg.next() as usize % (planned + 1)
+                    lcg.next_u64() as usize % (planned + 1)
                 };
                 for _ in 0..edits {
                     corrupt(&mut chars, &mut lcg);
@@ -451,7 +451,7 @@ fn every_document_within_the_budget_is_found_and_nothing_outside_it_is() {
     for &cap in caps() {
         for len in sweep_lengths() {
             for _ in 0..ITERS {
-                let doc = lcg.next() as usize % bodies.len();
+                let doc = lcg.next_u64() as usize % bodies.len();
                 let Some(original) = substring_of(&bodies[doc], len, &mut lcg) else {
                     continue;
                 };
@@ -460,7 +460,7 @@ fn every_document_within_the_budget_is_found_and_nothing_outside_it_is() {
                 let edits = if planned == 0 {
                     0
                 } else {
-                    lcg.next() as usize % (planned + 1)
+                    lcg.next_u64() as usize % (planned + 1)
                 };
                 for _ in 0..edits {
                     corrupt(&mut chars, &mut lcg);
@@ -551,7 +551,7 @@ fn regexify(sub: &str, lcg: &mut Lcg) -> String {
     let mut out = String::new();
     for c in sub.chars() {
         // Most characters stay literal, or every literal set goes empty.
-        match lcg.next() % 10 {
+        match lcg.next_u64() % 10 {
             0 if c != '\n' => out.push('.'),
             1 => out.push_str(&format!("[{}z]", esc(c))),
             2 => out.push_str(&format!("(?:{}|zzq)", esc(c))),
@@ -560,7 +560,7 @@ fn regexify(sub: &str, lcg: &mut Lcg) -> String {
             _ => out.push_str(&esc(c)),
         }
     }
-    match lcg.next() % 6 {
+    match lcg.next_u64() % 6 {
         0 => format!(".*{out}"),
         1 => format!("{out}.*"),
         _ => out,
@@ -585,7 +585,7 @@ fn a_regex_finds_exactly_the_documents_it_matches() {
 
     for len in sweep_lengths() {
         for _ in 0..iters_per_len().min(40) {
-            let doc = lcg.next() as usize % bodies.len();
+            let doc = lcg.next_u64() as usize % bodies.len();
             let Some(sub) = substring_of(&bodies[doc], len, &mut lcg) else {
                 continue;
             };

@@ -237,3 +237,18 @@ fn only_light_is_light() {
         );
     }
 }
+
+/// In automatic mode the rebuild is already under way behind the modal;
+/// commanding another one would delete its progress and start over.
+#[test]
+fn the_stale_index_prompt_never_restarts_a_rebuild_already_running() {
+    use super::modals::stale_prompt_should_command;
+
+    assert!(!stale_prompt_should_command(IndexMode::Auto, true));
+    // Auto before the first tick: the coordinator still gets there on its own.
+    assert!(!stale_prompt_should_command(IndexMode::Auto, false));
+    assert!(!stale_prompt_should_command(IndexMode::ManualRunning, true));
+
+    // Manual and stopped: nothing else would ever start it.
+    assert!(stale_prompt_should_command(IndexMode::ManualStopped, false));
+}

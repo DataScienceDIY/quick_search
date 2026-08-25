@@ -7,14 +7,14 @@
 
 use std::error::Error;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek};
 use std::path::Path;
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use zip::ZipArchive;
 
-use super::{ExtractError, Extractor};
+use super::{ExtractError, Extractor, Scratch};
 
 pub struct OfficeExtractor;
 
@@ -72,43 +72,72 @@ const ODF_SHEET: TextSpec = TextSpec {
     separator: Some(' '),
 };
 
-/// The text an `&entity;` or `&#1234;` reference stands for. quick-xml 0.41
-/// reports a reference as its own event, so a reader that ignores it silently
-/// drops every `&amp;` from the document. Only the five predefined entities
-/// and numeric references are resolvable without a DTD.
-fn entity_text(raw: &str) -> Option<String> {
+/// Append what an `&entity;` or `&#1234;` reference stands for to `out`,
+/// reporting whether it resolved. quick-xml 0.41 reports a reference as its
+/// own event, so a reader that ignores it silently drops every `&amp;` from
+/// the document. Only the five predefined entities and numeric references are
+/// resolvable without a DTD.
+///
+/// Pushed rather than returned: a document is mostly `&amp;`s and `&#8217;`s,
+/// and a `String` per reference was an allocation per *character* of output.
+#[must_use]
+fn push_entity_text(raw: &str, out: &mut String) -> bool {
     if let Some(digits) = raw.strip_prefix('#') {
         let code = match digits.strip_prefix(['x', 'X']) {
-            Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-            None => digits.parse::<u32>().ok()?,
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => digits.parse::<u32>().ok(),
         };
-        let c = char::from_u32(code)?;
+        let Some(c) = code.and_then(char::from_u32) else {
+            return false;
+        };
         // `char::from_u32` accepts more than XML's character production does:
-        // `&#0;` would put a literal NUL into an FTS5 column. `None` becomes
+        // `&#0;` would put a literal NUL into an FTS5 column. `false` becomes
         // the same visible "unknown entity" error an unexpandable name gets.
-        let legal = !c.is_control() || matches!(c, '\t' | '\n' | '\r');
-        return legal.then(|| String::from(c));
+        if c.is_control() && !matches!(c, '\t' | '\n' | '\r') {
+            return false;
+        }
+        out.push(c);
+        return true;
     }
-    quick_xml::escape::resolve_predefined_entity(raw).map(String::from)
+    match quick_xml::escape::resolve_predefined_entity(raw) {
+        Some(text) => {
+            out.push_str(text);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Append the text `spec` selects out of `xml` to `out`. Text-bearing
 /// elements are counted, not flagged: ODF nests them, and a flag made a
 /// span's close end the run, dropping everything up to the paragraph's
 /// close. The separator belongs after a *run* — several events since 0.41.
-fn collect_xml_text(xml: &str, spec: &TextSpec, out: &mut String) -> Result<(), Box<dyn Error>> {
-    let mut reader = Reader::from_str(xml);
+///
+/// Reads from a stream and stops at `limit`: the member is never held whole,
+/// and a document with more text than the caller will keep is abandoned at
+/// the point the surplus begins rather than parsed to the end and truncated.
+fn collect_xml_text<R: BufRead>(
+    xml: R,
+    spec: &TextSpec,
+    out: &mut String,
+    limit: usize,
+    buf: &mut Vec<u8>,
+) -> Result<(), Box<dyn Error>> {
+    let mut reader = Reader::from_reader(xml);
     // No `trim_text`: it trims each *event*, and since 0.41 an entity
     // reference splits the character data into separate events — `Jack &amp;
     // Jill` would come back as `Jack&Jill`. Whitespace inside a text-bearing
     // element is content; between elements it is ignored anyway.
-    let mut buf = Vec::new();
+    buf.clear();
     // Open text-bearing elements; the run ends at zero, not on the innermost
     // close.
     let mut depth = 0usize;
 
     loop {
-        match reader.read_event_into(&mut buf) {
+        if out.len() >= limit {
+            return Ok(());
+        }
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) => {
                 if spec.text.contains(&e.name().as_ref()) {
                     depth += 1;
@@ -122,9 +151,9 @@ fn collect_xml_text(xml: &str, spec: &TextSpec, out: &mut String) -> Result<(), 
                 let raw = e.decode()?;
                 // An unexpandable entity is an error: dropping it takes
                 // characters out of the indexed text silently.
-                let text = entity_text(&raw)
-                    .ok_or_else(|| format!("Error parsing XML: unknown entity &{};", raw))?;
-                out.push_str(&text);
+                if !push_entity_text(&raw, out) {
+                    return Err(format!("Error parsing XML: unknown entity &{};", raw).into());
+                }
             }
             Ok(Event::End(ref e)) => {
                 let name = e.name();
@@ -172,41 +201,38 @@ fn open_container(path: &Path) -> Result<Archive, Box<dyn Error>> {
     Ok(ZipArchive::new(BufReader::new(File::open(path)?))?)
 }
 
-/// Cap on one decompressed member, mirroring `ole::MAX_TEXT_BYTES`: the zip
-/// header declares sizes, but the deflate stream is what we actually read, so
-/// a tiny archive can inflate without bound.
-const MAX_XML_BYTES: usize = 64 * 1024 * 1024;
-
-/// Cap on the text taken from one *container*. [`MAX_XML_BYTES`] bounds each
-/// member on its own, and a small archive can carry dozens that each inflate
-/// to that cap: without a running total the peak is members × 64 MiB per
-/// worker, and an allocation failure aborts rather than unwinding.
-const MAX_TEXT_BYTES: usize = 64 * 1024 * 1024;
-
-/// One member's bytes as a string. An over-cap member keeps its prefix.
-fn member_text<R: Read + Seek>(
+/// Inflate one member into `buf`, which is the **worker's** buffer, reused
+/// member after member and file after file: after the first document a
+/// container costs no allocation for its members at all.
+///
+/// A zip declares its sizes but the deflate stream is what actually gets
+/// read, so `limit` — [`super::Limits::inflate`], derived from the config —
+/// is the only real bound on what a crafted archive can expand to. It used
+/// to be a hardcoded 64 MiB per member *and* another 64 MiB per container.
+///
+/// The buffer keeps whatever capacity the largest member so far needed and
+/// does not shrink, so one hostile document leaves that worker holding up to
+/// `limit` for the rest of the pass. That is the trade for never allocating
+/// in the common case, and it is bounded where it used to be 16× larger.
+fn member_bytes<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     name: &str,
-) -> Result<String, Box<dyn Error>> {
-    let mut body = Vec::new();
+    limit: usize,
+    buf: &mut Vec<u8>,
+) -> Result<(), Box<dyn Error>> {
+    buf.clear();
     archive
         .by_name(name)?
-        .take(MAX_XML_BYTES as u64 + 1)
-        .read_to_end(&mut body)?;
-    let truncated = body.len() > MAX_XML_BYTES;
-    body.truncate(MAX_XML_BYTES);
-    match String::from_utf8(body) {
-        Ok(text) => Ok(text),
-        // Only a cut at the cap may split a character; invalid UTF-8 anywhere
-        // else still fails the extraction, as `read_to_string` always did.
-        Err(e) if truncated && e.utf8_error().valid_up_to() >= MAX_XML_BYTES - 3 => {
-            let valid = e.utf8_error().valid_up_to();
-            let mut bytes = e.into_bytes();
-            bytes.truncate(valid);
-            Ok(String::from_utf8(bytes)?)
-        }
-        Err(e) => Err(e.into()),
-    }
+        .take(limit as u64)
+        .read_to_end(buf)?;
+    Ok(())
+}
+
+/// A reader over bytes already in hand — what the XML parsers are driven
+/// from, so quick-xml streams events out of the worker's buffer rather than
+/// a copy of it.
+fn xml_over(buf: &[u8]) -> Cursor<&[u8]> {
+    Cursor::new(buf)
 }
 
 /// Names of the `.xml` members under `prefix`, in archive order — not
@@ -227,61 +253,87 @@ fn xml_members_under<R: Read + Seek>(
 }
 
 /// A format whose whole text lives in one member under one spec.
-fn single_member(path: &Path, member: &str, spec: &TextSpec) -> Result<String, Box<dyn Error>> {
+fn single_member(
+    path: &Path,
+    member: &str,
+    spec: &TextSpec,
+    out: &mut String,
+    scratch: &mut Scratch,
+) -> Result<(), Box<dyn Error>> {
+    let limits = scratch.limits();
     let mut archive = open_container(path)?;
-    let xml = member_text(&mut archive, member)?;
-    let mut out = String::new();
-    collect_xml_text(&xml, spec, &mut out)?;
-    Ok(out)
+    let (bytes, events) = scratch.container_bufs();
+    member_bytes(&mut archive, member, limits.inflate, bytes)?;
+    collect_xml_text(xml_over(bytes), spec, out, limits.text, events)
 }
 
 /// Concatenate what `collect` gets out of each `.xml` member under `prefix`,
-/// in archive order, bounded by [`MAX_TEXT_BYTES`]; whole members are kept or
-/// dropped, never cut mid-way.
+/// in archive order, stopping once the text reaches [`super::Limits::text`]
+/// — the point past which the caller would discard it anyway.
 fn collect_members(
     archive: &mut Archive,
     prefix: &str,
-    mut collect: impl FnMut(&str, &mut String) -> Result<(), Box<dyn Error>>,
-) -> Result<String, Box<dyn Error>> {
-    let mut out = String::new();
+    out: &mut String,
+    limit: usize,
+    mut collect: impl FnMut(&mut Archive, &str, &mut String) -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
     for name in xml_members_under(archive, prefix)? {
-        if out.len() >= MAX_TEXT_BYTES {
+        if out.len() >= limit {
             break;
         }
-        let xml = member_text(archive, &name)?;
-        collect(&xml, &mut out)?;
+        collect(archive, &name, out)?;
     }
-    Ok(out)
+    Ok(())
 }
 
-fn extract_pptx(path: &Path) -> Result<String, Box<dyn Error>> {
+fn extract_pptx(path: &Path, out: &mut String, scratch: &mut Scratch) -> Result<(), Box<dyn Error>> {
+    let limits = scratch.limits();
     let mut archive = open_container(path)?;
-    collect_members(&mut archive, "ppt/slides/slide", |xml, out| {
-        collect_xml_text(xml, &PPTX, out)?;
-        out.push_str("\n--- New Slide ---\n");
-        Ok(())
-    })
+    let (bytes, events) = scratch.container_bufs();
+    collect_members(
+        &mut archive,
+        "ppt/slides/slide",
+        out,
+        limits.text,
+        |archive, name, out| {
+            member_bytes(archive, name, limits.inflate, bytes)?;
+            collect_xml_text(xml_over(bytes), &PPTX, out, limits.text, events)?;
+            out.push_str("\n--- New Slide ---\n");
+            Ok(())
+        },
+    )
 }
 
 // XLSX: shared strings plus cells
 
-/// The workbook's shared-string table, in index order. Absent or unreadable
-/// is not an error: a sheet of nothing but numbers has no table at all.
-fn shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Vec<String> {
-    let Ok(xml) = member_text(archive, "xl/sharedStrings.xml") else {
-        return Vec::new();
-    };
-    let mut reader = Reader::from_str(&xml);
+/// The workbook's shared-string table, in index order, into `strings`.
+/// Absent or unreadable is not an error: a sheet of nothing but numbers has
+/// no table at all.
+///
+/// **This one member is read whole**, unlike every other: a `t="s"` cell
+/// holds an *index* into the table, so a table cut short does not lose the
+/// tail — it renders the wrong string for every cell past the cut, silently.
+/// It is bounded by the same inflation budget and by nothing else.
+fn shared_strings<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    limit: usize,
+    bytes: &mut Vec<u8>,
+    events: &mut Vec<u8>,
+    strings: &mut Vec<String>,
+) {
+    if member_bytes(archive, "xl/sharedStrings.xml", limit, bytes).is_err() {
+        return;
+    }
+    let mut reader = Reader::from_reader(xml_over(bytes));
     // No `trim_text`; see `collect_xml_text`.
-    let mut buf = Vec::new();
-    let mut strings = Vec::new();
+    events.clear();
     let mut in_text = false;
     // One `<t>` is one shared string but not one event (an entity reference
     // splits it); accumulated and pushed on the closing tag, or a cell with
     // `&amp;` would become three table entries.
     let mut current = String::new();
     loop {
-        match reader.read_event_into(&mut buf) {
+        match reader.read_event_into(events) {
             Ok(Event::Start(ref e)) if e.name().as_ref() == b"t" => {
                 in_text = true;
                 current.clear();
@@ -295,14 +347,12 @@ fn shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Vec<String> {
             }
             Ok(Event::Text(e)) if in_text => match e.decode() {
                 Ok(s) => current.push_str(&s),
-                Err(_) => return strings,
+                Err(_) => return,
             },
             Ok(Event::GeneralRef(e)) if in_text => {
                 // This reader cannot fail; an unexpandable entity is left out.
                 if let Ok(raw) = e.decode() {
-                    if let Some(text) = entity_text(&raw) {
-                        current.push_str(&text);
-                    }
+                    let _ = push_entity_text(&raw, &mut current);
                 }
             }
             Ok(Event::End(ref e)) if e.name().as_ref() == b"t" => {
@@ -312,29 +362,37 @@ fn shared_strings<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Vec<String> {
             Ok(Event::Eof) | Err(_) => break,
             _ => {}
         }
-        buf.clear();
+        events.clear();
     }
-    strings
 }
 
 /// One worksheet's cells. A `t="s"` cell holds an index into `strings`
 /// rather than text of its own; every other type holds its value inline.
-fn collect_sheet(xml: &str, strings: &[String], out: &mut String) -> Result<(), Box<dyn Error>> {
-    let mut reader = Reader::from_str(xml);
+fn collect_sheet<R: BufRead>(
+    xml: R,
+    strings: &[String],
+    out: &mut String,
+    limit: usize,
+    buf: &mut Vec<u8>,
+) -> Result<(), Box<dyn Error>> {
+    let mut reader = Reader::from_reader(xml);
     // No `trim_text`; see `collect_xml_text`.
-    let mut buf = Vec::new();
+    buf.clear();
     let mut in_cell = false;
     let mut cell_type = String::new();
 
     loop {
-        match reader.read_event_into(&mut buf) {
+        if out.len() >= limit {
+            return Ok(());
+        }
+        match reader.read_event_into(buf) {
             Ok(Event::Start(ref e)) if e.name().as_ref() == b"c" => {
                 in_cell = true;
                 cell_type.clear();
                 // `with_checks(false)`: the duplicate-attribute-name check is
                 // quadratic with no bound but the tag's size
-                // (RUSTSEC-2026-0194), so one crafted `<c>` in 64 MiB of
-                // inflated XML could hold this worker for hours,
+                // (RUSTSEC-2026-0194), so one crafted `<c>` in the inflation
+                // budget's worth of XML could hold this worker for hours,
                 // uncancellably. This extractor wants one attribute anyway.
                 for attr in e.attributes().with_checks(false) {
                     let attr = attr?;
@@ -372,9 +430,9 @@ fn collect_sheet(xml: &str, strings: &[String], out: &mut String) -> Result<(), 
             // Only inline values can carry one; a `t="s"` cell's is an index.
             Ok(Event::GeneralRef(e)) if in_cell && cell_type != "s" => {
                 let raw = e.decode()?;
-                let text = entity_text(&raw)
-                    .ok_or_else(|| format!("Error parsing XML: unknown entity &{};", raw))?;
-                out.push_str(&text);
+                if !push_entity_text(&raw, out) {
+                    return Err(format!("Error parsing XML: unknown entity &{};", raw).into());
+                }
             }
             Ok(Event::End(ref e)) => {
                 let name = e.name();
@@ -393,12 +451,23 @@ fn collect_sheet(xml: &str, strings: &[String], out: &mut String) -> Result<(), 
     Ok(())
 }
 
-fn extract_xlsx(path: &Path) -> Result<String, Box<dyn Error>> {
+fn extract_xlsx(path: &Path, out: &mut String, scratch: &mut Scratch) -> Result<(), Box<dyn Error>> {
+    let limits = scratch.limits();
     let mut archive = open_container(path)?;
-    let strings = shared_strings(&mut archive);
-    collect_members(&mut archive, "xl/worksheets/sheet", |xml, out| {
-        collect_sheet(xml, &strings, out)
-    })
+    // All three at once: the sheets are read while the table is live, and
+    // separate `&mut scratch` borrows cannot overlap.
+    let (bytes, events, strings) = scratch.xlsx_bufs();
+    shared_strings(&mut archive, limits.inflate, bytes, events, strings);
+    collect_members(
+        &mut archive,
+        "xl/worksheets/sheet",
+        out,
+        limits.text,
+        |archive, name, out| {
+            member_bytes(archive, name, limits.inflate, bytes)?;
+            collect_sheet(xml_over(bytes), strings, out, limits.text, events)
+        },
+    )
 }
 
 // Dispatch
@@ -406,16 +475,21 @@ fn extract_xlsx(path: &Path) -> Result<String, Box<dyn Error>> {
 /// Extract text from an office document, chosen by lowercase extension. An
 /// unhandled extension yields empty text: the MIME was claimed, so the file
 /// was simply named unlike its type.
-fn extract_document_text(path: &Path, extension: &str) -> Result<String, Box<dyn Error>> {
+fn extract_document_text(
+    path: &Path,
+    extension: &str,
+    out: &mut String,
+    scratch: &mut Scratch,
+) -> Result<(), Box<dyn Error>> {
     match extension {
-        "docx" => single_member(path, "word/document.xml", &DOCX),
-        "xlsx" => extract_xlsx(path),
-        "pptx" => extract_pptx(path),
-        "odt" | "odp" => single_member(path, "content.xml", &ODF_TEXT),
-        "ods" => single_member(path, "content.xml", &ODF_SHEET),
+        "docx" => single_member(path, "word/document.xml", &DOCX, out, scratch),
+        "xlsx" => extract_xlsx(path, out, scratch),
+        "pptx" => extract_pptx(path, out, scratch),
+        "odt" | "odp" => single_member(path, "content.xml", &ODF_TEXT, out, scratch),
+        "ods" => single_member(path, "content.xml", &ODF_SHEET, out, scratch),
         // Pre-2007 binary formats: a different container entirely.
-        "doc" | "xls" | "ppt" => super::ole::extract_ole_text(path, extension),
-        _ => Ok(String::new()),
+        "doc" | "xls" | "ppt" => super::ole::extract_ole_text(path, extension, out, scratch),
+        _ => Ok(()),
     }
 }
 
@@ -424,16 +498,20 @@ impl Extractor for OfficeExtractor {
         mime_to_ext(mime).is_some()
     }
 
-    fn extract(&self, path: &Path) -> Result<String, ExtractError> {
+    fn extract(
+        &self,
+        path: &Path,
+        out: &mut String,
+        scratch: &mut Scratch,
+    ) -> Result<(), ExtractError> {
         // From the path, not the MIME: `.docm` and `.docx` share a MIME.
         let ext = path
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase())
             .unwrap_or_default();
-        let text = extract_document_text(path, &ext)
-            .map_err(|e| format!("office extractor {}: {}", path.display(), e))?;
-        Ok(text)
+        extract_document_text(path, &ext, out, scratch)
+            .map_err(|e| format!("office extractor {}: {}", path.display(), e))
     }
 }
 
@@ -441,6 +519,22 @@ impl Extractor for OfficeExtractor {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn scratch() -> Scratch {
+        Scratch::new(&crate::config::Config::default())
+    }
+
+    /// The one-file forms: these assert on extracted text, not on the buffer
+    /// reuse a pool worker gets.
+    fn extract_document_text(path: &Path, extension: &str) -> Result<String, Box<dyn Error>> {
+        let mut out = String::new();
+        super::extract_document_text(path, extension, &mut out, &mut scratch()).map(|()| out)
+    }
+
+    fn office_extract(path: &Path) -> Result<String, ExtractError> {
+        let mut out = String::new();
+        OfficeExtractor.extract(path, &mut out, &mut scratch()).map(|()| out)
+    }
 
     /// A reader that only handles `Event::Text` loses `&amp;` with no error;
     /// this fails by producing "Blake  Co".
@@ -450,7 +544,7 @@ mod tests {
              <w:t>Blake &amp; Co &lt;tags&gt; &#8217;24 &#x2019;25</w:t>\
              </w:r></w:p></w:body></w:document>";
         let path = container("docx-entities", "docx", &[("word/document.xml", body)]);
-        let out = OfficeExtractor.extract(&path).expect("extract");
+        let out = office_extract(&path).expect("extract");
         assert!(
             out.contains("Blake & Co"),
             "predefined entity lost: {:?}",
@@ -483,7 +577,7 @@ mod tests {
                 ("xl/worksheets/sheet1.xml", sheet),
             ],
         );
-        let out = OfficeExtractor.extract(&path).expect("extract");
+        let out = office_extract(&path).expect("extract");
         assert!(
             out.contains("Jack & Jill"),
             "entity lost through the shared-string table: {:?}",
@@ -509,7 +603,7 @@ mod tests {
                 ("xl/worksheets/sheet1.xml", sheet),
             ],
         );
-        let out = OfficeExtractor.extract(&path).expect("extract");
+        let out = office_extract(&path).expect("extract");
         assert!(
             out.contains("Marmalade"),
             "the shared string was dropped by an indented index: {:?}",
@@ -554,6 +648,78 @@ mod tests {
         }
         zip.finish().unwrap();
         path
+    }
+
+    /// A docx whose text is far larger than any limit under test, and whose
+    /// XML compresses to almost nothing — the shape a hostile archive has.
+    fn oversized_docx(tag: &str, runs: usize) -> std::path::PathBuf {
+        let mut body = String::from("<w:document><w:body>");
+        for i in 0..runs {
+            body.push_str("<w:p><w:r><w:t>");
+            // Distinguishable, so a truncated result can be located.
+            body.push_str(&format!("paragraph{:08} ", i));
+            body.push_str("</w:t></w:r></w:p>");
+        }
+        body.push_str("</w:body></w:document>");
+        container(tag, "docx", &[("word/document.xml", &body)])
+    }
+
+    fn limited(text: usize) -> Scratch {
+        let mut config = crate::config::Config::default();
+        config.processing.maximum_text_size = text;
+        Scratch::new(&config)
+    }
+
+    /// Extraction **stops** at `maximum_text_size` instead of running the
+    /// document to its end for the caller to truncate. The margin is what
+    /// makes this a real assertion: the old code produced every byte, so a
+    /// result the size of the document would pass a "≥ limit" check.
+    #[test]
+    fn a_document_larger_than_the_limit_stops_at_it() {
+        // ~2 MiB of text; the limit is 4 KiB, so 99.8% must never be built.
+        let path = oversized_docx("docx-oversize", 100_000);
+        let mut out = String::new();
+        let mut scratch = limited(4096);
+        OfficeExtractor
+            .extract(&path, &mut out, &mut scratch)
+            .expect("extract");
+
+        assert!(
+            out.len() >= 4096,
+            "stopped short of the limit: {} bytes",
+            out.len()
+        );
+        // One paragraph of overshoot is the documented allowance — the check
+        // is per event, not per byte.
+        assert!(
+            out.len() < 4096 * 2,
+            "ran past the limit rather than stopping at it: {} bytes",
+            out.len()
+        );
+        assert!(
+            out.starts_with("paragraph00000000"),
+            "the kept text is the document's start: {:?}",
+            &out[..out.len().min(40)]
+        );
+    }
+
+    /// The same document with the shipped limits: still bounded, and still
+    /// the document's beginning rather than an arbitrary window.
+    #[test]
+    fn the_default_limits_bound_an_oversized_document() {
+        let path = oversized_docx("docx-oversize-default", 100_000);
+        let config = crate::config::Config::default();
+        let mut out = String::new();
+        let mut scratch = Scratch::new(&config);
+        OfficeExtractor
+            .extract(&path, &mut out, &mut scratch)
+            .expect("extract");
+        assert!(
+            out.len() < config.processing.maximum_text_size * 2,
+            "{} bytes for a {}-byte limit",
+            out.len(),
+            config.processing.maximum_text_size
+        );
     }
 
     const DOCX_BODY: &str = "<w:document><w:body>\

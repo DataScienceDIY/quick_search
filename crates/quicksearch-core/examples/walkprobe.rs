@@ -60,6 +60,8 @@ fn main() {
 fn serial(root: &str, config: &Config, existing: &DirRows) -> (usize, usize) {
     let ignore = IgnoreSet::compile(&[]).unwrap();
     let registry = Registry::default_set();
+    // One for the whole walk, as a walk worker holds one.
+    let mut scratch = quicksearch_core::extract::Scratch::new(config);
     let (mut seen, mut prepared) = (0, 0);
     for entry in filtered_walk(root, false, false, &ignore, &UnreadableDirs::default()) {
         seen += 1;
@@ -83,7 +85,7 @@ fn serial(root: &str, config: &Config, existing: &DirRows) -> (usize, usize) {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         if classify_for_indexing(&name, mtime, existing) != FileIndexAction::Skip
-            && prepare_file_record(&path, &meta, config, &registry).is_some()
+            && prepare_file_record(&path, &meta, config, &registry, &mut scratch).is_some()
         {
             prepared += 1;
         }

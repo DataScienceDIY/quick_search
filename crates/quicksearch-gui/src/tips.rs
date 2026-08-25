@@ -52,7 +52,7 @@ impl Tipped for egui::Response {
 /// One grid row; the label and the control share the tooltip.
 pub fn tip_row(
     ui: &mut egui::Ui,
-    label: &str,
+    label: impl Into<egui::WidgetText>,
     tip: &'static Tip,
     widget: impl FnOnce(&mut egui::Ui) -> egui::Response,
 ) {
@@ -60,6 +60,26 @@ pub fn tip_row(
     widget(ui).tip(tip);
     ui.end_row();
 }
+
+// --- Settings: the advanced toggle ----------------------------------------
+
+pub static SHOW_ADVANCED: Tip = Tip {
+    title: "Show advanced settings",
+    body: "Reveals the rest of the Settings tab: where the index file lives, \
+           how text is broken into searchable pieces, how much of a file is \
+           read, how much memory searching may use, and similar.\n\n\
+           They are hidden by default because their defaults are right for \
+           almost every installation, and because a wrong value can make \
+           indexing slower, searching worse, or a rebuild necessary. Nothing \
+           is lost by leaving this off — every setting behind it keeps working \
+           at its default.",
+    examples: &[
+        "on when you want the index kept on a different drive, or are tuning \
+         a very large collection.",
+        "off for everyday use.",
+    ],
+    caution: None,
+};
 
 // --- Settings: Paths ------------------------------------------------------
 
@@ -215,13 +235,15 @@ pub static MAX_WAL_SIZE: Tip = Tip {
     body: "While indexing, changes are written to a companion file beside \
            the index and folded in afterwards. That normally happens by \
            itself, but during a long run with searches going on at the same \
-           time the companion file keeps growing, sometimes past the size of \
-           the index. This is the point at which QuickSearch pauses and folds \
-           it in regardless.\n\n\
-           Another speed setting; the default suits most machines.",
+           time the companion file keeps growing, often past the size of the \
+           index itself: it records every version of every page the run \
+           touches, where the index keeps only the last. This is the point at \
+           which QuickSearch pauses and folds it in regardless.\n\n\
+           Folding in less often makes indexing faster and makes searching \
+           during it slower.",
     examples: &[
-        "536870912, 512 MB, is the default.",
-        "67108864, 64 MB, when disk space is tight.",
+        "2147483648, 2 GB, is the default.",
+        "67108864, 64 MB, to favour searching while indexing runs.",
         "0 to never force it and let the database decide. Any other value below 16 MB \
          is treated as 16 MB.",
     ],
@@ -287,6 +309,28 @@ pub static DISPLAY_LIMIT: Tip = Tip {
          type:Image, and want them all at once.",
     ],
     caution: None,
+};
+
+pub static SEARCH_CACHE: Tip = Tip {
+    title: "Search cache",
+    body: "The size of the memory-backed cache for the Indexing database.\n\n\
+           When set to 0, QuickSearch automatically sizes it for your index, capped at 128 MiB. \
+           The recommended value is shown below the setting. It matters most on an \
+           encrypted index, which has to decrypt anything the cache does not \
+           already hold. If this is smaller than the recommended value it will \
+           make search results four times slower.\n\n\
+           An unencrypted index doesn't need much cache so we give it \
+           a small amount which doesn't change with index size.",
+    examples: &[
+        "0 sizes it automatically, and is right unless your folders are \
+         nested unusually deep.",
+        "a fixed value when you would rather cap what QuickSearch keeps \
+         resident, at the cost of slower searching on a large index.",
+    ],
+    caution: Some(
+        "This memory is held for as long as the search stays open, and \
+         released after a long idle.",
+    ),
 };
 
 pub static RESULTS_PER_PAGE: Tip = Tip {

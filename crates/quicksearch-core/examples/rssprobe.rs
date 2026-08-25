@@ -17,6 +17,10 @@
 //! `glibc arenas` line says whether an anonymous figure is live data or
 //! retention that `malloc_trim(3)` could return.
 
+// The GUI's idle footprint is an allocator property too; see `memprobe`.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
 use quicksearch_core::testutil::{mib, size_class};
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use pdf_extract::{Document, PlainTextOutput};
 
-use super::{ExtractError, Extractor};
+use super::{ExtractError, Extractor, Scratch};
 
 thread_local! {
     /// True while this thread is inside a contained `pdf_extract` call.
@@ -46,14 +46,32 @@ impl Extractor for PdfExtractor {
         mime == "application/pdf"
     }
 
-    fn extract(&self, path: &Path) -> Result<String, ExtractError> {
+    /// The one format with no streaming option: `Document::load` builds the
+    /// whole object graph before a byte of text comes out, and a 2 MiB file
+    /// has been measured holding tens of megabytes. Its *input* is bounded by
+    /// `maximum_text_file_size` and its output by `maximum_text_size`, but the
+    /// middle is `pdf_extract`'s and there is no scratch to reuse — so peak
+    /// for PDFs alone is `workers × amplification`, one pool per root.
+    fn extract(
+        &self,
+        path: &Path,
+        out: &mut String,
+        _scratch: &mut Scratch,
+    ) -> Result<(), ExtractError> {
         // Loading is inside the guard too — a panic outside it takes the thread.
         install_quiet_panic_hook();
         let path_buf = path.to_path_buf();
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(true));
         let result = std::panic::catch_unwind(move || extract_one_pass(&path_buf));
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(false));
-        result.map_err(|panic| format!("pdf_extract panicked: {}", panic_message(&*panic)))?
+        let text = result
+            .map_err(|panic| format!("pdf_extract panicked: {}", panic_message(&*panic)))??;
+        if out.is_empty() {
+            *out = text;
+        } else {
+            out.push_str(&text);
+        }
+        Ok(())
     }
 }
 
@@ -76,6 +94,12 @@ fn extract_one_pass(path: &Path) -> Result<String, ExtractError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn extract(path: &Path) -> Result<String, ExtractError> {
+        let mut out = String::new();
+        let mut scratch = Scratch::new(&crate::config::Config::default());
+        PdfExtractor.extract(path, &mut out, &mut scratch).map(|()| out)
+    }
 
     #[test]
     fn contained_panics_are_caught_quietly_with_reason() {
@@ -163,7 +187,7 @@ mod tests {
             }),
         );
 
-        let out = PdfExtractor.extract(&path).expect("extract");
+        let out = extract(&path).expect("extract");
         assert!(
             out.contains("Hello QuickSearch"),
             "drawn text missing from {:?}",
@@ -174,7 +198,7 @@ mod tests {
     #[test]
     fn missing_info_dictionary_still_yields_text() {
         let path = write_pdf("pdf-noinfo", "Body Only", None);
-        let out = PdfExtractor.extract(&path).expect("extract");
+        let out = extract(&path).expect("extract");
         assert!(out.contains("Body Only"));
     }
 
@@ -183,8 +207,7 @@ mod tests {
         let path = crate::testutil::scratch_dir("pdf-malformed").join("broken.pdf");
         std::fs::write(&path, b"%PDF-1.4\n\x00\x01\x02 not a pdf at all \xff\xfe").unwrap();
 
-        let err = PdfExtractor
-            .extract(&path)
+        let err = extract(&path)
             .expect_err("malformed pdf must fail");
         assert!(
             err.starts_with("pdf_extract"),
@@ -226,7 +249,7 @@ mod tests {
         doc.save(&path).expect("write fixture pdf");
 
         // The verdict that matters is that we reach this line at all.
-        let _ = PdfExtractor.extract(&path);
+        let _ = extract(&path);
     }
 
     /// A Form XObject drawing itself must be skipped — the second unbounded
@@ -280,6 +303,6 @@ mod tests {
         let path = crate::testutil::scratch_dir("pdf-xobject-cycle").join("cycle.pdf");
         doc.save(&path).expect("write fixture pdf");
 
-        let _ = PdfExtractor.extract(&path);
+        let _ = extract(&path);
     }
 }

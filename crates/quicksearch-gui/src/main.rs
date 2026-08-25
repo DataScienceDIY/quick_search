@@ -4,6 +4,12 @@
 //! `quicksearch-cli`. A query passed here still seeds the search box.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+// Only the binary that declares it gets it — a library cannot choose an
+// allocator for its dependents — so this line is what actually puts the app
+// on mimalloc. See `platform::Allocator` for why it is not glibc's.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
 mod app;
 mod backend;
 #[cfg(feature = "capture")]
@@ -73,6 +79,11 @@ fn main() {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(e)),
     };
+    // Before any search connection exists: the ceiling is applied at open, and
+    // `0` leaves it derived from the index.
+    quicksearch_core::db::set_search_cache_override(
+        (config.search.cache_size_mib != 0).then_some(config.search.cache_size_mib as i64),
+    );
     let initial_query = seed_query();
 
     // After the CLI early-exit, deliberately: the CLI only reads. Two

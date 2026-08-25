@@ -28,6 +28,21 @@ probe = []
 # no runtime library dependencies. With no `PRAGMA key` applied, SQLCipher
 # behaves identically to stock SQLite, so unencrypted indexes are unaffected.
 rusqlite = { version = "0.39", features = ["bundled-sqlcipher-vendored-openssl"] }
+# The allocator every binary here installs; see `platform::Allocator`.
+#
+# glibc gives each thread a 64 MiB arena and never shrinks one below its
+# high-water mark, so a multi-million-file run settled at 985 MB RSS with
+# 871 MB of anonymous slack that `malloc_trim` could not coalesce.
+# `glibc.malloc.arena_max=2` cut that to 146 MB but made indexing dramatically
+# slower, because two arenas serialise every worker's allocations. mimalloc
+# has no such trade: per-thread heaps with no lock on the fast path, and freed
+# segments are decommitted rather than parked.
+#
+# `mimalloc` supplies the `GlobalAlloc` type; `libmimalloc-sys` is what links
+# the C library `platform::release_free_heap` calls `mi_collect` from. Both
+# compile C, which this build already needs for SQLCipher and OpenSSL.
+mimalloc = "0.1"
+libmimalloc-sys = "0.1"
 argon2 = { version = "0.5", features = ["zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"
@@ -161,14 +176,36 @@ harness = false
 name = "index"
 harness = false
 
-# Plain-main measurement probes, env-gated (QSB_SEARCH_PERF / QSB_SEARCH_ALLOC)
-# so a bare `cargo bench` doesn't pay their seed cost. snippet_perf, which
-# compared the pre-schema-v3 FTS shape against v3, is gone: the question is
-# decided (v3 won on every axis) — don't re-measure it.
+# Plain-main measurement probes, env-gated (QSB_SEARCH_PERF / QSB_SEARCH_ALLOC
+# / QSB_INDEX_ALLOC) so a bare `cargo bench` doesn't pay their seed cost.
+# snippet_perf, which compared the pre-schema-v3 FTS shape against v3, is
+# gone: the question is decided (v3 won on every axis) — don't re-measure it.
 [[bench]]
 name = "search_perf"
 harness = false
 
 [[bench]]
 name = "search_alloc"
+harness = false
+
+# Per-file allocator traffic through the walk and the extractors. Compiles
+# `tests/corpus/` for its fixtures, so it needs the dev-dependency writers.
+[[bench]]
+name = "index_alloc"
+harness = false
+
+# QSB_PGSZ: the speed half of the page-geometry question that
+# `tests/encrypted_perf.rs` gates the size half of. Sweeps database page size
+# against FTS5's record size over corpora up to 1M files, so it is opt-in like
+# the two above — and wants TMPDIR pointed at real storage, not tmpfs.
+[[bench]]
+name = "page_geometry"
+harness = false
+
+# QSB_HMAC: prices SQLCipher's per-page authenticator (off / SHA-256 / SHA-512)
+# against a plain index, and is what `db::schema::HMAC_MODE` is set from. Same
+# corpora and same seed cost as page_geometry, so it is opt-in for the same
+# reason.
+[[bench]]
+name = "cipher_hmac"
 harness = false

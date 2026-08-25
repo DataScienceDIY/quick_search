@@ -171,13 +171,16 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
             )
             .unwrap()
             .expect("unique path");
-            ready.push(ExtractedRow {
+            ready.push(ExtractedRow::new(
                 file_id,
-                name: format!("f{}.txt", i),
-                outcome: ContentOutcome::Done {
+                crate::db::repo::RowPath::new(
+                    &crate::file_handling::dir_to_db_parent(&tree),
+                    &format!("f{}.txt", i),
+                ),
+                ContentOutcome::Done {
                     text: format!("sphinx of black quartz {}", i),
                 },
-            });
+            ));
         }
         tx.commit().unwrap();
     }
@@ -224,7 +227,13 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
         totals: None,
         current_file: None,
     };
-    let mut cx = RunCx::new(conn_mutex.clone(), &config, &db_path, &stop);
+    let mut cx = RunCx::new(
+        conn_mutex.clone(),
+        &config,
+        &db_path,
+        &stop,
+        Arc::new(Mutex::new(IndexingStatus::Idle)),
+    );
     cx.slice = Duration::ZERO;
 
     let mut turns = 0;
@@ -276,8 +285,23 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
 }
 
 fn run_with(config: &Config, db_path: &str, stop: &Arc<AtomicBool>) -> Result<(), String> {
-    IndexingService::run_indexing(
+    run_indexing_with(
+        config,
+        db_path,
+        stop,
         &Arc::new(Mutex::new(IndexingStatus::Idle)),
+    )
+}
+
+/// [`run_with`] for the tests that read the status the run leaves behind.
+fn run_indexing_with(
+    config: &Config,
+    db_path: &str,
+    stop: &Arc<AtomicBool>,
+    status: &Arc<Mutex<IndexingStatus>>,
+) -> Result<(), String> {
+    IndexingService::run_indexing(
+        status,
         &config.paths.indexing_paths,
         db_path,
         stop,
@@ -468,6 +492,102 @@ fn an_interrupted_reconcile_records_nothing() {
         outstanding_work(&db_path, &narrowed).is_empty(),
         "a completed run leaves nothing to reconcile"
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A context with no run behind it: `maintaining` only ever touches the
+/// status, never the database.
+fn cx_for<'a>(
+    config: &'a Config,
+    stop: &'a Arc<AtomicBool>,
+    status: &Arc<Mutex<IndexingStatus>>,
+) -> pipeline::RunCx<'a> {
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory database");
+    pipeline::RunCx::new(
+        Arc::new(Mutex::new(conn)),
+        config,
+        "/nowhere",
+        stop,
+        status.clone(),
+    )
+}
+
+fn running_status(maintenance: Option<MaintenanceStep>) -> Arc<Mutex<IndexingStatus>> {
+    Arc::new(Mutex::new(IndexingStatus::Running {
+        start_time: Instant::now(),
+        roots: vec![progress(RootPhase::Extracting, 100, None)],
+        maintenance,
+    }))
+}
+
+/// The counters freeze for the length of the step either way; the only
+/// question is whether the status says so.
+#[test]
+fn an_upkeep_step_is_published_for_exactly_as_long_as_it_runs() {
+    let config = Config::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let status = running_status(None);
+    let cx = cx_for(&config, &stop, &status);
+
+    let guard = cx.maintaining(MaintenanceStep::Checkpoint);
+    match &*crate::lock_ok(&status) {
+        IndexingStatus::Running {
+            roots, maintenance, ..
+        } => {
+            assert_eq!(*maintenance, Some(MaintenanceStep::Checkpoint));
+            assert_eq!(roots.len(), 1, "the published snapshot was replaced");
+            assert_eq!(roots[0].walked, 100, "the counters were rewritten");
+        }
+        other => panic!("the run went missing: {:?}", other),
+    }
+
+    drop(guard);
+    match &*crate::lock_ok(&status) {
+        IndexingStatus::Running {
+            roots, maintenance, ..
+        } => {
+            assert_eq!(*maintenance, None, "the step outlived its work");
+            assert_eq!(
+                roots[0].walked, 100,
+                "the roots went missing on the way out"
+            );
+        }
+        other => panic!("the run went missing: {:?}", other),
+    };
+}
+
+/// The command thread owns the `Stopping` transition — the rule
+/// `publish_status` has always kept, and an upkeep step is no exception:
+/// neither end of it may resurrect a run that has been told to stop.
+#[test]
+fn an_upkeep_step_never_clobbers_a_stop() {
+    let config = Config::default();
+    let stop = Arc::new(AtomicBool::new(false));
+    let status = Arc::new(Mutex::new(IndexingStatus::Stopping));
+    let cx = cx_for(&config, &stop, &status);
+
+    let guard = cx.maintaining(MaintenanceStep::MergingText);
+    assert!(matches!(*crate::lock_ok(&status), IndexingStatus::Stopping));
+    drop(guard);
+    assert!(matches!(*crate::lock_ok(&status), IndexingStatus::Stopping));
+}
+
+/// A fresh snapshot means the writer is back on files; a step that ended
+/// while the round was mid-flight must not linger on it.
+#[test]
+fn a_status_publish_clears_the_step() {
+    let dir = tmp_dir("publish-clears-step");
+    let db_path = dir.join("index.db").to_string_lossy().into_owned();
+    let config = config_with(vec![dir.to_string_lossy().into_owned()], &[]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let status = running_status(Some(MaintenanceStep::RootCounts));
+
+    run_indexing_with(&config, &db_path, &stop, &status).expect("indexed");
+    match &*crate::lock_ok(&status) {
+        IndexingStatus::Running { maintenance, .. } => assert_eq!(*maintenance, None),
+        other => panic!("the run went missing: {:?}", other),
+    };
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -7,8 +7,9 @@ use std::path::Path;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use super::schema::{
-    effective_tokenizer, fts_create_sql, PRAGMAS_FAST, PRAGMAS_INCREMENTAL, PRAGMAS_MAINTENANCE,
-    PRAGMAS_READONLY, PRAGMAS_SEARCH, PRAGMAS_WALK_READER, SCHEMA_CURRENT,
+    effective_tokenizer, fts_create_sql, fts_set_pgsz, pragmas_search,
+    recommended_search_cache_mib, Profile, PRAGMAS_FAST, PRAGMAS_INCREMENTAL, PRAGMAS_MAINTENANCE,
+    PRAGMAS_READONLY, PRAGMAS_WALK_READER, SCHEMA_CURRENT,
 };
 use crate::security::IndexKey;
 
@@ -20,7 +21,16 @@ pub const KEY_MISMATCH_PREFIX: &str = "KEY_MISMATCH: ";
 /// Bump on any schema change — and on classifier changes: `files.mime`,
 /// `files.type` and `content_state` are computed at walk time and never
 /// re-derived for unchanged files, so only the wipe applies them everywhere.
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+///
+/// v11 is a cipher-profile change, not a table change: [`schema::HMAC_MODE`]
+/// became `Off`, which moves the page reserve and with it FTS5's record size.
+/// A *keyed* index would have been condemned anyway — the profile retry in
+/// [`open_probed`] is what spots it, since the version cannot be read off a
+/// file that will not decrypt — so this bump is what brings **unprotected**
+/// indexes along, on the release boundary rather than piecemeal.
+///
+/// [`schema::HMAC_MODE`]: super::schema::HMAC_MODE
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
 
 /// Open `db_path`; on any schema/tokenizer mismatch, delete the file and
 /// recreate it empty — callers will need to re-index.
@@ -40,28 +50,89 @@ pub(crate) fn open_or_recreate_keyed(
                 .map_err(|e| format!("Failed to create database dir {}: {}", dir.display(), e))?;
         }
     }
-    let conn = Connection::open(db_path)
-        .map_err(|e| format!("Failed to open database at {}: {}", db_path, e))?;
-    // Before a single row is written: SQLite creates the file 0644 (inherited
-    // by `-wal`/`-shm`), and the index holds the full text of files whose own
-    // permissions are 0600.
-    crate::platform::restrict_to_owner(&path);
-    key_and_probe(&conn, db_path, key)?;
+    let want = super::key::current_profile();
+    let (conn, matched) = open_probed(db_path, key, want, |p| {
+        let conn =
+            Connection::open(p).map_err(|e| format!("Failed to open database at {}: {}", p, e))?;
+        // Before a single row is written: SQLite creates the file 0644
+        // (inherited by `-wal`/`-shm`), and the index holds the full text of
+        // files whose own permissions are 0600.
+        crate::platform::restrict_to_owner(Path::new(p));
+        Ok(conn)
+    })?;
     conn.execute_batch(PRAGMAS_FAST)
         .map_err(|e| format!("Failed to apply pragmas: {}", e))?;
 
-    if db_matches_current(&conn, tokenizer)? {
-        return Ok(conn);
+    match matched {
+        // The profile is fixed for a file's life — neither the page size nor
+        // the page reserve can be changed in place — so a file that only
+        // opened under an older one has to be rebuilt whatever its schema says.
+        ProfileMatch::Previous(found) => crate::log_warn!(
+            "database at {} was built with {} and this build uses {}; \
+             rebuilding. Existing rows will be re-scanned on next indexing run.",
+            db_path,
+            found,
+            want
+        ),
+        ProfileMatch::Current => {
+            if db_matches_current(&conn, tokenizer)? {
+                return Ok(conn);
+            }
+            crate::log_warn!(
+                "database at {} does not match current schema; rebuilding. \
+                 Existing rows will be re-scanned on next indexing run.",
+                db_path
+            );
+        }
     }
-
-    crate::log_warn!(
-        "database at {} does not match current schema; rebuilding. \
-         Existing rows will be re-scanned on next indexing run.",
-        db_path
-    );
-    let conn = wipe_and_reopen(conn, &path, key)?;
-    apply_current_schema(&conn, tokenizer)?;
+    let conn = wipe_and_reopen(conn, &path, key, want)?;
+    apply_current_schema(&conn, tokenizer, key, want)?;
     Ok(conn)
+}
+
+/// Which layout the file on disk answered to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileMatch {
+    Current,
+    /// Opened only under this [`super::schema::PROFILES_PREVIOUS`] entry.
+    Previous(Profile),
+}
+
+/// Open through `make`, apply the key and `profile`, and probe. On a keyed
+/// file that will not decrypt, retry under each [`PROFILES_PREVIOUS`] entry
+/// before giving up — a profile change is otherwise indistinguishable from a
+/// wrong password, and answering it with "wrong password" would be a lie the
+/// user cannot act on.
+fn open_probed(
+    db_path: &str,
+    key: Option<&IndexKey>,
+    profile: Profile,
+    make: impl Fn(&str) -> Result<Connection, String>,
+) -> Result<(Connection, ProfileMatch), String> {
+    let conn = make(db_path)?;
+    let failure = match key_and_probe(&conn, db_path, key, profile) {
+        Ok(()) => return Ok((conn, ProfileMatch::Current)),
+        Err(e) => e,
+    };
+    // Only a profile mismatch is worth retrying, and only when a key is what
+    // makes the layout undiscoverable. An unencrypted file reports its own
+    // page size and has no reserve, so a failure there is a real one.
+    if key.is_none() || !failure.starts_with(KEY_MISMATCH_PREFIX) {
+        return Err(failure);
+    }
+    for previous in super::schema::PROFILES_PREVIOUS {
+        if *previous == profile {
+            continue;
+        }
+        // A fresh connection: after a failed decrypt the pager has already
+        // formed an opinion about the file, and both `cipher_page_size` and
+        // the HMAC pragmas are only honoured before the first read.
+        let retry = make(db_path)?;
+        if key_and_probe(&retry, db_path, key, *previous).is_ok() {
+            return Ok((retry, ProfileMatch::Previous(*previous)));
+        }
+    }
+    Err(failure)
 }
 
 /// Open an *existing* index: any schema mismatch is an error instead of a
@@ -81,8 +152,25 @@ pub fn open_walk_reader(db_path: &str) -> Result<Connection, String> {
 }
 
 /// The search worker's connection, held across requests.
+///
+/// The only profile whose cache ceiling is not a constant: it has to hold the
+/// `files` table, which every keystroke rescans, and that scales with the
+/// index. The order matters — the connection is opened on the read-only
+/// profile, the ceiling is worked out *from* it, and only then is the search
+/// profile applied over the top. `PRAGMA cache_size` is settable at any time,
+/// so the brief moment on the smaller ceiling costs one `sqlite_stat1` read.
 pub fn open_search_reader(db_path: &str) -> Result<Connection, String> {
-    open_profiled(db_path, false, PRAGMAS_SEARCH)
+    let conn = open_profiled(db_path, false, PRAGMAS_READONLY)?;
+    let cache_mib = super::key::search_cache_override().unwrap_or_else(|| {
+        // No stats yet means a fresh or never-optimised index; the floor is
+        // right for one, and `repo::maintain` will have run by the time an
+        // index is large enough for it to be wrong.
+        let files = super::repo::analyzed_file_count(&conn).unwrap_or(0);
+        recommended_search_cache_mib(files, super::key::process_key().is_some())
+    });
+    conn.execute_batch(&pragmas_search(cache_mib))
+        .map_err(|e| format!("Failed to apply search pragmas: {}", e))?;
+    Ok(conn)
 }
 
 /// The coordinator's write connection for watcher events and reconciles.
@@ -121,13 +209,24 @@ fn open_keyed_with_pragmas(
         } else {
             OpenFlags::SQLITE_OPEN_READ_ONLY
         };
-    let conn = Connection::open_with_flags(db_path, flags)
-        .map_err(|e| format!("Failed to open database at {}: {}", db_path, e))?;
-    key_and_probe(&conn, db_path, key)?;
+    let (conn, matched) = open_probed(db_path, key, super::key::current_profile(), |p| {
+        Connection::open_with_flags(p, flags)
+            .map_err(|e| format!("Failed to open database at {}: {}", p, e))
+    })?;
     conn.execute_batch(pragmas)
         .map_err(|e| format!("Failed to apply pragmas: {}", e))?;
 
-    if !schema_version_current(&conn)? {
+    // A file that answered only to a previous profile is one `open_or_recreate`
+    // is about to wipe, so a consumer must be turned away now. The version
+    // check beside it is not enough on its own, and the independence is the
+    // point: nothing forces a profile change to come with a schema bump, and
+    // an unbumped one would leave this reading a file back perfectly while the
+    // indexer replaces the inode under it. Both conditions, so neither has to
+    // be remembered.
+    //
+    // The refusal is deliberately the re-index one and not
+    // [`KEY_MISMATCH_PREFIX`]: the password was right.
+    if !schema_version_current(&conn)? || matched != ProfileMatch::Current {
         return Err(format!(
             "index at {} is not a compatible QuickSearch index (schema v{} expected); \
              refusing to modify it. Re-index to rebuild.",
@@ -148,14 +247,25 @@ pub fn verify_process_key(db_path: &str) -> Result<(), String> {
 /// `false` for anything this cannot positively establish: announcing a reset
 /// that is not happening would be worse than saying nothing.
 pub fn index_needs_rebuild(db_path: &str) -> bool {
-    let Ok(conn) = Connection::open_with_flags(
+    let opened = open_probed(
         db_path,
-        OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) else {
+        super::key::process_key().as_ref(),
+        super::key::current_profile(),
+        |p| {
+            Connection::open_with_flags(
+                p,
+                OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .map_err(|e| format!("Failed to open database at {}: {}", p, e))
+        },
+    );
+    let Ok((conn, matched)) = opened else {
         return false;
     };
-    if key_and_probe(&conn, db_path, super::key::process_key().as_ref()).is_err() {
-        return false;
+    // A file under an older profile is certain to be rebuilt: neither the page
+    // size nor the page reserve can be changed in place.
+    if matched != ProfileMatch::Current {
+        return true;
     }
     // Only `Ok(false)`: an `Err` means we could not tell.
     matches!(schema_version_current(&conn), Ok(false))
@@ -164,31 +274,88 @@ pub fn index_needs_rebuild(db_path: &str) -> bool {
 pub(crate) fn verify_key(db_path: &str, key: Option<&IndexKey>) -> Result<(), String> {
     // Read-only and no CREATE: verifying a key must never bring a database
     // into existence, and must never modify one.
-    let conn = Connection::open_with_flags(
-        db_path,
-        OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| format!("Failed to open database at {}: {}", db_path, e))?;
-    key_and_probe(&conn, db_path, key)
+    //
+    // The profile is discarded: this answers the *key* question, and a key
+    // that opens the file under an older profile is the right key. Telling a
+    // user their password is wrong because their index predates a page-size or
+    // HMAC change would be the worst answer available.
+    open_probed(db_path, key, super::key::current_profile(), |p| {
+        Connection::open_with_flags(
+            p,
+            OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .map_err(|e| format!("Failed to open database at {}: {}", p, e))
+    })
+    .map(|_| ())
 }
 
-/// Apply the SQLCipher key (if any) and force the first page off disk.
+/// SQLCipher keeps its `cipher_default_*` settings in process-wide statics,
+/// and [`key_and_probe`] has to write them to select an [`HmacMode`]. This
+/// covers the window between writing them and the `PRAGMA key` that consumes
+/// them, so two threads opening under different profiles cannot interleave.
 ///
-/// Ordering is load-bearing twice over: SQLCipher requires `PRAGMA key`
-/// before anything else touches the file, and the probe must run before any
-/// schema comparison so a wrong key surfaces as [`KEY_MISMATCH_PREFIX`] —
-/// never as a "schema mismatch" that [`open_or_recreate`] answers by wiping.
-/// The raw-key `x'…'` form bypasses SQLCipher's per-connection PBKDF2.
-fn key_and_probe(conn: &Connection, db_path: &str, key: Option<&IndexKey>) -> Result<(), String> {
+/// Held for the length of one pragma batch and never across a query, so it
+/// costs a connection setup, not a search.
+static CIPHER_DEFAULTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Apply the SQLCipher key (if any) and the profile, then force the first
+/// page off disk.
+///
+/// Ordering is load-bearing four times over: the HMAC mode has to be chosen
+/// *before* `PRAGMA key`, `PRAGMA key` has to precede anything else that
+/// touches the file, `cipher_page_size` has to follow the key and precede the
+/// first read, and the probe must run before any schema comparison so a wrong
+/// key surfaces as [`KEY_MISMATCH_PREFIX`] — never as a "schema mismatch" that
+/// [`open_or_recreate`] answers by wiping. The raw-key `x'…'` form bypasses
+/// SQLCipher's per-connection PBKDF2.
+///
+/// # Why the HMAC mode goes first, as a *default*
+///
+/// The obvious spelling — `PRAGMA cipher_use_hmac = OFF` after the key — is
+/// silently ignored. `sqlite3BtreeSetPageSize` will only ever *raise* a page
+/// reserve (`if( nReserve<x ) nReserve = x;`), and `PRAGMA key` has already
+/// installed SQLCipher's default 80 bytes by the time any per-connection
+/// cipher pragma can run. The pragma sets the flag, `PRAGMA cipher_settings`
+/// reports the new mode, and the reserve stays where it was — which shows up
+/// not as an error but as FTS5 leaves overflowing against a limit 64 bytes
+/// smaller than the one they were built for.
+///
+/// SQLCipher's own route is `cipher_default_use_hmac` /
+/// `cipher_default_hmac_algorithm`, which `sqlcipher_codec_ctx_init` reads
+/// when it builds the codec — before the btree is sized. They are global, so
+/// [`CIPHER_DEFAULTS`] serialises them against the key that consumes them.
+///
+/// # Why on every open
+///
+/// The profile is applied on *every* open, not just creating ones: a keyed
+/// file's header is ciphertext, so SQLCipher has to be told the page size and
+/// the HMAC mode — which sets the page reserve — before it can read the file
+/// at all. Unencrypted, `PRAGMA page_size` sets the size for a file about to
+/// be created and is ignored for one that exists, and there is no reserve for
+/// the HMAC mode to decide.
+fn key_and_probe(
+    conn: &Connection,
+    db_path: &str,
+    key: Option<&IndexKey>,
+    profile: Profile,
+) -> Result<(), String> {
     if let Some(key) = key {
         // `cipher_log_level = NONE` mutes SQLCipher's stderr HMAC trace on
         // wrong-password attempts; it must follow `PRAGMA key`, which has to
-        // be the first statement on the connection.
-        conn.execute_batch(&format!(
-            "PRAGMA key = \"x'{}'\"; PRAGMA cipher_log_level = NONE;",
-            key.to_hex()
-        ))
-        .map_err(|e| format!("Failed to apply encryption key: {}", e))?;
+        // be the first statement to touch the file.
+        let guard = crate::lock_ok(&CIPHER_DEFAULTS);
+        let applied = conn.execute_batch(&format!(
+            "{} PRAGMA key = \"x'{}'\"; PRAGMA cipher_log_level = NONE; \
+             PRAGMA cipher_page_size = {};",
+            profile.hmac.default_pragmas(),
+            key.to_hex(),
+            profile.page_size
+        ));
+        drop(guard);
+        applied.map_err(|e| format!("Failed to apply encryption key: {}", e))?;
+    } else {
+        conn.execute_batch(&format!("PRAGMA page_size = {};", profile.page_size))
+            .map_err(|e| format!("Failed to apply page size: {}", e))?;
     }
     match conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
         r.get::<_, i64>(0)
@@ -402,13 +569,16 @@ fn db_matches_current(conn: &Connection, tokenizer: &str) -> Result<bool, String
     Ok(stored_tokenize.as_deref() == Some(&*want_tokenize))
 }
 
-/// Delete the DB file + sidecars, reopen a fresh file, re-apply key and
-/// pragmas. Re-keying here is essential: a rebuild of a protected index must
-/// come back encrypted, never silently plaintext.
+/// Delete the DB file + sidecars, reopen a fresh file, re-apply key, profile
+/// and pragmas. Re-keying here is essential: a rebuild of a protected index
+/// must come back encrypted, never silently plaintext. `profile` is the
+/// *current* one even when the file being replaced answered to an older —
+/// adopting the new layout is the point of the rebuild.
 fn wipe_and_reopen(
     conn: Connection,
     path: &Path,
     key: Option<&IndexKey>,
+    profile: Profile,
 ) -> Result<Connection, String> {
     drop(conn);
     // Before the delete, even if the removal fails partway.
@@ -438,18 +608,30 @@ fn wipe_and_reopen(
     let conn = Connection::open(path)
         .map_err(|e| format!("Failed to reopen database after rebuild: {}", e))?;
     crate::platform::restrict_to_owner(path);
-    key_and_probe(&conn, &path.to_string_lossy(), key)?;
+    key_and_probe(&conn, &path.to_string_lossy(), key, profile)?;
     conn.execute_batch(PRAGMAS_FAST)
         .map_err(|e| format!("Failed to apply pragmas after rebuild: {}", e))?;
     Ok(conn)
 }
 
-fn apply_current_schema(conn: &Connection, tokenizer: &str) -> Result<(), String> {
+fn apply_current_schema(
+    conn: &Connection,
+    tokenizer: &str,
+    key: Option<&IndexKey>,
+    profile: Profile,
+) -> Result<(), String> {
     conn.execute_batch(SCHEMA_CURRENT)
         .map_err(|e| format!("Failed to create current schema tables: {}", e))?;
     let fts = fts_create_sql(tokenizer);
     conn.execute_batch(&fts)
         .map_err(|e| format!("Failed to create searchabletext: {}", e))?;
+    // Only here: FTS5's leaf size has to suit the page size and the reserve
+    // this file was built with. Deciding it once at creation is sound because
+    // the profile is fixed for the file's life — toggling password protection
+    // always wipes and rebuilds, so the stored geometry cannot outlive its key
+    // state.
+    fts_set_pgsz(conn, profile, key.is_some())
+        .map_err(|e| format!("Failed to set searchabletext pgsz: {}", e))?;
 
     let now = crate::log::now_unix();
     let effective = effective_tokenizer(tokenizer);

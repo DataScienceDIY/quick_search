@@ -342,7 +342,15 @@ enum Known<'a> {
 /// At most one `stat`, then classify; only files that will be written get
 /// opened, and small text files are finished outright. "At most": on Windows
 /// [`PendingFile::cached`] may already hold the answer.
-fn prepare(file: PendingFile, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
+///
+/// `scratch` is this worker's, carrying the head buffer every hash and MIME
+/// sniff reads into.
+fn prepare(
+    file: PendingFile,
+    known: Known<'_>,
+    ctx: &Ctx,
+    scratch: &mut crate::extract::Scratch,
+) -> WalkedFile {
     let PendingFile { path, cached } = file;
     // Every route here has already screened the path for UTF-8:
     // `path_to_db_string` is lossy, and a lossy string would key another
@@ -386,7 +394,7 @@ fn prepare(file: PendingFile, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
         FileIndexAction::Skip => None,
         // `prepare_file_record` gates on `is_file()`, which keeps us from
         // opening a FIFO — an uninterruptible forever-block.
-        _ => prepare_file_record(&db_path, &meta, &ctx.config, &ctx.registry),
+        _ => prepare_file_record(&db_path, &meta, &ctx.config, &ctx.registry, scratch),
     };
 
     WalkedFile {
@@ -398,6 +406,10 @@ fn prepare(file: PendingFile, known: Known<'_>, ctx: &Ctx) -> WalkedFile {
 }
 
 fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
+    // One per worker, for the whole walk: the head buffer inside it is what
+    // every file's hash and MIME sniff reads into, and a fresh one per file
+    // was an allocation per file.
+    let mut scratch = crate::extract::Scratch::new(&ctx.config);
     while let Some((job, slot)) = shared.take() {
         let _busy = shared.stats.enter();
         if ctx.stop_flag.load(Ordering::Relaxed) {
@@ -417,7 +429,12 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
                 slot.finish(found);
                 let file = PendingFile::uncached(path);
                 if tx
-                    .send(WalkEvent::File(prepare(file, Known::Exact(stored), ctx)))
+                    .send(WalkEvent::File(prepare(
+                        file,
+                        Known::Exact(stored),
+                        ctx,
+                        &mut scratch,
+                    )))
                     .is_err()
                 {
                     shared.shutdown();
@@ -442,7 +459,12 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
                 return;
             }
             if tx
-                .send(WalkEvent::File(prepare(file, Known::InDir(&rows), ctx)))
+                .send(WalkEvent::File(prepare(
+                    file,
+                    Known::InDir(&rows),
+                    ctx,
+                    &mut scratch,
+                )))
                 .is_err()
             {
                 // Receiver gone: the run was stopped or failed. Not an error.

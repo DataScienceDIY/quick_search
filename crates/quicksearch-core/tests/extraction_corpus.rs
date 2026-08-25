@@ -59,13 +59,13 @@ fn every_format_extracts_its_planted_text() {
         let mime = mime::guess_mime_from_head(&sample.path, &head)
             .unwrap_or_else(|| panic!("{} no MIME resolved", ctx(sample)));
         assert!(
-            registry.supports(&mime),
+            registry.supports(mime),
             "{} MIME {mime:?} is claimed by no extractor",
             ctx(sample)
         );
 
         let content = registry
-            .extract(&sample.path, &mime)
+            .extract_to_string(&sample.path, mime, &Config::default())
             .unwrap_or_else(|e| panic!("{} extraction failed: {e}", ctx(sample)))
             .unwrap_or_else(|| panic!("{} MIME {mime:?} dispatched nowhere", ctx(sample)));
 
@@ -92,7 +92,7 @@ fn head_extraction_agrees_with_reading_the_file() {
         let head = head_of(&sample.path);
         let mime = mime::guess_mime_from_head(&sample.path, &head).expect("MIME");
         let whole = std::fs::read(&sample.path).expect("read whole file");
-        let from_head = registry.extract_complete_head(&sample.path, &mime, &whole);
+        let from_head = registry.extract_head_to_string(&sample.path, mime, &whole);
 
         if !sample.head_path {
             // A format that seeks or reads a trailer must never be handed a
@@ -110,7 +110,7 @@ fn head_extraction_agrees_with_reading_the_file() {
             .unwrap_or_else(|| panic!("{} declined the head path", ctx(sample)))
             .unwrap_or_else(|e| panic!("{} head extraction failed: {e}", ctx(sample)));
         let from_disk = registry
-            .extract(&sample.path, &mime)
+            .extract_to_string(&sample.path, mime, &Config::default())
             .expect("on-disk extraction")
             .expect("claimed");
 
@@ -214,13 +214,14 @@ fn search(conn: &rusqlite::Connection, term: &str) -> Vec<String> {
 #[test]
 fn rtf_unicode_escapes_survive_extraction() {
     let dir = quicksearch_core::testutil::scratch_dir("rtf-escapes");
+    let registry = Registry::default_set();
     let extract = |name: &str, body: &str| {
-        use quicksearch_core::extract::Extractor;
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
-        quicksearch_core::extract::rtf::RtfExtractor
-            .extract(&path)
+        registry
+            .extract_to_string(&path, "application/rtf", &Config::default())
             .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .unwrap_or_else(|| panic!("{name}: rtf dispatched nowhere"))
     };
 
     // Both halves matter: the escape survives, and so does the word.

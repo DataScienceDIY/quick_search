@@ -9,7 +9,7 @@ use lofty::{
     tag::{Accessor, ItemKey},
 };
 
-use super::{ExtractError, Extractor};
+use super::{ExtractError, Extractor, Scratch};
 
 pub struct AudioExtractor;
 
@@ -18,49 +18,66 @@ impl Extractor for AudioExtractor {
         mime.starts_with("audio/")
     }
 
-    fn extract(&self, path: &Path) -> Result<String, ExtractError> {
+    fn extract(
+        &self,
+        path: &Path,
+        out: &mut String,
+        _scratch: &mut Scratch,
+    ) -> Result<(), ExtractError> {
         let tagged = Probe::open(path)
             .map_err(|e| format!("lofty probe {}: {}", path.display(), e))?
             .read()
             .map_err(|e| format!("lofty read {}: {}", path.display(), e))?;
 
-        let mut pieces: Vec<String> = Vec::new();
+        // Straight into the caller's buffer: the fields are short and few,
+        // and a `Vec<String>` then `join` allocated every piece twice over.
         if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
-            let mut push = |value: Option<String>| {
-                if let Some(v) = value.filter(|v: &String| !v.is_empty()) {
-                    pieces.push(v);
+            // The `Accessor` shortcuts hand back a `Cow`, so their fallbacks
+            // are bound here rather than inside an `or_else` that would let
+            // the temporary die before it is read.
+            let (title, artist, album) = (tag.title(), tag.artist(), tag.album());
+            let mut push = |value: Option<&str>| {
+                if let Some(v) = value.filter(|v: &&str| !v.is_empty()) {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(v);
                 }
             };
             // A tag can carry a value under `ItemKey` or the `Accessor` shortcut.
             push(
                 tag.get_string(&ItemKey::TrackTitle)
                     .filter(|v| !v.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| tag.title().map(|t| t.to_string())),
+                    .or(title.as_deref()),
             );
             push(
                 tag.get_string(&ItemKey::TrackArtist)
                     .filter(|v| !v.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| tag.artist().map(|a| a.to_string())),
+                    .or(artist.as_deref()),
             );
             push(
                 tag.get_string(&ItemKey::AlbumTitle)
                     .filter(|v| !v.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| tag.album().map(|a| a.to_string())),
+                    .or(album.as_deref()),
             );
-            push(tag.get_string(&ItemKey::Genre).map(str::to_string));
-            push(tag.get_string(&ItemKey::Comment).map(str::to_string));
+            push(tag.get_string(&ItemKey::Genre));
+            push(tag.get_string(&ItemKey::Comment));
         }
 
-        Ok(pieces.join(" "))
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one-file form: these assert on text, not on buffer reuse.
+    fn extract(path: &std::path::Path) -> Result<String, ExtractError> {
+        let mut out = String::new();
+        let mut scratch = Scratch::new(&crate::config::Config::default());
+        AudioExtractor.extract(path, &mut out, &mut scratch).map(|()| out)
+    }
 
     /// An ID3v2.3 tag carrying `frames`, then silent MPEG frames so the probe
     /// recognizes the format from content.
@@ -112,7 +129,7 @@ mod tests {
                 ("TCON", "Synthpop"),
             ],
         );
-        let out = AudioExtractor.extract(&path).expect("extract");
+        let out = extract(&path).expect("extract");
         for expected in ["Blue Monday", "New Order", "Power Corruption", "Synthpop"] {
             assert!(
                 out.contains(expected),
@@ -127,7 +144,7 @@ mod tests {
     #[test]
     fn an_untagged_file_yields_empty_text() {
         let path = write_mp3("audio-untagged", &[]);
-        let out = AudioExtractor.extract(&path).expect("extract");
+        let out = extract(&path).expect("extract");
         assert!(out.is_empty(), "unexpected text {:?}", out);
     }
 

@@ -14,7 +14,11 @@
 //! QSB_SEARCH_ALLOC=1 cargo bench -p quicksearch-core --bench search_alloc
 //! ```
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
+
+// What `Counting` wraps: the allocator the shipped binaries install, or the
+// figures describe a build nobody runs. See `platform::Allocator`.
+use quicksearch_core::platform::Allocator as Inner;
 use std::cell::Cell;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
@@ -83,7 +87,7 @@ fn note_peak(live: i64) {
     PEAK.try_with(|p| p.set(p.get().max(live))).ok();
 }
 
-/// `System`, with counters; a failed allocation is not counted, so the
+/// [`Inner`], with counters; a failed allocation is not counted, so the
 /// totals describe memory that really existed.
 struct Counting;
 
@@ -96,7 +100,7 @@ fn note_alloc(size: usize) {
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc(layout) };
+        let p = unsafe { Inner.alloc(layout) };
         if !p.is_null() {
             note_alloc(layout.size());
         }
@@ -104,7 +108,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc_zeroed(layout) };
+        let p = unsafe { Inner.alloc_zeroed(layout) };
         if !p.is_null() {
             note_alloc(layout.size());
         }
@@ -114,13 +118,13 @@ unsafe impl GlobalAlloc for Counting {
     /// Cross-thread frees drive this negative; see the `thread_local!` note.
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         bump_live(-(layout.size() as i64));
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { Inner.dealloc(ptr, layout) }
     }
 
     /// Counted as a resize: a doubling `Vec` is one buffer, not twelve — the
     /// difference this harness exists to show. Only growth adds to traffic.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        let p = unsafe { Inner.realloc(ptr, layout, new_size) };
         if !p.is_null() {
             bump(&REALLOCS, 1);
             let (old, new) = (layout.size() as u64, new_size as u64);
@@ -322,8 +326,8 @@ fn allocation_traffic_per_query() {
         .expect("open the seeded index");
 
     println!(
-        "{:<16} {:>12} {:>10} {:>12} {:>12} {:>7} {:>9}   {}",
-        "case", "allocs", "reallocs", "bytes (MiB)", "peak (MiB)", "hits", "time", "passes"
+        "{:<16} {:>12} {:>10} {:>12} {:>12} {:>7} {:>9}   passes",
+        "case", "allocs", "reallocs", "bytes (MiB)", "peak (MiB)", "hits", "time"
     );
     for case in CASES {
         // Warm once, then measure: a cold first query would report SQLite's
@@ -355,6 +359,10 @@ fn allocation_traffic_per_query() {
 fn the_counters_track_real_allocations() {
     let start = Counters::start();
     let mut v: Vec<u8> = Vec::new();
+    // `push` in a loop on purpose: the growth is what is being measured, and
+    // the `resize`/`vec![0; n]` clippy asks for would allocate once with no
+    // reallocs at all, so the assertion below could never fail.
+    #[allow(clippy::same_item_push)]
     for _ in 0..64 * 1024 {
         v.push(0);
     }

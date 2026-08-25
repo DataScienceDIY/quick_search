@@ -72,10 +72,15 @@ fn running_state(roots: &[&str], current_file: Option<&str>) -> IndexerState {
 }
 
 fn state_with(roots: Vec<RootProgress>) -> IndexerState {
+    maintaining_state(roots, None)
+}
+
+fn maintaining_state(roots: Vec<RootProgress>, step: Option<MaintenanceStep>) -> IndexerState {
     IndexerState {
         activity: IndexingStatus::Running {
             start_time: std::time::Instant::now(),
             roots,
+            maintenance: step,
         },
         ..idle_state()
     }
@@ -433,8 +438,87 @@ fn every_phase_word_is_painted_in_its_hint_color() {
             let spans = frame_spans(&ctx, &mut tab, &state);
             let hint = spans.iter().find(|(text, _)| text == word).map(|(_, c)| *c);
             assert_eq!(hint, Some(want), "{:?}: {:?} in {:?}", theme, word, spans);
+
+            // Upkeep blocks the writer whatever the root was doing, so it
+            // replaces the phase word rather than sitting beside it.
+            let state = maintaining_state(
+                vec![root_progress(phase, 100, Some(1000))],
+                Some(MaintenanceStep::Checkpoint),
+            );
+            let spans = frame_spans(&ctx, &mut tab, &state);
+            let painted = |want: &str| spans.iter().find(|(t, _)| t == want).map(|(_, c)| *c);
+            assert_eq!(
+                painted("maintenance"),
+                Some(colors.orange),
+                "{:?}: {:?}",
+                theme,
+                spans
+            );
+            assert_eq!(
+                painted(word),
+                None,
+                "{:?}: {:?} survived: {:?}",
+                theme,
+                word,
+                spans
+            );
         }
     }
+}
+
+/// Run-wide state: said once, however many roots are on screen. And said
+/// *alongside* the per-root file hints rather than instead of them.
+///
+/// The hint count is the assertion that matters. A checkpoint fires every few
+/// seconds on a large index, so a line that disappears per root and comes back
+/// reflowed the whole block on a loop. Keeping it costs a moment of staleness
+/// (it names the last file written, not one in flight) and buys a row that
+/// holds its height.
+#[test]
+fn an_upkeep_step_names_itself_once_and_keeps_the_file_hints() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = ManageTab::new();
+
+    let with_file = |root: &str| RootProgress {
+        root: root.to_string(),
+        current_file: Some("/data/a-file-that-already-landed.txt".to_string()),
+        ..root_progress(RootPhase::Extracting, 100, Some(1000))
+    };
+    let roots = vec![with_file("/data"), with_file("/media")];
+    let hints = |drawn: &[String]| {
+        drawn
+            .iter()
+            .filter(|t| t.contains("a-file-that-already-landed.txt"))
+            .count()
+    };
+
+    let running = frame_text(&ctx, &mut tab, &state_with(roots.clone()));
+    assert_eq!(
+        hints(&running),
+        2,
+        "the per-root file hint is drawn while files are moving: {:?}",
+        running
+    );
+
+    let text = frame_text(
+        &ctx,
+        &mut tab,
+        &maintaining_state(roots, Some(MaintenanceStep::RemovingStale)),
+    );
+    assert_eq!(
+        text.iter()
+            .filter(|t| t.contains("Removing entries for deleted files"))
+            .count(),
+        1,
+        "the step is run-wide, not per-root: {:?}",
+        text
+    );
+    assert_eq!(
+        hints(&text),
+        2,
+        "every root keeps its file hint through the step: {:?}",
+        text
+    );
 }
 
 #[test]
@@ -459,6 +543,7 @@ fn each_prologue_step_says_what_it_is_waiting_on() {
     for (step, expected) in [
         (PrepStep::PreviousRun, "Finishing the previous run…"),
         (PrepStep::OpeningIndex, "Opening the index…"),
+        (PrepStep::Starting, "Getting the index ready…"),
     ] {
         let text = frame_text(&ctx, &mut tab, &preparing_state(step)).join(" | ");
         assert!(text.contains(expected), "{}", text);

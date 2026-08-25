@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use super::{ExtractError, Extractor};
+use super::{ExtractError, Extractor, Scratch};
 
 /// Non-`text/*` MIMEs the plaintext extractor claims. Every entry must be
 /// emitted by some MIME source and map to a [`crate::mime::FileType`]
@@ -38,15 +38,25 @@ pub(crate) const EXTRA_TEXT_MIMES: &[&str] = &[
     "message/rfc822",
 ];
 
-fn decode(bytes: Vec<u8>, path: &Path) -> Result<String, ExtractError> {
-    crate::textenc::decode_text(bytes, path)
+/// Decode into `out`, moving rather than copying where the class allows it.
+///
+/// This extractor is the one place a read buffer *becomes* the answer: a
+/// UTF-8 file's bytes are its text, so consuming the buffer turns the read
+/// into the output with no copy at all. That is why plaintext reads into a
+/// fresh buffer instead of the worker's scratch — a reused buffer here would
+/// trade one allocation for one full-length `memcpy` per file, on the format
+/// that dominates every corpus.
+fn decode_into(bytes: Vec<u8>, path: &Path, out: &mut String) -> Result<(), ExtractError> {
+    let text = crate::textenc::decode_text(bytes, path)?;
+    if out.is_empty() {
+        *out = text;
+    } else {
+        out.push_str(&text);
+    }
+    Ok(())
 }
 
 pub struct PlaintextExtractor;
-
-/// Ceiling on a single read, whatever the file claims — backstop for files
-/// that grew since the walk sized them and for nodes whose `fstat` lies.
-const MAX_READ: usize = 64 * 1024 * 1024;
 
 /// Read `size` bytes from `f`, never more than `cap`. A short read is not an
 /// error: a file that shrank keeps its prefix.
@@ -73,7 +83,16 @@ impl Extractor for PlaintextExtractor {
 
     /// A file that shrank since the `fstat` keeps its prefix; one that grew is
     /// read to the sized length — its mtime moved, so the next run re-extracts.
-    fn extract(&self, path: &Path) -> Result<String, ExtractError> {
+    fn extract(
+        &self,
+        path: &Path,
+        out: &mut String,
+        scratch: &mut Scratch,
+    ) -> Result<(), ExtractError> {
+        // `read`, not a constant of this module's own: the content pass never
+        // offers a file above it, so the only readers that reach the cap are
+        // the two below — a file that grew, and one whose size is a lie.
+        let cap = scratch.limits().read;
         let mut f =
             File::open(path).map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
         let size = f
@@ -85,23 +104,63 @@ impl Extractor for PlaintextExtractor {
         // only they pay the read-to-EOF probe, capped against endless streams.
         if size == 0 {
             let mut buf = Vec::new();
-            f.take(MAX_READ as u64)
+            f.take(cap as u64)
                 .read_to_end(&mut buf)
                 .map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
-            return decode(buf, path);
+            return decode_into(buf, path, out);
         }
 
-        decode(read_sized(&mut f, size, MAX_READ, path)?, path)
+        decode_into(read_sized(&mut f, size, cap, path)?, path, out)
     }
 
-    fn extract_from_head(&self, path: &Path, head: &[u8]) -> Option<Result<String, ExtractError>> {
-        Some(decode(head.to_vec(), path))
+    /// The head belongs to the walk worker and is reused for the next file,
+    /// so it is decoded borrowed rather than copied to be given away.
+    fn extract_from_head(
+        &self,
+        path: &Path,
+        head: &[u8],
+        out: &mut String,
+    ) -> Option<Result<(), ExtractError>> {
+        Some(
+            crate::textenc::decode_borrowed_text(head, path).map(|text| {
+                if out.is_empty() {
+                    *out = text;
+                } else {
+                    out.push_str(&text);
+                }
+            }),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch() -> Scratch {
+        Scratch::new(&crate::config::Config::default())
+    }
+
+    /// The default `maximum_text_file_size`, which is what bounds a read now.
+    fn max_read() -> usize {
+        scratch().limits().read
+    }
+
+    fn extract(path: &Path) -> Result<String, ExtractError> {
+        let mut out = String::new();
+        PlaintextExtractor
+            .extract(path, &mut out, &mut scratch())
+            .map(|()| out)
+    }
+
+    fn extract_from_head(path: &Path, head: &[u8]) -> Option<Result<String, ExtractError>> {
+        let mut out = String::new();
+        match PlaintextExtractor.extract_from_head(path, head, &mut out) {
+            Some(Ok(())) => Some(Ok(out)),
+            Some(Err(e)) => Some(Err(e)),
+            None => None,
+        }
+    }
 
     fn tmp(tag: &str, body: &[u8]) -> std::path::PathBuf {
         let p = crate::testutil::scratch_dir(tag).join("sample.txt");
@@ -112,7 +171,7 @@ mod tests {
     #[test]
     fn reads_utf8_file() {
         let p = tmp("basic", b"hello world");
-        let c = PlaintextExtractor.extract(&p).unwrap();
+        let c = extract(&p).unwrap();
         assert_eq!(c, "hello world");
         std::fs::remove_file(&p).ok();
     }
@@ -123,10 +182,9 @@ mod tests {
             "agree",
             b"shared body with unicode: caf\xc3\xa9 \xe2\x9c\x93",
         );
-        let from_disk = PlaintextExtractor.extract(&p).unwrap();
+        let from_disk = extract(&p).unwrap();
         let bytes = std::fs::read(&p).unwrap();
-        let from_head = PlaintextExtractor
-            .extract_from_head(&p, &bytes)
+        let from_head = extract_from_head(&p, &bytes)
             .unwrap()
             .unwrap();
         assert_eq!(from_disk, from_head);
@@ -138,9 +196,8 @@ mod tests {
         // A NUL keeps this undecodable now that legacy charsets decode.
         let body = [0x68, 0x69, 0x00, 0xff];
         let p = tmp("binary", &body);
-        let disk_err = PlaintextExtractor.extract(&p).unwrap_err();
-        let head_err = PlaintextExtractor
-            .extract_from_head(&p, &body)
+        let disk_err = extract(&p).unwrap_err();
+        let head_err = extract_from_head(&p, &body)
             .unwrap()
             .unwrap_err();
         assert_eq!(disk_err, head_err, "one decode path, one message");
@@ -156,9 +213,8 @@ mod tests {
     fn latin1_decodes_via_both_paths() {
         let body = b"une journ\xe9e agr\xe9able pr\xe8s de la rivi\xe8re";
         let p = tmp("latin1", body);
-        let from_disk = PlaintextExtractor.extract(&p).unwrap();
-        let from_head = PlaintextExtractor
-            .extract_from_head(&p, body)
+        let from_disk = extract(&p).unwrap();
+        let from_head = extract_from_head(&p, body)
             .unwrap()
             .unwrap();
         assert_eq!(from_disk, from_head);
@@ -172,9 +228,8 @@ mod tests {
         let mut body = vec![0xFF, 0xFE];
         body.extend(src.encode_utf16().flat_map(|u| u.to_le_bytes()));
         let p = tmp("utf16", &body);
-        let from_disk = PlaintextExtractor.extract(&p).unwrap();
-        let from_head = PlaintextExtractor
-            .extract_from_head(&p, &body)
+        let from_disk = extract(&p).unwrap();
+        let from_head = extract_from_head(&p, &body)
             .unwrap()
             .unwrap();
         assert_eq!(from_disk, from_head);
@@ -189,7 +244,7 @@ mod tests {
     fn reads_a_file_larger_than_one_buffer_completely() {
         let body = "abcdefgh".repeat(200 * 1024 / 8);
         let p = tmp("large", body.as_bytes());
-        let c = PlaintextExtractor.extract(&p).unwrap();
+        let c = extract(&p).unwrap();
         assert_eq!(c.len(), body.len());
         assert_eq!(c, body);
         std::fs::remove_file(&p).ok();
@@ -198,14 +253,8 @@ mod tests {
     #[test]
     fn an_empty_file_extracts_to_empty_text() {
         let p = tmp("empty", b"");
-        assert_eq!(PlaintextExtractor.extract(&p).unwrap(), "");
-        assert_eq!(
-            PlaintextExtractor
-                .extract_from_head(&p, &[])
-                .unwrap()
-                .unwrap(),
-            ""
-        );
+        assert_eq!(extract(&p).unwrap(), "");
+        assert_eq!(extract_from_head(&p, &[]).unwrap().unwrap(), "");
         std::fs::remove_file(&p).ok();
     }
 
@@ -220,7 +269,7 @@ mod tests {
             0,
             "precondition: procfs reports zero size"
         );
-        let c = PlaintextExtractor.extract(p).unwrap();
+        let c = extract(p).unwrap();
         assert!(
             c.contains("Name:"),
             "content must survive a zero st_size, got {} bytes",
@@ -235,7 +284,7 @@ mod tests {
         // A mid-extract truncate is not reproducible; assert the property directly.
         f.set_len(10).unwrap();
         drop(f);
-        let c = PlaintextExtractor.extract(&p).unwrap();
+        let c = extract(&p).unwrap();
         assert_eq!(c, "xxxxxxxxxx", "a shrunk file reads short, not fatal");
         std::fs::remove_file(&p).ok();
     }
@@ -272,7 +321,7 @@ mod tests {
     fn a_short_read_keeps_what_was_there() {
         let p = tmp("short", b"only ten!!");
         let mut f = File::open(&p).unwrap();
-        let out = read_sized(&mut f, 1_000_000, MAX_READ, &p).unwrap();
+        let out = read_sized(&mut f, 1_000_000, max_read(), &p).unwrap();
         assert_eq!(out, b"only ten!!");
         std::fs::remove_file(&p).ok();
     }
@@ -281,7 +330,7 @@ mod tests {
     fn a_file_under_the_cap_is_read_whole() {
         let body = vec![b'y'; 4096];
         let p = tmp("uncapped", &body);
-        let out = PlaintextExtractor.extract(&p).unwrap();
+        let out = extract(&p).unwrap();
         assert_eq!(out.len(), 4096);
         std::fs::remove_file(&p).ok();
     }

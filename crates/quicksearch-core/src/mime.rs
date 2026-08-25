@@ -80,18 +80,29 @@ const EXTENSION_OVERRIDES: &[(&str, &str)] = &[
 const AMBIGUOUS_EXTENSIONS: &[&str] = &["mod", "mts", "org", "pot", "scm", "ts", "vhd"];
 
 fn extension_is_ambiguous(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .is_some_and(|e| AMBIGUOUS_EXTENSIONS.contains(&e.as_str()))
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        AMBIGUOUS_EXTENSIONS
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(e))
+    })
 }
 
 fn extension_override(path: &Path) -> Option<&'static str> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let ext = path.extension()?.to_str()?;
     EXTENSION_OVERRIDES
         .iter()
-        .find(|(e, _)| *e == ext)
+        .find(|(e, _)| e.eq_ignore_ascii_case(ext))
         .map(|(_, mime)| *mime)
+}
+
+/// The essence of a raw MIME — everything before any `;` parameter — as a
+/// borrow of the same static. `Mime::essence_str` would do this too, but only
+/// off an owned `Mime`, which is why the raw form is what gets asked for.
+fn essence(raw: &'static str) -> &'static str {
+    match raw.split_once(';') {
+        Some((essence, _)) => essence.trim_end(),
+        None => raw,
+    }
 }
 
 /// Infer a MIME type from a path plus the file's leading bytes.
@@ -101,13 +112,20 @@ fn extension_override(path: &Path) -> Option<&'static str> {
 ///
 /// A `None` result is a real answer, not a "don't know": the content pass
 /// stores it and never re-derives it.
-pub fn guess_mime_from_head(path: &Path, head: &[u8]) -> Option<String> {
+///
+/// `&'static str` rather than `String`: every answer comes from one of three
+/// static tables ([`EXTENSION_OVERRIDES`], `mime_guess`'s, `infer`'s) or is a
+/// literal, and this runs once per indexed file — an owned copy here was a
+/// heap allocation per file for a string nobody mutates.
+pub fn guess_mime_from_head(path: &Path, head: &[u8]) -> Option<&'static str> {
     if let Some(m) = extension_override(path) {
-        return Some(m.to_string());
+        return Some(m);
     }
-    let by_extension = mime_guess::from_path(path).first().and_then(|g| {
-        let s = g.essence_str();
-        (!s.is_empty() && s != "application/octet-stream").then(|| s.to_string())
+    // `first_raw`, not `first`: the owned `Mime` exists only to be borrowed
+    // from, and its `essence_str` cannot outlive it.
+    let by_extension = mime_guess::from_path(path).first_raw().and_then(|raw| {
+        let s = essence(raw);
+        (!s.is_empty() && s != "application/octet-stream").then_some(s)
     });
     if !extension_is_ambiguous(path) && by_extension.is_some() {
         return by_extension;
@@ -120,19 +138,65 @@ pub fn guess_mime_from_head(path: &Path, head: &[u8]) -> Option<String> {
         if magic == "application/x-ole-storage" && by_extension.is_some() {
             return by_extension;
         }
-        return Some(magic.to_string());
+        return Some(magic);
     }
     if crate::textenc::looks_like_text(head) {
-        return Some("text/plain".to_string());
+        return Some("text/plain");
     }
     // Only an ambiguous extension still has an answer left to fall back on.
     by_extension
 }
 
+/// The longest MIME any table here holds is 73 bytes; 128 leaves room and
+/// keeps [`LowerMime`] a stack value. Anything longer names no format this
+/// classifies, so it is matched as it came rather than growing a heap copy.
+const MAX_MIME_LEN: usize = 128;
+
+/// A MIME lowercased without allocating.
+///
+/// Nearly every MIME reaching the classifiers is already lowercase —
+/// [`guess_mime_from_head`] answers from static tables — so the common path
+/// borrows and only a genuinely mixed-case string is copied into the buffer.
+/// This runs a few times per indexed file; `to_ascii_lowercase` there was a
+/// heap allocation apiece.
+pub(crate) struct LowerMime {
+    buf: [u8; MAX_MIME_LEN],
+    len: usize,
+    /// Set when the input was already lowercase (or too long to copy), in
+    /// which case [`LowerMime::as_str`] hands the original straight back.
+    borrowed: bool,
+}
+
+impl LowerMime {
+    pub(crate) fn new(mime: &str) -> LowerMime {
+        let mut lower = LowerMime {
+            buf: [0; MAX_MIME_LEN],
+            len: mime.len(),
+            borrowed: true,
+        };
+        if mime.len() <= MAX_MIME_LEN && mime.bytes().any(|b| b.is_ascii_uppercase()) {
+            lower.buf[..mime.len()].copy_from_slice(mime.as_bytes());
+            // ASCII-only folding: a multi-byte sequence is left untouched, so
+            // what comes out is still the UTF-8 that went in.
+            lower.buf[..mime.len()].make_ascii_lowercase();
+            lower.borrowed = false;
+        }
+        lower
+    }
+
+    pub(crate) fn as_str<'a>(&'a self, original: &'a str) -> &'a str {
+        if self.borrowed {
+            return original;
+        }
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or(original)
+    }
+}
+
 /// Map a MIME string to a [`FileType`] bitmask. Ported from Baloo's
 /// `basicindexingjob.cpp:typesForMimeType`.
 pub fn mime_to_type(mime: &str) -> FileType {
-    let lower = mime.to_ascii_lowercase();
+    let lower = LowerMime::new(mime);
+    let lower = lower.as_str(mime);
     let (top, sub) = match lower.split_once('/') {
         Some(pair) => pair,
         None => return FileType::EMPTY,
@@ -317,7 +381,7 @@ mod tests {
             let mime = guess_mime_from_head(&PathBuf::from(name), b"")
                 .unwrap_or_else(|| panic!("{} has no MIME", name));
             assert!(
-                PlaintextExtractor.supports(&mime),
+                PlaintextExtractor.supports(mime),
                 "{} -> {} is not extractable as text",
                 name,
                 mime
@@ -329,11 +393,11 @@ mod tests {
     fn extension_overrides_are_case_insensitive() {
         use std::path::PathBuf;
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("DEPLOY.PS1"), b"").as_deref(),
+            guess_mime_from_head(&PathBuf::from("DEPLOY.PS1"), b""),
             Some("text/plain")
         );
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("Build.Bat"), b"").as_deref(),
+            guess_mime_from_head(&PathBuf::from("Build.Bat"), b""),
             Some("text/plain")
         );
     }
@@ -343,11 +407,11 @@ mod tests {
     fn extension_overrides_beat_magic_bytes() {
         use std::path::PathBuf;
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("a.ps1"), b"Write-Host hi").as_deref(),
+            guess_mime_from_head(&PathBuf::from("a.ps1"), b"Write-Host hi"),
             Some("text/plain")
         );
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("a.ps1"), b"%PDF-1.7").as_deref(),
+            guess_mime_from_head(&PathBuf::from("a.ps1"), b"%PDF-1.7"),
             Some("text/plain")
         );
     }
@@ -357,7 +421,7 @@ mod tests {
         use crate::extract::{plaintext::PlaintextExtractor, Extractor};
         use std::path::PathBuf;
         let mime = guess_mime_from_head(&PathBuf::from("schema.sql"), b"").unwrap();
-        assert!(PlaintextExtractor.supports(&mime), "{}", mime);
+        assert!(PlaintextExtractor.supports(mime), "{}", mime);
     }
 
     /// The content pass trusts the stored MIME and never reopens the file —
@@ -385,7 +449,7 @@ mod tests {
             let mut body = magic.to_vec();
             body.resize(head_bytes, 0);
             assert_eq!(
-                guess_mime_from_head(&path, &body).as_deref(),
+                guess_mime_from_head(&path, &body),
                 Some(*expected),
                 "{} must be detectable from a default-sized head",
                 tag
@@ -399,12 +463,11 @@ mod tests {
     fn a_head_shorter_than_the_signature_declines_rather_than_guessing() {
         use std::path::PathBuf;
         let path = PathBuf::from("/tmp/qs-sniff-truncated");
-        assert_eq!(guess_mime_from_head(&path, b"").as_deref(), None);
+        assert_eq!(guess_mime_from_head(&path, b""), None);
         // A PNG magic truncated to two bytes: no magic match, no text guess.
-        assert_eq!(guess_mime_from_head(&path, &[0x89, 0x00]).as_deref(), None);
+        assert_eq!(guess_mime_from_head(&path, &[0x89, 0x00]), None);
         assert_eq!(
-            guess_mime_from_head(&path, &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
-                .as_deref(),
+            guess_mime_from_head(&path, &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
             Some("image/png")
         );
     }
@@ -452,7 +515,7 @@ mod tests {
             let mime =
                 guess_mime_from_head(&path, head).unwrap_or_else(|| panic!("{} has no MIME", name));
             let extracted = registry
-                .extract_complete_head(&path, &mime, head)
+                .extract_head_to_string(&path, mime, head)
                 .unwrap_or_else(|| {
                     panic!(
                         "{} -> {} not claimed by a head-capable extractor",
@@ -474,17 +537,17 @@ mod tests {
         use std::path::PathBuf;
         let readme = PathBuf::from("README");
         assert_eq!(
-            guess_mime_from_head(&readme, b"QuickSearch indexes your files.\n").as_deref(),
+            guess_mime_from_head(&readme, b"QuickSearch indexes your files.\n"),
             Some("text/plain")
         );
         let makefile = PathBuf::from("Makefile");
         assert_eq!(
-            guess_mime_from_head(&makefile, b"all:\n\tcargo build\n").as_deref(),
+            guess_mime_from_head(&makefile, b"all:\n\tcargo build\n"),
             Some("text/plain")
         );
         let blob = PathBuf::from("blob");
         assert_eq!(
-            guess_mime_from_head(&blob, &[0x00, 0x01, 0x02, 0xFF]).as_deref(),
+            guess_mime_from_head(&blob, &[0x00, 0x01, 0x02, 0xFF]),
             None
         );
     }
@@ -505,13 +568,13 @@ mod tests {
         // legacy-encoded documents still type as text.
         let latin1 = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9.";
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("notes.txt"), latin1).as_deref(),
+            guess_mime_from_head(&PathBuf::from("notes.txt"), latin1),
             Some("text/plain")
         );
 
         // A `.pb` that really is UTF-8 text still indexes.
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("notes.pb"), b"just some words\n").as_deref(),
+            guess_mime_from_head(&PathBuf::from("notes.pb"), b"just some words\n"),
             Some("text/plain")
         );
     }
@@ -522,11 +585,11 @@ mod tests {
 
         let ts_source = b"export function hi(): string { return 'hi'; }\n";
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("app.ts"), ts_source).as_deref(),
+            guess_mime_from_head(&PathBuf::from("app.ts"), ts_source),
             Some("text/plain")
         );
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("APP.TS"), ts_source).as_deref(),
+            guess_mime_from_head(&PathBuf::from("APP.TS"), ts_source),
             Some("text/plain")
         );
         // An MPEG transport stream: no magic matcher, fails the text sniff,
@@ -535,7 +598,7 @@ mod tests {
         ts_video[0] = 0x47;
         ts_video[188] = 0x47;
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("clip.ts"), &ts_video).as_deref(),
+            guess_mime_from_head(&PathBuf::from("clip.ts"), &ts_video),
             Some("video/vnd.dlna.mpeg-tts")
         );
 
@@ -543,30 +606,27 @@ mod tests {
             guess_mime_from_head(
                 &PathBuf::from("go.mod"),
                 b"module example.com/x\n\ngo 1.22\n"
-            )
-            .as_deref(),
+            ),
             Some("text/plain")
         );
 
         // gettext template vs PowerPoint template.
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("app.pot"), b"msgid \"hello\"\nmsgstr \"\"\n")
-                .as_deref(),
+            guess_mime_from_head(&PathBuf::from("app.pot"), b"msgid \"hello\"\nmsgstr \"\"\n"),
             Some("text/plain")
         );
         let ole = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0x00, 0x00];
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("slides.pot"), &ole).as_deref(),
+            guess_mime_from_head(&PathBuf::from("slides.pot"), &ole),
             Some("application/vnd.ms-powerpoint")
         );
 
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("cpu.vhd"), b"entity cpu is\nend cpu;\n")
-                .as_deref(),
+            guess_mime_from_head(&PathBuf::from("cpu.vhd"), b"entity cpu is\nend cpu;\n"),
             Some("text/plain")
         );
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("disk.vhd"), &[0x00, 0x01, 0x02, 0x03]).as_deref(),
+            guess_mime_from_head(&PathBuf::from("disk.vhd"), &[0x00, 0x01, 0x02, 0x03]),
             Some("application/x-virtualbox-vhd")
         );
     }

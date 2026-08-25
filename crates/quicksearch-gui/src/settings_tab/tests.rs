@@ -239,77 +239,130 @@ fn an_unapplied_shortcut_says_it_is_not_in_force_yet() {
     assert_eq!(run("Ctrl+Shift+F", "Ctrl+Shift+F"), "");
 }
 
-/// Every row with the tip it must show, so a wrong tooltip is impossible.
-const ROWS: &[(Section, &str, &tips::Tip)] = &[
+/// Every row with the tip it must show and who it is for, so a wrong tooltip
+/// is impossible and the everyday/advanced split is written down once.
+const ROWS: &[(Section, &str, &tips::Tip, Level)] = &[
     (
         Section::Indexing,
         "Full reindex every",
         &tips::REINDEX_INTERVAL,
+        Level::Advanced,
     ),
-    (Section::Indexing, "Follow symlinks", &tips::FOLLOW_SYMLINKS),
+    (
+        Section::Indexing,
+        "Follow symlinks",
+        &tips::FOLLOW_SYMLINKS,
+        Level::Advanced,
+    ),
     (
         Section::Indexing,
         "Include hidden files",
         &tips::INCLUDE_HIDDEN,
+        Level::Everyday,
     ),
-    (Section::Processing, "Tokenizer", &tips::TOKENIZER),
+    (
+        Section::Processing,
+        "Tokenizer",
+        &tips::TOKENIZER,
+        Level::Advanced,
+    ),
     (
         Section::Processing,
         "Hash sample size (bytes)",
         &tips::HASH_LENGTH,
+        Level::Advanced,
     ),
     (
         Section::Processing,
         "Max stored text (bytes)",
         &tips::MAX_STORED_TEXT,
+        Level::Advanced,
     ),
     (
         Section::Processing,
         "Max text file size (bytes)",
         &tips::MAX_TEXT_FILE_SIZE,
+        Level::Advanced,
     ),
-    (Section::Processing, "Batch size", &tips::BATCH_SIZE),
+    (
+        Section::Processing,
+        "Batch size",
+        &tips::BATCH_SIZE,
+        Level::Advanced,
+    ),
     (
         Section::Processing,
         "Max WAL size (bytes)",
         &tips::MAX_WAL_SIZE,
+        Level::Advanced,
     ),
     (
         Section::Processing,
         "Store text for snippets",
         &tips::STORE_TEXT,
+        Level::Everyday,
     ),
     (
         Section::Search,
         "Fuzzy search ON by default",
         &tips::FUZZY_DEFAULT,
+        Level::Everyday,
     ),
-    (Section::Search, "Fuzzy edit distance", &tips::FUZZY_EDITS),
-    (Section::Search, "Display limit", &tips::DISPLAY_LIMIT),
+    (
+        Section::Search,
+        "Fuzzy edit distance",
+        &tips::FUZZY_EDITS,
+        Level::Advanced,
+    ),
+    (
+        Section::Search,
+        "Display limit",
+        &tips::DISPLAY_LIMIT,
+        Level::Advanced,
+    ),
     (
         Section::Search,
         "Stream batch size",
         &tips::RESULTS_PER_PAGE,
+        Level::Advanced,
     ),
-    (Section::Search, "Debounce (ms)", &tips::DEBOUNCE),
-    (Section::Search, "Live results", &tips::LIVE_RESULTS),
+    (
+        Section::Search,
+        "Debounce (ms)",
+        &tips::DEBOUNCE,
+        Level::Advanced,
+    ),
+    (
+        Section::Search,
+        "Live results",
+        &tips::LIVE_RESULTS,
+        Level::Everyday,
+    ),
+    (
+        Section::Search,
+        "Search cache MiB (0 = auto)",
+        &tips::SEARCH_CACHE,
+        Level::Advanced,
+    ),
 ];
 
-/// Rendered without the tab's scroll area so nothing sits below the fold.
+/// Rendered without the tab's scroll area so nothing sits below the fold, and
+/// with advanced on so every row is present to be hovered.
 #[test]
 fn every_row_shows_its_own_tip() {
-    for (section, label, tip) in ROWS {
+    for (section, label, tip, _) in ROWS {
         let ctx = crate::test_ui::ctx();
         ctx.style_mut(|s| {
             s.interaction.tooltip_delay = 0.0;
             s.interaction.show_tooltips_only_when_still = false;
         });
         let mut cfg = Config::default();
+        let form = Form { advanced: true };
         let mut run = |events: Vec<egui::Event>| {
             let input = crate::test_ui::raw_input(egui::vec2(600.0, 800.0), events);
             ctx.run(input, |ctx| {
                 egui::CentralPanel::default()
-                    .show(ctx, |ui| config_editor_ui(ui, &mut cfg, *section));
+                    .show(ctx, |ui| config_editor_ui(ui, &mut cfg, *section, None, form));
             })
         };
 
@@ -341,14 +394,21 @@ fn hovering_a_setting_label_explains_it() {
         s.interaction.tooltip_delay = 0.0;
         s.interaction.show_tooltips_only_when_still = false;
     });
-    let cfg = Config::default();
+    // Tokenizer is an advanced row, so the whole tab has to be showing them.
+    let cfg = Config {
+        ui: quicksearch_core::config::UiConfig {
+            show_advanced_settings: true,
+            ..Default::default()
+        },
+        ..Config::default()
+    };
     let mut w = SettingsTab::new();
 
     let run = |w: &mut SettingsTab, events: Vec<egui::Event>| {
         let input = crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), events);
         ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                w.ui(ui, &cfg);
+                w.ui(ui, &cfg, None);
             });
         })
     };
@@ -382,7 +442,7 @@ fn the_tab_renders_and_apply_reports_the_draft() {
         let input = crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), events);
         let mut out = SettingsOutput::default();
         let full = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| out = w.ui(ui, &cfg));
+            egui::CentralPanel::default().show(ctx, |ui| out = w.ui(ui, &cfg, None));
         });
         crate::test_ui::assert_no_tofu(&ctx, &full);
         (out, full)
@@ -479,7 +539,7 @@ fn run_security(
     let mut action = None;
     let full = ctx.run(input, |ctx| {
         egui::CentralPanel::default().show(ctx, |ui| {
-            action = security_ui(ui, current, false);
+            action = security_ui(ui, current, false, Form { advanced: true });
         });
     });
     crate::test_ui::assert_no_tofu(ctx, &full);
@@ -549,5 +609,121 @@ fn a_stale_draft_cannot_revert_the_columns() {
     assert!(
         applied.search.columns.size,
         "applying the stale draft reverted the column"
+    );
+}
+
+/// The hint is the only place the automatic ceiling is visible, and the only
+/// thing that makes the override discoverable when the cap bites.
+#[test]
+fn the_search_cache_hint_explains_the_automatic_value() {
+    let mut cfg = Config::default();
+
+    assert_eq!(
+        search_cache_hint(&cfg, None),
+        None,
+        "with no file count there is no honest number to show"
+    );
+
+    // An explicit setting is not automatic, so there is nothing to explain.
+    cfg.search.cache_size_mib = 64;
+    assert_eq!(search_cache_hint(&cfg, Some(200_000)), None);
+    cfg.search.cache_size_mib = 0;
+
+    // Unencrypted: a fixed value, and the reason for it.
+    let plain = search_cache_hint(&cfg, Some(200_000)).expect("a hint");
+    assert!(plain.contains("16 MiB"), "{}", plain);
+    assert!(plain.contains("unencrypted"), "{}", plain);
+
+    // Encrypted and inside the cap: the derived value, and the file count it
+    // came from.
+    cfg.security.password_protected = true;
+    let keyed = search_cache_hint(&cfg, Some(200_000)).expect("a hint");
+    assert!(keyed.contains("32 MiB"), "{}", keyed);
+    assert!(keyed.contains("200,000"), "{}", keyed);
+
+    // Encrypted and past it: says so, and says what the index actually wants,
+    // or the override cannot be found by the people who need it.
+    let capped = search_cache_hint(&cfg, Some(2_000_000)).expect("a hint");
+    assert!(
+        capped.contains("128 MiB") && capped.contains("320 MiB"),
+        "the capped hint must name both the cap and the want: {}",
+        capped
+    );
+}
+
+/// The whole point: with advanced off, only the everyday rows are on screen,
+/// and with it on nothing has gone missing. `ROWS` is the categorisation, so
+/// this fails the moment a row is added without deciding who it is for.
+#[test]
+fn advanced_rows_are_hidden_until_asked_for() {
+    let painted_labels = |advanced: bool| -> Vec<&'static str> {
+        let ctx = crate::test_ui::ctx();
+        let mut cfg = Config::default();
+        let form = Form { advanced };
+        let mut shown = Vec::new();
+        for section in [Section::Indexing, Section::Processing, Section::Search] {
+            let out = ctx.run(
+                crate::test_ui::raw_input(egui::vec2(600.0, 800.0), vec![]),
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        config_editor_ui(ui, &mut cfg, section, None, form)
+                    });
+                },
+            );
+            let text = painted_text(&out).join("\n");
+            for (row_section, label, _, _) in ROWS {
+                if *row_section == section && text.contains(*label) {
+                    shown.push(*label);
+                }
+            }
+        }
+        shown
+    };
+
+    let everyday: Vec<&str> = ROWS
+        .iter()
+        .filter(|(_, _, _, level)| *level == Level::Everyday)
+        .map(|(_, label, _, _)| *label)
+        .collect();
+    let all: Vec<&str> = ROWS.iter().map(|(_, label, _, _)| *label).collect();
+
+    assert!(
+        !everyday.is_empty() && everyday.len() < all.len(),
+        "a split with nothing on one side is not a split: {} of {}",
+        everyday.len(),
+        all.len()
+    );
+    assert_eq!(
+        painted_labels(false),
+        everyday,
+        "the default view must show the everyday rows and only those"
+    );
+    assert_eq!(
+        painted_labels(true),
+        all,
+        "turning advanced on must bring every row back"
+    );
+}
+
+/// Revealing a setting is not editing one: the toggle writes through
+/// `SettingsOutput` and must never make the tab read as dirty, or looking at
+/// an advanced setting would demand an Apply.
+#[test]
+fn showing_advanced_settings_is_not_an_unsaved_edit() {
+    let mut w = SettingsTab::new();
+    let mut cfg = Config::default();
+    assert!(!cfg.ui.show_advanced_settings, "hidden by default");
+    w.stage(&cfg);
+
+    // The checkbox writes straight to the live config, as the app does.
+    cfg.ui.show_advanced_settings = true;
+    assert!(!w.is_dirty(&cfg), "revealing rows read as an edit");
+
+    // And a draft staged while they were hidden must not put them away again.
+    let mut applied = w.draft_config().expect("a draft");
+    crate::app::pin_live_fields(&mut applied, &cfg);
+    assert!(
+        applied.ui.show_advanced_settings,
+        "applying the stale draft hid the advanced settings again"
     );
 }

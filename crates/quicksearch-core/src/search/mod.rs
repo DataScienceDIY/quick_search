@@ -31,8 +31,11 @@ pub use duplicates::{find_duplicate_groups, DuplicateGroup};
 /// decrypted pages and the next keystroke pays to refill them: on a 200k-file
 /// index the first query after a release costs 129 ms unencrypted and 192 ms
 /// encrypted, against ~10 ms warm. Encryption is why the gap widens — a
-/// refill is an AES decrypt plus an HMAC verify per page rather than a
-/// `memcpy`. What the release buys back is the ~42 MiB the trim in
+/// refill is an AES decrypt per page rather than a `memcpy`. (The 192 ms was
+/// measured while `db::schema::HMAC_MODE` was still HMAC-SHA512 and there was
+/// a per-page verify to pay as well, so the gap is narrower now; the argument
+/// for a long idle timeout only gets stronger as the two converge.) What the
+/// release buys back is the ~42 MiB the trim in
 /// [`Worker::run`] returns, so this trades an idle process floor against
 /// stalling the one keystroke a user is most likely to notice.
 ///

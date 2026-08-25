@@ -108,6 +108,63 @@ fn a_compressed_body_carries_its_uncompressed_length() {
     }
 }
 
+/// Several rows into one arena, which is the shape the writer uses.
+///
+/// The trap this pins: `zstd`'s `WriteBuf` for `Vec` writes from **offset
+/// zero** and sets the length, so compressing straight into a shared arena
+/// silently overwrites the previous row and leaves every returned range
+/// pointing past the end. Each body must come back byte-identical to what
+/// the one-shot encoder produces, and out of its own range.
+#[test]
+fn an_arena_keeps_every_row_it_is_given() {
+    let mut enc = DocEncoder::new().unwrap();
+    let bodies = [
+        "the first document",
+        "",
+        "a considerably longer second document ".repeat(512).as_str(),
+        "third",
+    ]
+    .map(str::to_string);
+
+    let mut arena = Vec::new();
+    let mut ranges = Vec::new();
+    for text in &bodies {
+        ranges.push(enc.encode_into(text, &mut arena).unwrap());
+    }
+
+    for (text, at) in bodies.iter().zip(&ranges) {
+        let blob = &arena[at.clone()];
+        assert_eq!(
+            raw_text_len(blob),
+            Some(text.len() as u64),
+            "a row's frame does not describe its own body"
+        );
+        assert_eq!(
+            DocDecoder::new().unwrap().decode(blob),
+            Some(text.as_str()),
+            "a row did not survive sharing the arena"
+        );
+    }
+
+    // The ranges tile the arena in order and account for all of it: a gap or
+    // an overlap means one row landed on another.
+    let mut next = 0;
+    for at in &ranges {
+        assert_eq!(at.start, next, "rows must be contiguous");
+        next = at.end;
+    }
+    assert_eq!(next, arena.len(), "the arena holds exactly the four bodies");
+
+    // Reuse: a second batch must not read the first one's bytes.
+    arena.clear();
+    let at = enc.encode_into("a fresh batch", &mut arena).unwrap();
+    assert_eq!(at.start, 0);
+    assert_eq!(
+        DocDecoder::new().unwrap().decode(&arena[at]),
+        Some("a fresh batch")
+    );
+}
+
 #[test]
 fn insert_update_delete_round_trip() {
     let (_dir, p) = tmp_path();
@@ -812,6 +869,80 @@ fn checkpoint_truncate_reports_an_incomplete_checkpoint() {
     assert!(wal_bytes(&p) > 0, "and the log is still there");
 }
 
+/// The floor under the case above. A TRUNCATE that cannot take the reset lock
+/// leaves the file at its high-water mark, and without `journal_size_limit`
+/// that mark is where it stays — one bad run leaves a multi-gigabyte log
+/// behind for every later reader to page around.
+///
+/// The limit is not a checkpoint: `sqlite3WalFrames` applies it at the **first
+/// commit after the log restarts**, which is the next write once a checkpoint
+/// has copied every frame out. So the space comes back on its own, from
+/// whichever writer touches the index next, with no successful TRUNCATE
+/// anywhere in the story. That is the property worth having — the run that
+/// bloated the log is exactly the one whose checkpoint is most likely to lose
+/// its lock race.
+///
+/// The writing pragma profiles carry it; `db::schema`'s
+/// `every_writing_profile_bounds_the_log` is what keeps them in step with
+/// [`crate::config::MINIMUM_WAL_SIZE`], and this is what shows it works.
+#[test]
+fn journal_size_limit_gives_the_space_back_after_a_blocked_truncate() {
+    let (_dir, p) = tmp_path();
+    let mut writer = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    seed_rows(&mut writer, 0..10);
+    writer
+        .busy_timeout(std::time::Duration::from_millis(100))
+        .unwrap();
+
+    let peak = {
+        // Held across the seeding, which is what lets the log grow past the
+        // limit at all: pinned to an early frame, no checkpoint of any kind
+        // can reset it. This is the run's own shape — a reader per root, live
+        // from start to finish.
+        let reader = crate::db::open_existing(p.to_str().unwrap(), false).unwrap();
+        let mut stmt = reader.prepare("SELECT id FROM files").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        rows.next().unwrap().expect("a row to hold the snapshot on");
+
+        // 6k rows measured 12.5 MiB of log; this clears 16 MiB with room.
+        seed_rows(&mut writer, 10..10_000);
+        let peak = wal_bytes(&p);
+        assert!(
+            peak > crate::config::MINIMUM_WAL_SIZE,
+            "the fixture left {} bytes of log, under the limit it must exceed",
+            peak
+        );
+
+        checkpoint_truncate(&writer).expect_err("a reader holds the log open");
+        assert_eq!(wal_bytes(&p), peak, "a blocked TRUNCATE trims nothing");
+        peak
+    };
+
+    // The reader is gone, so an ordinary PASSIVE checkpoint copies every
+    // frame out — but on its own it trims nothing, because the log has not
+    // restarted yet.
+    writer
+        .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+        .unwrap();
+    assert_eq!(
+        wal_bytes(&p),
+        peak,
+        "a checkpoint that does not restart the log cannot trim it"
+    );
+
+    // The next write restarts it, and *that* commit honours the limit. No
+    // TRUNCATE was ever accepted.
+    seed_rows(&mut writer, 10_000..10_001);
+    let after = wal_bytes(&p);
+    assert!(
+        after <= crate::config::MINIMUM_WAL_SIZE,
+        "the log went {} -> {} bytes against a {} byte limit",
+        peak,
+        after,
+        crate::config::MINIMUM_WAL_SIZE
+    );
+}
+
 /// Autocheckpoint tries the reset lock exactly once, with no retry, so a
 /// reader querying back to back keeps the log growing for the whole run. An
 /// explicit checkpoint retries the same lock under `busy_timeout` and gets it.
@@ -896,6 +1027,44 @@ fn a_busy_reader_defeats_the_autocheckpoint_but_not_a_forced_one() {
     );
 }
 
+/// Sizing the search cache reads the row count from `sqlite_stat1` rather than
+/// counting, so it has to survive the two states that table is really in.
+#[test]
+fn the_analyzed_file_count_ignores_the_partial_index_and_missing_stats() {
+    let (_dir, p) = tmp_path();
+    let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    assert_eq!(
+        analyzed_file_count(&conn),
+        None,
+        "a never-analyzed index must say so, not report zero files"
+    );
+
+    seed_rows(&mut conn, 0..2000);
+    // All 2000 rows land content_state = 0, so `idx_files_content_pending`
+    // covers every one of them; mark most done to make the partial index
+    // genuinely smaller than the table, which is the trap being tested.
+    conn.execute("UPDATE files SET content_state = 1 WHERE id % 100 != 0", [])
+        .unwrap();
+    conn.execute_batch("ANALYZE;").unwrap();
+
+    let pending: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE content_state = 0",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        pending < 2000,
+        "the partial index must be smaller than the table for this to test anything"
+    );
+    assert_eq!(
+        analyzed_file_count(&conn),
+        Some(2000),
+        "the partial index's smaller count must not win"
+    );
+}
+
 #[test]
 fn maintain_vacuums_when_slack_is_significant() {
     let (_dir, p) = tmp_path();
@@ -919,9 +1088,8 @@ fn maintain_vacuums_when_slack_is_significant() {
         .unwrap();
     assert!(freelist > 0, "the deletions should have freed pages");
 
-    let dir = p.parent().unwrap().to_string_lossy().into_owned();
     assert!(
-        maintain(&conn, &dir).unwrap(),
+        maintain(&conn, p.to_str().unwrap()).unwrap(),
         "that much slack is worth a vacuum"
     );
     assert_eq!(
@@ -955,9 +1123,8 @@ fn maintain_skips_vacuum_on_a_tight_file() {
     drop(conn);
 
     let conn = crate::db::open::open_maintenance(p.to_str().unwrap()).unwrap();
-    let dir = p.parent().unwrap().to_string_lossy().into_owned();
     assert!(
-        !maintain(&conn, &dir).unwrap(),
+        !maintain(&conn, p.to_str().unwrap()).unwrap(),
         "a file with no slack is not worth rewriting"
     );
     // The checkpoint is not conditional on the vacuum, though.

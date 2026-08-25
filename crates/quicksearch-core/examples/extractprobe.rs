@@ -23,7 +23,11 @@
 //! its arena free lists. With one worker the per-file table is exact — the
 //! largest entries are the files that would spike a real run.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
+
+// What `Counting` wraps: the allocator the shipped binaries install, or the
+// figures describe a build nobody runs. See `platform::Allocator`.
+use quicksearch_core::platform::Allocator as Inner;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -35,7 +39,7 @@ mod common;
 // Allocation accounting
 // ---------------------------------------------------------------------------
 
-/// `System`, counting — per binary, so the shipped `quicksearch` is
+/// [`Inner`], counting — per binary, so the shipped `quicksearch` is
 /// untouched. `PEAK_LIVE` is the high-water of live bytes: unlike RSS it
 /// cannot be inflated by the allocator declining to return pages.
 struct Counting;
@@ -53,14 +57,14 @@ fn note(live: u64) {
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc(l) };
+        let p = unsafe { Inner.alloc(l) };
         if !p.is_null() {
             note(LIVE.fetch_add(l.size() as u64, Ordering::Relaxed) + l.size() as u64);
         }
         p
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc_zeroed(l) };
+        let p = unsafe { Inner.alloc_zeroed(l) };
         if !p.is_null() {
             note(LIVE.fetch_add(l.size() as u64, Ordering::Relaxed) + l.size() as u64);
         }
@@ -68,10 +72,10 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         LIVE.fetch_sub(l.size() as u64, Ordering::Relaxed);
-        unsafe { System.dealloc(p, l) }
+        unsafe { Inner.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        let q = unsafe { System.realloc(p, l, new) };
+        let q = unsafe { Inner.realloc(p, l, new) };
         if !q.is_null() {
             let (old, new) = (l.size() as u64, new as u64);
             let live = if new >= old {
@@ -103,7 +107,7 @@ use quicksearch_core::testutil::mib;
 
 /// Head bytes read for the MIME sniff — the same window the walk uses, so
 /// this probe classifies files exactly as a run would.
-fn sniff(path: &Path, hash_length: usize) -> Option<String> {
+fn sniff(path: &Path, hash_length: usize) -> Option<&'static str> {
     use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     let mut head = vec![0u8; hash_length];
@@ -114,7 +118,7 @@ fn sniff(path: &Path, hash_length: usize) -> Option<String> {
 
 struct Candidate {
     path: String,
-    mime: String,
+    mime: &'static str,
     size: u64,
 }
 
@@ -137,7 +141,7 @@ fn candidates(dir: &Path, config: &Config, registry: &Registry) -> Vec<Candidate
         let Some(mime) = sniff(entry.path(), config.processing.hash_length) else {
             continue;
         };
-        if !registry.supports(&mime) {
+        if !registry.supports(mime) {
             continue;
         }
         out.push(Candidate {
@@ -195,7 +199,7 @@ fn main() {
     // instead of the pool draining down to one straggler.
     let queue: Vec<&Candidate> = (0..replicas).flat_map(|_| found.iter()).collect();
     let next = AtomicUsize::new(0);
-    let worst: Mutex<Vec<(u64, String, u64, String)>> = Mutex::new(Vec::new());
+    let worst: Mutex<Vec<(u64, String, u64, &'static str)>> = Mutex::new(Vec::new());
     let per_file = workers == 1;
 
     let start = Instant::now();
@@ -203,13 +207,16 @@ fn main() {
         for _ in 0..workers {
             let (queue, next, worst) = (&queue, &next, &worst);
             let (registry, config) = (registry.clone(), config.clone());
+            // One per worker, as the content pass does: the per-file figures
+            // below are a worker's steady state, not its first file.
+            let mut scratch = quicksearch_core::extract::Scratch::new(&config);
             s.spawn(move || loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(c) = queue.get(i) else { return };
                 if per_file {
                     take_mark();
                 }
-                let outcome = decide_content(&c.path, Some(&c.mime), &registry, &config);
+                let outcome = decide_content(&c.path, Some(c.mime), &registry, &config, &mut scratch);
                 if per_file {
                     let cost = take_mark();
                     let text =
@@ -217,7 +224,7 @@ fn main() {
                     let mut w = worst
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    w.push((cost, c.path.clone(), c.size, c.mime.clone()));
+                    w.push((cost, c.path.clone(), c.size, c.mime));
                     // Kept small so the table itself is not the peak.
                     w.sort_by_key(|(cost, ..)| std::cmp::Reverse(*cost));
                     w.truncate(12);

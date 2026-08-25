@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 use quicksearch_core::config::Config;
 use quicksearch_core::coordinator::{IndexMode, IndexerState, ReconcileState, WatcherStatus};
 use quicksearch_core::indexing::{
-    IndexingStatus, PrepStep, ReconcileProgress, RootPhase, RootProgress,
+    IndexingStatus, MaintenanceStep, PrepStep, ReconcileProgress, RootPhase, RootProgress,
 };
 
 use crate::format::{
-    fmt_duration_clock, fmt_interval, fmt_rate, fmt_reconcile_summary, group_thousands, human_size,
-    middle_truncate,
+    fmt_duration_clock, fmt_interval, fmt_maintenance, fmt_rate, fmt_reconcile_summary,
+    group_thousands, human_size, middle_truncate,
 };
 use crate::tips::{self, Tipped};
 use crate::tracker::SpeedTracker;
@@ -56,15 +56,21 @@ impl ManageTab {
 
     pub fn observe(&mut self, status: &IndexingStatus) {
         match status {
-            IndexingStatus::Running { roots, .. } => {
+            IndexingStatus::Running {
+                maintenance: None,
+                roots,
+                ..
+            } => {
                 let total: usize = roots.iter().map(|r| r.walked + r.extracted).sum();
                 self.speed.record(total);
             }
-            // Preparing included: a stale files/sec would read as progress.
+            // Preparing and a run's upkeep steps included: no file is moving
+            // in either, and a stale files/sec would read as progress.
             IndexingStatus::Idle
             | IndexingStatus::Error(_)
             | IndexingStatus::Optimizing
-            | IndexingStatus::Preparing { .. } => self.speed.reset(),
+            | IndexingStatus::Preparing { .. }
+            | IndexingStatus::Running { .. } => self.speed.reset(),
             _ => {}
         }
     }
@@ -649,9 +655,17 @@ fn status_contents(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker
         IndexingStatus::Optimizing => {
             ui.label("Optimizing index; reclaiming unused space…");
         }
-        IndexingStatus::Running { roots, .. } => {
+        IndexingStatus::Running {
+            roots, maintenance, ..
+        } => {
             for root in roots {
-                root_row(ui, root);
+                root_row(ui, root, *maintenance);
+            }
+            // Run-wide, so said once rather than once per root. Purely
+            // additional: the per-root file hints stay put underneath it, so
+            // a step starting does not reflow the block.
+            if let Some(step) = maintenance {
+                ui.label(hint(fmt_maintenance(*step)));
             }
             if let Some(rate) = speed.files_per_sec() {
                 ui.label(
@@ -674,6 +688,7 @@ fn prep_row(ui: &mut egui::Ui, step: &PrepStep, elapsed: Duration) {
         PrepStep::PreviousRun => waiting_row(ui, "Finishing the previous run…", elapsed),
         PrepStep::OpeningIndex => waiting_row(ui, "Opening the index…", elapsed),
         PrepStep::Reconciling(r) => reconcile_row(ui, r, Some(elapsed)),
+        PrepStep::Starting => waiting_row(ui, "Getting the index ready…", elapsed),
     }
 }
 
@@ -732,18 +747,28 @@ fn reconcile_row(ui: &mut egui::Ui, r: &ReconcileProgress, elapsed: Option<Durat
     }
 }
 
-fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
+/// `maintenance` is the run's, not the root's: while it is set the writer is
+/// inside a database step and every figure here is the last one published
+/// before it began.
+fn root_row(ui: &mut egui::Ui, r: &RootProgress, maintenance: Option<MaintenanceStep>) {
     let divider = |ui: &mut egui::Ui| {
         ui.label(egui::RichText::new("|").weak());
     };
     let phase = crate::color::palette(ui.visuals().dark_mode);
+    // The counters stay keyed on the root's phase; only the word changes.
+    let (word, color) = match (maintenance, r.phase) {
+        (Some(_), _) => ("maintenance", phase.orange),
+        (None, RootPhase::Walking) => ("indexing", phase.yellow),
+        (None, RootPhase::Extracting) => ("extracting text", phase.green),
+        (None, RootPhase::Done) => ("done", phase.blue),
+    };
     ui.horizontal(|ui| {
         ui.monospace(middle_truncate(&r.root, 48));
         divider(ui);
+        ui.label(egui::RichText::new(word).color(color));
+        divider(ui);
         match r.phase {
             RootPhase::Walking => {
-                ui.label(egui::RichText::new("indexing").color(phase.yellow));
-                divider(ui);
                 let workers = format!("{}/{} workers", r.active_workers, r.total_workers);
                 match r.walk_denominator() {
                     Some(total) if total > 0 => {
@@ -768,8 +793,6 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
                 }
             }
             RootPhase::Extracting => {
-                ui.label(egui::RichText::new("extracting text").color(phase.green));
-                divider(ui);
                 let workers = format!("{}/{} workers", r.active_workers, r.total_workers);
                 match r.extract_total {
                     Some(total) => {
@@ -800,8 +823,6 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
             }
             RootPhase::Done => {
                 // Whole-root totals, not just this run's new work.
-                ui.label(egui::RichText::new("done").color(phase.blue));
-                divider(ui);
                 ui.label(format!(
                     "indexed {}, extracted {}",
                     group_thousands(r.walked as u64),
@@ -811,6 +832,10 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
             }
         }
     });
+    // Drawn during upkeep too, where it names the last file *written* rather
+    // than one in flight. That moment of staleness is worth less than the row
+    // keeping its height: with a checkpoint every few seconds, a line
+    // vanishing and returning per root reflowed the whole block on a loop.
     if let Some(f) = &r.current_file {
         ui.label(hint(middle_truncate(f, 90)));
     }

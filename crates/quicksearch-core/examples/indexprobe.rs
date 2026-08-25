@@ -31,7 +31,11 @@
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
+
+// What `Counting` wraps: the allocator the shipped binaries install, or the
+// throughput figures describe a build nobody runs.
+use quicksearch_core::platform::Allocator as Inner;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,7 +45,7 @@ use common::{evict, mib, Io};
 // Allocation accounting
 // ---------------------------------------------------------------------------
 
-/// `System`, counting — per binary, so the shipped `quicksearch` is
+/// [`Inner`], counting — per binary, so the shipped `quicksearch` is
 /// untouched. Global atomics, not `search_alloc`'s per-thread `Cell`s: the
 /// work spreads over several pools and nothing else runs here, so a global
 /// count is exactly the run. The contended RMW is fine when both sides of a
@@ -63,14 +67,14 @@ fn note_alloc(size: usize) {
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc(l) };
+        let p = unsafe { Inner.alloc(l) };
         if !p.is_null() {
             note_alloc(l.size());
         }
         p
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc_zeroed(l) };
+        let p = unsafe { Inner.alloc_zeroed(l) };
         if !p.is_null() {
             note_alloc(l.size());
         }
@@ -78,10 +82,10 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         LIVE.fetch_sub(l.size() as u64, Ordering::Relaxed);
-        unsafe { System.dealloc(p, l) }
+        unsafe { Inner.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        let q = unsafe { System.realloc(p, l, new) };
+        let q = unsafe { Inner.realloc(p, l, new) };
         if !q.is_null() {
             let (old, new) = (l.size() as u64, new as u64);
             ALLOC_BYTES.fetch_add(new.saturating_sub(old), Ordering::Relaxed);

@@ -79,6 +79,7 @@ impl QuickSearchApp {
                                 ("Finishing the previous run…".to_string(), None)
                             }
                             PrepStep::OpeningIndex => ("Opening the index…".to_string(), None),
+                            PrepStep::Starting => ("Getting the index ready…".to_string(), None),
                             PrepStep::Reconciling(r) => (
                                 format!(
                                     "Applying configuration change · {} entries",
@@ -116,10 +117,12 @@ impl QuickSearchApp {
                     IndexingStatus::Optimizing => {
                         ui.label(egui::RichText::new("Optimizing index…").small());
                     }
-                    IndexingStatus::Running { roots, .. } => {
+                    IndexingStatus::Running {
+                        roots, maintenance, ..
+                    } => {
                         let colors = palette(ui.visuals().dark_mode);
                         let rate = self.manage.speed.files_per_sec();
-                        status_line(ui, &running_line(roots, rate, &colors));
+                        status_line(ui, &running_line(roots, *maintenance, rate, &colors));
                         progress_widget(ui, overall_progress(roots).fraction());
                     }
                 }
@@ -181,12 +184,18 @@ fn status_line(ui: &mut egui::Ui, spans: &[Span]) {
     ui.label(job);
 }
 
-/// The bottom bar's line for a run in progress.
-fn running_line(roots: &[RootProgress], rate: Option<f64>, colors: &Palette) -> Vec<Span> {
-    let phase = if roots.iter().any(|r| r.phase == RootPhase::Walking) {
-        colors.yellow
-    } else {
-        colors.green
+/// The bottom bar's line for a run in progress. An upkeep step outranks the
+/// per-root phases: while one runs it is the only thing moving.
+fn running_line(
+    roots: &[RootProgress],
+    maintenance: Option<MaintenanceStep>,
+    rate: Option<f64>,
+    colors: &Palette,
+) -> Vec<Span> {
+    let (word, phase) = match maintenance {
+        Some(_) => ("Maintenance", colors.orange),
+        None if roots.iter().any(|r| r.phase == RootPhase::Walking) => ("Indexing", colors.yellow),
+        None => ("Indexing", colors.green),
     };
     let done = roots.iter().filter(|r| r.phase == RootPhase::Done).count();
     let progress = overall_progress(roots);
@@ -210,7 +219,15 @@ fn running_line(roots: &[RootProgress], rate: Option<f64>, colors: &Palette) -> 
     if total_workers > 0 {
         rest.push_str(&format!(" · {}/{} workers", active, total_workers));
     }
-    vec![("Indexing".to_string(), Some(phase)), (rest, None)]
+    if let Some(step) = maintenance {
+        // Last, and without the ellipsis the tab's own line carries: the bar
+        // is one sentence, not a heading.
+        rest.push_str(&format!(
+            " · {}",
+            crate::format::fmt_maintenance(step).trim_end_matches('…')
+        ));
+    }
+    vec![(word.to_string(), Some(phase)), (rest, None)]
 }
 
 fn idle_line(mode: IndexMode, files: i64, colors: &Palette) -> Vec<Span> {
@@ -270,6 +287,7 @@ mod tests {
             line(&running_line(
                 &[root(RootPhase::Walking, 100, Some(1000))],
                 None,
+                None,
                 &colors
             )),
             "Indexing 100 / 1,000 (10%) · 2/4 workers"
@@ -278,6 +296,7 @@ mod tests {
         assert_eq!(
             line(&running_line(
                 &[root(RootPhase::Walking, 100, None)],
+                None,
                 None,
                 &colors
             )),
@@ -294,16 +313,44 @@ mod tests {
         done.active_workers = 0;
         done.total_workers = 0;
         assert_eq!(
-            line(&running_line(&[extracting, done], Some(120.0), &colors)),
+            line(&running_line(
+                &[extracting, done],
+                None,
+                Some(120.0),
+                &colors
+            )),
             "Indexing 2,200 / 2,800 (79%) · 1/2 roots done · 120 files/s · 3/4 workers"
         );
+    }
+
+    /// The counters are still the run's last true position; only the phase
+    /// word and the trailing clause say that nothing is moving.
+    #[test]
+    fn an_upkeep_step_renames_the_phase_and_names_itself() {
+        let colors = palette(true);
+        let spans = running_line(
+            &[root(RootPhase::Extracting, 100, Some(1000))],
+            Some(MaintenanceStep::Checkpoint),
+            None,
+            &colors,
+        );
+        assert_eq!(
+            line(&spans),
+            "Maintenance 100 / 100 (100%) · 2/4 workers · Compacting the write-ahead log"
+        );
+        assert_eq!(spans[0].1, Some(colors.orange));
     }
 
     #[test]
     fn only_the_phase_word_of_the_running_line_is_hinted() {
         for dark in [true, false] {
             let colors = palette(dark);
-            let spans = running_line(&[root(RootPhase::Walking, 100, Some(1000))], None, &colors);
+            let spans = running_line(
+                &[root(RootPhase::Walking, 100, Some(1000))],
+                None,
+                None,
+                &colors,
+            );
             assert_eq!(spans[0].0, "Indexing");
             assert_eq!(spans[0].1, Some(colors.yellow), "dark_mode={}", dark);
             assert!(
@@ -317,7 +364,7 @@ mod tests {
     #[test]
     fn the_running_hint_follows_the_least_advanced_root() {
         let colors = palette(true);
-        let hint = |roots: &[RootProgress]| running_line(roots, None, &colors)[0].1;
+        let hint = |roots: &[RootProgress]| running_line(roots, None, None, &colors)[0].1;
 
         assert_eq!(
             hint(&[
@@ -338,6 +385,21 @@ mod tests {
             hint(&[root(RootPhase::Done, 100, None)]),
             Some(colors.green)
         );
+        // Upkeep outranks every phase: it is the only thing running.
+        for phase in [RootPhase::Walking, RootPhase::Extracting, RootPhase::Done] {
+            assert_eq!(
+                running_line(
+                    &[root(phase, 100, Some(1000))],
+                    Some(MaintenanceStep::MergingText),
+                    None,
+                    &colors
+                )[0]
+                .1,
+                Some(colors.orange),
+                "{:?}",
+                phase
+            );
+        }
     }
 
     #[test]

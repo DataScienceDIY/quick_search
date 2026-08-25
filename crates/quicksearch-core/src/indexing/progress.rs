@@ -11,6 +11,22 @@ pub enum RootPhase {
     Done,
 }
 
+/// Index upkeep the writer stops file work to do. Every one of these blocks
+/// the writer, so the per-root counters are frozen for its whole life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaintenanceStep {
+    /// Folding the write-ahead log back into the index file.
+    Checkpoint,
+    /// Deleting the rows of files that are no longer on disk.
+    RemovingStale,
+    /// Merging the full-text index's segments.
+    MergingText,
+    /// Re-reading each root's stored totals.
+    RootCounts,
+    /// Marking files above the size limit as having no text.
+    SizeLimit,
+}
+
 /// Progress for one indexing root; the GUI shows one row per root.
 #[derive(Debug, Clone)]
 pub struct RootProgress {

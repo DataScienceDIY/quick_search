@@ -197,6 +197,22 @@ mod census {
         true
     }
 
+    /// One tail step's cost, in the two numbers the end-of-run WAL bug was
+    /// about: how long it held the writer and what it left in the log.
+    ///
+    /// Autocheckpoint is off across the tail, so a per-step reading is the
+    /// only way to say which step is responsible for the log's peak.
+    /// `db::repo::maintain` emits the same shape for the half that runs after
+    /// this connection has gone.
+    pub(super) fn tail(step: &str, db_path: &str, started: Instant) {
+        crate::log_info!(
+            "tail t={:.1}s  wal {}  after {}",
+            started.elapsed().as_secs_f64(),
+            mib(super::wal_len(&format!("{}-wal", db_path))),
+            step
+        );
+    }
+
     /// One line per structure group: the log collapses embedded newlines, so
     /// a multi-line report would arrive as one unreadable line.
     pub(super) fn report(cx: &RunCx<'_>, pipelines: &[RootPipeline], started: Instant) {
@@ -231,7 +247,7 @@ mod census {
                 .iter()
                 .map(|r| {
                     (crate::file_handling::outcome_body(&r.outcome).map_or(0, str::len)
-                        + r.name.len()) as u64
+                        + r.name().len()) as u64
                 })
                 .sum();
             crate::log_info!(
@@ -456,6 +472,7 @@ impl RootPipeline {
             // Counting the range is the pass's job, on its own connection —
             // on the writer it is seconds of every other walk standing still.
             {
+                let _maintaining = cx.maintaining(MaintenanceStep::SizeLimit);
                 let conn = crate::lock_ok(&cx.conn_mutex);
                 mark_oversize_pending_na(&conn, &cursor, cx.config)?;
             }
@@ -513,7 +530,7 @@ impl RootPipeline {
             let stored = store_extracted(&cx.conn_mutex, ready, cx.stop_flag, cx.config, deadline)?;
             if stored.consumed > 0 {
                 // The last row *written*, not the last fetched.
-                *current_file = Some(ready[stored.consumed - 1].name.clone());
+                *current_file = Some(ready[stored.consumed - 1].name().to_string());
             }
             ready.drain(..stored.consumed);
             *written += stored.written;
@@ -549,6 +566,8 @@ pub(super) struct RunCx<'a> {
     pub(super) config: &'a Config,
     pub(super) db_path: &'a str,
     pub(super) stop_flag: &'a Arc<AtomicBool>,
+    /// Where an upkeep step announces itself; see [`RunCx::maintaining`].
+    pub(super) status: Arc<Mutex<IndexingStatus>>,
     /// Walk workers use it to finish small text files without the content pass.
     pub(super) registry: Arc<Registry>,
     pub(super) quantum: usize,
@@ -568,12 +587,14 @@ impl<'a> RunCx<'a> {
         config: &'a Config,
         db_path: &'a str,
         stop_flag: &'a Arc<AtomicBool>,
+        status: Arc<Mutex<IndexingStatus>>,
     ) -> RunCx<'a> {
         RunCx {
             conn_mutex,
             config,
             db_path,
             stop_flag,
+            status,
             registry: Arc::new(Registry::default_set()),
             quantum: config.processing.batch_size.max(1),
             slice: Duration::from_millis(config.processing.writer_turn_slice_ms),
@@ -582,10 +603,45 @@ impl<'a> RunCx<'a> {
             stale_cleanup_ok: true,
         }
     }
+
+    /// Mark the run as inside `step` for as long as the returned guard lives:
+    /// the writer is doing index upkeep, not file work, and the last per-file
+    /// snapshot would otherwise sit frozen and read as a hang.
+    ///
+    /// An annotation on the snapshot already published, so the counters keep
+    /// their last true values, `Stopping` is left alone, and the guard borrows
+    /// nothing from `cx` — every caller holds it mutably for the wrapped work.
+    pub(super) fn maintaining(&self, step: MaintenanceStep) -> MaintenanceGuard {
+        set_maintenance(&self.status, Some(step));
+        MaintenanceGuard {
+            status: self.status.clone(),
+        }
+    }
+}
+
+/// Clears the step its [`RunCx::maintaining`] set.
+pub(super) struct MaintenanceGuard {
+    status: Arc<Mutex<IndexingStatus>>,
+}
+
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        set_maintenance(&self.status, None);
+    }
+}
+
+/// Annotate the published run, if there still is one: a status that has moved
+/// on to `Stopping` is the command thread's, and a step is not news worth
+/// resurrecting a run for.
+fn set_maintenance(status: &Arc<Mutex<IndexingStatus>>, step: Option<MaintenanceStep>) {
+    if let IndexingStatus::Running { maintenance, .. } = &mut *crate::lock_ok(status) {
+        *maintenance = step;
+    }
 }
 
 /// Publish a status snapshot. Never clobbers Stopping — the command thread
-/// owns that transition.
+/// owns that transition. Always clears any upkeep step: fresh per-file
+/// figures mean the writer is back on files.
 fn publish_status(
     status: &Arc<Mutex<IndexingStatus>>,
     run_start: Instant,
@@ -597,6 +653,7 @@ fn publish_status(
         *g = IndexingStatus::Running {
             start_time: run_start,
             roots,
+            maintenance: None,
         };
     }
 }
@@ -674,11 +731,15 @@ fn build_pipeline(
 /// Reconcile deletions once every walk has ended — globally, because a file
 /// may be reachable through more than one root's symlinks. A no-op for a
 /// stopped or abnormally terminated run.
-fn cleanup_stale(pipelines: &mut [RootPipeline], cx: &mut RunCx<'_>) -> Result<(), String> {
+fn cleanup_stale(pipelines: &[RootPipeline], cx: &mut RunCx<'_>) -> Result<(), String> {
     let stopped = cx.stop_flag.load(Ordering::Relaxed);
     if !cx.stale_cleanup_ok || stopped {
         return Ok(());
     }
+    // The whole pass, not just the deleting: the sweep below reads every
+    // stored parent under every root, and the merge that ends the deletion is
+    // minutes of writer time on a big index.
+    let _maintaining = cx.maintaining(MaintenanceStep::RemovingStale);
     for p in pipelines.iter() {
         sweep_unvisited_parents(
             &cx.conn_mutex,
@@ -715,9 +776,6 @@ fn cleanup_stale(pipelines: &mut [RootPipeline], cx: &mut RunCx<'_>) -> Result<(
         }
     }
     if !stale_paths.is_empty() {
-        if let Some(first) = pipelines.first_mut() {
-            first.current_file = Some("Removing stale index entries…".to_string());
-        }
         let started = Instant::now();
         let stale_deleted = cleanup_stale_index_entries(
             &cx.conn_mutex,
@@ -778,6 +836,9 @@ impl IndexingService {
         {
             return Ok(());
         }
+        // Everything from here to the first walk is database work of its own;
+        // leaving the step on `Reconciling` reads as a reconcile that hung.
+        Self::set_prep_step(status, PrepStep::Starting);
         Self::update_config(&conn, config, &roots)?;
 
         // Failed files are retried once per run; only a retry can tell.
@@ -800,8 +861,14 @@ impl IndexingService {
         // Autocheckpoint off for the run: it can never reset the log while a
         // reader per root is live, so it copies pages back perpetually at full
         // price. Safe here and nowhere else — this writer bounds its own log
-        // (`wal_cap_for_volume`, the forced checkpoint below, the optimize
-        // pass); a writer without all three must keep the automatic one.
+        // (`wal_cap_for_volume`, the forced checkpoint below, and the pair
+        // bracketing the tail once the readers are dropped); a writer without
+        // all of them must keep the automatic one.
+        //
+        // The tail pair is not optional and was once missing. Deferring to "the
+        // optimize pass checkpoints at the end" left everything after the loop —
+        // the FTS merge above all — piling onto the log unbounded, and handed
+        // `repo::maintain` a full one to run a VACUUM on top of.
         if let Err(e) = conn.execute_batch("PRAGMA wal_autocheckpoint = 0;") {
             crate::log_warn!("could not disable autocheckpoint (non-fatal): {}", e);
         }
@@ -815,7 +882,7 @@ impl IndexingService {
         let count_cancel = Arc::new(AtomicBool::new(false));
         let _count_guard = CancelOnDrop(count_cancel.clone());
 
-        let mut cx = RunCx::new(conn_mutex, config, db_path, stop_flag);
+        let mut cx = RunCx::new(conn_mutex, config, db_path, stop_flag, status.clone());
 
         let stored_counts: Vec<Option<usize>> = {
             let conn = crate::lock_ok(&cx.conn_mutex);
@@ -887,7 +954,7 @@ impl IndexingService {
 
             if !cleanup_done && pipelines.iter().all(|p| p.phase != RootPhase::Walking) {
                 cleanup_done = true;
-                cleanup_stale(&mut pipelines, &mut cx)?;
+                cleanup_stale(&pipelines, &mut cx)?;
                 progressed = true;
             }
 
@@ -907,6 +974,7 @@ impl IndexingService {
                 && wal_len(&wal_path) >= checkpoint_at
             {
                 {
+                    let _maintaining = cx.maintaining(MaintenanceStep::Checkpoint);
                     let conn = crate::lock_ok(&cx.conn_mutex);
                     if let Err(e) = crate::db::repo::checkpoint_truncate(&conn) {
                         crate::log_warn!("{}", e);
@@ -957,6 +1025,28 @@ impl IndexingService {
             }
         }
 
+        // The tail's readers, released before any of its writing. Every
+        // per-root walk prefetcher and content feeder lives in `pipelines`, and
+        // a read mark held by any one of them turns a TRUNCATE checkpoint into
+        // a silent PASSIVE one that truncates nothing — see
+        // [`repo::checkpoint_truncate`]. Nothing below reads `pipelines`: the
+        // stale cleanup and every status publish are inside the loop, and the
+        // counts iterate `roots`.
+        #[cfg(feature = "probe")]
+        let tail_started = Instant::now();
+        drop(pipelines);
+        #[cfg(feature = "probe")]
+        census::tail("dropping the readers", db_path, tail_started);
+
+        // First half of the pair that bounds the tail. It lands the run's own
+        // writing, so whatever the log holds from here is the tail's alone —
+        // which is what makes the FTS merge's cost legible rather than mixed
+        // in with a run's worth of log. On the stopped path too: that is
+        // exactly when the log is largest.
+        checkpoint_tail(&cx, interrupt);
+        #[cfg(feature = "probe")]
+        census::tail("tail checkpoint", db_path, tail_started);
+
         if aborted {
             // Nothing is landed on the way out — "a stopped run promises
             // nothing"; the next run finds it all again. No stale cleanup
@@ -978,33 +1068,65 @@ impl IndexingService {
         );
 
         {
+            let _maintaining = cx.maintaining(MaintenanceStep::MergingText);
             let conn = crate::lock_ok(&cx.conn_mutex);
             fts_finalize_after_text_indexing(&conn);
         }
+        #[cfg(feature = "probe")]
+        census::tail("the FTS merge", db_path, tail_started);
 
-        // An absent stamp reads as "never indexed" and `periodic_due` starts
-        // another full run on the very next tick.
-        let now = crate::log::now_unix();
-        let conn = crate::lock_ok(&cx.conn_mutex);
-        if let Err(e) = crate::db::repo::set_last_full_index(&conn, now) {
-            crate::log_warn!("{}", e);
-        }
+        {
+            // An absent stamp reads as "never indexed" and `periodic_due`
+            // starts another full run on the very next tick.
+            let now = crate::log::now_unix();
+            let conn = crate::lock_ok(&cx.conn_mutex);
+            if let Err(e) = crate::db::repo::set_last_full_index(&conn, now) {
+                crate::log_warn!("{}", e);
+            }
 
-        // Per-root figures, while the pages are warm; under the interrupt
-        // guard because quitting should not wait out a per-root scan.
-        let _guard = db::InterruptGuard::arm(interrupt, &conn);
-        for root in &roots {
-            let range = ExtractCursor::for_root(root);
-            match repo::count_root(&conn, &range.lo, &range.hi) {
-                Ok(counts) => {
-                    if let Err(e) = repo::set_root_counts(&conn, root, counts) {
-                        crate::log_warn!("{}", e);
+            // Per-root figures, while the pages are warm; under the interrupt
+            // guard because quitting should not wait out a per-root scan.
+            let _maintaining = cx.maintaining(MaintenanceStep::RootCounts);
+            let _guard = db::InterruptGuard::arm(interrupt, &conn);
+            for root in &roots {
+                let range = ExtractCursor::for_root(root);
+                match repo::count_root(&conn, &range.lo, &range.hi) {
+                    Ok(counts) => {
+                        if let Err(e) = repo::set_root_counts(&conn, root, counts) {
+                            crate::log_warn!("{}", e);
+                        }
                     }
+                    Err(e) => crate::log_warn!("counts for {} unavailable: {}", root, e),
                 }
-                Err(e) => crate::log_warn!("counts for {} unavailable: {}", root, e),
             }
         }
+        #[cfg(feature = "probe")]
+        census::tail("the per-root counts", db_path, tail_started);
+
+        // Second half of the pair. `repo::maintain` runs next on its own
+        // connection and VACUUMs, whose copy-back pushes the whole database
+        // through the log — so it has to start from an empty one. Its own
+        // leading checkpoint cannot be relied on for that: it is best-effort
+        // and swallows the failure.
+        checkpoint_tail(&cx, interrupt);
+        #[cfg(feature = "probe")]
+        census::tail("tail checkpoint", db_path, tail_started);
 
         Ok(())
+    }
+}
+
+/// Land the log during the tail. Autocheckpoint is off for this connection
+/// (see `run_indexing`), so between the writer loop and `repo::maintain`
+/// nothing else will.
+///
+/// Under the interrupt guard: a quit must not start waiting on a checkpoint's
+/// lock, and an abandoned log is safe — the next run lands it.
+fn checkpoint_tail(cx: &RunCx<'_>, interrupt: &db::InterruptSlot) {
+    let _maintaining = cx.maintaining(MaintenanceStep::Checkpoint);
+    let conn = crate::lock_ok(&cx.conn_mutex);
+    let _guard = db::InterruptGuard::arm(interrupt, &conn);
+    if let Err(e) = crate::db::repo::checkpoint_truncate(&conn) {
+        crate::log_warn!("{}", e);
     }
 }

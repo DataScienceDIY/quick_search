@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::config::Config;
-use crate::extract::Registry;
+use crate::extract::{Registry, Scratch};
 use crate::mime::guess_mime_from_head;
 
 use super::*;
@@ -137,8 +137,8 @@ fn content_extractable_is_decide_contents_not_applicable() {
             let p = root.join(name);
             let path = p.to_str().unwrap();
             let mime = guess_mime_from_head(&p, body);
-            let claimed = content_extractable(&p, mime.as_deref(), &cfg, &registry);
-            let outcome = decide_content(path, mime.as_deref(), &registry, &cfg);
+            let claimed = content_extractable(&p, mime, &cfg, &registry);
+            let outcome = decide_content(path, mime, &registry, &cfg, &mut Scratch::new(&cfg));
             assert_eq!(
                 claimed,
                 outcome != ContentOutcome::NotApplicable,
@@ -163,7 +163,7 @@ fn prepare_file_record_marks_only_claimable_files() {
     let needs = |cfg: &Config, name: &str| -> bool {
         let p = root.join(name);
         let meta = std::fs::metadata(&p).unwrap();
-        prepare_file_record(p.to_str().unwrap(), &meta, cfg, &registry)
+        prepare_file_record(p.to_str().unwrap(), &meta, cfg, &registry, &mut Scratch::new(&Config::default()))
             .expect("regular file")
             .needs_content
     };
@@ -231,7 +231,7 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
         .map(|name| {
             let p = root.join(name);
             let meta = std::fs::metadata(&p).unwrap();
-            prepare_file_record(p.to_str().unwrap(), &meta, &config, &registry)
+            prepare_file_record(p.to_str().unwrap(), &meta, &config, &registry, &mut Scratch::new(&Config::default()))
                 .expect("regular file")
         })
         .collect();

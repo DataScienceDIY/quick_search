@@ -1,8 +1,8 @@
 //! Encryption must cost a constant factor, not a different algorithm.
 //!
-//! SQLCipher decrypts and HMAC-verifies every 4 KiB page it reads, so a keyed
-//! index is intrinsically slower than a plain one — that part is not a bug and
-//! this file does not try to gate it. What it gates is *amplification*: a query
+//! SQLCipher AES-decrypts every page it reads, so a keyed index is
+//! intrinsically slower than a plain one — that part is not a bug and this
+//! file does not try to gate it. What it gates is *amplification*: a query
 //! whose cost is one page fetch per row is fine unencrypted (the page cache
 //! makes it nearly free) and disastrous keyed. `find_duplicate_groups` was
 //! exactly that until it was rewritten to stay inside `idx_files_hash`:
@@ -14,40 +14,87 @@
 //!
 //! Measured on 400k rows, so the ceiling below sits between those two: the old
 //! shape fails it, the current one passes with room. The ratio is what makes
-//! this a *test* rather than a benchmark — both arms run the same workload on
+//! this a *test* rather than a benchmark — every arm runs the same workload on
 //! the same machine in the same process, so host speed, CPU governor and CI
 //! contention divide out. Absolute times are printed but never asserted.
+//!
+//! Since `db::schema::HMAC_MODE` became `Off` the constant factor is much
+//! smaller — every shape here now runs 1.03–1.20x, where the same shapes were
+//! up to 1.3x with a per-page HMAC-SHA512 to pay as well.
+//!
+//! # Size
+//!
+//! Four arms, because the second variable is FTS5's *record* size. A table
+//! leaf holds `page − reserve − 35` bytes inline, where a plain file's reserve
+//! is 0 and a keyed one's is `HMAC_MODE.reserve()`. FTS5's own default record
+//! of 4050 was chosen to fit a plain 4096 page; `db::schema::fts_pgsz_for`
+//! derives it from the profile instead. Measured at 120k files,
+//! `schema::PAGE_SIZE` = 8192:
+//!
+//! | arm | size | fts leaves | overflow |
+//! |---|---|---|---|
+//! | plain, pgsz 4050 | 131.3 MiB | 10986 | 0 |
+//! | plain, derived | 130.8 MiB | 10922 | 0 |
+//! | keyed, pgsz 4050 | 131.2 MiB | 10986 | 0 |
+//! | keyed, derived | 130.9 MiB | 10942 | 0 |
+//!
+//! Encrypted over plain on disk: **1.001x**.
+//!
+//! **The `_4050` arms no longer demonstrate much, and that is the change
+//! rather than a defect in them.** They existed because a keyed page used to
+//! give up 80 bytes, which left a keyed 8192 page holding only *one*
+//! 4052-byte record — two would not fit under the 8077-byte limit — so half of
+//! every page went empty and the index came out at 221.0 MiB, 1.688x plain.
+//! At a 16-byte reserve the limit is 8141 and two fit with room, so FTS5's
+//! fixed default happens to be fine here. It is still wrong at other page
+//! sizes, which is why the derivation stays and why these arms still assert
+//! `derived <= pinned` — just with a much smaller margin than they used to.
+//!
+//! The query times are unmoved by leaf geometry, within this seed's noise: the
+//! working set is served from the search cache either way, so it shows up on
+//! disk long before it shows up here. `benches/page_geometry.rs` is where it
+//! is timed, on corpora that do not fit, and `benches/cipher_hmac.rs` is where
+//! the authenticator itself was priced.
 //!
 //! Its own integration binary because it installs a process-global key, the
 //! same reason `tests/encrypted.rs` gives.
 
-use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use quicksearch_core::db;
 use quicksearch_core::query::split::split_for_cascade;
 use quicksearch_core::search::{cascade, find_duplicate_groups, SearchHit, SearchOptions};
-use quicksearch_core::security::IndexKey;
-use quicksearch_core::testutil::{scratch_db, seed_index, SeedSpec, BODY_TERM, NEEDLE};
+use quicksearch_core::testutil::{
+    measurement_key, seed_arms, Arm, SeedSpec, ARM_KEYED, ARM_KEYED_4050, ARM_PLAIN,
+    ARM_PLAIN_4050, BODY_TERM, NEEDLE,
+};
 
-/// A raw 32-byte key, not an Argon2id derivation: the KDF costs half a second
-/// in release and minutes in debug, and proves nothing about page work. It
-/// reaches SQLCipher as raw hex either way (see `db::open::key_and_probe`), so
-/// what is measured below is identical to a real unlocked index.
-const KEY_HEX: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+/// Ceiling on encrypted/plain for one workload. It still has to sit under the
+/// 3.9x the old duplicate query cost — that is the regression this gate is
+/// for — but it no longer has to leave room for a per-page HMAC: with
+/// `HMAC_MODE` off the worst shape measures 1.20x, so 2.0 is 66% of headroom
+/// over the worst observed and still fails the amplified shape outright.
+/// Raising this without a measurement in the table above defeats it.
+const MAX_RATIO: f64 = 2.0;
 
-/// Ceiling on encrypted/plain for one workload. Between the 3.9x the old
-/// duplicate query cost and the 1.3x the current one costs; see the table
-/// above. Raising this without a measurement in the same table defeats it.
-const MAX_RATIO: f64 = 3.0;
+/// Ceiling on the encrypted index's *size* relative to the plain one, both as
+/// shipped. Measured at 1.001x: `fts_pgsz_for` hands the reserve back to the
+/// leaves, so a protected index is now the same size as an unprotected one.
+/// The ceiling keeps room for a corpus whose table mix differs.
+const MAX_SIZE_RATIO: f64 = 1.03;
 
 /// Enough rows that neither index fits in `PRAGMAS_SEARCH`'s 32 MiB page
 /// cache — the only regime where a per-page decrypt is visible at all. Below
 /// that both arms are served from cache, every ratio is 1.0, and the gate
-/// silently stops testing anything. `index_is_larger_than_the_search_cache`
-/// pins that this seed still clears it.
-const FILES: usize = 60_000;
+/// silently stops testing anything. The assertion below pins that this seed
+/// still clears it.
+///
+/// Raised from 60k when `schema::PAGE_SIZE` became 8192: the same queries got
+/// fast enough that `cascade literal name` and `cascade wildcard` fell under
+/// [`MIN_MEASURABLE`], which is that guard working, not failing. The seed has
+/// to grow when the code outruns it.
+const FILES: usize = 120_000;
 const CONTENT_EVERY: usize = 5;
 
 /// The cache the search connection actually opens with, from
@@ -75,31 +122,8 @@ fn spec() -> SeedSpec {
     }
 }
 
-fn key() -> IndexKey {
-    IndexKey::from_hex(KEY_HEX).expect("a 64-hex-digit key")
-}
-
-/// Seed the same corpus twice, once plain and once keyed. Identical content
-/// and identical insertion order, so the two indexes differ *only* by
-/// encryption — which is what lets a display-limited query be compared at all
-/// (the cascade stops when the limit fills, so a different rowid order would
-/// decide the answer rather than the encryption).
-fn seed_both() -> (PathBuf, PathBuf) {
-    let plain = scratch_db("encperf-plain");
-    let keyed = scratch_db("encperf-keyed");
-
-    db::set_process_key(None);
-    seed_index(&plain, &spec());
-
-    db::set_process_key(Some(key()));
-    seed_index(&keyed, &spec());
-    db::set_process_key(None);
-
-    (plain, keyed)
-}
-
-fn mib(path: &PathBuf) -> f64 {
-    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0)
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
 }
 
 /// Run `f` `RUNS` times, keeping the fastest.
@@ -113,39 +137,44 @@ fn best_of(mut f: impl FnMut()) -> Duration {
     best
 }
 
-/// One workload's verdict. Collected rather than asserted inline so a run
-/// reports *every* ratio, not just the first one that failed.
+/// One workload timed on every arm, in `seed_arms` order. Collected rather
+/// than asserted inline so a run reports *every* ratio, not just the first one
+/// that failed.
 struct Measured {
     what: &'static str,
-    plain: Duration,
-    keyed: Duration,
+    per_arm: Vec<Duration>,
 }
 
 impl Measured {
+    /// Encrypted over plain, both as shipped — the ratio this file exists to
+    /// gate.
     fn ratio(&self) -> f64 {
-        self.keyed.as_secs_f64() / self.plain.as_secs_f64()
+        self.per_arm[SHIPPED_KEYED].as_secs_f64() / self.per_arm[SHIPPED_PLAIN].as_secs_f64()
     }
 
     fn line(&self) -> String {
-        format!(
-            "{:<28} plain {:>9.2?}   encrypted {:>9.2?}   ratio {:>5.2}x",
-            self.what,
-            self.plain,
-            self.keyed,
-            self.ratio()
-        )
+        let times: String = self
+            .per_arm
+            .iter()
+            .map(|d| format!("{:>18.2?}", d))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{:<28}{}   ratio {:>5.2}x", self.what, times, self.ratio())
     }
 }
 
 /// Time `find_duplicate_groups`, which opens its own connection — so the
 /// process key has to be right at call time, not at open time.
-fn time_duplicates(path: &PathBuf, keyed: bool) -> Duration {
-    let db_path = path.to_string_lossy().into_owned();
-    best_of(|| {
-        db::set_process_key(keyed.then(key));
+fn time_duplicates(arm: &Arm) -> Duration {
+    let db_path = arm.path.to_string_lossy().into_owned();
+    let keyed = arm.keyed;
+    let out = best_of(|| {
+        db::set_process_key(keyed.then(measurement_key));
         let groups = find_duplicate_groups(&db_path, 200).expect("duplicate scan");
         assert!(!groups.is_empty(), "the seed must contain duplicate groups");
-    })
+    });
+    db::set_process_key(None);
+    out
 }
 
 /// Time one cascade query on a connection opened while its key state was
@@ -166,27 +195,42 @@ fn time_query(conn: &rusqlite::Connection, query: &str, fuzzy: bool) -> Duration
     })
 }
 
+/// Aliases for `testutil`'s arm order, naming the pair that is the shipped
+/// product; the other two exist only to price the change against.
+const SHIPPED_PLAIN: usize = ARM_PLAIN;
+const SHIPPED_KEYED: usize = ARM_KEYED;
+
 #[test]
 fn encryption_costs_a_constant_factor_not_a_different_algorithm() {
-    let (plain, keyed) = seed_both();
+    let arms = seed_arms("encperf", &spec());
 
-    // Both connections are opened up front, each under its own key state.
-    db::set_process_key(None);
-    let plain_conn = db::open::open_search_reader(&plain.to_string_lossy()).expect("open plain");
-    db::set_process_key(Some(key()));
-    let keyed_conn = db::open::open_search_reader(&keyed.to_string_lossy()).expect("open keyed");
-    db::set_process_key(None);
+    // Every connection is opened up front, each under its own key state.
+    let conns: Vec<rusqlite::Connection> = arms.iter().map(Arm::open_search).collect();
 
     println!(
-        "seeded {} files ({} with content): plain {:.1} MiB, encrypted {:.1} MiB",
+        "seeded {} files ({} with content) per arm\n",
         FILES,
         FILES / CONTENT_EVERY,
-        mib(&plain),
-        mib(&keyed),
     );
+    println!(
+        "{:<28}{:>10}{:>12}{:>12}",
+        "arm", "size", "fts leaves", "overflow"
+    );
+    for arm in &arms {
+        let (leaf, overflow) = arm.fts_pages();
+        println!(
+            "{:<28}{:>7.1} MiB{:>12}{:>12}",
+            arm.what,
+            mib(arm.size_bytes()),
+            leaf,
+            overflow
+        );
+    }
+    println!();
+
     assert!(
-        (mib(&plain) * 1024.0 * 1024.0) as u64 > SEARCH_CACHE_BYTES,
-        "seed is smaller than the {} MiB search cache, so both arms would be \
+        arms[SHIPPED_PLAIN].size_bytes() > SEARCH_CACHE_BYTES,
+        "seed is smaller than the {} MiB search cache, so every arm would be \
          served entirely from memory and every ratio below would be a \
          meaningless 1.0 — raise FILES",
         SEARCH_CACHE_BYTES / (1024 * 1024)
@@ -195,12 +239,11 @@ fn encryption_costs_a_constant_factor_not_a_different_algorithm() {
     // Duplicate finding first: it is the shape this gate exists for.
     let mut measured = vec![Measured {
         what: "find_duplicate_groups",
-        plain: time_duplicates(&plain, false),
-        keyed: time_duplicates(&keyed, true),
+        per_arm: arms.iter().map(time_duplicates).collect(),
     }];
 
     // The cascade's four shapes. Arms alternate per workload so a machine that
-    // slows down partway through moves both sides, not one.
+    // slows down partway through moves all of them, not one.
     for (what, query, fuzzy) in [
         ("cascade literal name", NEEDLE, false),
         ("cascade literal body", BODY_TERM, false),
@@ -210,18 +253,62 @@ fn encryption_costs_a_constant_factor_not_a_different_algorithm() {
     ] {
         measured.push(Measured {
             what,
-            plain: time_query(&plain_conn, query, fuzzy),
-            keyed: time_query(&keyed_conn, query, fuzzy),
+            per_arm: conns
+                .iter()
+                .map(|conn| time_query(conn, query, fuzzy))
+                .collect(),
         });
     }
 
+    println!(
+        "\n{:<28}{}",
+        "workload",
+        arms.iter()
+            .map(|a| format!("{:>18}", a.what))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     for m in &measured {
         println!("{}", m.line());
     }
 
+    // Deriving the record size from the page size has to beat pinning FTS5's
+    // own 4050 — for *both* key states. It used to be a keyed-only concern,
+    // when the page size was the 4096 that 4050 was chosen for; at
+    // `schema::PAGE_SIZE` neither key state gets a fitting leaf by accident.
+    for (pinned, derived, what) in [
+        (ARM_PLAIN_4050, SHIPPED_PLAIN, "plain"),
+        (ARM_KEYED_4050, SHIPPED_KEYED, "keyed"),
+    ] {
+        let (before, after) = (arms[pinned].size_bytes(), arms[derived].size_bytes());
+        assert!(
+            after <= before,
+            "the derived pgsz costs the {} index space: {:.1} MiB against \
+             {:.1} MiB on FTS5's fixed 4050",
+            what,
+            mib(after),
+            mib(before)
+        );
+    }
+    let keyed_after = arms[SHIPPED_KEYED].size_bytes();
+    let size_ratio = keyed_after as f64 / arms[SHIPPED_PLAIN].size_bytes() as f64;
+    println!("\nencrypted/plain on disk: {:.3}x", size_ratio);
+    assert!(
+        size_ratio <= MAX_SIZE_RATIO,
+        "an encrypted index is {:.3}x the plain one on disk, over the {:.2}x \
+         ceiling — the usual cause is FTS5 leaves that no longer fit inside \
+         SQLCipher's reduced usable page",
+        size_ratio,
+        MAX_SIZE_RATIO
+    );
+
+    // Only the shipped pair: nothing is asserted about the two `pgsz 4050`
+    // arms, so their timings being at the noise floor costs a reader nothing.
     let too_short: Vec<&Measured> = measured
         .iter()
-        .filter(|m| m.plain < MIN_MEASURABLE || m.keyed < MIN_MEASURABLE)
+        .filter(|m| {
+            m.per_arm[SHIPPED_PLAIN] < MIN_MEASURABLE || m.per_arm[SHIPPED_KEYED] < MIN_MEASURABLE
+        })
         .collect();
     assert!(
         too_short.is_empty(),

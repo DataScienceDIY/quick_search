@@ -10,33 +10,60 @@ use super::*;
 use crate::config::Config;
 use crate::db::repo::{self};
 
-/// The compressed sidecar for one row, or `None` where there is none to
-/// write. `Err` is kept per row rather than failing the batch.
-type Body = Result<Option<Vec<u8>>, String>;
+/// One writer's compressed sidecars: a batch's blobs end to end in `arena`,
+/// with `slots[i]` saying where row `i`'s is — or that it has none, or that
+/// its compression failed (kept per row rather than failing the batch).
+///
+/// Everything here is reused across chunks. The encoder because building a
+/// zstd context per chunk is wasted CPU (`benches/index.rs`, `zstd_encode`);
+/// the arena because a `Vec` per row was one allocation per indexed
+/// document, and the writer sees every one of them.
+struct Bodies {
+    enc: repo::DocEncoder,
+    arena: Vec<u8>,
+    slots: Vec<Result<Option<std::ops::Range<usize>>, String>>,
+}
 
-/// Compress a batch's bodies through one context, before the caller takes
-/// the connection — the lock covers only the SQL, and one reused
-/// [`repo::DocEncoder`] cuts compression ~4.7x (`benches/index.rs`).
-fn compress_bodies<'a>(
-    texts: impl Iterator<Item = Option<&'a str>>,
-    config: &Config,
-) -> Result<Vec<Body>, String> {
-    let mut enc = repo::DocEncoder::new()?;
-    Ok(texts
-        .map(|text| match text {
-            Some(t) if config.processing.store_text_for_snippets && !t.is_empty() => {
-                enc.encode(t).map(Some)
-            }
-            _ => Ok(None),
+impl Bodies {
+    fn new() -> Result<Bodies, String> {
+        Ok(Bodies {
+            enc: repo::DocEncoder::new()?,
+            arena: Vec::new(),
+            slots: Vec::new(),
         })
-        .collect())
+    }
+
+    /// Compress one chunk's bodies, **before the caller takes the
+    /// connection**: the lock covers only the SQL.
+    fn fill<'a>(&mut self, texts: impl Iterator<Item = Option<&'a str>>, config: &Config) {
+        self.arena.clear();
+        self.slots.clear();
+        for text in texts {
+            let slot = match text {
+                Some(t) if config.processing.store_text_for_snippets && !t.is_empty() => {
+                    self.enc.encode_into(t, &mut self.arena).map(Some)
+                }
+                _ => Ok(None),
+            };
+            self.slots.push(slot);
+        }
+    }
+
+    /// Row `i`'s blob, or why there is none.
+    fn get(&self, i: usize) -> Result<Option<&[u8]>, &str> {
+        match &self.slots[i] {
+            Ok(Some(at)) => Ok(Some(&self.arena[at.clone()])),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// The sidecar blob for row `i`, or a logged skip if its compression failed.
 macro_rules! body_or_skip {
     ($bodies:expr, $i:expr, $what:expr) => {
-        match &$bodies[$i] {
-            Ok(b) => b.as_deref(),
+        match $bodies.get($i) {
+            Ok(b) => b,
             Err(e) => {
                 crate::log_warn!("compress text for {}: {}", $what, e);
                 continue;
@@ -60,13 +87,15 @@ fn write_prepared_records(
     chunk_size: usize,
     write_row: impl Fn(&rusqlite::Transaction<'_>, &OwnedNewFile) -> Result<Option<i64>, String>,
 ) -> Result<(), String> {
+    // One set of buffers for every chunk this call writes.
+    let mut bodies = Bodies::new()?;
     for batch in records.chunks(chunk_size) {
         if stop_flag.load(Ordering::Relaxed) {
             return Ok(());
         }
 
-        // Outside the lock — see `compress_bodies`.
-        let bodies = compress_bodies(batch.iter().map(|r| r.inline_text.as_deref()), config)?;
+        // Outside the lock — see `Bodies::fill`.
+        bodies.fill(batch.iter().map(|r| r.inline_text.as_deref()), config);
         let conn = crate::lock_ok(conn_mutex);
         let tx = conn
             .unchecked_transaction()
@@ -336,17 +365,19 @@ pub fn store_extracted(
     deadline: std::time::Instant,
 ) -> Result<Stored, String> {
     let mut done = Stored::default();
+    // One set of buffers for every chunk this turn writes.
+    let mut bodies = Bodies::new()?;
     for chunk in rows.chunks(STORE_CHUNK) {
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
-        // Outside the lock — see `compress_bodies`.
-        let bodies = compress_bodies(
+        // Outside the lock — see `Bodies::fill`.
+        bodies.fill(
             chunk
                 .iter()
                 .map(|r| crate::file_handling::outcome_body(&r.outcome)),
             config,
-        )?;
+        );
         let conn = crate::lock_ok(conn_mutex);
         let tx = conn
             .unchecked_transaction()
@@ -355,14 +386,12 @@ pub fn store_extracted(
         for (i, row) in chunk.iter().enumerate() {
             // Counted before anything can skip it: a failed row still leaves.
             done.consumed += 1;
-            match &bodies[i] {
-                Err(e) => crate::log_warn!("compress text for {}: {}", row.name, e),
-                Ok(zstd) => {
-                    match store_content_outcome(&tx, row.file_id, &row.outcome, zstd.as_deref()) {
-                        Ok(()) => done.written += 1,
-                        Err(e) => crate::log_warn!("content indexing for {}: {}", row.name, e),
-                    }
-                }
+            match bodies.get(i) {
+                Err(e) => crate::log_warn!("compress text for {}: {}", row.name(), e),
+                Ok(zstd) => match store_content_outcome(&tx, row.file_id, &row.outcome, zstd) {
+                    Ok(()) => done.written += 1,
+                    Err(e) => crate::log_warn!("content indexing for {}: {}", row.name(), e),
+                },
             }
             if stop_flag.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
                 cut = true;

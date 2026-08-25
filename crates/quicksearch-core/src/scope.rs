@@ -309,8 +309,8 @@ pub fn advance(
         }
     }
 
-    // Deletions leave FTS tombstones; automerge collapses them. Skipping it
-    // costs only tidiness — the next run's automerge does the same.
+    // Deletions leave FTS tombstones; a merge collapses them. Skipping it
+    // costs only tidiness — the next run's merge does the same.
     if cancelled(cancel) {
         return Ok(());
     }

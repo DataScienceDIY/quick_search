@@ -113,7 +113,7 @@ fn scan_one(path: &Path, size: u64, config: &Config, registry: &Registry) -> Opt
     }
 
     let extractable = size <= config.processing.maximum_text_file_size
-        && content_extractable(path, base_mime.as_deref(), config, registry);
+        && content_extractable(path, base_mime, config, registry);
 
     Some(Scan {
         size,
@@ -768,7 +768,7 @@ mod tests {
                     members: 10,
                     baseline_groups: 4,
                     reported_pairs: 45,
-                    fp_pairs: 45 - (3 + 1 + 0 + 6),
+                    fp_pairs: 45 - ((3 + 1) + 6),
                     overstated_bytes: 3 * 64,
                 },
             },

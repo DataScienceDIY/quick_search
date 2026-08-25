@@ -365,17 +365,49 @@ where
         .expect("spawn worker thread")
 }
 
-/// Return free heap pages to the kernel. glibc's `free` keeps chunks on arena
-/// free lists, so a transient peak stays in RSS for the life of the process;
-/// `malloc_trim(0)` walks *every* arena, reclaiming other threads' leavings
-/// too, and costs milliseconds — it must not go anywhere hot. Idempotent.
+/// The allocator every binary in this workspace installs.
+///
+/// Re-exported because `#[global_allocator]` only takes effect in the crate
+/// that *declares* it — a library cannot choose one for its dependents. So
+/// each binary names this type, and they must all name the same one: a
+/// measurement harness left on the system allocator would report numbers for
+/// a build nobody ships.
+///
+/// ```ignore
+/// #[global_allocator]
+/// static GLOBAL: quicksearch_core::platform::Allocator =
+///     quicksearch_core::platform::Allocator;
+/// ```
+///
+/// Why not glibc: it gives each thread a 64 MiB arena and never shrinks one
+/// below its high-water mark. A multi-million-file run settled at 985 MB RSS,
+/// 871 MB of it anonymous slack that `malloc_trim` could not coalesce —
+/// it only returns pages that are *wholly* free, and one live chunk pins
+/// 4 KiB. Capping arenas at 2 cut the floor to 146 MB but made indexing
+/// dramatically slower, because two arenas serialise every worker. mimalloc
+/// has per-thread heaps with no lock on the fast path and decommits freed
+/// segments, so it gives both.
+pub use mimalloc::MiMalloc as Allocator;
+
+/// Return free memory to the kernel; idempotent, and costs milliseconds, so
+/// it must not go anywhere hot.
+///
+/// A run's peak is not its steady state — extraction buffers, path strings
+/// and compression scratch are all freed by the end — but freed is not
+/// returned. This is the point where a finished run gives it back.
 pub fn release_free_heap() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    {
-        // SAFETY: callable from any thread; glibc takes the arena locks itself.
-        unsafe { libc::malloc_trim(0) };
+    // `libmimalloc-sys` binds only the allocation entry points, so this one
+    // is declared here. The symbol is in the static library that crate
+    // already links; depending on it is what puts it there.
+    extern "C" {
+        /// `void mi_collect(bool force)`. C `_Bool` and Rust `bool` are the
+        /// same one byte.
+        fn mi_collect(force: bool);
     }
-    // Elsewhere: `malloc_trim` is a glibc extension; musl frees to the kernel.
+    // SAFETY: no arguments of ours, no state of ours, callable from any
+    // thread. `true` asks it to return memory to the OS rather than merely to
+    // mimalloc's own free lists — the whole point of the call.
+    unsafe { mi_collect(true) };
 }
 
 /// Create `dir` and its parents, readable only by their owner:

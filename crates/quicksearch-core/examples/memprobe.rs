@@ -30,6 +30,11 @@
 //! naming what its run-scoped structures hold, which is the half `smaps`
 //! cannot answer: a mapping is "heap", never "the stale-candidate list".
 
+// Settled RSS is the whole point of this probe, and it is a property of the
+// allocator, so it must be the one the shipped binaries install.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 

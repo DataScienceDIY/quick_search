@@ -47,7 +47,7 @@ pub fn document(size: usize, hits: usize) -> String {
             next_plant = next_plant.saturating_add(stride);
             continue;
         }
-        out.push_str(WORDS[lcg.next() as usize % WORDS.len()]);
+        out.push_str(WORDS[lcg.next_u64() as usize % WORDS.len()]);
         out.push(' ');
     }
     out
@@ -119,8 +119,8 @@ static ROWS: LazyLock<Vec<Row>> = LazyLock::new(|| {
     let mut lcg = Lcg::new(0xd00d);
     (0..2000)
         .map(|i| {
-            let w1 = WORDS[lcg.next() as usize % WORDS.len()];
-            let w2 = WORDS[lcg.next() as usize % WORDS.len()];
+            let w1 = WORDS[lcg.next_u64() as usize % WORDS.len()];
+            let w2 = WORDS[lcg.next_u64() as usize % WORDS.len()];
             let name = format!("{}-{}-{:05}.txt", w1, w2, i);
             // Mixed case in the directory portion, so the folded tiers resolve.
             let path = format!("/home/user/Documents/Quartzite/{:03}/{}", i % 40, name);
@@ -144,7 +144,7 @@ pub fn text_head() -> &'static [u8] {
 pub fn binary_head() -> &'static [u8] {
     static HEAD: LazyLock<Vec<u8>> = LazyLock::new(|| {
         let mut lcg = Lcg::new(0xbeef);
-        (0..8 << 10).map(|_| (lcg.next() & 0xff) as u8).collect()
+        (0..8 << 10).map(|_| (lcg.next_u64() & 0xff) as u8).collect()
     });
     &HEAD
 }

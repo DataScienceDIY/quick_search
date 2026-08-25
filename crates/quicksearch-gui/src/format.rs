@@ -1,5 +1,7 @@
 //! Small display formatters shared across tabs.
 
+use quicksearch_core::indexing::MaintenanceStep;
+
 /// Human-readable byte size: `999 B`, `1.2 KB`, `4.7 MB`, `1.3 GB`.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -98,6 +100,15 @@ pub fn fmt_elapsed(d: std::time::Duration) -> String {
     }
 }
 
+/// Search timing: time to the first result, then to the last pass. A search
+/// that matched nothing has no first result, and reads as the total alone.
+pub fn fmt_search_times(first: Option<std::time::Duration>, total: std::time::Duration) -> String {
+    match first {
+        Some(first) => format!("{} / {}", fmt_elapsed(first), fmt_elapsed(total)),
+        None => fmt_elapsed(total),
+    }
+}
+
 /// A running clock: `0:07`, `4:32`, `1:04:12`; fixed-width seconds.
 pub fn fmt_duration_clock(d: std::time::Duration) -> String {
     let secs = d.as_secs();
@@ -106,6 +117,18 @@ pub fn fmt_duration_clock(d: std::time::Duration) -> String {
         format!("{}:{:02}:{:02}", h, m, s)
     } else {
         format!("{}:{:02}", m, s)
+    }
+}
+
+/// The index upkeep a run is inside, in the words a user reads. Every one of
+/// these freezes the per-file counters for as long as it runs.
+pub fn fmt_maintenance(step: MaintenanceStep) -> &'static str {
+    match step {
+        MaintenanceStep::Checkpoint => "Compacting the write-ahead log…",
+        MaintenanceStep::RemovingStale => "Removing entries for deleted files…",
+        MaintenanceStep::MergingText => "Merging the text index…",
+        MaintenanceStep::RootCounts => "Updating folder totals…",
+        MaintenanceStep::SizeLimit => "Applying the file-size limit…",
     }
 }
 
@@ -200,6 +223,22 @@ mod tests {
         assert_eq!(fmt_elapsed(Duration::from_millis(999)), "999 ms");
         assert_eq!(fmt_elapsed(Duration::from_millis(1000)), "1.0 s");
         assert_eq!(fmt_elapsed(Duration::from_millis(2340)), "2.3 s");
+    }
+
+    #[test]
+    fn search_times_pair_up() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        assert_eq!(fmt_search_times(Some(ms(12)), ms(340)), "12 ms / 340 ms");
+        assert_eq!(fmt_search_times(Some(ms(5)), ms(5)), "5 ms / 5 ms");
+        // Each side carries its own unit, so a pair may straddle the boundary.
+        assert_eq!(fmt_search_times(Some(ms(800)), ms(1400)), "800 ms / 1.4 s");
+        assert_eq!(
+            fmt_search_times(Some(ms(1000)), ms(12_300)),
+            "1.0 s / 12.3 s"
+        );
+        // Nothing matched: no first result to report.
+        assert_eq!(fmt_search_times(None, ms(340)), "340 ms");
     }
 
     #[test]

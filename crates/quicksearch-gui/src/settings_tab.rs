@@ -6,16 +6,82 @@ use crate::tips::{self, tip_row, Tipped};
 use crate::ui_util::hint;
 use quicksearch_core::config::{ColumnsConfig, Config};
 
-fn drag_row<N: egui::emath::Numeric>(
-    ui: &mut egui::Ui,
-    label: &str,
-    tip: &'static tips::Tip,
-    value: &mut N,
-    range: std::ops::RangeInclusive<N>,
-) {
-    tip_row(ui, label, tip, |ui| {
-        ui.add(egui::DragValue::new(value).range(range))
-    });
+/// Who a row is for.
+///
+/// [`Level::Advanced`] means one of two things, and usually both: a person who
+/// indexed their home folder and nothing else will never need to change it, or
+/// they could not tell what it does without already knowing how the indexer
+/// works. A byte budget over the writer's batching is both. Password
+/// protection is neither, however technical it sounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Level {
+    Everyday,
+    Advanced,
+}
+
+/// The settings form's render context: which rows are on screen.
+///
+/// Every row goes through [`Form`], which is what keeps the two lists from
+/// drifting — a setting cannot be added to the tab without saying who it is
+/// for, and it cannot be shown without a tooltip either, because
+/// [`tips::tip_row`] is the only way through.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Form {
+    pub advanced: bool,
+}
+
+impl Form {
+    fn shows(self, level: Level) -> bool {
+        level == Level::Everyday || self.advanced
+    }
+
+    fn row(
+        self,
+        level: Level,
+        ui: &mut egui::Ui,
+        label: impl Into<egui::WidgetText>,
+        tip: &'static tips::Tip,
+        widget: impl FnOnce(&mut egui::Ui) -> egui::Response,
+    ) {
+        if self.shows(level) {
+            tip_row(ui, label, tip, widget);
+        }
+    }
+
+    fn drag<N: egui::emath::Numeric>(
+        self,
+        level: Level,
+        ui: &mut egui::Ui,
+        label: impl Into<egui::WidgetText>,
+        tip: &'static tips::Tip,
+        value: &mut N,
+        range: std::ops::RangeInclusive<N>,
+    ) {
+        self.row(level, ui, label, tip, |ui| {
+            ui.add(egui::DragValue::new(value).range(range))
+        });
+    }
+}
+
+/// A label ruled underneath in the palette's orange.
+///
+/// For the advanced toggle, which sits in the same two-column form as the
+/// settings but is not one of them — it decides which of them are on screen.
+/// The rule marks that difference without a second type size or a box: the
+/// text keeps the ordinary label color, so it reads as part of the form.
+fn accented_label(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        egui::text::TextFormat {
+            font_id: egui::TextStyle::Body.resolve(ui.style()),
+            color: ui.visuals().text_color(),
+            underline: egui::Stroke::new(1.0, crate::color::palette(ui.visuals().dark_mode).orange),
+            ..Default::default()
+        },
+    );
+    job
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +107,9 @@ pub struct SettingsOutput {
     pub security: Option<SecurityAction>,
     /// Like Security, edits the live config, so it takes effect without Apply.
     pub columns: Option<ColumnsConfig>,
+    /// Also live: a view preference should not need an Apply to look at, and
+    /// drafting it would make merely revealing a setting read as an edit.
+    pub show_advanced: Option<bool>,
 }
 
 pub struct SettingsTab {
@@ -111,7 +180,15 @@ impl SettingsTab {
         self.keychain_active
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, current: &Config) -> SettingsOutput {
+    /// `indexed_files` is the coordinator's count, used only to show what the
+    /// automatic search cache works out to for *this* index; `None` while it
+    /// is not yet known.
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        current: &Config,
+        indexed_files: Option<i64>,
+    ) -> SettingsOutput {
         self.stage(current);
         let mut out = SettingsOutput::default();
         let keychain_active = self.keychain_active(current);
@@ -119,26 +196,65 @@ impl SettingsTab {
         let capturing = &mut self.capturing_hotkey;
         let draft = self.draft.as_mut().unwrap();
 
+        // Live, like the columns below: read from the saved config, not the
+        // draft, so ticking it reveals the rows at once instead of after Apply.
+        let form = Form {
+            advanced: current.ui.show_advanced_settings,
+        };
+
         let scroll = egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 // A maximized window would stretch every hint into one line.
                 ui.set_max_width(620.0);
 
-                ui.heading(egui::RichText::new("Paths").strong());
-                egui::Grid::new("opt-paths").num_columns(2).show(ui, |ui| {
-                    tip_row(ui, "Database file", &tips::DATABASE_PATH, |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut draft.paths.database_path)
-                                .desired_width(260.0),
-                        )
+                // The same two-column shape as every settings row — label
+                // left, control right — so it reads as part of the form; the
+                // orange rule is what says it governs the form rather than
+                // belonging to it.
+                let label = accented_label(ui, "Show advanced settings");
+                egui::Grid::new("opt-advanced")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        tip_row(ui, label, &tips::SHOW_ADVANCED, |ui| {
+                            let mut advanced = form.advanced;
+                            let response = ui.checkbox(&mut advanced, "");
+                            if response.changed() {
+                                out.show_advanced = Some(advanced);
+                            }
+                            response
+                        });
                     });
-                });
-                ui.label(hint("Indexed folders are managed on the Manage Index tab."));
+                ui.label(hint(
+                    "Advanced settings control how the index is built, stored \
+                     and searched. The defaults suit almost every installation.",
+                ));
                 ui.separator();
 
+                // The whole section, heading and all: its only row is the
+                // database path.
+                if form.advanced {
+                    ui.heading(egui::RichText::new("Paths").strong());
+                    egui::Grid::new("opt-paths").num_columns(2).show(ui, |ui| {
+                        form.row(
+                            Level::Advanced,
+                            ui,
+                            "Database file",
+                            &tips::DATABASE_PATH,
+                            |ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.paths.database_path)
+                                        .desired_width(260.0),
+                                )
+                            },
+                        );
+                    });
+                    ui.label(hint("Indexed folders are managed on the Manage Index tab."));
+                    ui.separator();
+                }
+
                 ui.heading(egui::RichText::new("Indexing").strong());
-                config_editor_ui(ui, draft, Section::Indexing);
+                config_editor_ui(ui, draft, Section::Indexing, indexed_files, form);
                 ui.label(hint(
                     "Automatic and manual indexing are switched on the \
                      Manage Index tab.",
@@ -146,11 +262,11 @@ impl SettingsTab {
                 ui.separator();
 
                 ui.heading(egui::RichText::new("Processing").strong());
-                config_editor_ui(ui, draft, Section::Processing);
+                config_editor_ui(ui, draft, Section::Processing, indexed_files, form);
                 ui.separator();
 
                 ui.heading(egui::RichText::new("Search").strong());
-                config_editor_ui(ui, draft, Section::Search);
+                config_editor_ui(ui, draft, Section::Search, indexed_files, form);
                 ui.add_space(6.0);
                 // Live, not drafted — see `columns_ui`.
                 out.columns = columns_ui(ui, &current.search.columns);
@@ -158,19 +274,27 @@ impl SettingsTab {
 
                 ui.heading(egui::RichText::new("Interface").strong());
                 egui::Grid::new("opt-ui").num_columns(2).show(ui, |ui| {
-                    tip_row(ui, "UI scale", &tips::UI_SCALE, |ui| {
+                    form.row(Level::Everyday, ui, "UI scale", &tips::UI_SCALE, |ui| {
                         ui.add(
                             egui::Slider::new(&mut draft.ui.scale, 0.5..=2.5)
                                 .step_by(0.05)
                                 .fixed_decimals(2),
                         )
                     });
-                    tip_row(ui, "Search shortcut", &tips::SEARCH_HOTKEY, |ui| {
-                        hotkey_edit(ui, &mut draft.ui.search_hotkey, capturing)
-                    });
-                    tip_row(ui, "Color scheme", &tips::COLOR_SCHEME, |ui| {
-                        color_scheme_edit(ui, &mut draft.ui.color_scheme)
-                    });
+                    form.row(
+                        Level::Everyday,
+                        ui,
+                        "Search shortcut",
+                        &tips::SEARCH_HOTKEY,
+                        |ui| hotkey_edit(ui, &mut draft.ui.search_hotkey, capturing),
+                    );
+                    form.row(
+                        Level::Everyday,
+                        ui,
+                        "Color scheme",
+                        &tips::COLOR_SCHEME,
+                        |ui| color_scheme_edit(ui, &mut draft.ui.color_scheme),
+                    );
                 });
                 hotkey_note(ui, &draft.ui.search_hotkey, &current.ui.search_hotkey);
                 ui.separator();
@@ -178,7 +302,7 @@ impl SettingsTab {
                 // Security acts on the live config, not the draft; the KDF
                 // salt is never shown anywhere in the GUI.
                 ui.heading(egui::RichText::new("Security").strong());
-                out.security = security_ui(ui, current, keychain_active);
+                out.security = security_ui(ui, current, keychain_active, form);
                 ui.separator();
 
                 let p = crate::color::palette(ui.visuals().dark_mode);
@@ -203,11 +327,16 @@ impl SettingsTab {
                         }
                     });
                 });
-                ui.label(hint(
+                // The second sentence names two rows that are only on screen
+                // with advanced settings shown.
+                ui.label(hint(if form.advanced {
                     "Narrowing a filter removes the entries it excludes; widening \
                      one reindexes to find what it now allows. Only the tokenizer \
-                     and hash length require a full rebuild.",
-                ));
+                     and hash length require a full rebuild."
+                } else {
+                    "Narrowing a filter removes the entries it excludes; widening \
+                     one reindexes to find what it now allows."
+                }));
             });
         crate::ui_util::more_below_hint(ui, &scroll);
 
@@ -381,6 +510,7 @@ fn security_ui(
     ui: &mut egui::Ui,
     current: &Config,
     keychain_active: bool,
+    form: Form,
 ) -> Option<SecurityAction> {
     let mut action = None;
     if current.security.password_protected {
@@ -408,10 +538,13 @@ fn security_ui(
                 action = Some(SecurityAction::Disable);
             }
         });
-        if ui
-            .button("Show database key…")
-            .tip(&tips::SHOW_KEY)
-            .clicked()
+        // The raw key is for someone recovering the file by hand; the password
+        // controls above it are for everyone.
+        if form.advanced
+            && ui
+                .button("Show database key…")
+                .tip(&tips::SHOW_KEY)
+                .clicked()
         {
             action = Some(SecurityAction::ShowKey);
         }
@@ -440,9 +573,57 @@ fn security_ui(
     action
 }
 
-/// Every row goes through [`crate::tips::tip_row`], so a setting cannot
-/// arrive here without a tooltip.
-fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
+/// What the automatic search cache resolves to, as a sentence. `None` when the
+/// file count is not known yet, in which case the row shows nothing rather
+/// than a number that would be wrong.
+fn search_cache_hint(config: &Config, indexed_files: Option<i64>) -> Option<String> {
+    use quicksearch_core::db::schema::{
+        recommended_search_cache_mib, SEARCH_CACHE_BYTES_PER_FILE, SEARCH_CACHE_MAX_MIB,
+    };
+    if config.search.cache_size_mib != 0 {
+        return None;
+    }
+    let files = indexed_files?;
+    let keyed = config.security.password_protected;
+    let mib = recommended_search_cache_mib(files, keyed);
+    if !keyed {
+        return Some(format!(
+            "Automatic: {} MiB. An unencrypted index reads a cache miss \
+             straight from the operating system, so a larger cache measures no \
+             faster.",
+            mib
+        ));
+    }
+    let counted = crate::format::group_thousands(files.max(0) as u64);
+    // Past ~800k files the automatic value is capped below what the index
+    // wants. Saying so is the only way the override is discoverable in the one
+    // case that needs it.
+    let wanted = files.max(0).saturating_mul(SEARCH_CACHE_BYTES_PER_FILE) / (1024 * 1024);
+    if wanted > SEARCH_CACHE_MAX_MIB {
+        return Some(format!(
+            "Automatic: {} MiB, the most it will choose on its own. This \
+             index's {} files want about {} MiB to search at full speed — set \
+             that here if you would rather spend the memory than the time.",
+            mib, counted, wanted
+        ));
+    }
+    Some(format!(
+        "Automatic: {} MiB, sized to hold this index's {} file records — an \
+         encrypted index re-decrypts them on every keystroke when they do not \
+         fit.",
+        mib, counted
+    ))
+}
+
+/// Every row goes through [`Form`], so a setting cannot arrive here without a
+/// tooltip or without saying who it is for.
+fn config_editor_ui(
+    ui: &mut egui::Ui,
+    config: &mut Config,
+    section: Section,
+    indexed_files: Option<i64>,
+    form: Form,
+) {
     match section {
         Section::Indexing => {
             egui::Grid::new("cfg-indexing")
@@ -450,31 +631,47 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                 .show(ui, |ui| {
                     // Automatic vs manual is absent: it is live state, and a
                     // staged copy would fight the Manage Index buttons.
-                    tip_row(ui, "Full reindex every", &tips::REINDEX_INTERVAL, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::DragValue::new(&mut config.indexing.reindex_interval_minutes)
+                    form.row(
+                        Level::Advanced,
+                        ui,
+                        "Full reindex every",
+                        &tips::REINDEX_INTERVAL,
+                        |ui| {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(
+                                        &mut config.indexing.reindex_interval_minutes,
+                                    )
                                     .range(5..=60 * 24 * 30),
-                            );
-                            ui.label("minutes");
-                        })
-                        .response
-                    });
+                                );
+                                ui.label("minutes");
+                            })
+                            .response
+                        },
+                    );
 
-                    tip_row(ui, "Follow symlinks", &tips::FOLLOW_SYMLINKS, |ui| {
-                        ui.checkbox(&mut config.indexing.follow_symlinks, "")
-                    });
+                    form.row(
+                        Level::Advanced,
+                        ui,
+                        "Follow symlinks",
+                        &tips::FOLLOW_SYMLINKS,
+                        |ui| ui.checkbox(&mut config.indexing.follow_symlinks, ""),
+                    );
 
-                    tip_row(ui, "Include hidden files", &tips::INCLUDE_HIDDEN, |ui| {
-                        ui.checkbox(&mut config.indexing.include_hidden, "")
-                    });
+                    form.row(
+                        Level::Everyday,
+                        ui,
+                        "Include hidden files",
+                        &tips::INCLUDE_HIDDEN,
+                        |ui| ui.checkbox(&mut config.indexing.include_hidden, ""),
+                    );
                 });
         }
         Section::Processing => {
             egui::Grid::new("cfg-processing")
                 .num_columns(2)
                 .show(ui, |ui| {
-                    tip_row(ui, "Tokenizer", &tips::TOKENIZER, |ui| {
+                    form.row(Level::Advanced, ui, "Tokenizer", &tips::TOKENIZER, |ui| {
                         egui::ComboBox::from_id_salt("cfg-tokenize")
                             .selected_text(&config.processing.tokenize)
                             .show_ui(ui, |ui| {
@@ -489,14 +686,19 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                             .response
                     });
 
-                    ui.label("");
-                    ui.hyperlink_to(
-                        "Tokenizer documentation",
-                        "https://www.sqlite.org/fts5.html#tokenizers",
-                    );
-                    ui.end_row();
+                    // Not a row, so it needs its own guard: it documents the
+                    // tokenizer above and makes no sense without it.
+                    if form.advanced {
+                        ui.label("");
+                        ui.hyperlink_to(
+                            "Tokenizer documentation",
+                            "https://www.sqlite.org/fts5.html#tokenizers",
+                        );
+                        ui.end_row();
+                    }
 
-                    drag_row(
+                    form.drag(
+                        Level::Advanced,
                         ui,
                         "Hash sample size (bytes)",
                         &tips::HASH_LENGTH,
@@ -504,7 +706,8 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                         512..=1_048_576,
                     );
 
-                    drag_row(
+                    form.drag(
+                        Level::Advanced,
                         ui,
                         "Max stored text (bytes)",
                         &tips::MAX_STORED_TEXT,
@@ -512,7 +715,8 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                         1024..=16_777_216,
                     );
 
-                    drag_row(
+                    form.drag(
+                        Level::Advanced,
                         ui,
                         "Max text file size (bytes)",
                         &tips::MAX_TEXT_FILE_SIZE,
@@ -520,7 +724,8 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                         1024..=1_073_741_824,
                     );
 
-                    drag_row(
+                    form.drag(
+                        Level::Advanced,
                         ui,
                         "Batch size",
                         &tips::BATCH_SIZE,
@@ -528,7 +733,8 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                         10..=100_000,
                     );
 
-                    drag_row(
+                    form.drag(
+                        Level::Advanced,
                         ui,
                         "Max WAL size (bytes)",
                         &tips::MAX_WAL_SIZE,
@@ -536,21 +742,27 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                         0u64..=8_589_934_592u64,
                     );
 
-                    tip_row(ui, "Store text for snippets", &tips::STORE_TEXT, |ui| {
-                        ui.checkbox(&mut config.processing.store_text_for_snippets, "")
-                    });
+                    form.row(
+                        Level::Everyday,
+                        ui,
+                        "Store text for snippets",
+                        &tips::STORE_TEXT,
+                        |ui| ui.checkbox(&mut config.processing.store_text_for_snippets, ""),
+                    );
                 });
         }
         Section::Search => {
             egui::Grid::new("cfg-search").num_columns(2).show(ui, |ui| {
-                tip_row(
+                form.row(
+                    Level::Everyday,
                     ui,
                     "Fuzzy search ON by default",
                     &tips::FUZZY_DEFAULT,
                     |ui| ui.checkbox(&mut config.search.fuzzy_default, ""),
                 );
 
-                drag_row(
+                form.drag(
+                    Level::Advanced,
                     ui,
                     "Fuzzy edit distance",
                     &tips::FUZZY_EDITS,
@@ -558,7 +770,8 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                     0..=8,
                 );
 
-                drag_row(
+                form.drag(
+                    Level::Advanced,
                     ui,
                     "Display limit",
                     &tips::DISPLAY_LIMIT,
@@ -566,7 +779,8 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                     50..=100_000,
                 );
 
-                drag_row(
+                form.drag(
+                    Level::Advanced,
                     ui,
                     "Stream batch size",
                     &tips::RESULTS_PER_PAGE,
@@ -574,7 +788,8 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                     10..=10_000,
                 );
 
-                drag_row(
+                form.drag(
+                    Level::Advanced,
                     ui,
                     "Debounce (ms)",
                     &tips::DEBOUNCE,
@@ -582,16 +797,37 @@ fn config_editor_ui(ui: &mut egui::Ui, config: &mut Config, section: Section) {
                     0..=2000,
                 );
 
-                tip_row(ui, "Live results", &tips::LIVE_RESULTS, |ui| {
-                    ui.checkbox(&mut config.search.live_results, "")
+                form.row(
+                    Level::Everyday,
+                    ui,
+                    "Live results",
+                    &tips::LIVE_RESULTS,
+                    |ui| ui.checkbox(&mut config.search.live_results, ""),
+                );
+
+                // 0 is "derive it from the index", which is why this is a
+                // plain box rather than a range starting at the floor.
+                form.drag(
+                    Level::Advanced,
+                    ui,
+                    "Search cache MiB (0 = auto)",
+                    &tips::SEARCH_CACHE,
+                    &mut config.search.cache_size_mib,
+                    0..=quicksearch_core::db::schema::SEARCH_CACHE_OVERRIDE_MAX_MIB as usize,
+                );
+            });
+            // Both come and go as their values are edited, and both explain
+            // advanced rows — there is nothing to say when those are hidden.
+            if form.advanced {
+                crate::ui_util::stable_section(ui, |ui| {
+                    if let Some(warning) = config.search.fuzzy_edits_warning() {
+                        ui.colored_label(ui.visuals().warn_fg_color, warning);
+                    }
+                    if let Some(recommended) = search_cache_hint(config, indexed_files) {
+                        ui.label(hint(&recommended));
+                    }
                 });
-            });
-            // The warning comes and goes as the value is edited.
-            crate::ui_util::stable_section(ui, |ui| {
-                if let Some(warning) = config.search.fuzzy_edits_warning() {
-                    ui.colored_label(ui.visuals().warn_fg_color, warning);
-                }
-            });
+            }
         }
     }
 }

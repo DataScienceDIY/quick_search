@@ -1683,3 +1683,196 @@ fn high_byte_binaries_are_listed_but_not_text_extracted() {
 
     assert_eq!(probe("notes.md"), (1, 1, 0), "ordinary UTF-8 is unaffected");
 }
+
+/// A helper for the two tail tests below: run to completion and to `Idle`,
+/// which is the *end* of the post-run maintenance pass, sampling the log
+/// throughout. Returns its peak.
+///
+/// `Idle` and not the completion marker: the marker lands inside
+/// `run_indexing`, before the FTS merge, the tail checkpoints and the whole of
+/// `repo::maintain` — which is precisely the window under test.
+fn reindex_sampling_the_log(root: &Path, db: &Path, config: &Config) -> u64 {
+    let wal = db.with_file_name(format!(
+        "{}-wal",
+        db.file_name().and_then(|s| s.to_str()).unwrap()
+    ));
+    let service = IndexingService::new();
+    service
+        .start_indexing(
+            vec![root.to_string_lossy().into_owned()],
+            db.to_string_lossy().into_owned(),
+            config.clone(),
+        )
+        .unwrap();
+
+    let mut peak = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        peak = peak.max(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0));
+        match service.get_status() {
+            IndexingStatus::Idle => break,
+            IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "the run never reached Idle");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    drop(service);
+    peak
+}
+
+/// A text-heavy tree, for the two tail tests. Big enough that the FTS index
+/// dominates the database, which is what makes a log measured against the
+/// database size mean anything.
+fn seed_text_tree(tag: &str) -> Scratch {
+    let root = Scratch::dir(tag);
+    let body: Vec<u8> = "sphinx of black quartz judge my vow "
+        .repeat(200)
+        .into_bytes();
+    for i in 0..4000 {
+        touch(&root.join(format!("d{}/f{:05}.txt", i % 40, i)), &body);
+    }
+    root
+}
+
+/// The window [`the_wal_stays_bounded_during_a_run`] explicitly declines to
+/// cover — "a reading taken afterwards proves nothing" — and the one a
+/// released bug lived in.
+///
+/// Everything after the writer loop is database work with no checkpoint of its
+/// own: the FTS merge, the completion stamp, the per-root counts, then
+/// `repo::maintain`'s VACUUM, whose copy-back pushes the whole database
+/// through the log. With autocheckpoint off for the run and every per-root
+/// reader still holding a read mark, that all piled onto one log — a warm
+/// reindex, which writes almost nothing during the loop and so never trips the
+/// in-loop checkpoint, left a `-wal` several times the size of the index.
+///
+/// **A reader is held across both runs, and the test is vacuous without it.**
+/// The application always has one — the search worker keeps its connection for
+/// `IDLE_RELEASE`, half an hour. A test that does not leaves the indexer's
+/// connection as the last handle on the file, and SQLite checkpoints and
+/// *deletes* the log when the last one closes, papering over anything the run
+/// failed to land.
+///
+/// Two assertions, doing different jobs. The **mechanism** is that the tail's
+/// checkpoints hand `repo::maintain` an empty log — read back through
+/// [`repo::log_on_entry_to_maintain`], a latch, because the value is gone by
+/// the time a test could sample it. That is what fails without the fix. The
+/// **peak** is the guard on the reported symptom, and it is honest about its
+/// limits: a fixture this size cannot build a tail large enough to breach the
+/// ceiling on its own, so it protects the released behaviour rather than
+/// reproducing the bug.
+#[test]
+fn the_wal_stays_bounded_through_the_tail_of_a_warm_reindex() {
+    let root = seed_text_tree("wal-tail");
+    let db_dir = Scratch::dir("wal-tail-db");
+    let db = db_dir.join("index.sqlite");
+    let dir_key = db_dir.to_string_lossy().into_owned();
+    let config = Config::default();
+
+    // An empty root first, purely to bring the index into existence so the
+    // reader below can be opened before the run that matters.
+    let empty = Scratch::dir("wal-tail-empty");
+    reindex_sampling_the_log(&empty, &db, &config);
+
+    let reader = rusqlite::Connection::open(&db).unwrap();
+    // Lazily attached: without a statement there is no handle on the file yet,
+    // and the point of this connection is to be one.
+    reader
+        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+
+    // The cold run is where the mechanism is visible: it fills the log, and
+    // 30-odd MiB against a 512 MiB default cap means the in-loop checkpoint
+    // never fires, so the tail's is the only one there is.
+    reindex_sampling_the_log(&root, &db, &config);
+    let indexed = std::fs::metadata(&db).unwrap().len();
+    assert!(
+        indexed > 8 * 1024 * 1024,
+        "the fixture built a {} byte index; too small to measure a log against",
+        indexed
+    );
+    assert_eq!(
+        quicksearch_core::db::repo::log_on_entry_to_maintain(&dir_key),
+        Some(0),
+        "the tail must land its log before the pass that VACUUMs through it"
+    );
+
+    // Nothing on disk has changed, so every byte of log below is the tail's.
+    let peak = reindex_sampling_the_log(&root, &db, &config);
+
+    assert_eq!(
+        quicksearch_core::db::repo::log_on_entry_to_maintain(&dir_key),
+        Some(0),
+        "and a warm reindex's tail must land its own"
+    );
+    drop(reader);
+
+    // One VACUUM's copy-back is the largest thing the tail may legitimately
+    // write, plus the log's own 16 MiB floor. The bug cleared twice the index.
+    let ceiling = indexed + 16 * 1024 * 1024;
+    assert!(
+        peak < ceiling,
+        "the tail peaked at {} bytes of log against a {} byte index",
+        peak,
+        indexed
+    );
+    assert_eq!(
+        wal_path(&db).metadata().map(|m| m.len()).unwrap_or(0),
+        0,
+        "and the tail leaves no log behind"
+    );
+}
+
+fn wal_path(db: &Path) -> std::path::PathBuf {
+    db.with_file_name(format!(
+        "{}-wal",
+        db.file_name().and_then(|s| s.to_str()).unwrap()
+    ))
+}
+
+/// A reindex that finds nothing to do must not grow the FTS index.
+///
+/// The end-of-run merge takes a **positive** page budget for a reason. With a
+/// negative one SQLite routes through `fts5IndexOptimizeStruct` — that is
+/// `optimize`, merely rate-limited — hoisting every segment into a single
+/// level and leaving the structure mid-merge in `%_data`. Called once per run
+/// rather than looped to completion, as it was, each run restarted that and
+/// churned pages for a corpus that had not changed.
+#[test]
+fn repeated_warm_reindexes_do_not_grow_the_fts_index() {
+    let root = seed_text_tree("fts-churn");
+    let db_dir = Scratch::dir("fts-churn-db");
+    let db = db_dir.join("index.sqlite");
+    let config = Config::default();
+
+    let fts_pages = |db: &Path| -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM dbstat WHERE name = 'searchabletext_data'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+
+    reindex_sampling_the_log(&root, &db, &config);
+    let first = fts_pages(&db);
+    assert!(first > 0, "the fixture built no FTS index");
+
+    let mut sizes = vec![first];
+    for _ in 0..3 {
+        reindex_sampling_the_log(&root, &db, &config);
+        sizes.push(fts_pages(&db));
+    }
+
+    // Not equality: `PRAGMA optimize` and a merge that consolidates real
+    // segments may move the figure either way once. Monotonic growth over
+    // three no-op runs is the signature of a structure that never settles.
+    let last = *sizes.last().unwrap();
+    assert!(
+        last <= first,
+        "searchabletext_data grew across no-op reindexes: {:?} pages",
+        sizes
+    );
+}

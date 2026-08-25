@@ -98,12 +98,20 @@ writer_turn_slice_ms = 100
 fts_update_batch_size = 1000
 # How large the write-ahead log (index.sqlite-wal) may grow during an
 # indexing run before the indexer forces a checkpoint (bytes); left
-# alone, the log grows for the whole run. A stall-frequency knob, not a
-# safety one: on a volume short of space the indexer checkpoints sooner
-# than asked and stops the run with an error before the disk fills
-# (which would kill the process with SIGBUS through SQLite's mmap'd
-# wal-index). 0 disables it; any other value below 16777216 is raised to it.
-maximum_wal_size = 536870912
+# alone, the log grows for the whole run. Not a safety knob: on a volume
+# short of space the indexer checkpoints sooner than asked and stops the
+# run with an error before the disk fills (which would kill the process
+# with SIGBUS through SQLite's mmap'd wal-index). 0 disables it; any
+# other value below 16777216 is raised to it.
+#
+# Both directions cost. A checkpoint blocks indexing for its whole
+# copy-back, so a low value stalls the run often. A high one is paid by
+# readers instead: SQLite searches the log before every page it fetches
+# from the index, so a larger log slows searches running alongside a
+# run, and it lengthens recovery after a crash or a force-quit. The
+# default trades toward fewer stalls; lower it if searching while
+# indexing matters more than the run finishing quickly.
+maximum_wal_size = 2147483648
 # FTS5 tokenizer: 'trigram' (substring matching, the default; gets
 # remove_diacritics 1 appended), 'unicode61', 'porter', or a full FTS5
 # option string. See https://www.sqlite.org/fts5.html#tokenizers
@@ -151,6 +159,12 @@ search_hotkey = "Ctrl+Shift+F"
 # light/dark setting would need the session's D-Bus settings portal, so it
 # is deliberately not offered.
 color_scheme = "dark"
+# Written by QuickSearch, not by you: whether the Settings tab shows the
+# technical settings alongside the everyday ones. The checkbox at the top of
+# that tab writes it immediately, without an Apply. Off, the tab hides the
+# byte budgets, the tokenizer, the database path and the other knobs whose
+# defaults suit almost every installation.
+show_advanced_settings = false
 # Written by QuickSearch, not by you: whether the short introduction shown
 # on a brand-new installation has been dismissed. Absent means this config
 # predates that introduction - an installation that upgraded into this
@@ -180,6 +194,24 @@ debounce_ms = 150
 # so this works whether or not indexing is running, and the index is
 # brought up to date for those files. Editing the query drops the watches.
 live_results = true
+# Memory the search connection keeps database pages in, in MiB, held for the
+# length of a search session and released after a long idle.
+#
+# 0 sizes it from the index and is almost always right. Every keystroke
+# rescans the whole file list, so what has to stay resident is that list:
+# roughly 168 bytes per indexed file, capped at 128 MiB automatically.
+#
+# It matters on an *encrypted* index, which must decrypt any page the cache
+# does not already hold. Measured at 600k files: 127 ms per keystroke with a
+# cache too small, 34 ms once it fit. An unencrypted index reads a miss
+# straight from the operating system and is given a flat 16 MiB, because
+# sweeping 1 MiB to 256 MiB on one measured no faster than noise.
+#
+# Set it explicitly only when the automatic value is wrong for your tree —
+# deeply nested folders make wider rows and want more — or when your index is
+# over ~800k files, where the automatic cap lands below what it wants. An
+# explicit value may exceed that cap; it is clamped to 16..1024 on load.
+cache_size_mib = 0
 
 # Which columns the Search tab shows; the right-click menu of any column
 # header and Settings → Search both write here immediately, without an

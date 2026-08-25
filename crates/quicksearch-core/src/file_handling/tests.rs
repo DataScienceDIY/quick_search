@@ -386,9 +386,8 @@ fn hash_covers_size_and_head_only() {
     std::fs::write(&c, [b"DIFF".as_slice(), &[0u8; 64], b"AAAA"].concat()).unwrap();
 
     let h = |p: &Path| {
-        get_file_hash(std::fs::metadata(p).unwrap().len(), p, 8)
-            .unwrap()
-            .0
+        let mut head = Vec::new();
+        get_file_hash(std::fs::metadata(p).unwrap().len(), p, 8, &mut head).unwrap()
     };
     assert_eq!(h(&a), h(&b), "tail differences are invisible by design");
     assert_ne!(h(&a), h(&c), "head differences are caught");
@@ -398,10 +397,11 @@ fn hash_covers_size_and_head_only() {
     std::fs::write(&short, b"HEAD").unwrap();
     assert_ne!(h(&a), h(&short));
 
-    let (_, head) = get_file_hash(72, &a, 8).unwrap();
+    let mut head = Vec::new();
+    get_file_hash(72, &a, 8, &mut head).unwrap();
     assert_eq!(head, b"HEAD\0\0\0\0", "exactly hash_length bytes");
-    let (_, head) = get_file_hash(4, &short, 8).unwrap();
-    assert_eq!(head, b"HEAD", "a short file hashes whole");
+    get_file_hash(4, &short, 8, &mut head).unwrap();
+    assert_eq!(head, b"HEAD", "a short file hashes whole, and the buffer is reused");
 
     std::fs::remove_dir_all(&root).ok();
 }

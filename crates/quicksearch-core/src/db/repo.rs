@@ -255,19 +255,51 @@ const ZSTD_LEVEL: i32 = 3;
 
 /// Reusable compression context for the `documents_text` sidecar; one per
 /// batch. Measured (`benches/index.rs`, group `zstd_encode`).
-pub struct DocEncoder(zstd::bulk::Compressor<'static>);
+pub struct DocEncoder {
+    ctx: zstd::bulk::Compressor<'static>,
+    /// One row's compressed output, reused. **`zstd`'s `WriteBuf` for `Vec`
+    /// writes from offset 0 and sets the length** — it overwrites rather
+    /// than appends — so a body cannot be compressed straight into a shared
+    /// arena. It lands here and is copied across, which still costs no
+    /// allocation once both buffers have grown.
+    row: Vec<u8>,
+}
 
 impl DocEncoder {
     pub fn new() -> Result<DocEncoder, String> {
-        zstd::bulk::Compressor::new(ZSTD_LEVEL)
-            .map(DocEncoder)
-            .map_err(|e| format!("zstd encoder: {}", e))
+        Ok(DocEncoder {
+            ctx: zstd::bulk::Compressor::new(ZSTD_LEVEL)
+                .map_err(|e| format!("zstd encoder: {}", e))?,
+            row: Vec::new(),
+        })
     }
 
     pub fn encode(&mut self, text: &str) -> Result<Vec<u8>, String> {
-        self.0
+        self.ctx
             .compress(text.as_bytes())
             .map_err(|e| format!("zstd encode: {}", e))
+    }
+
+    /// Append the compressed form of `text` to `arena`, returning where it
+    /// landed. The mirror of [`DocDecoder`]'s reused buffer on the write
+    /// side: a whole batch's bodies share one allocation instead of taking
+    /// one `Vec` each, which at a chunk per commit was an allocation per
+    /// indexed document.
+    pub fn encode_into(
+        &mut self,
+        text: &str,
+        arena: &mut Vec<u8>,
+    ) -> Result<std::ops::Range<usize>, String> {
+        self.row.clear();
+        // `compress_to_buffer` writes into the buffer's capacity and fails
+        // rather than growing it, so the room has to be there first.
+        self.row.reserve(zstd::zstd_safe::compress_bound(text.len()));
+        self.ctx
+            .compress_to_buffer(text.as_bytes(), &mut self.row)
+            .map_err(|e| format!("zstd encode: {}", e))?;
+        let start = arena.len();
+        arena.extend_from_slice(&self.row);
+        Ok(start..arena.len())
     }
 }
 
@@ -447,17 +479,57 @@ pub fn dir_rows(
     Ok(out)
 }
 
+/// A stored path that remembers where its `name` begins — the whole
+/// `parent + name` in **one** buffer rather than the two or three strings
+/// carrying both halves would cost. The content pass moves one of these per
+/// file from the feeder to the writer, so the saving is per indexed file.
+#[derive(Debug)]
+pub struct RowPath {
+    path: String,
+    name_at: usize,
+}
+
+impl RowPath {
+    /// Join the two halves the index stores into one buffer. The pending-page
+    /// query builds its own in place; this is for everyone assembling a row
+    /// from parts they already hold.
+    pub fn new(parent: &str, name: &str) -> RowPath {
+        let mut path = String::with_capacity(parent.len() + name.len());
+        path.push_str(parent);
+        let name_at = path.len();
+        path.push_str(name);
+        RowPath { path, name_at }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.path
+    }
+
+    /// The `files.name` half.
+    pub fn name(&self) -> &str {
+        // `name_at` is the parent's length, taken as the buffer was built; a
+        // stored parent is by construction a prefix of the path.
+        &self.path[self.name_at..]
+    }
+}
+
+/// One row the content pass has yet to extract.
+#[derive(Debug)]
+pub struct PendingRow {
+    pub file_id: i64,
+    pub path: RowPath,
+    pub mime: Option<String>,
+}
+
 /// One page of rows still awaiting content extraction under `cursor`'s range,
-/// ordered by id, as `(id, name, path, mime)` tuples. Keyset paging: a row is
-/// served exactly once even though the writer is concurrently flipping
-/// `content_state` behind the reader.
-#[allow(clippy::type_complexity)]
+/// ordered by id. Keyset paging: a row is served exactly once even though the
+/// writer is concurrently flipping `content_state` behind the reader.
 pub fn pending_content_page(
     conn: &Connection,
     cursor: &crate::file_handling::ExtractCursor,
     max_size: i64,
     limit: i64,
-) -> Result<Vec<(i64, String, String, Option<String>)>, String> {
+) -> Result<Vec<PendingRow>, String> {
     let mut stmt = conn
         .prepare_cached(
             // `INDEXED BY`: left to itself the planner takes
@@ -476,15 +548,16 @@ pub fn pending_content_page(
         .query_map(
             params![max_size, cursor.last_id, cursor.lo, cursor.hi, limit],
             |row| {
-                let parent: String = row.get(1)?;
-                let name: String = row.get(2)?;
-                let path = format!("{}{}", parent, name);
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    name,
-                    path,
-                    row.get::<_, Option<String>>(3)?,
-                ))
+                // The parent is grown into the path in place rather than
+                // `format!`ed with the name into a third buffer.
+                let mut path: String = row.get(1)?;
+                let name_at = path.len();
+                path.push_str(row.get_ref(2)?.as_str()?);
+                Ok(PendingRow {
+                    file_id: row.get(0)?,
+                    path: RowPath { path, name_at },
+                    mime: row.get(3)?,
+                })
             },
         )
         .map_err(|e| format!("query pending content: {}", e))?;
@@ -757,19 +830,56 @@ pub(super) fn pragma_number(conn: &Connection, pragma: &str) -> Result<i64, Stri
     .ok_or_else(|| format!("read {}: not a number", pragma))
 }
 
+/// The row count ANALYZE last recorded for `files`, or `None` if it never ran.
+///
+/// Read from `sqlite_stat1`, which the `PRAGMA optimize` in [`maintain`]
+/// populates — a handful of rows, not the `COUNT(*)` full scan that sizing a
+/// cache to avoid full scans has no business paying. The first token of each
+/// `stat` string is the estimated row count.
+///
+/// **The maximum**, not the first row: `idx_files_content_pending` is partial
+/// (`WHERE content_state = 0`), so it reports only the pending files and would
+/// size the cache for a fraction of the table.
+pub fn analyzed_file_count(conn: &Connection) -> Option<i64> {
+    let mut stmt = conn
+        .prepare("SELECT stat FROM sqlite_stat1 WHERE tbl = 'files'")
+        .ok()?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|stat| stat.split_whitespace().next()?.parse::<i64>().ok());
+    rows.max()
+}
+
 /// Checkpoint → VACUUM → `PRAGMA optimize` → checkpoint — the trailing
 /// checkpoint matters because VACUUM's copy-back and `optimize` refill the
 /// log. Returns whether it vacuumed.
 ///
 /// Run on a connection from [`crate::db::open::open_maintenance`], never the
-/// indexer's. `db_dir` is where the temporary database goes and must be the
-/// index's own directory — default temp resolution can land on a RAM-backed
+/// indexer's. VACUUM's temporary database goes in the index's own directory,
+/// taken from `db_path` — default temp resolution can land on a RAM-backed
 /// `/tmp`. Peak transient space is roughly three times the index.
-pub fn maintain(conn: &Connection, db_dir: &str) -> Result<bool, String> {
+///
+/// The path rather than the directory, so the caller cannot pass one that is
+/// not the index's, and so the readings below can see the log.
+pub fn maintain(conn: &Connection, db_path: &str) -> Result<bool, String> {
+    let db_dir = std::path::Path::new(db_path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let db_dir = db_dir.as_str();
+
+    note_log_on_entry(db_dir, wal_bytes(db_path));
+    #[cfg(feature = "probe")]
+    let probe = MaintainProbe::start(db_path);
+
     // Best-effort: compaction does not need the log empty to start.
     if let Err(e) = checkpoint_truncate(conn) {
         crate::log_warn!("{}", e);
     }
+    #[cfg(feature = "probe")]
+    probe.step("maintain checkpoint");
 
     let page_count = pragma_number(conn, "page_count")?;
     let freelist = pragma_number(conn, "freelist_count")?;
@@ -806,13 +916,52 @@ pub fn maintain(conn: &Connection, db_dir: &str) -> Result<bool, String> {
         let _ = conn.execute_batch("PRAGMA temp_store_directory = '';");
         outcome?;
     }
+    #[cfg(feature = "probe")]
+    probe.step(if vacuumed { "VACUUM" } else { "VACUUM (skipped)" });
 
     conn.execute_batch("PRAGMA optimize;")
         .map_err(|e| format!("optimize: {}", e))?;
     note_optimized(db_dir);
+    #[cfg(feature = "probe")]
+    probe.step("optimize");
 
     checkpoint_truncate(conn)?;
+    #[cfg(feature = "probe")]
+    probe.step("maintain checkpoint");
     Ok(vacuumed)
+}
+
+/// Per-step log size and elapsed time through [`maintain`], for `probe` builds.
+///
+/// The pass runs on its own connection after the indexer's has gone, so its
+/// cost is invisible from the run's own instrumentation — and VACUUM's
+/// copy-back is the single largest thing that writes to the log in a whole
+/// run. Matches `indexing::pipeline`'s `tail` lines, which cover the half
+/// before this one.
+#[cfg(feature = "probe")]
+struct MaintainProbe {
+    db_path: String,
+    started: std::time::Instant,
+}
+
+#[cfg(feature = "probe")]
+impl MaintainProbe {
+    fn start(db_path: &str) -> MaintainProbe {
+        MaintainProbe {
+            db_path: db_path.to_string(),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn step(&self, what: &str) {
+        crate::log_info!(
+            "tail t={:.1}s  wal {}  after {}",
+            self.started.elapsed().as_secs_f64(),
+            crate::testutil::mib(wal_bytes(&self.db_path)),
+            what
+        );
+    }
+
 }
 
 /// `PRAGMA optimize` acceptances, per index directory — per directory so
@@ -832,6 +981,34 @@ fn note_optimized(db_dir: &str) {
 /// records that the statement was accepted, not what SQLite did.
 pub fn optimize_count(db_dir: &str) -> u64 {
     crate::lock_ok(&OPTIMIZED).get(db_dir).copied().unwrap_or(0)
+}
+
+/// Log bytes [`maintain`] was last handed, per index directory.
+static LOG_ON_ENTRY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn note_log_on_entry(db_dir: &str, bytes: u64) {
+    crate::lock_ok(&LOG_ON_ENTRY).insert(db_dir.to_string(), bytes);
+}
+
+/// How large the log was when [`maintain`] last started on the index in
+/// `db_dir`; `None` if it has not run there in this process.
+///
+/// A latch in the same shape as [`optimize_count`], and for the same reason:
+/// the value is gone by the time a test could sample it. It exists to pin the
+/// invariant the indexer's tail checkpoints establish — `maintain` is handed
+/// an *empty* log, so its VACUUM's copy-back is the only thing in it rather
+/// than a second layer over a whole run's writing.
+pub fn log_on_entry_to_maintain(db_dir: &str) -> Option<u64> {
+    crate::lock_ok(&LOG_ON_ENTRY).get(db_dir).copied()
+}
+
+/// The `-wal` beside `db_path`, in bytes; 0 when there is none.
+fn wal_bytes(db_path: &str) -> u64 {
+    std::fs::metadata(format!("{}-wal", db_path))
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 fn get_info(conn: &Connection, key: &str) -> Option<String> {

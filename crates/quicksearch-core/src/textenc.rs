@@ -73,6 +73,11 @@ pub fn looks_like_text(head: &[u8]) -> bool {
 /// besides what [`looks_like_text`] does: by the time this runs, something —
 /// usually the extension — has already decided the file is text, so a
 /// windows-1252 `.txt` or Shift-JIS `.csv` still decodes.
+///
+/// Takes the buffer **by value** so a UTF-8 file — the overwhelming majority
+/// — becomes its `String` with no copy at all. Callers that only have a
+/// borrow, and would otherwise clone one just to hand it over, want
+/// [`decode_borrowed_text`].
 pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
     if bytes.is_empty() {
         return Ok(String::new());
@@ -80,9 +85,28 @@ pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
     match classify(&bytes, false) {
         // Cannot fail: classify ran strict validation with truncated=false.
         TextClass::Utf8 => Ok(String::from_utf8(bytes).expect("classified as UTF-8")),
+        _ => decode_borrowed_text(&bytes, path),
+    }
+}
+
+/// [`decode_text`] for bytes the caller does not own — the walk's head
+/// buffer, which is reused for the next file and so cannot be given away.
+///
+/// The one difference is the UTF-8 case, which must copy here; every other
+/// class allocates its output either way. `head.to_vec()` at the call site
+/// was that same copy plus a second one for the bytes.
+pub fn decode_borrowed_text(bytes: &[u8], path: &Path) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Ok(String::new());
+    }
+    match classify(bytes, false) {
+        // Cannot fail: classify ran strict validation with truncated=false.
+        TextClass::Utf8 => Ok(std::str::from_utf8(bytes)
+            .expect("classified as UTF-8")
+            .to_string()),
         TextClass::Bom(enc) => {
             // Strips the BOM, replaces malformed sequences with U+FFFD.
-            let (text, _, _) = enc.decode(&bytes);
+            let (text, _, _) = enc.decode(bytes);
             Ok(text.into_owned())
         }
         TextClass::Legacy => {
@@ -96,7 +120,7 @@ pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
             // Deny UTF-8: strict UTF-8 was already ruled out, so a UTF-8
             // guess could only mean malformed UTF-8.
             let enc = det.guess(None, chardetng::Utf8Detection::Deny);
-            let (text, _, _) = enc.decode(&bytes);
+            let (text, _, _) = enc.decode(bytes);
             Ok(text.into_owned())
         }
         TextClass::Binary => Err(format!("plaintext read {}: binary content", path.display())),

@@ -1,6 +1,14 @@
 use super::*;
 use std::io::{Cursor, Write};
 
+/// The one-file form: these assert on extracted text, not on the buffer
+/// reuse a pool worker gets.
+fn extract_ole_text(path: &Path, extension: &str) -> Result<String, Box<dyn Error>> {
+    let mut out = String::new();
+    let mut scratch = Scratch::new(&crate::config::Config::default());
+    super::extract_ole_text(path, extension, &mut out, &mut scratch).map(|()| out)
+}
+
 fn container(tag: &str, ext: &str, streams: &[(&str, Vec<u8>)]) -> std::path::PathBuf {
     let path = crate::testutil::scratch_dir(tag).join(format!("doc.{ext}"));
     let mut cfb = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
@@ -480,7 +488,7 @@ fn doc_pieces_within_the_budget_are_all_decoded() {
 /// emitted-text brake never advances however many of them there are.
 #[test]
 fn xls_control_character_cells_stop_at_the_budget() {
-    let control: String = std::iter::repeat('\u{1}').take(4096).collect();
+    let control: String = std::iter::repeat_n('\u{1}', 4096).collect();
 
     let mut sst = Vec::new();
     sst.extend_from_slice(&le32(2)); // total

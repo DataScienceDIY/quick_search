@@ -30,22 +30,34 @@ const FEED_PAGE: usize = 128;
 #[derive(Debug)]
 pub struct ExtractedRow {
     pub file_id: i64,
-    /// The `files.name` the FTS row is indexed under.
-    pub name: String,
+    /// The path buffer the feeder built, carried through rather than split:
+    /// see [`crate::db::repo::RowPath`].
+    path: crate::db::repo::RowPath,
     pub outcome: ContentOutcome,
 }
 
-#[derive(Debug)]
-struct Pending {
-    file_id: i64,
-    name: String,
-    path: String,
-    mime: Option<String>,
+impl ExtractedRow {
+    pub fn new(
+        file_id: i64,
+        path: crate::db::repo::RowPath,
+        outcome: ContentOutcome,
+    ) -> ExtractedRow {
+        ExtractedRow {
+            file_id,
+            path,
+            outcome,
+        }
+    }
+
+    /// The `files.name` the FTS row is indexed under.
+    pub fn name(&self) -> &str {
+        self.path.name()
+    }
 }
 
 #[derive(Default)]
 struct Queue {
-    rows: Vec<Pending>,
+    rows: Vec<crate::db::repo::PendingRow>,
     /// Feeder mid-query, holding rows in neither the queue nor a worker;
     /// without it a worker could see an empty queue between two pages and
     /// declare the pass finished early.
@@ -66,7 +78,7 @@ struct Shared {
 impl Shared {
     /// Claim a row. `None` only when the queue is empty *and* the feeder is
     /// finished — at that instant nobody is left who could add another row.
-    fn take(&self) -> Option<Pending> {
+    fn take(&self) -> Option<crate::db::repo::PendingRow> {
         let mut q = crate::lock_ok(&self.queue);
         loop {
             if q.done {
@@ -109,7 +121,7 @@ impl Shared {
 
     /// Publish a page and clear the in-flight flag together, under one lock —
     /// the indivisibility [`Shared::take`]'s end-of-pass test relies on.
-    fn finish_feed(&self, rows: Vec<Pending>, last_page: bool) {
+    fn finish_feed(&self, rows: Vec<crate::db::repo::PendingRow>, last_page: bool) {
         let mut q = crate::lock_ok(&self.queue);
         // Reversed: `take` pops from the back, and rows should reach workers
         // in id order so a partial run leaves a contiguous prefix done.
@@ -225,19 +237,10 @@ fn feeder(shared: &Shared, db_path: &str, mut cursor: ExtractCursor, config: &Co
                 }
             };
         let last_page = page.len() < FEED_PAGE;
-        if let Some((id, _, _, _)) = page.last() {
-            cursor.last_id = *id;
+        if let Some(row) = page.last() {
+            cursor.last_id = row.file_id;
         }
-        let rows = page
-            .into_iter()
-            .map(|(file_id, name, path, mime)| Pending {
-                file_id,
-                name,
-                path,
-                mime,
-            })
-            .collect();
-        shared.finish_feed(rows, last_page);
+        shared.finish_feed(page, last_page);
         count_now(&conn, &cursor);
         if last_page {
             return;
@@ -256,16 +259,25 @@ fn worker(
     stop_flag: &Arc<AtomicBool>,
     stats: &WorkerStats,
 ) {
+    // One per worker, for the whole pass: the container and stream buffers
+    // inside it are what every extraction stages through.
+    let mut scratch = crate::extract::Scratch::new(config);
     while let Some(row) = shared.take() {
         let _busy = stats.enter();
         if stop_flag.load(Ordering::Relaxed) {
             shared.shutdown();
             return;
         }
-        let outcome = decide_content(&row.path, row.mime.as_deref(), registry, config);
+        let outcome = decide_content(
+            row.path.as_str(),
+            row.mime.as_deref(),
+            registry,
+            config,
+            &mut scratch,
+        );
         let sent = tx.send(ExtractedRow {
             file_id: row.file_id,
-            name: row.name,
+            path: row.path,
             outcome,
         });
         if sent.is_err() {

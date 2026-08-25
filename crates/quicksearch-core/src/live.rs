@@ -477,8 +477,16 @@ impl Loop {
             return WindowUpdate::Unchanged;
         };
         let mime = crate::mime::guess_mime_from_head(file, &head);
-        let outcome =
-            crate::file_handling::decide_content(path, mime.as_deref(), &self.registry, config);
+        // One file per call, on the UI's refresh path: no loop to amortize a
+        // longer-lived scratch over.
+        let mut scratch = crate::extract::Scratch::new(config);
+        let outcome = crate::file_handling::decide_content(
+            path,
+            mime,
+            &self.registry,
+            config,
+            &mut scratch,
+        );
         let Some(text) = crate::file_handling::outcome_body(&outcome) else {
             return WindowUpdate::Unchanged;
         };

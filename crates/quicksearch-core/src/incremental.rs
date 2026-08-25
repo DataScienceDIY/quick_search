@@ -185,7 +185,7 @@ fn upsert_file(
             &tx,
             file_id,
             &rec.path(),
-            rec.mime.as_deref(),
+            rec.mime,
             registry,
             config,
         )?;

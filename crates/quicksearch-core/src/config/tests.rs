@@ -782,7 +782,10 @@ fn salt_bytes_validates_hostile_configs() {
 #[test]
 fn ui_bookkeeping_fields_are_soft_knobs() {
     let base = Config::default();
-    let cases: [(&str, fn(&mut Config)); 2] = [
+    // Named so the closures below coerce to fn pointers and share one array
+    // type; without an annotation each would be its own anonymous type.
+    type Knob = (&'static str, fn(&mut Config));
+    let cases: [Knob; 2] = [
         ("watch_cap_warned_roots", |c| {
             c.ui.watch_cap_warned_roots = vec!["/media/ApolloStore".to_string()]
         }),

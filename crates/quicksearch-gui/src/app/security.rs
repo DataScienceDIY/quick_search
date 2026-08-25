@@ -408,7 +408,26 @@ fn confirm_key_modal(ctx: &egui::Context, pw: &mut String, wrong: bool) -> (bool
     .unwrap_or((false, false))
 }
 
+/// The page size other SQLCipher tools assume unless told otherwise, and so
+/// the one this screen has to talk them out of.
+const SQLCIPHER_DEFAULT_PAGE_SIZE: i64 = 4096;
+
+/// The pragma another tool needs for our page authenticator, spelled out
+/// because the setting is not one anybody would guess: the reserve it decides
+/// is part of the on-disk layout, so getting it wrong reads as a bad key
+/// rather than as a failed integrity check.
+fn hmac_pragma_hint() -> &'static str {
+    use quicksearch_core::db::schema::{HmacMode, HMAC_MODE};
+    match HMAC_MODE {
+        HmacMode::Off => "PRAGMA cipher_use_hmac = OFF;",
+        HmacMode::Sha256 => "PRAGMA cipher_hmac_algorithm = HMAC_SHA256;",
+        HmacMode::Sha512 => "",
+    }
+}
+
 fn reveal_key_modal(ctx: &egui::Context, display: &str) -> (bool, bool) {
+    use quicksearch_core::db::schema::{HMAC_MODE, PAGE_SIZE};
+
     centered_modal(ctx, "Database key", |ui| {
         ui.set_max_width(420.0);
         ui.label(
@@ -420,10 +439,23 @@ fn reveal_key_modal(ctx: &egui::Context, display: &str) -> (bool, bool) {
             ui.label(egui::RichText::new(display).monospace());
         });
         ui.add_space(6.0);
-        ui.label(hint(
-            "Other SQLCipher tools take the key in this form. A copy stays on the \
-             clipboard until something else replaces it.",
-        ));
+        // The key on its own is not enough: under any other page size or
+        // page authenticator the file decrypts to noise, and every tool
+        // reports that as a wrong key. Both are shown as their own lines, not
+        // in the small print, because both have to be entered alongside the
+        // key.
+        ui.label(egui::RichText::new(format!("Page size: {}", PAGE_SIZE)).monospace());
+        ui.label(egui::RichText::new(format!("Page HMAC: {}", HMAC_MODE.label())).monospace());
+        ui.add_space(6.0);
+        ui.label(hint(format!(
+            "Other SQLCipher tools take the key in this form, but default to \
+             {}-byte pages and HMAC_SHA512 — set both of the above as well or \
+             the index will not open ({} {}). Copy puts the key alone on the \
+             clipboard, where it stays until something else replaces it.",
+            SQLCIPHER_DEFAULT_PAGE_SIZE,
+            format_args!("PRAGMA cipher_page_size = {};", PAGE_SIZE),
+            hmac_pragma_hint(),
+        )));
         ui.add_space(6.0);
         ui.horizontal(|ui| (ui.button("Copy").clicked(), ui.button("Close").clicked()))
             .inner

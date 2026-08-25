@@ -193,13 +193,15 @@ impl Lcg {
         Lcg(seed)
     }
 
-    pub fn next(&mut self) -> u64 {
+    /// Not `next`: an inherent method by that name reads as `Iterator`'s, and
+    /// this one is infinite and returns a bare `u64` rather than an `Option`.
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
         self.0 >> 33
     }
 
     pub fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {
-        &from[self.next() as usize % from.len()]
+        &from[self.next_u64() as usize % from.len()]
     }
 }
 
@@ -231,6 +233,7 @@ pub const WORDS: &[&str] = &[
 ];
 
 /// What [`seed_index`] should build.
+#[derive(Clone, Copy)]
 pub struct SeedSpec {
     pub files: usize,
     /// One file in every `content_every` gets extracted text.
@@ -239,6 +242,12 @@ pub struct SeedSpec {
     pub body_words: usize,
     /// Directories to spread the rows across.
     pub dirs: usize,
+    /// Path segments in each stored `parent`. `1` is `/seed/NNN/` — short, and
+    /// what the search harnesses have always used. A real tree is nested, and
+    /// `parent` is stored per row, so this is most of what decides the width
+    /// of a `files` row and therefore how much cache a scan of it needs. Raise
+    /// it when calibrating anything against real-world row size.
+    pub dir_depth: usize,
     /// File names carrying [`NEEDLE`]. Kept far below any sane display limit
     /// — an early-exiting query measures how fast the cascade gives up.
     pub needle_names: usize,
@@ -252,6 +261,31 @@ pub struct SeedSpec {
     /// `0` leaves every hash NULL — the shape the search harnesses seed, and
     /// the one whose row width their numbers were taken against.
     pub dup_every: usize,
+    /// Commit every N files instead of wrapping the whole seed in one
+    /// transaction (`0`). Each commit flushes FTS5's in-memory hash to its own
+    /// segment, so this is what gives a later `merge` real work — the shape a
+    /// production run has, where the writer commits in slices. Harnesses that
+    /// only want rows as fast as possible leave it at `0`.
+    pub commit_every: usize,
+    /// Build the index at this database page size instead of
+    /// [`crate::db::schema::PAGE_SIZE`]. Installed as a process-global
+    /// override for the whole seed *and left installed*, because a keyed file
+    /// cannot be reopened without it — see
+    /// [`crate::db::set_page_size_override`].
+    pub page_size: Option<i64>,
+    /// Override FTS5's `pgsz` before a single row is written. `None` keeps
+    /// whatever the schema chose for this key state, which is what every
+    /// harness measuring the *product* wants. It exists so a benchmark can
+    /// pin FTS5's default 4050 on a keyed index and price
+    /// [`crate::db::schema::fts_pgsz_for`] against it in one process on
+    /// one corpus.
+    pub pgsz: Option<i64>,
+    /// Build the index under this per-page authenticator instead of
+    /// [`crate::db::schema::HMAC_MODE`]. A process-global override for the
+    /// same reason `page_size` is one — it sets the page reserve, so a keyed
+    /// file cannot be reopened without it. Ignored on a plain arm, which has
+    /// no reserve.
+    pub hmac: Option<crate::db::schema::HmacMode>,
 }
 
 impl Default for SeedSpec {
@@ -263,10 +297,15 @@ impl Default for SeedSpec {
             // full-text pass look free when it is the cascade's most expensive.
             body_words: 300,
             dirs: 500,
+            dir_depth: 1,
             needle_names: 50,
             needle_docs: 50,
             body_term_docs: 500,
             dup_every: 0,
+            commit_every: 0,
+            page_size: None,
+            pgsz: None,
+            hmac: None,
         }
     }
 }
@@ -277,14 +316,33 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
     use crate::db::repo::{insert_file, set_content_done, NewFile};
     use crate::mime::FileType;
 
-    let mut conn = crate::db::open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+    // Before the open, not after: the profile decides how the file is
+    // *created*, and on a keyed file it decides whether it can be read at all.
+    if let Some(page_size) = spec.page_size {
+        crate::db::set_page_size_override(page_size);
+    }
+    if let Some(hmac) = spec.hmac {
+        crate::db::set_hmac_mode_override(hmac);
+    }
+    let conn = crate::db::open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+    // Before the first row: `pgsz` decides how leaves are built, so setting it
+    // afterwards would only affect segments merged later.
+    if let Some(pgsz) = spec.pgsz {
+        conn.execute(
+            "INSERT INTO searchabletext(searchabletext, rank) VALUES('pgsz', ?1)",
+            [pgsz],
+        )
+        .unwrap();
+    }
     let mut rng = Lcg::new(0x5eed);
     // Spacing, not a random draw: a cluster at the front would let a pass
     // stop early and report a fraction of the work a real rare query costs.
     let name_stride = spec.files / spec.needle_names.max(1);
     let doc_stride = spec.files / spec.needle_docs.max(1);
     let body_stride = spec.files / spec.body_term_docs.max(1);
-    let tx = conn.transaction().unwrap();
+    // `unchecked_transaction` borrows the connection shared, which is what
+    // lets `commit_every` end one and start the next inside the loop.
+    let mut tx = conn.unchecked_transaction().unwrap();
     for i in 0..spec.files {
         let w1 = rng.pick(WORDS);
         let w2 = rng.pick(WORDS);
@@ -294,7 +352,15 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
             format!("{}-{}-{:07}.txt", w1, w2, i)
         };
         // Stored parents always end in a separator; see `dir_to_db_parent`.
-        let dir = format!("/seed/{:03}/", i % spec.dirs.max(1));
+        // Deeper segments are derived from the directory index, not the file
+        // index, so files continue to share parents the way a real tree does.
+        let d = i % spec.dirs.max(1);
+        let mut dir = format!("/seed/{:03}", d);
+        for segment in 1..spec.dir_depth.max(1) {
+            dir.push('/');
+            dir.push_str(WORDS[(d * 7 + segment * 13) % WORDS.len()]);
+        }
+        dir.push('/');
         // Every `dup_every`-th row takes the hash of the one before it, so the
         // groups are pairs of equal-sized rows — the shape `find_duplicate_groups`
         // prices, since a hash covers the size.
@@ -338,9 +404,230 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
             let body = body.join(" ");
             set_content_done(&tx, id, &body, zstd_of(&body).as_deref()).unwrap();
         }
+        if spec.commit_every > 0 && (i + 1) % spec.commit_every == 0 {
+            tx.commit().unwrap();
+            tx = conn.unchecked_transaction().unwrap();
+        }
     }
     tx.commit().unwrap();
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+}
+
+/// A raw 32-byte key for the measurement harnesses, deliberately **not** an
+/// Argon2id derivation: the KDF costs half a second in release and minutes in
+/// debug, and proves nothing about page work. It reaches SQLCipher as raw hex
+/// either way (see `db::open::key_and_probe`), so a keyed arm measures what a
+/// real unlocked index does.
+pub const MEASUREMENT_KEY_HEX: &str =
+    "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+
+pub fn measurement_key() -> crate::security::IndexKey {
+    crate::security::IndexKey::from_hex(MEASUREMENT_KEY_HEX).expect("a 64-hex-digit key")
+}
+
+/// `(hits, misses)` in this connection's page cache since it was opened.
+///
+/// A *miss* is the unit that costs money on a keyed index: the page has to be
+/// read and AES-CBC decrypted before a single row can be read out of it, where
+/// a hit is a pointer into memory SQLite already holds. So
+/// counting misses per query shape attributes cost to the table that caused
+/// it, which timing alone cannot do.
+///
+/// `sqlite3_db_status` has no safe wrapper in rusqlite; the raw binding and
+/// `Connection::handle` are both public, and neither the pointer nor the
+/// out-params outlive this call.
+pub fn cache_stats(conn: &rusqlite::Connection) -> (i64, i64) {
+    use rusqlite::ffi;
+    let mut hits = (0i32, 0i32);
+    let mut misses = (0i32, 0i32);
+    unsafe {
+        let handle = conn.handle();
+        ffi::sqlite3_db_status(
+            handle,
+            ffi::SQLITE_DBSTATUS_CACHE_HIT,
+            &mut hits.0,
+            &mut hits.1,
+            0,
+        );
+        ffi::sqlite3_db_status(
+            handle,
+            ffi::SQLITE_DBSTATUS_CACHE_MISS,
+            &mut misses.0,
+            &mut misses.1,
+            0,
+        );
+    }
+    (hits.0 as i64, misses.0 as i64)
+}
+
+/// FTS5's own default page size, which a keyed index used to inherit. Pinned
+/// explicitly on the "before" arms of [`seed_arms`] so the cost of that
+/// inheritance is priced in the same run as the fix, not remembered from
+/// another one.
+pub use crate::db::schema::FTS5_DEFAULT_PGSZ;
+
+/// Indices into [`seed_arms`]'s fixed order. The two `_4050` arms exist only
+/// to price [`crate::db::schema::FTS_PGSZ_ENCRYPTED`] against what came
+/// before; the other two are the shipped product.
+pub const ARM_PLAIN_4050: usize = 0;
+pub const ARM_PLAIN: usize = 1;
+pub const ARM_KEYED_4050: usize = 2;
+pub const ARM_KEYED: usize = 3;
+
+/// `(label, keyed, pgsz, path suffix)`, in [`seed_arms`] order.
+const ARM_SHAPES: [(&str, bool, Option<i64>, &str); 4] = [
+    (
+        "plain, pgsz 4050",
+        false,
+        Some(FTS5_DEFAULT_PGSZ),
+        "plain-4050",
+    ),
+    ("plain, as shipped", false, None, "plain"),
+    (
+        "keyed, pgsz 4050",
+        true,
+        Some(FTS5_DEFAULT_PGSZ),
+        "keyed-4050",
+    ),
+    ("keyed, as shipped", true, None, "keyed"),
+];
+
+/// One seeded index in a plain-vs-keyed comparison: `tests/encrypted_perf.rs`
+/// gates four of them on size, `benches/page_geometry.rs` sweeps page sizes
+/// across them. Defined here, once, so the harnesses report on the same shape.
+pub struct Arm {
+    pub what: String,
+    pub keyed: bool,
+    /// `None` takes whatever the schema chose for this key state — the
+    /// shipped behaviour. `Some` pins a value, only ever used to reproduce
+    /// the old geometry.
+    pub pgsz: Option<i64>,
+    /// The database page size this arm was built at, and the one every open
+    /// of it must re-install: a keyed file's header is ciphertext, so it
+    /// cannot be read back off the file.
+    pub page_size: Option<i64>,
+    /// The per-page authenticator this arm was built under, re-installed on
+    /// every open for the same reason `page_size` is: it sets the page
+    /// reserve, which the header cannot be read without.
+    pub hmac: Option<crate::db::schema::HmacMode>,
+    pub path: PathBuf,
+    /// How long seeding spent writing it: the database-write half of indexing
+    /// (rows, zstd bodies, FTS postings), which is the half a page geometry
+    /// can change. The walk and the extractors are not in it.
+    pub seeded_in: std::time::Duration,
+}
+
+impl Arm {
+    /// Seed one arm from `spec` and time the write. `spec.page_size`,
+    /// `spec.hmac` and `spec.pgsz` define the geometry; `tag` names its
+    /// scratch directory.
+    pub fn seed(what: impl Into<String>, tag: &str, keyed: bool, spec: &SeedSpec) -> Arm {
+        let arm = Arm {
+            what: what.into(),
+            keyed,
+            pgsz: spec.pgsz,
+            page_size: spec.page_size,
+            hmac: spec.hmac,
+            path: scratch_db(tag),
+            seeded_in: std::time::Duration::ZERO,
+        };
+        let path = arm.path.clone();
+        let spec = *spec;
+        let start = std::time::Instant::now();
+        arm.with_key(|| seed_index(&path, &spec));
+        Arm {
+            seeded_in: start.elapsed(),
+            ..arm
+        }
+    }
+
+    /// Run `f` with this arm's key *and profile* installed process-wide, then
+    /// restore the shipped ones. Every open has to be wrapped: all three are
+    /// process-globals, and an index seeded under them and opened without them
+    /// fails as a wrong-password error rather than quietly.
+    pub fn with_key<T>(&self, f: impl FnOnce() -> T) -> T {
+        crate::db::set_process_key(self.keyed.then(measurement_key));
+        crate::db::set_page_size_override(self.page_size.unwrap_or(crate::db::schema::PAGE_SIZE));
+        crate::db::set_hmac_mode_override(self.hmac.unwrap_or(crate::db::schema::HMAC_MODE));
+        let out = f();
+        crate::db::set_process_key(None);
+        crate::db::set_page_size_override(crate::db::schema::PAGE_SIZE);
+        crate::db::set_hmac_mode_override(crate::db::schema::HMAC_MODE);
+        out
+    }
+
+    /// Delete this arm's scratch directory. The sweep seeds a lot of large
+    /// indexes; dropping each once measured keeps one resident at a time.
+    pub fn discard(self) {
+        if let Some(dir) = self.path.parent() {
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// A search connection on this arm, at the production pragma profile.
+    pub fn open_search(&self) -> rusqlite::Connection {
+        self.with_key(|| {
+            crate::db::open::open_search_reader(&self.path.to_string_lossy()).expect("open arm")
+        })
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Bytes `dbstat` attributes to one table. The number to compare a cache
+    /// ceiling against: `files` is what every keystroke rescans, so whether it
+    /// fits is what decides if a typing session stays warm.
+    pub fn table_bytes(&self, table: &str) -> u64 {
+        let conn = self.open_search();
+        conn.query_row(
+            "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat WHERE name = ?1",
+            [table],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as u64
+    }
+
+    /// `(leaf, overflow)` pages in `searchabletext_data`. The overflow count
+    /// is the whole diagnosis: SQLCipher's page reserve drops the inline
+    /// payload limit below what a leaf built for another profile assumes, and
+    /// each miss costs a second page — a second fetch and decrypt on every
+    /// read of it. See `db::schema::fts_pgsz_for`, which is what keeps the
+    /// count at zero.
+    pub fn fts_pages(&self) -> (i64, i64) {
+        let conn = self.open_search();
+        let count = |pagetype: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM dbstat \
+                 WHERE name = 'searchabletext_data' AND pagetype = ?1",
+                [pagetype],
+                |r| r.get(0),
+            )
+            .expect("dbstat")
+        };
+        (count("leaf"), count("overflow"))
+    }
+}
+
+/// Seed the same corpus four times: plain and keyed, each on FTS5's default
+/// page size and on whatever the schema picks. Identical content and identical
+/// insertion order throughout, so arms differ *only* in those two variables —
+/// which is what lets a display-limited query be compared at all (the cascade
+/// stops when the limit fills, so a different rowid order would decide the
+/// answer rather than the encryption).
+///
+/// `spec.pgsz` is overridden per arm; everything else is the caller's.
+pub fn seed_arms(tag: &str, spec: &SeedSpec) -> Vec<Arm> {
+    ARM_SHAPES
+        .iter()
+        .map(|(what, keyed, pgsz, suffix)| {
+            let spec = SeedSpec {
+                pgsz: *pgsz,
+                ..*spec
+            };
+            Arm::seed(*what, &format!("{}-{}", tag, suffix), *keyed, &spec)
+        })
+        .collect()
 }
 
 #[cfg(test)]

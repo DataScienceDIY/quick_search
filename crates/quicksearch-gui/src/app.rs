@@ -9,7 +9,8 @@ use quicksearch_core::config::{diff_actions, nested_roots, Config, SecurityConfi
 use quicksearch_core::coordinator::{IndexMode, IndexerState, ReconcileState, WatcherStatus};
 use quicksearch_core::db;
 use quicksearch_core::indexing::{
-    overall_progress, ConfigChange, IndexingStatus, PrepStep, RootPhase, RootProgress,
+    overall_progress, ConfigChange, IndexingStatus, MaintenanceStep, PrepStep, RootPhase,
+    RootProgress,
 };
 use quicksearch_core::platform::{IndexLock, LockError};
 use quicksearch_core::search::SearchOptions;
@@ -392,6 +393,17 @@ impl QuickSearchApp {
                 search.set_db_path(new.resolved_database_path());
             }
         }
+        // The ceiling is a property of the connection, so it only takes effect
+        // on the next open — release the one being held rather than leaving
+        // the setting to appear ignored until the next idle timeout.
+        if new.search.cache_size_mib != self.cfg.search.cache_size_mib {
+            quicksearch_core::db::set_search_cache_override(
+                (new.search.cache_size_mib != 0).then_some(new.search.cache_size_mib as i64),
+            );
+            if let Some(search) = self.backend.search() {
+                search.release_connection();
+            }
+        }
         // Only settings that leave the stored file unreadable need a rebuild.
         self.backend.coordinator.apply_config(new.clone());
         if actions.requires_rebuild {
@@ -580,8 +592,11 @@ pub(crate) fn pin_live_fields(new: &mut Config, live: &Config) {
     new.security = live.security.clone();
     new.indexing.auto_index = live.indexing.auto_index;
     // The column picker writes straight to the live config; pinning stops a
-    // draft taken before a header-menu change from undoing it on Apply.
+    // draft taken before a header-menu change from undoing it on Apply. The
+    // advanced-settings toggle is written the same way and needs the same
+    // protection — Apply must not put the rows away again.
     new.search.columns = live.search.columns.clone();
+    new.ui.show_advanced_settings = live.ui.show_advanced_settings;
 }
 
 fn clamp_scale(scale: f32) -> f32 {
@@ -751,7 +766,8 @@ impl eframe::App for QuickSearchApp {
                 }
             }
             Tab::Settings => {
-                let out = self.settings.ui(ui, &self.cfg);
+                let indexed_files = self.backend.coordinator.state().files;
+                let out = self.settings.ui(ui, &self.cfg, indexed_files);
                 if let Some(new_cfg) = out.applied {
                     self.apply_new_config(ctx, new_cfg);
                 }
@@ -763,6 +779,12 @@ impl eframe::App for QuickSearchApp {
                     self.cfg.search.columns = columns.clone();
                     self.search.columns = columns;
                     self.search.mark_sort_dirty();
+                    self.save_cfg();
+                }
+                // Likewise: revealing a setting is not an edit to one, so it
+                // takes effect and is remembered without an Apply.
+                if let Some(show_advanced) = out.show_advanced {
+                    self.cfg.ui.show_advanced_settings = show_advanced;
                     self.save_cfg();
                 }
             }
