@@ -244,8 +244,23 @@ fn a_stamped_run_has_finished_its_stale_cleanup() {
         quicksearch_core::db::repo::get_last_full_index(&conn)
     };
 
+    // The ladder samples the race; the trailing `None` is "let it finish", and
+    // it is what makes the guard below hold. With every entry a deadline the
+    // guard was a wall-clock assumption, and this suite runs in parallel:
+    // under enough load no run reaches its stamp inside 200 ms, and the test
+    // then failed for having proved nothing rather than for a defect.
     let mut stamped = false;
-    for delay_ms in [2u64, 5, 10, 20, 35, 60, 100, 200] {
+    for delay_ms in [
+        Some(2u64),
+        Some(5),
+        Some(10),
+        Some(20),
+        Some(35),
+        Some(60),
+        Some(100),
+        Some(200),
+        None,
+    ] {
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
             conn.execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
@@ -261,27 +276,50 @@ fn a_stamped_run_has_finished_its_stale_cleanup() {
                 config.clone(),
             )
             .unwrap();
-        std::thread::sleep(Duration::from_millis(delay_ms));
-        service.stop_indexing().unwrap();
-        drop(service);
-        std::thread::sleep(Duration::from_millis(300));
+        match delay_ms {
+            Some(ms) => {
+                std::thread::sleep(Duration::from_millis(ms));
+                service.stop_indexing().unwrap();
+                drop(service);
+                // The stamp lands in the run's tail, past the point a stop can
+                // still cut it short; give that tail room to land.
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            // Idle is the *end* of the post-run maintenance pass, and a
+            // resting state, so waiting for it cannot miss the stamp however
+            // fast or slow the machine is.
+            None => {
+                let by = Instant::now() + Duration::from_secs(120);
+                loop {
+                    match service.get_status() {
+                        IndexingStatus::Idle => break,
+                        IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
+                        _ => {}
+                    }
+                    assert!(Instant::now() < by, "the unstopped run never reached Idle");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(service);
+            }
+        }
 
         if marker(&db).is_some() {
             stamped = true;
             assert_eq!(
                 rows(&db).len(),
                 0,
-                "delay {}ms: the run stamped itself complete but left stale rows behind",
+                "delay {:?}: the run stamped itself complete but left stale rows behind",
                 delay_ms
             );
             break;
         }
     }
-    // Vacuity guard: at least one delay must have let a run finish and stamp.
+    // A real guard now rather than a timing hope: the `None` pass is never
+    // stopped, so arriving here unstamped is a defect in the stamp itself.
     assert!(
         stamped,
-        "no delay produced a stamped run; the fixture never exercised the \
-         stamp-means-clean invariant"
+        "a run allowed to finish did not stamp itself; the fixture never \
+         exercised the stamp-means-clean invariant"
     );
 }
 
