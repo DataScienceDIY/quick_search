@@ -1,54 +1,40 @@
 //! Split raw search-box input into (cascade term, structured filters).
 //!
-//! The ranked search cascade has no boolean logic by design: everything
-//! that isn't a recognized `key:value` filter joins the *term* — the single
-//! phrase the cascade matches through its filename/full-text/fuzzy stages.
-//! Recognized filters (`type:`, `modified:`, `path:`, `mime:`, `name:`)
-//! become parameterized SQL fragments ANDed onto every cascade stage.
+//! Everything that isn't a recognized `key:value` filter joins the *term*;
+//! recognized filters become SQL fragments ANDed onto every cascade stage.
 //!
-//! Robustness rules for search-as-you-type:
-//! - A lex error (e.g. a half-typed quote) degrades to "whole input is the
-//!   term" — incremental typing must never surface an error.
-//! - An *unrecognized* `key:value` (like `12:30`) is reassembled verbatim
-//!   into the term.
-//! - A recognized key whose value doesn't translate (bad date, unknown type
-//!   name) is a real [`TranslateError`] — the caller shows it inline.
-//! - `AND`/`OR`/parens are not operators here; the words pass through into
-//!   the term, parens are dropped.
+//! Search-as-you-type robustness: a lex error degrades to "whole input is
+//! the term" — incremental typing must never surface an error; an
+//! unrecognized `key:value` (`12:30`) reassembles verbatim; `AND`/`OR` pass
+//! through as words, parens are dropped.
 
-use super::ast::Op;
 use super::lexer::{tokenize, Token};
 use super::pattern::{RegexQuery, TermPart, TermPattern};
 use super::translator::{build_filter, is_filter_key, TranslateError};
+use super::Op;
 
 /// The cascade's parsed input: one term string plus composable filter SQL.
 #[derive(Debug, Clone, Default)]
 pub struct CascadeQuery {
-    /// The ranked search phrase; may be empty when the input was
-    /// filter-only or regex-only.
+    /// The ranked search phrase; empty for filter-only or regex-only input.
     pub term: String,
-    /// `term` compiled for matching: literal, wildcard, or empty.
     pub pattern: TermPattern,
-    /// A `regex:` filter, matched in Rust against name, path and content —
-    /// never part of the SQL.
+    /// A `regex:` filter, matched in Rust — never part of the SQL.
     pub regex: Option<RegexQuery>,
-    /// Zero or more ` AND (...)` fragments with anonymous `?` placeholders
-    /// over alias `f`; appended verbatim to every stage's WHERE clause.
+    /// ` AND (...)` fragments appended verbatim to every stage's WHERE clause.
     pub filter_sql: String,
     pub filter_params: Vec<rusqlite::types::Value>,
 }
 
 impl CascadeQuery {
-    /// Nothing to rank on: no term pattern and no regex. (Filters alone
-    /// don't drive a search.)
+    /// Nothing to rank on — filters alone don't drive a search.
     pub fn is_empty(&self) -> bool {
         self.pattern.is_empty() && self.regex.is_none()
     }
 
     fn term_only(term: &str) -> CascadeQuery {
         let term = term.trim().to_string();
-        // Un-lexable input is searched verbatim — stars are not wildcards
-        // here, mirroring the "whole input is the term" degrade rule.
+        // Un-lexable input is searched verbatim — stars are not wildcards here.
         let pattern = TermPattern::build(&[TermPart {
             text: term.clone(),
             glob: false,
@@ -74,23 +60,20 @@ fn op_str(op: Op) -> &'static str {
 }
 
 pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
-    // NUL bytes can't occur in filenames or extracted text, but they do
-    // break SQLite text binding and the FTS5 query parser — strip them.
+    // NULs break SQLite text binding and the FTS5 query parser — strip them.
     let input = input.replace('\0', "");
     let input = input.as_str();
     let tokens = match tokenize(input) {
         Ok(t) => t,
-        // Half-typed input (unterminated quote, invalid word): the whole
-        // raw string is the term. Never an error mid-keystroke.
+        // Half-typed input: the whole raw string is the term. Never an
+        // error mid-keystroke.
         Err(_) => return Ok(CascadeQuery::term_only(input)),
     };
 
     let mut out = CascadeQuery::default();
     let mut term_parts: Vec<TermPart> = Vec::new();
     let mut i = 0usize;
-    // Only plain unquoted words are wildcard-eligible; everything else
-    // (quoted phrases, demoted AND/OR, reassembled key:value glue) is
-    // searched verbatim.
+    // Only plain unquoted words are wildcard-eligible.
     let literal = |text: &str| TermPart {
         text: text.to_string(),
         glob: false,
@@ -99,8 +82,8 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
     while i < tokens.len() {
         match &tokens[i] {
             Token::Word(word) => {
-                // Candidate filter: Word(key) Op [Op] (Word|Quoted).
-                // The lexer emits `modified:>=x` as Word Op(:) Op(>=) Word.
+                // Candidate filter: Word(key) Op [Op] (Word|Quoted), since
+                // the lexer emits `modified:>=x` as Word Op(:) Op(>=) Word.
                 if let Some(Token::Op(op1)) = tokens.get(i + 1) {
                     let (op, value_idx) = match tokens.get(i + 2) {
                         Some(Token::Op(op2)) => (*op2, i + 3),
@@ -111,12 +94,10 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
                         _ => None,
                     };
                     if let Some(value) = value {
-                        // Quoted values keep `*` literal; only a bare word's
-                        // stars act as wildcards (`name:` honors this too).
+                        // Quoted values keep `*` literal.
                         let value_is_word = matches!(tokens.get(value_idx), Some(Token::Word(_)));
                         if word.eq_ignore_ascii_case("regex") {
-                            // Not a SQL filter: compiled here, matched in
-                            // Rust against name, path and content.
+                            // Not a SQL filter: matched in Rust.
                             if op != Op::Contains {
                                 return Err(TranslateError::UnsupportedOp {
                                     key: word.clone(),
@@ -141,9 +122,8 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
                             i = value_idx + 1;
                             continue;
                         }
-                        // Unrecognized key — reassemble verbatim (`12:30`,
-                        // `foo:bar`), gluing any further `:value` chains
-                        // (`foo:bar:baz`).
+                        // Unrecognized key: reassemble verbatim, gluing any
+                        // further `:value` chains (`foo:bar:baz`).
                         let mut glued = format!("{}{}{}", word, op_str(op), value);
                         i = value_idx + 1;
                         while let Some(Token::Op(next_op)) = tokens.get(i) {
@@ -157,8 +137,7 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
                         term_parts.push(literal(&glued));
                         continue;
                     }
-                    // Key + op with no value yet (mid-typing "type:"):
-                    // pass through as literal text.
+                    // Key + op with no value yet (mid-typing "type:").
                     term_parts.push(literal(&format!("{}{}", word, op_str(*op1))));
                     i += 2;
                     continue;
@@ -169,12 +148,9 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
                 });
             }
             Token::Quoted(q) => term_parts.push(literal(q)),
-            // Not operators in the cascade grammar — plain words.
             Token::And => term_parts.push(literal("AND")),
             Token::Or => term_parts.push(literal("OR")),
-            // Grouping has no meaning without boolean logic.
             Token::LParen | Token::RParen => {}
-            // Dangling operator (e.g. "a > b" typed literally).
             Token::Op(op) => term_parts.push(literal(op_str(*op))),
         }
         i += 1;
@@ -291,11 +267,11 @@ mod tests {
     fn a_windows_drive_path_reaches_the_filter_intact() {
         let q = split_for_cascade(r"path:C:\Users\me\docs").unwrap();
         assert_eq!(q.term, "", "the whole input is a filter");
-        assert!(
-            matches!(
-                &q.filter_params[0],
-                Value::Text(t) if t == r"C:\Users\me\docs"
-            ),
+        assert_eq!(
+            q.filter_params[0],
+            Value::Text(crate::query::translator::like_subtree_pattern(
+                r"C:\Users\me\docs"
+            )),
             "{:?}",
             q.filter_params
         );
@@ -307,7 +283,9 @@ mod tests {
         assert_eq!(q.term, "");
         assert_eq!(
             q.filter_params[0],
-            Value::Text("/home/me/My Documents".into())
+            Value::Text(crate::query::translator::like_subtree_pattern(
+                "/home/me/My Documents"
+            ))
         );
     }
 
@@ -319,12 +297,9 @@ mod tests {
 
     #[test]
     fn injection_shapes_stay_bound() {
-        // Everything lands either in the term (never interpolated into
-        // SQL by the cascade — bound as parameters there too) or in
-        // filter_params. filter_sql must never contain user text.
+        // filter_sql must never contain user text.
         let q = split_for_cascade("mime:application/x-foo'; DROP TABLE files; --").unwrap();
         assert!(!q.filter_sql.contains("DROP"), "{}", q.filter_sql);
-        // The value went into params (term got the trailing junk words).
         assert!(matches!(&q.filter_params[0], Value::Text(t) if t.contains("x-foo'")));
 
         let q = split_for_cascade("name:%_\\").unwrap();
@@ -412,7 +387,6 @@ mod tests {
             split_for_cascade("regex:a regex:b"),
             Err(TranslateError::BadRegex(_))
         ));
-        // Empty-matchable patterns are rejected loudly.
         assert!(matches!(
             split_for_cascade("regex:.*"),
             Err(TranslateError::BadRegex(_))
@@ -439,14 +413,16 @@ mod tests {
         let q = split_for_cascade("name:%*_").unwrap();
         assert!(matches!(&q.filter_params[0], Value::Text(t) if t == "%\\%%\\_%"));
 
-        // path: values never glob.
+        // path: values never glob — the star reaches the pattern as a literal.
         let q = split_for_cascade("path:/da*ta").unwrap();
-        assert!(matches!(&q.filter_params[0], Value::Text(t) if t == "/da*ta"));
+        assert_eq!(
+            q.filter_params[0],
+            Value::Text(crate::query::translator::like_subtree_pattern("/da*ta"))
+        );
     }
 
     #[test]
     fn nul_bytes_stripped_and_long_terms_pass_through() {
-        // NULs would break SQLite binding / FTS5 parsing downstream.
         let q = split_for_cascade("abc\0def").unwrap();
         assert_eq!(q.term, "abcdef");
 

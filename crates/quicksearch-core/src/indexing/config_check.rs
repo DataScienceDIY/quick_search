@@ -13,11 +13,9 @@ use crate::extract::Registry;
 use super::*;
 
 impl IndexingService {
-    /// The settings the index was built under, paired with their current
-    /// values. One list drives [`validate_config`], [`update_config`] and
+    /// One list drives [`validate_config`], [`update_config`] and
     /// [`crate::scope::stored_config`], so record, comparison and
-    /// reconstruction cannot drift. List values are sorted before joining and
-    /// the roots arrive canonicalized; `stored_config` parses these back.
+    /// reconstruction cannot drift; `stored_config` parses these back.
     fn config_validation_entries(config: &Config, roots: &[String]) -> Vec<(&'static str, String)> {
         let sorted_joined = |v: &[String]| {
             let mut v: Vec<String> = v.to_vec();
@@ -26,15 +24,11 @@ impl IndexingService {
         };
         vec![
             ("hash_length", config.processing.hash_length.to_string()),
-            // Bump this string whenever the digest input changes, so existing
-            // indexes are offered a rebuild instead of silently mixing
-            // hash schemes.
+            // Bump whenever the digest input changes, so old indexes are offered a rebuild.
             ("hash_algorithm", "size+head".to_string()),
             ("indexing_path", sorted_joined(roots)),
             ("tokenize", config.processing.tokenize.clone()),
             ("include_hidden", config.indexing.include_hidden.to_string()),
-            // Decides whether symlink targets are in the index at all, so a
-            // change leaves rows that no longer belong.
             (
                 "follow_symlinks",
                 config.indexing.follow_symlinks.to_string(),
@@ -54,9 +48,7 @@ impl IndexingService {
         ]
     }
 
-    /// Every recorded `config_validation` key, for
-    /// [`crate::scope::stored_config`] to rebuild the configuration the index
-    /// was last written under.
+    /// Every recorded `config_validation` key, for [`crate::scope::stored_config`].
     pub(crate) fn stored_validation(conn: &Connection) -> Result<Vec<(String, String)>, String> {
         let mut stmt = conn
             .prepare("SELECT key, value FROM config_validation")
@@ -68,15 +60,13 @@ impl IndexingService {
             .map_err(|e| format!("read config_validation row: {}", e))
     }
 
-    /// The recorded settings a difference in which cannot be reconciled: the
-    /// FTS tokenizer is part of the table definition, and a hash written under
-    /// a different length or algorithm cannot be compared with a new one.
-    /// Everything else is recoverable — see [`crate::scope`].
+    /// Settings a difference in which cannot be reconciled: the FTS tokenizer
+    /// is part of the table definition, and hashes under a different length or
+    /// algorithm cannot be compared. Everything else — see [`crate::scope`].
     const REBUILD_KEYS: [&'static str; 3] = ["hash_length", "hash_algorithm", "tokenize"];
 
-    /// The settings the index was built under that no longer match and cannot
-    /// be reconciled — the list a rebuild prompt shows. `None` when there are
-    /// none. A key absent from the DB (older index) never counts as changed.
+    /// The unreconcilable settings that no longer match — what a rebuild prompt
+    /// shows; `None` when none. A key absent (older index) never counts as changed.
     pub(super) fn validate_config(
         conn: &Connection,
         config: &Config,
@@ -113,14 +103,9 @@ impl IndexingService {
     }
 
     /// Bring the index into line with `config` before a run walks anything.
-    ///
-    /// A no-op in the normal case (the coordinator reconciled at edit time);
-    /// it exists for configs changed while the app was not running. Runs to
-    /// completion, but in slices, so the status moves and the stop flag is
-    /// read between statements; `interrupt` reaches the statement in flight.
-    ///
-    /// Returns whether it finished: `false` means it was cut short and
-    /// nothing may be recorded as reconciled.
+    /// Runs in slices, so the stop flag is read between statements and
+    /// `interrupt` reaches the one in flight. Returns `false` if cut short —
+    /// nothing may then be recorded as reconciled.
     pub(super) fn reconcile_stored_config(
         status: &Arc<Mutex<IndexingStatus>>,
         interrupt: &db::InterruptSlot,
@@ -129,8 +114,6 @@ impl IndexingService {
         roots: &[String],
         stop_flag: &Arc<AtomicBool>,
     ) -> Result<bool, String> {
-        // What this run is about to index, which is `config` everywhere except
-        // its roots — see the caller.
         let mut current = config.clone();
         current.paths.indexing_paths = roots.to_vec();
 
@@ -139,7 +122,6 @@ impl IndexingService {
         if !work.touches_index() {
             return Ok(true);
         }
-        // Announced ahead of the scan — the wait it describes can be minutes.
         crate::log_info!(
             "configuration changed since the last run: reconciling the index ({})",
             work.summary()
@@ -156,8 +138,7 @@ impl IndexingService {
                 return Ok(false);
             }
             let outcome = {
-                // Armed per slice, so the handle names only this scan's
-                // statement; the interrupt reaches the one already in flight.
+                // Armed per slice, so the handle names only this scan's statement.
                 let _armed = db::InterruptGuard::arm(interrupt, conn);
                 crate::scope::advance(
                     conn,
@@ -169,8 +150,7 @@ impl IndexingService {
                 )
             };
             if let Err(e) = outcome {
-                // An interrupted statement fails like any other; ask the flag,
-                // not the message. A stopped run is not an error.
+                // An interrupted statement fails like any other; ask the flag, not the message.
                 if stop_flag.load(Ordering::Relaxed) {
                     crate::log_info!(
                         "configuration reconcile interrupted after {} index entries; \
@@ -203,10 +183,8 @@ impl IndexingService {
         Self::stamp(conn, Self::config_validation_entries(config, roots))
     }
 
-    /// Record the settings a reconciliation has just brought the index into
-    /// line with — everything except [`Self::REBUILD_KEYS`], which a scan
-    /// cannot satisfy: stamping those would clear a rebuild prompt the user
-    /// declined.
+    /// Stamp everything except [`Self::REBUILD_KEYS`], which a scan cannot
+    /// satisfy: stamping those would clear a rebuild prompt the user declined.
     pub(crate) fn stamp_reconciled(
         conn: &Connection,
         config: &Config,

@@ -1,16 +1,11 @@
-//! Parallel content extraction for one indexing root.
+//! Parallel content extraction for one indexing root: a worker pool produces
+//! finished work over a bounded channel; the single writer drains it in
+//! time-bounded turns, serving walks first so a fast pass waits rather than
+//! holding up anyone's walk (see `indexing::pipeline`).
 //!
-//! The second half of a root's pipeline, and the sibling of [`crate::walk`]:
-//! a pool of worker threads produces finished work over a bounded channel,
-//! and the single writer drains it in time-bounded turns. Walking roots are
-//! served first and only one extracting root per round, so a pass that is
-//! producing faster than the writer can tokenize waits rather than holding up
-//! anyone's walk — see `indexing::pipeline`.
-//!
-//! **One feeder thread owns the only database connection**, paging through
-//! the root's pending rows, while N workers do nothing but filesystem work. A
-//! connection per worker would multiply SQLite's page cache by the pool size
-//! (see [`crate::db::schema::PRAGMAS_WALK_READER`]).
+//! **One feeder thread owns the only database connection** — a connection per
+//! worker would multiply SQLite's page cache by the pool size
+//! ([`crate::db::schema::PRAGMAS_WALK_READER`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
@@ -21,49 +16,52 @@ use crate::extract::Registry;
 use crate::file_handling::{decide_content, ContentOutcome, ExtractCursor, ExtractScope};
 use crate::walk::{try_recv_next, TryNext, WorkerStats};
 
-/// Finished rows waiting for the writer.
-///
-/// Far shallower than the walk's 4096: an [`ExtractedRow`] carries up to
-/// `maximum_text_size` of extracted text (256 KiB by default), so the walk's
-/// depth would put gigabytes in flight. At 32 the ceiling is ~8 MiB per root.
+/// Finished rows waiting for the writer. Far shallower than the walk's 4096:
+/// a row carries up to `maximum_text_size` of text, so the walk's depth would
+/// put gigabytes in flight; at 32 the ceiling is ~8 MiB per root.
 const READY_CAP: usize = 32;
 
-/// Rows fetched but not yet claimed by a worker. Small so the feeder does not
-/// run arbitrarily far ahead of an I/O-bound pool; only ids and paths.
+/// Rows fetched but not yet claimed; bounds how far the feeder runs ahead.
 const QUEUE_AHEAD: usize = 256;
 
-/// How many rows the feeder fetches per query. Large enough that a slow root
-/// is not paying a round trip per file, small enough to stay inside
-/// [`QUEUE_AHEAD`].
 const FEED_PAGE: usize = 128;
 
 /// One file's extracted content, ready to be written.
 #[derive(Debug)]
 pub struct ExtractedRow {
     pub file_id: i64,
-    /// The `files.name` the FTS row is indexed under.
-    pub name: String,
+    /// The path buffer the feeder built, carried through rather than split:
+    /// see [`crate::db::repo::RowPath`].
+    path: crate::db::repo::RowPath,
     pub outcome: ContentOutcome,
 }
 
-/// A row the feeder handed to the pool: everything a worker needs, and nothing
-/// that would make it touch the database.
-#[derive(Debug)]
-struct Pending {
-    file_id: i64,
-    name: String,
-    path: String,
-    mime: Option<String>,
+impl ExtractedRow {
+    pub fn new(
+        file_id: i64,
+        path: crate::db::repo::RowPath,
+        outcome: ContentOutcome,
+    ) -> ExtractedRow {
+        ExtractedRow {
+            file_id,
+            path,
+            outcome,
+        }
+    }
+
+    /// The whole path, parent and all — what progress and logs name the file by.
+    pub fn path(&self) -> &str {
+        self.path.as_str()
+    }
 }
 
 #[derive(Default)]
 struct Queue {
-    rows: Vec<Pending>,
-    /// Set while the feeder is mid-query, holding rows that are in neither the
-    /// queue nor a worker. Without it a worker could see an empty queue
-    /// between two pages and declare the pass finished early.
+    rows: Vec<crate::db::repo::PendingRow>,
+    /// Feeder mid-query, holding rows in neither the queue nor a worker;
+    /// without it a worker could see an empty queue between two pages and
+    /// declare the pass finished early.
     feeding: bool,
-    /// True once the feeder has read the last page.
     drained: bool,
     done: bool,
 }
@@ -71,19 +69,16 @@ struct Queue {
 struct Shared {
     queue: Mutex<Queue>,
     idle: Condvar,
-    /// What the range held when the pass began: rows still to extract and
-    /// rows already done. Set by the feeder before it pages anything, so
-    /// `already_done + rows written this pass` stays exact; never set if the
-    /// feeder could not count.
+    /// What the range held when the pass began. Set by the feeder just
+    /// *behind* its first page, so the pool is never blocked on the scan;
+    /// never set if the feeder could not count.
     totals: std::sync::OnceLock<ExtractScope>,
 }
 
 impl Shared {
-    /// Claim a row, blocking while the feeder might still produce more.
-    ///
-    /// `None` only when the queue is empty *and* the feeder is finished — at
-    /// that instant nobody is left who could add another row.
-    fn take(&self) -> Option<Pending> {
+    /// Claim a row. `None` only when the queue is empty *and* the feeder is
+    /// finished — at that instant nobody is left who could add another row.
+    fn take(&self) -> Option<crate::db::repo::PendingRow> {
         let mut q = crate::lock_ok(&self.queue);
         loop {
             if q.done {
@@ -106,8 +101,7 @@ impl Shared {
         }
     }
 
-    /// Claim the right to fetch one page, or `None` once the pass is over.
-    /// Parks while the queue is already [`QUEUE_AHEAD`] deep.
+    /// Claim the right to fetch one page; parks at [`QUEUE_AHEAD`] deep.
     fn take_feed_slot(&self) -> Option<()> {
         let mut q = crate::lock_ok(&self.queue);
         loop {
@@ -127,7 +121,7 @@ impl Shared {
 
     /// Publish a page and clear the in-flight flag together, under one lock —
     /// the indivisibility [`Shared::take`]'s end-of-pass test relies on.
-    fn finish_feed(&self, rows: Vec<Pending>, last_page: bool) {
+    fn finish_feed(&self, rows: Vec<crate::db::repo::PendingRow>, last_page: bool) {
         let mut q = crate::lock_ok(&self.queue);
         // Reversed: `take` pops from the back, and rows should reach workers
         // in id order so a partial run leaves a contiguous prefix done.
@@ -147,8 +141,7 @@ impl Shared {
     }
 }
 
-/// A running content pass. Draining it yields finished rows; dropping it stops
-/// the workers and joins them.
+/// A running content pass; dropping it stops the workers and joins them.
 pub struct ContentPass {
     rx: Option<mpsc::Receiver<ExtractedRow>>,
     handles: Vec<JoinHandle<()>>,
@@ -158,30 +151,22 @@ pub struct ContentPass {
 }
 
 impl ContentPass {
-    /// Non-blocking pull, for the writer loop multiplexing several roots.
     pub fn try_next(&mut self) -> TryNext<ExtractedRow> {
         try_recv_next(self.rx.as_ref())
     }
 
-    /// A cheap, cloneable handle for reading pool activity while the pass is
-    /// mutably borrowed by the writer loop; the sibling of
-    /// [`crate::walk::ParallelWalk::worker_stats`].
+    /// Cloneable handle for reading pool activity.
     pub fn worker_stats(&self) -> WorkerStats {
         self.stats.clone()
     }
 
-    /// The range's pending and already-done counts as they stood when the
-    /// pass began.
-    ///
-    /// `None` until the feeder has counted — a scan that takes seconds on a
-    /// large root, which is why it happens here on the pass's own connection
-    /// and not on the indexer's writer — and forever if it could not.
+    /// The range's counts as they stood when the pass began. `None` until
+    /// the feeder has counted, and forever if it could not.
     pub fn totals(&self) -> Option<ExtractScope> {
         self.shared.totals.get().copied()
     }
 
-    /// Join the workers and report whether every one finished cleanly.
-    /// See [`crate::walk::ParallelWalk::finish`].
+    /// Join the workers; see [`crate::walk::ParallelWalk::finish`].
     pub fn finish(&mut self) -> bool {
         // Dropping the receiver first releases any worker parked in `send`.
         self.rx = None;
@@ -204,16 +189,13 @@ impl ContentPass {
 impl Drop for ContentPass {
     fn drop(&mut self) {
         self.shared.shutdown();
-        // No-op if the caller already called `finish`.
         self.finish();
     }
 }
 
 /// Page the root's pending rows into the queue from one read-only connection.
-///
-/// A failed query ends the pass rather than retrying: the rows stay
-/// `content_state = 0` and the next run picks them up, which is the same
-/// outcome as being interrupted.
+/// A failed query ends the pass: the rows stay `content_state = 0` and the
+/// next run picks them up — the same outcome as being interrupted.
 fn feeder(shared: &Shared, db_path: &str, mut cursor: ExtractCursor, config: &Config) {
     let conn = match crate::db::open::open_walk_reader(db_path) {
         Ok(conn) => conn,
@@ -224,16 +206,23 @@ fn feeder(shared: &Shared, db_path: &str, mut cursor: ExtractCursor, config: &Co
         }
     };
 
-    // Before the first page, so nothing this pass writes is inside the count.
-    // The workers cannot run ahead of this: they block in `take` until the
-    // first page lands. A failure here costs the progress figure, not the
-    // pass.
-    match crate::file_handling::count_extract_scope(&conn, &cursor, config) {
-        Ok(totals) => {
-            let _ = shared.totals.set(totals);
+    // The count happens *behind* the first page: counting first idled the
+    // whole pool for a scan that only feeds a progress bar. Deferring costs a
+    // numerator that briefly runs ahead — a shape `RootProgress` reports
+    // and deliberately does not clamp.
+    let mut counted = false;
+    let mut count_now = |conn: &rusqlite::Connection, cursor: &ExtractCursor| {
+        if counted {
+            return;
         }
-        Err(e) => crate::log_warn!("content reader: {}", e),
-    }
+        counted = true;
+        match crate::file_handling::count_extract_scope(conn, cursor, config) {
+            Ok(totals) => {
+                let _ = shared.totals.set(totals);
+            }
+            Err(e) => crate::log_warn!("content reader: {}", e),
+        }
+    };
 
     let max_size = crate::file_handling::max_text_file_size(config);
     while shared.take_feed_slot().is_some() {
@@ -248,23 +237,18 @@ fn feeder(shared: &Shared, db_path: &str, mut cursor: ExtractCursor, config: &Co
                 }
             };
         let last_page = page.len() < FEED_PAGE;
-        if let Some((id, _, _, _)) = page.last() {
-            cursor.last_id = *id;
+        if let Some(row) = page.last() {
+            cursor.last_id = row.file_id;
         }
-        let rows = page
-            .into_iter()
-            .map(|(file_id, name, path, mime)| Pending {
-                file_id,
-                name,
-                path,
-                mime,
-            })
-            .collect();
-        shared.finish_feed(rows, last_page);
+        shared.finish_feed(page, last_page);
+        count_now(&conn, &cursor);
         if last_page {
             return;
         }
     }
+    // An empty range still counts — `an_empty_range_terminates_immediately`
+    // pins that it reports a known zero rather than an unknown.
+    count_now(&conn, &cursor);
 }
 
 fn worker(
@@ -275,18 +259,25 @@ fn worker(
     stop_flag: &Arc<AtomicBool>,
     stats: &WorkerStats,
 ) {
+    // One per worker, for the whole pass: the container and stream buffers
+    // inside it are what every extraction stages through.
+    let mut scratch = crate::extract::Scratch::new(config);
     while let Some(row) = shared.take() {
-        // Held for the whole of `decide_content`; that is the work the
-        // progress line reports.
         let _busy = stats.enter();
         if stop_flag.load(Ordering::Relaxed) {
             shared.shutdown();
             return;
         }
-        let outcome = decide_content(&row.path, row.mime.as_deref(), registry, config);
+        let outcome = decide_content(
+            row.path.as_str(),
+            row.mime.as_deref(),
+            registry,
+            config,
+            &mut scratch,
+        );
         let sent = tx.send(ExtractedRow {
             file_id: row.file_id,
-            name: row.name,
+            path: row.path,
             outcome,
         });
         if sent.is_err() {
@@ -297,10 +288,8 @@ fn worker(
     }
 }
 
-/// Extract every pending row under `cursor`'s range, in parallel.
-/// `workers` is the root's own count — the same value its walk uses —
-/// clamped to 1..=64.
-#[allow(clippy::too_many_arguments)]
+/// Extract every pending row under `cursor`'s range, in parallel. `workers`
+/// is the root's own count, clamped to 1..=64.
 pub fn extract_content(
     db_path: &str,
     cursor: &ExtractCursor,
@@ -362,9 +351,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
-    /// The removed `extract_scope_prepare`: the sweep on the writer, then the
-    /// count the content pass now does on its own connection. Composed here
-    /// because these tests want both halves in one call.
+    /// The writer's oversize sweep, then the pass's own count.
     fn extract_scope_prepare(
         conn_mutex: &Arc<Mutex<rusqlite::Connection>>,
         cursor: &ExtractCursor,
@@ -374,13 +361,11 @@ mod tests {
         crate::file_handling::mark_oversize_pending_na(&conn, cursor, config)?;
         crate::file_handling::count_extract_scope(&conn, cursor, config)
     }
-    /// A path that does not exist yet — the caller builds the tree under it.
     fn tmp(tag: &str) -> PathBuf {
         crate::testutil::scratch_dir(tag).join("tree")
     }
 
-    /// A tree of `n` text files under `root/sub`, plus an index holding a
-    /// pending row for each.
+    /// A tree of text files, plus an index holding a pending row for each.
     fn seed(tag: &str, dirs: &[(&str, usize)]) -> (PathBuf, PathBuf) {
         let tree = tmp(&format!("{}-tree", tag));
         let db = tmp(&format!("{}-db", tag));
@@ -396,8 +381,7 @@ mod tests {
                     &tx,
                     &NewFile {
                         name: f.file_name().unwrap().to_str().unwrap(),
-                        path: f.to_str().unwrap(),
-                        parent: d.to_str().unwrap(),
+                        parent: &crate::file_handling::dir_to_db_parent(&d),
                         size: std::fs::metadata(&f).unwrap().len(),
                         mtime: 1,
                         mime: Some("text/plain"),
@@ -426,8 +410,6 @@ mod tests {
         )
     }
 
-    /// Drain a pass to exhaustion, blocking between polls the way the writer
-    /// loop's outer sleep does.
     fn drain(pass: &mut ContentPass) -> Vec<ExtractedRow> {
         let mut out = Vec::new();
         loop {
@@ -459,8 +441,6 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    /// The pass is scoped by the cursor's path range, so a sibling root's
-    /// rows are never touched.
     #[test]
     fn the_pass_is_scoped_to_its_root_range() {
         let (tree, db) = seed("scope", &[("r1", 3), ("r2", 3)]);
@@ -494,7 +474,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .query_row(
-                    "SELECT content_state FROM files WHERE path = ?1",
+                    "SELECT content_state FROM files WHERE parent || name = ?1",
                     rusqlite::params![p.to_str().unwrap()],
                     |r| r.get(0),
                 )
@@ -507,8 +487,7 @@ mod tests {
             "out-of-range row untouched"
         );
 
-        // A second run over the unchanged root reports it already extracted,
-        // so progress reads "3 of 3" rather than "0 of 0".
+        // A second run over the unchanged root reads "3 of 3", not "0 of 0".
         let scope2 = extract_scope_prepare(&conn_mutex, &cursor, &config).unwrap();
         assert_eq!((scope2.pending, scope2.already_done), (0, 3));
 
@@ -529,14 +508,11 @@ mod tests {
 
     #[test]
     fn an_empty_range_terminates_immediately() {
-        // The "nothing to do at t=0" corner: every worker must observe the pass
-        // as finished rather than waiting for rows that will never arrive.
         let (tree, db) = seed("empty", &[("r1", 2)]);
         let mut pass = pass_for(&tree, &db, "nonexistent", 4);
         assert!(drain(&mut pass).is_empty());
         assert!(pass.finish());
-        // The pass still counted: an empty range is a known zero, not an
-        // unknown.
+        // An empty range is a known zero, not an unknown.
         assert_eq!(
             pass.totals(),
             Some(ExtractScope {
@@ -548,9 +524,8 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    /// The pass counts its range on its own connection, before it pages —
-    /// which is what lets the writer thread stop doing it. The count is what
-    /// stood at the start: rows this pass writes are not inside it.
+    /// The count is what stood at the start: rows this pass writes are not
+    /// inside it.
     #[test]
     fn the_pass_counts_its_range_before_it_starts() {
         let (tree, db) = seed("totals", &[("r1", 3), ("r2", 2)]);
@@ -570,9 +545,8 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    /// The writer's turn is bounded by time, not by batch: `store_extracted`
-    /// stops at its deadline, tells the caller how far it got, and always
-    /// gets at least one row down so a caller looping on it cannot spin.
+    /// `store_extracted` stops at its deadline but always gets at least one
+    /// row down, so a caller looping on it cannot spin.
     #[test]
     fn store_extracted_honours_its_deadline_but_always_makes_progress() {
         let (tree, db) = seed("deadline", &[("r1", 5)]);
@@ -595,7 +569,6 @@ mod tests {
                 written: 1
             }
         );
-        // Plenty of time: the rest, in one call.
         let far = Instant::now() + Duration::from_secs(60);
         assert_eq!(
             store_extracted(&conn_mutex, &rows[1..], &stop, &config, far).unwrap(),
@@ -615,7 +588,7 @@ mod tests {
             .unwrap();
         assert_eq!(done, 5, "every row landed across the two calls");
 
-        // Stopped before it starts: nothing consumed, and the caller can tell.
+        // Stopped before it starts: nothing consumed.
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             store_extracted(&conn_mutex, &rows, &stop, &config, far).unwrap(),
@@ -649,7 +622,6 @@ mod tests {
         // away, or `Drop` would join threads that never wake.
         let (tree, db) = seed("early-drop", &[("r1", 500)]);
         let mut pass = pass_for(&tree, &db, "r1", 4);
-        // Pull one, leave the rest queued and the channel full.
         loop {
             match pass.try_next() {
                 TryNext::Item(_) => break,
@@ -664,8 +636,8 @@ mod tests {
 
     #[test]
     fn repeated_passes_agree_on_the_result_set() {
-        // The termination protocol is racy by nature; run it enough times under
-        // real contention that a premature exit would show up.
+        // The termination protocol is racy by nature; run it under real
+        // contention until a premature exit would show up.
         let (tree, db) = seed("repeat", &[("r1", 120)]);
         for run in 0..20 {
             let mut pass = pass_for(&tree, &db, "r1", 4);
@@ -677,8 +649,6 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    /// The pass counts its own busy threads, which is what the progress line
-    /// shows once a root leaves the walk behind.
     #[test]
     fn the_pool_reports_its_own_activity() {
         let (tree, db) = seed("stats", &[("r1", 300)]);
@@ -687,7 +657,7 @@ mod tests {
         assert_eq!(stats.total(), 4);
 
         // Nothing is drained, so the channel fills and every worker parks
-        // mid-row inside `send` — busy by the display's definition.
+        // mid-row inside `send`.
         let mut peak = 0;
         for _ in 0..500 {
             peak = peak.max(stats.active());
@@ -706,9 +676,7 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
-    /// A file that vanished between the walk and extraction is a failure with
-    /// a reason, not a silent skip: the row records why so it is not retried
-    /// forever.
+    /// Vanished files fail with a reason so they are not retried forever.
     #[test]
     fn a_missing_file_is_reported_as_failed() {
         let (tree, db) = seed("missing", &[("r1", 2)]);

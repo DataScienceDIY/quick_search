@@ -10,13 +10,13 @@ use quicksearch_core::db;
 use quicksearch_core::query::split::split_for_cascade;
 use quicksearch_core::search::{cascade, SearchHit, SearchOptions};
 use quicksearch_core::security::{derive_key, IndexKey};
+use quicksearch_core::textenc::scrub_controls;
 use zeroize::Zeroizing;
 
 use crate::format::{fmt_mtime, human_size};
 
-/// Scripting escape hatch for password-protected indexes. Caveat: other
-/// processes of the same user can read this process's environment, and
-/// exported variables end up in shell history.
+/// Scripting escape hatch. Caveat: other processes of the same user can read
+/// the environment, and exported variables end up in shell history.
 const PASSWORD_ENV: &str = "QUICKSEARCH_PASSWORD";
 
 pub(crate) const USAGE: &str = "\
@@ -24,10 +24,15 @@ QuickSearch: indexed file search
 
 USAGE:
     quicksearch                          open the GUI
+    quicksearch --toggle                 focus the running GUI, or start it
     quicksearch [FLAGS] <query terms>    search from the terminal
                                          (Windows: quicksearch-cli)
 
 FLAGS:
+    --toggle        bring the running GUI forward with the search box
+                    focused, starting it if none is running. Bind a key to
+                    this in your desktop's keyboard settings for a
+                    system-wide search shortcut.
     --fuzzy         also run the fuzzy filename/full-text passes
     --limit <N>     maximum results (default: [search].display_limit)
     --long          rank, size, mtime, and snippets instead of bare paths
@@ -43,19 +48,14 @@ A password-protected index unlocks from, in order: the OS keychain (when
 environment variable, or an interactive prompt. Note that environment
 variables are visible to other processes of the same user.";
 
-/// Parse argv; `Some(exit_code)` when the invocation was CLI-mode (query
-/// or --help), `None` to open the GUI.
+/// Parse argv; `Some(exit_code)` for CLI-mode, `None` to open the GUI.
 ///
-/// Invariant: terminal mode never builds an [`IndexCoordinator`] — no
-/// watcher, no background threads, no inotify watches consumed. A one-shot
-/// query must not compete for the per-user watch budget with a running GUI.
-///
-/// [`IndexCoordinator`]: quicksearch_core::coordinator::IndexCoordinator
+/// Invariant: terminal mode never builds an `IndexCoordinator` — a one-shot
+/// query must not compete for the per-user inotify budget with a running GUI.
 pub fn maybe_run_cli() -> Option<i32> {
     run_cli(std::env::args().skip(1).collect())
 }
 
-/// The body of [`maybe_run_cli`], taking argv for testability.
 fn run_cli(args: Vec<String>) -> Option<i32> {
     let mut fuzzy = false;
     let mut long = false;
@@ -90,8 +90,7 @@ fn run_cli(args: Vec<String>) -> Option<i32> {
                 }
             },
             other if other.starts_with('-') && terms.is_empty() => {
-                // Unknown flags without a query fall through to the GUI
-                // (they may be eframe/winit flags).
+                // Unknown flags may be eframe/winit flags: fall through to the GUI.
                 return None;
             }
             other => terms.push(other.to_string()),
@@ -104,14 +103,10 @@ fn run_cli(args: Vec<String>) -> Option<i32> {
     Some(run_query(&terms.join(" "), fuzzy, limit, long))
 }
 
-/// Unlock a protected index using whichever key source is available.
-///
-/// Order: keychain (when enabled) → `QUICKSEARCH_PASSWORD` → interactive
-/// prompt (three attempts) → an instructive error. `try_key` installs a
-/// candidate as the process key and verifies it against the index; sources
-/// whose key doesn't fit fall through (keychain: stale entry) or fail hard
-/// (env var, exhausted prompts). Password buffers are zeroized on drop and
-/// consumed immediately by the KDF; nothing here retains or logs them.
+/// Unlock a protected index: keychain → `QUICKSEARCH_PASSWORD` →
+/// interactive prompt (three attempts) → an instructive error. Password
+/// buffers are zeroized on drop and consumed immediately by the KDF;
+/// nothing here retains or logs them.
 pub(crate) fn resolve_key(
     security: &SecurityConfig,
     is_tty: bool,
@@ -127,15 +122,20 @@ pub(crate) fn resolve_key(
 
     if let Some(hex) = keychain_hex {
         match IndexKey::from_hex(&hex).map_err(|e| format!("keychain entry: {}", e)) {
-            Ok(key) => {
-                match try_key(key) {
-                    Ok(()) => return Ok(()),
-                    Err(e) if e.starts_with(db::KEY_MISMATCH_PREFIX) => {
-                        eprintln!("warning: the key remembered in the OS keychain no longer opens this index");
+            Ok(key) => match try_key(key) {
+                Ok(()) => return Ok(()),
+                Err(e) => match mismatch_cause(&e) {
+                    Some((db::KeyMismatch::WrongPassword, _)) => {
+                        eprintln!(
+                            "warning: the key remembered in the OS keychain no longer \
+                             opens this index"
+                        );
                     }
-                    Err(e) => return Err(e),
-                }
-            }
+                    // Not a stale entry: say which, then fall through.
+                    Some((_, detail)) => eprintln!("warning: {}", detail),
+                    None => return Err(e),
+                },
+            },
             Err(e) => eprintln!("warning: {}", e),
         }
     }
@@ -145,11 +145,15 @@ pub(crate) fn resolve_key(
         drop(password);
         return match try_key(key) {
             Ok(()) => Ok(()),
-            Err(e) if e.starts_with(db::KEY_MISMATCH_PREFIX) => Err(format!(
-                "{} does not match this index's password",
-                PASSWORD_ENV
-            )),
-            Err(e) => Err(e),
+            Err(e) => match mismatch_cause(&e) {
+                Some((db::KeyMismatch::WrongPassword, _)) => Err(format!(
+                    "{} does not match this index's password",
+                    PASSWORD_ENV
+                )),
+                // Don't blame the env var for a cause that is not about it.
+                Some((_, detail)) => Err(detail),
+                None => Err(e),
+            },
         };
     }
 
@@ -168,17 +172,26 @@ pub(crate) fn resolve_key(
         drop(password);
         match try_key(key) {
             Ok(()) => return Ok(()),
-            Err(e) if e.starts_with(db::KEY_MISMATCH_PREFIX) => {
-                eprintln!("Wrong password.");
-            }
-            Err(e) => return Err(e),
+            Err(e) => match mismatch_cause(&e) {
+                // Only a wrong password is worth another attempt; the other
+                // causes are facts about the index, and retrying makes the
+                // user type a *correct* password twice more.
+                Some((db::KeyMismatch::WrongPassword, _)) => eprintln!("Wrong password."),
+                Some((_, detail)) => return Err(detail),
+                None => return Err(e),
+            },
         }
     }
     Err("wrong password (3 attempts)".to_string())
 }
 
-/// Wire [`resolve_key`] to the real terminal, environment, keychain and
-/// database, installing the verified key as the process key.
+/// [`db::key_mismatch_parts`] with the detail copied out, so a caller can
+/// hand the original error back on the `None` arm without a borrow conflict.
+fn mismatch_cause(error: &str) -> Option<(db::KeyMismatch, String)> {
+    db::key_mismatch_parts(error).map(|(cause, detail)| (cause, detail.to_string()))
+}
+
+/// [`resolve_key`] wired to the real terminal, environment and keychain.
 fn resolve_key_for_terminal(security: &SecurityConfig, db_path: &str) -> Result<(), String> {
     let keychain_hex = if security.use_keychain {
         crate::keychain::load_key(db_path).unwrap_or_else(|e| {
@@ -227,8 +240,8 @@ fn run_query(query: &str, fuzzy: bool, limit: Option<usize>, long: bool) -> i32 
             return 2;
         }
     }
-    // Read-write purely so SQLite may create the WAL shared-memory file
-    // when no other process has the index open; nothing is written.
+    // Read-write purely so SQLite may create the WAL shared-memory file;
+    // nothing is written.
     let conn = match db::open_existing(&db_path.to_string_lossy(), true) {
         Ok(c) => c,
         Err(e) => {
@@ -269,7 +282,18 @@ fn run_query(query: &str, fuzzy: bool, limit: Option<usize>, long: bool) -> i32 
 
     match outcome {
         Ok(Some(outcome)) => {
-            let color = long && std::io::stdout().is_terminal() && enable_vt();
+            let tty = std::io::stdout().is_terminal();
+            let color = long && tty && enable_vt();
+            // Scrubbed only for a terminal (the way `ls` does it): raw escape
+            // sequences in a filename can rewrite the line or reach the
+            // clipboard via OSC 52. Piped output stays byte-exact.
+            let show = |s: &str| -> String {
+                if tty {
+                    scrub_controls(s).into_owned()
+                } else {
+                    s.to_string()
+                }
+            };
             for hit in &hits {
                 if long {
                     println!(
@@ -277,13 +301,13 @@ fn run_query(query: &str, fuzzy: bool, limit: Option<usize>, long: bool) -> i32 
                         hit.rank,
                         human_size(hit.size),
                         fmt_mtime(hit.mtime),
-                        hit.path
+                        show(&hit.path)
                     );
                     if let Some(snip) = &hit.snippet {
-                        println!("        {}", render_snippet(snip, color));
+                        println!("        {}", render_snippet(snip, color, tty));
                     }
                 } else {
-                    println!("{}", hit.path);
+                    println!("{}", show(&hit.path));
                 }
             }
             if outcome.limited {
@@ -299,13 +323,9 @@ fn run_query(query: &str, fuzzy: bool, limit: Option<usize>, long: bool) -> i32 
     }
 }
 
-/// Whether ANSI escapes will actually render.
-///
-/// Always true where the terminal is ANSI by nature. On Windows the console
-/// only interprets escapes once `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set:
-/// Windows Terminal and Windows 11 have it already, older conhost needs it
-/// turned on, and anything that refuses gets plain text rather than a screen
-/// full of `\x1b[1m`.
+/// Whether ANSI escapes will actually render. On Windows the console only
+/// interprets escapes once `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set;
+/// anything that refuses gets plain text rather than a screen of `\x1b[1m`.
 #[cfg(not(windows))]
 fn enable_vt() -> bool {
     true
@@ -334,28 +354,49 @@ fn enable_vt() -> bool {
 }
 
 /// One-line snippet with matches emphasized (ANSI bold on TTYs).
-fn render_snippet(snip: &quicksearch_core::snippet::Snippet, color: bool) -> String {
+fn render_snippet(snip: &quicksearch_core::snippet::Snippet, color: bool, tty: bool) -> String {
+    // Each piece is scrubbed as it goes in, before the emphasis codes, so
+    // the only escapes in the result are the ones put there here.
     let mut out = String::new();
+    let push = |out: &mut String, piece: &str| {
+        // Flattened *before* the scrub: `scrub_controls` turns `\n` into
+        // `U+FFFD`, so a trailing replace would print `�` where the space belongs.
+        let flat = flatten_lines(piece);
+        if tty {
+            out.push_str(&scrub_controls(&flat));
+        } else {
+            out.push_str(&flat);
+        }
+    };
     if snip.truncated_start {
         out.push('…');
     }
     let mut cursor = 0;
     for &(start, end) in &snip.ranges {
-        out.push_str(&snip.window[cursor..start]);
+        push(&mut out, &snip.window[cursor..start]);
         if color {
             out.push_str("\x1b[1m");
-            out.push_str(&snip.window[start..end]);
+            push(&mut out, &snip.window[start..end]);
             out.push_str("\x1b[0m");
         } else {
-            out.push_str(&snip.window[start..end]);
+            push(&mut out, &snip.window[start..end]);
         }
         cursor = end;
     }
-    out.push_str(&snip.window[cursor..]);
+    push(&mut out, &snip.window[cursor..]);
     if snip.truncated_end {
         out.push('…');
     }
-    out.replace(['\n', '\r'], " ")
+    out
+}
+
+/// Line breaks flattened to spaces, borrowed when there are none.
+fn flatten_lines(piece: &str) -> std::borrow::Cow<'_, str> {
+    if piece.contains(['\n', '\r']) {
+        std::borrow::Cow::Owned(piece.replace(['\n', '\r'], " "))
+    } else {
+        std::borrow::Cow::Borrowed(piece)
+    }
 }
 
 #[cfg(test)]
@@ -372,14 +413,16 @@ mod tests {
     }
 
     fn mismatch() -> Result<(), String> {
-        Err(format!("{}wrong password", db::KEY_MISMATCH_PREFIX))
+        Err(format!(
+            "{}wrong-password: index at /x: wrong password",
+            db::KEY_MISMATCH_PREFIX
+        ))
     }
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
     }
 
-    /// Informational flags answer and exit 0 without touching the index.
     #[test]
     fn informational_flags_answer_and_succeed() {
         for flag in ["-V", "--version", "-h", "--help"] {
@@ -387,16 +430,13 @@ mod tests {
         }
     }
 
-    /// Nothing to search for means "open the GUI".
     #[test]
     fn nothing_to_search_for_opens_the_gui() {
         assert_eq!(run_cli(argv(&[])), None);
-        // Including flags the GUI stack might want for itself.
         assert_eq!(run_cli(argv(&["--some-winit-flag"])), None);
     }
 
-    /// A malformed value is a usage error, not a silent default — in both
-    /// spellings, since only one of them goes through `it.next()`.
+    /// Both spellings, since only one of them goes through `it.next()`.
     #[test]
     fn a_non_numeric_limit_is_a_usage_error() {
         assert_eq!(run_cli(argv(&["--limit", "x", "term"])), Some(2));
@@ -565,8 +605,7 @@ mod tests {
 
     #[test]
     fn non_mismatch_errors_are_fatal_immediately() {
-        // e.g. the database file vanished between existence check and open:
-        // retrying the password would mislead the user.
+        // e.g. the database vanished: retrying the password would mislead.
         let sec = protected();
         let err = resolve_key(
             &sec,

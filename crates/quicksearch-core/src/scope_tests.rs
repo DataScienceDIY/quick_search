@@ -45,12 +45,12 @@ fn seed(conn: &mut Connection, paths: &[PathBuf]) {
     let tx = conn.transaction().unwrap();
     for path in paths {
         let path = path.to_string_lossy();
-        let (parent, name) = path.rsplit_once('/').unwrap();
+        // The indexer's own split, so the separator stays with the parent.
+        let (parent, name) = crate::file_handling::split_db_path(&path).expect("a file's path");
         repo::insert_file(
             &tx,
             &repo::NewFile {
                 name,
-                path: &path,
                 parent,
                 size: 1,
                 mtime: 1,
@@ -66,7 +66,6 @@ fn seed(conn: &mut Connection, paths: &[PathBuf]) {
     tx.commit().unwrap();
 }
 
-/// Every file that physically exists under `root`, walker or no walker.
 fn on_disk(root: &Path) -> Vec<PathBuf> {
     walkdir::WalkDir::new(root)
         .into_iter()
@@ -76,9 +75,8 @@ fn on_disk(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `Scope` must reach the same verdict the walker does for every file on
-/// disk: stricter, and every prune deletes rows the next run puts straight
-/// back; laxer, and the rows the user excluded survive.
+/// Stricter than the walker and every prune deletes rows the next run puts
+/// straight back; laxer and the rows the user excluded survive.
 #[test]
 fn scope_agrees_with_the_walker() {
     let root = tmp_tree("agree");
@@ -97,8 +95,7 @@ fn scope_agrees_with_the_walker() {
     config.indexing.ignore_patterns = vec![
         "*.tmp".into(),
         "node_modules".into(),
-        // A full-path pattern: prunes this one directory, not every
-        // directory called `out`.
+        // A full-path pattern: this directory, not every one called `out`.
         root.join("build/out").to_string_lossy().into_owned(),
     ];
 
@@ -121,9 +118,6 @@ fn scope_agrees_with_the_walker() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// A root is never filtered — the user chose it. A component pattern naming
-/// the root must not empty it out, but a full-path pattern matching the
-/// root still prunes everything below it.
 #[test]
 fn a_root_is_never_filtered_but_its_children_still_are() {
     let base = tmp_tree("root-name");
@@ -152,8 +146,7 @@ fn a_root_is_never_filtered_but_its_children_still_are() {
     std::fs::remove_dir_all(&base).ok();
 }
 
-/// The counters the status display reads: a scan that reports nothing is
-/// indistinguishable from a hang.
+/// A scan that reports nothing is indistinguishable from a hang.
 #[test]
 fn the_scan_reports_its_way_through_every_row() {
     let root = tmp_tree("progress");
@@ -185,8 +178,8 @@ fn the_scan_reports_its_way_through_every_row() {
     let run = AtomicBool::new(false);
     let mut seen: Vec<usize> = Vec::new();
     while !cursor.done() {
-        // A deadline already past, so each call does the least it can and
-        // the counters are sampled at their finest granularity.
+        // A deadline already past: each call does the least it can, so the
+        // counters are sampled at their finest granularity.
         advance(
             &mut conn,
             &narrowed,
@@ -218,10 +211,8 @@ fn the_scan_reports_its_way_through_every_row() {
     std::fs::remove_dir_all(&db_dir).ok();
 }
 
-/// Cancelling stops the pass at the next statement boundary and leaves the
-/// cursor un-finished, so nothing downstream can record the configuration
-/// as reconciled. Rows already reached stay gone — the pass is idempotent
-/// and the next run finishes it.
+/// The cursor is left un-finished, so nothing downstream records the config
+/// as reconciled. Rows already reached stay gone: the pass is idempotent.
 #[test]
 fn cancelling_stops_the_scan_without_finishing_it() {
     let root = tmp_tree("cancel");
@@ -262,8 +253,7 @@ fn cancelling_stops_the_scan_without_finishing_it() {
         "a cancelled pass touched the index"
     );
 
-    // And part-way through: one slice with the flag clear, the rest with
-    // it set. The counters keep what the first slice earned.
+    // And part-way through: the counters keep what the first slice earned.
     let stop = AtomicBool::new(false);
     let mut cursor = WorkCursor::new(work, &narrowed).unwrap();
     advance(

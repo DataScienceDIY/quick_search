@@ -1,7 +1,4 @@
 //! Shared scaffolding for the integration-test binaries.
-//!
-//! Cargo compiles this into each `tests/*.rs` that declares `mod common;`, so
-//! every binary gets its own copy and each one uses a different subset.
 
 #![allow(dead_code)]
 
@@ -15,34 +12,26 @@ use quicksearch_core::indexing::{IndexingService, IndexingStatus};
 #[allow(unused_imports)]
 pub use quicksearch_core::testutil::{scratch_dir, scratch_dir_canonical, touch};
 
-/// A scratch database path under a fresh directory. The sidecars SQLite
-/// creates alongside it (`-wal`, `-shm`) land in the same directory.
-pub fn scratch_db(tag: &str) -> std::path::PathBuf {
-    scratch_dir(tag).join("index.sqlite")
-}
+#[allow(unused_imports)]
+pub use quicksearch_core::testutil::{
+    scratch_db, seed_index, Lcg, SeedSpec, BODY_TERM, NEEDLE, WORDS,
+};
 
-/// How long a single indexing run may take before the test gives up. Generous:
-/// CI runs these in a container against a cold page cache.
 const INDEX_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// One full indexing run, awaited to completion.
-///
-/// Completion is read from the `last_full_index` marker rather than the status
-/// enum, because `run_indexing` writes that marker only on a successful finish.
-/// Polling for `IndexingStatus::Idle` instead would race: a small tree finishes
-/// between two polls, leaving `Idle` ambiguous between "not started yet" and
-/// "already done".
+/// One full indexing run, awaited via the `last_full_index` marker, which is
+/// written only on a successful finish — polling for `Idle` would race: a
+/// small tree finishes between two polls, leaving `Idle` ambiguous between
+/// "not started yet" and "already done".
 pub struct IndexOnce<'a> {
     pub db: &'a Path,
     pub roots: Vec<String>,
     pub config: &'a Config,
-    /// Delete any existing completion marker first, so a second run over the
-    /// same index is distinguishable from the first. Off for suites that index
-    /// into a database whose lifecycle they are themselves testing.
+    /// Delete any existing completion marker first. Off for suites indexing a
+    /// database whose lifecycle they are themselves testing.
     pub fresh_marker: bool,
-    /// Poll the marker through the keyed open. An encrypted index cannot be
-    /// read by a plain `rusqlite::Connection::open`, so a run against one would
-    /// otherwise never observe its own completion and time out.
+    /// Poll the marker through the keyed open: a plain open cannot read an
+    /// encrypted index and would never observe its own completion.
     pub encrypted: bool,
 }
 
@@ -79,8 +68,7 @@ impl IndexOnce<'_> {
         service.stop_indexing().unwrap();
     }
 
-    /// Whether the completion marker is present. A database mid-creation is
-    /// simply "not yet", not a failure — the poll comes round again.
+    /// Whether the marker is present; mid-creation is simply "not yet".
     fn completed(&self) -> bool {
         let conn = if self.encrypted {
             db::open_existing(&self.db.to_string_lossy(), false).ok()

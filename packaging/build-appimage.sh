@@ -28,7 +28,8 @@ set -euo pipefail
 umask 022
 
 readonly PKG=quicksearch
-readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
+parse_args "$@"
 readonly ICON_SRC="$REPO_ROOT/crates/quicksearch-gui/assets/icons"
 readonly ICON_SVG="$ICON_SRC/quicksearch_icon.svg"
 readonly METAINFO=com.karsttech.quicksearch.metainfo.xml
@@ -62,25 +63,6 @@ readonly RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/downloa
 # resolves that from the sidecar's own headers, relative to this URL.
 readonly UPDATE_URL="https://code.karsttech.com/jeremy/quick_search/releases/download/latest/$PKG-x86_64.AppImage.zsync"
 
-do_build=1
-do_strip=1
-out_dir="$REPO_ROOT/dist"
-
-die() { printf 'build-appimage: %s\n' "$*" >&2; exit 1; }
-say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --no-build) do_build=0 ;;
-        --no-strip) do_strip=0 ;;
-        -o|--output-dir) shift; [ $# -gt 0 ] || die "--output-dir needs a path"; out_dir="$1" ;;
-        # Print the header comment block, however long it grows.
-        -h|--help) awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; exit 0 ;;
-        *) die "unknown option: $1 (try --help)" ;;
-    esac
-    shift
-done
-
 # zsyncmake comes from the zsync package. appimagetool looks it up in PATH
 # rather than bundling it, and - worse - reports success and produces nothing
 # when it is missing, so it is checked for here instead. appstreamcli comes from
@@ -91,11 +73,6 @@ for tool in curl sha256sum desktop-file-validate zsyncmake appstreamcli readelf;
     command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
 [ "$do_strip" -eq 0 ] || command -v strip >/dev/null 2>&1 || die "missing strip (install binutils, or pass --no-strip)"
-
-# Version comes from [workspace.package] so the AppImage can never drift from
-# the crate version.
-version="$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' "$REPO_ROOT/Cargo.toml")"
-[ -n "$version" ] || die "could not read version from Cargo.toml"
 
 # Absolute from here on: appimagetool is run from a scratch directory below, and
 # -o could well have been given a relative path.

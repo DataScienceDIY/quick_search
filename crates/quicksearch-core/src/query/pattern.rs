@@ -1,14 +1,10 @@
 //! Compiled matchers for the cascade term and the `regex:` keyword.
 //!
-//! A term with an unquoted `*` compiles to a small regex (every literal
-//! chunk escaped, stars joined with `.*`), so wildcards and `regex:` share
-//! one linear-time matching engine. Terms without stars stay on the
-//! [`Literal`](TermPattern::Literal) path — plain string operations.
+//! A term with an unquoted `*` compiles to a small regex; star-free terms
+//! stay on the [`Literal`](TermPattern::Literal) path.
 //!
 //! `.` never matches `\n`, so a star cannot span lines of extracted text —
-//! a `*` bridging a whole document would produce absurd match ranges and
-//! page-sized snippets. Names and paths contain no newlines, so the rule
-//! only shows up in content matching.
+//! a `*` bridging a whole document would produce page-sized snippets.
 
 use std::ops::Range;
 
@@ -17,9 +13,7 @@ use regex::{Regex, RegexBuilder};
 use super::translator::TranslateError;
 use crate::snippet;
 
-/// Compile-time memory cap for user-supplied and derived regexes. Keeps a
-/// hostile pattern (`a{1000000}{1000}` and friends) from ballooning the
-/// compiled program; matching itself is linear-time by construction.
+/// Keeps a hostile pattern (`a{1000000}{1000}`) from ballooning the program.
 const REGEX_SIZE_LIMIT: usize = 4 << 20;
 
 /// Occurrence counts saturate here, matching `count_frac` in the cascade.
@@ -28,13 +22,11 @@ const COUNT_CAP: usize = 1000;
 /// The cascade term, compiled once at split time.
 #[derive(Debug, Clone, Default)]
 pub enum TermPattern {
-    /// No matchable content: an empty term, or only stars (`*`, `**`).
-    /// Matches nothing — a bare `*` must not become a scan of everything.
+    /// Empty or stars-only. Matches nothing — a bare `*` must not become a
+    /// scan of everything.
     #[default]
     Empty,
-    /// A star-free term; plain string operations.
     Literal(LiteralPattern),
-    /// A term with at least one active wildcard.
     Wildcard(WildcardPattern),
 }
 
@@ -46,12 +38,10 @@ pub struct LiteralPattern {
 
 #[derive(Debug, Clone)]
 pub struct WildcardPattern {
-    /// Literal chunks between stars, in order. Never empty, and no chunk
-    /// is empty: edge stars are folded into the compiled regexes, doubled
-    /// stars collapse.
+    /// Literal chunks between stars, in order. Never empty and no chunk is
+    /// empty: edge stars fold into the regexes, doubled stars collapse.
     segments: Vec<String>,
-    /// Unanchored search regexes with non-greedy joins — leftmost-shortest
-    /// match, which is what a snippet window wants.
+    /// Unanchored, non-greedy joins — leftmost-shortest, what a snippet wants.
     search_cs: Regex,
     search_ci: Regex,
     /// Anchored (`^…$`) regexes for whole-field matching (rank tiers 1/2).
@@ -59,24 +49,21 @@ pub struct WildcardPattern {
     anchored_ci: Regex,
 }
 
-/// One piece of the search phrase as split out of the token stream.
-/// `glob` is true only for plain unquoted words — quoted phrases and
-/// reassembled `key:value` text keep their stars literal.
+/// One piece of the search phrase. `glob` is true only for plain unquoted
+/// words — quoted phrases and `key:value` text keep their stars literal.
 #[derive(Debug, Clone)]
 pub struct TermPart {
     pub text: String,
     pub glob: bool,
 }
 
-/// A chunk stream: literal text interleaved with active stars.
 enum Chunk {
     Lit(String),
     Star,
 }
 
 impl TermPattern {
-    /// Compile the joined term parts. Parts are joined with a single space,
-    /// exactly like the display term (`parts.join(" ")`).
+    /// Compile the term parts, joined with single spaces like the display term.
     pub fn build(parts: &[TermPart]) -> Result<TermPattern, TranslateError> {
         let mut chunks: Vec<Chunk> = Vec::new();
         let push_lit = |chunks: &mut Vec<Chunk>, s: &str| {
@@ -138,8 +125,7 @@ impl TermPattern {
                 .build()
                 .map_err(|e| TranslateError::BadRegex(e.to_string()))
         };
-        // Edge stars are dropped from the search form — under substring
-        // semantics a leading/trailing `.*?` adds nothing.
+        // Under substring semantics a leading/trailing `.*?` adds nothing.
         let search_src = escaped.join(".*?");
         // The anchored form keeps them: `*foo` must whole-match "myfoo".
         let anchored_src = format!(
@@ -165,11 +151,19 @@ impl TermPattern {
         matches!(self, TermPattern::Wildcard(_))
     }
 
-    /// The literal text, when the term has no wildcard. SQL builders branch
-    /// on this to keep the original single-`LIKE`/phrase-`MATCH` shapes.
+    /// The literal text, when the term has no wildcard.
     pub fn literal(&self) -> Option<&str> {
         match self {
             TermPattern::Literal(l) => Some(&l.text),
+            _ => None,
+        }
+    }
+
+    /// [`literal`](Self::literal), ASCII-folded — the form every
+    /// case-insensitive scan searches with.
+    pub fn literal_folded(&self) -> Option<&str> {
+        match self {
+            TermPattern::Literal(l) => Some(&l.folded),
             _ => None,
         }
     }
@@ -183,13 +177,11 @@ impl TermPattern {
         }
     }
 
-    /// Characters of literal (non-star) content — the trigram floor and
-    /// path-tier switch count these.
+    /// Characters of literal (non-star) content.
     pub fn literal_char_count(&self) -> usize {
         self.segments().iter().map(|s| s.chars().count()).sum()
     }
 
-    /// Does the pattern match the entire field?
     pub fn whole_match(&self, text: &str, case_insensitive: bool) -> bool {
         match self {
             TermPattern::Empty => false,
@@ -211,19 +203,10 @@ impl TermPattern {
         }
     }
 
-    /// ASCII-case-insensitive [`str::find`], without folding the haystack.
-    ///
-    /// `needle` must already be `to_ascii_lowercase`d — `LiteralPattern`
-    /// stores it that way. This exists because the folding version allocated
-    /// a lowercase copy of its haystack on every call, and the cascade's
-    /// filename pass calls it twice — once on the name, once on the path —
-    /// for every row of a full-table scan.
-    ///
-    /// The candidate index is always a `char` boundary: a `&str`'s first byte
-    /// is either ASCII or a UTF-8 lead byte, never a continuation byte, so a
-    /// first-byte hit cannot land mid-character. Both sides being valid UTF-8
-    /// that differ only in ASCII case then makes the end a boundary too, which
-    /// is what keeps the returned range valid in the unfolded original.
+    /// ASCII-case-insensitive [`str::find`] without folding the haystack;
+    /// `needle` must already be lowercased. The returned index is always a
+    /// `char` boundary: a `&str`'s first byte is never a continuation byte,
+    /// and ASCII-only case differences keep the end a boundary too.
     fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
         if needle.is_empty() {
             return Some(0);
@@ -237,9 +220,7 @@ impl TermPattern {
         })
     }
 
-    /// Leftmost match as a byte range. Literal folding is ASCII-only and
-    /// byte-length preserving, so folded offsets are valid in the original —
-    /// the same invariant the cascade has always relied on.
+    /// Leftmost match as a byte range; folded offsets are valid in the original.
     pub fn find_first(&self, text: &str, case_insensitive: bool) -> Option<Range<usize>> {
         match self {
             TermPattern::Empty => None,
@@ -262,9 +243,7 @@ impl TermPattern {
         }
     }
 
-    /// Case-insensitive [`TermPattern::find_first`] against an already-folded
-    /// haystack. Folding is byte-length preserving, so the returned range is
-    /// valid in the unfolded original too.
+    /// [`TermPattern::find_first`], case-insensitive, on a pre-folded haystack.
     pub fn find_first_folded(&self, folded: &str) -> Option<Range<usize>> {
         match self {
             TermPattern::Empty => None,
@@ -272,25 +251,21 @@ impl TermPattern {
                 let pos = folded.find(&l.folded)?;
                 Some(pos..pos + l.text.len())
             }
-            // The regex engine folds as it matches, so it needs no help.
             TermPattern::Wildcard(w) => w.search_ci.find(folded).map(|m| m.range()),
         }
     }
 
-    /// Case-insensitive [`TermPattern::count`] against an already-folded
-    /// haystack. See [`TermPattern::find_first_folded`].
+    /// Case-insensitive [`TermPattern::count`] against an already-folded haystack.
     pub fn count_folded(&self, folded: &str) -> usize {
         match self {
             TermPattern::Empty => 0,
-            // Both sides are already folded, so an exact scan *is* the
-            // case-insensitive one.
             TermPattern::Literal(l) => snippet::count_occurrences(folded, &l.folded, true),
             TermPattern::Wildcard(w) => w.search_ci.find_iter(folded).take(COUNT_CAP).count(),
         }
     }
 
-    /// Non-overlapping occurrence count, capped at 1000 (the cascade's
-    /// `count_frac` saturates there anyway).
+    /// Non-overlapping occurrence count. Wildcards stop at 1000 — the
+    /// cascade's `count_frac` saturates there anyway.
     pub fn count(&self, text: &str, case_insensitive: bool) -> usize {
         match self {
             TermPattern::Empty => 0,
@@ -307,13 +282,59 @@ impl TermPattern {
     }
 }
 
-/// A compiled `regex:` query. Case-insensitive by default (override with an
-/// inline `(?-i:…)`); `multi_line` makes `^`/`$` per-line over extracted
-/// text, which is what they mean in a search box.
+/// A compiled `regex:` query. Case-insensitive by default (override with
+/// `(?-i:…)`); `multi_line` makes `^`/`$` per-line over extracted text.
 #[derive(Debug, Clone)]
 pub struct RegexQuery {
     pub source: String,
     re: Regex,
+    required: Option<crate::search::prefilter::Required>,
+}
+
+/// Extract a set of literals at least one of which occurs in every match.
+/// Sound because every match begins (prefix set) or ends (suffix set) with
+/// one of the literals; an unbounded set yields `None`. Parsed
+/// case-sensitively on purpose: case-insensitive extraction explodes
+/// combinatorially, and both consumers fold anyway, so a case-sensitive set
+/// stays sound — `(?i)` yields `None`, a lost optimisation, never a lost row.
+fn required_literals(source: &str) -> Option<crate::search::prefilter::Required> {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
+
+    let hir = regex_syntax::ParserBuilder::new()
+        .case_insensitive(false)
+        .build()
+        .parse(source)
+        .ok()?;
+
+    let mut best: Option<(usize, crate::search::prefilter::Required)> = None;
+    for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
+        let seq = Extractor::new().kind(kind).extract(&hir);
+        let Some(literals) = seq.literals() else {
+            continue; // unbounded: no constraint to be had from this direction
+        };
+        // The extractor can split a multi-byte character; invalid UTF-8 cannot
+        // be handed to FTS5 or bound as SQL text, so the whole direction is
+        // abandoned — dropping one literal from an OR would drop rows.
+        let strings: Option<Vec<String>> = literals
+            .iter()
+            .map(|l| std::str::from_utf8(l.as_bytes()).ok().map(str::to_owned))
+            .collect();
+        let Some(strings) = strings else { continue };
+        let Some(required) = crate::search::prefilter::Required::new(strings) else {
+            continue;
+        };
+        // The OR is only as selective as its shortest arm.
+        let weakest = required
+            .literals()
+            .iter()
+            .map(|l| l.chars().count())
+            .min()
+            .unwrap_or(0);
+        if best.as_ref().is_none_or(|(w, _)| weakest > *w) {
+            best = Some((weakest, required));
+        }
+    }
+    best.map(|(_, required)| required)
 }
 
 impl RegexQuery {
@@ -324,8 +345,8 @@ impl RegexQuery {
             .size_limit(REGEX_SIZE_LIMIT)
             .build()
             .map_err(|e| TranslateError::BadRegex(e.to_string()))?;
-        // The regex analog of the bare-`*` rule, but loud: the user typed an
-        // explicit keyword, so tell them instead of matching every file.
+        // The regex analog of the bare-`*` rule, but loud: the user typed a
+        // keyword, so tell them instead of matching every file.
         if re.is_match("") {
             return Err(TranslateError::BadRegex(format!(
                 "'{}' can match the empty string and would match every file",
@@ -335,7 +356,15 @@ impl RegexQuery {
         Ok(RegexQuery {
             source: source.to_string(),
             re,
+            required: required_literals(source),
         })
+    }
+
+    /// Literals of which at least one occurs in anything this matches; `None`
+    /// means nothing usable (`\d+`) and the pass scans everything. See
+    /// [`crate::search::prefilter`] for the rule to obey.
+    pub fn required(&self) -> Option<&crate::search::prefilter::Required> {
+        self.required.as_ref()
     }
 
     pub fn is_match(&self, text: &str) -> bool {
@@ -352,10 +381,8 @@ impl RegexQuery {
     }
 }
 
-/// Cap a match range at `max_len` bytes (aligned back to a char boundary)
-/// before handing it to `snippet::window_around`. A greedy user regex can
-/// legitimately match megabytes of a minified file; the snippet window
-/// wants the start of that, not all of it.
+/// Cap a match range at `max_len` bytes, aligned back to a char boundary: a
+/// greedy regex can match megabytes; the snippet window wants the start.
 pub fn clamp_match_range(text: &str, range: Range<usize>, max_len: usize) -> Range<usize> {
     let mut end = range.end.min(range.start + max_len);
     while end > range.start && !text.is_char_boundary(end) {
@@ -407,7 +434,6 @@ mod tests {
 
     #[test]
     fn quoted_star_stays_literal() {
-        // A quoted "*" arrives with glob = false.
         let p = TermPattern::build(&[part("a*b", false)]).unwrap();
         assert_eq!(p.literal(), Some("a*b"));
         assert!(p.find_first("xa*by", false).is_some());
@@ -416,8 +442,7 @@ mod tests {
 
     #[test]
     fn segment_shapes() {
-        // Edge stars vanish into the anchors: `*foo` whole-matches any
-        // suffix `foo`, `foo*` any prefix.
+        // Edge stars vanish into the anchors.
         let p = TermPattern::build(&[part("*foo", true)]).unwrap();
         assert_eq!(p.segments(), ["foo"]);
         assert!(p.whole_match("myfoo", false));
@@ -431,7 +456,6 @@ mod tests {
         let w = wildcard(&[part("f*o*o", true)]);
         assert_eq!(w.segments, ["f", "o", "o"]);
 
-        // Doubled stars collapse.
         let w = wildcard(&[part("f**o", true)]);
         assert_eq!(w.segments, ["f", "o"]);
 
@@ -439,8 +463,7 @@ mod tests {
         let w = wildcard(&[part("a*", true), part("b", false)]);
         assert_eq!(w.segments, ["a", " b"]);
 
-        // `* *` — the joining space between two stars is interior literal
-        // content, so this is a real (if odd) pattern, not Empty.
+        // `* *`: the joining space is interior literal content, not Empty.
         let p = TermPattern::build(&[part("*", true), part("*", true)]).unwrap();
         assert_eq!(p.segments(), [" "]);
         assert!(p.whole_match("a b", false));
@@ -467,9 +490,7 @@ mod tests {
     #[test]
     fn find_first_is_leftmost_shortest() {
         let p = TermPattern::build(&[part("a*b", true)]).unwrap();
-        // Leftmost-first with a lazy join: starts at 0, ends at the first b.
         assert_eq!(p.find_first("aXXbYYb", false), Some(0..4));
-        // Case-insensitive variant.
         assert_eq!(p.find_first("AXXB", true), Some(0..4));
         assert_eq!(p.find_first("AXXB", false), None);
     }
@@ -487,7 +508,6 @@ mod tests {
         let hay = "le café du menu";
         let r = p.find_first(hay, false).unwrap();
         assert_eq!(&hay[r], "café du menu");
-        // Case-insensitive over non-ASCII haystack: offsets stay valid.
         let hay = "LE CAFÉ DU MENU";
         let r = p.find_first(hay, true).unwrap();
         assert!(hay.is_char_boundary(r.start) && hay.is_char_boundary(r.end));
@@ -553,12 +573,11 @@ mod tests {
 
     #[test]
     fn hostile_regexes_fail_fast_or_run_linear() {
-        // Deep nesting: rejected cleanly by the parser's nest limit.
+        // Deep nesting: rejected by the parser's nest limit.
         assert!(RegexQuery::new(&"(".repeat(2000)).is_err());
         // Huge counted repetition: rejected by size_limit, not compiled.
         assert!(RegexQuery::new("a{1000000}{1000}").is_err());
-        // Classic backtracking bomb: the linear engine answers immediately
-        // (a backtracker would take exponential time here).
+        // Backtracking bomb: the linear engine answers immediately.
         let r = RegexQuery::new("(a+)+$").unwrap();
         let hay = format!("{}b", "a".repeat(10_000));
         assert!(!r.is_match(&hay));
@@ -578,7 +597,6 @@ mod tests {
         let r = clamp_match_range(text, 0..text.len(), 4);
         assert!(text.is_char_boundary(r.end));
         assert!(r.end <= 4);
-        // No-op when already short enough.
         assert_eq!(clamp_match_range(text, 1..3, 100), 1..3);
     }
 }

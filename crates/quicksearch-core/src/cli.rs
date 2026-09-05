@@ -1,27 +1,7 @@
-//! Programmatic query helpers.
-//!
-//! Pure functions that open a DB, run a query, and return structured data.
-//! No stdout, no CLI framing — the GUI and `quicksearch-cli` format the
-//! result as they see fit. Indexing operations live on
-//! [`crate::indexing::IndexingService`] since they require a running worker
-//! thread.
-//!
-//! # These are consumed from outside this repository
-//!
-//! QuickSearch is a sub-repo, and **nothing in this module has a caller in
-//! this tree**. [`status_for_path`], [`list_failed`], [`index_size_breakdown`],
-//! [`pending_content_count`] and [`clear_path`] are called by the parent
-//! repository's Baloo compat daemon, which is what reports them to `balooctl`
-//! and mirrors them into LMDB.
-//!
-//! So they are **not dead code**, and their signatures are a compatibility
-//! surface rather than an internal detail: a search of this repository alone
-//! will not turn up the callers that break when one changes.
-//!
-//! One exception to the "query helpers" framing: [`clear_path`] mutates. It
-//! opens its own writer, which sidesteps the single-writer discipline the
-//! coordinator maintains, so it is safe only against an index no local
-//! coordinator is running against.
+//! Programmatic query helpers, **consumed from outside this repository**
+//! (the parent repo's Baloo compat daemon) — *not dead code*; the signatures
+//! are a compatibility surface. The one mutator, [`clear_path`], opens its
+//! own writer and is safe only where no local coordinator is running.
 
 use rusqlite::{params, OptionalExtension};
 
@@ -50,8 +30,7 @@ impl From<i64> for IndexState {
     }
 }
 
-/// Indexing status for a single file. `basic` is the metadata row state
-/// (indexed or not); `content` is the extractor state.
+/// Indexing status for a single file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStatus {
     pub path: String,
@@ -60,7 +39,6 @@ pub struct FileStatus {
     pub failure_reason: Option<String>,
 }
 
-/// Per-file entry returned by [`list_failed`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FailedEntry {
     pub file_id: i64,
@@ -69,10 +47,7 @@ pub struct FailedEntry {
     pub ts: i64,
 }
 
-/// Storage footprint report: per-table row/size counts (the equivalent of
-/// Baloo's LMDB sub-DBs). `documents_text_*` fields cover the
-/// zstd-compressed extracted-text sidecar; ratio is `compressed / raw`, so
-/// ~0.3 means ~70% saved vs storing the plaintext verbatim.
+/// Storage footprint report: per-table row/size counts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SizeReport {
     pub file_size_bytes: u64,
@@ -85,8 +60,7 @@ pub struct SizeReport {
 }
 
 impl SizeReport {
-    /// Compressed:raw ratio for the stored extracted text. `None` when no
-    /// rows have been written yet (avoids divide-by-zero).
+    /// Compressed:raw ratio for the stored text; `None` when no rows yet.
     pub fn documents_text_ratio(&self) -> Option<f64> {
         if self.documents_text_raw_bytes <= 0 {
             return None;
@@ -95,25 +69,26 @@ impl SizeReport {
     }
 }
 
-/// Query the per-file indexing status. Returns `FileStatus` with
-/// `basic == NotIndexed` if the path isn't in the database.
-///
-/// There is no stored basic state: a `files` row exists only once its
-/// metadata has been read, so the row *is* the basic-indexed state. The
-/// failure reason comes from `failed_files`, the one place it is written.
+/// Query the per-file indexing status; `basic == NotIndexed` if the path
+/// isn't in the database. There is no stored basic state: the row existing
+/// *is* the basic-indexed state.
 pub fn status_for_path(db_path: &str, path: &str) -> Result<FileStatus, String> {
     let conn = open_existing(db_path, false)?;
-    let row: Option<(i64, Option<String>)> = conn
-        .query_row(
-            "SELECT f.content_state, ff.reason \
+    let split = crate::file_handling::split_db_path(path);
+    let row: Option<(i64, Option<String>)> = match split {
+        None => None,
+        Some((parent, name)) => conn
+            .query_row(
+                "SELECT f.content_state, ff.reason \
                FROM files f \
                LEFT JOIN failed_files ff ON ff.file_id = f.id \
-              WHERE f.path = ?1",
-            params![path],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(|e| format!("status_for_path({}): {}", path, e))?;
+              WHERE f.parent = ?1 AND f.name = ?2",
+                params![parent, name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("status_for_path({}): {}", path, e))?,
+    };
     Ok(match row {
         None => FileStatus {
             path: path.to_string(),
@@ -138,7 +113,7 @@ pub fn list_failed(db_path: &str, limit: Option<u32>) -> Result<Vec<FailedEntry>
         None => String::new(),
     };
     let sql = format!(
-        "SELECT ff.file_id, f.path, ff.reason, ff.ts \
+        "SELECT ff.file_id, f.parent, f.name, ff.reason, ff.ts \
          FROM failed_files ff \
          JOIN files f ON f.id = ff.file_id \
          ORDER BY ff.ts DESC{}",
@@ -149,11 +124,13 @@ pub fn list_failed(db_path: &str, limit: Option<u32>) -> Result<Vec<FailedEntry>
         .map_err(|e| format!("list_failed prepare: {}", e))?;
     let rows = stmt
         .query_map([], |r| {
+            let parent: String = r.get(1)?;
+            let name: String = r.get(2)?;
             Ok(FailedEntry {
                 file_id: r.get(0)?,
-                path: r.get(1)?,
-                reason: r.get(2)?,
-                ts: r.get(3)?,
+                path: format!("{}{}", parent, name),
+                reason: r.get(3)?,
+                ts: r.get(4)?,
             })
         })
         .map_err(|e| format!("list_failed query: {}", e))?;
@@ -170,10 +147,8 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
             .map_err(|e| format!("count {}: {}", table, e))
     };
     let dt_row_count: i64 = count("documents_text")?;
-    // The uncompressed length is not a column: zstd records it in each frame's
-    // header, so this reads it back (see `repo::raw_text_len`). Only the
-    // header is wanted, and 18 bytes is the most one can occupy — projecting
-    // the prefix keeps this off the document bodies themselves.
+    // The uncompressed length lives in each zstd frame header (at most 18
+    // bytes); projecting the prefix keeps this off the document bodies.
     let mut stmt = conn
         .prepare("SELECT substr(text_zstd, 1, 18), LENGTH(text_zstd) FROM documents_text")
         .map_err(|e| format!("documents_text size sum prepare: {}", e))?;
@@ -183,8 +158,7 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
     let (mut dt_raw, mut dt_compressed) = (0i64, 0i64);
     for row in rows {
         let (header, compressed) = row.map_err(|e| format!("documents_text size row: {}", e))?;
-        // A frame with no recorded content size contributes nothing rather
-        // than skewing the ratio with a guess.
+        // A frame with no recorded content size contributes nothing.
         dt_raw += crate::db::repo::raw_text_len(&header).unwrap_or(0) as i64;
         dt_compressed += compressed;
     }
@@ -201,14 +175,9 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
     })
 }
 
-/// Count files with `content_state = 0` (pending) — files an extractor claims
-/// whose text has not been read yet. Files nothing extracts (binary formats,
-/// too-large files) are written `content_state = 3` (NA) when the walk records
-/// them and are never counted here, so this is outstanding work rather than
-/// `files_row_count − searchabletext_row_count`, which counts those forever.
-///
-/// Used by the Baloo compat daemon to report the "Files waiting for content
-/// indexing" figure both to balooctl and to the LMDB mirror.
+/// Count pending files — outstanding extraction work, not
+/// `files − searchabletext`, which would count never-extractable rows
+/// forever. Used by the Baloo compat daemon.
 pub fn pending_content_count(db_path: &str) -> Result<i64, String> {
     let conn = open_existing(db_path, false)?;
     conn.query_row(
@@ -219,8 +188,7 @@ pub fn pending_content_count(db_path: &str) -> Result<i64, String> {
     .map_err(|e| format!("pending_content_count: {}", e))
 }
 
-/// Remove a single file from the index. Returns whether a row was deleted.
-/// Keeps FTS and `documents_text` in sync via the repo helpers.
+/// Remove a single file from the index; returns whether a row was deleted.
 pub fn clear_path(db_path: &str, path: &str) -> Result<bool, String> {
     let mut conn = open_existing(db_path, true)?;
     let tx = conn
@@ -252,8 +220,7 @@ mod tests {
                 &tx,
                 &NewFile {
                     name: "a.txt",
-                    path: "/tmp/a.txt",
-                    parent: "/tmp",
+                    parent: "/tmp/",
                     size: 1,
                     mtime: 1,
                     mime: Some("text/plain"),
@@ -269,8 +236,7 @@ mod tests {
                 &tx,
                 &NewFile {
                     name: "b.bin",
-                    path: "/tmp/b.bin",
-                    parent: "/tmp",
+                    parent: "/tmp/",
                     size: 1,
                     mtime: 1,
                     mime: None,
@@ -323,28 +289,24 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// The count is "outstanding extraction work", which is a narrower thing
-    /// than "rows without text": a file nothing extracts is settled, not
-    /// waiting, and would otherwise be reported as a backlog that never
-    /// drains.
+    /// A file nothing extracts is settled, not waiting — it must not be
+    /// reported as a backlog that never drains.
     #[test]
     fn pending_content_count_counts_only_outstanding_work() {
         let p = tmp_path();
         let dbp = p.to_str().unwrap();
-        // a is Done, b is Failed — both resolved, neither pending.
         let _ = seed_fixture(dbp);
         assert_eq!(pending_content_count(dbp).unwrap(), 0);
 
         let mut conn = open_or_recreate(dbp, "trigram").unwrap();
         {
             let tx = conn.transaction().unwrap();
-            // Claimed by an extractor, text not read yet: this is the backlog.
+            // Claimed by an extractor, text not read yet: the backlog.
             insert_file(
                 &tx,
                 &NewFile {
                     name: "c.txt",
-                    path: "/tmp/c.txt",
-                    parent: "/tmp",
+                    parent: "/tmp/",
                     size: 1,
                     mtime: 1,
                     mime: Some("text/plain"),
@@ -355,14 +317,12 @@ mod tests {
             )
             .unwrap()
             .expect("unique path");
-            // Nothing extracts this one, so it is NA on arrival and must not
-            // inflate the figure.
+            // NA on arrival; must not inflate the figure.
             insert_file(
                 &tx,
                 &NewFile {
                     name: "d.bin",
-                    path: "/tmp/d.bin",
-                    parent: "/tmp",
+                    parent: "/tmp/",
                     size: 1,
                     mtime: 1,
                     mime: None,
@@ -401,7 +361,6 @@ mod tests {
         assert!(r.file_size_bytes > 0);
         assert_eq!(r.files_row_count, 2);
         assert_eq!(r.failed_files_row_count, 1);
-        // File a got content ("hello"); file b failed. Only one documents_text row.
         assert_eq!(r.documents_text_row_count, 1);
         assert_eq!(r.documents_text_raw_bytes, "hello".len() as i64);
         assert!(r.documents_text_compressed_bytes > 0);
@@ -411,9 +370,7 @@ mod tests {
 
     #[test]
     fn documents_text_ratio_reports_savings_on_compressible_prose() {
-        // Feed highly-compressible prose (lots of repeated words) and verify
-        // the reported ratio reflects real savings. Guards against anyone
-        // silently swapping the compression step for a pass-through.
+        // Guards against silently swapping compression for a pass-through.
         let p = tmp_path();
         let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         {
@@ -422,8 +379,7 @@ mod tests {
                 &tx,
                 &NewFile {
                     name: "big.txt",
-                    path: "/tmp/big.txt",
-                    parent: "/tmp",
+                    parent: "/tmp/",
                     size: 1,
                     mtime: 1,
                     mime: Some("text/plain"),
@@ -442,8 +398,7 @@ mod tests {
 
         let r = index_size_breakdown(p.to_str().unwrap()).unwrap();
         let ratio = r.documents_text_ratio().expect("has rows");
-        // Repeating a 44-byte sentence 500x → zstd should hit <20% ratio
-        // trivially. Loose bound protects the test from zstd version churn.
+        // Loose bound protects the test from zstd version churn.
         assert!(
             ratio < 0.3,
             "ratio too high: {ratio} raw={} comp={}",
@@ -469,21 +424,18 @@ mod tests {
 
     #[test]
     fn clear_path_on_nondefault_tokenizer_db_removes_only_target() {
-        // On an index built with a non-default tokenizer, clear_path must
-        // delete only the target row — never trigger the owner's
-        // schema-mismatch wipe.
+        // Must never trigger the owner's schema-mismatch wipe.
         let p = tmp_path();
         let dbp = p.to_str().unwrap();
         {
             let mut conn = open_or_recreate(dbp, "unicode61").unwrap();
             let tx = conn.transaction().unwrap();
-            for (name, path) in [("a.txt", "/tmp/a.txt"), ("b.txt", "/tmp/b.txt")] {
+            for name in ["a.txt", "b.txt"] {
                 insert_file(
                     &tx,
                     &NewFile {
                         name,
-                        path,
-                        parent: "/tmp",
+                        parent: "/tmp/",
                         size: 1,
                         mtime: 1,
                         mime: Some("text/plain"),
@@ -499,7 +451,6 @@ mod tests {
         }
 
         assert!(clear_path(dbp, "/tmp/a.txt").unwrap());
-        // The other row must survive — proof we deleted one row, not wiped.
         assert_eq!(
             status_for_path(dbp, "/tmp/b.txt").unwrap().basic,
             IndexState::Done

@@ -1,7 +1,14 @@
 use super::*;
 use std::io::{Cursor, Write};
 
-/// An OLE2 container holding `streams`, written to a scratch file.
+/// The one-file form: these assert on extracted text, not on the buffer
+/// reuse a pool worker gets.
+fn extract_ole_text(path: &Path, extension: &str) -> Result<String, Box<dyn Error>> {
+    let mut out = String::new();
+    let mut scratch = Scratch::new(&crate::config::Config::default());
+    super::extract_ole_text(path, extension, &mut out, &mut scratch).map(|()| out)
+}
+
 fn container(tag: &str, ext: &str, streams: &[(&str, Vec<u8>)]) -> std::path::PathBuf {
     let path = crate::testutil::scratch_dir(tag).join(format!("doc.{ext}"));
     let mut cfb = cfb::CompoundFile::create(Cursor::new(Vec::new())).unwrap();
@@ -23,11 +30,8 @@ fn le32(v: u32) -> [u8; 4] {
 
 // -- .doc ------------------------------------------------------------
 
-/// A minimal but structurally real Word 97 file: a FIB whose variable
-/// sections lead to a CLX, a CLX holding one `Pcdt`, and a piece table
-/// with `pieces` entries pointing into the character data.
-///
-/// `pieces` are `(text, compressed)`.
+/// A structurally real Word 97 file: a FIB whose variable sections lead to a
+/// CLX holding one `Pcdt`, and a piece table of `(text, compressed)` pieces.
 fn word_doc(pieces: &[(&str, bool)]) -> Vec<(&'static str, Vec<u8>)> {
     // Character data starts after the FIB; 2048 is comfortably past it.
     const TEXT_BASE: usize = 2048;
@@ -47,7 +51,6 @@ fn word_doc(pieces: &[(&str, bool)]) -> Vec<(&'static str, Vec<u8>)> {
     doc[off..off + 2].copy_from_slice(&le16(pairs));
     let blob = off + 2;
 
-    // Lay the pieces' character data into the document stream.
     let mut cps = vec![0u32];
     let mut pcds = Vec::new();
     let mut cp = 0u32;
@@ -88,7 +91,6 @@ fn word_doc(pieces: &[(&str, bool)]) -> Vec<(&'static str, Vec<u8>)> {
     clx.extend_from_slice(&le32(plc.len() as u32));
     clx.extend_from_slice(&plc);
 
-    // The table stream: the CLX at a known offset.
     let clx_at = 16usize;
     let mut table = vec![0u8; clx_at];
     table.extend_from_slice(&clx);
@@ -112,8 +114,6 @@ fn doc_reads_a_wide_piece() {
     assert_eq!(extract_ole_text(&p, "doc").unwrap(), "Καλημέρα\n");
 }
 
-/// The whole reason the piece table exists: text is assembled in CP order,
-/// not in the order it happens to sit in the stream.
 #[test]
 fn doc_concatenates_pieces_in_document_order() {
     let p = container(
@@ -147,8 +147,6 @@ fn doc_without_a_table_stream_is_an_error() {
     assert!(err.contains("1Table"), "{err}");
 }
 
-/// A piece whose byte range lies outside the stream. The pieces before it
-/// are real text and are kept; nothing panics on the slice.
 #[test]
 fn doc_survives_a_piece_pointing_past_the_stream() {
     let mut streams = word_doc(&[("Good text\r", true), ("later", true)]);
@@ -222,16 +220,14 @@ fn xls_resolves_shared_strings() {
     assert!(text.contains("Ω omega"), "{text}");
 }
 
-/// The classic correctness trap: a shared string cut across a `CONTINUE`
-/// boundary, where the continuation carries its own width flag. Getting
-/// this wrong reads the second half as the wrong encoding.
+/// The continuation carries its own width flag; getting that wrong reads the
+/// second half of the string as the wrong encoding.
 #[test]
 fn xls_reads_a_string_split_across_a_continue_record() {
     let mut sst = Vec::new();
     sst.extend_from_slice(&le32(1));
     sst.extend_from_slice(&le32(1));
-    // A 10-character compressed string, but only the first 4 characters
-    // fit in the SST record; the rest continue.
+    // Declares 10 characters; only 4 sit in the SST record, the rest continue.
     sst.extend_from_slice(&le16(10));
     sst.push(0x00); // compressed
     sst.extend_from_slice(b"ABCD");
@@ -248,7 +244,6 @@ fn xls_reads_a_string_split_across_a_continue_record() {
     assert!(text.contains("ABCDEFGHIJ"), "{text}");
 }
 
-/// A continuation may also switch width mid-string.
 #[test]
 fn xls_honours_a_width_change_at_a_continue_boundary() {
     let mut sst = Vec::new();
@@ -290,8 +285,6 @@ fn xls_indexes_numbers_as_typed() {
     );
 }
 
-/// A cell indexing past the end of the shared-string table. Dropped, not
-/// panicked on, and the valid cells around it survive.
 #[test]
 fn xls_drops_an_out_of_range_shared_string_index() {
     let mut sst = Vec::new();
@@ -307,8 +300,6 @@ fn xls_drops_an_out_of_range_shared_string_index() {
     assert_eq!(extract_ole_text(&p, "xls").unwrap().trim(), "only");
 }
 
-/// An SST whose declared count far exceeds the bytes present. The loop
-/// must be bounded by the data, not the header.
 #[test]
 fn xls_ignores_a_lying_shared_string_count() {
     let mut sst = Vec::new();
@@ -331,7 +322,6 @@ fn xls_record_running_past_the_stream_is_not_fatal() {
     book.extend_from_slice(&le16(5000));
     book.extend_from_slice(b"short");
     let p = container("xls-past", "xls", &[("Workbook", book)]);
-    // No readable text, reported as an error rather than a panic.
     assert!(extract_ole_text(&p, "xls").is_err());
 }
 
@@ -371,7 +361,6 @@ fn ppt_reads_both_atom_widths() {
     assert!(text.contains("Ωmega body"), "{text}");
 }
 
-/// Atoms live inside nested containers; the walk has to descend to them.
 #[test]
 fn ppt_descends_into_containers() {
     let bytes = encoding_rs::WINDOWS_1252
@@ -386,18 +375,14 @@ fn ppt_descends_into_containers() {
     assert!(extract_ole_text(&p, "ppt").unwrap().contains("Nested deep"));
 }
 
-/// A container that claims to hold itself. The depth bound is what stops
-/// this from exhausting the stack.
 #[test]
 fn ppt_bounds_container_recursion() {
-    // Each level wraps the last, well past MAX_DEPTH.
     let bytes = encoding_rs::WINDOWS_1252.encode("buried").0.into_owned();
     let mut rec = ppt_record(0x0000, ppt::TEXT_BYTES_ATOM, &bytes);
     for _ in 0..(ppt::MAX_DEPTH + 20) {
         rec = ppt_record(0x000F, 0x0FF0, &rec);
     }
     let p = container("ppt-deep", "ppt", &[("PowerPoint Document", rec)]);
-    // Too deep to reach the text — an error, not a stack overflow.
     assert!(extract_ole_text(&p, "ppt").is_err());
 }
 
@@ -435,4 +420,97 @@ fn an_empty_file_is_an_error() {
     let p = dir.join("doc.xls");
     crate::testutil::touch(&p, b"");
     assert!(extract_ole_text(&p, "xls").is_err());
+}
+
+// -- decode budgets ---------------------------------------------------
+
+/// Nothing in the format requires pieces to be disjoint, so a small file can
+/// decode gigabytes; `clean` drops the whole C0 range, so an emitted-text
+/// brake never fires. The budget has to charge what was *read*.
+#[test]
+fn doc_overlapping_control_pieces_stop_at_the_budget() {
+    const SPAN: usize = 4 * 1024;
+    let mut doc = vec![0x01u8; SPAN];
+    let marker_at = doc.len();
+    doc.extend_from_slice(b"MARKER");
+
+    let mut pieces: Vec<doc::Piece> = (0..64)
+        .map(|_| doc::Piece {
+            start: 0,
+            end: SPAN,
+            compressed: true,
+        })
+        .collect();
+    // Reachable only if the budget did not stop the walk first.
+    pieces.push(doc::Piece {
+        start: marker_at,
+        end: doc.len(),
+        compressed: true,
+    });
+
+    // A budget of half what those pieces decode.
+    let out = doc::decode_pieces(&doc, &pieces, SPAN * 32);
+    assert!(
+        !out.contains("MARKER"),
+        "the walk ran past its budget: {out:?}"
+    );
+    assert!(
+        out.trim().is_empty(),
+        "control bytes must not survive `clean`: {out:?}"
+    );
+}
+
+#[test]
+fn doc_pieces_within_the_budget_are_all_decoded() {
+    const SPAN: usize = 4 * 1024;
+    let mut doc = vec![0x01u8; SPAN];
+    let marker_at = doc.len();
+    doc.extend_from_slice(b"MARKER");
+
+    let mut pieces: Vec<doc::Piece> = (0..4)
+        .map(|_| doc::Piece {
+            start: 0,
+            end: SPAN,
+            compressed: true,
+        })
+        .collect();
+    pieces.push(doc::Piece {
+        start: marker_at,
+        end: doc.len(),
+        compressed: true,
+    });
+
+    let out = doc::decode_pieces(&doc, &pieces, SPAN * 32);
+    assert!(out.contains("MARKER"), "stopped early: {out:?}");
+}
+
+/// Every `LABELSST` resolves to a shared string `clean` erases, so an
+/// emitted-text brake never advances however many of them there are.
+#[test]
+fn xls_control_character_cells_stop_at_the_budget() {
+    let control: String = std::iter::repeat_n('\u{1}', 4096).collect();
+
+    let mut sst = Vec::new();
+    sst.extend_from_slice(&le32(2)); // total
+    sst.extend_from_slice(&le32(2)); // unique
+    sst.extend_from_slice(&sst_string(&control, false));
+    sst.extend_from_slice(&sst_string("MARKER", false));
+
+    let mut book = biff(xls::REC_SST, &sst);
+    for _ in 0..64 {
+        book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(0)));
+    }
+    // Reachable only if the budget did not stop the scan first.
+    book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(1)));
+
+    let out = xls::extract_from_book(&book, 4096 * 32)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        out.contains("no readable cell text"),
+        "expected the scan to stop before the marker, got: {out}"
+    );
+
+    let out = xls::extract_from_book(&book, 4096 * 1024).unwrap();
+    assert!(out.contains("MARKER"), "stopped early: {out:?}");
 }

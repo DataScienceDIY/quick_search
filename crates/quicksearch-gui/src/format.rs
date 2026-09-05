@@ -1,5 +1,7 @@
 //! Small display formatters shared across tabs.
 
+use quicksearch_core::indexing::MaintenanceStep;
+
 /// Human-readable byte size: `999 B`, `1.2 KB`, `4.7 MB`, `1.3 GB`.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -25,8 +27,7 @@ pub fn fmt_mtime(unix_secs: i64) -> String {
     }
 }
 
-/// Relative time for recent events, absolute for old ones: "just now",
-/// "5 min ago", "3 h ago", else `YYYY-MM-DD HH:MM`.
+/// "just now", "5 min ago", "3 h ago", then `YYYY-MM-DD HH:MM`.
 pub fn fmt_ago(unix_secs: u64) -> String {
     let age = quicksearch_core::log::now_unix().saturating_sub(unix_secs);
     if age < 60 {
@@ -40,13 +41,11 @@ pub fn fmt_ago(unix_secs: u64) -> String {
     }
 }
 
-/// A configured interval as a phrase to drop after "every": `90 min`,
-/// `24 h`, `3 days`.
+/// An interval as a phrase to follow "every": `90 min`, `24 h`, `3 days`.
 pub fn fmt_interval(minutes: u64) -> String {
-    if minutes == 0 {
-        // The scheduler treats 0 as always-due.
-        return "run".to_string();
-    }
+    // The same clamp `coordinator::inner::periodic_due` applies; the two
+    // must not describe different behaviour.
+    let minutes = minutes.max(1);
     if minutes < 60 {
         return format!("{} min", minutes);
     }
@@ -65,7 +64,7 @@ pub fn fmt_interval(minutes: u64) -> String {
     format!("{} h {} min", minutes / 60, minutes % 60)
 }
 
-/// Group thousands for counts: `1,234,567`.
+/// `1,234,567`.
 pub fn group_thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -78,8 +77,7 @@ pub fn group_thousands(n: u64) -> String {
     out
 }
 
-/// Files/sec display. Never renders a nonzero rate as "0.0": slow rates
-/// switch to a per-minute figure.
+/// Files/sec. A nonzero rate never renders as "0.0": slow rates go per-minute.
 pub fn fmt_rate(files_per_sec: f64) -> String {
     if files_per_sec <= 0.0 {
         "0 files/s".to_string()
@@ -102,8 +100,16 @@ pub fn fmt_elapsed(d: std::time::Duration) -> String {
     }
 }
 
-/// A running clock: `0:07`, `4:32`, `1:04:12`. Seconds are always two
-/// digits so the text does not change width every tick.
+/// Search timing: time to the first result, then to the last pass. A search
+/// that matched nothing has no first result, and reads as the total alone.
+pub fn fmt_search_times(first: Option<std::time::Duration>, total: std::time::Duration) -> String {
+    match first {
+        Some(first) => format!("{} / {}", fmt_elapsed(first), fmt_elapsed(total)),
+        None => fmt_elapsed(total),
+    }
+}
+
+/// A running clock: `0:07`, `4:32`, `1:04:12`; fixed-width seconds.
 pub fn fmt_duration_clock(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
@@ -114,9 +120,20 @@ pub fn fmt_duration_clock(d: std::time::Duration) -> String {
     }
 }
 
-/// What a finished configuration reconciliation did, in one line. A clause
-/// whose count is zero is left out rather than printed as "0", and a pass
-/// that found nothing to change still reports that it ran.
+/// The index upkeep a run is inside, in the words a user reads. Every one of
+/// these freezes the per-file counters for as long as it runs.
+pub fn fmt_maintenance(step: MaintenanceStep) -> &'static str {
+    match step {
+        MaintenanceStep::Checkpoint => "Compacting the write-ahead log…",
+        MaintenanceStep::RemovingStale => "Removing entries for deleted files…",
+        MaintenanceStep::MergingText => "Merging the text index…",
+        MaintenanceStep::RootCounts => "Updating folder totals…",
+        MaintenanceStep::SizeLimit => "Applying the file-size limit…",
+    }
+}
+
+/// What a finished reconciliation did, in one line. A zero clause is left
+/// out, and a pass that changed nothing still reports that it ran.
 pub fn fmt_reconcile_summary(deleted: usize, recontented: usize) -> String {
     let entries = |n: usize| {
         format!(
@@ -138,9 +155,8 @@ pub fn fmt_reconcile_summary(deleted: usize, recontented: usize) -> String {
     format!("Configuration change applied · {}", parts.join(" · "))
 }
 
-/// Middle-truncate a path to at most `max_chars` characters. Char-count
-/// based and `Ui`-free; rows with a real pixel budget use the width-aware
-/// `ui_util::middle_elide` instead.
+/// Middle-truncate to at most `max_chars` characters, `Ui`-free; rows with a
+/// pixel budget use the width-aware `ui_util::middle_elide`.
 pub fn middle_truncate(s: &str, max_chars: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= max_chars || max_chars < 5 {
@@ -170,13 +186,12 @@ mod tests {
 
     #[test]
     fn intervals() {
-        assert_eq!(fmt_interval(0), "run");
+        assert_eq!(fmt_interval(0), "1 min");
         assert_eq!(fmt_interval(1), "1 min");
         assert_eq!(fmt_interval(59), "59 min");
         assert_eq!(fmt_interval(60), "1 h", "the shipped default");
         assert_eq!(fmt_interval(90), "1 h 30 min");
         assert_eq!(fmt_interval(120), "2 h");
-        // A whole day is the one multiple-of-1440 case that stays in hours.
         assert_eq!(fmt_interval(1440), "24 h");
         assert_eq!(fmt_interval(2880), "2 days");
         assert_eq!(fmt_interval(10_080), "7 days");
@@ -208,6 +223,22 @@ mod tests {
         assert_eq!(fmt_elapsed(Duration::from_millis(999)), "999 ms");
         assert_eq!(fmt_elapsed(Duration::from_millis(1000)), "1.0 s");
         assert_eq!(fmt_elapsed(Duration::from_millis(2340)), "2.3 s");
+    }
+
+    #[test]
+    fn search_times_pair_up() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        assert_eq!(fmt_search_times(Some(ms(12)), ms(340)), "12 ms / 340 ms");
+        assert_eq!(fmt_search_times(Some(ms(5)), ms(5)), "5 ms / 5 ms");
+        // Each side carries its own unit, so a pair may straddle the boundary.
+        assert_eq!(fmt_search_times(Some(ms(800)), ms(1400)), "800 ms / 1.4 s");
+        assert_eq!(
+            fmt_search_times(Some(ms(1000)), ms(12_300)),
+            "1.0 s / 12.3 s"
+        );
+        // Nothing matched: no first result to report.
+        assert_eq!(fmt_search_times(None, ms(340)), "340 ms");
     }
 
     #[test]

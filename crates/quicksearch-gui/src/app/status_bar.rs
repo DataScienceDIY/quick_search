@@ -1,23 +1,18 @@
-//! The bottom status bar: one line summarizing the indexer, plus the
-//! watch-cap warning it feeds.
+//! The bottom status bar and the watch-cap warning it feeds.
 
 use super::*;
 
 use crate::ui_util::hint;
 
 impl QuickSearchApp {
-    /// Raise the "live updates are disabled" modal when the watcher has
-    /// given up on the directory budget and at least one indexed folder has
-    /// not been warned about yet. Keyed on roots: a restart stays quiet,
-    /// but adding a folder warns again.
+    /// Raise the "live updates are disabled" modal. Keyed on roots: a
+    /// restart stays quiet, but adding a folder warns again.
     fn check_watch_cap_warning(&mut self, state: &IndexerState) {
         let WatcherStatus::Disabled { reason } = &state.watcher else {
-            // Recovered — retract a modal that is no longer true.
             self.watch_cap_prompt = None;
             return;
         };
-        // Only the budget limits warrant a modal; other failures are
-        // transient and land in the status tooltip and Logs tab.
+        // Only the budget limits warrant a modal; other failures are transient.
         if !matches!(
             reason,
             WatchError::TooManyDirectories { .. } | WatchError::KernelLimit { .. }
@@ -43,11 +38,10 @@ impl QuickSearchApp {
         self.manage.observe(&state.activity);
         self.check_watch_cap_warning(&state);
 
-        egui::TopBottomPanel::bottom("status-bar").show(ctx, |ui| {
+        let panel = egui::TopBottomPanel::bottom("status-bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 match &state.activity {
-                    // A reconcile the coordinator applies between runs:
-                    // activity is `Idle` while it scans every row.
+                    // A coordinator reconcile runs with activity `Idle`.
                     IndexingStatus::Idle if state.reconcile.is_some() => {
                         match state.reconcile.expect("matched Some") {
                             ReconcileState::Running(r) => {
@@ -85,6 +79,7 @@ impl QuickSearchApp {
                                 ("Finishing the previous run…".to_string(), None)
                             }
                             PrepStep::OpeningIndex => ("Opening the index…".to_string(), None),
+                            PrepStep::Starting => ("Getting the index ready…".to_string(), None),
                             PrepStep::Reconciling(r) => (
                                 format!(
                                     "Applying configuration change · {} entries",
@@ -122,16 +117,17 @@ impl QuickSearchApp {
                     IndexingStatus::Optimizing => {
                         ui.label(egui::RichText::new("Optimizing index…").small());
                     }
-                    IndexingStatus::Running { roots, .. } => {
+                    IndexingStatus::Running {
+                        roots, maintenance, ..
+                    } => {
                         let colors = palette(ui.visuals().dark_mode);
                         let rate = self.manage.speed.files_per_sec();
-                        status_line(ui, &running_line(roots, rate, &colors));
+                        status_line(ui, &running_line(roots, *maintenance, rate, &colors));
                         progress_widget(ui, overall_progress(roots).fraction());
                     }
                 }
 
-                // In a right-to-left layout the first widget added is the
-                // rightmost, so the version is the fixed anchor.
+                // In a right-to-left layout the first widget added is rightmost.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(hint(crate::version::BUILD_ID))
                         .on_hover_text(crate::version::BUILD_ID_HINT);
@@ -144,10 +140,12 @@ impl QuickSearchApp {
                 });
             });
         });
+        // The whole bar, not its contents: the tour's page is about the line
+        // along the bottom of the window.
+        crate::spotlight::mark(ctx, crate::spotlight::Spot::StatusBar, panel.response.rect);
 
-        // The reconcile clause is not redundant: the coordinator's pass runs
-        // with activity `Idle`, and without it the counters would freeze
-        // mid-scan until the pointer moved.
+        // The reconcile clause is not redundant: without it the counters
+        // freeze mid-scan, since that pass runs with activity `Idle`.
         if !matches!(
             state.activity,
             IndexingStatus::Idle | IndexingStatus::Error(_)
@@ -156,20 +154,18 @@ impl QuickSearchApp {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         // Watcher registration walks every root, so its verdict can land
-        // minutes after startup; without this the warning would wait for a
-        // mouse move.
+        // minutes after startup, with no input to repaint on.
         if matches!(state.watcher, WatcherStatus::Starting) {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
 }
 
-/// One run of status text and the color hint it carries, if any. `None` is
-/// the theme's own text color, not an absence of paint.
+/// One run of status text and its hint; `None` is the theme's text color.
 type Span = (String, Option<egui::Color32>);
 
-/// A status line assembled from colored spans, painted as one small widget
-/// so the segments keep the exact spacing of a single label.
+/// Colored spans painted as one widget, so the segments keep the spacing of
+/// a single label.
 fn status_line(ui: &mut egui::Ui, spans: &[Span]) {
     let font = egui::TextStyle::Small.resolve(ui.style());
     let default = ui.visuals().text_color();
@@ -188,13 +184,18 @@ fn status_line(ui: &mut egui::Ui, spans: &[Span]) {
     ui.label(job);
 }
 
-/// The bottom bar's line for a run in progress; only the phase word carries
-/// the color hint. A run with any root still walking counts as walking.
-fn running_line(roots: &[RootProgress], rate: Option<f64>, colors: &Palette) -> Vec<Span> {
-    let phase = if roots.iter().any(|r| r.phase == RootPhase::Walking) {
-        colors.yellow
-    } else {
-        colors.green
+/// The bottom bar's line for a run in progress. An upkeep step outranks the
+/// per-root phases: while one runs it is the only thing moving.
+fn running_line(
+    roots: &[RootProgress],
+    maintenance: Option<MaintenanceStep>,
+    rate: Option<f64>,
+    colors: &Palette,
+) -> Vec<Span> {
+    let (word, phase) = match maintenance {
+        Some(_) => ("Maintenance", colors.orange),
+        None if roots.iter().any(|r| r.phase == RootPhase::Walking) => ("Indexing", colors.yellow),
+        None => ("Indexing", colors.green),
     };
     let done = roots.iter().filter(|r| r.phase == RootPhase::Done).count();
     let progress = overall_progress(roots);
@@ -218,10 +219,17 @@ fn running_line(roots: &[RootProgress], rate: Option<f64>, colors: &Palette) -> 
     if total_workers > 0 {
         rest.push_str(&format!(" · {}/{} workers", active, total_workers));
     }
-    vec![("Indexing".to_string(), Some(phase)), (rest, None)]
+    if let Some(step) = maintenance {
+        // Last, and without the ellipsis the tab's own line carries: the bar
+        // is one sentence, not a heading.
+        rest.push_str(&format!(
+            " · {}",
+            crate::format::fmt_maintenance(step).trim_end_matches('…')
+        ));
+    }
+    vec![(word.to_string(), Some(phase)), (rest, None)]
 }
 
-/// The bottom bar's idle line; only Manual mode carries a color hint.
 fn idle_line(mode: IndexMode, files: i64, colors: &Palette) -> Vec<Span> {
     let (mode_text, mode_color) = match mode {
         IndexMode::Auto => ("Auto", None),
@@ -237,8 +245,6 @@ fn idle_line(mode: IndexMode, files: i64, colors: &Palette) -> Vec<Span> {
     ]
 }
 
-/// The status bar's trailing progress indicator: a bar when the work has a
-/// denominator, a spinner when it does not.
 fn progress_widget(ui: &mut egui::Ui, fraction: Option<f64>) {
     match fraction {
         Some(frac) => {
@@ -272,8 +278,7 @@ mod tests {
         spans.iter().map(|(text, _)| text.as_str()).collect()
     }
 
-    /// Splitting the line to color its first word must not move a character
-    /// of it — the spacing comes from the text, not egui's item spacing.
+    /// The spacing comes from the text, not from egui's item spacing.
     #[test]
     fn the_running_line_reads_as_one_sentence() {
         let colors = palette(true);
@@ -282,15 +287,16 @@ mod tests {
             line(&running_line(
                 &[root(RootPhase::Walking, 100, Some(1000))],
                 None,
+                None,
                 &colors
             )),
             "Indexing 100 / 1,000 (10%) · 2/4 workers"
         );
 
-        // No count has landed yet: no denominator is invented for it.
         assert_eq!(
             line(&running_line(
                 &[root(RootPhase::Walking, 100, None)],
+                None,
                 None,
                 &colors
             )),
@@ -307,17 +313,44 @@ mod tests {
         done.active_workers = 0;
         done.total_workers = 0;
         assert_eq!(
-            line(&running_line(&[extracting, done], Some(120.0), &colors)),
+            line(&running_line(
+                &[extracting, done],
+                None,
+                Some(120.0),
+                &colors
+            )),
             "Indexing 2,200 / 2,800 (79%) · 1/2 roots done · 120 files/s · 3/4 workers"
         );
     }
 
-    /// The hint is on the phase word alone.
+    /// The counters are still the run's last true position; only the phase
+    /// word and the trailing clause say that nothing is moving.
+    #[test]
+    fn an_upkeep_step_renames_the_phase_and_names_itself() {
+        let colors = palette(true);
+        let spans = running_line(
+            &[root(RootPhase::Extracting, 100, Some(1000))],
+            Some(MaintenanceStep::Checkpoint),
+            None,
+            &colors,
+        );
+        assert_eq!(
+            line(&spans),
+            "Maintenance 100 / 100 (100%) · 2/4 workers · Compacting the write-ahead log"
+        );
+        assert_eq!(spans[0].1, Some(colors.orange));
+    }
+
     #[test]
     fn only_the_phase_word_of_the_running_line_is_hinted() {
         for dark in [true, false] {
             let colors = palette(dark);
-            let spans = running_line(&[root(RootPhase::Walking, 100, Some(1000))], None, &colors);
+            let spans = running_line(
+                &[root(RootPhase::Walking, 100, Some(1000))],
+                None,
+                None,
+                &colors,
+            );
             assert_eq!(spans[0].0, "Indexing");
             assert_eq!(spans[0].1, Some(colors.yellow), "dark_mode={}", dark);
             assert!(
@@ -328,11 +361,10 @@ mod tests {
         }
     }
 
-    /// A run with any root still walking is still walking.
     #[test]
     fn the_running_hint_follows_the_least_advanced_root() {
         let colors = palette(true);
-        let hint = |roots: &[RootProgress]| running_line(roots, None, &colors)[0].1;
+        let hint = |roots: &[RootProgress]| running_line(roots, None, None, &colors)[0].1;
 
         assert_eq!(
             hint(&[
@@ -349,14 +381,27 @@ mod tests {
             ]),
             Some(colors.green)
         );
-        // Every root finished, but the run has not torn itself down yet.
         assert_eq!(
             hint(&[root(RootPhase::Done, 100, None)]),
             Some(colors.green)
         );
+        // Upkeep outranks every phase: it is the only thing running.
+        for phase in [RootPhase::Walking, RootPhase::Extracting, RootPhase::Done] {
+            assert_eq!(
+                running_line(
+                    &[root(phase, 100, Some(1000))],
+                    Some(MaintenanceStep::MergingText),
+                    None,
+                    &colors
+                )[0]
+                .1,
+                Some(colors.orange),
+                "{:?}",
+                phase
+            );
+        }
     }
 
-    /// Only Manual idle is hinted; Auto is the expected state.
     #[test]
     fn only_manual_idle_is_hinted() {
         for dark in [true, false] {
@@ -385,7 +430,6 @@ mod tests {
         }
     }
 
-    /// A count read back as negative is a bug, not something to print.
     #[test]
     fn a_negative_file_count_reads_as_zero() {
         let colors = palette(true);

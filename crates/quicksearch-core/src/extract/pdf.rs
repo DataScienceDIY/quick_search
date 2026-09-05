@@ -1,15 +1,6 @@
-//! PDF text extraction.
-//!
-//! One `Document::load` per file, then the text is taken off it.
-//! `pdf_extract` can panic or hard-error on malformed files; any failure is
-//! surfaced to the caller and marks the file's content state as failed.
-//!
-//! `lopdf` is reached through `pdf_extract`'s own `pub use lopdf::*` and must
-//! **not** be declared in `Cargo.toml` again: a direct declaration resolved a
-//! *second, older* copy, dragging `rayon` — and a global thread pool that is
-//! never torn down — plus `chrono`, `time`, `md5` and a second `nom` into the
-//! build. The re-export is not a semver-guaranteed surface, but a break in it
-//! is a compile error rather than a silent behaviour change.
+//! PDF text extraction via `pdf_extract`.
+//! `lopdf` must come from `pdf_extract`'s `pub use lopdf::*`, never declared in
+//! `Cargo.toml` too: that resolved a second, older copy (plus a rayon pool).
 
 use std::cell::Cell;
 use std::path::Path;
@@ -17,18 +8,15 @@ use std::sync::OnceLock;
 
 use pdf_extract::{Document, PlainTextOutput};
 
-use super::{ExtractError, ExtractedContent, Extractor};
+use super::{ExtractError, Extractor, Scratch};
 
 thread_local! {
     /// True while this thread is inside a contained `pdf_extract` call.
     static SUPPRESS_PANIC_PRINT: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Chain a process panic hook (once) that swallows the default
-/// "thread panicked at …" report while this thread is inside a *contained*
-/// PDF extraction — those panics are expected on malformed PDFs, caught,
-/// and recorded as the file's failure reason, so printing each one is pure
-/// console spam. Panics anywhere else print exactly as before.
+/// Install (once) a panic hook that stays quiet while this thread is inside a
+/// contained PDF extraction; malformed-PDF panics are expected and recorded.
 fn install_quiet_panic_hook() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
@@ -41,8 +29,6 @@ fn install_quiet_panic_hook() {
     });
 }
 
-/// Human-readable message from a caught panic payload; lands in
-/// `failed_files.reason`.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
@@ -60,37 +46,39 @@ impl Extractor for PdfExtractor {
         mime == "application/pdf"
     }
 
-    fn extract(&self, path: &Path) -> Result<ExtractedContent, ExtractError> {
-        // Catch panics from pdf_extract (some PDFs crash its parser). The
-        // whole operation is inside the guard, document loading included — a
-        // panic in the parser outside it would reach the process hook and
-        // take the thread with it.
+    /// The one format with no streaming option: `Document::load` builds the
+    /// whole object graph before a byte of text comes out, and a 2 MiB file
+    /// has been measured holding tens of megabytes. Its *input* is bounded by
+    /// `maximum_text_file_size` and its output by `maximum_text_size`, but the
+    /// middle is `pdf_extract`'s and there is no scratch to reuse — so peak
+    /// for PDFs alone is `workers × amplification`, one pool per root.
+    fn extract(
+        &self,
+        path: &Path,
+        out: &mut String,
+        _scratch: &mut Scratch,
+    ) -> Result<(), ExtractError> {
+        // Loading is inside the guard too — a panic outside it takes the thread.
         install_quiet_panic_hook();
         let path_buf = path.to_path_buf();
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(true));
         let result = std::panic::catch_unwind(move || extract_one_pass(&path_buf));
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(false));
-        result.map_err(|panic| format!("pdf_extract panicked: {}", panic_message(&*panic)))?
+        let text = result
+            .map_err(|panic| format!("pdf_extract panicked: {}", panic_message(&*panic)))??;
+        if out.is_empty() {
+            *out = text;
+        } else {
+            out.push_str(&text);
+        }
+        Ok(())
     }
 }
 
-// properties (parked) — the `Info` dictionary read. See
-// `super::ExtractedContent`; reviving this also needs the `Object` import
-// above and `object_to_string` below.
-//
-// /// The six `Info` keys worth keeping, in the order they are written.
-// const INFO_KEYS: [&str; 6] = [
-//     "Title", "Author", "Subject", "Keywords", "Creator", "Producer",
-// ];
-
-/// Load the document once and take the text off it. This is
-/// `pdf_extract::extract_text`'s body (load, decrypt, `output_doc`) spelled
-/// out, which is also what kept the document in scope for the `Info` read.
-fn extract_one_pass(path: &Path) -> Result<ExtractedContent, ExtractError> {
+/// `pdf_extract::extract_text`'s body (load, decrypt, `output_doc`) spelled out.
+fn extract_one_pass(path: &Path) -> Result<String, ExtractError> {
     let mut doc = Document::load(path).map_err(|e| format!("pdf_extract: {}", e))?;
-    // Decryption must happen before either the content streams or the `Info`
-    // strings mean anything. Empty password only: a real one is the user's
-    // to supply and nothing on this path can ask for it.
+    // Empty-password decrypt only; nothing on this path can prompt for a real one.
     if doc.is_encrypted() {
         doc.decrypt("").map_err(|e| format!("pdf_extract: {}", e))?;
     }
@@ -100,40 +88,18 @@ fn extract_one_pass(path: &Path) -> Result<ExtractedContent, ExtractError> {
         let mut sink = PlainTextOutput::new(&mut text);
         pdf_extract::output_doc(&doc, &mut sink).map_err(|e| format!("pdf_extract: {}", e))?;
     }
-    // properties (parked): the `Info` dictionary was read here, soft-failing
-    // when absent because the text is the half that matters. It is all that
-    // held `doc` open past `output_doc`.
-    //
-    //  let info = doc
-    //      .trailer
-    //      .get(b"Info")
-    //      .ok()
-    //      .and_then(|o| o.as_reference().ok())
-    //      .and_then(|id| doc.get_object(id).ok())
-    //      .and_then(|o| o.as_dict().ok());
-    //  if let Some(dict) = info {
-    //      for key in INFO_KEYS {
-    //          if let Some(s) = dict.get(key.as_bytes()).ok().and_then(object_to_string) {
-    //              if !s.is_empty() {
-    //                  out.properties.insert(key.to_ascii_lowercase(), s);
-    //              }
-    //          }
-    //      }
-    //  }
-    //
-    //  fn object_to_string(obj: &Object) -> Option<String> {
-    //      match obj {
-    //          Object::String(bytes, _) => Some(String::from_utf8_lossy(bytes).into_owned()),
-    //          Object::Name(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-    //          _ => None,
-    //      }
-    //  }
-    Ok(ExtractedContent::with_text(text))
+    Ok(text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn extract(path: &Path) -> Result<String, ExtractError> {
+        let mut out = String::new();
+        let mut scratch = Scratch::new(&crate::config::Config::default());
+        PdfExtractor.extract(path, &mut out, &mut scratch).map(|()| out)
+    }
 
     #[test]
     fn contained_panics_are_caught_quietly_with_reason() {
@@ -143,9 +109,6 @@ mod tests {
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(false));
         let payload = result.expect_err("must panic");
         assert_eq!(panic_message(&*payload), "synthetic pdf failure");
-        // Panics outside the suppression window keep printing: the flag is
-        // thread-local and cleared, so nothing here can silence other
-        // threads or later tests.
         assert!(!SUPPRESS_PANIC_PRINT.with(|flag| flag.get()));
     }
 
@@ -159,15 +122,9 @@ mod tests {
     use std::path::PathBuf;
 
     /// Write a one-page PDF drawing `body`, with `info` as its `Info`
-    /// dictionary, and return the path.
-    ///
-    /// Everything needed is public through `pdf_extract`'s `lopdf` re-export
-    /// — the same surface the extractor uses — so if that re-export moves,
-    /// these fail to compile alongside it. The page is minimal but complete:
-    /// `output_doc` walks Catalog → Pages → Page and needs `MediaBox`, a
-    /// resolvable `Resources` font and a content stream; Helvetica is a
-    /// base-14 font with built-in encoding tables, so no font file is
-    /// involved.
+    /// dictionary, using only `pdf_extract`'s `lopdf` re-export — a move in
+    /// that surface fails to compile here alongside the extractor. Helvetica
+    /// is a base-14 font with built-in encoding tables, so no font file.
     fn write_pdf(tag: &str, body: &str, info: Option<Dictionary>) -> PathBuf {
         let mut doc = Document::with_version("1.5");
         let font = doc.add_object(dictionary! {
@@ -215,8 +172,6 @@ mod tests {
         Object::String(s.as_bytes().to_vec(), StringFormat::Literal)
     }
 
-    /// A document *with* an `Info` dictionary still extracts its text — the
-    /// dictionary is no longer read, and must not get in the way.
     #[test]
     fn extracts_text_from_a_document_with_an_info_dictionary() {
         let path = write_pdf(
@@ -232,33 +187,27 @@ mod tests {
             }),
         );
 
-        let out = PdfExtractor.extract(&path).expect("extract");
+        let out = extract(&path).expect("extract");
         assert!(
-            out.text.contains("Hello QuickSearch"),
+            out.contains("Hello QuickSearch"),
             "drawn text missing from {:?}",
-            out.text
+            out
         );
     }
 
-    /// The soft-fail path: no `Info` dictionary is not an extraction failure,
-    /// because the text is the half that matters.
     #[test]
     fn missing_info_dictionary_still_yields_text() {
         let path = write_pdf("pdf-noinfo", "Body Only", None);
-        let out = PdfExtractor.extract(&path).expect("extract");
-        assert!(out.text.contains("Body Only"));
+        let out = extract(&path).expect("extract");
+        assert!(out.contains("Body Only"));
     }
 
-    /// Malformed input must come back as an error, not take the process
-    /// down — the case the `catch_unwind` around the document load exists
-    /// for.
     #[test]
     fn malformed_pdf_fails_without_panicking_the_process() {
         let path = crate::testutil::scratch_dir("pdf-malformed").join("broken.pdf");
         std::fs::write(&path, b"%PDF-1.4\n\x00\x01\x02 not a pdf at all \xff\xfe").unwrap();
 
-        let err = PdfExtractor
-            .extract(&path)
+        let err = extract(&path)
             .expect_err("malformed pdf must fail");
         assert!(
             err.starts_with("pdf_extract"),
@@ -267,21 +216,16 @@ mod tests {
         );
     }
 
-    /// A page whose `/Parent` is itself must be skipped, not fatal.
-    ///
-    /// `get_inherited` walks `/Parent` looking for `Resources` and `MediaBox`,
-    /// and upstream did so without a depth bound — a cycle recursed until the
-    /// guard page. That is *not* a panic `catch_unwind` can hold: Rust's
-    /// handler aborts, so this test could not even be written before
-    /// `vendor/pdf-extract` bounded the walk; it would have taken the test
-    /// binary down with it. What arrives now is an ordinary contained failure.
+    /// A page whose `/Parent` is itself must be skipped, not fatal. Upstream
+    /// `get_inherited` walked `/Parent` with no depth bound; a cycle overflows
+    /// the stack, which aborts — `catch_unwind` cannot hold it — so
+    /// `vendor/pdf-extract` bounds the walk.
     #[test]
     fn a_self_referential_page_parent_is_contained() {
         let mut doc = Document::with_version("1.5");
         let contents = doc.add_object(Stream::new(dictionary! {}, b"BT ET".to_vec()));
         let page_id = doc.new_object_id();
-        // Neither `Resources` nor `MediaBox` here, so both lookups have to
-        // follow `/Parent` — which points back at this same dictionary.
+        // No `Resources` or `MediaBox`, so both lookups follow `/Parent` — into itself.
         doc.objects.insert(
             page_id,
             Object::Dictionary(dictionary! {
@@ -305,13 +249,12 @@ mod tests {
         doc.save(&path).expect("write fixture pdf");
 
         // The verdict that matters is that we reach this line at all.
-        let _ = PdfExtractor.extract(&path);
+        let _ = extract(&path);
     }
 
-    /// A Form XObject whose content stream draws itself must be skipped, not
-    /// fatal — the second unbounded recursion, in `process_stream`'s `Do` arm.
-    /// The same bound also caps the branching shape, where each level draws
-    /// the next twice and a shallow document costs 2^depth calls.
+    /// A Form XObject drawing itself must be skipped — the second unbounded
+    /// recursion (`process_stream`'s `Do` arm); the bound also caps the
+    /// 2^depth branching shape.
     #[test]
     fn a_self_drawing_form_xobject_is_contained() {
         let mut doc = Document::with_version("1.5");
@@ -360,6 +303,6 @@ mod tests {
         let path = crate::testutil::scratch_dir("pdf-xobject-cycle").join("cycle.pdf");
         doc.save(&path).expect("write fixture pdf");
 
-        let _ = PdfExtractor.extract(&path);
+        let _ = extract(&path);
     }
 }

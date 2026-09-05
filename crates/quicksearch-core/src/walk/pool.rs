@@ -1,11 +1,9 @@
-//! The walk's worker-pool engine: the bounded LIFO job queue, prefetch
-//! accounting, and per-worker busy stats. The filesystem logic stays in
-//! the parent module.
+//! The walk's worker-pool engine: bounded LIFO job queue, prefetch
+//! accounting, per-worker busy stats. Filesystem logic stays in the parent.
 
 use super::*;
 
-/// Cap on directories fetched but not yet taken by a worker; each holds its
-/// rows live.
+/// Cap on directories fetched but not yet taken; each holds its rows live.
 const PREFETCH_AHEAD: usize = 64;
 
 #[derive(Default)]
@@ -13,32 +11,23 @@ pub(super) struct Queue {
     /// LIFO: a directory's children are processed close in time to the read
     /// that discovered them, which is what the attribute cache rewards.
     pub(super) jobs: Vec<Job>,
-    /// Directories discovered but not yet given their rows, and symlink
-    /// targets awaiting an mtime lookup. The prefetcher drains both.
     pub(super) needs_rows: Vec<PathBuf>,
     pub(super) needs_alias: Vec<PathBuf>,
-    /// Set while the prefetcher is mid-query, holding work that is in neither
-    /// list. Part of the end-of-walk proof: see [`Shared::take`].
+    /// Prefetcher mid-query, holding work in neither list; part of the
+    /// end-of-walk proof in [`Shared::take`].
     pub(super) prefetching: bool,
-    /// Fetched directories sitting in `jobs` — what [`PREFETCH_AHEAD`] bounds.
-    /// Not derived from `jobs.len()`, which also counts `Job::Files` chunks:
-    /// they carry no rows and would starve directory prefetching.
+    /// What [`PREFETCH_AHEAD`] bounds. Not `jobs.len()`: that also counts
+    /// `Job::Files` chunks, which carry no rows and would starve prefetching.
     pub(super) dirs_ready: usize,
-    /// Workers currently holding a job — that is, workers that may still push
-    /// more. The walk is over when this is zero and `jobs` is empty.
     pub(super) active: usize,
-    /// Canonical directories already queued. Collapses overlapping roots and
-    /// makes symlink cycles impossible: a cycle must revisit a canonical path.
-    ///
-    /// Also the record of which directories the walk reached, read by the
-    /// caller's vanished-directory sweep.
+    /// Canonical directories already queued: collapses overlapping roots,
+    /// breaks symlink cycles (a cycle must revisit a canonical path), and
+    /// records which directories the walk reached for the vanished sweep.
     pub(super) seen_dirs: HashSet<PathBuf>,
     pub(super) done: bool,
 }
 
 impl Queue {
-    /// Whether any stage still holds work. The prefetch stage is invisible to
-    /// a `jobs`/`active` test, so it has to be named here explicitly.
     pub(super) fn idle(&self) -> bool {
         self.jobs.is_empty()
             && self.needs_rows.is_empty()
@@ -51,13 +40,10 @@ impl Queue {
 pub(super) struct Shared {
     pub(super) queue: Mutex<Queue>,
     pub(super) idle: Condvar,
-    /// Workers currently processing (not parked waiting for work), for
-    /// progress display.
     pub(super) stats: WorkerStats,
 }
 
-/// Decrements the busy count however the worker leaves its job — including
-/// early returns on stop and panics.
+/// Decrements the busy count however the worker leaves — stop or panic.
 pub(crate) struct BusyGuard<'a>(&'a AtomicUsize);
 
 impl Drop for BusyGuard<'_> {
@@ -81,13 +67,11 @@ impl WorkerStats {
         }
     }
 
-    /// Count the calling thread as busy until the returned guard drops.
     pub(crate) fn enter(&self) -> BusyGuard<'_> {
         self.busy.fetch_add(1, Ordering::Relaxed);
         BusyGuard(&self.busy)
     }
 
-    /// Workers doing work right now (the rest are parked).
     pub fn active(&self) -> usize {
         self.busy.load(Ordering::Relaxed).min(self.total)
     }
@@ -98,11 +82,9 @@ impl WorkerStats {
 }
 
 impl Shared {
-    /// Claim a job, blocking while other workers are still running.
-    ///
-    /// Returns `None` only when the queue is empty *and* no worker holds a
-    /// job — at that instant nobody is left who could push more, so the walk
-    /// is provably finished.
+    /// Claim a job. Returns `None` only when the queue is empty *and* no
+    /// worker holds a job — at that instant nobody is left who could push
+    /// more, so the walk is provably finished.
     pub(super) fn take(&self) -> Option<(Job, ActiveJob<'_>)> {
         let mut q = crate::lock_ok(&self.queue);
         loop {
@@ -124,8 +106,8 @@ impl Shared {
                     },
                 ));
             }
-            // Only "nobody anywhere holds work" proves the walk is over — a
-            // directory in the prefetch stage still becomes a job.
+            // A directory in the prefetch stage still becomes a job, hence
+            // the full idle() test.
             if q.idle() {
                 q.done = true;
                 self.idle.notify_all();
@@ -139,17 +121,14 @@ impl Shared {
     }
 
     /// Claim one unit of prefetch work, or `None` once the walk is over.
-    ///
-    /// Parks while the runnable queue is already `PREFETCH_AHEAD` deep, so
-    /// fetched-but-unclaimed rows stay bounded.
+    /// Parks while the runnable queue is already `PREFETCH_AHEAD` deep.
     pub(super) fn take_prefetch(&self) -> Option<PrefetchWork> {
         let mut q = crate::lock_ok(&self.queue);
         loop {
             if q.done {
                 return None;
             }
-            // Aliases carry a single mtime, not rows, so they are never
-            // throttled.
+            // Aliases carry a single mtime, not rows: never throttled.
             if let Some(path) = q.needs_alias.pop() {
                 q.prefetching = true;
                 return Some(PrefetchWork::Alias(path));
@@ -184,7 +163,6 @@ impl Shared {
         self.idle.notify_all();
     }
 
-    /// Give the prefetch slot back without producing a job (the query failed).
     pub(super) fn abandon_prefetch(&self) {
         let mut q = crate::lock_ok(&self.queue);
         q.prefetching = false;
@@ -192,7 +170,6 @@ impl Shared {
     }
 }
 
-/// One unit of work for the prefetcher.
 pub(super) enum PrefetchWork {
     Dir(PathBuf),
     Alias(PathBuf),
@@ -200,20 +177,17 @@ pub(super) enum PrefetchWork {
 
 /// What a worker discovered while reading a directory.
 pub(super) enum Found {
-    /// A subdirectory. Needs its rows before a worker can classify inside it.
     Dir(PathBuf),
-    /// A resolved symlink target. Needs an exact-path mtime lookup.
     Alias(PathBuf),
     /// Overflow files from the directory just read, which already has rows.
     Files(Vec<PendingFile>, Arc<DirRows>),
 }
 
 impl Shared {
-    /// Push discovered work and give the job slot back, under a single lock
-    /// acquisition. Doing both together is what makes the idle test in
-    /// [`Shared::take`] an end-of-walk proof rather than a race: a worker
-    /// that has popped the last job but not yet published its children must
-    /// never look idle.
+    /// Push discovered work and give the job slot back under a single lock:
+    /// that makes the idle test in [`Shared::take`] a proof, not a race — a
+    /// worker that popped the last job but has not yet published its
+    /// children must never look idle.
     pub(super) fn publish(&self, found: Vec<Found>) {
         let mut q = crate::lock_ok(&self.queue);
         for item in found {
@@ -238,9 +212,8 @@ impl Shared {
     }
 }
 
-/// Hands the job slot back even if the worker panics or returns early. A
-/// stranded count would leave every other worker waiting on a number that
-/// never reaches zero.
+/// Hands the job slot back even if the worker panics or returns early; a
+/// stranded count would strand every other worker too.
 pub(super) struct ActiveJob<'a> {
     shared: &'a Shared,
     finished: bool,

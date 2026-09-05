@@ -18,11 +18,17 @@ pub use batch::{
     Stored,
 };
 pub use counting::count_tree_entries_fast;
-pub use paths::{db_key_for_missing_path, filtered_dirs, filtered_walk, UnreadableDirs};
-pub(crate) use paths::{normalize_root_string, path_to_db_string, warn_if_unrepresentable};
+pub use paths::{
+    db_key_for_missing_path, filtered_dirs, filtered_walk, split_db_path, UnreadableDirs,
+};
+pub(crate) use paths::{
+    dir_to_db_parent, index_file_set, normalize_root_string, path_to_db_string,
+    warn_if_unrepresentable, INDEX_SIDECAR_SUFFIXES,
+};
 pub use records::{
     classify_by_mtime, classify_for_indexing, content_extractable, decide_content,
-    extract_and_store, fts_finalize_after_text_indexing, hash_failure_counts, outcome_body,
-    prepare_file_record, prepare_file_record_from_path, reset_run_warnings, store_content_outcome,
-    ContentOutcome, DirRows, FileIndexAction, OwnedNewFile,
+    extract_and_store, fts_begin_bulk_write, fts_finalize_after_text_indexing, fts_set_automerge,
+    get_file_hash, hash_failure_counts, outcome_body, prepare_file_record,
+    prepare_file_record_from_path, reset_run_warnings, store_content_outcome, ContentOutcome,
+    DirRows, FileIndexAction, OwnedNewFile,
 };

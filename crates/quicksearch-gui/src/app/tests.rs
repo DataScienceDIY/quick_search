@@ -147,6 +147,75 @@ fn only_the_two_draft_backed_tabs_have_an_editor() {
     }
 }
 
+/// The scan reads every entry in the hash index, so arriving at the tab must
+/// not re-run it over a listing that is already there.
+#[test]
+fn only_an_empty_duplicates_tab_scans_on_arrival() {
+    assert!(arrival_starts_dup_scan(
+        Tab::Duplicates,
+        &DupState::NotLoaded
+    ));
+    for held in [
+        DupState::Loading,
+        DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(Vec::new())),
+        DupState::Error("boom".into()),
+    ] {
+        assert!(
+            !arrival_starts_dup_scan(Tab::Duplicates, &held),
+            "arriving must not disturb a scan already run or running"
+        );
+    }
+    // No other tab scans, whatever the Duplicates tab is holding.
+    for tab in [
+        Tab::Search,
+        Tab::Manage,
+        Tab::Logs,
+        Tab::Help,
+        Tab::Settings,
+    ] {
+        assert!(!arrival_starts_dup_scan(tab, &DupState::NotLoaded));
+    }
+}
+
+/// A listing describes the index at the moment it was scanned. Every way that
+/// index can change out from under it has to reach the tab.
+#[test]
+fn an_index_that_changed_invalidates_what_the_tab_holds() {
+    let loaded = || DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(Vec::new()));
+
+    // On screen: the user is looking at it, so redo it now.
+    assert_eq!(
+        dup_invalidation(Tab::Duplicates, &loaded()),
+        DupInvalidation::Rescan
+    );
+    assert_eq!(
+        dup_invalidation(Tab::Duplicates, &DupState::Error("boom".into())),
+        DupInvalidation::Rescan,
+        "a failed scan is worth retrying against the new index"
+    );
+
+    // Out of sight: drop it, and let the next visit pay for the rescan.
+    assert_eq!(
+        dup_invalidation(Tab::Search, &loaded()),
+        DupInvalidation::Drop
+    );
+
+    // Nothing to invalidate.
+    assert_eq!(
+        dup_invalidation(Tab::Search, &DupState::NotLoaded),
+        DupInvalidation::Nothing
+    );
+
+    // In flight: its answer already predates the change, but racing a second
+    // scan against it would read the index twice over.
+    for tab in [Tab::Duplicates, Tab::Search] {
+        assert_eq!(
+            dup_invalidation(tab, &DupState::Loading),
+            DupInvalidation::WhenItLands
+        );
+    }
+}
+
 /// The two values the Settings tab's color-scheme box writes, plus
 /// hand-edited variants.
 #[test]
@@ -167,4 +236,19 @@ fn only_light_is_light() {
             nonsense
         );
     }
+}
+
+/// In automatic mode the rebuild is already under way behind the modal;
+/// commanding another one would delete its progress and start over.
+#[test]
+fn the_stale_index_prompt_never_restarts_a_rebuild_already_running() {
+    use super::modals::stale_prompt_should_command;
+
+    assert!(!stale_prompt_should_command(IndexMode::Auto, true));
+    // Auto before the first tick: the coordinator still gets there on its own.
+    assert!(!stale_prompt_should_command(IndexMode::Auto, false));
+    assert!(!stale_prompt_should_command(IndexMode::ManualRunning, true));
+
+    // Manual and stopped: nothing else would ever start it.
+    assert!(stale_prompt_should_command(IndexMode::ManualStopped, false));
 }

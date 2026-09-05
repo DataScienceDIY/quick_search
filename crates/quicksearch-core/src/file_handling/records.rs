@@ -10,15 +10,13 @@ use std::time::UNIX_EPOCH;
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
-use super::paths::parent_str;
 use super::*;
 use crate::config::Config;
 use crate::db::repo::{self, NewFile};
-use crate::extract::Registry;
+use crate::extract::{Registry, Scratch};
 use crate::mime::{guess_mime_from_head, mime_to_type, FileType};
 
-/// One directory's indexed files, as `name -> mtime`. Produced by
-/// [`crate::db::repo::dir_rows`].
+/// One directory's indexed files, as `name -> mtime`.
 pub type DirRows = HashMap<String, u64>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,19 +26,14 @@ pub enum FileIndexAction {
     Insert,
 }
 
-/// Decide what Phase 1 should do with a file, given its name within the
-/// directory being walked and the file's mtime.
-///
+/// Decide what Phase 1 should do with a file.
 /// A file whose parent is *not* this directory — a resolved symlink target —
-/// must not be classified here: it would miss, read as
-/// [`FileIndexAction::Insert`], and `insert_file`'s `INSERT OR IGNORE` would
-/// then silently not update it. Use [`classify_by_mtime`] for those.
+/// must not be classified here: it would read as `Insert` and `INSERT OR
+/// IGNORE` would silently not update it. Use [`classify_by_mtime`] for those.
 pub fn classify_for_indexing(name: &str, mtime: u64, rows: &DirRows) -> FileIndexAction {
     classify_by_mtime(rows.get(name).copied(), mtime)
 }
 
-/// The same decision from an already-resolved stored mtime; used directly for
-/// resolved symlink targets.
 pub fn classify_by_mtime(stored: Option<u64>, mtime: u64) -> FileIndexAction {
     match stored {
         Some(known) if known == mtime => FileIndexAction::Skip,
@@ -49,11 +42,14 @@ pub fn classify_by_mtime(stored: Option<u64>, mtime: u64) -> FileIndexAction {
     }
 }
 
-/// Truncate to at most `max_bytes` bytes, backing up to a UTF-8 character
-/// boundary. Cuts short of the budget rather than over it.
-fn safe_truncate_string(s: &str, max_bytes: usize) -> String {
+/// Truncate to at most `max_bytes`, backing up to a UTF-8 char boundary.
+///
+/// In place: this runs on documents up to `maximum_text_size`, and building
+/// the prefix as a second `String` allocated and copied the whole thing only
+/// to drop the original a line later.
+pub(crate) fn safe_truncate(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
-        return s.to_string();
+        return;
     }
 
     let mut end = max_bytes;
@@ -61,124 +57,196 @@ fn safe_truncate_string(s: &str, max_bytes: usize) -> String {
         end -= 1;
     }
 
-    s[..end].to_string()
+    s.truncate(end);
 }
 
-/// Identify a file as `sha256(size || first hash_length bytes)`, returning
-/// the head bytes alongside the digest so the caller can sniff a MIME type
-/// without opening the file again.
+/// A SHA-256 digest. An array, not a `Vec`: it is a fixed 32 bytes, it is
+/// produced once per new or changed file, and a heap allocation apiece is
+/// per-file allocator traffic for something that fits in a register pair's
+/// worth of stack.
+pub type FileHash = [u8; 32];
+
+/// Identify a file as `sha256(size || first hash_length bytes)`, leaving the
+/// head bytes in `head` for MIME sniffing. The cost is a collision class —
+/// same-size files with identical heads read as duplicates
+/// (`examples/hashprobe.rs` has the study); `crate::verify` is the way out.
 ///
-/// The cost is a collision class: two files of identical size whose first
-/// `hash_length` bytes match hash identically — pre-allocated VM disk images
-/// (fixed-size VHDs keep their unique footer at the *end*; fresh raw/qcow2
-/// images are zeros at the head) are reported as duplicates when they are
-/// not. Duplicate listing is advisory, so this is a display artifact.
-pub(super) fn get_file_hash(
+/// `head` is the caller's buffer, reused file after file; it is resized to
+/// the bytes actually read and its previous contents are discarded.
+pub fn get_file_hash(
     size: u64,
     path: &Path,
     hash_length: usize,
-) -> Result<(Vec<u8>, Vec<u8>), std::io::Error> {
+    head: &mut Vec<u8>,
+) -> Result<FileHash, std::io::Error> {
     // The caller's `is_file()` came from a `stat` taken before this open; a
     // FIFO renamed over the name in between would block this walk worker
     // forever and park the pool behind it. See `platform::open_regular_file`.
     let mut f: File = crate::platform::open_regular_file(path)?;
-    // Files shorter than the window hash whole; `min` keeps the cast sound
-    // for large files on 32-bit targets.
-    let mut head = vec![0u8; size.min(hash_length as u64) as usize];
-    f.read_exact(&mut head)?;
+    head.clear();
+    head.resize(size.min(hash_length as u64) as usize, 0);
+    f.read_exact(head)?;
 
     let mut hasher = Sha256::new();
     hasher.update(size.to_le_bytes());
-    hasher.update(&head);
-    Ok((hasher.finalize().to_vec(), head))
+    hasher.update(&*head);
+    Ok(hasher.finalize().into())
 }
 
-/// Nudge FTS5 to merge its index segments. Best-effort; failure is logged
-/// and swallowed.
-pub fn fts_finalize_after_text_indexing(conn: &Connection) {
+/// FTS5's automerge threshold (2..=16). 16 measured ~19% faster cold indexing
+/// and a third fewer bytes written for no search cost; don't retune casually.
+const WRITE_AUTOMERGE: u8 = 16;
+
+/// Set FTS5's automerge threshold. Best-effort; failure is logged.
+///
+/// **This sets a parameter — it does not merge anything.** The merging
+/// command is `'merge'`; see [`fts_finalize_after_text_indexing`]. It must
+/// run *before* the bulk load: called only at the end of a run, it affects
+/// nothing.
+pub fn fts_set_automerge(conn: &Connection, segments: u8) {
     if let Err(e) = conn.execute(
-        "INSERT INTO searchabletext(searchabletext, rank) VALUES('automerge', 8)",
-        [],
+        "INSERT INTO searchabletext(searchabletext, rank) VALUES('automerge', ?1)",
+        [segments as i64],
     ) {
         crate::log_warn!("FTS automerge failed (non-fatal): {}", e);
     }
 }
 
-/// An owned, fully-derived file record: everything needed to insert or
-/// update a `files` row, produced by [`prepare_file_record`].
+/// FTS5's crisis-merge threshold (its default is 16). 32 measured a 13%
+/// smaller, more build-stable index for no cost; 64 measured identically.
+const WRITE_CRISISMERGE: u8 = 32;
+
+/// Apply the write-side FTS5 settings, before a run starts writing.
+///
+/// `pgsz` is deliberately absent: it is not a per-run setting. Sweeping it
+/// *unencrypted* only ever wrote more bytes for an index the same size, so the
+/// default 4050 stands there. Keyed is the opposite — SQLCipher's page reserve
+/// makes 4050 a cliff — and that case is handled once at schema creation; see
+/// [`crate::db::schema::FTS_PGSZ_ENCRYPTED`].
+pub fn fts_begin_bulk_write(conn: &Connection) {
+    fts_set_automerge(conn, WRITE_AUTOMERGE);
+    if let Err(e) = conn.execute(
+        "INSERT INTO searchabletext(searchabletext, rank) VALUES('crisismerge', ?1)",
+        [WRITE_CRISISMERGE as i64],
+    ) {
+        crate::log_warn!("FTS crisismerge failed (non-fatal): {}", e);
+    }
+}
+
+/// Output leaf pages [`fts_finalize_after_text_indexing`] may write.
+///
+/// FTS5's own `FTS5_OPT_WORK_UNIT`, which is the budget it gives one step of a
+/// real `'optimize'`. **Unswept** — the other two constants here carry measured
+/// tables and this one does not yet; it is a starting point chosen to match
+/// SQLite's own unit of merge work, not a tuned figure.
+///
+/// The budget is not a hard ceiling. `fts5IndexMergeLevel` only tests it at a
+/// term boundary, so one term with a very long doclist writes past it; that is
+/// the shape to expect if this ever needs raising or lowering.
+const FINALIZE_MERGE_PAGES: i64 = 1000;
+
+/// Merge FTS5 segments once a run has finished writing — this is what
+/// reclaims the tombstones a `contentless_delete` table accumulates.
+/// Best-effort; an unconsolidated index is still correct.
+///
+/// **The sign of the argument picks a different algorithm**, which is worth
+/// spelling out because reading it as a plain page budget cost a release. From
+/// `sqlite3Fts5IndexMerge` in the amalgamation:
+///
+/// - **Positive** `N`: ordinary consolidation. Merges any level holding at
+///   least `usermerge` segments (FTS5's default 4 — we set `automerge` and
+///   `crisismerge`, never `usermerge`), for up to `N` output leaf pages.
+/// - **Negative** `N`: `fts5IndexOptimizeStruct` with `nMin` forced to 1 —
+///   that is `'optimize'`, hoisting every segment in the table into a single
+///   level, merely rate-limited to `|N|` pages per call. It is built to be
+///   called in a loop until `changes() == 0`. Called *once*, it leaves the
+///   structure permanently mid-optimize, and that persists in `%_data`.
+///
+/// So this takes the positive form. Tombstone reclamation survives the switch:
+/// `fts5IndexMerge` falls through to `fts5IndexFindDeleteMerge` when no level
+/// has `nMin` segments, and that path keys off `deletemerge` whatever the sign.
+pub fn fts_finalize_after_text_indexing(conn: &Connection) {
+    if let Err(e) = conn.execute(
+        "INSERT INTO searchabletext(searchabletext, rank) VALUES('merge', ?1)",
+        [FINALIZE_MERGE_PAGES],
+    ) {
+        crate::log_warn!("FTS merge failed (non-fatal): {}", e);
+    }
+}
+
+/// An owned, fully-derived file record, produced by [`prepare_file_record`].
 #[derive(Debug, Clone)]
 pub struct OwnedNewFile {
     pub name: String,
-    pub path: String,
+    /// The containing directory, ending in the platform separator.
     pub parent: String,
     pub size: u64,
     pub mtime: u64,
-    pub mime: Option<String>,
+    /// Borrowed from the static tables [`guess_mime_from_head`] answers out
+    /// of; nothing here ever owns a MIME string.
+    pub mime: Option<&'static str>,
     pub ftype: FileType,
     /// `None` only for a dehydrated cloud placeholder. Stored as SQL NULL,
     /// which keeps such files out of duplicate detection: an empty or zero
     /// hash would make every one of them look identical.
-    pub hash: Option<Vec<u8>>,
+    pub hash: Option<FileHash>,
     /// Text extracted from the head bytes during the walk, for files small
     /// enough that the head *was* the whole file. `Some` means the content
     /// pass never has to open this file; `None` leaves it pending.
     pub inline_text: Option<String>,
-    /// Whether the content pass has anything to do for this file — see
-    /// [`content_extractable`], plus the `maximum_text_file_size` gate.
     /// `false` means the row is born `STATE_NA`.
     pub needs_content: bool,
 }
 
 impl OwnedNewFile {
+    pub fn path(&self) -> String {
+        format!("{}{}", self.parent, self.name)
+    }
+
     pub fn as_new_file(&self) -> NewFile<'_> {
         NewFile {
             name: &self.name,
-            path: &self.path,
             parent: &self.parent,
             size: self.size,
             mtime: self.mtime,
-            mime: self.mime.as_deref(),
+            mime: self.mime,
             ftype: self.ftype,
-            hash: self.hash.as_deref(),
+            hash: self.hash.as_ref().map(|h| &h[..]),
             needs_content: self.needs_content,
         }
     }
 }
 
-/// Individual "cannot hash" warnings allowed per run before only the count is
-/// kept. See [`crate::log::Throttle`]; [`reset_run_warnings`] arms it.
+/// "Cannot hash" warnings allowed per run before only the count is kept.
 static HASH_FAILURES: crate::log::Throttle = crate::log::Throttle::new(20);
 
-/// Arm the per-run warning throttles; called once at the start of an
-/// indexing run.
+/// Arm the per-run warning throttles, at the start of an indexing run.
 pub fn reset_run_warnings() {
     HASH_FAILURES.reset();
 }
 
-/// How many files could not be hashed this run, and how many of those went
-/// unlogged. `(0, 0)` when nothing failed.
+/// How many files could not be hashed this run, and how many went unlogged.
 pub fn hash_failure_counts() -> (u64, u64) {
     (HASH_FAILURES.seen(), HASH_FAILURES.suppressed())
 }
 
 /// Build the `files` row for one on-disk file from a `stat` the caller
-/// already holds. The single implementation behind both full-run batches
-/// and incremental watcher updates.
+/// already holds. Returns `None` for anything that isn't a readable regular
+/// file.
 ///
-/// `path` must already be canonical and in `files.path` spelling (see
-/// [`path_to_db_string`]), and must still name the file once parsed back into
-/// a [`Path`] — this opens it by that string. A path that only survived
-/// `to_string_lossy` does not qualify; callers holding the original [`Path`]
-/// screen it with [`warn_if_unrepresentable`] first. Callers holding an
-/// unresolved path want [`prepare_file_record_from_path`] instead.
-///
-/// Returns `None` for anything that isn't a readable regular file, with a
-/// warning when hashing fails.
+/// `path` must be canonical, in stored spelling, and must still name the file
+/// once parsed back into a [`Path`] — this opens it by that string. A path
+/// that only survived `to_string_lossy` does not qualify: the lossy spelling
+/// of one name is the real name of another, so it would hash and index the
+/// wrong file.
+/// `scratch` holds the head buffer this reads into, reused across every file
+/// a walk worker handles.
 pub fn prepare_file_record(
     path: &str,
     meta: &std::fs::Metadata,
     config: &Config,
     registry: &Registry,
+    scratch: &mut Scratch,
 ) -> Option<OwnedNewFile> {
     if !meta.is_file() {
         return None;
@@ -191,17 +259,23 @@ pub fn prepare_file_record(
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs())?;
 
-    // A dehydrated cloud file is indexed from its metadata alone: reading even
-    // the first byte would block on downloading the whole file, so no hash, no
-    // MIME sniff, no inline extraction. Hydration does not change the mtime,
-    // so a later run picks it up once the attribute clears.
+    // A dehydrated cloud file is indexed from its metadata alone: reading
+    // even the first byte would block on downloading the whole file.
     let dehydrated = crate::platform::is_cloud_placeholder(meta);
 
-    let (hash, head) = if dehydrated {
-        (None, Vec::new())
+    let hash = if dehydrated {
+        // No head either: an empty buffer sniffs to the extension's answer,
+        // which is all a placeholder can be classified by.
+        scratch.head_buffer().clear();
+        None
     } else {
-        match get_file_hash(size, Path::new(path), config.processing.hash_length) {
-            Ok((hash, head)) => (Some(hash), head),
+        match get_file_hash(
+            size,
+            Path::new(path),
+            config.processing.hash_length,
+            scratch.head_buffer(),
+        ) {
+            Ok(hash) => Some(hash),
             Err(e) => {
                 // Throttled: on Windows a file another process holds open
                 // fails here as a matter of course.
@@ -213,38 +287,31 @@ pub fn prepare_file_record(
         }
     };
 
-    let name = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())?;
-    let parent = parent_str(path);
-    // Sniff from the bytes hashing already read; an empty head falls back to
-    // the extension.
-    let mime = guess_mime_from_head(Path::new(path), &head);
-    let ftype = mime.as_deref().map(mime_to_type).unwrap_or(FileType::EMPTY);
+    let (parent, name) = split_db_path(path)?;
+    let (parent, name) = (parent.to_string(), name.to_string());
+    let head = scratch.head();
+    let mime = guess_mime_from_head(Path::new(path), head);
+    let ftype = mime.map(mime_to_type).unwrap_or(FileType::EMPTY);
 
     let needs_content = !dehydrated
         && size <= config.processing.maximum_text_file_size
-        && content_extractable(Path::new(path), mime.as_deref(), config, registry);
+        && content_extractable(Path::new(path), mime, config, registry);
 
     // When the head is the whole file, an extractor that works from bytes can
-    // finish the job now; any condition that does not hold leaves this `None`
-    // and the file stays pending.
-    let inline_text = mime.as_deref().filter(|_| needs_content).and_then(|m| {
+    // finish the job now; otherwise the file stays pending.
+    let inline_text = mime.filter(|_| needs_content).and_then(|m| {
         // Size 0 is excluded: procfs, sysfs and some FUSE mounts report it
         // for files that do have content, and inlining would store empty
         // text for them.
         if size == 0 || size > config.processing.hash_length as u64 {
             return None;
         }
+        let mut text = String::new();
         // A panicking parser arrives here as `Some(Err(..))` — contained by
-        // the registry, which is what keeps a walk worker alive. See
-        // `Registry::extract`.
-        match registry.extract_complete_head(Path::new(path), m, &head) {
-            Some(Ok(content)) => {
-                let mut text = content.text;
-                if text.len() > config.processing.maximum_text_size {
-                    text = safe_truncate_string(&text, config.processing.maximum_text_size);
-                }
+        // the registry, which is what keeps a walk worker alive.
+        match registry.extract_complete_head(Path::new(path), m, head, &mut text) {
+            Some(Ok(())) => {
+                safe_truncate(&mut text, config.processing.maximum_text_size);
                 Some(text)
             }
             // Recording a failure needs a file id the walk does not have;
@@ -255,7 +322,6 @@ pub fn prepare_file_record(
 
     Some(OwnedNewFile {
         name,
-        path: path.to_string(),
         parent,
         size,
         mtime,
@@ -267,8 +333,8 @@ pub fn prepare_file_record(
     })
 }
 
-/// [`prepare_file_record`] for a path that has not been resolved yet — the
-/// watcher path.
+/// [`prepare_file_record`] for a path not yet resolved — the watcher path.
+/// One file at a time, so it owns the scratch rather than being handed one.
 pub fn prepare_file_record_from_path(
     path: &Path,
     config: &Config,
@@ -280,16 +346,13 @@ pub fn prepare_file_record_from_path(
     }
     let db_path = path_to_db_string(&canonical);
     let meta = std::fs::metadata(&canonical).ok()?;
-    prepare_file_record(&db_path, &meta, config, registry)
+    let mut scratch = Scratch::new(config);
+    prepare_file_record(&db_path, &meta, config, registry, &mut scratch)
 }
 
-/// Extract content for one file and record the outcome on its row: text on
-/// success, `NA` when no extractor applies or the `content_extensions`
-/// filter excludes it, `FAILED` with a reason on extractor errors. The single implementation behind the full text-index
-/// pass and incremental updates.
-///
-/// `mime` is authoritative, including when it is `None`: the head was already
-/// sniffed by [`prepare_file_record`], and re-sniffing gives the same answer.
+/// Extract content for one file and record the outcome on its row. `mime` is
+/// authoritative, including when it is `None`: the head was already sniffed
+/// by [`prepare_file_record`], and re-sniffing gives the same answer.
 pub fn extract_and_store(
     tx: &rusqlite::Transaction<'_>,
     file_id: i64,
@@ -298,7 +361,10 @@ pub fn extract_and_store(
     registry: &Registry,
     config: &Config,
 ) -> Result<(), String> {
-    let outcome = decide_content(path, mime, registry, config);
+    // One file, called from the watcher and the CLI: a scratch per call is
+    // the right scope — there is no loop for a reused one to amortize over.
+    let mut scratch = Scratch::new(config);
+    let outcome = decide_content(path, mime, registry, config, &mut scratch);
     let zstd = match outcome_body(&outcome) {
         Some(text) => repo::encode_one(text, config.processing.store_text_for_snippets)?,
         None => None,
@@ -311,20 +377,17 @@ pub fn extract_and_store(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentOutcome {
     /// Text, already truncated to `maximum_text_size`.
-    Done { text: String },
-    /// No extractor claims the MIME, or `content_extensions` excludes it.
+    Done {
+        text: String,
+    },
     NotApplicable,
-    /// The extractor ran and failed; the reason goes on the row.
     Failed(String),
 }
 
-/// Whether extraction will produce anything for this file: the
-/// `content_extensions` filter allows it, and some extractor claims its MIME.
-///
-/// The single predicate behind both the `content_state` a row is born with
-/// and [`decide_content`]'s not-applicable early-out: if they disagreed, a
-/// file the walk wrote off as NA would silently never be full-text indexed.
-/// Size-free — the `maximum_text_file_size` gate lives in the feeder's query.
+/// Whether extraction will produce anything for this file. The single
+/// predicate behind both the `content_state` a row is born with and
+/// [`decide_content`]'s early-out: if they disagreed, a file the walk wrote
+/// off as NA would silently never be full-text indexed.
 pub fn content_extractable(
     path: &Path,
     mime: Option<&str>,
@@ -334,47 +397,43 @@ pub fn content_extractable(
     crate::config::content_allowed(path, config) && mime.is_some_and(|m| registry.supports(m))
 }
 
-/// Read `path` and decide what its content row should say. No database access,
-/// no locks held — this is the expensive half.
+/// Read `path` and decide what its content row should say. No database
+/// access, no locks held — this is the expensive half.
 ///
-/// `mime` is authoritative, including when it is `None`: see
-/// [`extract_and_store`].
+/// `scratch` is the calling worker's, reused for every file it handles; the
+/// text is a fresh `String` because it goes on to cross a channel.
 pub fn decide_content(
     path: &str,
     mime: Option<&str>,
     registry: &Registry,
     config: &Config,
+    scratch: &mut Scratch,
 ) -> ContentOutcome {
     let p = Path::new(path);
     if !content_extractable(p, mime, config, registry) {
         return ContentOutcome::NotApplicable;
     }
-    // `content_extractable` established that an extractor claims this MIME,
-    // so the `Ok(None)` arm below is unreachable. A panicking parser is
-    // contained by the registry and arrives as `Err`, which becomes this
-    // row's recorded failure reason rather than a dead worker.
+    let mut text = String::new();
+    // A panicking parser is contained by the registry and arrives as `Err`,
+    // which becomes this row's recorded failure reason, not a dead worker.
     let result = match mime {
-        Some(m) => registry.extract(p, m),
-        None => Ok(None),
+        Some(m) => registry.extract(p, m, &mut text, scratch),
+        None => Ok(false),
     };
     match result {
-        Ok(Some(mut content)) => {
-            if content.text.len() > config.processing.maximum_text_size {
-                content.text =
-                    safe_truncate_string(&content.text, config.processing.maximum_text_size);
-            }
-            ContentOutcome::Done { text: content.text }
+        Ok(true) => {
+            // Extractors stop at the limit themselves; this is the backstop
+            // for the ones that can overshoot by a run or a slide.
+            safe_truncate(&mut text, config.processing.maximum_text_size);
+            ContentOutcome::Done { text }
         }
-        Ok(None) => ContentOutcome::NotApplicable,
+        Ok(false) => ContentOutcome::NotApplicable,
         Err(reason) => ContentOutcome::Failed(reason),
     }
 }
 
-/// Apply a decision from [`decide_content`]. The cheap half: pure database
-/// writes, so this is all that runs with the connection held.
-///
-/// `text_zstd` is the compressed body for a `Done` outcome, prepared by the
-/// caller before it took the lock — see [`repo::set_content_done`].
+/// Apply a decision from [`decide_content`] — the cheap half, all that runs
+/// with the connection held. `text_zstd`: see [`repo::set_content_done`].
 pub fn store_content_outcome(
     tx: &rusqlite::Transaction<'_>,
     file_id: i64,
@@ -388,8 +447,7 @@ pub fn store_content_outcome(
     }
 }
 
-/// The body a [`ContentOutcome`] would store, if any — what the caller feeds
-/// to its [`repo::DocEncoder`] ahead of the lock.
+/// The body a [`ContentOutcome`] would store, if any.
 pub fn outcome_body(outcome: &ContentOutcome) -> Option<&str> {
     match outcome {
         ContentOutcome::Done { text } => Some(text),

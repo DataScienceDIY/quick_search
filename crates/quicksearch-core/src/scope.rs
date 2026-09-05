@@ -1,35 +1,6 @@
-//! Bringing a stored index back in line with a changed configuration,
-//! without deleting it.
-//!
-//! The index is a cache of what a walk under the configured roots would
-//! produce. When the configuration changes, the two disagree — and almost
-//! always in a way that can be *reconciled* rather than rebuilt:
-//!
-//! * A root was removed. Its rows are a contiguous `files.path` range, so
-//!   they go in five statements ([`crate::db::repo::delete_subtree`]).
-//! * An ignore pattern was added, hidden files were switched off, symlinks
-//!   stopped being followed. The rows to drop are picked out by a predicate
-//!   no SQL range can express, so [`Scope::covers`] re-runs the walker's own
-//!   filtering rules against each stored path.
-//! * The content filter moved. The rows stay; only their extracted text
-//!   and FTS entry are re-decided.
-//!
-//! Only settings that make stored data unreadable or incomparable — the FTS
-//! tokenizer, the hash length, the encryption key — still force a wipe. See
-//! [`crate::config::diff_actions`], which decides which of these applies, and
-//! [`crate::config::IndexWork`], the plan it produces.
-//!
-//! The scan is per-root: [`advance`] walks each root's `[lo, hi)` range
-//! rather than the whole `files` table. With `follow_symlinks` on, a symlink
-//! target is stored under its own canonical path, possibly outside every
-//! root — such a row has no owning root and no filtering rules to apply, and
-//! scanning by range never visits it.
-//!
-//! The pass can be abandoned through the flag-plus-interrupt pair
-//! [`crate::db::InterruptSlot`] describes. That is safe because nothing here
-//! records anything: the *caller* stamps the stored configuration, only once
-//! the cursor reports finished, so an abandoned pass leaves the next run to
-//! derive the same plan again. See [`outstanding_work`].
+//! Brings a stored index back in line with a changed configuration without
+//! rebuilding it. Nothing here stamps the stored configuration — the caller
+//! does, and only once the cursor reports finished; see [`outstanding_work`].
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,15 +14,12 @@ use crate::extract::Registry;
 use crate::file_handling::{content_extractable, fts_finalize_after_text_indexing, ExtractCursor};
 use crate::indexing::ReconcileProgress;
 
-/// How long [`advance`] may work before handing control back — a bound on
-/// how long a Stop, a search or a further config edit waits behind a scan.
-///
-/// It bounds the wait *between* statements only; one statement can outlast
-/// the whole budget, which is why the pass also publishes its connection
-/// through [`crate::db::InterruptGuard`].
+/// How long [`advance`] may work before handing control back. This bounds
+/// only the wait *between* statements; one statement can outlast the budget,
+/// which is why the pass also publishes its connection via [`crate::db::InterruptGuard`].
 pub const SLICE: Duration = Duration::from_millis(250);
 
-/// One configured root, with the `files.path` range it owns precomputed.
+/// One configured root, with the `files.parent` range it owns precomputed.
 struct Root {
     path: PathBuf,
     lo: String,
@@ -90,24 +58,13 @@ impl Scope {
     }
 
     /// Whether the walker would still emit `path` while walking `root`.
-    ///
-    /// Mirrors `read_directory`'s three `continue`s. Full-path ignore
-    /// patterns are tested once against the whole path
-    /// ([`IgnoreSet::matches_path_pattern`] walks every ancestor); the hidden
-    /// and component-pattern rules per component *below* the root — a root
-    /// itself is never filtered.
+    /// Mirrors `read_directory`'s filtering; a root itself is never filtered.
     pub fn covers(&self, root: &Path, path: &Path) -> bool {
         self.covers_cached(root, path, &mut CoverCache::default())
     }
 
-    /// [`Scope::covers`], reusing the verdicts already reached for the
-    /// directories on the way down.
-    ///
-    /// On Unix the repeated ancestor tests are free string comparisons. On
-    /// Windows each component is a `symlink_metadata` — a `CreateFileW`
-    /// through the full filter-driver stack; a 3M-row index at depth 8 was
-    /// ~24M file opens. The cache collapses that to roughly one per
-    /// directory.
+    /// [`Scope::covers`], reusing verdicts for the directories on the way down —
+    /// on Windows this collapses per-ancestor `symlink_metadata` opens to ~one per directory.
     pub fn covers_cached(&self, root: &Path, path: &Path, cache: &mut CoverCache) -> bool {
         if self.ignore.matches_path_pattern(path) {
             return false;
@@ -119,13 +76,11 @@ impl Scope {
         let depth = relative.components().count();
         for (i, component) in relative.components().enumerate() {
             let std::path::Component::Normal(name) = component else {
-                // Stored paths are canonical, so stripping a canonical root
-                // leaves plain names. Anything else did not come from a walk.
+                // Stored paths are canonical; anything but a plain name did not come from a walk.
                 return false;
             };
             current.push(name);
-            // Leaves are asked once and never again; caching them grows the
-            // map one entry per row for no hits.
+            // Leaves are asked once and never again; caching them grows the map for no hits.
             let is_leaf = i + 1 == depth;
             if !is_leaf {
                 if let Some(allowed) = cache.get(&current) {
@@ -146,13 +101,8 @@ impl Scope {
         true
     }
 
-    /// Whether one path component passes the hidden and component-pattern
-    /// rules. `current` is its full path, which the attribute test needs.
     fn component_allowed(&self, current: &Path, name: &str) -> bool {
-        // The metadata closure is only consulted on Windows, where hidden is
-        // an attribute rather than a leading dot; on Unix this is zero
-        // syscalls. `symlink_metadata` because the component is judged as
-        // itself, never as what it points at — the walker does the same.
+        // `symlink_metadata`: judged as itself, never its target — the walker does the same.
         if !self.include_hidden
             && crate::platform::entry_is_hidden(name, || std::fs::symlink_metadata(current).ok())
         {
@@ -162,20 +112,15 @@ impl Scope {
     }
 }
 
-/// Directory verdicts already reached by [`Scope::covers_cached`].
-///
-/// Bounded: a multi-million-row scan would otherwise hold every directory
-/// under every root at once. Past the cap the map is cleared outright — rows
-/// arrive in roughly insertion order, so the entries that matter are the
-/// ones just added.
+/// Directory verdicts already reached by [`Scope::covers_cached`]. Past the
+/// cap the map is cleared outright — rows arrive in roughly insertion order,
+/// so the entries that matter are the ones just added.
 #[derive(Default)]
 pub struct CoverCache {
     dirs: std::collections::HashMap<PathBuf, bool>,
 }
 
 impl CoverCache {
-    /// Directories remembered before the map is cleared. Roughly 100 bytes per
-    /// entry, so this is a few megabytes at most.
     const CAP: usize = 20_000;
 
     fn get(&self, dir: &Path) -> Option<bool> {
@@ -191,37 +136,26 @@ impl CoverCache {
 }
 
 /// How far an in-progress [`advance`] has got; the caller hands back the
-/// same cursor each tick with a fresh deadline.
-///
-/// Resumable within one pass only: an abandoned cursor takes its position
-/// with it, and the next attempt restarts a freshly derived plan — every
-/// part of the pass is idempotent so that costs time and nothing else. A
-/// config edit arriving mid-pass has the same effect, which is why the
-/// counters can go backwards between two published snapshots.
+/// same cursor each tick with a fresh deadline. Resumable within one pass
+/// only: abandonment (or a mid-pass config edit) restarts a freshly derived
+/// plan — every part is idempotent — so counters can go backwards between snapshots.
 pub struct WorkCursor {
     work: IndexWork,
     scope: Scope,
-    /// Index into `work.drop_roots` of the next range to delete outright.
     drop_idx: usize,
-    /// Set once the out-of-root sweep has run; it is a single statement set,
-    /// so it either happened or it did not.
     dropped_aliases: bool,
-    /// Index into `scope.roots` of the range being scanned.
     root_idx: usize,
-    /// Last path served by the scan — the keyset cursor. Empty means "start
-    /// this root's range from its `lo` bound".
-    after: String,
-    /// Set once the FTS automerge that follows a batch of deletions has run.
+    /// Last `(parent, name)` served by the scan — the keyset cursor. An empty
+    /// parent means "start this root's range from its `lo` bound".
+    after: (String, String),
     finalized: bool,
-    /// Rows deleted so far, for the log line when the work completes.
+    /// Rows deleted so far.
     pub deleted: usize,
     /// Rows whose content state or stored text was re-decided.
     pub recontented: usize,
-    /// Rows the scan has re-tested against the current configuration.
     examined: usize,
-    /// Rows in the index, counted once when the scan first needs a page — a
-    /// denominator that moved would walk the display backwards. `None` until
-    /// then, and for a plan that reads no rows at all.
+    /// Row count taken once when the scan first needs a page — a denominator
+    /// that moved would walk the display backwards.
     total: Option<usize>,
 }
 
@@ -233,7 +167,7 @@ impl WorkCursor {
             drop_idx: 0,
             dropped_aliases: false,
             root_idx: 0,
-            after: String::new(),
+            after: (String::new(), String::new()),
             finalized: false,
             deleted: 0,
             recontented: 0,
@@ -246,7 +180,6 @@ impl WorkCursor {
         self.finalized
     }
 
-    /// A snapshot for the status the caller publishes.
     pub fn progress(&self) -> ReconcileProgress {
         ReconcileProgress {
             examined: self.examined,
@@ -261,27 +194,23 @@ impl WorkCursor {
         self.work.reindex
     }
 
-    /// The plan being applied, for a caller that has to restart against a
-    /// newer configuration and must not lose what this one had left to do.
+    /// The plan being applied — a restart against a newer config must not
+    /// lose what this one left to do.
     pub fn work(&self) -> &IndexWork {
         &self.work
     }
 
-    /// Drop the walk this reconciliation asked for, keeping the rest. For a
-    /// caller that has since been told not to run anything.
+    /// Drop the walk this reconciliation asked for, keeping the rest.
     pub fn cancel_reindex(&mut self) {
         self.work.reindex = false;
     }
 }
 
 /// Apply as much of `cursor` as fits before `deadline`, one page of rows per
-/// transaction. Returns with the cursor advanced; call again until
-/// [`WorkCursor::done`].
-///
-/// `cancel` means "do not start another statement" — the statement already
-/// running answers to [`crate::db::interrupt`] and nothing else. A cancelled
-/// pass leaves the work owed: the stored configuration is stamped only by a
-/// caller that saw the cursor finish.
+/// transaction; call again until [`WorkCursor::done`]. `cancel` means "do
+/// not start another statement" — the statement already running answers to
+/// [`crate::db::interrupt`] and nothing else. A cancelled pass leaves the
+/// work owed until a caller sees the cursor finish.
 pub fn advance(
     conn: &mut Connection,
     config: &Config,
@@ -290,7 +219,6 @@ pub fn advance(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    // Whole ranges first: deleting by range spares the scan the work.
     while cursor.drop_idx < cursor.work.drop_roots.len() {
         if cancelled(cancel) {
             return Ok(());
@@ -313,8 +241,8 @@ pub fn advance(
         return Ok(());
     }
 
-    // Before the per-root scan and after the root deletions: the ranges it
-    // spares must already be the final set of roots.
+    // After the root deletions and before the scan: the ranges spared here
+    // must already be the final set of roots.
     if !cursor.dropped_aliases && cursor.work.drop_aliases {
         let ranges: Vec<(String, String)> = cursor
             .scope
@@ -336,8 +264,6 @@ pub fn advance(
     }
 
     if cursor.work.scans_rows() {
-        // One count, the first time a page is actually needed; without it
-        // the display has no denominator at all.
         if cursor.total.is_none() {
             if cancelled(cancel) {
                 return Ok(());
@@ -345,23 +271,24 @@ pub fn advance(
             cursor.total = Some(repo::row_count(conn)?);
         }
         let page = config.processing.batch_size.max(1) as i64;
-        // Lives across pages: consecutive pages walk the same directories.
         let mut covered = CoverCache::default();
         while cursor.root_idx < cursor.scope.roots.len() {
             if cancelled(cancel) {
                 return Ok(());
             }
             let root = &cursor.scope.roots[cursor.root_idx];
-            if cursor.after.is_empty() {
-                cursor.after = root.lo.clone();
+            if cursor.after.0.is_empty() {
+                // `(lo, "")` sorts below every row in the range — no stored name is empty.
+                cursor.after = (root.lo.clone(), String::new());
             }
-            let rows = repo::rows_in_range_page(conn, &cursor.after, &root.hi, page)?;
+            let rows =
+                repo::rows_in_range_page(conn, &cursor.after.0, &cursor.after.1, &root.hi, page)?;
             let Some(last) = rows.last() else {
                 cursor.root_idx += 1;
-                cursor.after.clear();
+                cursor.after = (String::new(), String::new());
                 continue;
             };
-            cursor.after = last.path.clone();
+            cursor.after = (last.parent.clone(), last.name.clone());
             cursor.examined += rows.len();
             let root = cursor.scope.roots[cursor.root_idx].path.clone();
             let (deleted, recontented) = apply_page(
@@ -382,8 +309,8 @@ pub fn advance(
         }
     }
 
-    // Deletions leave FTS tombstones; the automerge collapses them. Skipping
-    // it costs only tidiness — the next run's automerge does the same.
+    // Deletions leave FTS tombstones; a merge collapses them. Skipping it
+    // costs only tidiness — the next run's merge does the same.
     if cancelled(cancel) {
         return Ok(());
     }
@@ -425,9 +352,8 @@ fn apply_page(
             stale_text.push(row.id);
         }
         if work.reconcile_content || work.restore_text {
-            // The walker's own decision, recomputed. Both directions run
-            // whenever either flag is set: a row that disagrees with the
-            // current config is wrong however it got that way.
+            // The walker's decision, recomputed. Both directions run whenever
+            // either flag is set: a disagreeing row is wrong however it got that way.
             let wants = row.size <= config.processing.maximum_text_file_size
                 && content_extractable(path, row.mime.as_deref(), config, registry);
             if !wants && row.content_state != repo::STATE_NA {
@@ -465,8 +391,7 @@ fn apply_page(
 }
 
 /// The configuration the index was last built with, as far as
-/// `config_validation` records it: `config` with the recorded fields
-/// substituted back in. Fields the table does not record keep `config`'s own
+/// `config_validation` records it. Unrecorded fields keep `config`'s own
 /// values, so they never read as changed.
 pub fn stored_config(conn: &Connection, config: &Config) -> Result<Config, String> {
     let mut stored = config.clone();
@@ -490,24 +415,20 @@ pub fn stored_config(conn: &Connection, config: &Config) -> Result<Config, Strin
             }
             "hash_length" => match value.parse() {
                 Ok(n) => stored.processing.hash_length = n,
-                // Keeping the caller's value makes the diff describe a config
-                // the index was not built under; don't let it pass in silence.
                 Err(e) => crate::log_warn!("stored hash_length {:?} unreadable: {}", value, e),
             },
             "tokenize" => stored.processing.tokenize = value,
-            // An unrecognized key is a record from a newer build; ignore it.
+            // A record from a newer build; ignore it.
             _ => {}
         }
     }
     Ok(stored)
 }
 
-/// The reconciliation the index still owes `config`, derived from its own
-/// record of what it was last brought into line with.
-///
-/// Empty is the normal answer; non-empty means a pass was abandoned or the
-/// config was edited while the app was closed. Roots are canonicalized first
-/// — that is the spelling the record holds.
+/// The reconciliation the index still owes `config`. Empty is the normal
+/// answer; non-empty means a pass was abandoned or the config was edited
+/// while the app was closed. Roots are canonicalized first — that is the
+/// spelling the record holds.
 pub fn outstanding_work(db_path: &str, config: &Config) -> Result<IndexWork, String> {
     let conn = crate::db::open_existing(db_path, false)?;
     let mut current = config.clone();

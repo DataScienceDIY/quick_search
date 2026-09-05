@@ -4,6 +4,10 @@
 //! shell waiting for the process all behave normally. `src/cli.rs` and
 //! `src/format.rs` are compiled into both binaries.
 
+// Per-binary, like the GUI's; see `platform::Allocator`.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
 mod cli;
 #[allow(dead_code)]
 mod format;

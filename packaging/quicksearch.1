@@ -7,6 +7,8 @@ quicksearch, quicksearch\-cli \- fast full\-text search across your files
 .SH SYNOPSIS
 .B quicksearch
 .br
+.B quicksearch \-\-toggle
+.br
 .B quicksearch
 .RI [ FLAGS ]
 .IR "query terms" ...
@@ -41,6 +43,24 @@ and a console tool built as a GUI application cannot write back to the shell
 that invoked it. Given no query it prints usage and exits 2 rather than falling
 back to the application.
 .SH OPTIONS
+.TP
+.B \-\-toggle
+Bring a running QuickSearch to the front with the search box focused, or start
+it if none is running. Intended as the target of a key binding made in the
+desktop's own keyboard settings.
+.IP
+QuickSearch also claims a shortcut of its own while it is running
+.RI ( Ctrl+Shift+F
+by default, rebindable to any combination on the Settings tab), which needs no
+setting up. That one cannot fire while QuickSearch is not running, because
+nothing a program registers for itself can; this option is what a desktop
+binding runs so that a key can start it as well.
+.IP
+The activation reaches the running instance over a unix socket in
+.IR $XDG_RUNTIME_DIR ,
+named after the configuration file; when nothing answers, this process becomes
+the application. On Wayland an already\-open window cannot be raised by another
+process, so it is highlighted in the task bar instead of coming to the front.
 .TP
 .B \-\-fuzzy
 Also run the fuzzy filename and full\-text passes, which tolerate spelling
@@ -166,6 +186,18 @@ for the annotated reference.
 The index. The location is set by
 .I [paths].database_path
 in the configuration.
+.TP
+.IR $XDG_RUNTIME_DIR /quicksearch\- <key> .sock
+The socket
+.B \-\-toggle
+connects to, where
+.I <key>
+is a hash of the configuration file's path \(em not the index's, which is a
+setting that can change while running. Present only while the application is
+running; a leftover one is inert and is replaced at the next start. Falls back
+to a private directory under the temporary directory when
+.I XDG_RUNTIME_DIR
+is unset.
 .TP
 .I ./config.toml
 A configuration file placed next to the

@@ -1,33 +1,23 @@
-//! Plain-language tooltips for the configuration controls: every setting in
-//! the Settings tab, and every configuration control on the Manage Index
-//! tab, explains itself on hover.
+//! Plain-language tooltips: every configuration control explains itself on hover.
 
-/// How wide a tooltip may get; matches `manage_tab::db_size_tooltip`.
 const TIP_WIDTH: f32 = 420.0;
 
-/// One control's tooltip.
 pub struct Tip {
-    /// The setting's name, in bold at the top.
     pub title: &'static str,
-    /// The explanation. One or more paragraphs separated by `"\n\n"`.
     pub body: &'static str,
     /// Concrete values and when to choose them, rendered small underneath.
-    /// Empty where a setting has nothing to weigh up.
     pub examples: &'static [&'static str],
-    /// A consequence worth seeing before the click, rendered small and
-    /// orange. Reserved for rebuilds and deletions.
+    /// Rendered small and orange; reserved for rebuilds and deletions.
     pub caution: Option<&'static str>,
 }
 
 impl Tip {
-    /// Render into a hover popup.
     pub fn show(&self, ui: &mut egui::Ui) {
         ui.set_max_width(TIP_WIDTH);
         ui.strong(self.title);
         ui.label(self.body);
         if !self.examples.is_empty() {
             ui.add_space(4.0);
-            // One example reads as a sentence; several read as a list.
             let single = self.examples.len() == 1;
             for example in self.examples {
                 let line = if single {
@@ -46,10 +36,9 @@ impl Tip {
     }
 }
 
-/// Attach a [`Tip`] to any widget.
 pub trait Tipped {
-    /// Show `tip` on hover, whether or not the widget is enabled: a greyed
-    /// out button is exactly when someone wants to know what it would do.
+    /// Shown even while disabled: a greyed-out button is exactly when
+    /// someone wants to know what it would do.
     fn tip(self, tip: &'static Tip) -> Self;
 }
 
@@ -60,11 +49,10 @@ impl Tipped for egui::Response {
     }
 }
 
-/// One row of a two-column settings grid: the label and the control share a
-/// tooltip, so hovering the name works as well as hovering the widget.
+/// One grid row; the label and the control share the tooltip.
 pub fn tip_row(
     ui: &mut egui::Ui,
-    label: &str,
+    label: impl Into<egui::WidgetText>,
     tip: &'static Tip,
     widget: impl FnOnce(&mut egui::Ui) -> egui::Response,
 ) {
@@ -72,6 +60,26 @@ pub fn tip_row(
     widget(ui).tip(tip);
     ui.end_row();
 }
+
+// --- Settings: the advanced toggle ----------------------------------------
+
+pub static SHOW_ADVANCED: Tip = Tip {
+    title: "Show advanced settings",
+    body: "Reveals the rest of the Settings tab: where the index file lives, \
+           how text is broken into searchable pieces, how much of a file is \
+           read, how much memory searching may use, and similar.\n\n\
+           They are hidden by default because their defaults are right for \
+           almost every installation, and because a wrong value can make \
+           indexing slower, searching worse, or a rebuild necessary. Nothing \
+           is lost by leaving this off — every setting behind it keeps working \
+           at its default.",
+    examples: &[
+        "on when you want the index kept on a different drive, or are tuning \
+         a very large collection.",
+        "off for everyday use.",
+    ],
+    caution: None,
+};
 
 // --- Settings: Paths ------------------------------------------------------
 
@@ -227,13 +235,15 @@ pub static MAX_WAL_SIZE: Tip = Tip {
     body: "While indexing, changes are written to a companion file beside \
            the index and folded in afterwards. That normally happens by \
            itself, but during a long run with searches going on at the same \
-           time the companion file keeps growing, sometimes past the size of \
-           the index. This is the point at which QuickSearch pauses and folds \
-           it in regardless.\n\n\
-           Another speed setting; the default suits most machines.",
+           time the companion file keeps growing, often past the size of the \
+           index itself: it records every version of every page the run \
+           touches, where the index keeps only the last. This is the point at \
+           which QuickSearch pauses and folds it in regardless.\n\n\
+           Folding in less often makes indexing faster and makes searching \
+           during it slower.",
     examples: &[
-        "536870912, 512 MB, is the default.",
-        "67108864, 64 MB, when disk space is tight.",
+        "2147483648, 2 GB, is the default.",
+        "67108864, 64 MB, to favour searching while indexing runs.",
         "0 to never force it and let the database decide. Any other value below 16 MB \
          is treated as 16 MB.",
     ],
@@ -299,6 +309,28 @@ pub static DISPLAY_LIMIT: Tip = Tip {
          type:Image, and want them all at once.",
     ],
     caution: None,
+};
+
+pub static SEARCH_CACHE: Tip = Tip {
+    title: "Search cache",
+    body: "The size of the memory-backed cache for the Indexing database.\n\n\
+           When set to 0, QuickSearch automatically sizes it for your index, capped at 128 MiB. \
+           The recommended value is shown below the setting. It matters most on an \
+           encrypted index, which has to decrypt anything the cache does not \
+           already hold. If this is smaller than the recommended value it will \
+           make search results four times slower.\n\n\
+           An unencrypted index doesn't need much cache so we give it \
+           a small amount which doesn't change with index size.",
+    examples: &[
+        "0 sizes it automatically, and is right unless your folders are \
+         nested unusually deep.",
+        "a fixed value when you would rather cap what QuickSearch keeps \
+         resident, at the cost of slower searching on a large index.",
+    ],
+    caution: Some(
+        "This memory is held for as long as the search stays open, and \
+         released after a long idle.",
+    ),
 };
 
 pub static RESULTS_PER_PAGE: Tip = Tip {
@@ -389,16 +421,15 @@ pub static SEARCH_HOTKEY: Tip = Tip {
            start typing.\n\n\
            Click the button and press the keys you want. Combine Ctrl, Alt \
            and Shift with one other key. Clear switches the shortcut off.\n\n\
-           On Wayland the shortcut is registered with your desktop rather \
-           than claimed directly, so your desktop may assign a different key \
-           or ask you to confirm it, and its own keyboard settings are where \
-           to change it afterwards. Wayland also does not let any application \
-           put itself in front of what you are doing, so there the shortcut \
-           selects the Search tab and the search box, but bringing the window \
-           forward is up to your desktop.",
+           This works whenever QuickSearch is running and needs no setting \
+           up, but it cannot start QuickSearch. For a shortcut that opens it \
+           too, bind the command shown below in your desktop's own keyboard \
+           settings.\n\n\
+           On Wayland your desktop registers the shortcut, so it may pick a \
+           different key and owns it afterwards, and it decides whether the \
+           window comes forward.",
     examples: &[
-        "Ctrl+Shift+F, the default, which few other programs use.",
-        "Ctrl+Alt+Space if something else on your system already answers to it.",
+        "Ctrl+Shift+F, the default, which few other programs use."
     ],
     caution: None,
 };
@@ -535,18 +566,22 @@ pub static ADD_ROOT: Tip = Tip {
     body: "Adds a folder for QuickSearch to index, along with everything \
            inside it. Choose it with the browser, or type the path and press \
            Add.\n\n\
+           Adding a folder does not replace the current index, it adds to it: \
+           an indexing pass picks up the new folder and the rest of the index \
+           is left alone. Nothing is rebuilt.\n\n\
            Indexed folders may not overlap, so a folder already inside \
-           another one is refused. Adding a folder starts an indexing pass to \
-           pick it up and leaves the rest of the index alone.",
+           another one is refused.",
     examples: &["a second drive, or a network share you search often."],
     caution: None,
 };
 
 pub static REMOVE_ROOT: Tip = Tip {
     title: "Remove this folder",
-    body: "Stops indexing this folder and removes its entries from the \
-           index. The rest of the index is left alone, and the files \
-           themselves are not touched.\n\n\
+    body: "Stops indexing the folder named on this line, and removes that \
+           folder's entries from the index.\n\n\
+           Removing a folder does not affect the whole index, only its own \
+           entries; everything else stays searchable and nothing is rebuilt. \
+           Your files themselves are never touched.\n\n\
            Takes effect when you click Apply & Save.",
     examples: &[],
     caution: None,
@@ -586,18 +621,20 @@ pub static ROOT_COUNTS: Tip = Tip {
 
 pub static EXT_WHITELIST: Tip = Tip {
     title: "Full-text extensions whitelist",
-    body: "Which kinds of file QuickSearch reads the text out of, one \
-           extension per line, the leading dot optional. Empty means every \
-           kind it understands.\n\n\
-           Every file is still indexed by name whatever you put here. A list \
-           also leaves out files with no extension at all, such as Makefile \
-           or README, unless you add the line (none). Anything after a # is a \
-           comment, so a file type can be switched off without losing the \
-           line.\n\n\
+    body: "Which kinds of file QuickSearch is allowed to read the text out \
+           of. It limits contents only: every file is still indexed and still \
+           found by its name and its path, whatever you put here. A file left \
+           off the list simply cannot be found by the words inside it.\n\n\
+           Empty, the default, means every kind QuickSearch understands. To \
+           narrow it, enter one extension per line, the leading dot optional. \
+           A non-empty list also leaves out files with no extension at all, \
+           such as Makefile or README, unless you add the line (none). \
+           Anything after a # is a comment.\n\n\
            Narrowing the list discards the text it now excludes; widening it \
            reads those files again.",
     examples: &[
-        "txt, md and pdf to keep the index small and focused on documents.",
+        "txt, md and pdf to keep the stored text small and focused on documents, \
+         with everything else still findable by name.",
         "empty to search inside everything QuickSearch can read.",
     ],
     caution: None,
@@ -605,19 +642,21 @@ pub static EXT_WHITELIST: Tip = Tip {
 
 pub static IGNORE_PATTERNS: Tip = Tip {
     title: "Ignore patterns",
-    body: "Files and folders left out of the index entirely, by name and by \
-           content alike. Type one pattern and click Add.\n\n\
-           A pattern without a slash matches a file or folder name anywhere, \
-           and must match the whole name: .jpg matches only something called \
-           exactly that, while *.jpg matches every JPEG. A pattern with a \
-           slash in it is matched against the whole path, and skips \
-           everything underneath. * stands for any run of characters and ? \
-           for a single one.\n\n\
-           Adding a pattern removes the entries it matches; removing one \
-           indexes them again.",
+    body: "Whole files and folders kept out of the index. A pattern is \
+           compared against names and paths, never against what is inside a \
+           file: nothing is excluded for the words it holds, and a file \
+           excluded here loses its text along with its name. Type one pattern \
+           and click Add.\n\n\
+           A pattern with no slash matches a file or folder name anywhere \
+           under your indexed folders, and must match that name in full. A \
+           pattern with a slash is matched against the whole path, and skips \
+           everything under it. * is any run of characters, ? exactly one.\n\n\
+           Adding a pattern removes the entries it matches; deleting a \
+           pattern from this list indexes those files again. Worked examples \
+           are on the Help tab.",
     examples: &[
         "node_modules to skip that folder wherever it turns up.",
-        "*.tmp to skip temporary files by extension.",
+        "*.log to skip every file ending in .log, whatever it is called.",
         "a full path such as the Videos folder to skip it and everything inside it.",
     ],
     caution: None,
@@ -642,8 +681,7 @@ pub static APPLY_SAVE: Tip = Tip {
 mod tests {
     use super::*;
 
-    /// Every tip in the file. A tip missing from here is only missing from
-    /// the checks below, so keep it in step when adding one.
+    /// Keep in step when adding a tip: one missing here skips the checks below.
     const ALL: &[&Tip] = &[
         &DATABASE_PATH,
         &REINDEX_INTERVAL,
@@ -682,7 +720,6 @@ mod tests {
         &APPLY_SAVE,
     ];
 
-    /// Everything a tip can put on screen, as one string.
     fn all_text(tip: &Tip) -> String {
         let mut text = format!("{}\n{}", tip.title, tip.body);
         for example in tip.examples {
@@ -696,7 +733,6 @@ mod tests {
         text
     }
 
-    /// House style: these tooltips use no em-dashes.
     #[test]
     fn no_tip_uses_an_em_dash() {
         for tip in ALL {
@@ -727,9 +763,8 @@ mod tests {
                 "{}: body is not a finished sentence",
                 tip.title
             );
-            // "Stops the run in progress" under the title "Stop" is fine;
-            // "Stop. Stops the run" is the restatement worth catching, so
-            // the title only counts as repeated when a word ends there.
+            // "Stop. Stops the run" is the restatement worth catching; the
+            // title only counts as repeated when a word ends there.
             let restates = tip
                 .body
                 .strip_prefix(tip.title)
@@ -753,7 +788,6 @@ mod tests {
         }
     }
 
-    /// A tooltip nobody reads to the end helps nobody.
     #[test]
     fn no_tip_is_a_wall_of_text() {
         for tip in ALL {
@@ -762,8 +796,6 @@ mod tests {
         }
     }
 
-    /// Two controls sharing a title means one of them was pasted from the
-    /// other and never renamed.
     #[test]
     fn titles_are_distinct() {
         let mut seen: Vec<&str> = ALL.iter().map(|t| t.title).collect();
@@ -773,8 +805,6 @@ mod tests {
         assert_eq!(count, seen.len(), "two tips share a title: {:?}", seen);
     }
 
-    /// The renderer puts every part on screen: title, body, examples and
-    /// caution. Written against the tip with all four.
     #[test]
     fn show_paints_every_part() {
         let ctx = crate::test_ui::ctx();
@@ -792,7 +822,6 @@ mod tests {
         );
     }
 
-    /// A lone example reads as a sentence rather than a one-item list.
     #[test]
     fn a_single_example_is_prefixed_with_example() {
         let ctx = crate::test_ui::ctx();
@@ -807,8 +836,8 @@ mod tests {
         );
     }
 
-    /// A greyed-out control still explains itself: egui shows nothing on a
-    /// disabled widget unless the *disabled* tooltip is set too.
+    /// egui shows nothing on a disabled widget unless the *disabled*
+    /// tooltip is set too.
     #[test]
     fn a_disabled_control_still_explains_itself() {
         let ctx = crate::test_ui::ctx();

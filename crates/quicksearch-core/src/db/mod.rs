@@ -1,10 +1,6 @@
 //! SQLite schema, on-disk open/recreate, and row-level repository helpers.
-//!
-//! Policy: the indexer (owner) opens via [`open::open_or_recreate`], which on
-//! any schema mismatch wipes the DB and rebuilds from
-//! [`schema::SCHEMA_CURRENT`]; there are no in-place migrations. *Consumers*
-//! (search, status, size, `clear`) use [`open::open_existing`], which never
-//! creates or wipes — a mismatch is an error, not data loss.
+//! The indexer (owner) opens via [`open::open_or_recreate`], which wipes on
+//! mismatch; *consumers* use [`open::open_existing`], which never wipes.
 
 use std::sync::Mutex;
 
@@ -15,10 +11,13 @@ pub mod open;
 pub mod repo;
 pub mod schema;
 
-pub use key::{process_key_hex, set_process_key};
+pub use key::{
+    process_key_hex, set_hmac_mode_override, set_page_size_override, set_process_key,
+    set_search_cache_override,
+};
 pub use open::{
-    index_needs_rebuild, open_existing, open_or_recreate, verify_process_key,
-    CURRENT_SCHEMA_VERSION, KEY_MISMATCH_PREFIX,
+    index_needs_rebuild, key_mismatch_parts, open_existing, open_or_recreate, verify_process_key,
+    KeyMismatch, CURRENT_SCHEMA_VERSION, FOREIGN_DB_PREFIX, KEY_MISMATCH_PREFIX,
 };
 
 /// Bumped whenever the index file is replaced rather than modified — a
@@ -66,7 +65,6 @@ impl Drop for InterruptGuard<'_> {
 }
 
 /// Interrupt the statement `slot` holds a handle for, if there is one.
-/// A no-op otherwise, and on a connection that has since closed.
 pub fn interrupt(slot: &InterruptSlot) {
     if let Some(handle) = crate::lock_ok(slot).as_ref() {
         handle.interrupt();

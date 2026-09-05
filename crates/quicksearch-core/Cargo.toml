@@ -11,6 +11,16 @@ description = "Indexing, storage and search engine behind QuickSearch."
 name = "quicksearch_core"
 path = "src/lib.rs"
 
+# Off by default and never enabled by a shipped build. `probe` turns on the
+# indexing run's structure census (`indexing::pipeline`), which attributes
+# peak memory to a *structure*; `smaps` can only attribute it to a mapping,
+# and every one of these lives in the same anonymous heap. Built for the
+# `memprobe` example, which reads the census off stderr.
+[features]
+probe = []
+
+# Several dependencies below are named directly despite already being in the
+# lockfile transitively ("transitive already"): they compile nothing new.
 [dependencies]
 # `bundled-sqlcipher-vendored-openssl` compiles the SQLCipher amalgamation
 # (a superset of the stock SQLite `bundled` build — FTS5 etc. included) and
@@ -18,6 +28,21 @@ path = "src/lib.rs"
 # no runtime library dependencies. With no `PRAGMA key` applied, SQLCipher
 # behaves identically to stock SQLite, so unencrypted indexes are unaffected.
 rusqlite = { version = "0.39", features = ["bundled-sqlcipher-vendored-openssl"] }
+# The allocator every binary here installs; see `platform::Allocator`.
+#
+# glibc gives each thread a 64 MiB arena and never shrinks one below its
+# high-water mark, so a multi-million-file run settled at 985 MB RSS with
+# 871 MB of anonymous slack that `malloc_trim` could not coalesce.
+# `glibc.malloc.arena_max=2` cut that to 146 MB but made indexing dramatically
+# slower, because two arenas serialise every worker's allocations. mimalloc
+# has no such trade: per-thread heaps with no lock on the fast path, and freed
+# segments are decommitted rather than parked.
+#
+# `mimalloc` supplies the `GlobalAlloc` type; `libmimalloc-sys` is what links
+# the C library `platform::release_free_heap` calls `mi_collect` from. Both
+# compile C, which this build already needs for SQLCipher and OpenSSL.
+mimalloc = "0.1"
+libmimalloc-sys = "0.1"
 argon2 = { version = "0.5", features = ["zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"
@@ -28,31 +53,28 @@ walkdir = "2.5.0"
 # containers (docx/xlsx/pptx/odt/ods/odp), whose entries are always deflate or
 # stored, so zstd/bzip2/aes-crypto are all dead weight here.
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
-quick-xml = "0.31"
+quick-xml = "0.41"
 # OLE2 compound-file reader, for the pre-2007 binary Office formats
-# (.doc/.xls/.ppt) whose text lives in named streams rather than a zip. Already
-# in the lockfile transitively via infer, so naming it directly compiles
-# nothing new.
+# (.doc/.xls/.ppt) whose text lives in named streams, not a zip. Transitive
+# already (infer).
 cfb = "0.7"
 serde = { version = "1.0", features = ["derive"] }
-# 1.x, not 0.8: 0.8 pulls `toml_edit`, the whole format-preserving document
-# model, for what is only `from_str` and `to_string_pretty` here. 1.x parses and
-# writes as a stream instead - no `toml_edit`, no `winnow` 0.5 alongside the 1.0
-# already in the tree - which is 252 KB of `.text` this crate was paying for a
-# document API it never touches.
+# 1.x, not 0.8: 0.8 pulls `toml_edit` + a second `winnow` (~252 KB of `.text`)
+# for a format-preserving document API this crate never touches.
 toml = "1"
 mime_guess = "2.0"
 infer = "0.15"
 # Charset decoding for non-UTF-8 text (UTF-16 .reg exports, legacy
-# single-byte and CJK encodings). Already in the lockfile transitively via
-# pdf-extract, so naming it directly compiles nothing new.
+# single-byte and CJK encodings). Transitive already (pdf-extract).
 encoding_rs = "0.8"
 # Statistical charset detection (Firefox's detector) for text that is neither
 # UTF-8 nor BOM-marked. Its mandatory deps beyond encoding_rs are tiny
 # (cfg-if, memchr, detone).
 chardetng = "1.0"
-# RTF text extraction. Pure Rust; with the default `jsbindings` feature off
-# (it exists for the crate's WASM build) it depends only on serde.
+# RTF text extraction. Resolves to `vendor/rtf-parser` via the workspace
+# `[patch.crates-io]` (see there for why). 0.4 is what the patch is against;
+# `default-features = false` is redundant against the vendored copy but keeps
+# a registry fallback from pulling wasm-bindgen.
 rtf-parser = { version = "0.4", default-features = false }
 # `lopdf` is deliberately NOT declared here. `pdf-extract` re-exports it
 # (`pub use lopdf::*`), and `extract/pdf.rs` reaches it that way. Naming it
@@ -61,57 +83,88 @@ rtf-parser = { version = "0.4", default-features = false }
 # global thread pool is never torn down), chrono, time, md5 and a second nom.
 pdf-extract = "0.12"
 lofty = "0.19"
-# Parked with `extract::image` — see `extract::ExtractedContent`.
-# kamadak-exif = "0.5"
 notify = "6.1"
 ctrlc = "3.4"
 zstd = "0.13"
 globset = "0.4"
 regex = "1"
-# SIMD substring search for the full-text passes. `str::match_indices` uses
-# std's Two-Way searcher, which has no vector prefilter: measured against a
-# 256 KiB body (`benches/search.rs`, group `substring`) it runs 111 µs where
-# `memmem` runs 2.4 µs, and the full-text passes scan a body per candidate
-# row. Already in the lockfile transitively (regex, globset, chardetng), so
-# naming it directly compiles nothing new.
+# Required-literal extraction for the `regex:` prefilter: the same analysis the
+# regex engine does to pick its own prefilter, reused to narrow which rows the
+# regex passes ever see. Transitive already (regex).
+regex-syntax = "0.8"
+# SIMD substring search for the full-text passes: std's Two-Way searcher has
+# no vector prefilter and measured ~45x slower (`benches/search.rs`,
+# `substring`). Transitive already (regex, globset, chardetng).
 memchr = "2"
 
 # `nice()`, for dropping indexing threads to background scheduling priority.
-# Linux schedules per task, so it affects only the calling thread. Already in
-# the lockfile transitively (rusqlite, getrandom), so naming it directly
-# compiles nothing new.
+# Linux schedules per task, so it affects only the calling thread. Transitive
+# already (rusqlite, getrandom).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# `GetDriveTypeW` (a mapped drive letter is the only way to spot an SMB share
-# that isn't written as UNC) plus the FILE_ATTRIBUTE_* constants, which
-# `platform.rs` spells out for itself so its tests run on Linux and then
-# const-asserts against this crate on Windows builds.
-# Pinned to 0.52 deliberately: walkdir → winapi-util already
-# resolves exactly that version, so this adds no new crate compilations.
+# `GetDriveTypeW`, thread priorities, and the FILE_ATTRIBUTE_* constants
+# `platform.rs` spells out for itself (so its tests run on Linux) and
+# const-asserts against on Windows builds. Pinned to 0.52: walkdir →
+# winapi-util already resolves exactly that version.
 [target.'cfg(windows)'.dependencies]
-# GetDriveTypeW and the FILE_ATTRIBUTE_* constants live in
-# Win32_Storage_FileSystem; DRIVE_REMOTE, oddly, is filed under
-# Win32_System_WindowsProgramming. Win32_System_Threading carries
-# SetThreadPriority and THREAD_MODE_BACKGROUND_BEGIN, and both it and
-# GetCurrentThread need Win32_Foundation for HANDLE/BOOL.
+# DRIVE_REMOTE is, oddly, in Win32_System_WindowsProgramming;
+# Win32_System_Threading carries SetThreadPriority and needs Win32_Foundation
+# for HANDLE/BOOL.
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     # SECURITY_ATTRIBUTES, which `CreateFileW`'s signature names even though
     # the directory-count path passes null for it.
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    # OVERLAPPED, which `LockFileEx` takes for the index's instance lock.
+    # `LockFileEx` and `GetDiskFreeSpaceExW` themselves are in
+    # Win32_Storage_FileSystem above.
+    "Win32_System_IO",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }
 
-# Microbenchmark harness for `benches/`. Criterion is the more common choice
-# and was rejected: it pulls rayon (a global thread pool that never tears
-# down, the same reason `lopdf` is not named directly above) plus plotters and
-# clap, some forty crates. Divan's mandatory set is a handful and it spawns no
-# threads of its own.
+# Microbenchmark harness for `benches/`. Criterion was rejected: it pulls
+# rayon (a never-torn-down global thread pool) plus plotters and clap, some
+# forty crates. Divan's set is a handful and it spawns no threads of its own.
 [dev-dependencies]
 divan = "0.1"
+
+# Writers for `tests/extraction_corpus.rs`, each deliberately a *different
+# implementation* from the reader it feeds — a fixture built with the reader's
+# own library proves only self-agreement. (`src/extract/` unit tests use the
+# readers' libraries on purpose: they target malformed input.) `.doc`/`.xls`/
+# `.ppt` are committed LibreOffice fixtures instead — nothing in Rust writes
+# OLE2 but `cfb`, the reader. See `tests/fixtures/legacy/`.
+#
+# docx: writes its own OOXML over `zip` 8.x (our reader uses 0.6). The default
+# `image` feature would pull the whole `image` crate for nothing.
+docx-rs = { version = "0.4", default-features = false }
+# xlsx: builds a real shared-string table, which is the path `extract_xlsx`
+# actually cares about.
+rust_xlsxwriter = { version = "0.98", default-features = false }
+# pdf: typst's low-level writer. No `lopdf` anywhere in its tree, which is what
+# makes it independent of `pdf-extract`.
+pdf-writer = "0.15"
+# audio tags: `id3` writes the ID3v2 frames `lofty` reads back, `metaflac`
+# the Vorbis comment block. The FLAC stream is a committed fixture — `lofty`
+# derives stream properties from a real CRC-checked frame; see
+# `tests/corpus/audio.rs`.
+id3 = "1"
+metaflac = "0.2"
+# CRC32 for the hand-rolled stored-entry zip that builds the pptx and ODF
+# containers. Transitive already (zip).
+crc32fast = "1"
+
+# Declared only to turn its test harness on: examples are otherwise
+# auto-discovered, and this one carries unit tests for the collision
+# arithmetic it reports. `cargo test -p quicksearch-core --example hashprobe`
+# runs them.
+[[example]]
+name = "hashprobe"
+path = "examples/hashprobe.rs"
+test = true
 
 # `harness = false` on both: divan supplies its own `main` via `divan::main()`,
 # so libtest must not also link one in.
@@ -121,4 +174,38 @@ harness = false
 
 [[bench]]
 name = "index"
+harness = false
+
+# Plain-main measurement probes, env-gated (QSB_SEARCH_PERF / QSB_SEARCH_ALLOC
+# / QSB_INDEX_ALLOC) so a bare `cargo bench` doesn't pay their seed cost.
+# snippet_perf, which compared the pre-schema-v3 FTS shape against v3, is
+# gone: the question is decided (v3 won on every axis) — don't re-measure it.
+[[bench]]
+name = "search_perf"
+harness = false
+
+[[bench]]
+name = "search_alloc"
+harness = false
+
+# Per-file allocator traffic through the walk and the extractors. Compiles
+# `tests/corpus/` for its fixtures, so it needs the dev-dependency writers.
+[[bench]]
+name = "index_alloc"
+harness = false
+
+# QSB_PGSZ: the speed half of the page-geometry question that
+# `tests/encrypted_perf.rs` gates the size half of. Sweeps database page size
+# against FTS5's record size over corpora up to 1M files, so it is opt-in like
+# the two above — and wants TMPDIR pointed at real storage, not tmpfs.
+[[bench]]
+name = "page_geometry"
+harness = false
+
+# QSB_HMAC: prices SQLCipher's per-page authenticator (off / SHA-256 / SHA-512)
+# against a plain index, and is what `db::schema::HMAC_MODE` is set from. Same
+# corpora and same seed cost as page_geometry, so it is opt-in for the same
+# reason.
+[[bench]]
+name = "cipher_hmac"
 harness = false

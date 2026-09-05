@@ -7,44 +7,36 @@ use std::time::{Duration, Instant};
 use quicksearch_core::config::Config;
 use quicksearch_core::coordinator::{IndexMode, IndexerState, ReconcileState, WatcherStatus};
 use quicksearch_core::indexing::{
-    IndexingStatus, PrepStep, ReconcileProgress, RootPhase, RootProgress,
+    IndexingStatus, MaintenanceStep, PrepStep, ReconcileProgress, RootPhase, RootProgress,
 };
 
 use crate::format::{
-    fmt_duration_clock, fmt_interval, fmt_rate, fmt_reconcile_summary, group_thousands, human_size,
-    middle_truncate,
+    fmt_duration_clock, fmt_interval, fmt_maintenance, fmt_rate, fmt_reconcile_summary,
+    group_thousands, human_size, middle_truncate,
 };
 use crate::tips::{self, Tipped};
 use crate::tracker::SpeedTracker;
 use crate::ui_util::hint;
 use crate::ui_util::middle_elide;
 
-/// What the tab asks the app to do after this frame.
 #[derive(Default)]
 pub struct ManageActions {
     pub start_now: bool,
     pub stop: bool,
     pub auto: bool,
-    /// Ask the app to confirm and delete the index.
     pub clear_index: bool,
-    /// A full edited config to apply (roots / filters).
     pub apply_config: Option<Config>,
 }
 
 pub struct ManageTab {
     pub speed: SpeedTracker,
-    /// Multiline editor, one extension per line; parsed back on Apply.
     ext_filter_text: String,
     new_root: String,
-    /// Text of the inline "add ignore pattern" box.
     new_ignore: String,
-    /// Inline error from a rejected root add (nested/duplicate).
     root_error: Option<String>,
     /// The config the draft was last synced from; `None` forces a full resync.
     baseline: Option<Config>,
-    /// Draft of the roots/filters edited in-place.
     draft: Option<Config>,
-    /// Cached on-disk footprint of the index, restatted on a timer.
     db_size: DbSizeProbe,
 }
 
@@ -62,27 +54,28 @@ impl ManageTab {
         }
     }
 
-    /// Feed the tracker from the polled status (called every frame, on
-    /// every tab).
     pub fn observe(&mut self, status: &IndexingStatus) {
         match status {
-            IndexingStatus::Running { roots, .. } => {
-                // Monotonic within a run: walks and extractions only grow.
+            IndexingStatus::Running {
+                maintenance: None,
+                roots,
+                ..
+            } => {
                 let total: usize = roots.iter().map(|r| r.walked + r.extracted).sum();
                 self.speed.record(total);
             }
-            // Preparing included: a stale files/sec left over from the last
-            // run would read as progress that is not happening.
+            // Preparing and a run's upkeep steps included: no file is moving
+            // in either, and a stale files/sec would read as progress.
             IndexingStatus::Idle
             | IndexingStatus::Error(_)
             | IndexingStatus::Optimizing
-            | IndexingStatus::Preparing { .. } => self.speed.reset(),
+            | IndexingStatus::Preparing { .. }
+            | IndexingStatus::Running { .. } => self.speed.reset(),
             _ => {}
         }
     }
 
-    /// Reconcile the draft with the live config, every frame, so a filter
-    /// persisted elsewhere shows up here on the next frame.
+    /// Reconcile the draft with the live config, every frame.
     fn sync_editors(&mut self, config: &Config) {
         let Some(baseline) = &self.baseline else {
             // First frame, or right after our own Apply.
@@ -91,19 +84,16 @@ impl ManageTab {
         if baseline == config {
             return;
         }
-        // The config changed elsewhere.
         if !self.is_dirty() {
-            // Nothing staged, nothing to lose.
             return self.resync(config);
         }
-        // Staged edits exist: keep the sections this tab edits, adopt the
-        // rest so a later Apply cannot revert changes made elsewhere.
+        // Keep the sections this tab edits, adopt the rest so a later Apply
+        // cannot revert changes made elsewhere.
         let draft = self.draft.take().expect("synced");
         let mut merged = config.clone();
         merged.paths.indexing_paths = draft.paths.indexing_paths;
         merged.indexing = draft.indexing;
-        // Live state, not a user edit: a stale `auto_index` frozen into the
-        // draft would read as permanently dirty.
+        // Live state: a stale `auto_index` would read as permanently dirty.
         merged.indexing.auto_index = config.indexing.auto_index;
         merged.processing = draft.processing;
         for pat in &config.indexing.ignore_patterns {
@@ -123,10 +113,8 @@ impl ManageTab {
         self.baseline = Some(config.clone());
     }
 
-    /// Whether the editors hold changes not yet applied. Live fields are
-    /// pinned before comparing (`pin_live_fields`) and the extension text is
-    /// compared parsed, so a trailing newline never reads as dirty. False
-    /// before the first sync.
+    /// Live fields are pinned before comparing and the extension text is
+    /// compared parsed, so a trailing newline never reads as dirty.
     pub fn is_dirty(&self) -> bool {
         let (Some(draft), Some(baseline)) = (&self.draft, &self.baseline) else {
             return false;
@@ -138,10 +126,8 @@ impl ManageTab {
                 != parse_lines(&baseline.indexing.content_extensions.join("\n"))
     }
 
-    /// The Apply & Save action. Syncs against `live` first so a config
-    /// applied elsewhere moments ago is not reverted. Does NOT clear
-    /// `baseline`: the app calls [`ManageTab::mark_applied`] only after the
-    /// apply succeeds, so a rejected apply keeps the staged edits.
+    /// Syncs against `live` first so a config applied elsewhere is not
+    /// reverted. Does NOT clear `baseline`: a rejected apply keeps the edits.
     pub fn take_apply_config(&mut self, live: &Config) -> Option<Config> {
         self.sync_editors(live);
         let draft = self.draft.as_ref()?;
@@ -155,12 +141,10 @@ impl ManageTab {
         Some(new_config)
     }
 
-    /// The last apply landed: resync from the applied config next frame.
     pub fn mark_applied(&mut self) {
         self.baseline = None;
     }
 
-    /// Drop every staged edit; the next frame resyncs from the live config.
     pub fn discard(&mut self) {
         self.draft = None;
         self.baseline = None;
@@ -252,16 +236,28 @@ impl ManageTab {
                 let draft = self.draft.as_mut().expect("synced");
                 let mut remove: Option<usize> = None;
                 let (paths, indexing) = (&draft.paths, &mut draft.indexing);
+                // Widget ids here are positional (egui 0.32's push_id cannot
+                // make them row-stable), so a Remove renames every row below.
+                // Safe because the Remove click surrenders focus before the
+                // shift — pinned by tests::removing_a_root_does_not_leak_an_edit_onto_another_row.
                 for (i, root) in paths.indexing_paths.iter().enumerate() {
+                    // One rule per row, plus the closing one below the loop:
+                    // the Remove button then sits inside a bounded band with
+                    // the folder it belongs to, even with a single folder
+                    // listed. Drawn for every row alike, so the positional
+                    // widget ids below shift by a constant.
+                    ui.separator();
                     ui.horizontal(|ui| {
-                        // Controls claim the right edge first so a long path
-                        // can never push them out of view.
+                        // Controls claim the right edge first.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Remove").tip(&tips::REMOVE_ROOT).clicked() {
+                            let remove_btn =
+                                ui.small_button("Remove Folder").tip(&tips::REMOVE_ROOT);
+                            #[cfg(test)]
+                            tests::record_widget("remove", &remove_btn);
+                            if remove_btn.clicked() {
                                 remove = Some(i);
                             }
-                            // Per-root walker override; 0 = auto (4 local / 16
-                            // network, detected per root). Applies on the next run.
+                            // Per-root walker override; 0 = auto. Applies next run.
                             let mut workers = indexing.root_workers.get(root).copied().unwrap_or(0);
                             let response = ui
                                 .add(
@@ -298,9 +294,8 @@ impl ManageTab {
                             // Unconditional, placeholder and all: egui names a
                             // widget by how many precede it, so a label that
                             // came and went would rename the field above and
-                            // cost it any edit in progress. After that field
-                            // for the same reason — in this right-to-left
-                            // layout "after" is to its left.
+                            // cost it any edit in progress ("after" is to its
+                            // left in this right-to-left layout).
                             ui.label(hint(root_counts_text(state, root)))
                                 .tip(&tips::ROOT_COUNTS);
 
@@ -316,11 +311,14 @@ impl ManageTab {
                         });
                     });
                 }
+                // Closes the last row's band; the add controls below belong to
+                // no folder and must not read as another row.
+                ui.separator();
                 if let Some(i) = remove {
                     let removed = draft.paths.indexing_paths.remove(i);
                     draft.indexing.root_workers.remove(&removed);
                 }
-                ui.horizontal(|ui| {
+                let add_row = ui.horizontal(|ui| {
                     if ui.button("Add folder…").tip(&tips::ADD_ROOT).clicked() {
                         if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                             let path = dir.to_string_lossy().into_owned();
@@ -342,39 +340,47 @@ impl ManageTab {
                         }
                     }
                 });
+                // All three ways to add a folder, as one target for the tour.
+                crate::spotlight::mark(
+                    ui.ctx(),
+                    crate::spotlight::Spot::IndexedFolderAdd,
+                    add_row.response.rect,
+                );
                 crate::ui_util::stable_section(ui, |ui| {
                     if let Some(err) = &self.root_error {
                         ui.colored_label(ui.visuals().error_fg_color, err);
                     }
                 });
                 ui.label(hint(
-                    "Removing a folder removes its entries and leaves the rest of \
-                         the index untouched; adding one reindexes to pick it up. \
-                         Neither rebuilds.",
+                    "Adding a folder does not replace the current index, it adds to it.",
+                ));
+                ui.label(hint(
+                    "Removing a folder does not affect the whole index, only that \
+                         folder's entries.",
+                ));
+                ui.label(hint(
+                    "Neither action causes the index to be rebuilt from scratch.",
                 ));
                 ui.separator();
 
                 // --- Filters ---------------------------------------------------
                 ui.heading(egui::RichText::new("Content filters").strong());
+                // A box scrolled out of this tab's scroll area is still laid
+                // out, so its rect is somewhere off the panel: marking it
+                // would ring whatever now sits at those coordinates.
+                let mark_visible = |ui: &egui::Ui, spot, rect: egui::Rect| {
+                    if ui.is_rect_visible(rect) {
+                        crate::spotlight::mark(ui.ctx(), spot, rect);
+                    }
+                };
                 ui.columns(2, |cols| {
                     cols[0]
-                        .label("Full-text extensions whitelist (empty = all supported):")
-                        .tip(&tips::EXT_WHITELIST);
-                    cols[0]
-                        .add(
-                            egui::TextEdit::multiline(&mut self.ext_filter_text)
-                                .desired_rows(4)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("txt\nmd\npdf  # comments allowed\n(none)"),
-                        )
-                        .tip(&tips::EXT_WHITELIST);
-                    cols[1]
-                        .label("Ignore patterns (excluded entirely):")
+                        .label("Ignore patterns (files and folders never indexed):")
                         .tip(&tips::IGNORE_PATTERNS);
                     let mut remove_pat: Option<usize> = None;
-                    // The list grows and shrinks, so it is kept off the id of
-                    // the editor below it (see `ui_util::stable_section`).
-                    crate::ui_util::stable_section(&mut cols[1], |ui| {
+                    // The list grows and shrinks: keep it off the id of the
+                    // editor below it (see `ui_util::stable_section`).
+                    crate::ui_util::stable_section(&mut cols[0], |ui| {
                         for (i, pat) in draft.indexing.ignore_patterns.iter().enumerate() {
                             ui.horizontal(|ui| {
                                 ui.with_layout(
@@ -400,7 +406,7 @@ impl ManageTab {
                     if let Some(i) = remove_pat {
                         draft.indexing.ignore_patterns.remove(i);
                     }
-                    cols[1].horizontal(|ui| {
+                    cols[0].horizontal(|ui| {
                         let (response, valid) = crate::ui_util::pattern_edit(
                             ui,
                             &mut self.new_ignore,
@@ -409,6 +415,9 @@ impl ManageTab {
                         );
                         let submitted =
                             response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        mark_visible(ui, crate::spotlight::Spot::IgnorePatterns, response.rect);
+                        #[cfg(test)]
+                        tests::record_widget("ignore-entry", &response);
                         response.tip(&tips::IGNORE_PATTERNS);
                         if ui
                             .add_enabled(valid, egui::Button::new("Add"))
@@ -423,12 +432,29 @@ impl ManageTab {
                             self.new_ignore.clear();
                         }
                     });
-                    crate::ui_util::pattern_hint_label(&mut cols[1], &self.new_ignore);
-                    cols[1].label(hint(
+                    crate::ui_util::pattern_hint_label(&mut cols[0], &self.new_ignore);
+                    cols[0].label(hint(
                         "Changes apply on Apply & Save. A new pattern removes the \
-                             entries it matches; removing one reindexes to bring them \
-                             back.",
+                             entries it matches; deleting a pattern from this list \
+                             reindexes to bring those files back.",
                     ));
+
+                    cols[1]
+                        .label("Full-text extensions whitelist (empty = read all supported types):")
+                        .tip(&tips::EXT_WHITELIST);
+                    let ext = cols[1]
+                        .add(
+                            egui::TextEdit::multiline(&mut self.ext_filter_text)
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("#EXAMPLE WHITELISTED FILE EXTENSIONS FOR FULL-TEXT-SEARCH:\n#MOUSE \
+                                OVER FOR MORE INFO\n#------------------------------------------------\ntxt\nmd\n \
+                                pdf  # comments allowed\n(none)"),
+                        )
+                        .tip(&tips::EXT_WHITELIST);
+                    mark_visible(&cols[1], crate::spotlight::Spot::ExtWhitelist, ext.rect);
+                    #[cfg(test)]
+                    tests::record_widget("ext-filter", &ext);
                 });
                 ui.separator();
 
@@ -449,8 +475,7 @@ impl ManageTab {
                         .tip(&tips::APPLY_SAVE);
                     #[cfg(test)]
                     tests::record_widget("apply", &apply);
-                    // The label comes and goes with the dirty state; keep it
-                    // off the ids of whatever sits after it.
+                    // The label comes and goes with the dirty state.
                     crate::ui_util::stable_section(ui, |ui| {
                         if dirty {
                             ui.label(
@@ -467,31 +492,26 @@ impl ManageTab {
             });
         crate::ui_util::more_below_hint(ui, &scroll);
 
-        // Nothing else asks for repaints while the app sits idle; without
-        // this the size would freeze until the pointer next moved.
+        // Without this the size would freeze until the pointer next moved.
         ui.ctx().request_repaint_after(DB_SIZE_REFRESH);
 
         actions
     }
 }
 
-/// How often the index files are re-statted.
 const DB_SIZE_REFRESH: Duration = Duration::from_secs(10);
 
-/// Total on-disk footprint of the index: the database plus its `-wal` and
-/// `-shm` sidecars — mid-run the `-wal` can hold hundreds of megabytes the
-/// database does not show yet. A file that is not there counts as zero.
+/// The database plus its `-wal` and `-shm` sidecars — mid-run the `-wal`
+/// can hold hundreds of megabytes the database does not show yet.
 fn measure_db_size(db: &Path) -> u64 {
-    // Only regular files: a misconfigured path pointing at a directory
-    // would otherwise report that directory's own inode size as an index.
+    // Only regular files: a directory would report its own inode size.
     let len = |path: &Path| {
         std::fs::metadata(path)
             .map(|m| if m.is_file() { m.len() } else { 0 })
             .unwrap_or(0)
     };
     let name = db.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    // No `-journal`: the index runs in WAL mode, so a rollback journal is
-    // not part of a live database.
+    // No `-journal`: the index runs in WAL mode.
     len(db)
         + ["-wal", "-shm"]
             .iter()
@@ -499,7 +519,6 @@ fn measure_db_size(db: &Path) -> u64 {
             .sum::<u64>()
 }
 
-/// Caches the last measurement so the tab can ask for it every frame.
 #[derive(Default)]
 struct DbSizeProbe {
     /// Configured (unresolved) path the cached size belongs to.
@@ -509,9 +528,7 @@ struct DbSizeProbe {
 }
 
 impl DbSizeProbe {
-    /// The cached size, restatted when it has gone stale or the configured
-    /// database path changed under it. `now` is a parameter so the refresh
-    /// cadence can be tested without sleeping.
+    /// Restatted when stale or the path changed; `now` is a parameter for tests.
     fn size(&mut self, config: &Config, now: Instant) -> u64 {
         let expired = self
             .measured_at
@@ -525,7 +542,6 @@ impl DbSizeProbe {
     }
 }
 
-/// The index's footprint, with the levers for shrinking it on hover.
 fn db_size_label(ui: &mut egui::Ui, bytes: u64) {
     let response = ui.label(format!("Index size: {}", human_size(bytes)));
     #[cfg(test)]
@@ -558,13 +574,8 @@ fn db_size_tooltip(ui: &mut egui::Ui) {
     ));
 }
 
-/// What `root` held when indexing last completed, worded as the live
-/// per-root rows word it (see [`root_row`]) so the list does not rename the
-/// same two figures once the run that produced them is over.
-///
-/// A root the coordinator has no figures for — never indexed to completion,
-/// staged in the draft but not yet applied, or an index that was cleared —
-/// says so rather than claiming zero.
+/// Worded as [`root_row`] words it; a root the coordinator has no figures
+/// for says so rather than claiming zero.
 fn root_counts_text(state: &IndexerState, root: &str) -> String {
     match state.root_counts.iter().find(|c| c.root == root) {
         Some(c) => format!(
@@ -576,8 +587,7 @@ fn root_counts_text(state: &IndexerState, root: &str) -> String {
     }
 }
 
-/// Append a root to the draft unless it would duplicate or nest with an
-/// existing one; the rejection reason lands in `error`.
+/// Append a root unless it duplicates or nests; the reason lands in `error`.
 fn try_add_root(draft: &mut Config, candidate: String, error: &mut Option<String>) -> bool {
     if draft.paths.indexing_paths.contains(&candidate) {
         *error = Some(format!("{} is already in the list", candidate));
@@ -605,8 +615,7 @@ fn parse_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Live-update health. Empty in manual mode and a line long otherwise,
-/// hence the stable section (see [`status_panel`]).
+/// Empty in manual mode and a line long otherwise, hence the stable section.
 fn watch_panel(ui: &mut egui::Ui, state: &IndexerState, config: &Config) {
     crate::ui_util::stable_section(ui, |ui| watch_contents(ui, state, config));
 }
@@ -620,7 +629,7 @@ fn watch_contents(ui: &mut egui::Ui, state: &IndexerState, config: &Config) {
         WatcherStatus::Active { dirs } => {
             ui.label(
                 egui::RichText::new(format!(
-                    "Live updates on, watching {} folders",
+                    "Live index updates, watching {} folders",
                     group_thousands(*dirs as u64)
                 ))
                 .small()
@@ -631,7 +640,7 @@ fn watch_contents(ui: &mut egui::Ui, state: &IndexerState, config: &Config) {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
                 format!(
-                    "Live updates off; reindexing every {}",
+                    "Periodic index updates; updating every {}",
                     fmt_interval(config.indexing.reindex_interval_minutes)
                 ),
             )
@@ -640,9 +649,8 @@ fn watch_contents(ui: &mut egui::Ui, state: &IndexerState, config: &Config) {
     }
 }
 
-/// Live progress. Its widget count tracks the run, so it renders inside a
-/// [`crate::ui_util::stable_section`]: without one, every id below it would
-/// move mid-run.
+/// Its widget count tracks the run, so it renders inside a
+/// [`crate::ui_util::stable_section`] or every id below would move mid-run.
 fn status_panel(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker) {
     crate::ui_util::stable_section(ui, |ui| status_contents(ui, state, speed));
 }
@@ -650,12 +658,11 @@ fn status_panel(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker) {
 fn status_contents(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker) {
     match &state.activity {
         IndexingStatus::Idle => {
-            // A between-runs reconcile: the activity really is Idle, but the
-            // thread may be scanning every row for minutes.
+            // A between-runs reconcile: Idle, but the thread may be scanning
+            // every row for minutes.
             match &state.reconcile {
                 Some(ReconcileState::Running(r)) => return reconcile_row(ui, r, None),
-                // Kept on screen a few seconds after the work ends: a small
-                // index applies a filter faster than the display could show.
+                // Kept on screen a few seconds after the work ends.
                 Some(ReconcileState::Finished(r)) => {
                     ui.label(fmt_reconcile_summary(r.deleted, r.recontented));
                     return;
@@ -678,12 +685,19 @@ fn status_contents(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker
             ui.label("Stopping…");
         }
         IndexingStatus::Optimizing => {
-            // One bulk rewrite of the whole file; no per-file progress exists.
             ui.label("Optimizing index; reclaiming unused space…");
         }
-        IndexingStatus::Running { roots, .. } => {
+        IndexingStatus::Running {
+            roots, maintenance, ..
+        } => {
             for root in roots {
-                root_row(ui, root);
+                root_row(ui, root, *maintenance);
+            }
+            // Run-wide, so said once rather than once per root. Purely
+            // additional: the per-root file hints stay put underneath it, so
+            // a step starting does not reflow the block.
+            if let Some(step) = maintenance {
+                ui.label(hint(fmt_maintenance(*step)));
             }
             if let Some(rate) = speed.files_per_sec() {
                 ui.label(
@@ -700,18 +714,16 @@ fn status_contents(ui: &mut egui::Ui, state: &IndexerState, speed: &SpeedTracker
     }
 }
 
-/// What a run is doing before it walks its first file. Each step can
-/// outlast the walk itself on a large index; the elapsed clock is what
-/// distinguishes slow work from a hang.
+/// The elapsed clock distinguishes slow prologue work from a hang.
 fn prep_row(ui: &mut egui::Ui, step: &PrepStep, elapsed: Duration) {
     match step {
         PrepStep::PreviousRun => waiting_row(ui, "Finishing the previous run…", elapsed),
         PrepStep::OpeningIndex => waiting_row(ui, "Opening the index…", elapsed),
         PrepStep::Reconciling(r) => reconcile_row(ui, r, Some(elapsed)),
+        PrepStep::Starting => waiting_row(ui, "Getting the index ready…", elapsed),
     }
 }
 
-/// A prologue step with no counters: label, clock, indeterminate bar.
 fn waiting_row(ui: &mut egui::Ui, label: &str, elapsed: Duration) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -720,8 +732,7 @@ fn waiting_row(ui: &mut egui::Ui, label: &str, elapsed: Duration) {
     });
 }
 
-/// A configuration reconciliation, from either place one runs. `elapsed`
-/// is `Some` for a run's prologue; the between-runs pass has no start time.
+/// `elapsed` is `Some` for a run's prologue; the between-runs pass has none.
 fn reconcile_row(ui: &mut egui::Ui, r: &ReconcileProgress, elapsed: Option<Duration>) {
     ui.horizontal(|ui| {
         ui.label("Applying configuration change");
@@ -749,8 +760,7 @@ fn reconcile_row(ui: &mut egui::Ui, r: &ReconcileProgress, elapsed: Option<Durat
             Some(frac) => {
                 crate::ui_util::progress_bar(ui, Some(frac as f32), 160.0);
             }
-            // Whole-range deletions read no rows, so they reach the bar
-            // with no denominator.
+            // Whole-range deletions read no rows: no denominator.
             None => {
                 crate::ui_util::progress_bar(ui, None, 160.0);
             }
@@ -769,20 +779,28 @@ fn reconcile_row(ui: &mut egui::Ui, r: &ReconcileProgress, elapsed: Option<Durat
     }
 }
 
-/// One root's progress: path, phase, bar, counters, current file.
-fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
-    // Weak "|" separators split the row into folder | status | numbers.
+/// `maintenance` is the run's, not the root's: while it is set the writer is
+/// inside a database step and every figure here is the last one published
+/// before it began.
+fn root_row(ui: &mut egui::Ui, r: &RootProgress, maintenance: Option<MaintenanceStep>) {
     let divider = |ui: &mut egui::Ui| {
         ui.label(egui::RichText::new("|").weak());
     };
     let phase = crate::color::palette(ui.visuals().dark_mode);
+    // The counters stay keyed on the root's phase; only the word changes.
+    let (word, color) = match (maintenance, r.phase) {
+        (Some(_), _) => ("maintenance", phase.orange),
+        (None, RootPhase::Walking) => ("indexing", phase.yellow),
+        (None, RootPhase::Extracting) => ("extracting text", phase.green),
+        (None, RootPhase::Done) => ("done", phase.blue),
+    };
     ui.horizontal(|ui| {
         ui.monospace(middle_truncate(&r.root, 48));
         divider(ui);
+        ui.label(egui::RichText::new(word).color(color));
+        divider(ui);
         match r.phase {
             RootPhase::Walking => {
-                ui.label(egui::RichText::new("indexing").color(phase.yellow));
-                divider(ui);
                 let workers = format!("{}/{} workers", r.active_workers, r.total_workers);
                 match r.walk_denominator() {
                     Some(total) if total > 0 => {
@@ -807,8 +825,6 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
                 }
             }
             RootPhase::Extracting => {
-                ui.label(egui::RichText::new("extracting text").color(phase.green));
-                divider(ui);
                 let workers = format!("{}/{} workers", r.active_workers, r.total_workers);
                 match r.extract_total {
                     Some(total) => {
@@ -826,8 +842,7 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
                         ));
                         crate::ui_util::progress_bar(ui, Some(frac), 160.0);
                     }
-                    // The pass is still counting its range — the same shape
-                    // as a walk without a denominator yet.
+                    // The pass is still counting its range.
                     None => {
                         ui.label(format!(
                             "{} files · {}",
@@ -839,11 +854,7 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
                 }
             }
             RootPhase::Done => {
-                // Whole-root totals: `walked` counts every file the walk saw
-                // and `extracted` all rows with searchable text, not just
-                // this run's new work.
-                ui.label(egui::RichText::new("done").color(phase.blue));
-                divider(ui);
+                // Whole-root totals, not just this run's new work.
                 ui.label(format!(
                     "indexed {}, extracted {}",
                     group_thousands(r.walked as u64),
@@ -853,8 +864,18 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress) {
             }
         }
     });
+    // Drawn during upkeep too, where it names the last file *written* rather
+    // than one in flight. That moment of staleness is worth less than the row
+    // keeping its height: with a checkpoint every few seconds, a line
+    // vanishing and returning per root reflowed the whole block on a loop.
+    // Elided to the panel rather than to a character count: a full path over
+    // the width would wrap, and a hint that is one line or two is the very
+    // height change this row is drawn unconditionally to avoid. `Small` is the
+    // font `hint` paints in, and the budget has to be measured in that one.
     if let Some(f) = &r.current_file {
-        ui.label(hint(middle_truncate(f, 90)));
+        let font_id = egui::TextStyle::Small.resolve(ui.style());
+        let shown = middle_elide(ui, f, ui.available_width(), &font_id);
+        ui.label(hint(shown.as_ref()));
     }
 }
 

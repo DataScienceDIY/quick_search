@@ -26,36 +26,13 @@ readonly TARGET=x86_64-pc-windows-gnu
 # The GUI app and the console-subsystem terminal binary. Windows needs both as
 # separate executables - see the [[bin]] comment in crates/quicksearch-gui.
 readonly BINARIES=(quicksearch.exe quicksearch-cli.exe)
-readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
+parse_args "$@"
 readonly ICON="$REPO_ROOT/crates/quicksearch-gui/assets/icons/$PKG.ico"
-
-do_build=1
-do_strip=1
-out_dir="$REPO_ROOT/dist"
-
-die() { printf 'build-installer: %s\n' "$*" >&2; exit 1; }
-say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --no-build) do_build=0 ;;
-        --no-strip) do_strip=0 ;;
-        -o|--output-dir) shift; [ $# -gt 0 ] || die "--output-dir needs a path"; out_dir="$1" ;;
-        # Print the header comment block, however long it grows.
-        -h|--help) awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; exit 0 ;;
-        *) die "unknown option: $1 (try --help)" ;;
-    esac
-    shift
-done
 
 command -v makensis >/dev/null 2>&1 || die "missing makensis (install nsis)"
 [ "$do_strip" -eq 0 ] || command -v x86_64-w64-mingw32-strip >/dev/null 2>&1 \
     || die "missing x86_64-w64-mingw32-strip (install gcc-mingw-w64-x86-64, or pass --no-strip)"
-
-# Same source of truth as build-deb.sh and the CI asset names: the crate version,
-# never a tag or a branch name.
-version="$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' "$REPO_ROOT/Cargo.toml")"
-[ -n "$version" ] || die "could not read version from Cargo.toml"
 
 # VIProductVersion accepts nothing but four numeric fields, so 0.9.1 has to
 # become 0.9.1.0 and a pre-release suffix has to come off. The visible version

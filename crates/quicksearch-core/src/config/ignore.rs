@@ -3,16 +3,12 @@
 
 use std::path::Path;
 
-/// Longest name folded without allocating. Comfortably above `NAME_MAX` on the
-/// filesystems that matter (255 bytes), so the heap path is effectively dead
-/// code kept for correctness rather than for use.
+/// Longest name folded without allocating; comfortably above `NAME_MAX`.
 pub(super) const FOLD_BUF: usize = 256;
 
-/// Whether `pat` is a plain name with no glob syntax in it.
-///
-/// `\` is included even though it is not glob syntax everywhere: a pattern
-/// containing one is routed to the path set rather than the component set, so
-/// treating it as literal here would put it in the wrong place.
+/// Whether `pat` is a plain name with no glob syntax. `\` is included even
+/// though it is not glob syntax everywhere: a pattern containing one belongs
+/// in the path set, not the component set.
 fn is_literal_name(pat: &str) -> bool {
     !pat.contains(['*', '?', '[', ']', '{', '}', '/', '\\'])
 }
@@ -22,16 +18,11 @@ fn is_literal_name(pat: &str) -> bool {
 /// path. Both use glob syntax.
 #[derive(Debug)]
 pub struct IgnoreSet {
-    /// Component patterns that are plain ASCII names — `.git`, `node_modules`.
-    /// Held apart from `component` for speed: globset gives up every fast
-    /// path (`literal`, `ext`, `prefix`, `suffix`, `basename_tokens`) the
-    /// moment `case_insensitive` is set, which left Windows running a
-    /// 12-pattern regex DFA over every directory entry where Linux did five
-    /// hash lookups.
-    ///
-    /// Folded and compared as **ASCII**, matching [`PATH_COLLATION`]:
-    /// SQLite's `NOCASE` and `LIKE` fold ASCII only. Non-ASCII patterns stay
-    /// in `component` with globset's Unicode folding.
+    /// Plain-ASCII component names, held apart for speed: globset gives up
+    /// every fast path the moment `case_insensitive` is set (measured: a
+    /// regex DFA per directory entry on Windows vs five hash lookups).
+    /// Folded as **ASCII**, matching SQLite's `NOCASE`/`LIKE`; non-ASCII
+    /// patterns stay in `component` with globset's Unicode folding.
     pub(super) literal_components: std::collections::HashSet<String>,
     component: globset::GlobSet,
     path: globset::GlobSet,
@@ -44,13 +35,10 @@ impl IgnoreSet {
         let mut component = globset::GlobSetBuilder::new();
         let mut path = globset::GlobSetBuilder::new();
         for pat in patterns {
-            // Trailing separators are how people naturally write directory
-            // patterns ("/tmp/"); paths compare without them, so strip —
-            // except a drive root ("D:\" or "D:/"), where the separator is
-            // the whole point: trimmed to "D:" it would become a component
-            // pattern that can never match. Drive roots keep a normalized
-            // "D:/" spelling, which the ancestor walk in
-            // `matches_path_pattern` does reach.
+            // Trailing separators are stripped ("/tmp/" compares as "/tmp")
+            // — except a drive root, where the separator is the whole point:
+            // trimmed to "D:" it becomes a component pattern that can never
+            // match. Drive roots keep a normalized "D:/" spelling.
             let raw = pat.trim();
             let trimmed = raw.trim_end_matches(['/', '\\']);
             let is_drive_root = raw.len() > trimmed.len()
@@ -67,8 +55,6 @@ impl IgnoreSet {
             if pat.is_empty() {
                 continue;
             }
-            // A plain ASCII name needs no glob machinery — see
-            // `literal_components`.
             if pat.is_ascii() && is_literal_name(pat) {
                 literal_components.insert(if crate::platform::PATHS_ARE_CASE_INSENSITIVE {
                     pat.to_ascii_lowercase()
@@ -79,11 +65,8 @@ impl IgnoreSet {
             }
             let glob = globset::GlobBuilder::new(pat)
                 .literal_separator(false)
-                // Match the filesystem's own rules, or `node_modules` fails to
-                // exclude `Node_Modules`. globset already handles the other
-                // half of Windows compatibility on its own: `Candidate` folds
-                // `\` to `/` when matching, and backslash-as-escape is off
-                // wherever `\` is a separator.
+                // Match the filesystem's own rules, or `node_modules` fails
+                // to exclude `Node_Modules`.
                 .case_insensitive(crate::platform::PATHS_ARE_CASE_INSENSITIVE)
                 .build()
                 .map_err(|e| format!("invalid ignore pattern {:?}: {}", pat, e))?;
@@ -108,7 +91,6 @@ impl IgnoreSet {
         })
     }
 
-    /// Whether `name` is one of the plain-name patterns, folded per platform.
     /// Allocation-free for any name that fits [`FOLD_BUF`]; this runs on
     /// every directory entry the walker sees.
     fn matches_literal(&self, name: &str) -> bool {
@@ -118,8 +100,8 @@ impl IgnoreSet {
         if !crate::platform::PATHS_ARE_CASE_INSENSITIVE {
             return self.literal_components.contains(name);
         }
-        // Every stored literal is ASCII, and ASCII case folding maps ASCII to
-        // ASCII, so a name containing any non-ASCII byte cannot equal one.
+        // A name containing any non-ASCII byte cannot equal a stored ASCII
+        // literal.
         if !name.is_ascii() {
             return false;
         }
@@ -128,15 +110,13 @@ impl IgnoreSet {
             let buf = &mut buf[..name.len()];
             buf.copy_from_slice(name.as_bytes());
             buf.make_ascii_lowercase();
-            // Lowercasing ASCII yields ASCII, which is always valid UTF-8.
             let folded = std::str::from_utf8(buf).expect("ascii stays utf-8");
             return self.literal_components.contains(folded);
         }
         self.literal_components.contains(&name.to_ascii_lowercase())
     }
 
-    /// Match a single file/directory name. Used by the walker to prune
-    /// subtrees before descending.
+    /// Match a single file/directory name.
     pub fn matches_component(&self, name: &str) -> bool {
         if self.empty {
             return false;
@@ -146,8 +126,7 @@ impl IgnoreSet {
 
     /// Match a path against the full-path patterns only. The path *and its
     /// ancestors* are tested, so a pattern matching a directory ignores
-    /// everything beneath it — the same semantics the walker gets by
-    /// pruning that directory before descending.
+    /// everything beneath it.
     pub fn matches_path_pattern(&self, path: &Path) -> bool {
         if self.path.is_empty() {
             return false;
@@ -162,9 +141,8 @@ impl IgnoreSet {
         false
     }
 
-    /// Match a full path: either a full-path pattern hits it (or an
-    /// ancestor), or any single component matches a component pattern.
-    /// Used for watcher events, where walk-time pruning never saw the path.
+    /// Match a full path — for watcher events, where walk-time pruning never
+    /// saw it.
     pub fn matches_path(&self, path: &Path) -> bool {
         if self.empty {
             return false;
@@ -173,9 +151,9 @@ impl IgnoreSet {
             return true;
         }
         path.components().any(|c| match c {
-            // Routed through `matches_component` rather than `self.component`
-            // directly, or the literal patterns would be invisible here and the
-            // watcher would index what the walker prunes.
+            // Through `matches_component`, or the literal patterns would be
+            // invisible here and the watcher would index what the walker
+            // prunes.
             std::path::Component::Normal(name) => self.matches_component(&name.to_string_lossy()),
             _ => false,
         })

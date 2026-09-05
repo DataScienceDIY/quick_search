@@ -1,7 +1,6 @@
 use super::*;
 
-/// The same pipeline written against `std`, which is what the const
-/// numerics above have to reproduce.
+/// The same pipeline against `std`, which the const numerics must reproduce.
 fn reference(l: f64, c: f64, h_deg: f64) -> Color32 {
     let h = h_deg.to_radians();
     let (a, b) = (c * h.cos(), c * h.sin());
@@ -25,9 +24,7 @@ fn reference(l: f64, c: f64, h_deg: f64) -> Color32 {
     )
 }
 
-/// WCAG relative luminance, written from the specification rather than
-/// reusing [`decode`]: a test sharing its arithmetic with the code it
-/// checks proves less.
+/// WCAG relative luminance, written from the specification, not from `decode`.
 fn luminance(c: Color32) -> f64 {
     let f = |v: u8| {
         let v = v as f64 / 255.0;
@@ -55,9 +52,7 @@ fn oklch_of(c: Color32) -> (f64, f64, f64) {
     )
 }
 
-/// The const numerics have to agree with `std` everywhere, not just on
-/// the palette. Exact equality: a channel a step off would be a real
-/// regression, not rounding.
+/// Exact equality: a channel a step off is a regression, not rounding.
 #[test]
 fn the_const_conversion_matches_std_across_the_whole_space() {
     let mut l = 0.0;
@@ -86,7 +81,6 @@ fn the_const_conversion_matches_std_across_the_whole_space() {
 fn the_ends_of_the_scale_are_black_and_white() {
     assert_eq!(oklch(0.0, 0.0, 0.0), Color32::BLACK);
     assert_eq!(oklch(1.0, 0.0, 0.0), Color32::WHITE);
-    // A gray is a color with no chroma, whatever hue is named.
     for h in [0.0, 90.0, 217.0, 359.0] {
         let gray = oklch(0.6, 0.0, h);
         assert_eq!(gray.r(), gray.g(), "not gray at H={}: {:?}", h, gray);
@@ -94,8 +88,6 @@ fn the_ends_of_the_scale_are_black_and_white() {
     }
 }
 
-/// Asking for a color sRGB cannot show must give the nearest one it can,
-/// not a wrapped byte in a different hue family.
 #[test]
 fn out_of_gamut_requests_clamp() {
     for (l, c, h) in [(0.9, 0.4, 250.0), (0.5, 0.35, 20.0), (1.2, 0.1, 150.0)] {
@@ -107,8 +99,6 @@ fn out_of_gamut_requests_clamp() {
     assert_eq!(oklch(-1.0, 0.0, 0.0), Color32::BLACK);
 }
 
-/// `to_oklab` is the inverse of `oklch`, to within the 8 bits a channel
-/// has to hold the answer in.
 #[test]
 fn measuring_a_color_recovers_what_was_asked_for() {
     for (l, c, h) in [
@@ -129,11 +119,9 @@ fn a_blend_keeps_its_endpoints() {
     let (a, b) = (DARK_RED, LIGHT_BLUE);
     assert_eq!(oklab_lerp(a, b, 0.0), a);
     assert_eq!(oklab_lerp(a, b, 1.0), b);
-    // Out-of-range t clamps rather than extrapolating off the scale.
     assert_eq!(oklab_lerp(a, b, -0.5), a);
     assert_eq!(oklab_lerp(a, b, 1.5), b);
-    // The midpoint is genuinely between the two, not darkened the way an
-    // sRGB byte lerp leaves it.
+    // The midpoint is not darkened, the way an sRGB byte lerp leaves it.
     let mid = oklab_lerp(a, b, 0.5);
     let (l, _, _) = to_oklab(mid);
     let (la, _, _) = to_oklab(a);
@@ -147,7 +135,6 @@ fn a_blend_keeps_its_endpoints() {
     );
 }
 
-/// The claim the palette makes: within a theme, only hue varies.
 #[test]
 fn each_theme_is_one_lightness_and_one_chroma() {
     for (dark, l, c) in [(true, DARK_L, DARK_C), (false, LIGHT_L, LIGHT_C)] {
@@ -180,8 +167,7 @@ fn each_theme_is_one_lightness_and_one_chroma() {
     }
 }
 
-/// With L and C shared, hue spacing is the whole design; 40 degrees is
-/// the tightest pair (red to orange, orange to yellow).
+/// 40 degrees is the tightest pair shipped: red to orange, orange to yellow.
 #[test]
 fn no_two_colors_are_closer_than_forty_degrees() {
     let hues = [HUE_RED, HUE_ORANGE, HUE_YELLOW, HUE_GREEN, HUE_BLUE];
@@ -194,8 +180,7 @@ fn no_two_colors_are_closer_than_forty_degrees() {
     }
 }
 
-/// Readability fixed each theme's lightness, so it is checked rather than
-/// assumed — against the panel and text-field backgrounds.
+/// Readability is what fixed each theme's lightness, so it is checked.
 #[test]
 fn every_color_clears_wcag_aa_on_its_own_background() {
     for (dark, bgs) in [
@@ -237,8 +222,119 @@ fn every_color_clears_wcag_aa_on_its_own_background() {
     }
 }
 
-/// The chips read as a colorbar: hue marching one way from blue to red,
-/// nothing else moving.
+/// One call has to reach both themes: the live one alone is thrown away the
+/// moment the color scheme is switched.
+#[test]
+fn the_text_greys_land_on_both_themes() {
+    let ctx = egui::Context::default();
+    apply_text_contrast(&ctx);
+    for (theme, stock) in [
+        (egui::Theme::Dark, egui::Visuals::dark()),
+        (egui::Theme::Light, egui::Visuals::light()),
+    ] {
+        let visuals = &ctx.style_of(theme).visuals;
+        assert_ne!(
+            visuals.text_color(),
+            stock.text_color(),
+            "body text in {:?} is still egui's",
+            theme
+        );
+        assert_ne!(
+            visuals.widgets.inactive.text_color(),
+            stock.widgets.inactive.text_color(),
+            "widget text in {:?} is still egui's",
+            theme
+        );
+    }
+}
+
+/// Which way each theme moved. Written against egui's own defaults so that an
+/// upgrade quietly moving the baseline past us fails here instead of shipping.
+#[test]
+fn dark_text_lightens_and_light_text_darkens() {
+    let ctx = egui::Context::default();
+    apply_text_contrast(&ctx);
+    let dark = &ctx.style_of(egui::Theme::Dark).visuals;
+    let light = &ctx.style_of(egui::Theme::Light).visuals;
+    for (name, ours, stock) in [
+        (
+            "dark body",
+            dark.text_color(),
+            egui::Visuals::dark().text_color(),
+        ),
+        (
+            "dark widget",
+            dark.widgets.inactive.text_color(),
+            egui::Visuals::dark().widgets.inactive.text_color(),
+        ),
+    ] {
+        assert!(
+            luminance(ours) > luminance(stock),
+            "{} is not lighter than egui's: {:?} vs {:?}",
+            name,
+            ours,
+            stock
+        );
+    }
+    for (name, ours, stock) in [
+        (
+            "light body",
+            light.text_color(),
+            egui::Visuals::light().text_color(),
+        ),
+        (
+            "light widget",
+            light.widgets.inactive.text_color(),
+            egui::Visuals::light().widgets.inactive.text_color(),
+        ),
+    ] {
+        assert!(
+            luminance(ours) < luminance(stock),
+            "{} is not darker than egui's: {:?} vs {:?}",
+            name,
+            ours,
+            stock
+        );
+    }
+}
+
+/// The floors the greys were picked to clear, each on the fills it is
+/// actually painted over.
+#[test]
+fn plain_text_clears_its_backgrounds() {
+    let ctx = egui::Context::default();
+    apply_text_contrast(&ctx);
+    for (theme, floor) in [(egui::Theme::Dark, 5.5), (egui::Theme::Light, 8.5)] {
+        let visuals = &ctx.style_of(theme).visuals;
+        // Widget text is painted on the button fill, not on the panel.
+        for (name, color, bgs) in [
+            (
+                "body",
+                visuals.text_color(),
+                [visuals.panel_fill, visuals.extreme_bg_color],
+            ),
+            (
+                "widget",
+                visuals.widgets.inactive.text_color(),
+                // A frameless button (the tab strip) keeps the panel behind it.
+                [visuals.widgets.inactive.weak_bg_fill, visuals.panel_fill],
+            ),
+        ] {
+            for bg in bgs {
+                let ratio = contrast(color, bg);
+                assert!(
+                    ratio >= floor,
+                    "{} text in {:?} is {:.2}:1 on {:?}",
+                    name,
+                    theme,
+                    ratio,
+                    bg
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn the_rank_ramp_is_an_even_sweep_from_blue_to_red() {
     let mut prev: Option<f64> = None;
@@ -265,8 +361,8 @@ fn the_rank_ramp_is_an_even_sweep_from_blue_to_red() {
     );
 }
 
-/// The chips carry fixed near-black text, so every tier has to stay light
-/// enough to hold it — the reason the ramp has its own lightness.
+/// The chips carry fixed near-black text: the reason the ramp has its own
+/// lightness, apart from the palette's.
 #[test]
 fn every_chip_holds_its_dark_text() {
     let text = Color32::from_rgb(32, 32, 32);
@@ -276,8 +372,6 @@ fn every_chip_holds_its_dark_text() {
     }
 }
 
-/// Stages outside the cascade share the weakest tier's chip: 0 and 11
-/// and up all land there.
 #[test]
 fn stages_outside_the_cascade_take_the_last_chip() {
     let worst = RANK_RAMP[RANK_TIERS - 1];

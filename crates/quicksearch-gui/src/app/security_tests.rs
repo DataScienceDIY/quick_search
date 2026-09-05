@@ -142,6 +142,68 @@ fn the_reveal_shows_the_key_and_what_holding_it_means() {
     assert!(painted.contains(&"Close".to_string()), "{painted:?}");
 }
 
+/// The key alone opens nothing: a tool left on SQLCipher's defaults decrypts
+/// this file to noise and calls the key wrong. The screen has to say both
+/// halves of the layout, as the values the other tool needs typed in.
+#[test]
+fn the_reveal_shows_the_layout_the_index_was_built_under() {
+    use quicksearch_core::db::schema::{HMAC_MODE, PAGE_SIZE};
+
+    let ctx = crate::test_ui::ctx();
+    let painted = painted_text(&frame(&ctx, &format!("0x{KEY}"), Vec::new()).0);
+
+    assert!(
+        painted.contains(&format!("Page size: {PAGE_SIZE}")),
+        "the page size is not on screen: {painted:?}"
+    );
+    assert!(
+        painted.contains(&format!("Page HMAC: {}", HMAC_MODE.label())),
+        "the page authenticator is not on screen: {painted:?}"
+    );
+    assert!(
+        painted.iter().any(|t| t.contains("set both of the above")),
+        "nothing says the layout has to be entered too: {painted:?}"
+    );
+    assert_ne!(
+        PAGE_SIZE, SQLCIPHER_DEFAULT_PAGE_SIZE,
+        "the advice only makes sense while the index is off the default"
+    );
+}
+
+/// A tool cannot be told "HMAC off" in prose — it needs the pragma. The hint
+/// carries it whenever the index is off SQLCipher's default authenticator, and
+/// omits it when there is nothing to say.
+#[test]
+fn the_reveal_spells_out_the_hmac_pragma_when_there_is_one() {
+    use quicksearch_core::db::schema::{HmacMode, HMAC_MODE, PAGE_SIZE};
+
+    let ctx = crate::test_ui::ctx();
+    let painted = painted_text(&frame(&ctx, &format!("0x{KEY}"), Vec::new()).0);
+    let hint = painted
+        .iter()
+        .find(|t| t.contains("set both of the above"))
+        .unwrap_or_else(|| panic!("no layout hint painted: {painted:?}"));
+
+    match HMAC_MODE {
+        HmacMode::Sha512 => assert!(
+            !hint.contains("cipher_use_hmac") && !hint.contains("cipher_hmac_algorithm"),
+            "the index is on SQLCipher's own default; there is no pragma to give: {hint}"
+        ),
+        HmacMode::Off => assert!(
+            hint.contains("PRAGMA cipher_use_hmac = OFF;"),
+            "the pragma that turns the authenticator off is missing: {hint}"
+        ),
+        HmacMode::Sha256 => assert!(
+            hint.contains("PRAGMA cipher_hmac_algorithm = HMAC_SHA256;"),
+            "the pragma that selects the authenticator is missing: {hint}"
+        ),
+    }
+    assert!(
+        hint.contains(&format!("PRAGMA cipher_page_size = {};", PAGE_SIZE)),
+        "the page-size pragma is missing: {hint}"
+    );
+}
+
 #[test]
 fn both_of_the_reveal_buttons_report_their_click() {
     let display = format!("0x{KEY}");

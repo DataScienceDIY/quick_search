@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::*;
 use crate::testutil::{scratch_dir, touch};
 
-/// Run to completion with cancellation switched off, returning every update.
 fn run(paths: &[PathBuf]) -> Vec<VerifyUpdate> {
     let cancel = AtomicBool::new(false);
     let mut seen = Vec::new();
@@ -12,8 +11,7 @@ fn run(paths: &[PathBuf]) -> Vec<VerifyUpdate> {
     seen
 }
 
-/// The report from a run, asserting it produced exactly one terminal update
-/// and that the update was `Done`.
+/// Asserts the run produced exactly one terminal update, a `Done`.
 fn report(paths: &[PathBuf]) -> VerifyReport {
     let seen = run(paths);
     let terminal: Vec<&VerifyUpdate> = seen
@@ -27,7 +25,6 @@ fn report(paths: &[PathBuf]) -> VerifyReport {
     }
 }
 
-/// `n` files in a fresh directory, each with the body it is given.
 fn files(tag: &str, bodies: &[&[u8]]) -> Vec<PathBuf> {
     let dir = scratch_dir(tag);
     bodies
@@ -93,8 +90,6 @@ fn a_shared_head_with_a_different_tail_is_caught() {
 /// both exercised rather than assumed.
 #[test]
 fn a_difference_past_the_first_chunk_is_found() {
-    // Two files, so the chunk is the 256 KiB ceiling and the difference sits
-    // in the second one.
     let size = MAX_CHUNK * 2 + 1234;
     let a = vec![7u8; size];
     let mut b = a.clone();
@@ -104,9 +99,8 @@ fn a_difference_past_the_first_chunk_is_found() {
 
     let r = report(&paths);
     assert_eq!(r.verdicts[1], MemberVerdict::DiffersAt(at as u64));
-    // Two chunks out of each file and then it stops: with nothing left to
-    // compare against, reading the remainder of the reference would be work
-    // that cannot change the answer.
+    // Two chunks out of each file and then it stops: nothing left to
+    // compare against.
     assert_eq!(
         r.bytes_read,
         4 * MAX_CHUNK as u64,
@@ -202,9 +196,7 @@ fn a_run_cancelled_before_it_starts_reports_only_that() {
 }
 
 /// Cancelling part way through ends the run there, with no `Done` claiming a
-/// verdict it never reached. The first chunk always reports progress, so the
-/// flag goes up between two chunks rather than at a time the test has to race
-/// for.
+/// verdict it never reached.
 #[test]
 fn cancelling_mid_run_ends_it_without_a_verdict() {
     let body = vec![3u8; MAX_CHUNK * 4];
@@ -258,9 +250,7 @@ fn progress_climbs_and_never_overruns_its_denominator() {
 }
 
 /// A directory is not a file this can compare, however the platform refuses
-/// it — `File::open` fails outright on Windows, while on Linux it opens and
-/// then refuses to be read. Either way it is that member's problem, not the
-/// run's.
+/// it; either way it is that member's problem, not the run's.
 #[test]
 fn an_unreadable_member_does_not_stop_the_run() {
     let dir = scratch_dir("verify-dir");

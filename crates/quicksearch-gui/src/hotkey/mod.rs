@@ -1,69 +1,51 @@
-//! The system-wide shortcut that raises QuickSearch and focuses the search
-//! box.
+//! The in-application half of the search shortcut: the key QuickSearch
+//! claims for itself while it is running. Windows and X11 grant that via
+//! `global-hotkey` (`RegisterHotKey`/`XGrabKey`); Wayland refuses grabs by
+//! design, so it goes through the XDG portal and the *desktop* picks the key.
 //!
-//! It must be registered with the operating system — an egui shortcut gets
-//! no key events while the window is minimised, behind something else, or
-//! unfocused. Two ways, chosen by what the session is:
-//!
-//! * **Windows and X11** let an application claim a key for itself
-//!   (`RegisterHotKey`, `XGrabKey`), which `global-hotkey` wraps. The key is
-//!   exactly the one that was asked for, or the registration fails.
-//! * **Wayland** does not, on purpose, so the shortcut goes through the XDG
-//!   desktop portal instead and the *desktop* owns the binding. See
-//!   [`portal`].
+//! This is the path that needs no setup at all, and it is why the Settings
+//! tab can offer an arbitrary combination on every platform. It cannot fire
+//! while QuickSearch is not running — nothing an application registers for
+//! itself can — which is what [`crate::activate`] and `--toggle` are for.
+//! Both funnel into the same pending flag, so the window comes forward the
+//! same way whichever one fired.
 //!
 //! Held in a thread-local global rather than a field: the registration is
-//! process-wide, `GlobalHotKeyEvent::set_event_handler` is a set-once
-//! global, and on Windows `GlobalHotKeyManager` owns a hidden message
-//! window, so it is not `Send` and must stay on the winit event-loop thread.
-//!
-//! Every entry point is inert until [`init`] runs, so the headless UI tests
-//! never touch an OS registration.
+//! process-wide, the event handler is set-once, and on Windows
+//! `GlobalHotKeyManager` is not `Send`. Every entry point is inert until
+//! [`init`] runs, so headless UI tests never touch an OS registration.
 
 mod binding;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod portal;
-mod raise;
 
 pub use binding::{parse_setting, Binding};
-pub use raise::raise;
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
-/// Set from whichever thread the shortcut arrives on, consumed by the UI
-/// thread in [`take_fired`]. A flag rather than a queue: two presses before
-/// the app can redraw mean the same thing as one.
-static FIRED: AtomicBool = AtomicBool::new(false);
-
 thread_local! {
-    /// UI-thread only. See the module docs for why it is not a field.
     static REGISTRY: RefCell<Option<Registry>> = const { RefCell::new(None) };
 }
 
 /// What the Settings tab says about the shortcut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
-    /// The setting is empty: no shortcut, by choice.
     Disabled,
-    /// Registered with the display server, exactly as asked.
     Active,
-    /// Asked for, and the desktop has not answered yet.
+    /// Asked for; the desktop has not answered yet.
     Pending,
-    /// Wayland: registered, described in the desktop's own words because the
-    /// desktop, not the setting, decides the key.
+    /// Wayland: described in the desktop's own words, because the desktop,
+    /// not the setting, decides the key.
     PortalBound(String),
-    /// It is not going to work, and this says why.
     Error(String),
 }
 
 struct Registry {
     backend: Backend,
-    /// The status of everything except the portal, which reports its own
-    /// asynchronously; see [`status`].
+    /// Everything except the portal, which reports its own asynchronously.
     status: Status,
 }
 
@@ -73,22 +55,17 @@ enum Backend {
     /// Windows and X11.
     Grab {
         manager: GlobalHotKeyManager,
-        /// The registration currently held, to be released before the next.
         registered: Option<HotKey>,
     },
     #[cfg(all(unix, not(target_os = "macos")))]
     Portal(portal::Portal),
 }
 
-/// Start the shortcut and register `setting`.
-///
-/// Must be called on the thread running the event loop, and only from there:
-/// on Windows `GlobalHotKeyManager` creates a hidden window whose messages
-/// that loop is what dispatches. In practice that means eframe's app-creation
-/// closure, which runs on the main thread with the loop already going.
+/// Start the shortcut and register `setting`. Must be called on the
+/// event-loop thread: on Windows `GlobalHotKeyManager` creates a hidden
+/// window whose messages that loop dispatches.
 pub fn init(ctx: &egui::Context, setting: &str) {
-    // Press only: the crate reports the release as a second event, and
-    // acting on both means every press does its work twice.
+    // Press only: the crate reports the release as a second event.
     let repaint = ctx.clone();
     GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
         if event.state == HotKeyState::Pressed {
@@ -118,10 +95,9 @@ pub fn init(ctx: &egui::Context, setting: &str) {
     apply(setting);
 }
 
-/// Register `setting`, releasing whatever was registered before. Empty means
-/// no shortcut. An unparseable or refused shortcut is reported through
-/// [`status`], never by failing: a shortcut is not worth blocking a config
-/// the user has already applied.
+/// Register `setting`, releasing whatever was registered before. An
+/// unparseable or refused shortcut is reported through [`status`], never by
+/// failing: not worth blocking a config the user has already applied.
 pub fn apply(setting: &str) {
     REGISTRY.with_borrow_mut(|slot| {
         let Some(registry) = slot.as_mut() else {
@@ -131,7 +107,6 @@ pub fn apply(setting: &str) {
             Ok(binding) => binding,
             Err(e) => {
                 registry.status = Status::Error(format!("{:?} is not a shortcut: {}", setting, e));
-                // Releasing cannot fail in a way worth a second message.
                 let _ = registry.backend.register(None);
                 return;
             }
@@ -141,8 +116,8 @@ pub fn apply(setting: &str) {
             Ok(()) => Status::Disabled,
             Err(e) => Status::Error(e),
         };
-        // Logged because a shortcut that quietly does nothing is impossible
-        // to tell apart from one that was never asked for.
+        // A shortcut that quietly does nothing is indistinguishable from
+        // one that was never asked for; log it.
         match (&registry.status, wanted) {
             (Status::Active, Some(binding)) => {
                 quicksearch_core::log_info!("global shortcut: {} registered", binding)
@@ -153,17 +128,10 @@ pub fn apply(setting: &str) {
     });
 }
 
-/// Whether the shortcut was pressed since this was last asked, clearing it.
-pub fn take_fired() -> bool {
-    FIRED.swap(false, Ordering::SeqCst)
-}
-
-/// What to tell the user about the shortcut right now.
 pub fn status() -> Status {
     REGISTRY.with_borrow(|slot| match slot.as_ref() {
         None => Status::Disabled,
-        // The portal answers on its own schedule, so it keeps its own status
-        // and this one is stale the moment a bind is sent.
+        // The portal answers on its own schedule and keeps its own status.
         #[cfg(all(unix, not(target_os = "macos")))]
         Some(Registry {
             backend: Backend::Portal(portal),
@@ -173,11 +141,11 @@ pub fn status() -> Status {
     })
 }
 
-/// Record a press and wake the UI: without the repaint an idle or minimised
-/// window would leave the flag unread until something else asked for a frame.
+/// Hand the press to [`crate::activate`], which owns the pending flag and
+/// the repaint. One place to consume, whether the press came from our own
+/// registration or from a `--toggle` the desktop launched.
 fn fire(ctx: &egui::Context) {
-    FIRED.store(true, Ordering::SeqCst);
-    ctx.request_repaint();
+    crate::activate::fire(ctx);
 }
 
 impl Backend {
@@ -190,9 +158,7 @@ impl Backend {
                 registered,
             } => {
                 if let Some(old) = registered.take() {
-                    // A failed unregister leaves a key claimed that nothing
-                    // listens for; worth reporting, not worth refusing the
-                    // new binding over.
+                    // Worth reporting, not worth refusing the new binding over.
                     if let Err(e) = manager.unregister(old) {
                         quicksearch_core::log_warn!("releasing the old global shortcut: {}", e);
                     }
@@ -200,8 +166,6 @@ impl Backend {
                 let Some(binding) = wanted else {
                     return Ok(());
                 };
-                // Infallible in practice: a test holds `Binding`'s tokens to
-                // being parseable.
                 let hotkey: HotKey = binding
                     .to_string()
                     .parse()
@@ -224,11 +188,9 @@ impl Backend {
     }
 }
 
-/// Wayland refuses key grabs by design, so a session with a Wayland display
-/// gets the portal and everything else gets a grab. No falling back from one
-/// to the other: an X11 grab made from inside a Wayland session succeeds and
-/// then only ever fires while an XWayland window has focus, which looks like
-/// a broken shortcut rather than an unavailable one.
+/// A Wayland session gets the portal, everything else a grab. No falling
+/// back: an X11 grab inside a Wayland session succeeds and then only fires
+/// while an XWayland window has focus — a broken-looking shortcut.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn choose_backend(ctx: &egui::Context) -> Result<Backend, String> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
@@ -255,24 +217,15 @@ fn grab_backend() -> Result<Backend, String> {
 mod tests {
     use super::*;
 
-    /// Nothing may touch an OS registration before `init`, so that the
-    /// headless UI tests can render the Settings row.
+    /// Nothing may touch an OS registration before `init`.
     #[test]
     fn an_uninitialised_registry_is_inert() {
         apply("Ctrl+Shift+F");
         assert_eq!(status(), Status::Disabled);
-        assert!(!take_fired());
+        assert!(!crate::activate::take_pending());
     }
 
-    #[test]
-    fn a_press_is_reported_once() {
-        FIRED.store(true, Ordering::SeqCst);
-        assert!(take_fired());
-        assert!(!take_fired(), "the flag is consumed");
-    }
-
-    /// `Idle` stands in for a backend that never started; it must accept
-    /// every call rather than panic, since `apply` runs on every config save.
+    /// `Idle` must accept every call: `apply` runs on every config save.
     #[test]
     fn an_idle_backend_accepts_everything() {
         let mut backend = Backend::Idle;

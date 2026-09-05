@@ -5,7 +5,6 @@ use super::*;
 
 use crate::ui_util::{centered_modal, hint};
 
-/// A button (or Esc/backdrop click) in the unsaved-changes modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum UnsavedChoice {
     Apply,
@@ -50,7 +49,7 @@ impl QuickSearchApp {
                 ));
                 ui.horizontal(|ui| {
                     if ui.button("Rebuild now").clicked() {
-                        self.backend.coordinator.rebuild_index();
+                        self.backend.rebuild_index();
                         close = true;
                     }
                     if ui.button("Later").clicked() {
@@ -88,30 +87,34 @@ impl QuickSearchApp {
         }
     }
 
-    /// Tell the user their index is being replaced because it belongs to an
-    /// older version. The button starts the rebuild rather than merely
-    /// dismissing — in manual mode nothing else would.
+    /// The button starts the rebuild rather than merely dismissing — in
+    /// manual mode nothing else would.
     pub(super) fn stale_index_prompt_ui(&mut self, ctx: &egui::Context) {
         if !self.stale_index_prompt {
             return;
         }
-        if stale_index_window(ctx, self.key_source) {
+        let command = stale_prompt_should_command(
+            self.backend.coordinator.state().mode,
+            self.backend.coordinator.is_indexing(),
+        );
+        if stale_index_window(ctx, self.key_source, command) {
             self.stale_index_prompt = false;
-            self.backend.coordinator.rebuild_index();
+            if command {
+                self.backend.rebuild_index();
+            }
+            // Either way the index is being replaced under the tab.
             self.dups.state = DupState::NotLoaded;
         }
     }
 
-    /// Tell the user their settings have not reached the index. Work still
-    /// owed means a pass was abandoned or the config was edited while the
-    /// app was closed. Hidden while a run or reconcile is in progress.
+    /// Work still owed means a pass was abandoned or the config was edited
+    /// while the app was closed. Hidden while a run or reconcile is going.
     pub(super) fn reconcile_owed_ui(&mut self, ctx: &egui::Context) {
         if !self.reconcile_owed {
             return;
         }
         let state = self.backend.coordinator.state();
-        // A completed run reconciles from the same record and stamps it; a
-        // run the user stops does not move this.
+        // A completed run stamps this; a run the user stops does not.
         if state.last_full_index > self.reconcile_owed_since {
             self.reconcile_owed = false;
             return;
@@ -127,8 +130,8 @@ impl QuickSearchApp {
             None => {}
             Some(ReconcileOwedChoice::StartIndexing) => {
                 self.backend.coordinator.reindex_now();
-                // Not cleared here: the run that finishes clears it, and one
-                // that is stopped half-way leaves the reminder standing.
+                // The run that finishes clears it; one stopped half-way
+                // leaves the reminder standing.
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
             Some(ReconcileOwedChoice::Dismiss) => self.reconcile_owed = false,
@@ -158,6 +161,15 @@ impl QuickSearchApp {
                         group_thousands(*registered as u64),
                     ));
                 }
+                // Not reachable today: an overflow schedules a full run
+                // instead of disabling live updates. Spelled out so a future
+                // variant is a compile error here.
+                WatchError::Overflowed => {
+                    ui.label(
+                        "The system dropped some change notifications, so the index \
+                         is being rebuilt to catch up.",
+                    );
+                }
                 WatchError::Other(msg) => {
                     ui.label(format!("Live updates are unavailable: {}", msg));
                 }
@@ -181,31 +193,55 @@ impl QuickSearchApp {
                     self.cfg.ui.watch_cap_warned_roots.push(root.clone());
                 }
             }
-            if let Err(e) = self.cfg.save() {
-                self.config_error = Some(e);
-            }
+            self.save_cfg();
         }
     }
 
-    /// The first-start tour. Dismissal is written straight to the config, the
-    /// way the fuzzy default is — not through the Settings draft, which this
-    /// has nothing to do with.
+    /// Dismissal is written straight to the config, not the Settings draft.
     pub(super) fn tutorial_ui(&mut self, ctx: &egui::Context) {
         let Some(tour) = &mut self.tutorial else {
             return;
         };
         let roots = self.cfg.paths.indexing_paths.clone();
-        if tour.ui(ctx, &roots) {
+        let hotkey = self.cfg.ui.search_hotkey.clone();
+        let actions = tour.ui(ctx, &roots, &hotkey);
+        // Through the same path a keystroke takes: `seed` arms the debounce,
+        // so the demonstration search runs once the typing stops.
+        if let Some(query) = actions.set_query {
+            self.search.seed(query);
+        }
+        if actions.focus_search {
+            self.search.request_focus();
+        }
+        // Live, like the Settings slider on Apply — but saved only when the
+        // drag ends, so crossing the slider does not rewrite the config file
+        // on every frame.
+        if let Some(scale) = actions.set_scale {
+            self.cfg.ui.scale = scale;
+            ctx.set_zoom_factor(super::clamp_scale(scale));
+            if actions.save_scale {
+                self.save_cfg();
+            }
+        }
+        // Registered as it is captured, not on an Apply the tour has no
+        // button for — the page says it takes effect at once.
+        if let Some(hotkey) = actions.set_hotkey {
+            crate::hotkey::apply(&hotkey);
+            self.cfg.ui.search_hotkey = hotkey;
+            self.save_cfg();
+        }
+        // Through the guard, so a dirty draft still gets its say.
+        if let Some(tab) = actions.goto_tab {
+            self.request_tab(ctx, tab);
+        }
+        if actions.dismissed {
             self.tutorial = None;
             self.cfg.ui.tutorial_seen = Some(true);
-            if let Err(e) = self.cfg.save() {
-                self.config_error = Some(e);
-            }
+            self.save_cfg();
         }
     }
 
-    /// Re-open the tour from the Help tab. Nothing is written until it is
-    /// dismissed again, so a re-read costs the config nothing.
+    /// Re-open the tour from the Help tab.
     pub(crate) fn show_tutorial(&mut self) {
         self.tutorial = Some(crate::tutorial::Tutorial::new());
     }
@@ -224,10 +260,9 @@ impl QuickSearchApp {
                 let delete = egui::RichText::new("Delete index").color(ui.visuals().error_fg_color);
                 if ui.button(delete).clicked() {
                     // Manual first, and persisted: automatic mode must not
-                    // resurrect what was just deleted, nor the next launch
-                    // undo the stop.
+                    // resurrect what was just deleted.
                     self.set_index_mode(false);
-                    self.backend.coordinator.clear_index();
+                    self.backend.clear_index();
                     self.dups.state = DupState::NotLoaded;
                     return true;
                 }
@@ -240,23 +275,18 @@ impl QuickSearchApp {
         }
     }
 
-    /// Drive the unsaved-changes guard. Each frame the pending intent picks
-    /// the editor to ask about; Apply and Discard clean one editor and the
-    /// next frame moves on or falls through to the navigation. Cancel —
-    /// button, Esc, or a backdrop click — drops the intent.
+    /// Each frame the pending intent picks the editor to ask about; Apply
+    /// and Discard clean one editor and the next frame moves on. Cancel —
+    /// button, Esc, or backdrop click — drops the intent.
     pub(super) fn unsaved_prompt_ui(&mut self, ctx: &egui::Context) {
         let Some(intent) = self.pending_nav else {
             return;
         };
         let dirty = (self.manage.is_dirty(), self.settings.is_dirty(&self.cfg));
-        // `self.tab` is the tab being left: the switch itself is what the
-        // intent is holding back.
         let Some(source) = guard_source(intent, self.tab, dirty.0, dirty.1) else {
-            // Inside the guard: the Discard-then-quit path sets
-            // `quit_confirmed` and never returns to the close-request check,
-            // so a warning living only there would be skipped.
+            // Inside the guard: the Discard-then-quit path never returns to
+            // the close-request check, so a warning only there is skipped.
             if quit_needs_reconcile_warning(intent, self.backend.coordinator.reconciling()) {
-                // Repaint so a reconcile that ends takes the modal with it.
                 ctx.request_repaint_after(Duration::from_millis(250));
                 match reconcile_quit_modal(ctx) {
                     None => return,
@@ -300,15 +330,13 @@ impl QuickSearchApp {
                     },
                 };
                 if !ok {
-                    // Rejected (nested roots): stay put, keep the staged
-                    // edits; the error banner explains what to fix.
+                    // Rejected: stay put, keep the staged edits.
                     self.pending_nav = None;
                 }
             }
         }
     }
 
-    /// Perform a navigation the guard has cleared.
     pub(super) fn complete_nav(&mut self, ctx: &egui::Context, intent: NavIntent) {
         self.pending_nav = None;
         match intent {
@@ -321,11 +349,8 @@ impl QuickSearchApp {
     }
 }
 
-/// Body of the unsaved-changes guard; `Some(choice)` when the user decided
-/// this frame. Esc and a click on the backdrop count as Cancel.
-///
-/// Unlike the centered `egui::Window` the other prompts use, `egui::Modal`'s
-/// backdrop blocks input to everything behind it — a click landing on the
+/// Esc and a backdrop click count as Cancel. `egui::Modal`, not the usual
+/// centered window: its backdrop blocks input, and a click landing on the
 /// tab strip would re-trigger or bypass the guard.
 fn unsaved_changes_modal(ctx: &egui::Context, source: UnsavedSource) -> Option<UnsavedChoice> {
     let mut choice = None;
@@ -364,14 +389,12 @@ fn unsaved_changes_modal(ctx: &egui::Context, source: UnsavedSource) -> Option<U
     choice
 }
 
-/// What the user chose in the "settings not applied yet" banner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ReconcileOwedChoice {
     StartIndexing,
     Dismiss,
 }
 
-/// The banner's body, as a top panel under the config-error one.
 fn reconcile_owed_banner(ctx: &egui::Context) -> Option<ReconcileOwedChoice> {
     let mut choice = None;
     egui::TopBottomPanel::top("reconcile-owed").show(ctx, |ui| {
@@ -391,8 +414,7 @@ fn reconcile_owed_banner(ctx: &egui::Context) -> Option<ReconcileOwedChoice> {
     choice
 }
 
-/// Body of the quit-during-a-reconcile guard; `Some(true)` to quit anyway,
-/// `Some(false)` to stay. Esc and a backdrop click count as staying.
+/// `Some(true)` to quit anyway; Esc and a backdrop click count as staying.
 fn reconcile_quit_modal(ctx: &egui::Context) -> Option<bool> {
     let mut choice = None;
     let modal = egui::Modal::new(egui::Id::new("reconcile-quit-guard")).show(ctx, |ui| {
@@ -434,9 +456,17 @@ fn reconcile_quit_modal(ctx: &egui::Context) -> Option<bool> {
     choice
 }
 
-/// The stale-index window's body. Returns whether the user asked for the
-/// rebuild.
-fn stale_index_window(ctx: &egui::Context, key_source: KeySource) -> bool {
+/// Whether the stale-index button has to command the rebuild itself.
+///
+/// In Auto the coordinator already does: the recreated index has no
+/// `last_full_index`, so its first tick schedules a full run. Sending
+/// `RebuildIndex` on top of that deletes the rebuild in progress and starts
+/// it over from zero. Only manual mode needs the button to do anything.
+pub(super) fn stale_prompt_should_command(mode: IndexMode, indexing: bool) -> bool {
+    mode != IndexMode::Auto && !indexing
+}
+
+fn stale_index_window(ctx: &egui::Context, key_source: KeySource, command: bool) -> bool {
     centered_modal(ctx, "Index reset for this version", |ui| {
         ui.set_max_width(440.0);
         ui.label(
@@ -465,13 +495,12 @@ fn stale_index_window(ctx: &egui::Context, key_source: KeySource) -> bool {
              until the rebuild finishes; progress is on the Manage Index tab.",
         ));
         ui.add_space(4.0);
-        ui.button("Rebuild now").clicked()
+        ui.button(if command { "Rebuild now" } else { "Continue" })
+            .clicked()
     })
     .unwrap_or(false)
 }
 
-/// A stored/current config value for the rebuild prompt; list values are
-/// already newline-joined and render as-is, empty means unset.
 fn display_value(value: &str) -> String {
     if value.trim().is_empty() {
         "(none)".to_string()
@@ -484,20 +513,24 @@ fn display_value(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn frame(ctx: &egui::Context, source: KeySource, events: Vec<egui::Event>) -> bool {
+    fn frame(
+        ctx: &egui::Context,
+        source: KeySource,
+        command: bool,
+        events: Vec<egui::Event>,
+    ) -> bool {
         let input = crate::test_ui::raw_input(SCREEN, events);
         let mut clicked = false;
-        let _ = ctx.run(input, |ctx| clicked = stale_index_window(ctx, source));
+        let _ = ctx.run(input, |ctx| {
+            clicked = stale_index_window(ctx, source, command)
+        });
         clicked
     }
 
     use crate::test_ui::click_at;
 
-    /// The viewport every modal in this module is centred in.
     const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
 
-    /// The stale-index modal renders under every key source and its one
-    /// button reports the click that starts the rebuild.
     #[test]
     fn the_stale_index_modal_renders_and_its_button_fires() {
         for source in [
@@ -505,28 +538,31 @@ mod tests {
             KeySource::Prompt,
             KeySource::Keychain,
         ] {
-            let ctx = crate::test_ui::ctx();
-            assert!(
-                !frame(&ctx, source, Vec::new()),
-                "an untouched frame must not request a rebuild"
-            );
+            // Both button labels: "Rebuild now" when the click starts the
+            // rebuild, "Continue" when one is already running.
+            for command in [true, false] {
+                let ctx = crate::test_ui::ctx();
+                assert!(
+                    !frame(&ctx, source, command, Vec::new()),
+                    "an untouched frame must not request a rebuild"
+                );
 
-            // Sweep for the button: the window's height depends on which
-            // sentence is shown.
-            let mut fired = None;
-            'sweep: for y in (230..480).step_by(3) {
-                for x in (250..760).step_by(6) {
-                    let pos = egui::pos2(x as f32, y as f32);
-                    if frame(&ctx, source, click_at(pos)) {
-                        fired = Some(pos);
-                        break 'sweep;
+                // The window's height depends on which sentence is shown; sweep.
+                let mut fired = None;
+                'sweep: for y in (230..480).step_by(3) {
+                    for x in (250..760).step_by(6) {
+                        let pos = egui::pos2(x as f32, y as f32);
+                        if frame(&ctx, source, command, click_at(pos)) {
+                            fired = Some(pos);
+                            break 'sweep;
+                        }
                     }
                 }
+                assert!(
+                    fired.is_some(),
+                    "no clickable button for {source:?} (command: {command})"
+                );
             }
-            assert!(
-                fired.is_some(),
-                "no clickable Rebuild button for {source:?}"
-            );
         }
     }
 
@@ -541,8 +577,6 @@ mod tests {
         choice
     }
 
-    /// Every way out of the guard reports the right choice: all three
-    /// buttons fire, Esc cancels, and an untouched frame decides nothing.
     #[test]
     fn the_unsaved_modal_reports_each_choice() {
         for source in [UnsavedSource::Manage, UnsavedSource::Settings] {
@@ -595,7 +629,6 @@ mod tests {
         choice
     }
 
-    /// Both ways out of the quit warning work, and neither is the default.
     #[test]
     fn the_quit_warning_reports_both_answers() {
         let ctx = crate::test_ui::ctx();
@@ -638,14 +671,12 @@ mod tests {
         choice
     }
 
-    /// Both banner buttons report their clicks.
     #[test]
     fn the_reconcile_banner_reports_both_buttons() {
         let ctx = crate::test_ui::ctx();
         assert_eq!(banner_frame(&ctx, Vec::new()), None);
 
         let mut seen = std::collections::HashSet::new();
-        // A top panel, so it sits in the first rows of the window.
         for y in (0..60).step_by(2) {
             for x in (0..1000).step_by(4) {
                 if let Some(choice) = banner_frame(&ctx, click_at(egui::pos2(x as f32, y as f32))) {

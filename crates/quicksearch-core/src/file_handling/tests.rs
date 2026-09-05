@@ -45,7 +45,6 @@ fn filtered_walk_prunes_hidden_and_ignored() {
     names.sort();
     assert_eq!(names, vec!["keep.txt", "keep2.txt"]);
 
-    // include_hidden brings back dotfiles but ignores still apply.
     let mut names: Vec<String> = filtered_walk(
         root.to_str().unwrap(),
         false,
@@ -64,9 +63,8 @@ fn filtered_walk_prunes_hidden_and_ignored() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The watcher spends one inotify descriptor per directory this yields,
-/// so it must prune exactly like [`filtered_walk`] — the pruned
-/// subtrees are the whole saving.
+/// The watcher spends one inotify descriptor per directory this yields, so
+/// it must prune exactly like [`filtered_walk`].
 #[test]
 fn filtered_dirs_yields_only_kept_directories() {
     let root = tmp_tree();
@@ -87,14 +85,12 @@ fn filtered_dirs_yields_only_kept_directories() {
     .map(|e| e.file_name().to_string_lossy().into_owned())
     .collect();
     names.sort();
-    // The root itself is included (depth 0 is always kept); `.hidden`,
-    // `node_modules`, and `node_modules/dep` cost nothing.
+    // The root itself is included (depth 0 is always kept).
     let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
     let mut want = vec![root_name.clone(), "nested".to_string(), "sub".to_string()];
     want.sort();
     assert_eq!(names, want);
 
-    // include_hidden brings the dotted directory back.
     let names: Vec<String> = filtered_dirs(
         root.to_str().unwrap(),
         false,
@@ -113,8 +109,7 @@ fn filtered_dirs_yields_only_kept_directories() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// Files and directories partition the walk: every entry lands in
-/// exactly one of the two iterators.
+/// Every entry lands in exactly one of the two iterators.
 #[test]
 fn filtered_dirs_and_filtered_walk_do_not_overlap() {
     let root = tmp_tree();
@@ -153,8 +148,7 @@ fn filtered_dirs_and_filtered_walk_do_not_overlap() {
 
 #[test]
 fn filtered_walk_hidden_root_still_walked() {
-    // Users explicitly chose their roots — a hidden root dir must not
-    // silence the whole walk.
+    // A hidden root dir must not silence the whole walk.
     let base = tmp_tree();
     let root = base.join(".config");
     touch(&root.join("app.conf"));
@@ -196,8 +190,8 @@ fn classify_uses_mtime_against_the_existing_index() {
 
 #[test]
 fn classify_by_mtime_matches_the_name_keyed_path() {
-    // Resolved symlink targets take this route because their row is
-    // found by exact path, not by name within the directory walked.
+    // Resolved symlink targets take this route: their row is found by
+    // exact path.
     assert_eq!(classify_by_mtime(None, 100), FileIndexAction::Insert);
     assert_eq!(classify_by_mtime(Some(100), 100), FileIndexAction::Skip);
     assert_eq!(classify_by_mtime(Some(99), 100), FileIndexAction::Update);
@@ -213,15 +207,12 @@ fn db_path_strips_windows_prefixes() {
         path_to_db_string(Path::new(r"\\?\C:\docs\a.txt")),
         r"C:\docs\a.txt"
     );
-    // A share must come back as \\server\share, not UNC\server\share —
-    // stripping a fixed four characters produces a path that cannot be
-    // opened, and every file beneath it would be misfiled.
+    // A share must come back as \\server\share, not UNC\server\share.
     assert_eq!(
         path_to_db_string(Path::new(r"\\?\UNC\server\share\a.txt")),
         r"\\server\share\a.txt"
     );
-    // A volume mounted at a folder has no drive letter, so the prefix is
-    // load-bearing: `Volume{...}\a.txt` is not a path anything can open.
+    // The `\\?\` prefix is load-bearing for a Volume{GUID} mount.
     assert_eq!(
         path_to_db_string(Path::new(r"\\?\Volume{9f8a}\data\a.txt")),
         r"\\?\Volume{9f8a}\data\a.txt"
@@ -229,8 +220,7 @@ fn db_path_strips_windows_prefixes() {
 }
 
 /// The range must bracket paths spelled with the *platform's* separator: a
-/// hard-coded `'/' + 1` `hi` sorts below every `C:\…` path, leaving an empty
-/// range that silently disables extraction and the vanished-directory sweep.
+/// hard-coded `'/' + 1` `hi` sorts below every `C:\…` path.
 #[test]
 fn extract_cursor_brackets_paths_under_its_root() {
     use std::path::MAIN_SEPARATOR as SEP;
@@ -246,8 +236,8 @@ fn extract_cursor_brackets_paths_under_its_root() {
         c.hi
     );
 
-    // The directory itself is *not* in the range (the range is what lives
-    // beneath it), and a prefix sibling is outside it.
+    // The directory itself is *not* in the range; a prefix sibling is
+    // outside it.
     assert!(root.as_str() < c.lo.as_str());
     let sibling = format!("{}Users{}mexico{}a.txt", root_prefix(), SEP, SEP);
     assert!(
@@ -257,14 +247,12 @@ fn extract_cursor_brackets_paths_under_its_root() {
         root
     );
 
-    // A trailing separator of either flavour must not double up.
     for spelled in [format!("{}/", root), format!("{}\\", root)] {
         let c2 = ExtractCursor::for_root(&spelled);
         assert_eq!((&c2.lo, &c2.hi), (&c.lo, &c.hi), "spelled {:?}", spelled);
     }
 }
 
-/// An absolute-path prefix for the running platform.
 fn root_prefix() -> String {
     if cfg!(windows) {
         r"C:\".to_string()
@@ -273,8 +261,7 @@ fn root_prefix() -> String {
     }
 }
 
-/// A Remove event names a path that is already gone, so the key for it has
-/// to be built from the deepest ancestor that still resolves.
+/// A Remove event names a path that is already gone.
 #[test]
 fn db_key_for_a_vanished_path_canonicalizes_what_remains() {
     let root = tmp_tree();
@@ -287,8 +274,7 @@ fn db_key_for_a_vanished_path_canonicalizes_what_remains() {
     let expected = path_to_db_string(&real.canonicalize().unwrap().join("gone").join("deeper.txt"));
     assert_eq!(key, expected, "existing prefix resolved, missing tail kept");
 
-    // A redundant component in the *existing* part is collapsed, which is
-    // the whole point — the stored key never contains one.
+    // A redundant component in the *existing* part is collapsed.
     let odd = root.join("sub").join(".").join("gone.txt");
     let odd_key = db_key_for_missing_path(&odd);
     assert!(
@@ -298,6 +284,34 @@ fn db_key_for_a_vanished_path_canonicalizes_what_remains() {
     );
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// The hazard every screen exists for, stated once here: the stored key for
+/// an unrepresentable path is another file's key, and any use of it (open,
+/// hash, delete) lands on that file instead.
+#[test]
+fn the_stored_spelling_of_an_unrepresentable_path_is_another_files_key() {
+    let dir = Path::new("/docs");
+    let bad = dir.join(crate::testutil::unrepresentable_name("report", ".txt"));
+    let twin = dir.join(crate::testutil::lossy_twin("report", ".txt"));
+
+    assert!(warn_if_unrepresentable(&bad));
+    assert!(
+        !warn_if_unrepresentable(&twin),
+        "the twin is an ordinary name and must pass"
+    );
+    assert_eq!(
+        path_to_db_string(&bad),
+        path_to_db_string(&twin),
+        "two different files, one stored key"
+    );
+
+    // The collision is inherited by everything beneath a bad *directory*.
+    assert_eq!(
+        path_to_db_string(&bad.join("child.txt")),
+        path_to_db_string(&twin.join("child.txt"))
+    );
+    assert!(warn_if_unrepresentable(&bad.join("child.txt")));
 }
 
 #[test]
@@ -314,17 +328,15 @@ fn unreadable_dirs_match_by_component_not_string_prefix() {
     u.record(std::path::PathBuf::from("/a/b"));
     assert!(u.covers("/a/b/c.txt"));
     assert!(u.covers("/a/b"));
-    // The bug a naive `str::starts_with` would introduce: /a/bc is a
-    // sibling of /a/b, and its rows must stay deletable.
+    // /a/bc is a sibling of /a/b, and its rows must stay deletable.
     assert!(!u.covers("/a/bc/d.txt"));
     assert!(!u.covers("/a/other.txt"));
 }
 
 #[test]
 fn unreadable_directory_is_reported_rather_than_yielded_as_empty() {
-    // A directory the walk cannot read must be recorded, so the caller
-    // can tell "could not look" apart from "the files are gone" — the
-    // latter deletes index rows.
+    // "Could not look" must stay distinguishable from "the files are
+    // gone" — the latter deletes index rows.
     let root = tmp_tree();
     touch(&root.join("readable/a.txt"));
     let locked = root.join("locked");
@@ -343,7 +355,6 @@ fn unreadable_directory_is_reported_rather_than_yielded_as_empty() {
                 .map(|e| e.file_name().to_string_lossy().into_owned())
                 .collect();
 
-        // Restore before asserting so a failure still cleans up.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
 
         assert_eq!(
@@ -369,16 +380,14 @@ fn hash_covers_size_and_head_only() {
     let c = root.join("c.bin");
 
     // Same size, same head, differing only in the tail: the documented
-    // collision (pre-allocated VM images are the real-world case).
+    // collision.
     std::fs::write(&a, [b"HEAD".as_slice(), &[0u8; 64], b"AAAA"].concat()).unwrap();
     std::fs::write(&b, [b"HEAD".as_slice(), &[0u8; 64], b"BBBB"].concat()).unwrap();
-    // Differs within the head window.
     std::fs::write(&c, [b"DIFF".as_slice(), &[0u8; 64], b"AAAA"].concat()).unwrap();
 
     let h = |p: &Path| {
-        get_file_hash(std::fs::metadata(p).unwrap().len(), p, 8)
-            .unwrap()
-            .0
+        let mut head = Vec::new();
+        get_file_hash(std::fs::metadata(p).unwrap().len(), p, 8, &mut head).unwrap()
     };
     assert_eq!(h(&a), h(&b), "tail differences are invisible by design");
     assert_ne!(h(&a), h(&c), "head differences are caught");
@@ -388,11 +397,206 @@ fn hash_covers_size_and_head_only() {
     std::fs::write(&short, b"HEAD").unwrap();
     assert_ne!(h(&a), h(&short));
 
-    // The head is returned for MIME sniffing rather than re-read.
-    let (_, head) = get_file_hash(72, &a, 8).unwrap();
+    let mut head = Vec::new();
+    get_file_hash(72, &a, 8, &mut head).unwrap();
     assert_eq!(head, b"HEAD\0\0\0\0", "exactly hash_length bytes");
-    let (_, head) = get_file_hash(4, &short, 8).unwrap();
-    assert_eq!(head, b"HEAD", "a short file hashes whole");
+    get_file_hash(4, &short, 8, &mut head).unwrap();
+    assert_eq!(head, b"HEAD", "a short file hashes whole, and the buffer is reused");
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// The invariant the whole schema rests on: `parent` and `name` concatenate
+/// back into the path, with no separator logic at the join.
+#[test]
+fn a_split_path_concatenates_back_into_itself() {
+    let root = std::path::Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+    let cases = [
+        root.join("a.txt"),                        // a file at the very root
+        root.join("home").join("me").join("x.md"), // the ordinary case
+        root.join("dir with spaces").join("y"),
+        root.join("weird.name").join("z.tar.gz"),
+    ];
+    for path in cases {
+        let s = path_to_db_string(&path);
+        let (parent, name) = split_db_path(&s).expect("a file's path");
+        assert_eq!(
+            format!("{}{}", parent, name),
+            s,
+            "{:?} must round-trip through its (parent, name) key",
+            s
+        );
+        assert_eq!(
+            name,
+            path.file_name().unwrap().to_string_lossy(),
+            "the name half is the file name"
+        );
+        assert_eq!(
+            parent,
+            dir_to_db_parent(path.parent().unwrap()),
+            "the parent half is what `dir_to_db_parent` would store"
+        );
+        assert!(
+            parent.ends_with(MAIN_SEPARATOR),
+            "a stored parent always ends in a separator: {:?}",
+            parent
+        );
+        assert!(
+            !name.contains(MAIN_SEPARATOR),
+            "a stored name never contains one: {:?}",
+            name
+        );
+    }
+}
+
+/// A filesystem root already ends in a separator; a doubled one would store
+/// every file directly at the root under `//` and never find it again.
+#[test]
+fn a_root_directory_does_not_get_a_doubled_separator() {
+    let root = std::path::Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+    let parent = dir_to_db_parent(root);
+    assert_eq!(parent, path_to_db_string(root));
+    assert!(!parent.ends_with(&format!("{}{}", MAIN_SEPARATOR, MAIN_SEPARATOR)));
+    assert_eq!(
+        format!("{}{}", parent, "a.txt"),
+        path_to_db_string(&root.join("a.txt"))
+    );
+}
+
+/// Strings that are not a file's path have no key, and must say so.
+#[test]
+fn a_string_that_cannot_be_a_files_path_has_no_key() {
+    assert_eq!(split_db_path("bare-name.txt"), None, "no separator at all");
+    assert_eq!(
+        split_db_path(&format!("{}dir{}", MAIN_SEPARATOR, MAIN_SEPARATOR)),
+        None,
+        "trailing separator: names a directory, not a file"
+    );
+    assert_eq!(split_db_path(""), None);
+}
+
+/// On Unix a backslash is an ordinary filename character; splitting on it
+/// would leave the row unreachable by the path it was stored under.
+#[test]
+#[cfg(unix)]
+fn a_backslash_is_just_a_character_on_unix() {
+    let (parent, name) = split_db_path(r"/home/me/back\slash.txt").expect("a file's path");
+    assert_eq!(parent, "/home/me/");
+    assert_eq!(name, r"back\slash.txt");
+
+    // A folder genuinely named `weird\` still gets its separator appended.
+    assert_eq!(
+        dir_to_db_parent(std::path::Path::new(r"/tmp/weird\")),
+        r"/tmp/weird\/"
+    );
+}
+
+/// walkdir defaults `follow_root_links` to **true**, independently of
+/// `follow_links` — a symlinked root was descended even with following off,
+/// landing rows where no sweep range reaches.
+#[test]
+#[cfg(unix)]
+fn a_symlinked_root_is_not_descended_when_following_is_off() {
+    let base = tmp_tree();
+    let real = base.join("real");
+    touch(&real.join("inside.txt"));
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let ignore = IgnoreSet::compile(&[]).unwrap();
+    let names: Vec<String> = filtered_walk(
+        link.to_str().unwrap(),
+        false,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+    )
+    .map(|e| e.file_name().to_string_lossy().into_owned())
+    .collect();
+    assert!(
+        names.is_empty(),
+        "a symlinked root must not be descended: {names:?}"
+    );
+
+    let names: Vec<String> = filtered_walk(
+        link.to_str().unwrap(),
+        true,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+    )
+    .map(|e| e.file_name().to_string_lossy().into_owned())
+    .collect();
+    assert_eq!(names, vec!["inside.txt"]);
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// A symlink *inside* a root is the same hazard one level down.
+#[test]
+#[cfg(unix)]
+fn a_symlink_inside_a_root_is_skipped_when_following_is_off() {
+    let base = tmp_tree();
+    let root = base.join("root");
+    touch(&root.join("real.txt"));
+    let outside = base.join("outside");
+    touch(&outside.join("target.txt"));
+    std::os::unix::fs::symlink(outside.join("target.txt"), root.join("link.txt")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("linkdir")).unwrap();
+
+    let ignore = IgnoreSet::compile(&[]).unwrap();
+    let mut names: Vec<String> = filtered_walk(
+        root.to_str().unwrap(),
+        false,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+    )
+    .map(|e| e.file_name().to_string_lossy().into_owned())
+    .collect();
+    names.sort();
+    assert_eq!(names, vec!["real.txt"], "only the real file may be walked");
+
+    let mut names: Vec<String> = filtered_walk(
+        root.to_str().unwrap(),
+        true,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+    )
+    .map(|e| e.file_name().to_string_lossy().into_owned())
+    .collect();
+    names.sort();
+    assert_eq!(names, vec!["link.txt", "real.txt", "target.txt"]);
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// The watcher's directory walk must not spend descriptors on a subtree
+/// the indexer will discard.
+#[test]
+#[cfg(unix)]
+fn a_symlinked_root_yields_no_directories_when_following_is_off() {
+    let base = tmp_tree();
+    let real = base.join("real");
+    touch(&real.join("sub/inside.txt"));
+    let link = base.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let ignore = IgnoreSet::compile(&[]).unwrap();
+    let dirs: Vec<String> = filtered_dirs(
+        link.to_str().unwrap(),
+        false,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+    )
+    .map(|e| e.path().display().to_string())
+    .collect();
+    assert!(
+        dirs.is_empty(),
+        "a symlinked root must yield no directories: {dirs:?}"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
 }

@@ -169,11 +169,33 @@ Section "Start Menu shortcut" SecStartMenu
     ; One shortcut, no program folder: a single-application folder is noise in
     ; the Windows 10/11 Start menu, and the uninstaller lives in Add/Remove
     ; Programs rather than next to it.
-    CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\quicksearch.exe" "" "$INSTDIR\quicksearch.ico"
+    ; --toggle rather than a bare launch: it raises the running window
+    ; instead of a second copy refusing to start on the held index lock.
+    CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\quicksearch.exe" "--toggle" "$INSTDIR\quicksearch.ico"
+SectionEnd
+
+Section "Search hotkey (Ctrl+Alt+F)" SecHotkey
+    ; The .lnk "shortcut key" field is the only thing on Windows that binds a
+    ; key to a command, and it is what makes the shortcut work while
+    ; QuickSearch is closed - nothing an application registers for itself can
+    ; fire when it is not running. Windows only honours the field on a
+    ; shortcut in the Start menu or on the desktop, and only for combinations
+    ; including Ctrl+Alt, which is why this is Ctrl+Alt+F and not the
+    ; Ctrl+Shift+F the Settings tab offers. The in-application shortcut takes
+    ; any combination but only answers while the window is already open, so
+    ; the two are complementary rather than duplicates.
+    ;
+    ; Rewrites the same shortcut the section above creates: NSIS cannot add a
+    ; hotkey to an existing .lnk, and creating it twice is harmless.
+    CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\quicksearch.exe" "--toggle" \
+        "$INSTDIR\quicksearch.ico" 0 SW_SHOWNORMAL ALT|CONTROL|F \
+        "Search your files with ${APP}"
 SectionEnd
 
 Section /o "Desktop shortcut" SecDesktop
-    CreateShortcut "$DESKTOP\${APP}.lnk" "$INSTDIR\quicksearch.exe" "" "$INSTDIR\quicksearch.ico"
+    ; Deliberately no hotkey here: two shortcuts claiming one key is a
+    ; conflict, and the Start menu entry above already owns it.
+    CreateShortcut "$DESKTOP\${APP}.lnk" "$INSTDIR\quicksearch.exe" "--toggle" "$INSTDIR\quicksearch.ico"
 SectionEnd
 
 ; There is deliberately no "add to PATH" section, tempting as one is for
@@ -189,6 +211,10 @@ SectionEnd
         "The desktop app and quicksearch-cli, the terminal search tool."
     !insertmacro MUI_DESCRIPTION_TEXT ${SecStartMenu} \
         "Add ${APP} to the Start menu for all users."
+    !insertmacro MUI_DESCRIPTION_TEXT ${SecHotkey} \
+        "Press Ctrl+Alt+F anywhere to search, starting ${APP} if it is not \
+         already running. Windows allows this only on Ctrl+Alt combinations; \
+         the Settings tab has one that takes any keys while ${APP} is open."
     !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} \
         "Add a ${APP} shortcut to the desktop."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END

@@ -1,40 +1,29 @@
-//! The Logs tab: what the terminal would have shown.
-//!
-//! Everything here comes from [`quicksearch_core::log`], which background
-//! threads write through instead of printing. Launched from a desktop
-//! launcher there is no terminal to read, and this is the only place a
-//! "cannot read that folder" warning is visible.
+//! The Logs tab: every line background threads write to
+//! [`quicksearch_core::log`] instead of printing. Launched from a desktop
+//! launcher there is no terminal, so this is the only place they show.
 
 use quicksearch_core::log::{self, Level, LogLine};
 
 use crate::format::group_thousands;
 use crate::ui_util::hint;
 
-/// How often to repaint while the tab is open: log lines arrive on threads
-/// that never wake the UI, so an idle window would sit on a stale list.
+/// Repaint cadence: log lines arrive on threads that never wake the UI.
 const REFRESH_MS: u64 = 500;
 
 pub struct LogsTab {
-    /// Copy of the ring, refreshed only when the recorded count moves.
     lines: Vec<LogLine>,
     /// [`log::recorded`] as of the last refresh.
     seen: u64,
     dropped: u64,
     filter: String,
     warnings_only: bool,
-    /// Keep the newest line in view. Scrolling up releases the view anyway
-    /// (egui unsticks a scroll area the user moves, and re-sticks it when
-    /// they return to the bottom); unticking this stops it following at all.
+    /// Keep the newest line in view. egui already unsticks a scroll area the
+    /// user drags and re-sticks it at the bottom; this stops it following.
     follow: bool,
-    /// Indices into `lines` that pass both filters.
-    ///
-    /// Cached rather than rebuilt per frame: `keep` lowercases each line to
-    /// compare it, so with a filter typed this was up to [`log::CAPACITY`]
-    /// (5,000) string allocations every frame, on a tab that repaints twice a
-    /// second by itself and on every input frame besides.
+    /// Indices into `lines` that pass both filters. Measured: rebuilding this
+    /// per frame lowercased up to [`log::CAPACITY`] lines on every frame.
     shown: Vec<usize>,
-    /// What `shown` was computed from — refresh counter, filter text,
-    /// warnings-only — so it can be rebuilt exactly when one of them moves.
+    /// What `shown` was computed from: refresh counter, filter, warnings-only.
     shown_key: (u64, String, bool),
 }
 
@@ -48,13 +37,11 @@ impl LogsTab {
             warnings_only: false,
             follow: true,
             shown: Vec::new(),
-            // `u64::MAX` so the first frame always counts as stale, whatever
-            // the ring's counter happens to be.
+            // `u64::MAX`: the first frame always counts as stale.
             shown_key: (u64::MAX, String::new(), false),
         }
     }
 
-    /// Rebuild [`LogsTab::shown`] if any of its inputs moved.
     fn resync_shown(&mut self) {
         if self.shown_key.0 == self.seen
             && self.shown_key.2 == self.warnings_only
@@ -90,9 +77,6 @@ impl LogsTab {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(REFRESH_MS));
 
-        // The filter and warnings-only widgets are drawn below, so a change
-        // lands on the next frame — the same one-frame lag this always had,
-        // and the tab repaints immediately anyway.
         self.resync_shown();
         let shown = std::mem::take(&mut self.shown);
 
@@ -140,9 +124,8 @@ impl LogsTab {
             });
         });
         if cleared {
-            // `shown` indexes lines that no longer exist. Handing the buffer
-            // back keeps its capacity; `refresh` moves `seen`, which is what
-            // makes the next frame rebuild the contents.
+            // `shown` indexes lines that no longer exist; `refresh` moves
+            // `seen`, which makes the next frame rebuild it.
             self.shown = shown;
             self.refresh();
             return;
@@ -177,8 +160,7 @@ impl LogsTab {
             return;
         }
 
-        // `show_rows` assumes every row is exactly one line tall, so long
-        // paths extend into a horizontal scroll rather than wrapping.
+        // `show_rows` assumes every row is exactly one line tall.
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
         let scroll = egui::ScrollArea::both()
@@ -206,8 +188,7 @@ impl LogsTab {
     }
 }
 
-/// Whether a line survives the tab's two filters. `needle` must already be
-/// lowercased.
+/// Whether a line survives both filters; `needle` must already be lowercased.
 fn keep(line: &LogLine, needle: &str, warnings_only: bool) -> bool {
     if warnings_only && line.level != Level::Warn {
         return false;
@@ -218,8 +199,7 @@ fn keep(line: &LogLine, needle: &str, warnings_only: bool) -> bool {
 /// `HH:MM:SS` local time.
 fn fmt_clock(unix_secs: u64) -> String {
     use chrono::TimeZone;
-    // Not `as`: that cast wraps a huge value into a negative one — a valid
-    // 1969 timestamp that would render as a plausible time.
+    // Not `as`: that cast wraps a huge value into a plausible 1969 timestamp.
     let secs = i64::try_from(unix_secs).unwrap_or(i64::MAX);
     match chrono::Local.timestamp_opt(secs, 0) {
         chrono::LocalResult::Single(dt) => dt.format("%H:%M:%S").to_string(),
@@ -260,7 +240,6 @@ mod tests {
         assert!(keep(&line(Level::Warn, "cannot read"), "", true));
     }
 
-    /// Both filters apply, not either.
     #[test]
     fn the_two_filters_compose() {
         assert!(!keep(&line(Level::Info, "cannot read"), "cannot", true));
@@ -274,7 +253,6 @@ mod tests {
         assert_eq!(fmt_clock(1_700_000_000).len(), 8);
     }
 
-    /// Beyond what a local calendar can represent, the row still lines up.
     #[test]
     fn an_out_of_range_stamp_falls_back() {
         assert_eq!(fmt_clock(u64::MAX), "--:--:--");

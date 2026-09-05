@@ -1,18 +1,7 @@
-//! Byte-for-byte verification that a set of files really is identical.
-//!
-//! The index groups duplicates by `sha256(size ‖ first hash_length bytes)`
-//! (see [`crate::file_handling`]), which reads a file's head and nothing else
-//! — a deliberate trade, since hashing every byte on a disk is most of the
-//! cost of indexing it. Files of the same size whose heads agree are therefore
-//! listed as duplicates whether or not they are: a fixed-size VHD keeps what
-//! makes it unique in a footer, and a freshly pre-allocated disk image is
-//! zeroes as far as the head can see. This turns that advisory grouping into
-//! an answer, for the moment before someone deletes something.
-//!
-//! No hashing here, by policy. A digest per file would be shorter code and the
-//! same answer nearly always — but "nearly always" is what the head hash
-//! already offers, and the whole point of asking a second time is that this
-//! time the bytes are compared.
+//! Byte-for-byte verification that a set of files really is identical — the
+//! answer behind the index's advisory head-hash duplicate grouping, for the
+//! moment before someone deletes something. No hashing here, by policy: the
+//! whole point of asking a second time is that the bytes are compared.
 
 use std::fs::File;
 use std::io::Read;
@@ -20,29 +9,28 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Total read-buffer memory, split across the files being compared. A group is
-/// usually two files and can be thousands — a hardlink farm, which is exactly
-/// what `[indexing] ignore_patterns` warns about — so a per-file buffer of any
-/// fixed size would become the largest allocation the process ever makes.
+/// Total read-buffer memory, split across the files being compared: a group
+/// can be thousands of files (a hardlink farm), so a fixed per-file buffer
+/// would become the largest allocation the process ever makes.
 const CHUNK_BUDGET: usize = 8 * 1024 * 1024;
 const MIN_CHUNK: usize = 16 * 1024;
 const MAX_CHUNK: usize = 256 * 1024;
 
-/// How often progress is emitted. Each one repaints the UI, and a chunk off a
-/// warm page cache takes microseconds.
+/// How often progress is emitted; each one repaints the UI.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
-/// What one member turned out to be, against the reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberVerdict {
-    /// Same length, every byte agreed. The reference itself reads this.
+    /// The reference itself reads this.
     Identical,
     /// Offset of the first byte that disagreed.
     DiffersAt(u64),
     /// Lengths disagree, so nothing was read. Within a duplicate group this
     /// can only mean a stale index — the hash covers the size.
-    LengthDiffers { len: u64, reference_len: u64 },
-    /// Could not be opened, or stopped being readable part way through.
+    LengthDiffers {
+        len: u64,
+        reference_len: u64,
+    },
     Unreadable(String),
 }
 
@@ -57,15 +45,15 @@ pub struct VerifyReport {
     /// Index into the input paths of the file everything else was compared
     /// against: the first one that opened. `None` when none of them did.
     pub reference: Option<usize>,
-    /// One verdict per input path, in the input order.
+    /// How long that reference was, so a report can say *where* in the file a
+    /// difference landed. 0 when there was no reference to measure.
+    pub reference_len: u64,
     pub verdicts: Vec<MemberVerdict>,
-    /// Bytes actually read from disk, across every file.
     pub bytes_read: u64,
 }
 
 impl VerifyReport {
-    /// Whether every member was read and matched. An empty or single-file set
-    /// is vacuously identical.
+    /// An empty or single-file set is vacuously identical.
     pub fn all_identical(&self) -> bool {
         self.verdicts.iter().all(MemberVerdict::is_identical)
     }
@@ -82,38 +70,28 @@ pub enum VerifyUpdate {
     Cancelled,
 }
 
-/// A file still in the running, with its own read buffer.
 struct Live {
     index: usize,
     file: File,
     buf: Vec<u8>,
 }
 
-/// Compare every path against the first one that opens, byte for byte, and
-/// report what each turned out to be.
-///
-/// Emits `Progress` while it works and exactly one terminal update — `Done`,
-/// or `Cancelled` if `cancel` went up before the comparison finished.
+/// Compare every path against the first one that opens, byte for byte.
+/// Emits `Progress` while it works and exactly one terminal update.
 pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnMut(VerifyUpdate)) {
-    // Checked before the files are even opened, so a run cancelled before it
-    // starts reports the cancellation rather than a verdict nobody waited for.
     if cancel.load(Ordering::Relaxed) {
         on(VerifyUpdate::Cancelled);
         return;
     }
     let mut verdicts = vec![MemberVerdict::Identical; paths.len()];
 
-    // The reference is the first path that both opens *and* stats, not simply
-    // the first path: one unreadable member must not cost the answer about all
-    // the others.
+    // The reference is the first path that both opens *and* stats: one
+    // unreadable member must not cost the answer about all the others.
     let mut reference: Option<(usize, File, u64)> = None;
     let mut rest: Vec<(usize, File)> = Vec::new();
     for (i, path) in paths.iter().enumerate() {
-        // These paths come from the index, which records what each file was
-        // when it was walked. A member replaced by a FIFO since then needs no
-        // race at all to be sitting here — the walk keeps the old row when a
-        // regular file turns into something else — and a blocking open would
-        // strand this worker before it reported a single verdict.
+        // A member replaced by a FIFO since the walk would strand this
+        // worker on a blocking open before it reported a single verdict.
         let file = match crate::platform::open_regular_file(path) {
             Ok(f) => f,
             Err(e) => {
@@ -134,6 +112,7 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
     let Some((reference, mut reference_file, reference_len)) = reference else {
         on(VerifyUpdate::Done(VerifyReport {
             reference: None,
+            reference_len: 0,
             verdicts,
             bytes_read: 0,
         }));
@@ -172,8 +151,7 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
     let mut bytes_read = 0u64;
     let mut offset = 0u64;
     // Backdated so the first chunk reports: a progress bar that only appears
-    // after the first interval reads as a frozen window on a slow disk, which
-    // is the case this is for.
+    // after the first interval reads as a frozen window on a slow disk.
     let mut last_progress = Instant::now()
         .checked_sub(PROGRESS_INTERVAL)
         .unwrap_or_else(Instant::now);
@@ -184,16 +162,15 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
             return;
         }
 
-        // Termination is driven by what the reference actually reads rather
-        // than by the length it claimed, so a file truncated underneath us
-        // degrades to a short comparison instead of a hang or a false match.
+        // Termination is driven by what the reference actually reads, so a
+        // file truncated underneath us degrades to a short comparison
+        // instead of a hang or a false match.
         let n = match read_chunk(&mut reference_file, &mut reference_buf) {
             Ok(0) => break, // EOF: everything still live matched all the way.
             Ok(n) => n,
             Err(e) => {
                 verdicts[reference] = MemberVerdict::Unreadable(describe(&paths[reference], &e));
-                // Survivors agreed up to here but cannot be finished. Saying
-                // so is the only honest answer; "identical" would not be.
+                // Survivors agreed up to here but cannot be finished.
                 for l in live.iter() {
                     verdicts[l.index] = MemberVerdict::Unreadable(format!(
                         "compared only to byte {offset}: {} could not be read to the end",
@@ -259,14 +236,14 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
 
     on(VerifyUpdate::Done(VerifyReport {
         reference: Some(reference),
+        reference_len,
         verdicts,
         bytes_read,
     }));
 }
 
-/// Fill `buf` as far as the file allows, returning how much. Short reads are
-/// resumed and `Interrupted` retried, the way `extract::plaintext` does, so a
-/// short return really does mean end of file.
+/// Fill `buf` as far as the file allows. Short reads are resumed and
+/// `Interrupted` retried, so a short return really does mean end of file.
 fn read_chunk(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -281,8 +258,7 @@ fn read_chunk(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
 }
 
 /// Offset of the first byte that differs. The equality test comes first
-/// because it is a `memcmp`; the byte walk only ever runs on the one chunk
-/// that turned out to differ.
+/// because it is a `memcmp`.
 fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
     if a == b {
         return None;

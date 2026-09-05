@@ -1,174 +1,576 @@
-//! The first-start tour: a few pages explaining what QuickSearch indexes,
-//! how results are ranked, and what the parts of the Search tab do.
+//! The first-start tour. Shown once: `[ui] tutorial_seen` is `Some(false)`
+//! only in a config file this version created, so upgrading does not summon
+//! it. The Help tab can bring it back afterwards.
 //!
-//! Shown once, to an installation that has never run before — `[ui]
-//! tutorial_seen` is `Some(false)` only in a config file this version created,
-//! so upgrading into this version does not summon it. The Help tab can bring
-//! it back afterwards, which is also what keeps this from being write-only.
+//! Every page points at what it is talking about. Words wrapped in `[square
+//! brackets]` in a page's prose are keywords: the brackets are markup,
+//! stripped before anything is painted, and what was inside is coloured and
+//! pulsed. The n-th keyword on a page pairs with the n-th entry of its
+//! `spots` and the two share a colour, so "[search bar]" pulsing blue in the
+//! prose is unambiguously about the box pulsing blue on screen. The pairing
+//! is only as good as the two lists agreeing, which
+//! `every_keyword_has_a_spot_to_point_at` holds them to.
+//!
+//! The window is deliberately not modal and not anchored: the user can drag
+//! it off whatever it is covering, and can use the app underneath while it
+//! is up.
 
-use crate::ui_util::{centered_modal, hint};
+use std::borrow::Cow;
 
-/// One page of the tour. Static text, so the pages are a table rather than a
-/// match arm each.
+use egui::text::{LayoutJob, TextFormat};
+
+use crate::app::Tab;
+use crate::spotlight::{self, Spot};
+use crate::ui_util::hint;
+
 struct Page {
     title: &'static str,
-    /// Paragraphs. Rendered in order with a little space between them.
+    /// A first paragraph built from live state, ahead of `body`.
+    lead: Option<fn(&[String]) -> String>,
     body: &'static [&'static str],
-    /// Rendered small and de-emphasised under the body — where to go, rather
-    /// than what the thing is.
+    /// Rendered small under the body — where to go, not what the thing is.
     pointer: Option<&'static str>,
+    /// Switched to as the page is entered, so the page's subject is on screen.
+    tab: Option<Tab>,
+    /// Paired in order with the keywords in `lead` then `body`.
+    spots: &'static [Spot],
+    /// Typed into the search box a character at a time, on entry.
+    type_query: Option<&'static str>,
+    /// A control of the page's own, under its prose.
+    extra: Option<Extra>,
 }
+
+/// What a page offers in the tour's own window. Most pages point at a widget
+/// in the app instead; these two are setup the user can do from here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Extra {
+    /// The zoom slider, on the welcome page.
+    Scale,
+    /// The command to bind to a key, with Copy and a way to the desktop's
+    /// keyboard settings.
+    Shortcut,
+}
+
+/// Field defaults for the pages that do not point anywhere.
+const PLAIN: Page = Page {
+    title: "",
+    lead: None,
+    body: &[],
+    pointer: None,
+    tab: None,
+    spots: &[],
+    type_query: None,
+    extra: None,
+};
 
 const PAGES: &[Page] = &[
     Page {
         title: "Welcome to QuickSearch",
         body: &[
-            "QuickSearch keeps an index of the folders you choose, and searches \
-             as you type.",
-            "By default only your user folder is indexed and searchable.",
+            "QuickSearch is a search engine for your local files and their contents.",
+            "By default, only your user folder is indexed and searchable.",
             "Because the answers come from the index rather than from reading \
              your disk, results appear as fast as you can type, even across \
              hundreds of thousands of files.",
         ],
-        pointer: Some("A quick tutorial for new users! Hit Skip to Exit."),
+        pointer: Some(
+            "A quick tutorial for new users! Drag this window by its title bar \
+             if it covers something. Hit Skip to exit.",
+        ),
+        tab: Some(Tab::Search),
+        extra: Some(Extra::Scale),
+        ..PLAIN
     },
     Page {
-        title: "What is indexed",
+        title: "Open QuickSearch hotkey",
+        body: &[
+            "Would you like a keyboard shortcut that brings QuickSearch up \
+             from anywhere? Click the button below and press the keys you \
+             want — it takes effect at once.",
+            "QuickSearch does not sit in the background waiting for that key, \
+             though. When you close it, it closes completely and gives back \
+             the memory it was using; it starts again, index and all, in a \
+             moment. So to have a key start it as well, bind the command \
+             underneath in your desktop's own keyboard settings.",
+        ],
+        pointer: Some("Both of these are on the Settings tab too, under Interface."),
+        tab: Some(Tab::Search),
+        extra: Some(Extra::Shortcut),
+        ..PLAIN
+    },
+    Page {
+        title: "Which folders are searched",
+        lead: Some(folders_line),
+        pointer: Some(
+            "A folder you add is indexed in the background; everything already \
+             in the index is left alone.",
+        ),
+        tab: Some(Tab::Manage),
+        spots: &[Spot::IndexedFolderAdd],
+        ..PLAIN
+    },
+    Page {
+        title: "What is indexing?",
         body: &[
             "Indexing is QuickSearch reading through your folders once and \
              remembering what it found, so that searching later is instant. It \
              runs on its own in the background and keeps up with changes as you \
              make them.",
+            "You decide what gets read: [ignore patterns] keep files and folders \
+             out of the index entirely, while the [extensions whitelist] limits \
+             which file types have their contents read. Both are under Content \
+             filters on this tab.",
             "QuickSearch never connects to the internet, and always respects your privacy. \
              QuickSearch can encrypt your index to make this remembered data more secure.",
-            "These are the folders being indexed right now:",
+        ],
+        pointer: Some("To set an index password, look near the bottom of the Settings tab."),
+        tab: Some(Tab::Manage),
+        spots: &[Spot::IgnorePatterns, Spot::ExtWhitelist],
+        ..PLAIN
+    },
+    Page {
+        title: "Search: Input",
+        body: &[
+            "QuickSearch begins searching as soon as you start typing in the \
+             [search bar]. It accepts words, filenames, file extensions, and \
+             several other specifiers. Click the \"[?]\" block for full details.",
         ],
         pointer: Some(
-            "To index more locations, open the Manage Index tab and add a folder. \
-             To set an index password, look near the bottom of the Settings tab.",
+            "Filters you can type into a query look like type:Document or \
+             modified:>=2024-01-01.",
         ),
+        tab: Some(Tab::Search),
+        spots: &[Spot::SearchBar, Spot::QueryHelp],
+        type_query: Some("QuickSearch"),
+        ..PLAIN
     },
     Page {
         title: "How results are ranked",
         body: &[
             "The best search matches come first (have the lowest rank). \
-             Exact file-name matchs are best, then names that contain what you typed; then \
+             Exact file-name matches are best, then names that contain what you typed; then \
              files whose contents contain the search terms, the ones mentioning it most often \
              first; and last, files matched only by their full folder path.",
-            "The coloured number in the Rank column is which of those tiers a \
+            "The coloured number in the [Rank] column is which of those tiers a \
              result came from: blue is a great match, red is a distant one. \
              Clicking a column heading sorts by something else instead.",
         ],
         pointer: Some("Right-click any column heading to choose which columns are shown."),
+        tab: Some(Tab::Search),
+        spots: &[Spot::RankColumn],
+        ..PLAIN
     },
     Page {
         title: "The status bar",
         body: &[
-            "The line along the bottom of the window is what QuickSearch is \
-             doing. While it is indexing it shows the phase, how far through it \
-             is, and how fast; when it has nothing to do it shows how many files \
-             are indexed.",
+            "The [status bar] along the bottom of the window is what QuickSearch \
+             is doing. While it is indexing it shows the phase, how far through \
+             it is, and how fast; when it has nothing to do it shows how many \
+             files are indexed.",
             "Searching works the whole time, including during that first indexing run, \
              but some files might not be shown in the results until the scan completes.",
         ],
-        pointer: None,
+        tab: Some(Tab::Search),
+        spots: &[Spot::StatusBar],
+        ..PLAIN
     },
     Page {
-        title: "Typos, and what a result can do",
+        title: "Fuzzy Finding",
         body: &[
-            "Tick \"Fuzzy\"beside the search box to also match words with typos \
-             in them — \"repot\" will find \"report\". It searches more \
-             thoroughly, so it is a little slower; leave it off until you need \
-             it.",
-            "Right-click any result for more: open it, open the folder holding \
+            "Tick [Fuzzy] beside the search box to also match words with typos \
+             in them! When checked, \"repot\" will find \"report\". It searches more \
+             thoroughly, so it is a little slower to find all results, but the exact \
+             matches will be found just as fast and be displayed first.",
+            "Right-click any result for more options: open it, open the folder holding \
              it, copy its path, or build a filter that hides files like it from \
              future searches.",
         ],
-        pointer: Some(
-            "The ? button left of the search box lists the filters you can type \
-             into a query, like type:Document or modified:>=2024-01-01.",
-        ),
+        tab: Some(Tab::Search),
+        spots: &[Spot::FuzzyToggle],
+        ..PLAIN
     },
     Page {
         title: "Duplicates",
         body: &[
-            "The Duplicates tab looks for files across all indexed folders for identical copies. \
-             They are shown grouped together, with the largest wasted space first.",
+            "The [Duplicates] tab looks for files across all indexed folders for identical copies. \
+             They are shown grouped together, with the largest wasted space first — or grouped \
+             by file extension, if that is how you would rather work through them.",
             "It is a quick way to find the same download sitting in three \
              places. QuickSearch only shows you the groups; deleting anything is \
              left to you.",
+            "For speed, files are matched on their size and on how they begin — the \
+             first few kilobytes — which makes a group a strong suspicion rather \
+             than a certainty. Right-click any group and choose \"Verify copies are \
+             identical\" to read every byte before you delete anything. The tab says \
+             so at the top, every time.",
         ],
         pointer: Some(
-            "For speed, files are compared by size and by how they begin (first 8KB). \
-             This is not a guarantee of an exact match. You can right click a result to verify before you delete anything.",
+            "A group you never want to see again can be hidden, and a folder that is \
+             meant to hold copies can be excluded — both from that same right-click \
+             menu.",
         ),
+        tab: Some(Tab::Duplicates),
+        spots: &[Spot::TabButton(Tab::Duplicates)],
+        ..PLAIN
     },
     Page {
         title: "Settings",
         body: &[
-            "The Settings tab, at the right-hand end of the tab strip, is where \
+            "The [Settings] tab, at the right-hand end of the tab strip, is where \
              you can tweak and tune the software. Mouse over any of \
              the settings for a brief description of what they do.",
             "Most changes wait for the Apply & Save button at the bottom.",
+            "You can see this introduction again at any time from the [Help] tab \
+             — the \"Show the introduction again\" button at the top.",
             "QuickSearch is completely free for anyone to use. If you love it, please let your friends know about us!",
         ],
-        pointer: None,
+        tab: Some(Tab::Settings),
+        spots: &[
+            Spot::TabButton(Tab::Settings),
+            Spot::TabButton(Tab::Help),
+        ],
+        ..PLAIN
     },
 ];
 
-/// The open tour.
+/// One glow cycle, seconds.
+const PULSE_PERIOD: f64 = 1.6;
+/// How often the glow and the demonstration typing are stepped.
+const ANIMATION_TICK: std::time::Duration = std::time::Duration::from_millis(50);
+/// Seconds per character on a page that types into the search box.
+const TYPE_INTERVAL: f64 = 0.07;
+/// The tour's window keeps one id across pages: the title changes on every
+/// Next, and an id derived from it would put the window back in the middle
+/// each time, undoing wherever the user dragged it.
+const WINDOW_ID: &str = "quicksearch-tutorial";
+
+/// Whether the home folder is what is being indexed decides how the folders
+/// page opens; a tour re-run from Help can find any set of roots at all.
+fn folders_line(roots: &[String]) -> String {
+    let trim = |p: &str| p.trim_end_matches(['/', '\\']).to_string();
+    let home = quicksearch_core::platform::home_dir().map(|h| trim(&h.to_string_lossy()));
+    match home {
+        Some(home) if roots.iter().any(|root| trim(root) == home) => format!(
+            "Your home folder ({home}) is indexed by default. To search other \
+             locations, add them [here]."
+        ),
+        _ if roots.is_empty() => "No folders are indexed yet, so there is nothing to search. \
+             Add the first one [here]."
+            .to_string(),
+        _ => format!(
+            "These folders are indexed: {}. To search other locations, add them [here].",
+            roots.join(", ")
+        ),
+    }
+}
+
+/// The page's prose, live parts and all, in the order it is painted.
+fn paragraphs(page: &Page, roots: &[String]) -> Vec<Cow<'static, str>> {
+    page.lead
+        .map(|build| Cow::Owned(build(roots)))
+        .into_iter()
+        .chain(page.body.iter().copied().map(Cow::Borrowed))
+        .collect()
+}
+
+/// Split prose into runs, `true` for the ones that were bracketed. An
+/// unbalanced `[` is prose, not markup.
+fn runs(text: &str) -> Vec<(&str, bool)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let Some(close) = rest[open + 1..].find(']').map(|i| open + 1 + i) else {
+            break;
+        };
+        if open > 0 {
+            out.push((&rest[..open], false));
+        }
+        out.push((&rest[open + 1..close], true));
+        rest = &rest[close + 1..];
+    }
+    if !rest.is_empty() {
+        out.push((rest, false));
+    }
+    out
+}
+
+/// 0 at the dimmest, 1 at the brightest.
+fn pulse(time: f64) -> f32 {
+    0.5 + 0.5 * (time * std::f64::consts::TAU / PULSE_PERIOD).sin() as f32
+}
+
+/// The n-th keyword's colour, shared with the n-th spot it points at.
+fn accent(n: usize, dark_mode: bool) -> egui::Color32 {
+    let p = crate::color::palette(dark_mode);
+    [p.blue, p.green, p.orange][n % 3]
+}
+
+/// One paragraph, keywords coloured and tinted. `next_keyword` runs across
+/// the whole page, not the paragraph, so it stays in step with `Page::spots`.
+fn paragraph_job(ui: &egui::Ui, text: &str, next_keyword: &mut usize, pulse: f32) -> LayoutJob {
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let dark_mode = ui.visuals().dark_mode;
+    let mut job = LayoutJob::default();
+    for (run, keyword) in runs(text) {
+        let format = if keyword {
+            let color = accent(*next_keyword, dark_mode);
+            *next_keyword += 1;
+            TextFormat {
+                font_id: font_id.clone(),
+                color,
+                background: color.gamma_multiply(0.10 + 0.25 * pulse),
+                ..Default::default()
+            }
+        } else {
+            TextFormat {
+                font_id: font_id.clone(),
+                color: ui.visuals().text_color(),
+                ..Default::default()
+            }
+        };
+        job.append(run, 0.0, format);
+    }
+    job
+}
+
+/// The tour's own note size. `hint` is egui's `Small`, which is a touch fine
+/// to read in the one window a first-time user meets the app through; full
+/// Body would stop a note reading as an aside.
+fn note(ui: &egui::Ui, text: impl Into<egui::RichText>) -> egui::RichText {
+    hint(text).size(egui::TextStyle::Small.resolve(ui.style()).size + 2.0)
+}
+
+/// The live state the tour's own controls read, and the flag the shortcut
+/// capture keeps between frames.
+struct Live<'a> {
+    /// `ctx.zoom_factor()`, read before the window is laid out.
+    zoom: f32,
+    /// The shortcut in force, as the config spells it.
+    hotkey: &'a str,
+    capturing_hotkey: &'a mut bool,
+}
+
+/// The page's own control, under its prose. What they were used for goes
+/// back through `actions`: the config is the app's to write, not the tour's.
+fn extra_ui(ui: &mut egui::Ui, extra: Extra, live: &mut Live, actions: &mut TourActions) {
+    ui.add_space(6.0);
+    ui.separator();
+    match extra {
+        Extra::Scale => {
+            let mut scale = live.zoom;
+            ui.horizontal(|ui| {
+                ui.label("UI scale");
+                // Scoped to this row, which is the whole of its use.
+                ui.spacing_mut().slider_width = 220.0;
+                let slider = ui.add(
+                    egui::Slider::new(&mut scale, crate::app::SCALE_RANGE)
+                        .step_by(0.05)
+                        .fixed_decimals(2),
+                );
+                // Applied on every frame it moves, saved once it settles: a
+                // drag would otherwise rewrite the config file dozens of
+                // times on its way across. The release frame is not itself a
+                // change — the value stopped moving — so it is asked about
+                // separately, and carries the value with it so the app has
+                // one thing to act on.
+                let moved = slider.changed();
+                let settled = slider.drag_stopped() || (moved && !slider.dragged());
+                if moved || settled {
+                    actions.set_scale = Some(scale);
+                    actions.save_scale = settled;
+                }
+            });
+            ui.label(note(
+                ui,
+                "Makes everything larger or smaller together. You can change \
+                 it again on the Settings tab.",
+            ));
+        }
+        // Both of the Settings tab's shortcut controls, and the same two
+        // widgets rather than a second pair that could drift from them: the
+        // button that claims a key while QuickSearch is running, and under
+        // it the command a desktop shortcut binds to start it.
+        Extra::Shortcut => {
+            let mut setting = live.hotkey.to_string();
+            ui.horizontal(|ui| {
+                ui.label("Search shortcut");
+                crate::settings_tab::hotkey_edit(ui, &mut setting, live.capturing_hotkey);
+            });
+            if setting != live.hotkey {
+                actions.set_hotkey = Some(setting);
+            }
+            crate::settings_tab::shortcut_note(ui);
+        }
+    }
+}
+
+/// Rings around a widget, painted into the *panel* layer: over the widget,
+/// but under the tour's own window, which the user can drag aside rather
+/// than have the glow drawn across.
+fn glow(ctx: &egui::Context, rect: egui::Rect, color: egui::Color32, pulse: f32) {
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let strength = 0.45 + 0.55 * pulse;
+    painter.rect_filled(rect.expand(2.0), 4.0, color.gamma_multiply(0.08 * strength));
+    for ring in 0..3u8 {
+        let grow = 2.0 + 3.0 * f32::from(ring);
+        let alpha = (0.65 - 0.18 * f32::from(ring)) * strength;
+        painter.rect_stroke(
+            rect.expand(grow),
+            4.0 + grow,
+            egui::Stroke::new(2.0, color.gamma_multiply(alpha)),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
+/// The search box being filled in a character at a time.
+struct Typing {
+    text: &'static str,
+    started: f64,
+    emitted: usize,
+}
+
+impl Typing {
+    /// The prefix typed by `now`, but only when it has grown. `SearchTab::seed`
+    /// re-arms the debounce on every call, so re-emitting the same text every
+    /// frame would hold the search off for as long as the page is up.
+    fn advance(&mut self, now: f64) -> Option<String> {
+        let total = self.text.chars().count();
+        let due = (((now - self.started) / TYPE_INTERVAL).max(0.0) as usize).min(total);
+        if due <= self.emitted {
+            return None;
+        }
+        self.emitted = due;
+        Some(self.text.chars().take(due).collect())
+    }
+}
+
+/// What the tour asks the app to do after this frame.
+#[derive(Default)]
+pub struct TourActions {
+    /// The tour is over — skipped or read to the end.
+    pub dismissed: bool,
+    pub goto_tab: Option<Tab>,
+    pub set_query: Option<String>,
+    pub focus_search: bool,
+    /// A new UI scale from the welcome page's slider, to apply live.
+    pub set_scale: Option<f32>,
+    /// The drag ended, so the scale above is worth writing to the config.
+    pub save_scale: bool,
+    /// A shortcut captured on the shortcut page, to register and save.
+    pub set_hotkey: Option<String>,
+}
+
 pub struct Tutorial {
     page: usize,
+    /// The page whose arrival has already been acted on. Entering a page
+    /// switches tabs once, not every frame: a user who clicks another tab
+    /// mid-page is not dragged back.
+    shown: Option<usize>,
+    typing: Option<Typing>,
+    /// The user has dragged the window, so where it sits is their business.
+    moved: bool,
+    /// The shortcut button is armed and the next key combination is the
+    /// answer — the Settings tab's own capture, and its own flag.
+    capturing_hotkey: bool,
 }
 
 impl Tutorial {
     pub fn new() -> Tutorial {
-        Tutorial { page: 0 }
+        Tutorial {
+            page: 0,
+            shown: None,
+            typing: None,
+            moved: false,
+            capturing_hotkey: false,
+        }
     }
 
-    /// Render. `roots` is the live indexed-folder list, named on the page
-    /// about indexing so the tour describes this installation rather than a
-    /// generic one.
-    /// Returns true once the tour is finished with — skipped or read to the
-    /// end — which is the caller's cue to remember that and drop it.
-    pub fn ui(&mut self, ctx: &egui::Context, roots: &[String]) -> bool {
+    /// `roots` is the live indexed-folder list, which the folders page reads;
+    /// `hotkey` is the shortcut in force, which the shortcut page both shows
+    /// and rebinds.
+    pub fn ui(&mut self, ctx: &egui::Context, roots: &[String], hotkey: &str) -> TourActions {
         let page = &PAGES[self.page.min(PAGES.len() - 1)];
         let (first, last) = (self.page == 0, self.page + 1 == PAGES.len());
-        let mut dismissed = false;
+        let mut actions = TourActions::default();
         let mut step: i64 = 0;
+        let now = ctx.input(|i| i.time);
 
-        centered_modal(ctx, page.title, |ui| {
+        if self.shown != Some(self.page) {
+            self.shown = Some(self.page);
+            actions.goto_tab = page.tab;
+            self.typing = page.type_query.map(|text| Typing {
+                text,
+                started: now,
+                emitted: 0,
+            });
+            if self.typing.is_some() {
+                // From empty, with the caret in the box: what follows should
+                // read as someone typing, not as a value appearing.
+                actions.set_query = Some(String::new());
+                actions.focus_search = true;
+            }
+        }
+        if let Some(typing) = &mut self.typing {
+            if let Some(typed) = typing.advance(now) {
+                actions.set_query = Some(typed);
+            }
+        }
+
+        let lit = pulse(now);
+        // Read before the window: `set_zoom_factor` stores the new value at
+        // once, so the slider reads back what it asked for on the next frame
+        // rather than snapping to the old value mid-drag. It also follows an
+        // ad-hoc Ctrl +/- zoom, which is the size the user is looking at.
+        let zoom = ctx.zoom_factor();
+        // Lifted out of `self` for the window's closure, and put back after:
+        // the closure already holds the page and the actions.
+        let mut capturing = self.capturing_hotkey;
+        let mut dismissed = false;
+        let mut window = egui::Window::new(page.title)
+            .id(egui::Id::new(WINDOW_ID))
+            .collapsible(false)
+            .resizable(false)
+            .pivot(egui::Align2::CENTER_CENTER);
+        if !self.moved {
+            // Re-centred every frame rather than positioned once: the window
+            // is measured on its first frame and the viewport is not
+            // necessarily its final size on ours, so a position chosen then
+            // can be anywhere. Dropped the moment the user drags — the drag
+            // delta is applied after this, so the first drag frame already
+            // moves and the next one stops overriding.
+            window = window.current_pos(ctx.screen_rect().center());
+        }
+        let shown = window.show(ctx, |ui| {
             ui.set_max_width(520.0);
-            for paragraph in page.body {
-                ui.label(*paragraph);
+            let mut keyword = 0usize;
+            for paragraph in paragraphs(page, roots) {
+                let job = paragraph_job(ui, &paragraph, &mut keyword, lit);
+                ui.label(job);
                 ui.add_space(6.0);
             }
-            // The one page that shows live state rather than static text.
-            if self.page == 1 {
-                if roots.is_empty() {
-                    ui.label(hint("No folders are indexed yet."));
-                } else {
-                    for root in roots {
-                        ui.monospace(root);
-                    }
-                }
-                ui.add_space(6.0);
+            // The page's control first, then its note: a note that mentions
+            // what is on the page has to come after it, and it is the last
+            // and smallest thing before the footer either way.
+            if let Some(extra) = page.extra {
+                let mut live = Live {
+                    zoom,
+                    hotkey,
+                    capturing_hotkey: &mut capturing,
+                };
+                extra_ui(ui, extra, &mut live, &mut actions);
             }
             if let Some(pointer) = page.pointer {
-                ui.label(hint(pointer));
+                ui.label(note(ui, pointer));
             }
 
             ui.add_space(10.0);
             ui.separator();
-            // Three equal thirds rather than one row: it is the only layout
-            // that puts Skip in the middle without measuring the buttons
-            // either side of it, whose widths change with the page ("Next"
-            // becoming "Finish") and with the counter's digits.
+            // Three equal thirds: the only layout that centres Skip without
+            // measuring the buttons either side, whose widths change per page.
             ui.columns(3, |cols| {
-                // A column lays its contents out *justified*, so a button put
-                // straight into one is stretched to the full third. The other
-                // two escape that by nesting their own layout; this one has to
-                // say so.
+                // A column lays out *justified*: a button put straight into
+                // one is stretched to the full third.
                 cols[0].with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                     if ui.add_enabled(!first, egui::Button::new("Back")).clicked() {
                         step = -1;
@@ -179,9 +581,8 @@ impl Tutorial {
                         dismissed = true;
                     }
                 });
-                // `Align::Min`, not `Center`: a column is as tall as the rest
-                // of the window, so centring in it drops the button a hundred
-                // points below the two beside it.
+                // `Align::Min`: a column is as tall as the window, so
+                // centring drops the button far below the two beside it.
                 cols[2].with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                     let p = crate::color::palette(ui.visuals().dark_mode);
                     let next = if last { "Finish" } else { "Next" };
@@ -199,243 +600,38 @@ impl Tutorial {
                 });
             });
         });
+        if shown.is_some_and(|window| window.response.dragged()) {
+            self.moved = true;
+        }
+        self.capturing_hotkey = capturing;
 
-        // Applied after the closure so the page a frame rendered stays the page
-        // its buttons were laid out for.
+        // The widgets this page names, in the colours its keywords were given.
+        let dark_mode = ctx.style().visuals.dark_mode;
+        for (n, spot) in page.spots.iter().enumerate() {
+            if let Some(rect) = spotlight::rect(ctx, *spot) {
+                glow(ctx, rect, accent(n, dark_mode), lit);
+            }
+        }
+        if !page.spots.is_empty() || self.typing.is_some() {
+            ctx.request_repaint_after(ANIMATION_TICK);
+        }
+
+        // After the closure, so the rendered page stays the one its buttons
+        // were laid out for.
         if step != 0 {
             let next = self.page as i64 + step;
             self.page = next.clamp(0, PAGES.len() as i64 - 1) as usize;
         }
-        dismissed
+        if dismissed {
+            // Leave the user on the tab they will actually work in, with a
+            // box holding only what they typed themselves.
+            actions.dismissed = true;
+            actions.goto_tab = Some(Tab::Search);
+            actions.set_query = Some(String::new());
+        }
+        actions
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_ui::{click_at, painted_text, raw_input};
-
-    const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
-
-    /// Two passes: an `egui::Window` is measured on its first frame and only
-    /// placed on the next, so a single pass paints nothing to read back and
-    /// has nothing at a known position to click.
-    fn frame(
-        ctx: &egui::Context,
-        tour: &mut Tutorial,
-        events: Vec<egui::Event>,
-    ) -> (egui::FullOutput, bool) {
-        let roots = ["/home/me".to_string()];
-        let _ = ctx.run(raw_input(SCREEN, Vec::new()), |ctx| {
-            tour.ui(ctx, &roots);
-        });
-        let mut dismissed = false;
-        let out = ctx.run(raw_input(SCREEN, events), |ctx| {
-            dismissed = tour.ui(ctx, &roots);
-        });
-        (out, dismissed)
-    }
-
-    /// Every page has something to say, and says it.
-    #[test]
-    fn every_page_paints_its_own_title_and_body() {
-        for (page, spec) in PAGES.iter().enumerate() {
-            let ctx = crate::test_ui::ctx();
-            let mut tour = Tutorial { page };
-            let (out, _) = frame(&ctx, &mut tour, Vec::new());
-            let painted = painted_text(&out);
-            assert!(
-                painted.iter().any(|t| t == spec.title),
-                "page {page} painted no title: {painted:?}"
-            );
-            assert!(!spec.body.is_empty(), "page {page} has an empty body");
-            assert!(
-                painted
-                    .iter()
-                    .any(|t| t == &format!("{} of {}", page + 1, PAGES.len())),
-                "page {page} did not say where it is: {painted:?}"
-            );
-        }
-    }
-
-    /// The page about indexing names *this* installation's folders, not a
-    /// generic example.
-    #[test]
-    fn the_indexing_page_lists_the_configured_folders() {
-        let ctx = crate::test_ui::ctx();
-        let mut tour = Tutorial { page: 1 };
-        let roots = ["/srv/projects".to_string()];
-        let _ = ctx.run(raw_input(SCREEN, Vec::new()), |ctx| {
-            tour.ui(ctx, &roots);
-        });
-        let out = ctx.run(raw_input(SCREEN, Vec::new()), |ctx| {
-            tour.ui(ctx, &roots);
-        });
-        let painted = painted_text(&out);
-        assert!(painted.iter().any(|t| t == "/srv/projects"), "{painted:?}");
-    }
-
-    /// The y of the footer row on `page`, found by walking down the middle
-    /// column, which only Skip occupies. Wrapped text height moves the row
-    /// from page to page, so it is probed rather than guessed.
-    fn footer_y(ctx: &egui::Context, page: usize) -> f32 {
-        for y in (150..600).step_by(2) {
-            let mut t = Tutorial { page };
-            let (_, dismissed) = frame(ctx, &mut t, click_at(egui::pos2(500.0, y as f32)));
-            if dismissed {
-                return y as f32;
-            }
-        }
-        panic!("no Skip button down the middle of page {page}");
-    }
-
-    /// The stretch of x along the footer row that one button answers a click
-    /// on — where it is, and how wide.
-    #[derive(Debug, Clone, Copy)]
-    struct Span {
-        lo: f32,
-        hi: f32,
-    }
-
-    impl Span {
-        fn width(&self) -> f32 {
-            self.hi - self.lo
-        }
-    }
-
-    /// The three footer buttons, found by what clicking each one does: Back
-    /// steps a page back, Next steps one forward, Skip dismisses.
-    ///
-    /// Must be run on a middle page — on the last page Finish and Skip both
-    /// dismiss without moving, and on the first Back is disabled.
-    fn footer_spans(ctx: &egui::Context, page: usize) -> [Option<Span>; 3] {
-        assert!(page > 0 && page + 1 < PAGES.len(), "probe a middle page");
-        let y = footer_y(ctx, page);
-        let mut spans: [Option<Span>; 3] = [None; 3];
-        for x in 150..850 {
-            let mut t = Tutorial { page };
-            let (_, dismissed) = frame(ctx, &mut t, click_at(egui::pos2(x as f32, y)));
-            let x = x as f32;
-            let which = if dismissed {
-                1 // Skip
-            } else if t.page + 1 == page {
-                0 // Back
-            } else if t.page == page + 1 {
-                2 // Next
-            } else {
-                continue;
-            };
-            match &mut spans[which] {
-                Some(span) => span.hi = x,
-                slot => *slot = Some(Span { lo: x, hi: x }),
-            }
-        }
-        spans
-    }
-
-    /// The footer reads Back, then Skip, then Next — and each does what its
-    /// label says. Positions are probed rather than asserted against numbers:
-    /// the window auto-sizes to the page's text, so the thirds move.
-    ///
-    /// The widths are the other half of it. `Ui::columns` lays a column out
-    /// justified, so a button dropped straight into one comes out as wide as
-    /// the whole third — which is what Back was until it was given a layout of
-    /// its own. Two buttons with four-letter labels either side of the row
-    /// have to come out the same size.
-    #[test]
-    fn the_footer_runs_back_then_skip_then_next_at_the_same_size() {
-        let ctx = crate::test_ui::ctx();
-        let [back, skip, next] = footer_spans(&ctx, 1);
-        let back = back.expect("no Back button in the footer");
-        let skip = skip.expect("no Skip button in the footer");
-        let next = next.expect("no Next button in the footer");
-        assert!(
-            back.lo < skip.lo,
-            "Back ({back:?}) is not left of Skip ({skip:?})"
-        );
-        assert!(
-            skip.lo < next.lo,
-            "Skip ({skip:?}) is not left of Next ({next:?})"
-        );
-
-        assert!(
-            (back.width() - next.width()).abs() <= 2.0,
-            "Back is {} wide against Next's {}",
-            back.width(),
-            next.width()
-        );
-        // Belt and braces on the shape of the bug: a stretched button fills
-        // its third of a 520-point modal, which no four-letter label does.
-        assert!(
-            back.width() < 80.0,
-            "Back is stretched to {} points",
-            back.width()
-        );
-    }
-
-    /// Back is disabled on the first page, so nothing in the footer can walk
-    /// the tour off the front.
-    #[test]
-    fn the_first_page_cannot_go_back() {
-        let ctx = crate::test_ui::ctx();
-        let y = footer_y(&ctx, 0);
-        for x in (150..850).step_by(4) {
-            let mut t = Tutorial { page: 0 };
-            let _ = frame(&ctx, &mut t, click_at(egui::pos2(x as f32, y)));
-            assert!(
-                t.page == 0 || t.page == 1,
-                "clicking x={x} left page {}",
-                t.page
-            );
-        }
-    }
-
-    /// Clicking anywhere in the button row, on any page; collects what fired.
-    fn sweep(ctx: &egui::Context, tour: &mut Tutorial) -> Vec<usize> {
-        let mut seen = Vec::new();
-        for y in (200..500).step_by(4) {
-            for x in (240..760).step_by(8) {
-                let mut t = Tutorial { page: tour.page };
-                let (_, dismissed) = frame(ctx, &mut t, click_at(egui::pos2(x as f32, y as f32)));
-                if dismissed {
-                    seen.push(t.page);
-                }
-            }
-        }
-        seen
-    }
-
-    /// Both ways out of the tour report the dismissal, so the flag gets set
-    /// whichever the user takes. Positions depend on wrapped text height, so
-    /// the button row is swept rather than guessed at — the same approach the
-    /// confirmation modals' tests take.
-    #[test]
-    fn skip_and_finish_both_dismiss() {
-        let ctx = crate::test_ui::ctx();
-
-        // Skip is on every page.
-        let mut tour = Tutorial { page: 0 };
-        assert!(
-            !sweep(&ctx, &mut tour).is_empty(),
-            "Skip never fired on the first page"
-        );
-
-        // Finish only on the last, where it replaces Next.
-        let mut tour = Tutorial {
-            page: PAGES.len() - 1,
-        };
-        assert!(
-            !sweep(&ctx, &mut tour).is_empty(),
-            "Finish never fired on the last page"
-        );
-        let ctx = crate::test_ui::ctx();
-        let mut tour = Tutorial {
-            page: PAGES.len() - 1,
-        };
-        let (out, _) = frame(&ctx, &mut tour, Vec::new());
-        assert!(
-            painted_text(&out).contains(&"Finish".to_string()),
-            "the last page still offers Next"
-        );
-    }
-}
+mod tests;

@@ -1,17 +1,7 @@
-//! Steady-state memory accounting for an already-running process.
-//!
-//! [`memprobe`](memprobe.rs) answers "how much RAM does a run peak at"; this
-//! answers "how much is the process still holding once it has nothing to do",
-//! which is a different question with a different answer. Under glibc a peak
-//! is not returned to the OS when it is freed, so the idle floor is set by the
-//! largest thing that ever happened rather than by anything currently live.
-//! Telling those apart is the whole point of this probe.
-//!
-//! It reads another process's `/proc` rather than its own, so it measures a
-//! binary that was built without knowing it would be measured. That matters
-//! for a before/after: an in-process diagnostic would mean the "before" and
-//! "after" numbers come from different binaries, and the delta would include
-//! the diagnostic itself.
+//! [`memprobe`](memprobe.rs) answers "how much RAM does a run peak at";
+//! this answers "how much is the process still holding once idle". It
+//! reads another process's `/proc`, so the measured binary was built
+//! without knowing it would be measured.
 //!
 //! ```text
 //! cargo build -p quicksearch-core --example rssprobe --release
@@ -20,48 +10,29 @@
 //! ./target/release/examples/rssprobe $(pgrep -x quicksearch) 60 250
 //! ```
 //!
-//! With no duration it takes one snapshot and prints the full breakdown. With
-//! one it samples for that many seconds first, so a number can be quoted for
-//! an *idle* process rather than for whatever the process happened to be doing
-//! the instant the probe ran.
-//!
-//! **`VmRSS` is the wrong number to optimise and it is the one every system
-//! monitor shows.** Most of it here is `Shared_Clean`: the binary's own text,
-//! libc, and the Mesa/GL stack the window pulls in. Those pages are shared
-//! with every other process using them and the kernel drops them under
-//! pressure. The two numbers worth acting on are:
-//!
-//! - **`RssAnon`** — heap and thread stacks. Nothing else. This is the share
-//!   this codebase allocates and can therefore give back.
-//! - **`Private_Dirty`** — what the process actually costs the machine, from
-//!   `smaps_rollup`. Nobody else is sharing it and it cannot be evicted, only
-//!   freed.
-//!
-//! The `glibc arenas` line is the one that says whether an anonymous figure is
-//! live data or retention. glibc allocates each non-main arena as a 64 MiB
-//! aligned region and commits into it; it never unmaps one, and `free` returns
-//! chunks to the arena rather than to the kernel. So a stack of 64 MiB regions
-//! holding far less than 64 MiB each is freed memory the process is still
-//! charged for — which `malloc_trim(3)` can return and dropping a buffer
-//! cannot. Live data does not look like that.
+//! **`VmRSS` is the wrong number to optimise** — mostly `Shared_Clean`,
+//! shared and droppable, yet it is what every monitor shows. Act on
+//! **`RssAnon`** (heap and thread stacks — what this codebase allocates)
+//! and **`Private_Dirty`** (what the process costs the machine). The
+//! `glibc arenas` line says whether an anonymous figure is live data or
+//! retention that `malloc_trim(3)` could return.
 
+// The GUI's idle footprint is an allocator property too; see `memprobe`.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
+use quicksearch_core::testutil::{mib, size_class};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use quicksearch_core::testutil::{mib, size_class};
 
-/// Default gap between samples. One `status` plus one `smaps_rollup` read per
-/// sample, both small; the interval is set by how fine the timeline should be
-/// rather than by overhead. `smaps` is read once at the end, not per sample —
-/// it is the expensive one, being proportional to the mapping count.
+/// Default gap between samples; `smaps` — proportional to the mapping
+/// count — is read once at the end, not per sample.
 const DEFAULT_SAMPLE_MS: u64 = 500;
 
 /// The size glibc reserves per non-main arena (`HEAP_MAX_SIZE` on 64-bit).
-/// Regions of exactly this size, aligned to it, are arenas rather than
-/// anything the program asked for.
 const ARENA_SPAN: u64 = 64 * 1024 * 1024;
 
-/// One sample: the cheap per-interval reads only.
 struct Sample {
     at: Duration,
     rss: u64,
@@ -69,20 +40,14 @@ struct Sample {
     file: u64,
     private_dirty: u64,
     pss: u64,
-    /// Carried per sample rather than read once at the end, so it survives the
-    /// process exiting mid-run — it comes from the same `status` read anyway.
+    /// Carried per sample, so it survives the process exiting mid-run.
     hwm: u64,
 }
 
-/// Resident bytes per mapping, plus the two groupings that answer the
-/// retention question directly.
 #[derive(Default)]
 struct Breakdown {
-    /// Mapping name (or anonymous size class) to resident bytes, descending.
     entries: Vec<(String, u64)>,
-    /// Non-main glibc arenas: how many, and resident across all of them.
     arenas: (usize, u64),
-    /// The main arena, which grows by `brk` and is the one the kernel labels.
     main_heap: u64,
 }
 
@@ -114,13 +79,9 @@ fn main() {
     report(&samples, &at_end, interval);
 }
 
-/// Sample until `duration` elapses. A zero duration still takes one sample,
-/// so the no-argument form is a snapshot rather than an error.
-///
-/// The per-mapping breakdown is taken alongside the last *live* sample rather
-/// than after the loop, because a process that exits during a long run would
-/// otherwise report an empty one — which reads like "nothing was resident"
-/// rather than "nobody was there to ask".
+/// Sample until `duration` elapses; zero still takes one sample. The
+/// per-mapping breakdown rides the last *live* sample: a process exiting
+/// mid-run would otherwise report "nothing resident".
 fn sample_for(pid: u32, duration: Duration, interval: Duration) -> (Vec<Sample>, Breakdown) {
     let start = Instant::now();
     let mut samples = Vec::new();
@@ -139,9 +100,7 @@ fn sample_for(pid: u32, duration: Duration, interval: Duration) -> (Vec<Sample>,
             break;
         };
         samples.push(s);
-        // smaps is proportional to the mapping count, so it is read once per
-        // sample only when the sample might be the last one — which, until the
-        // loop ends, is every one of them.
+        // Read while the process might exit: every sample may be the last.
         at_end = breakdown(pid);
         if start.elapsed() >= duration {
             break;
@@ -153,9 +112,8 @@ fn sample_for(pid: u32, duration: Duration, interval: Duration) -> (Vec<Sample>,
 
 fn sample(pid: u32, at: Duration) -> Option<Sample> {
     let status = proc_kv(pid, "status")?;
-    // smaps_rollup is the kernel's own sum over smaps, so it costs one read
-    // rather than one per mapping. Missing only on kernels this old code will
-    // never meet; treat it as zero rather than failing the sample.
+    // smaps_rollup is the kernel's own sum — one read, not one per mapping;
+    // missing only on ancient kernels, treated as zero.
     let rollup = proc_kv(pid, "smaps_rollup").unwrap_or_default();
     Some(Sample {
         at,
@@ -168,11 +126,7 @@ fn sample(pid: u32, at: Duration) -> Option<Sample> {
     })
 }
 
-/// Parse a `/proc/<pid>/<file>` of `Key:  N kB` lines into bytes.
-///
-/// Both `status` and `smaps_rollup` are in this format, and both carry lines
-/// that are not sizes at all (`Name:`, `State:`, the rollup's address range).
-/// Anything that does not end in `kB` is skipped rather than guessed at.
+/// Parse `Key:  N kB` lines into bytes; non-size lines are skipped.
 fn proc_kv(pid: u32, file: &str) -> Option<HashMap<String, u64>> {
     let text = std::fs::read_to_string(format!("/proc/{}/{}", pid, file)).ok()?;
     let mut out = HashMap::new();
@@ -197,22 +151,16 @@ fn comm(pid: u32) -> String {
         .unwrap_or_default()
 }
 
-/// Resident bytes per mapping from `/proc/<pid>/smaps`, summed by name, with
-/// glibc's arenas identified.
-///
-/// The name is the mapping's path, or `[heap]`/`[stack]` for the ones the
-/// kernel labels. Everything else is anonymous — thread stacks, arena heaps,
-/// and any single `malloc` large enough to have gone to `mmap` — and is
-/// bucketed by size class, because individually they are unnamed and there can
-/// be hundreds of them.
+/// Resident bytes per mapping from smaps, summed by name, arenas
+/// identified; anonymous mappings are bucketed by size class —
+/// individually unnamed, and there can be hundreds.
 fn breakdown(pid: u32) -> Breakdown {
     let Ok(smaps) = std::fs::read_to_string(format!("/proc/{}/smaps", pid)) else {
         return Breakdown::default();
     };
 
-    // Two passes over the same parse: one for the by-name totals the report
-    // prints, one to find arenas — which needs the raw address ranges the
-    // names throw away.
+    // Two passes over one parse: by-name totals, then arenas — which need
+    // the raw address ranges the names throw away.
     let mut by_name: HashMap<String, u64> = HashMap::new();
     let mut regions: Vec<Region> = Vec::new();
     let mut current = String::new();
@@ -248,7 +196,6 @@ fn breakdown(pid: u32) -> Breakdown {
     }
 }
 
-/// One `smaps` mapping, kept with its address range so arenas can be found.
 struct Region {
     lo: u64,
     hi: u64,
@@ -257,19 +204,11 @@ struct Region {
     rss: u64,
 }
 
-/// Count glibc's non-main arenas and their resident bytes.
-///
-/// An arena is one `mmap` of [`ARENA_SPAN`], aligned to it, which glibc then
-/// commits into piecewise — so by the time it reaches `smaps` it has usually
-/// been split into a readable part and a `---p` remainder. Matching a single
-/// mapping of the full span therefore misses most of them. Contiguous runs of
-/// anonymous mappings are coalesced first, and a run that spans exactly one
-/// aligned [`ARENA_SPAN`] is an arena.
-///
-/// This can in principle collide with a program that mmaps 64 MiB at 64 MiB
-/// alignment on purpose. Nothing here does, and the alternative — parsing
-/// glibc's internal `heap_info` out of the process — is not worth it for a
-/// figure whose job is to point at a cause rather than to be exact.
+/// Count glibc's non-main arenas: one aligned `mmap` of [`ARENA_SPAN`] that
+/// glibc commits piecewise, so by `smaps` it is usually split — contiguous
+/// anonymous runs are coalesced first, and a run spanning exactly one
+/// aligned span is an arena. Could collide with a deliberate aligned 64 MiB
+/// mmap; nothing here does.
 fn find_arenas(regions: &[Region]) -> (usize, u64) {
     let mut count = 0;
     let mut resident = 0;
@@ -301,17 +240,14 @@ fn find_arenas(regions: &[Region]) -> (usize, u64) {
     (count, resident)
 }
 
-/// Parse one `smaps` header line: `addr-addr perms offset dev inode [path]`.
-///
-/// Anonymous mappings have no path; they are named by size class so that a
-/// hundred 8 MiB regions read as one line rather than a hundred.
+/// Parse one `smaps` header line; anonymous mappings are named by size
+/// class so a hundred 8 MiB regions read as one line.
 fn parse_map_header(line: &str) -> Option<Region> {
     let mut fields = line.split_whitespace();
     let range = fields.next()?;
     let (lo, hi) = range.split_once('-')?;
     let lo = u64::from_str_radix(lo, 16).ok()?;
     let hi = u64::from_str_radix(hi, 16).ok()?;
-    // Fields 2-5 are perms, offset, dev, inode; anything after is the path.
     let path = fields.nth(4).unwrap_or("");
     Some(Region {
         lo,
@@ -356,9 +292,8 @@ fn report(samples: &[Sample], at_end: &Breakdown, interval: Duration) {
         interval
     );
 
-    // Both ends of each range, because a figure that is drifting is a
-    // different finding from one that is flat, and only the flat one can be
-    // called a floor.
+    // Both ends of each range: drifting and flat are different findings,
+    // and only a flat figure can be called a floor.
     range_line("VmRSS", samples, |s| s.rss, "");
     range_line(
         "RssAnon",

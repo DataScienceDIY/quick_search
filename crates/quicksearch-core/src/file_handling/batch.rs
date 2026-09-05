@@ -10,51 +10,60 @@ use super::*;
 use crate::config::Config;
 use crate::db::repo::{self};
 
-/// The compressed sidecar for one row, or `None` where there is none to write
-/// — an empty body, or `store_text_for_snippets` turned off.
+/// One writer's compressed sidecars: a batch's blobs end to end in `arena`,
+/// with `slots[i]` saying where row `i`'s is — or that it has none, or that
+/// its compression failed (kept per row rather than failing the batch).
 ///
-/// `Err` is kept per row rather than failing the batch, because every caller
-/// here already logs and skips a row whose write fails.
-type Body = Result<Option<Vec<u8>>, String>;
+/// Everything here is reused across chunks. The encoder because building a
+/// zstd context per chunk is wasted CPU (`benches/index.rs`, `zstd_encode`);
+/// the arena because a `Vec` per row was one allocation per indexed
+/// document, and the writer sees every one of them.
+struct Bodies {
+    enc: repo::DocEncoder,
+    arena: Vec<u8>,
+    slots: Vec<Result<Option<std::ops::Range<usize>>, String>>,
+}
 
-/// Compress a batch's bodies through one context, before the caller takes the
-/// connection.
-///
-/// Compression used to run inside the transaction, so a chunk's worth of it —
-/// measured at ~8 ms per 500 documents — sat inside the `conn_mutex` hold as
-/// pure CPU. Hoisting it here leaves the lock covering only the SQL, and
-/// reusing one [`repo::DocEncoder`] across the batch cuts the compression
-/// itself by ~4.7x (`benches/index.rs`, group `zstd_encode`).
-///
-/// What that lock does *not* gate, so the benefit is not overclaimed: search
-/// holds its own connection (`db::open::open_search_reader`) and the database
-/// is WAL, where a reader never blocks on a writer. Nor does it separate one
-/// root from another — every root's writes already run on the single writer
-/// thread, so two of them are never inside the lock at once. What it actually
-/// serializes the run against is WAL checkpointing, which `run_indexing`
-/// forces from the same thread between turns. A whole-tree wall-clock run is
-/// dominated by FTS5 trigram tokenization and does not move measurably from
-/// this change; it is the length of the hold that improves, not throughput.
-fn compress_bodies<'a>(
-    texts: impl Iterator<Item = Option<&'a str>>,
-    config: &Config,
-) -> Result<Vec<Body>, String> {
-    let mut enc = repo::DocEncoder::new()?;
-    Ok(texts
-        .map(|text| match text {
-            Some(t) if config.processing.store_text_for_snippets && !t.is_empty() => {
-                enc.encode(t).map(Some)
-            }
-            _ => Ok(None),
+impl Bodies {
+    fn new() -> Result<Bodies, String> {
+        Ok(Bodies {
+            enc: repo::DocEncoder::new()?,
+            arena: Vec::new(),
+            slots: Vec::new(),
         })
-        .collect())
+    }
+
+    /// Compress one chunk's bodies, **before the caller takes the
+    /// connection**: the lock covers only the SQL.
+    fn fill<'a>(&mut self, texts: impl Iterator<Item = Option<&'a str>>, config: &Config) {
+        self.arena.clear();
+        self.slots.clear();
+        for text in texts {
+            let slot = match text {
+                Some(t) if config.processing.store_text_for_snippets && !t.is_empty() => {
+                    self.enc.encode_into(t, &mut self.arena).map(Some)
+                }
+                _ => Ok(None),
+            };
+            self.slots.push(slot);
+        }
+    }
+
+    /// Row `i`'s blob, or why there is none.
+    fn get(&self, i: usize) -> Result<Option<&[u8]>, &str> {
+        match &self.slots[i] {
+            Ok(Some(at)) => Ok(Some(&self.arena[at.clone()])),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// The sidecar blob for row `i`, or a logged skip if its compression failed.
 macro_rules! body_or_skip {
     ($bodies:expr, $i:expr, $what:expr) => {
-        match &$bodies[$i] {
-            Ok(b) => b.as_deref(),
+        match $bodies.get($i) {
+            Ok(b) => b,
             Err(e) => {
                 crate::log_warn!("compress text for {}: {}", $what, e);
                 continue;
@@ -63,13 +72,58 @@ macro_rules! body_or_skip {
     };
 }
 
-/// Write already-prepared records for files whose content changed.
+/// The skeleton behind [`process_batch_updates`] and
+/// [`process_batch_inserts`]: compress each chunk's bodies outside the lock,
+/// write its rows in one transaction through `write_row`, and store any
+/// inline text on a fresh row.
 ///
-/// The records arrive fully built (see [`prepare_file_record`]), so this does
-/// no filesystem I/O; rows are chunked so each transaction, and therefore
-/// each hold of the connection lock, stays short. Records that already carry
-/// their text ([`OwnedNewFile::inline_text`]) are stored complete here; the
-/// rest stay pending.
+/// `_fresh` is sound here because both row writers leave a row that
+/// **provably holds no content**: see their comments at the call sites.
+fn write_prepared_records(
+    conn_mutex: &Arc<Mutex<Connection>>,
+    records: &[OwnedNewFile],
+    stop_flag: &Arc<AtomicBool>,
+    config: &Config,
+    chunk_size: usize,
+    write_row: impl Fn(&rusqlite::Transaction<'_>, &OwnedNewFile) -> Result<Option<i64>, String>,
+) -> Result<(), String> {
+    // One set of buffers for every chunk this call writes.
+    let mut bodies = Bodies::new()?;
+    for batch in records.chunks(chunk_size) {
+        if stop_flag.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        // Outside the lock — see `Bodies::fill`.
+        bodies.fill(batch.iter().map(|r| r.inline_text.as_deref()), config);
+        let conn = crate::lock_ok(conn_mutex);
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        for (i, rec) in batch.iter().enumerate() {
+            if stop_flag.load(Ordering::Relaxed) {
+                drop(tx);
+                drop(conn);
+                return Ok(());
+            }
+            let id = write_row(&tx, rec)?;
+            if let (Some(id), Some(text)) = (id, rec.inline_text.as_deref()) {
+                let zstd = body_or_skip!(bodies, i, rec.path());
+                repo::set_content_done_fresh(&tx, id, text, zstd)?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit transaction: {}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Write already-prepared records for files whose content changed. No
+/// filesystem I/O; records carrying inline text are stored complete here,
+/// the rest stay pending.
 pub fn process_batch_updates(
     conn_mutex: &Arc<Mutex<Connection>>,
     files_to_update: &[OwnedNewFile],
@@ -82,63 +136,42 @@ pub fn process_batch_updates(
 
     let fts_batch = config.processing.fts_update_batch_size.max(1);
 
-    for batch in files_to_update.chunks(fts_batch) {
-        if stop_flag.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        // Outside the lock — see `compress_bodies`.
-        let bodies = compress_bodies(batch.iter().map(|r| r.inline_text.as_deref()), config)?;
-        let conn = crate::lock_ok(conn_mutex);
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
-
-        for (i, rec) in batch.iter().enumerate() {
-            if stop_flag.load(Ordering::Relaxed) {
-                drop(tx);
-                drop(conn);
-                return Ok(());
-            }
-
-            let updated = repo::update_file_basic(&tx, &rec.as_new_file()).map_err(|e| {
+    // The row leaves this closure `_fresh`: `update_file_basic` cleared its
+    // content in this same transaction, and the insert fallback created the
+    // row outright.
+    write_prepared_records(
+        conn_mutex,
+        files_to_update,
+        stop_flag,
+        config,
+        fts_batch,
+        |tx, rec| {
+            let updated = repo::update_file_basic(tx, &rec.as_new_file()).map_err(|e| {
                 format!(
                     "Failed to update file record + clear stale content for {}: {}",
-                    rec.path, e
+                    rec.path(),
+                    e
                 )
             })?;
 
-            // No row matched: the path spelling we're writing disagrees with
-            // the stored one. Dropping the update would leave the mtime stale
+            // No row matched: dropping the update would leave the mtime stale
             // and the file re-hashed on every run forever.
-            let id = match updated {
+            match updated {
                 None => {
                     crate::log_warn!(
                         "no indexed row matched {} during update; inserting instead",
-                        rec.path
+                        rec.path()
                     );
-                    repo::insert_file(&tx, &rec.as_new_file())
-                        .map_err(|e| format!("Failed to insert file record: {}", e))?
+                    repo::insert_file(tx, &rec.as_new_file())
+                        .map_err(|e| format!("Failed to insert file record: {}", e))
                 }
-                some => some,
-            };
-
-            if let (Some(id), Some(text)) = (id, rec.inline_text.as_deref()) {
-                let zstd = body_or_skip!(bodies, i, rec.path);
-                repo::set_content_done(&tx, id, text, zstd)?;
+                some => Ok(some),
             }
-        }
-
-        tx.commit()
-            .map_err(|e| format!("Failed to commit transaction: {}", e))?;
-    }
-
-    Ok(())
+        },
+    )
 }
 
-/// Write already-prepared records for newly discovered files. Silent, like
-/// [`process_batch_updates`], and likewise stores any text the walk already
-/// extracted.
+/// Write already-prepared records for newly discovered files.
 pub fn process_batch_inserts(
     conn_mutex: &Arc<Mutex<Connection>>,
     files_to_insert: &[OwnedNewFile],
@@ -149,45 +182,27 @@ pub fn process_batch_inserts(
         return Ok(());
     }
 
-    for batch in files_to_insert.chunks(config.processing.batch_size) {
-        if stop_flag.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        // Outside the lock — see `compress_bodies`.
-        let bodies = compress_bodies(batch.iter().map(|r| r.inline_text.as_deref()), config)?;
-        let conn = crate::lock_ok(conn_mutex);
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
-
-        for (i, rec) in batch.iter().enumerate() {
-            if stop_flag.load(Ordering::Relaxed) {
-                drop(tx);
-                drop(conn);
-                return Ok(());
-            }
-            let id = repo::insert_file(&tx, &rec.as_new_file())
-                .map_err(|e| format!("Failed to insert file record: {}", e))?;
-            if let (Some(id), Some(text)) = (id, rec.inline_text.as_deref()) {
-                let zstd = body_or_skip!(bodies, i, rec.path);
-                repo::set_content_done(&tx, id, text, zstd)?;
-            }
-        }
-
-        tx.commit()
-            .map_err(|e| format!("Failed to commit transaction: {}", e))?;
-    }
-
-    Ok(())
+    // `.max(1)`: `chunks(0)` panics on the indexing thread, so a hand-edited
+    // `batch_size = 0` would wedge indexing while the UI reads "Running".
+    //
+    // The row leaves this closure `_fresh`: `insert_file` returned `Some`
+    // only by creating it, so it cannot carry content from anywhere.
+    write_prepared_records(
+        conn_mutex,
+        files_to_insert,
+        stop_flag,
+        config,
+        config.processing.batch_size.max(1),
+        |tx, rec| {
+            repo::insert_file(tx, &rec.as_new_file())
+                .map_err(|e| format!("Failed to insert file record: {}", e))
+        },
+    )
 }
 
-/// Delete the rows a completed run found no file behind, in chunked
-/// transactions. Returns how many went.
-///
-/// The stop flag is checked between chunks and again per path, never with a
-/// transaction open: a chunk either commits whole or is not begun, so a stop
-/// cannot leave the index half-reconciled.
+/// Delete the rows a completed run found no file behind. Returns how many
+/// went. A chunk either commits whole or is not begun, so a stop cannot
+/// leave the index half-reconciled.
 pub fn cleanup_stale_index_entries(
     conn_mutex: &Arc<Mutex<Connection>>,
     stale_paths: &[String],
@@ -201,7 +216,6 @@ pub fn cleanup_stale_index_entries(
     let mut deleted_count = 0usize;
 
     for batch in stale_paths.chunks(chunk) {
-        // Outside the lock, so a stop is seen before a transaction is begun.
         if stop_flag.load(Ordering::Relaxed) {
             return Ok(deleted_count);
         }
@@ -234,16 +248,15 @@ pub fn cleanup_stale_index_entries(
     Ok(deleted_count)
 }
 
-/// Keyset cursor bounding everything stored beneath one directory.
+/// Keyset cursor bounding everything stored beneath one directory: the
+/// half-open range `[dir + SEP, dir + (SEP + 1))` over `files.parent`. It
+/// covers `dir`'s own files because every stored parent ends in a separator
+/// (see `dir_to_db_parent`).
 ///
-/// `lo`/`hi` are the half-open path range `[dir + SEP, dir + (SEP + 1))`, so
-/// the pair is a pure index range on `UNIQUE(files.path)`.
-///
-/// The separator must be the platform's own: `files.path` stores native
-/// separators, and the successor of `/` (`0x2F`) is `'0'` while the successor
-/// of `\` (`0x5C`) is `']'` — the Unix pair on Windows yields
-/// `hi = "C:\Users\me0"`, which every stored path sorts *above*, silently
-/// disabling content extraction and the vanished-directory sweep.
+/// The separator must be the platform's own: the successor of `/` is `'0'`
+/// while the successor of `\` is `']'` — the Unix pair on Windows yields a
+/// `hi` every stored parent sorts *above*, silently disabling content
+/// extraction and the vanished-directory sweep.
 #[derive(Debug, Clone)]
 pub struct ExtractCursor {
     pub last_id: i64,
@@ -255,9 +268,8 @@ impl ExtractCursor {
     /// Cursor covering everything under `root`.
     pub fn for_root(root: &str) -> ExtractCursor {
         const SEP: char = std::path::MAIN_SEPARATOR;
-        // Both separators are trimmed, not just the platform's: a config or a
-        // watcher event may spell a directory either way, and a trailing one
-        // would otherwise be doubled into the bounds.
+        // Both separators are trimmed, not just the platform's: a config or
+        // watcher event may spell a directory either way.
         let base = root.trim_end_matches(['/', '\\']);
         let next = char::from_u32(SEP as u32 + 1).expect("separator successor is a valid char");
         ExtractCursor {
@@ -268,51 +280,43 @@ impl ExtractCursor {
     }
 }
 
-/// What a root's extraction scope holds: rows still to extract this run,
-/// and rows whose text is already searchable from earlier runs.
-///
-/// Both halves count only files an extractor claims — rows nothing will
-/// extract are written `NA` at walk time (see [`content_extractable`]) — so
-/// their sum is a denominator for the *work*, not for every file under the
-/// root.
+/// What a root's extraction scope holds. Both halves count only files an
+/// extractor claims, so their sum is a denominator for the *work*, not for
+/// every file under the root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtractScope {
     pub pending: usize,
     pub already_done: usize,
 }
 
-/// The `maximum_text_file_size` bound as the SQL below compares it.
 pub(crate) fn max_text_file_size(config: &Config) -> i64 {
     i64::try_from(config.processing.maximum_text_file_size).unwrap_or(i64::MAX)
 }
 
-/// Flip a root's oversize pending rows to NA. Idempotent.
+/// Flip a root's oversize pending rows to NA. Idempotent. Covers what
+/// walk-time decisions cannot: a `maximum_text_file_size` *lowered* between
+/// runs, and rows left pending by an older build.
 ///
-/// Covers what walk-time decisions cannot: a `maximum_text_file_size`
-/// *lowered* between runs (which does not force a rebuild), and rows left
-/// pending by an older build. Rows this misses would stay pending forever, so
-/// it runs on the writer before a root's content pass starts.
+/// `INDEXED BY`: the planner's choice fetches every table row in the range on
+/// the writer thread; the partial index measured faster in every shape — this
+/// cannot be left to statistics.
 pub fn mark_oversize_pending_na(
     conn: &Connection,
     cursor: &ExtractCursor,
     config: &Config,
 ) -> Result<(), String> {
     conn.execute(
-        "UPDATE files SET content_state = 3 \
-         WHERE content_state = 0 AND size > ?1 AND path >= ?2 AND path < ?3",
+        "UPDATE files INDEXED BY idx_files_content_pending SET content_state = 3 \
+         WHERE content_state = 0 AND size > ?1 AND parent >= ?2 AND parent < ?3",
         rusqlite::params![max_text_file_size(config), cursor.lo, cursor.hi],
     )
     .map_err(|e| format!("mark oversize files NA: {}", e))?;
     Ok(())
 }
 
-/// Count what a root's range holds: rows still to extract this run, and rows
-/// whose text is already searchable from earlier runs.
-///
-/// One range scan for both figures. Deliberately callable on any connection
-/// — the content pass runs it on its own read connection rather than on the
-/// indexer's writer, because on a large root it takes seconds, and seconds of
-/// writer time is every other root's walk standing still.
+/// Count what a root's range holds, in one range scan. The content pass runs
+/// it on its own read connection, never the writer's: on a large root it
+/// takes seconds, and seconds of writer time stalls every other root's walk.
 pub fn count_extract_scope(
     conn: &Connection,
     cursor: &ExtractCursor,
@@ -322,7 +326,7 @@ pub fn count_extract_scope(
         .query_row(
             "SELECT COALESCE(SUM(content_state = 0 AND size <= ?1), 0), \
                     COALESCE(SUM(content_state = 1), 0) \
-             FROM files WHERE path >= ?2 AND path < ?3",
+             FROM files WHERE parent >= ?2 AND parent < ?3",
             rusqlite::params![max_text_file_size(config), cursor.lo, cursor.hi],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
@@ -333,17 +337,9 @@ pub fn count_extract_scope(
     })
 }
 
-/// Rows per compression chunk and per transaction inside [`store_extracted`].
-///
-/// Half of what a writer turn may hand in (`pipeline::READY_TOPUP` is 64), so
-/// a full turn commits twice rather than once — short holds of the connection
-/// being the point. It also bounds the compression thrown away when the
-/// deadline cuts a chunk short, to at most `STORE_CHUNK - 1` bodies.
-///
-/// Note the two buffers are additive: a root can hold `READY_TOPUP` extracted
-/// rows waiting for the writer *and* `content::READY_CAP` more in its
-/// channel, so in-flight text per root is bounded by their sum, not by either
-/// alone.
+/// Rows per compression chunk and per transaction inside [`store_extracted`]:
+/// half of what a writer turn may hand in (`pipeline::READY_TOPUP` is 64), so
+/// a full turn commits twice — short holds of the connection being the point.
 const STORE_CHUNK: usize = 32;
 
 /// What one [`store_extracted`] call did with the rows it was handed.
@@ -355,18 +351,12 @@ pub struct Stored {
     pub written: usize,
 }
 
-/// Write already-extracted rows — the cheap half of the content pass, and all
-/// that runs with the connection held — until `deadline`.
-///
-/// This is where a document's FTS5 trigram tokenization happens, up to
-/// `maximum_text_size` of it per row, and it is the writer thread's dominant
-/// cost. The deadline is checked after every row, so a turn on the writer
-/// overruns it by at most one document; the rows not reached are left for the
-/// caller to hand back next turn. At least one row is always consumed unless
-/// the run is already stopped, so a caller looping on this cannot spin.
-///
-/// A row whose write fails is logged and consumed rather than failing the
-/// run: its `content_state` stays pending, so the next run retries it.
+/// Write already-extracted rows — all that runs with the connection held —
+/// until `deadline`. This is where FTS5 tokenization happens: the writer
+/// thread's dominant cost. A turn overruns the deadline by at most one
+/// document; at least one row is always consumed unless the run is stopped,
+/// so a caller looping on this cannot spin. A row whose write fails is
+/// logged and consumed; its `content_state` stays pending for the next run.
 pub fn store_extracted(
     conn_mutex: &Arc<Mutex<Connection>>,
     rows: &[crate::content::ExtractedRow],
@@ -375,34 +365,33 @@ pub fn store_extracted(
     deadline: std::time::Instant,
 ) -> Result<Stored, String> {
     let mut done = Stored::default();
+    // One set of buffers for every chunk this turn writes.
+    let mut bodies = Bodies::new()?;
     for chunk in rows.chunks(STORE_CHUNK) {
         if stop_flag.load(Ordering::Relaxed) {
             break;
         }
-        // Outside the lock — see `compress_bodies`.
-        let bodies = compress_bodies(
+        // Outside the lock — see `Bodies::fill`.
+        bodies.fill(
             chunk
                 .iter()
                 .map(|r| crate::file_handling::outcome_body(&r.outcome)),
             config,
-        )?;
+        );
         let conn = crate::lock_ok(conn_mutex);
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin transaction: {}", e))?;
         let mut cut = false;
         for (i, row) in chunk.iter().enumerate() {
-            // Counted before anything can skip it: consumed is what the
-            // caller drains, and a row that failed still has to leave.
+            // Counted before anything can skip it: a failed row still leaves.
             done.consumed += 1;
-            match &bodies[i] {
-                Err(e) => crate::log_warn!("compress text for {}: {}", row.name, e),
-                Ok(zstd) => {
-                    match store_content_outcome(&tx, row.file_id, &row.outcome, zstd.as_deref()) {
-                        Ok(()) => done.written += 1,
-                        Err(e) => crate::log_warn!("content indexing for {}: {}", row.name, e),
-                    }
-                }
+            match bodies.get(i) {
+                Err(e) => crate::log_warn!("compress text for {}: {}", row.path(), e),
+                Ok(zstd) => match store_content_outcome(&tx, row.file_id, &row.outcome, zstd) {
+                    Ok(()) => done.written += 1,
+                    Err(e) => crate::log_warn!("content indexing for {}: {}", row.path(), e),
+                },
             }
             if stop_flag.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
                 cut = true;

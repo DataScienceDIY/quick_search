@@ -17,9 +17,14 @@ fn modal(state: VerifyState, n: usize) -> VerifyModal {
     }
 }
 
+/// A reference a megabyte long, so the offsets in the verdicts below have
+/// something to be reported "of".
+const REFERENCE_LEN: u64 = 4_000_000;
+
 fn report(verdicts: Vec<MemberVerdict>, bytes_read: u64) -> VerifyState {
     VerifyState::Done(Box::new(VerifyReport {
         reference: Some(0),
+        reference_len: REFERENCE_LEN,
         verdicts,
         bytes_read,
     }))
@@ -111,10 +116,39 @@ fn a_mismatch_names_the_file_and_the_offset() {
         "{painted:?}"
     );
     assert!(
-        painted.contains(&"differs at byte 1,234,567".to_string()),
+        painted.contains(&"differs at byte 1,234,567 of 4.0 MB".to_string()),
         "{painted:?}"
     );
     assert!(painted.contains(&"/d/copy1.bin".to_string()), "{painted:?}");
+}
+
+/// The report someone reads before deleting something has to answer the
+/// question it provokes: the files open identically, so how do they differ?
+#[test]
+fn a_mismatch_explains_a_difference_nobody_can_see() {
+    let ctx = crate::test_ui::ctx();
+    let m = modal(report(vec![Identical, DiffersAt(91)], 2), 2);
+    let painted = painted_text(&frame(&ctx, &m, Vec::new()).0).join(" ");
+    assert!(
+        painted.contains("this read every byte"),
+        "the report does not say what it did: {painted:?}"
+    );
+    assert!(
+        painted.contains("metadata") && painted.contains("revision"),
+        "nothing explains an invisible difference: {painted:?}"
+    );
+}
+
+/// …and does not raise the question when there is nothing to explain.
+#[test]
+fn a_clean_result_does_not_explain_a_difference_it_did_not_find() {
+    let ctx = crate::test_ui::ctx();
+    let m = modal(report(vec![Identical, Identical], 2), 2);
+    let painted = painted_text(&frame(&ctx, &m, Vec::new()).0).join(" ");
+    assert!(
+        !painted.contains("metadata"),
+        "an identical group was told about differences: {painted:?}"
+    );
 }
 
 #[test]
@@ -158,15 +192,18 @@ fn both_dismiss_buttons_report_the_dismissal() {
 
 #[test]
 fn every_verdict_reads_as_a_sentence_about_the_file() {
-    assert_eq!(verdict_line(&Identical, false), "identical");
-    assert_eq!(verdict_line(&Identical, true), "compared against");
-    assert_eq!(verdict_line(&DiffersAt(0), false), "differs at byte 0");
+    let line = |v: &MemberVerdict, reference| verdict_line(v, reference, 2_000_000);
+    assert_eq!(line(&Identical, false), "identical");
+    assert_eq!(line(&Identical, true), "compared against");
+    // Where in the file, not just how far in: byte 0 of 2 MB is the format's
+    // own header, which is what makes an invisible difference make sense.
+    assert_eq!(line(&DiffersAt(0), false), "differs at byte 0 of 2.0 MB");
     assert_eq!(
-        verdict_line(&DiffersAt(1_048_576), false),
-        "differs at byte 1,048,576"
+        line(&DiffersAt(1_048_576), false),
+        "differs at byte 1,048,576 of 2.0 MB"
     );
     assert_eq!(
-        verdict_line(
+        line(
             &LengthDiffers {
                 len: 2048,
                 reference_len: 1024
@@ -175,7 +212,7 @@ fn every_verdict_reads_as_a_sentence_about_the_file() {
         ),
         "size differs: 2.0 KB against 1.0 KB"
     );
-    assert!(verdict_line(&CannotRead("/d/x: denied".into()), false)
+    assert!(line(&CannotRead("/d/x: denied".into()), false)
         .contains("could not be read — /d/x: denied"));
 }
 
@@ -184,6 +221,7 @@ fn the_summary_counts_what_it_found() {
     let of = |verdicts: Vec<MemberVerdict>, reference| {
         summary_line(&VerifyReport {
             reference,
+            reference_len: REFERENCE_LEN,
             verdicts,
             bytes_read: 0,
         })

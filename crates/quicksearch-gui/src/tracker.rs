@@ -1,19 +1,17 @@
-//! Indexing-rate estimation for the status displays.
-//!
-//! The rate shown is a rolling [`WINDOW`] average, not a run average. The
-//! tracker records a point only when the counter *changes*, prunes points
-//! older than the window but never below two (so a rate slower than one
-//! file per window stays computable), and measures against `now` so the
-//! estimate decays during stalls instead of freezing at the last burst.
+//! Indexing-rate estimation: a rolling [`WINDOW`] average, not a run
+//! average. Two rules that look like bugs and are not — never prune below
+//! two points (a rate slower than one file per window must stay
+//! computable), and measure against `now` (so a stall decays the estimate
+//! instead of freezing it at the last burst).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// The averaging window; public so the display can name it.
+/// Public so the display can name it.
 pub const WINDOW: Duration = Duration::from_secs(30);
 
 pub struct SpeedTracker {
-    /// (when, counter value) — appended only on counter change.
+    /// (when, counter value), appended only on a change.
     points: VecDeque<(Instant, usize)>,
 }
 
@@ -24,7 +22,7 @@ impl SpeedTracker {
         }
     }
 
-    /// Reset between phases (each phase restarts its counter).
+    /// Between phases — each restarts its counter.
     pub fn reset(&mut self) {
         self.points.clear();
     }
@@ -42,17 +40,14 @@ impl SpeedTracker {
             _ => {}
         }
         self.points.push_back((now, files_processed));
-        // Prune points that have fallen out of the window, but always keep
-        // at least two so a slow but steady rate never becomes unmeasurable.
+        // Never below two: see the module header.
         while self.points.len() > 2 && now.duration_since(self.points[0].0) > WINDOW {
             self.points.pop_front();
         }
     }
 
-    /// Estimated files/sec over the last [`WINDOW`], measured from the
-    /// oldest retained progress point to *now*; `None` until two data
-    /// points exist. During a stall nothing is recorded, so the growing
-    /// span decays the estimate toward zero.
+    /// Estimated files/sec from the oldest retained point to *now*; `None`
+    /// until two points exist.
     pub fn files_per_sec(&self) -> Option<f64> {
         self.files_per_sec_at(Instant::now())
     }
@@ -130,8 +125,6 @@ mod tests {
         let base = Instant::now();
         t.record_at(base, 1);
         t.record_at(base + Duration::from_secs(30), 2);
-        // Far beyond the history window; both points are older than 60 s
-        // relative to this record.
         t.record_at(base + Duration::from_secs(300), 3);
         assert!(t.points.len() >= 2);
         assert!(t
@@ -141,9 +134,8 @@ mod tests {
 
     #[test]
     fn window_forgets_an_older_burst() {
-        // 10,000 files in the first second, then a steady 10/s. A run
-        // average would still read in the hundreds; the window must report
-        // what the run is doing now.
+        // 10,000 files in the first second, then a steady 10/s: a run
+        // average would still read in the hundreds.
         let mut t = SpeedTracker::new();
         let base = Instant::now();
         t.record_at(base, 0);

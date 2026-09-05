@@ -3,55 +3,132 @@
 
 use super::*;
 
-/// What a pass's per-row classifier decided about one row.
 enum RowHit {
     Skip,
     Emit(SearchHit),
     Defer(SearchHit),
 }
 
-/// Fold `text` into `dst` in place, reusing its allocation.
-///
-/// The ASCII fold is byte-length preserving, which is what lets the cascade
-/// use offsets found in the folded copy against the unfolded original.
+#[allow(clippy::too_many_arguments)]
+fn row_hit(
+    row: &rusqlite::Row<'_>,
+    file_id: i64,
+    path: &str,
+    name: &str,
+    rank: f64,
+    stage: u8,
+    snippet: Option<snippet::Snippet>,
+    defer: bool,
+) -> Result<RowHit, String> {
+    let (size, mtime) = size_and_mtime(row)?;
+    let hit = SearchHit {
+        file_id,
+        name: name.to_string(),
+        path: path.to_string(),
+        size,
+        mtime,
+        rank,
+        stage,
+        snippet,
+    };
+    Ok(if defer {
+        RowHit::Defer(hit)
+    } else {
+        RowHit::Emit(hit)
+    })
+}
+
+/// The row's decompressed document body (column 5), or `None` where no text
+/// is stored or the blob will not decode.
+fn stored_text<'d>(
+    row: &rusqlite::Row<'_>,
+    doc: &'d mut crate::db::repo::DocDecoder,
+) -> Result<Option<&'d str>, String> {
+    let blob: Option<&[u8]> = row
+        .get_ref(5)
+        .map_err(|e| e.to_string())?
+        .as_blob_or_null()
+        .map_err(|e| e.to_string())?;
+    Ok(blob.and_then(|b| doc.decode(b)))
+}
+
+/// Scan of every stored document body, for a pass with no usable FTS narrowing.
+fn doc_scan_sql(filter_sql: &str) -> String {
+    format!(
+        "SELECT {}, dt.text_zstd \
+         FROM documents_text dt JOIN files f ON f.id = dt.file_id WHERE 1=1{}",
+        HIT_COLUMNS, filter_sql
+    )
+}
+
+/// The scan behind a `searchabletext MATCH` prefilter. `require_text` picks
+/// the join to `documents_text`: `false` is [`Cx::pass_fulltext`]'s LEFT
+/// JOIN, which keeps an FTS-matched row whose stored text was dropped.
+fn fts_match_sql(filter_sql: &str, require_text: bool) -> String {
+    format!(
+        "SELECT {}, dt.text_zstd \
+         FROM searchabletext \
+         JOIN files f ON f.id = searchabletext.rowid \
+         {} documents_text dt ON dt.file_id = f.id \
+         WHERE searchabletext MATCH ?{}",
+        HIT_COLUMNS,
+        if require_text { "JOIN" } else { "LEFT JOIN" },
+        filter_sql
+    )
+}
+
+/// Fold `text` into `dst`, reusing its allocation. The ASCII fold is
+/// byte-length preserving, so folded offsets are valid in the original.
 fn fold_into(dst: &mut String, text: &str) {
     dst.clear();
     dst.push_str(text);
     dst.make_ascii_lowercase();
 }
 
+/// The segment a straddling wildcard can be SQL-prefiltered on: the longest
+/// one containing no path separator, or `None` when every segment has one.
+/// Any single segment is a superset test, and a separator-free one cannot
+/// span the `parent`/`name` join — see `search/prefilter.rs` (the one rule).
+fn anchor_segment(pattern: &crate::query::pattern::TermPattern) -> Option<&str> {
+    pattern
+        .segments()
+        .iter()
+        .filter(|s| !s.contains(std::path::MAIN_SEPARATOR))
+        .max_by_key(|s| s.len())
+        .map(String::as_str)
+}
+
 /// Which [`Deferred`] buffer a scan's held-back hits go to.
 enum DeferSlot {
-    /// Ranks 9–10, flushed by [`Pass::Path`]. Shared by passes A and E,
-    /// which never appear in the same pass list.
+    /// Ranks 9–10, flushed by [`Pass::Path`].
     Path,
-    /// Rank 11, flushed by [`Pass::FuzzyPath`]. Filled by pass C.
+    /// Rank 11, flushed by [`Pass::FuzzyPath`].
     FuzzyPath,
 }
 
 impl<'a> Cx<'a> {
-    /// One scan pass: prepare `sql`, stream its rows, classify each into
-    /// emit/defer/skip, and flush. Every pass shares this skeleton; only the
-    /// prelude and `classify` differ. Returns Ok(false) on cancellation.
-    ///
-    /// `cancel_every` is the cancellation-check cadence: row-cheap scans
-    /// check every [`CANCEL_CHECK_ROWS`], decompression-heavy scans every
-    /// row. `classify` sees only rows that already passed [`Cx::skip`]. A
-    /// `Defer`red hit lands in `defer_slot` at the end of the scan rather
-    /// than being emitted — path-tier ranks sort below stages that have not
-    /// run yet, so they are held back and never flushed mid-scan.
+    /// One scan pass: prepare `sql`, stream rows, classify each into
+    /// emit/defer/skip, and flush; only the prelude and `classify` differ per
+    /// pass. Returns Ok(false) on cancellation. A `Defer`red hit lands in
+    /// `defer_slot` at the end of the scan — path-tier ranks sort below
+    /// stages that have not run yet. `classify` receives the reassembled
+    /// path and the name as a borrowed slice of it.
     fn scan_pass(
         &mut self,
         sql: &str,
         params: Vec<rusqlite::types::Value>,
         cancel_every: usize,
         defer_slot: Option<DeferSlot>,
-        mut classify: impl FnMut(&mut Self, &rusqlite::Row<'_>, i64, &str) -> Result<RowHit, String>,
+        mut classify: impl FnMut(
+            &mut Self,
+            &rusqlite::Row<'_>,
+            i64,
+            &str,
+            &str,
+        ) -> Result<RowHit, String>,
     ) -> Result<bool, String> {
         let conn = self.conn;
-        // Cached: a search re-runs the same six statements on every keystroke,
-        // and only the bound term changes between them — the filter SQL each
-        // one interpolates is fixed for the life of the query.
+        // Cached: the same statements re-run on every keystroke.
         let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
         let mut rows = stmt
             .query(rusqlite::params_from_iter(params))
@@ -62,41 +139,43 @@ impl<'a> Cx<'a> {
         let mut deferred = Deferred::default();
         let mut scanned = 0usize;
         let mut clock = FlushClock::new();
+        // Set when the loop stops on the display limit: the result set is cut.
+        let mut cut_short = false;
+        // One path buffer per scan; a local because classifiers take `&mut Self`.
+        let mut path = String::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
             scanned += 1;
             if scanned.is_multiple_of(cancel_every) && self.cancelled() {
                 return Ok(false);
             }
-            // The display limit is already full, and holding a row proves at
-            // least one more match exists than will be shown — so `limited` is
-            // exactly true here, and everything below is work whose result
-            // `flush_pass` would throw away. That work is not small: the
-            // full-text passes decompress the document, fold a copy of it, and
-            // cut a snippet, per row. `cascade::run` makes the same test
-            // between passes; without this one a single pass over a common
-            // term runs to the end of the candidate set.
-            if self.remaining() == 0 {
-                self.limited = true;
-                break;
-            }
             let file_id: i64 = col(row, 0)?;
-            // Borrowed from the statement rather than `col::<String>`: this
-            // runs for every *scanned* row — a full-table scan on the filename
-            // pass — while only the few that become hits need an owned copy.
-            let path = row
-                .get_ref(2)
-                .map_err(|e| e.to_string())?
-                .as_str()
-                .map_err(|e| e.to_string())?;
-            if self.skip(file_id, path) {
+            let borrowed = |idx| -> Result<&str, String> {
+                row.get_ref(idx)
+                    .map_err(|e| e.to_string())?
+                    .as_str()
+                    .map_err(|e| e.to_string())
+            };
+            path.clear();
+            // Every stored parent already ends in a separator (`dir_to_db_parent`).
+            path.push_str(borrowed(2)?);
+            // The parent is written whole, so this offset stays a char boundary.
+            let name_at = path.len();
+            path.push_str(borrowed(1)?);
+            if self.skip(file_id, &path) {
                 continue;
             }
-            match classify(self, row, file_id, path)? {
+            match classify(self, row, file_id, &path, &path[name_at..])? {
                 RowHit::Skip => {}
                 RowHit::Emit(hit) => {
                     buf.push(hit);
                     overflowed |= self.enforce_cap(&mut buf);
                     self.flush_if_due(&mut buf, &mut clock);
+                    // Stop once the display limit is full. Recorded, not
+                    // turned into `limited` here: `flush_pass` owns that call.
+                    if self.remaining() == 0 {
+                        cut_short = true;
+                        break;
+                    }
                 }
                 RowHit::Defer(hit) => {
                     deferred.hits.push(hit);
@@ -114,6 +193,9 @@ impl<'a> Cx<'a> {
             None => debug_assert!(deferred.hits.is_empty(), "deferred hits with no slot"),
         }
         self.flush_pass(buf, overflowed);
+        // After the flush, so it cannot be undone by one that truncated nothing;
+        // without this a cut set can report itself complete.
+        self.limited |= cut_short;
         Ok(true)
     }
 
@@ -123,43 +205,66 @@ impl<'a> Cx<'a> {
         let query = self.query;
         let pattern = &query.pattern;
         let with_paths = path_tiers_enabled(pattern);
-        // A path always ends in its own name, so `path LIKE` is the
-        // superset that feeds both the name and the path tiers.
-        let sql = format!(
-            "SELECT {} FROM files f \
-             WHERE {} LIKE ? ESCAPE '\\'{}",
-            HIT_COLUMNS,
-            if with_paths { "f.path" } else { "f.name" },
-            query.filter_sql
+        // Each star becomes an unescaped `%`; user `%`/`_` stay escaped literals.
+        let like = format!(
+            "%{}%",
+            pattern
+                .segments()
+                .iter()
+                .map(|s| escape_like(s))
+                .collect::<Vec<_>>()
+                .join("%")
         );
-        // Wildcard patterns turn each star into an unescaped `%`; the
-        // substring wrap absorbs leading/trailing stars. User `%`/`_`
-        // remain escaped literals either way.
-        let like = pattern
-            .segments()
-            .iter()
-            .map(|s| escape_like(s))
-            .collect::<Vec<_>>()
-            .join("%");
-        let params =
-            self.params_with_filters(vec![rusqlite::types::Value::Text(format!("%{}%", like))]);
+        // The prefilter must stay a *superset* of what the classifier accepts
+        // (see `search/prefilter.rs`): a straddling pattern falls back to its
+        // [`anchor_segment`]. Straddling is ordinary wildcard typing
+        // (`rep*rt`) — don't send it back to `1=1`.
+        let straddles = pattern.segments().len() > 1
+            || pattern
+                .segments()
+                .iter()
+                .any(|s| s.contains(std::path::MAIN_SEPARATOR));
+        let two_column =
+            || "(f.name LIKE ? ESCAPE '\\' OR f.parent LIKE ? ESCAPE '\\')".to_string();
+        let bind_twice = |pat: String| {
+            vec![
+                rusqlite::types::Value::Text(pat.clone()),
+                rusqlite::types::Value::Text(pat),
+            ]
+        };
+        let (predicate, terms) = match (with_paths, straddles) {
+            (false, _) => (
+                "f.name LIKE ? ESCAPE '\\'".to_string(),
+                vec![rusqlite::types::Value::Text(like)],
+            ),
+            (true, false) => (two_column(), bind_twice(like)),
+            (true, true) => match anchor_segment(pattern) {
+                Some(anchor) => (
+                    two_column(),
+                    bind_twice(format!("%{}%", escape_like(anchor))),
+                ),
+                None => ("1=1".to_string(), Vec::new()),
+            },
+        };
+        let sql = format!(
+            "SELECT {} FROM files f WHERE {}{}",
+            HIT_COLUMNS, predicate, query.filter_sql
+        );
+        let params = self.params_with_filters(terms);
         self.scan_pass(
             &sql,
             params,
             CANCEL_CHECK_ROWS,
             Some(DeferSlot::Path),
-            |cx, row, file_id, path| {
-                let name: String = col(row, 1)?;
-                // Folding is byte-length preserving, so folded offsets are
-                // valid in the original. For wildcards, tiers 1/2 mean "the
-                // whole name matches the pattern".
-                let (rank, match_range) = if pattern.whole_match(&name, false) {
+            |cx, row, file_id, path, name| {
+                // For wildcards, tiers 1/2 mean "the whole name matches".
+                let (rank, match_range) = if pattern.whole_match(name, false) {
                     (1.0, (0, name.len()))
-                } else if pattern.whole_match(&name, true) {
+                } else if pattern.whole_match(name, true) {
                     (2.0, (0, name.len()))
-                } else if let Some(r) = pattern.find_first(&name, false) {
+                } else if let Some(r) = pattern.find_first(name, false) {
                     (3.0, (r.start, r.end))
-                } else if let Some(r) = pattern.find_first(&name, true) {
+                } else if let Some(r) = pattern.find_first(name, true) {
                     (4.0, (r.start, r.end))
                 } else if !with_paths {
                     return Ok(RowHit::Skip);
@@ -168,36 +273,26 @@ impl<'a> Cx<'a> {
                 } else if let Some(r) = pattern.find_first(path, true) {
                     (10.0, (r.start, r.end))
                 } else {
-                    // LIKE folds ASCII case only; a row that matched it but
-                    // neither field is a non-ASCII near-miss. Drop it.
+                    // LIKE folds ASCII case only; this row is a non-ASCII near-miss.
                     return Ok(RowHit::Skip);
                 };
                 if !cx.regex_accepts(file_id, path, None)? {
                     return Ok(RowHit::Skip);
                 }
                 let is_path_tier = rank >= 9.0;
-                // The "snippet" of a name or path hit is that field itself
-                // with the matched span marked.
-                let snip = snippet::whole_field(
-                    if is_path_tier { path } else { name.as_str() },
-                    match_range,
-                );
-                let (size, mtime) = size_and_mtime(row)?;
-                let hit = SearchHit {
+                // A name/path hit's snippet is the field itself, span marked.
+                let snip =
+                    snippet::whole_field(if is_path_tier { path } else { name }, match_range);
+                row_hit(
+                    row,
                     file_id,
+                    path,
                     name,
-                    path: path.to_string(),
-                    size,
-                    mtime,
                     rank,
-                    stage: rank as u8,
-                    snippet: Some(snip),
-                };
-                Ok(if is_path_tier {
-                    RowHit::Defer(hit)
-                } else {
-                    RowHit::Emit(hit)
-                })
+                    rank as u8,
+                    Some(snip),
+                    is_path_tier,
+                )
             },
         )
     }
@@ -211,11 +306,9 @@ impl<'a> Cx<'a> {
             // Below the trigram floor the MATCH can't return anything.
             return Ok(true);
         }
-        // Column filter goes inside the MATCH expression (`text: "..."`)
-        // so only document bodies match — filenames get ranks 1-4 from the
-        // filename pass instead. A literal term is one quoted phrase; a
-        // wildcard term narrows with an AND of its trigram-sized segments.
-        // With no segment of 3+ chars (`ab*cd`) FTS can't narrow at all, so
+        // The column filter goes inside the MATCH (`text: "..."`) so only
+        // bodies match. A literal term is one quoted phrase; a wildcard
+        // narrows with an AND of its 3+-char segments; with none (`ab*cd`)
         // fall back to scanning every stored document — every row is
         // pattern-verified either way.
         let match_expr: Option<String> = match pattern.literal() {
@@ -237,72 +330,57 @@ impl<'a> Cx<'a> {
         let narrowed = match_expr.is_some();
         let (sql, params) = match match_expr {
             Some(expr) => (
-                format!(
-                    "SELECT {}, dt.text_zstd \
-                     FROM searchabletext \
-                     JOIN files f ON f.id = searchabletext.rowid \
-                     LEFT JOIN documents_text dt ON dt.file_id = f.id \
-                     WHERE searchabletext MATCH ?{}",
-                    HIT_COLUMNS, query.filter_sql
-                ),
+                fts_match_sql(&query.filter_sql, false),
                 self.params_with_filters(vec![rusqlite::types::Value::Text(expr)]),
             ),
             None => (
-                format!(
-                    "SELECT {}, dt.text_zstd \
-                     FROM documents_text dt \
-                     JOIN files f ON f.id = dt.file_id WHERE 1=1{}",
-                    HIT_COLUMNS, query.filter_sql
-                ),
+                doc_scan_sql(&query.filter_sql),
                 self.params_with_filters(Vec::new()),
             ),
         };
-        // One decoder and one fold buffer for the whole scan; both are reused
-        // per row rather than reallocated.
         let mut doc = crate::db::repo::DocDecoder::new()?;
         let mut lower = String::new();
         // Decompression dominates: check cancellation every row.
-        self.scan_pass(&sql, params, 1, None, |cx, row, file_id, path| {
-            let blob: Option<&[u8]> = row
-                .get_ref(5)
-                .map_err(|e| e.to_string())?
-                .as_blob_or_null()
-                .map_err(|e| e.to_string())?;
-            let text = blob.and_then(|b| doc.decode(b));
+        self.scan_pass(&sql, params, 1, None, |cx, row, file_id, path, name| {
+            let text = stored_text(row, &mut doc)?;
 
             let (rank, stage, snip) = match text {
                 Some(text) => {
-                    // Fold once: the case-insensitive count, the first-match
-                    // search and the snippet extraction all need it, and
-                    // nearly every candidate takes this path.
-                    let mut folded = false;
-                    let (count, stage) = {
-                        let count_cs = pattern.count(text, false);
-                        if count_cs > 0 {
-                            (count_cs, 5)
-                        } else {
-                            fold_into(&mut lower, text);
-                            folded = true;
-                            let count_ci = pattern.count_folded(&lower);
-                            if count_ci > 0 {
-                                (count_ci, 6)
-                            } else {
-                                // Folded/unordered FTS candidate: the
-                                // pattern never occurs — drop it.
+                    // Fold once: count, first-match and snippet all need it —
+                    // including rows about to be dropped.
+                    fold_into(&mut lower, text);
+                    match super::text_snippet_counted(pattern, text, &lower) {
+                        Some((snip, count_ci)) => {
+                            if count_ci == 0 {
                                 return Ok(RowHit::Skip);
                             }
+                            let count_cs = pattern.count(text, false);
+                            let (count, stage) = if count_cs > 0 {
+                                (count_cs, 5)
+                            } else {
+                                (count_ci, 6)
+                            };
+                            (stage as f64 + count_frac(count), stage as u8, Some(snip))
                         }
-                    };
-                    if !folded {
-                        fold_into(&mut lower, text);
+                        None => {
+                            let count_cs = pattern.count(text, false);
+                            let (count, stage) = if count_cs > 0 {
+                                (count_cs, 5)
+                            } else {
+                                let count_ci = pattern.count_folded(&lower);
+                                if count_ci == 0 {
+                                    return Ok(RowHit::Skip);
+                                }
+                                (count_ci, 6)
+                            };
+                            let snip = super::text_snippet(pattern, text, &lower);
+                            (stage as f64 + count_frac(count), stage as u8, snip)
+                        }
                     }
-                    let snip = super::text_snippet(pattern, text, &lower);
-                    (stage as f64 + count_frac(count), stage as u8, snip)
                 }
-                // No stored text: can't case-verify or count. On the
-                // FTS-narrowed path accept at the bottom of rank 6 as
-                // count-unknown; on the full-scan fallback there is no FTS
-                // evidence at all, so an unverifiable row is skipped.
+                // No stored text: FTS-narrowed rows are accepted at the bottom
+                // of rank 6 as count-unknown; on the full-scan fallback an
+                // unverifiable row is skipped.
                 None => {
                     if !narrowed {
                         return Ok(RowHit::Skip);
@@ -314,38 +392,29 @@ impl<'a> Cx<'a> {
                 return Ok(RowHit::Skip);
             }
 
-            let (size, mtime) = size_and_mtime(row)?;
-            Ok(RowHit::Emit(SearchHit {
-                file_id,
-                name: col(row, 1)?,
-                path: path.to_string(),
-                size,
-                mtime,
-                rank,
-                stage,
-                snippet: snip,
-            }))
+            row_hit(row, file_id, path, name, rank, stage, snip, false)
         })
+    }
+
+    /// The fuzzy passes' shared gate: the edit budget and matcher, or `None`
+    /// when fuzzy is off, the term is a wildcard, it earns no budget, or it
+    /// does not fit. The term goes in as typed: the matcher folds in its mask
+    /// table.
+    fn fuzzy_matcher(&self) -> Option<(usize, Bitap)> {
+        if !self.options.fuzzy || self.query.pattern.is_wildcard() {
+            return None;
+        }
+        let k = edit_budget(self.query.term.len(), self.options.fuzzy_max_edits)?;
+        Bitap::new(self.query.term.as_bytes(), k).map(|bitap| (k, bitap))
     }
 
     /// Pass C — rank 7 now, rank 11 deferred: one bitap sweep over every
     /// filename, falling back to the full path where the name misses.
     pub(super) fn pass_fuzzy_filename(&mut self) -> Result<bool, String> {
-        if !self.options.fuzzy {
+        let Some((_, bitap)) = self.fuzzy_matcher() else {
             return Ok(true);
-        }
+        };
         let query = self.query;
-        // Bitap is a literal matcher; wildcard terms don't fuzz.
-        if query.pattern.is_wildcard() {
-            return Ok(true);
-        }
-        let folded_term = query.term.to_ascii_lowercase();
-        let Some(k) = edit_budget(folded_term.len(), self.options.fuzzy_max_edits) else {
-            return Ok(true);
-        };
-        let Some(bitap) = Bitap::new(folded_term.as_bytes(), k) else {
-            return Ok(true);
-        };
         let with_paths = path_tiers_enabled(&query.pattern);
 
         let sql = format!(
@@ -358,220 +427,182 @@ impl<'a> Cx<'a> {
             params,
             CANCEL_CHECK_ROWS,
             Some(DeferSlot::FuzzyPath),
-            |cx, row, file_id, path| {
-                let name: String = col(row, 1)?;
-                // The name wins when both fire; only a name miss falls
-                // through to the path tier.
-                let folded_name = name.to_ascii_lowercase();
-                let (rank, field, range) = match bitap
-                    .best_distance_and_first(folded_name.as_bytes())
-                {
-                    Some((distance, range)) => (7.0 + 0.1 * distance as f64, name.as_str(), range),
-                    None if with_paths => {
-                        let folded_path = path.to_ascii_lowercase();
-                        match bitap.best_distance_and_first(folded_path.as_bytes()) {
-                            Some((distance, range)) => (11.0 + 0.1 * distance as f64, path, range),
-                            None => return Ok(RowHit::Skip),
-                        }
-                    }
+            |cx, row, file_id, path, name| {
+                // The name wins when both fire. Fields are read as stored —
+                // the matcher folds in its mask table; don't fold per row.
+                let (rank, field, range) = match bitap.best_distance_and_first(name.as_bytes()) {
+                    Some((distance, range)) => (7.0 + 0.1 * distance as f64, name, range),
+                    None if with_paths => match bitap.best_distance_and_first(path.as_bytes()) {
+                        Some((distance, range)) => (11.0 + 0.1 * distance as f64, path, range),
+                        None => return Ok(RowHit::Skip),
+                    },
                     None => return Ok(RowHit::Skip),
                 };
                 if !cx.regex_accepts(file_id, path, None)? {
                     return Ok(RowHit::Skip);
                 }
-                // The matched field itself with the fuzzy span marked — the
-                // same shape pass A emits, and what `SearchHit::snippet`
-                // documents for the name and path tiers. Windowing it here
-                // used to hand back a *suffix* whenever the match sat past
-                // two thirds of the way through, which broke that contract
-                // and left a frontend unable to line the ranges up against
-                // the field it paints.
+                // The matched field itself, span marked. Don't window it: that
+                // breaks the ranges-index-the-field contract.
                 let snip = Some(snippet::whole_field(field, range));
                 let is_path_tier = rank >= 11.0;
-                let (size, mtime) = size_and_mtime(row)?;
-                let hit = SearchHit {
-                    file_id,
-                    name,
-                    path: path.to_string(),
-                    size,
-                    mtime,
-                    rank,
-                    // Stamped, not truncated from `rank`: this is the one pass
-                    // whose ranks carry a fraction large enough to reach the
-                    // next integer. `edit_budget` is only warned about above
-                    // 3, so a distance of 10 makes rank 8.0 — and truncating
-                    // that would file a *filename* hit under stage 8, the
-                    // fuzzy full-text tier, telling every frontend to render
-                    // it as a content match.
-                    stage: if is_path_tier { 11 } else { 7 },
-                    snippet: snip,
-                };
-                Ok(if is_path_tier {
-                    RowHit::Defer(hit)
-                } else {
-                    RowHit::Emit(hit)
-                })
+                // The stage is stamped, not truncated from `rank`: a distance
+                // of 10 makes rank 8.0, and truncating would file a filename
+                // hit under stage 8, the fuzzy full-text tier.
+                let stage = if is_path_tier { 11 } else { 7 };
+                row_hit(row, file_id, path, name, rank, stage, snip, is_path_tier)
             },
         )
     }
 
     /// Pass D — rank 8, bitap over every stored document text.
     pub(super) fn pass_fuzzy_fulltext(&mut self) -> Result<bool, String> {
-        if !self.options.fuzzy {
-            return Ok(true);
-        }
-        // Bitap is a literal matcher; wildcard terms don't fuzz.
-        if self.query.pattern.is_wildcard() {
-            return Ok(true);
-        }
-        let folded_term = self.query.term.to_ascii_lowercase();
-        let Some(k) = edit_budget(folded_term.len(), self.options.fuzzy_max_edits) else {
-            return Ok(true);
-        };
-        let Some(bitap) = Bitap::new(folded_term.as_bytes(), k) else {
+        let Some((k, bitap)) = self.fuzzy_matcher() else {
             return Ok(true);
         };
 
-        let sql = format!(
-            "SELECT {}, dt.text_zstd \
-             FROM documents_text dt JOIN files f ON f.id = dt.file_id WHERE 1=1{}",
-            HIT_COLUMNS, self.query.filter_sql
-        );
-        let params = self.params_with_filters(Vec::new());
-        // One decoder and one fold buffer for the whole scan, reused per row.
+        // Candidate prefilter: the pigeonhole split is a sound superset
+        // narrowing — see [`pigeonhole_chunks`] and `search/prefilter.rs`
+        // (the one rule). `None` means too short to split; the pass scans.
+        let (sql, params) = match pigeonhole_chunks(&self.query.term, k) {
+            Some(chunks) => {
+                // Every chunk is quoted into inertness: a slice of user text
+                // can contain FTS5 syntax, and unquoted it is a syntax error.
+                let expr = chunks
+                    .iter()
+                    .map(|c| format!("text: {}", quote_phrase(c)))
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+                (
+                    fts_match_sql(&self.query.filter_sql, true),
+                    self.params_with_filters(vec![rusqlite::types::Value::Text(format!(
+                        "({})",
+                        expr
+                    ))]),
+                )
+            }
+            None => (
+                doc_scan_sql(&self.query.filter_sql),
+                self.params_with_filters(Vec::new()),
+            ),
+        };
+        // No fold buffer: the matcher folds in its mask table — don't
+        // copy-and-fold per document.
         let mut doc = crate::db::repo::DocDecoder::new()?;
-        let mut folded = String::new();
         // Decompression dominates: check cancellation every row.
-        self.scan_pass(&sql, params, 1, None, |cx, row, file_id, path| {
-            let blob: Option<&[u8]> = row
-                .get_ref(5)
-                .map_err(|e| e.to_string())?
-                .as_blob_or_null()
-                .map_err(|e| e.to_string())?;
-            let Some(text) = blob.and_then(|b| doc.decode(b)) else {
+        self.scan_pass(&sql, params, 1, None, |cx, row, file_id, path, name| {
+            let Some(text) = stored_text(row, &mut doc)? else {
                 return Ok(RowHit::Skip);
             };
-            // ASCII folding is byte-length preserving, so ranges found in
-            // the folded buffer are valid in the original.
-            fold_into(&mut folded, text);
-            let Some((count, snip)) = super::fuzzy_snippet(&bitap, text, &folded) else {
+            let Some((count, snip)) = super::fuzzy_snippet(&bitap, text) else {
                 return Ok(RowHit::Skip);
             };
             if !cx.regex_accepts(file_id, path, Some(text))? {
                 return Ok(RowHit::Skip);
             }
-            let (size, mtime) = size_and_mtime(row)?;
-            Ok(RowHit::Emit(SearchHit {
+            row_hit(
+                row,
                 file_id,
-                name: col(row, 1)?,
-                path: path.to_string(),
-                size,
-                mtime,
-                rank: 8.0 + count_frac(count),
-                stage: 8,
-                snippet: Some(snip),
-            }))
+                path,
+                name,
+                8.0 + count_frac(count),
+                8,
+                Some(snip),
+                false,
+            )
         })
     }
 
-    /// Regex-only pass over `files`: the regex bypasses the FTS trigram
-    /// entirely and runs on every name, falling back to the full path.
-    /// Name hits reuse rank 4, path hits defer to rank 10, so the GUI's
-    /// stage-based rendering needs no new cases.
+    /// Regex-only pass over `files`: name hits reuse rank 4, path hits defer
+    /// to rank 10, so stage-based rendering needs no new cases. Narrowed by
+    /// the pattern's required literals
+    /// ([`crate::search::prefilter::Required::like_predicate`]); a pattern
+    /// with no literal (`\d+`) still scans every name and path per keystroke.
     pub(super) fn pass_regex_name(&mut self) -> Result<bool, String> {
         let query = self.query;
         let re = query.regex.as_ref().expect("regex-only pass list");
+        let (predicate, terms) = match re.required().and_then(|r| r.like_predicate()) {
+            Some((sql, params)) => (sql, params),
+            None => ("1=1".to_string(), Vec::new()),
+        };
         let sql = format!(
-            "SELECT {} FROM files f WHERE 1=1{}",
-            HIT_COLUMNS, query.filter_sql
+            "SELECT {} FROM files f WHERE {}{}",
+            HIT_COLUMNS, predicate, query.filter_sql
         );
-        let params = self.params_with_filters(Vec::new());
+        let params = self.params_with_filters(terms);
         self.scan_pass(
             &sql,
             params,
             CANCEL_CHECK_ROWS,
             Some(DeferSlot::Path),
-            |_cx, row, file_id, path| {
-                let name: String = col(row, 1)?;
-                // The name is the better hit; only a name miss falls through
-                // to the path tier — mirroring pass A.
-                let (rank, match_range, is_path_tier) = match re.find_first(&name) {
+            |_cx, row, file_id, path, name| {
+                let (rank, match_range, is_path_tier) = match re.find_first(name) {
                     Some(r) => (4.0, (r.start, r.end), false),
                     None => match re.find_first(path) {
                         Some(r) => (10.0, (r.start, r.end), true),
                         None => return Ok(RowHit::Skip),
                     },
                 };
-                let snip = snippet::whole_field(
-                    if is_path_tier { path } else { name.as_str() },
-                    match_range,
-                );
-                let (size, mtime) = size_and_mtime(row)?;
-                let hit = SearchHit {
+                let snip =
+                    snippet::whole_field(if is_path_tier { path } else { name }, match_range);
+                row_hit(
+                    row,
                     file_id,
+                    path,
                     name,
-                    path: path.to_string(),
-                    size,
-                    mtime,
                     rank,
-                    stage: rank as u8,
-                    snippet: Some(snip),
-                };
-                Ok(if is_path_tier {
-                    RowHit::Defer(hit)
-                } else {
-                    RowHit::Emit(hit)
-                })
+                    rank as u8,
+                    Some(snip),
+                    is_path_tier,
+                )
             },
         )
     }
 
     /// Regex-only pass over every stored document text, reusing rank 6.
+    /// Narrowed by required literals through
+    /// [`crate::search::prefilter::Required::fts_expr`]; without a usable set
+    /// this decompresses and regex-scans every document per keystroke.
     pub(super) fn pass_regex_content(&mut self) -> Result<bool, String> {
         let query = self.query;
         let re = query.regex.as_ref().expect("regex-only pass list");
-        let sql = format!(
-            "SELECT {}, dt.text_zstd \
-             FROM documents_text dt JOIN files f ON f.id = dt.file_id WHERE 1=1{}",
-            HIT_COLUMNS, query.filter_sql
-        );
-        let params = self.params_with_filters(Vec::new());
+        let (sql, params) = match re.required().and_then(|r| r.fts_expr()) {
+            Some(expr) => (
+                fts_match_sql(&query.filter_sql, true),
+                self.params_with_filters(vec![rusqlite::types::Value::Text(expr)]),
+            ),
+            None => (
+                doc_scan_sql(&query.filter_sql),
+                self.params_with_filters(Vec::new()),
+            ),
+        };
         let snippet_opts = snippet::Options {
             approx_chars: SNIPPET_WINDOW_CHARS,
         };
-        // One decoder for the whole scan, reused per row.
         let mut doc = crate::db::repo::DocDecoder::new()?;
         // Decompression dominates: check cancellation every row.
-        self.scan_pass(&sql, params, 1, None, |_cx, row, file_id, path| {
-            let blob: Option<&[u8]> = row
-                .get_ref(5)
-                .map_err(|e| e.to_string())?
-                .as_blob_or_null()
-                .map_err(|e| e.to_string())?;
-            let Some(text) = blob.and_then(|b| doc.decode(b)) else {
+        self.scan_pass(&sql, params, 1, None, |_cx, row, file_id, path, name| {
+            let Some(text) = stored_text(row, &mut doc)? else {
                 return Ok(RowHit::Skip);
             };
             let count = re.count(text);
             if count == 0 {
                 return Ok(RowHit::Skip);
             }
-            // A greedy user regex can match megabytes; clamp the range
-            // before the snippet window is cut.
+            // A greedy user regex can match megabytes; clamp before the window.
             let snip = re.find_first(text).map(|r| {
                 let r = clamp_match_range(text, r, SNIPPET_WINDOW_CHARS);
                 snippet::window_around(text, (r.start, r.end), &snippet_opts)
             });
-            let (size, mtime) = size_and_mtime(row)?;
-            Ok(RowHit::Emit(SearchHit {
+            row_hit(
+                row,
                 file_id,
-                name: col(row, 1)?,
-                path: path.to_string(),
-                size,
-                mtime,
-                rank: 6.0 + count_frac(count),
-                stage: 6,
-                snippet: snip,
-            }))
+                path,
+                name,
+                6.0 + count_frac(count),
+                6,
+                snip,
+                false,
+            )
         })
     }
 }

@@ -1,80 +1,39 @@
-//! Peak-memory accounting for a full indexing run.
 //!
-//! [`indexprobe`](indexprobe.rs) answers "how fast"; this answers "how much
-//! RAM", which is the number that decides whether indexing a large root is
-//! usable on a small machine. It drives the same [`IndexingService`] the GUI
-//! drives, so what it measures is the indexer's own footprint with no window,
-//! no renderer and no GL context in the total.
+//! [`indexprobe`](indexprobe.rs) answers "how fast"; this answers "how
+//! much RAM", driving the same [`IndexingService`] the GUI drives with no
+//! window or GL context in the total. For the idle footprint of a running
+//! GUI, use [`rssprobe`](rssprobe.rs).
 //!
 //! ```text
 //! cargo build -p quicksearch-core --example memprobe --release
 //! ./target/release/examples/memprobe cold /media/shared /var/tmp/qs-mem/index.db
 //! ./target/release/examples/memprobe warm /media/shared /var/tmp/qs-mem/index.db
-//! ./target/release/examples/memprobe cold /media/shared /var/tmp/qs-mem/index.db 10
 //! ./target/release/examples/memprobe cold ~ /var/tmp/qs-mem/index.db 250 probe.toml
 //! ```
 //!
-//! The optional trailing number is the sampling interval in milliseconds
-//! (default 100), and the one after it a config file to load instead of the
-//! defaults — the only way to probe a tree that the shipped `include_hidden =
-//! false` would walk past, such as a home directory that is nearly all dotdirs.
-//! Finer sampling resolves the *shape* of a spike, not its
-//! cause: the file column is only as good as `RootProgress::current_file`,
-//! which [`crate::indexing`] publishes once per extraction batch, holding the
-//! last file of the batch that just finished. During a batch it therefore
-//! names a file that is already done, and no sampling rate fixes that. To
-//! attribute a spike to a file, narrow the root instead — index a directory
-//! holding only the candidates, which is what identified `pdf-extract` as the
-//! largest single consumer on this tree.
+//! **Roots are comma-separated**, because per-root state is what multiplies:
+//! a one-root run cannot show the buffers that exist once per pipeline.
 //!
-//! `cold` deletes the database first: every file is new, so the walk hashes
-//! and extracts all of them. `warm` re-runs against the finished database,
-//! where most files classify as unchanged and the run is dominated by
-//! reconciliation rather than extraction. Warm peaks *below* cold on the same
-//! tree — the walk reads one directory's rows at a time (`repo::dir_rows`,
-//! held in an `Arc` only while that directory is in flight), so there is no
-//! up-front load that scales with tree size.
+//! ```text
+//! ./target/release/examples/memprobe cold /media/shared,/home/me,/usr /var/tmp/qs-mem/index.db
+//! ```
 //!
-//! **`growth per file` is a ratio, not a per-file cost.** It divides a peak
-//! that is essentially constant by the file count, so it *falls* as the tree
-//! grows: measured 2052 B/file over 99,477 files and 644 B/file over 279,936,
-//! with the larger tree peaking *lower* in absolute terms. Read the peak, not
-//! the quotient. What actually scales with tree size is `seen_paths`
-//! (`indexing.rs`), a `HashSet<u128>` of path digests — ~17 bytes per file
-//! including hashbrown's control bytes and load factor.
+//! Trailing arguments: sampling interval in ms (default 100) and a config
+//! file. `cold` deletes the database first; `warm` re-runs against the
+//! finished one. Reading the report: **VmHWM** cannot miss a spike — quote
+//! it; the sampled peak only says *when*. `growth per file` is a ratio, not
+//! a per-file cost. Nothing reported is evictable page cache. `settled RSS`
+//! is what a long-lived process keeps — glibc frees to its arena, so
+//! without `release_free_heap` the peak becomes the floor.
 //!
-//! Two peaks are reported and they measure different things:
-//!
-//! - **VmHWM** is the kernel's own high-water mark for resident set size. It
-//!   cannot miss a spike, so it is the number to quote.
-//! - **sampled peak** comes from polling `/proc/self/statm`, and exists only
-//!   to say *when* the peak happened. The timeline it prints attributes the
-//!   peak to the walk or to extraction; a sampled peak far under VmHWM means
-//!   the real spike was shorter than the sampling interval.
-//!
-//! Nothing here is evictable page cache. The connections set no `mmap_size`,
-//! so SQLite reads the index through its own `malloc`'d page cache (see
-//! [`quicksearch_core::db::schema`], where every profile's ceiling is set and
-//! argued) rather than mapping the file, and the `by mapping` breakdown
-//! confirms it: the index never appears as a file-backed mapping. Every
-//! megabyte reported is memory the process actually holds. `/usr/bin/time -v`
-//! on this binary reports the same VmHWM, as a cross-check that nothing here
-//! is fooling itself.
-//!
-//! # Peak, settled, and the difference between them
-//!
-//! `settled RSS` is read once the run is over and the service is idle, and it
-//! is the number that matters for a process that stays open. It is not the
-//! peak minus the run's buffers: glibc's `free` returns a chunk to its arena
-//! rather than to the kernel, so without an explicit
-//! [`quicksearch_core::platform::release_free_heap`] a run's high-water
-//! becomes the process's floor for as long as it lives. On a 65k-file tree
-//! that was the difference between settling at 89 MiB and settling at 34 MiB.
-//!
-//! For the *idle* footprint of a running GUI — which includes the window, the
-//! GL stack and everything this binary deliberately excludes — use
-//! [`rssprobe`](rssprobe.rs), which reads another process's `/proc` and so can
-//! measure a build that was made without knowing it would be measured.
+//! Built with `--features probe` the indexer also prints a `census` line
+//! naming what its run-scoped structures hold, which is the half `smaps`
+//! cannot answer: a mapping is "heap", never "the stale-candidate list".
+
+// Settled RSS is the whole point of this probe, and it is a property of the
+// allocator, so it must be the one the shipped binaries install.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -83,65 +42,62 @@ use quicksearch_core::config::Config;
 use quicksearch_core::indexing::{IndexingService, IndexingStatus, RootPhase};
 use quicksearch_core::testutil::{mib, size_class};
 
-/// Default RSS sampling interval. Cheap (one small `/proc` read), so this is
-/// set by how fine-grained the timeline should be rather than by overhead.
+mod common;
+
 const DEFAULT_SAMPLE_MS: u64 = 100;
 
-/// How often the completion marker is checked, in milliseconds. Rarer than
-/// sampling because each check opens a connection to the database being
-/// written, and a finer sampling interval must not turn into more of them.
+/// Rarer than sampling: each check opens a connection to the live database.
 const MARKER_INTERVAL_MS: u64 = 500;
 
-/// Wall-clock ceiling. A 100k-file tree indexes in minutes; anything past
-/// this is a hang, and reporting a peak for a run that never finished would
-/// be worse than failing.
+/// Past this is a hang; a peak for a run that never finished would be worse
+/// than failing.
 const TIMEOUT: Duration = Duration::from_secs(3 * 3600);
 
-/// How long to wait for the run to reach `Idle` before measuring what it left
-/// behind. Generous because the wait is for `VACUUM` on a multi-gigabyte index
-/// ([`quicksearch_core::db::open`]'s maintenance connection), not for anything
-/// that scales with the sampling interval.
+/// Generous: the wait is for `VACUUM` on a multi-gigabyte index, not for
+/// anything that scales with the sampling interval.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// The pause after `Idle` is published. The writer thread releases its
-/// connection and returns free pages to the kernel *after* setting the status,
-/// so sampling the instant it flips would miss exactly the thing being
-/// measured.
+/// The writer releases its connection and returns pages *after* setting
+/// `Idle`; sampling the instant it flips would miss the thing measured.
 const SETTLE_QUIET: Duration = Duration::from_secs(2);
 
-/// Resident bytes at the peak, grouped by what the mapping is.
-///
-/// A peak figure alone cannot be acted on: 60 MiB of heap is a buffer to
-/// size down, 60 MiB of file-backed pages is page cache the kernel will
-/// drop under pressure, and 60 MiB of thread stacks is a pool that is too
-/// wide. `smaps` is the only place that distinction is visible.
+/// Resident bytes at the peak, grouped: heap, droppable file-backed cache
+/// and thread stacks each want different fixes — only `smaps` shows which.
 #[derive(Default, Clone)]
 struct Breakdown {
     entries: Vec<(String, u64)>,
 }
 
-/// One RSS reading with the progress that produced it.
 struct Sample {
     at: Duration,
     rss: u64,
     walked: usize,
     extracted: usize,
     phase: &'static str,
-    /// What extraction was working on. A peak that a single file causes is
-    /// a different problem from one that grows with the tree, and this is
-    /// what tells the two apart.
+    /// What extraction was working on: a single-file peak is a different
+    /// problem from one growing with the tree.
     file: String,
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let mode = args.next().unwrap_or_default();
-    let (Some(root), Some(db)) = (args.next(), args.next()) else {
-        eprintln!("usage: memprobe <cold|warm> <root> <db> [sample_ms] [config.toml]");
+    let (Some(roots), Some(db)) = (args.next(), args.next()) else {
+        eprintln!("usage: memprobe <cold|warm> <root[,root...]> <db> [sample_ms] [config.toml]");
         std::process::exit(2);
     };
     if mode != "cold" && mode != "warm" {
-        eprintln!("usage: memprobe <cold|warm> <root> <db> [sample_ms] [config.toml]");
+        eprintln!("usage: memprobe <cold|warm> <root[,root...]> <db> [sample_ms] [config.toml]");
+        std::process::exit(2);
+    }
+    let roots: Vec<String> = roots
+        .split(',')
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect();
+    if roots.is_empty() {
+        eprintln!("memprobe: no roots given");
         std::process::exit(2);
     }
     let interval = Duration::from_millis(
@@ -162,22 +118,18 @@ fn main() {
         }
     }
 
-    run(&mode, &root, &db, interval, config_path.as_deref());
+    run(&mode, &roots, &db, interval, config_path.as_deref());
 }
 
-fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Option<&Path>) {
-    // The root and database always come from argv; a config file only supplies
-    // the knobs that change *what* indexing does — `include_hidden`,
-    // `ignore_patterns`, `maximum_text_size` and so on. Without one the probe
-    // measures the shipped defaults, which is what makes two runs comparable.
+fn run(mode: &str, roots: &[String], db: &Path, interval: Duration, config_path: Option<&Path>) {
+    // A config file only supplies the knobs that change *what* indexing
+    // does; the defaults keep runs comparable.
     let config = match config_path {
         Some(p) => Config::load_from(p).expect("load probe config"),
         None => Config::default(),
     };
 
-    // Cleared for the same reason indexprobe clears it: the marker is the
-    // only unambiguous completion signal, and a stale one from the previous
-    // run would end this one immediately.
+    // A stale marker from the previous run would end this one immediately.
     if db.exists() {
         let conn = rusqlite::Connection::open(db).expect("open db");
         conn.execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
@@ -186,9 +138,10 @@ fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Optio
 
     let baseline = rss().expect("read /proc/self/statm");
     eprintln!(
-        "memprobe {}: root={} db={}\n  baseline RSS {} (process before indexing starts)",
+        "memprobe {}: {} root(s)={} db={}\n  baseline RSS {} (process before indexing starts)",
         mode,
-        root,
+        roots.len(),
+        roots.join(" "),
         db.display(),
         mib(baseline)
     );
@@ -196,11 +149,7 @@ fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Optio
     let service = IndexingService::new();
     let start = Instant::now();
     service
-        .start_indexing(
-            vec![root.to_string()],
-            db.to_string_lossy().into_owned(),
-            config,
-        )
+        .start_indexing(roots.to_vec(), db.to_string_lossy().into_owned(), config)
         .expect("start indexing");
 
     let mut samples: Vec<Sample> = Vec::new();
@@ -221,8 +170,7 @@ fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Optio
         }
         let (walked, extracted, phase, file) = progress(&status);
         let now = rss().unwrap_or(0);
-        // Only on a new high: reading smaps costs far more than statm, and
-        // the breakdown is only wanted for the sample that sets the peak.
+        // Only on a new high: smaps costs far more than statm.
         if now > high {
             high = now;
             at_peak = breakdown();
@@ -247,9 +195,7 @@ fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Optio
     }
     let elapsed = start.elapsed();
 
-    // Read before stopping: the peak belongs to the run, and stopping frees
-    // nothing that VmHWM would forget anyway.
-    let hwm = vm_hwm();
+    let hwm = common::vm_hwm();
     assert!(done, "indexing did not finish within {:?}", TIMEOUT);
 
     let settled = settle(&service);
@@ -260,19 +206,10 @@ fn run(mode: &str, root: &str, db: &Path, interval: Duration, config_path: Optio
     );
 }
 
-/// RSS once the run has fully finished and stopped allocating.
-///
-/// The peak says what indexing needs; this says what it *keeps*, and the gap
-/// between them is the number that decides whether an idle QuickSearch is
-/// holding memory it has no use for. They differ by more than the run's own
-/// buffers: `free` under glibc returns a chunk to its arena rather than to the
-/// kernel, so what is measured here is the floor the process will sit at for
-/// as long as it stays open.
-///
-/// The marker this loop's caller watches for is written *during* the run, so
-/// maintenance and the final release are still ahead of it — hence waiting for
-/// `Idle` rather than sampling immediately, and then a little longer, because
-/// the last of it happens after the status is published.
+/// The peak says what indexing needs; this says what it *keeps* — `free`
+/// under glibc returns to the arena, not the kernel, so this is the
+/// process's floor. The final release lands even after `Idle` is published,
+/// hence the wait, and then a little longer.
 fn settle(service: &IndexingService) -> u64 {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     while Instant::now() < deadline {
@@ -285,9 +222,8 @@ fn settle(service: &IndexingService) -> u64 {
     rss().unwrap_or(0)
 }
 
-/// Flatten per-root progress into one line's worth of numbers. Roots are
-/// summed: the process has one address space, so a per-root split would not
-/// explain a peak that several roots contribute to at once.
+/// Flatten per-root progress into one line: the process has one address
+/// space, so a per-root split would not explain a shared peak.
 fn progress(status: &IndexingStatus) -> (usize, usize, &'static str, String) {
     let IndexingStatus::Running { roots, .. } = status else {
         return (0, 0, "-", String::new());
@@ -310,8 +246,6 @@ fn progress(status: &IndexingStatus) -> (usize, usize, &'static str, String) {
     (walked, extracted, phase, file)
 }
 
-/// Eight columns of one probe run, printed as a line. Grouping them into a
-/// struct would only move the same eight names one level out.
 #[allow(clippy::too_many_arguments)]
 fn report(
     mode: &str,
@@ -342,8 +276,7 @@ fn report(
     }
 
     let peak = samples.iter().max_by_key(|s| s.rss);
-    // The maximum, not the last: progress reads zero again once the service
-    // returns to Idle, and the final sample is usually that one.
+    // The maximum, not the last: progress reads zero again at Idle.
     let files = samples.iter().map(|s| s.walked).max().unwrap_or(0);
     let db_bytes = db_size(db);
 
@@ -404,9 +337,8 @@ fn report(
         }
     }
 
-    // A transient spike is the failure mode a peak figure hides: steady-state
-    // use can be modest while one file briefly doubles it. Ranking the
-    // sample-to-sample rises names the files that do it.
+    // A transient spike is what a peak figure hides; ranking
+    // sample-to-sample rises names the files that cause it.
     let mut jumps: Vec<(u64, &Sample)> = samples
         .windows(2)
         .map(|w| (w[1].rss.saturating_sub(w[0].rss), &w[1]))
@@ -438,13 +370,9 @@ fn rss() -> Option<u64> {
     Some(pages * page_size())
 }
 
-/// Resident bytes per mapping from `/proc/self/smaps`, summed by name.
-///
-/// The name is the mapping's path, or `[heap]`/`[stack]` for the ones the
-/// kernel labels. Everything else is anonymous — thread stacks and any
-/// large `malloc` that went to `mmap` rather than the main arena — and is
-/// bucketed by size class, because individually they are unnamed and there
-/// can be hundreds of them.
+/// Resident bytes per mapping from `/proc/self/smaps`, summed by name;
+/// anonymous mappings are bucketed by size class — individually unnamed,
+/// and there can be hundreds.
 fn breakdown() -> Breakdown {
     let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") else {
         return Breakdown::default();
@@ -470,11 +398,8 @@ fn breakdown() -> Breakdown {
     Breakdown { entries }
 }
 
-/// The name for a `smaps` header line, or `None` if the line is not one.
-///
-/// A header is `addr-addr perms offset dev inode [path]`. Anonymous mappings
-/// have inode 0 and no path; they are bucketed by size so that a hundred
-/// 8 MiB regions read as one line rather than a hundred.
+/// The name for a `smaps` header line, or `None`. Anonymous mappings are
+/// bucketed by size so a hundred 8 MiB regions read as one line.
 fn parse_map_header(line: &str) -> Option<String> {
     let mut fields = line.split_whitespace();
     let range = fields.next()?;
@@ -489,23 +414,13 @@ fn parse_map_header(line: &str) -> Option<String> {
     Some(format!("anon {}", size_class(hi.saturating_sub(lo))))
 }
 
-/// The kernel's peak RSS for this process, from `/proc/self/status`.
-fn vm_hwm() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
-    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-    Some(kib * 1024)
-}
-
-/// 4 KiB everywhere this runs. Reading it from `sysconf` would mean a libc
-/// dependency for a constant that has never differed on the targets that
-/// have `/proc`.
+/// 4 KiB everywhere this runs; `sysconf` would mean a libc dependency for a
+/// constant that never differs where `/proc` exists.
 fn page_size() -> u64 {
     4096
 }
 
-/// The index plus its WAL: the WAL is where a run's writes sit until the
-/// next checkpoint, so leaving it out understates a run in progress.
+/// The index plus its WAL — leaving the WAL out understates a run in progress.
 fn db_size(db: &Path) -> u64 {
     ["", "-wal"]
         .iter()

@@ -1,11 +1,6 @@
-//! Tests for live result watching.
-//!
-//! The [`classify`] tests are pure: they feed the exact event shapes `notify`
-//! 6.1 emits on each platform and check what one settled window decides. They
-//! are the ones that pin the design — in particular that a watch on a
-//! *directory* sees an atomic save, which a watch on the file would not.
-//!
-//! The end-to-end tests drive a real filesystem through a real watcher.
+//! Tests for live result watching: pure [`classify`] tests feed the exact
+//! event shapes `notify` 6.1 emits on each platform; the end-to-end tests
+//! drive a real filesystem through a real watcher.
 
 use super::*;
 
@@ -54,11 +49,9 @@ fn window(targets: &HashMap<String, Target>, events: Vec<NotifyEvent>) -> HashMa
     pending
 }
 
-/// An editor saving a file writes a temporary and renames it over the target.
-/// The row did not move — its contents changed — and a watch on the file
-/// itself would have seen none of this, because the inode it was attached to
-/// is the one that got orphaned. This test is why the watches are on
-/// directories.
+/// An editor saves by writing a temporary and renaming it over the target. A
+/// watch on the file itself would see none of this — its inode is the one
+/// orphaned — which is why the watches are on directories.
 #[test]
 fn an_atomic_save_reads_as_a_content_change() {
     let t = targets(&["/docs/report.txt"]);
@@ -83,8 +76,7 @@ fn an_atomic_save_reads_as_a_content_change() {
     assert_eq!(decided.len(), 1, "nothing else was decided: {decided:?}");
 }
 
-/// Linux emits From, To and then Both for one in-directory rename. The
-/// provisional Gone recorded for the From half must not escape the window.
+/// Linux emits From, To and then Both for one in-directory rename.
 #[test]
 fn a_linux_rename_pairs_without_leaking_a_gone() {
     let t = targets(&["/docs/old.txt"]);
@@ -115,8 +107,7 @@ fn a_linux_rename_pairs_without_leaking_a_gone() {
     );
 }
 
-/// Windows never emits `Both` and gives no cookie to pair the halves by, so
-/// one unclaimed destination beside one departed target is paired by position.
+/// Windows never emits `Both` and gives no cookie to pair the halves by.
 #[test]
 fn a_windows_rename_pairs_by_elimination() {
     let t = targets(&["/docs/old.txt"]);
@@ -139,9 +130,6 @@ fn a_windows_rename_pairs_by_elimination() {
     );
 }
 
-/// Two departures and two arrivals in one window cannot be paired without
-/// guessing. Guessing wrong renames a row to someone else's file, so the
-/// ambiguous case resolves to the truthful answer instead.
 #[test]
 fn an_ambiguous_windows_window_reports_gone_rather_than_guessing() {
     let t = targets(&["/docs/a.txt", "/docs/b.txt"]);
@@ -170,8 +158,80 @@ fn an_ambiguous_windows_window_reports_gone_rather_than_guessing() {
     assert_eq!(decided.get("/docs/b.txt"), Some(&Op::Gone));
 }
 
-/// A watched directory is full of files that are not on screen. None of them
-/// may produce an update — live results never add rows.
+fn event_os(kind: EventKind, paths: &[PathBuf]) -> NotifyEvent {
+    NotifyEvent {
+        kind,
+        paths: paths.to_vec(),
+        attrs: Default::default(),
+    }
+}
+
+fn twin_pair() -> (String, PathBuf) {
+    let shown = format!("/docs/{}", crate::testutil::lossy_twin("report", ".txt"));
+    let bad = PathBuf::from("/docs").join(crate::testutil::unrepresentable_name("report", ".txt"));
+    assert_eq!(bad.to_string_lossy(), shown, "the two must collide");
+    (shown, bad)
+}
+
+/// Keyed lossily, events for the unindexable file would land on the displayed
+/// row that owns the same lossy spelling.
+#[test]
+fn events_for_an_unrepresentable_path_never_touch_its_lossy_twin() {
+    let (shown, bad) = twin_pair();
+    let t = targets(&[&shown]);
+    let decided = window(
+        &t,
+        vec![
+            event_os(
+                EventKind::Remove(RemoveKind::File),
+                std::slice::from_ref(&bad),
+            ),
+            event_os(
+                EventKind::Create(CreateKind::File),
+                std::slice::from_ref(&bad),
+            ),
+            event_os(EventKind::Modify(ModifyKind::Any), &[bad]),
+        ],
+    );
+    assert!(
+        decided.is_empty(),
+        "the displayed row must be untouched: {decided:?}"
+    );
+}
+
+/// `Op::Renamed` carries the destination and the GUI opens rows by it, so a
+/// lossy destination would open some other file; `Gone` is the honest answer.
+#[test]
+fn a_rename_to_an_unrepresentable_name_reports_gone() {
+    let (_, bad) = twin_pair();
+    let t = targets(&["/docs/a.txt"]);
+    let decided = window(
+        &t,
+        vec![event_os(
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            &[PathBuf::from("/docs/a.txt"), bad],
+        )],
+    );
+    assert_eq!(decided.get("/docs/a.txt"), Some(&Op::Gone));
+}
+
+#[test]
+fn a_split_rename_is_not_paired_with_an_unrepresentable_arrival() {
+    let (_, bad) = twin_pair();
+    let t = targets(&["/docs/a.txt"]);
+    let decided = window(
+        &t,
+        vec![
+            event(
+                EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+                &["/docs/a.txt"],
+            ),
+            event_os(EventKind::Modify(ModifyKind::Name(RenameMode::To)), &[bad]),
+        ],
+    );
+    assert_eq!(decided.get("/docs/a.txt"), Some(&Op::Gone));
+}
+
 #[test]
 fn events_for_paths_that_are_not_shown_decide_nothing() {
     let t = targets(&["/docs/shown.txt"]);
@@ -186,8 +246,6 @@ fn events_for_paths_that_are_not_shown_decide_nothing() {
     assert!(decided.is_empty(), "{decided:?}");
 }
 
-/// A delete marks the row; a file recreated at the same path un-marks it,
-/// which is what makes the mark reversible without re-registering anything.
 #[test]
 fn a_delete_marks_the_row_and_a_recreate_clears_it() {
     let t = targets(&["/docs/report.txt"]);
@@ -210,7 +268,6 @@ fn a_delete_marks_the_row_and_a_recreate_clears_it() {
     assert_eq!(back.get("/docs/report.txt"), Some(&Op::Changed));
 }
 
-/// Several writes to one file inside a window are one decision, not several.
 #[test]
 fn repeated_writes_in_one_window_coalesce() {
     let t = targets(&["/docs/log.txt"]);
@@ -230,7 +287,6 @@ fn repeated_writes_in_one_window_coalesce() {
 
 use crate::testutil::scratch_dir;
 
-/// Collect updates until `want` of them arrive or the timeout expires.
 fn collect(rx: &mpsc::Receiver<LiveUpdate>, want: usize, timeout: Duration) -> Vec<LiveUpdate> {
     let deadline = Instant::now() + timeout;
     let mut out = Vec::new();
@@ -247,9 +303,8 @@ fn collect(rx: &mpsc::Receiver<LiveUpdate>, want: usize, timeout: Duration) -> V
     out
 }
 
-/// A target describing `path` exactly as it is on disk right now, so the
-/// arm-time sweep finds nothing to report and the test sees only what it
-/// provokes afterwards.
+/// Matches the disk exactly, so the arm-time sweep finds nothing to report
+/// and the test sees only what it provokes afterwards.
 fn current_target(path: &str, text: Option<ContentTier>) -> Target {
     let meta = std::fs::metadata(path).expect("target file exists");
     Target {
@@ -264,7 +319,6 @@ fn watch_one(dir: &Path, name: &str) -> (LiveWatcher, mpsc::Receiver<LiveUpdate>
     watch_one_matching(dir, name, "hello world", None)
 }
 
-/// Write `body` at `dir/name` and watch it for the query `hello`.
 fn watch_one_matching(
     dir: &Path,
     name: &str,
@@ -284,14 +338,8 @@ fn watch_one_matching(
     (watcher, rx, path)
 }
 
-/// Stop the watcher, then take the tree with it.
-///
-/// The stop is not optional: the watcher holds an inotify registration on the
-/// directory, and pulling the directory out from under a live one is a race
-/// worth not having. Unlike most of this crate's tests these do clean up on
-/// the way out — the trees are a file or two apiece, generated identically
-/// every run, so they hold no evidence the assertion message does not already
-/// carry.
+/// Stop before removing the tree: pulling the directory out from under a live
+/// inotify registration is a race worth not having.
 fn stop_and_clean(mut watcher: LiveWatcher, dir: &Path) {
     watcher.stop();
     std::fs::remove_dir_all(dir).ok();
@@ -334,10 +382,6 @@ fn e2e_a_delete_surfaces_as_gone() {
     );
 }
 
-/// The design test, on a real filesystem: write a temporary and rename it over
-/// the target, the way an editor saves. It must read as a change to the row,
-/// not as the row disappearing — which is exactly what a watch on the file
-/// itself would have reported.
 #[test]
 fn e2e_an_atomic_save_does_not_read_as_a_delete() {
     let dir = scratch_dir("live-atomic");
@@ -355,8 +399,6 @@ fn e2e_an_atomic_save_does_not_read_as_a_delete() {
     );
 }
 
-/// A row whose directory does not exist must not panic, and must not stop the
-/// watcher from covering the rows whose directories do.
 #[test]
 fn a_missing_directory_does_not_stop_the_others() {
     let dir = scratch_dir("live-missing-dir");
@@ -393,12 +435,9 @@ fn a_missing_directory_does_not_stop_the_others() {
 }
 
 // --- content, read from the file rather than from the index ---------------
-//
-// None of these open a database. That is the assertion they all share: a row
-// on screen tracks the disk with no indexer involved, which is what the
-// feature is for.
+// None of these open a database: a row on screen tracks the disk with no
+// indexer involved.
 
-/// Pull the one `Changed` out of a batch, failing loudly on anything else.
 fn one_change(updates: &[LiveUpdate], path: &str) -> (u64, i64, WindowUpdate) {
     let found = updates.iter().find_map(|u| match u {
         LiveUpdate::Changed {
@@ -412,9 +451,6 @@ fn one_change(updates: &[LiveUpdate], path: &str) -> (u64, i64, WindowUpdate) {
     found.unwrap_or_else(|| panic!("expected a Changed for {path}, got {updates:?}"))
 }
 
-/// The test the old index-backed design could not have: edit a watched file
-/// with no index anywhere, and the row's size, modified time and Content Match
-/// window all follow it.
 #[test]
 fn e2e_a_content_change_re_cuts_the_snippet_with_no_index() {
     let dir = scratch_dir("live-content");
@@ -439,9 +475,6 @@ fn e2e_a_content_change_re_cuts_the_snippet_with_no_index() {
     assert!(!snippet.ranges.is_empty(), "the match was not marked");
 }
 
-/// Edited until it no longer matches, the row keeps its place and its metadata
-/// but loses its window — the Content Match cell falls back to its dash rather
-/// than showing text that is no longer a hit.
 #[test]
 fn e2e_an_edit_that_removes_the_match_clears_the_window() {
     let dir = scratch_dir("live-unmatch");
@@ -461,10 +494,6 @@ fn e2e_an_edit_that_removes_the_match_clears_the_window() {
     );
 }
 
-/// A fuzzy content hit is re-cut with the fuzzy matcher, not the literal one.
-/// The literal is absent from the body by construction — that is what made
-/// it a fuzzy hit — so re-cutting it as an exact row would read as "no longer
-/// matches" and blank a cell that still has a hit in it.
 #[test]
 fn e2e_a_fuzzy_content_hit_is_re_cut_with_the_fuzzy_matcher() {
     let dir = scratch_dir("live-fuzzy");
@@ -495,8 +524,6 @@ fn e2e_a_fuzzy_content_hit_is_re_cut_with_the_fuzzy_matcher() {
     assert!(!snippet.ranges.is_empty(), "the fuzzy match was not marked");
 }
 
-/// A file no extractor claims still reports what `metadata` knows. Size and
-/// Modified are not the text columns' to withhold.
 #[test]
 fn e2e_a_file_with_no_extractable_text_still_reports_its_metadata() {
     let dir = scratch_dir("live-binary");
@@ -521,8 +548,6 @@ fn e2e_a_file_with_no_extractable_text_still_reports_its_metadata() {
     assert_eq!(window, WindowUpdate::Unchanged);
 }
 
-/// Past `maximum_text_file_size` the indexer stores no text, so neither does
-/// the row — but it still says how big the file got.
 #[test]
 fn e2e_a_file_over_the_text_size_limit_reports_size_but_no_window() {
     let dir = scratch_dir("live-oversize");
@@ -553,10 +578,8 @@ fn e2e_a_file_over_the_text_size_limit_reports_size_but_no_window() {
 
 // --- the arm-time sweep ---------------------------------------------------
 
-/// A row armed with what the *index* said about a file that has since moved on
-/// is corrected the moment it is watched. This is the check of the index
-/// against the disk, and it is also the only thing that reports anything at
-/// all on a filesystem the platform sends no events for.
+/// The arm-time sweep is also all that reports anything on a filesystem the
+/// platform sends no events for.
 #[test]
 fn arming_corrects_a_row_that_went_stale_while_it_was_not_watched() {
     let dir = scratch_dir("live-sweep-stale");
@@ -587,7 +610,6 @@ fn arming_corrects_a_row_that_went_stale_while_it_was_not_watched() {
     );
 }
 
-/// Same sweep, for a row whose file is simply not there any more.
 #[test]
 fn arming_reports_a_row_whose_file_vanished_while_it_was_not_watched() {
     let dir = scratch_dir("live-sweep-gone");
@@ -619,9 +641,6 @@ fn arming_reports_a_row_whose_file_vanished_while_it_was_not_watched() {
     );
 }
 
-/// The other half of the sweep, and the one that keeps it quiet: a row that
-/// already agrees with the disk is not touched. Without this the watcher would
-/// repaint every visible row on every scroll.
 #[test]
 fn arming_says_nothing_about_a_row_that_already_agrees_with_the_disk() {
     let dir = scratch_dir("live-sweep-quiet");
@@ -639,8 +658,6 @@ fn arming_says_nothing_about_a_row_that_already_agrees_with_the_disk() {
     );
 }
 
-/// Re-arming replaces the set wholesale; an event for a path that is no longer
-/// shown decides nothing.
 #[test]
 fn re_arming_drops_the_previous_targets() {
     let t = targets(&["/docs/new.txt"]);
@@ -652,4 +669,33 @@ fn re_arming_drops_the_previous_targets() {
         )],
     );
     assert!(decided.is_empty(), "{decided:?}");
+}
+
+/// Regression: `flush_settled` used to run only when `pending` was non-empty,
+/// so churn beside the results left a stale `orphan_to` entry that paired with
+/// the next lone `Gone`. A move-in from an unwatched directory is the reliable
+/// lone orphan on every platform — no `From` half, so no `Both` follows.
+#[test]
+fn e2e_an_unpaired_move_in_does_not_capture_a_later_deletion() {
+    let dir = scratch_dir("live-orphan-drain");
+    let (watcher, rx, path) = watch_one(&dir, "before.txt");
+
+    let elsewhere = scratch_dir("live-orphan-source");
+    let outside = elsewhere.join("moved-in.txt");
+    std::fs::write(&outside, "unrelated").unwrap();
+    std::fs::rename(&outside, dir.join("moved-in.txt")).unwrap();
+
+    // Past the settle window, so the drain has had its chance.
+    std::thread::sleep(Duration::from_millis(600));
+
+    std::fs::remove_file(&path).unwrap();
+
+    let updates = collect(&rx, 1, Duration::from_secs(5));
+    stop_and_clean(watcher, &dir);
+    std::fs::remove_dir_all(&elsewhere).ok();
+
+    match updates.first() {
+        Some(LiveUpdate::Gone { path: gone, .. }) => assert_eq!(gone, &path),
+        other => panic!("a deletion must not pair with unrelated churn: {other:?}"),
+    }
 }

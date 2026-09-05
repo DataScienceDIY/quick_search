@@ -1,14 +1,6 @@
-//! Incremental single-path index updates, driven by watcher events.
-//!
-//! One [`FsEvent`] becomes one (or a few) small transactions: files row,
-//! `documents_text`, and FTS are updated together, so the index is
-//! consistent after every commit. The same filters as the full walk apply
-//! ([`IgnoreSet`], hidden components, `content_extensions`, size caps) —
-//! a watcher event for something the walker would have skipped is a no-op.
-//! Renames are handled as remove + re-add.
-//!
-//! The watcher only reports paths under the configured roots, so no root
-//! containment check is repeated here.
+//! Incremental single-path index updates, driven by watcher events, applying
+//! the same filters as the full walk — the two must agree. The watcher only
+//! reports paths under the configured roots, so containment is not rechecked.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,14 +19,10 @@ use crate::platform::path_has_hidden_component_under;
 use crate::watcher::FsEvent;
 
 /// How much of one event may be applied in this turn, and where the last turn
-/// stopped.
-///
-/// One event is not always one file: a directory moved into a watched tree
-/// arrives as a single `Create` covering everything beneath it. Shaped like
-/// [`crate::scope::advance`]'s arguments and there for the same reason — this
-/// runs on the coordinator's own thread, so an unbounded call is a command
-/// loop that reads no commands, including the shutdown a closing window is
-/// waiting on.
+/// stopped. One event is not always one file: a moved-in directory arrives as
+/// a single `Create` covering everything beneath it. This runs on the
+/// coordinator's own thread, so an unbounded call is a command loop that
+/// reads no commands — including the shutdown a closing window is waiting on.
 pub struct Budget<'a> {
     pub deadline: Instant,
     pub cancel: &'a AtomicBool,
@@ -51,18 +39,18 @@ impl Budget<'_> {
 /// Whether an event was applied in full, or ran out of budget partway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applied {
-    /// Everything the event implied is in the index.
     Done,
     /// Budget spent. What was written is committed; the caller should re-queue
     /// the same event with `resume_from` set to `done`.
-    Unfinished { done: usize },
+    Unfinished {
+        done: usize,
+    },
 }
 
 /// Apply one filesystem event to the index. Missing files are treated as
-/// no-ops (a Create followed by a quick delete resolves via the Remove
-/// event); unchanged mtimes short-circuit without touching the DB.
-///
-/// See [`Budget`] for the one event that is not small.
+/// no-ops (the pending Remove event resolves them); unchanged mtimes
+/// short-circuit without touching the DB. See [`Budget`] for the one event
+/// that is not small.
 pub fn apply_fs_event(
     conn: &mut Connection,
     event: &FsEvent,
@@ -94,40 +82,38 @@ fn upsert_path(
     if ignore.matches_path(path) {
         return Ok(Applied::Done);
     }
-    // Measured from the innermost configured root: the walk never filters
-    // the root it was handed, so a root that is itself hidden must not be
-    // rejected here — that disagreement makes the index churn every cycle.
+    // Measured from the innermost configured root: the walk never filters the
+    // root it was handed, and disagreeing here makes the index churn every cycle.
     if !config.indexing.include_hidden
         && path_has_hidden_component_under(path, &config.resolved_indexing_paths())
     {
         return Ok(Applied::Done);
     }
+    // Checked before the followed `metadata` below: with following off the
+    // walk records no symlinks, and `prepare_file_record_from_path`
+    // canonicalizes — a followed link targeting outside every root writes a
+    // row no sweep range covers, and nothing but a rebuild clears it.
+    if !config.indexing.follow_symlinks {
+        match std::fs::symlink_metadata(path) {
+            Ok(md) if md.file_type().is_symlink() => return Ok(Applied::Done),
+            Err(_) => return Ok(Applied::Done),
+            Ok(_) => {}
+        }
+    }
     let Ok(meta) = std::fs::metadata(path) else {
-        // Already gone again — the pending Remove event handles it.
         return Ok(Applied::Done);
     };
     if meta.is_dir() {
-        // A moved-in tree surfaces as one directory event; walk it with
-        // the same filters as a full run.
-        //
-        // A non-UTF-8 path is a whole subtree missing from the index, so it
-        // is an error (the caller schedules a full run) rather than a quiet
-        // `Ok`.
+        // A path the index cannot spell is "nothing indexable here", not an
+        // error: an error would set `needs_full_run`, and a full run screens
+        // the same subtree out for the same reason — the reindex fixes nothing.
         let Some(root) = path.to_str() else {
-            return Err(format!("directory path is not valid UTF-8: {:?}", path));
+            return Ok(Applied::Done);
         };
-        // Streamed, not collected: `mv` of a large tree is one event, and
-        // materialising its entries first is a `DirEntry` per file resident
-        // before a single row is written. Each file is its own transaction,
-        // so stopping between two of them leaves the index consistent and the
-        // remainder for the next turn.
-        //
-        // `skip` rather than re-testing every entry: `upsert_file` on an
-        // unchanged file is cheap but not free, and paying it again for
-        // everything already done would make a large tree quadratic in the
-        // number of turns it takes. The walk order is deterministic for an
-        // unchanged tree; if the tree does change under us the count is only
-        // an optimisation, and the next full run is what makes it exact.
+        // Resumed by `skip`, with two limits: the traversal itself is not
+        // skipped (walk cost stays quadratic in turns), and `skip(n)` is
+        // positional — a tree that changes underneath skips the wrong files
+        // until the next full run. If either matters, resume by last-path.
         let mut done = budget.resume_from;
         for entry in filtered_walk(
             root,
@@ -166,12 +152,12 @@ fn upsert_file(
 
     let existing: Option<(i64, i64)> = tx
         .query_row(
-            "SELECT id, mtime FROM files WHERE path = ?1",
-            rusqlite::params![rec.path],
+            "SELECT id, mtime FROM files WHERE parent = ?1 AND name = ?2",
+            rusqlite::params![rec.parent, rec.name],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
-        .map_err(|e| format!("lookup {}: {}", rec.path, e))?;
+        .map_err(|e| format!("lookup {}: {}", rec.path(), e))?;
 
     let file_id = match existing {
         Some((_, mtime)) if mtime.max(0) as u64 == rec.mtime => return Ok(()),
@@ -181,15 +167,13 @@ fn upsert_file(
         }
         None => match repo::insert_file(&tx, &rec.as_new_file())? {
             Some(id) => id,
-            // Lost a race with another writer on the same path; the row
-            // that won is current enough.
+            // Lost a race with another writer; the row that won is current enough.
             None => return Ok(()),
         },
     };
 
-    // The only size gate on this path — `decide_content` has none, and
-    // falling through would hand a multi-gigabyte `.txt` to the plaintext
-    // extractor, which reads the whole file into memory.
+    // The only size gate on this path — `decide_content` has none, and falling
+    // through would read a multi-gigabyte `.txt` whole into memory.
     if !rec.needs_content {
         repo::set_content_na(&tx, file_id)?;
     } else if let Some(text) = rec.inline_text.as_deref() {
@@ -200,8 +184,8 @@ fn upsert_file(
         extract_and_store(
             &tx,
             file_id,
-            &rec.path,
-            rec.mime.as_deref(),
+            &rec.path(),
+            rec.mime,
             registry,
             config,
         )?;
@@ -216,12 +200,9 @@ fn remove_path(conn: &mut Connection, path: &Path) -> Result<(), String> {
 }
 
 /// Delete `paths` and everything indexed beneath them, in transactions of at
-/// most `chunk` paths.
-///
-/// Pays off only when the caller has reduced the set to its *roots*: then
-/// `rm -rf dir/` is a fixed handful of range-driven statements
-/// ([`repo::delete_subtree`]) rather than five per file. Chunking bounds how
-/// long any single transaction holds the connection.
+/// most `chunk` paths. Pays off only when the caller has reduced the set to
+/// its *roots*: then `rm -rf dir/` is a fixed handful of range-driven
+/// statements ([`repo::delete_subtree`]) rather than five per file.
 pub fn remove_paths(
     conn: &mut Connection,
     paths: &[std::path::PathBuf],
@@ -232,13 +213,17 @@ pub fn remove_paths(
             .transaction()
             .map_err(|e| format!("begin incremental tx: {}", e))?;
         for path in batch {
-            // The insert side stores a canonicalized path, so the raw event
-            // spelling is not a usable key — but the file is already gone, so
-            // `canonicalize` cannot be called on it directly either.
+            // A path the index cannot spell was never indexed, so there is
+            // nothing to delete — and a lossy path must never become a DB key:
+            // it would name whichever *different* file owns the lossy spelling
+            // and delete it, plus its whole subtree range.
+            if path.to_str().is_none() {
+                continue;
+            }
+            // The stored key is canonicalized, but the file is already gone,
+            // so `canonicalize` cannot run; `db_key_for_missing_path` approximates it.
             let path_str = db_key_for_missing_path(path);
-            // The path itself, whether it was a file or a directory...
             repo::delete_file_by_path(&tx, &path_str)?;
-            // ...then everything beneath it, for a directory removal.
             let range = ExtractCursor::for_root(&path_str);
             repo::delete_subtree(&tx, &range.lo, &range.hi)?;
         }
@@ -282,9 +267,6 @@ mod tests {
             }
         }
 
-        /// Applies with an effectively unlimited budget: these tests are about
-        /// what lands in the index, not about the slicing. See
-        /// [`Fixture::apply_within`] for the budget itself.
         fn apply(&mut self, event: &FsEvent) {
             let done = self.apply_within(event, Duration::from_secs(3600));
             assert_eq!(done, Applied::Done, "unexpectedly ran out of budget");
@@ -317,9 +299,8 @@ mod tests {
             p
         }
 
-        /// The key the index actually stores. Must go through
-        /// `path_to_db_string`, or every lookup here misses the
-        /// `\\?\`-stripped spelling on Windows.
+        /// The key the index actually stores: through `path_to_db_string`, or
+        /// every lookup here misses the `\\?\`-stripped spelling on Windows.
         fn canonical(&self, p: &Path) -> String {
             crate::file_handling::path_to_db_string(&p.canonicalize().unwrap())
         }
@@ -327,7 +308,7 @@ mod tests {
         fn row(&self, path: &str) -> Option<(i64, i64, i64)> {
             self.conn
                 .query_row(
-                    "SELECT id, mtime, content_state FROM files WHERE path = ?1",
+                    "SELECT id, mtime, content_state FROM files WHERE parent || name = ?1",
                     rusqlite::params![path],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
@@ -369,17 +350,41 @@ mod tests {
         }
     }
 
-    /// The collapse must not change what ends up deleted — only how much work
-    /// it takes to get there.
-    /// A directory event is applied in slices, and a slice resumes where the
-    /// last one stopped instead of re-walking what it already did.
-    ///
-    /// `mv` of a large tree is one `Create`. Applying it in one go held the
-    /// coordinator's command loop — and the shutdown queued behind it — for as
-    /// long as the whole tree took; applying it in slices that each restarted
-    /// from the top would be quadratic instead. Asserted by resume point
-    /// rather than by clock, because a timing-based assertion says nothing
-    /// reliable on a loaded CI runner.
+    /// The coordinator prunes `resume_from` alongside the queues: resuming
+    /// from a count that belonged to an earlier walk skips real files, and
+    /// they get no row until the next full run.
+    #[test]
+    fn resuming_past_the_end_indexes_nothing_rather_than_the_wrong_files() {
+        let mut f = Fixture::new();
+        for i in 0..3 {
+            f.write(&format!("sub/f{i}.txt"), "body");
+        }
+        let sub = f.dir.join("sub");
+
+        let outcome =
+            f.apply_resuming(&FsEvent::Create(sub.clone()), Duration::from_secs(3600), 99);
+        assert_eq!(outcome, Applied::Done);
+        assert_eq!(f.counts().0, 0);
+
+        f.apply(&FsEvent::Create(sub));
+        assert_eq!(f.counts().0, 3);
+    }
+
+    /// `chunks(0)` panics on the indexing thread above the arm that publishes
+    /// `IndexingStatus::Error` — a hand-edited zero wedged indexing for the
+    /// session while the UI went on reading "Running".
+    #[test]
+    fn a_zero_batch_size_does_not_panic_the_writer() {
+        let mut f = Fixture::new();
+        f.config.processing.batch_size = 0;
+        f.write("a.txt", "body");
+        f.apply(&FsEvent::Create(f.dir.join("a.txt")));
+        assert_eq!(f.counts().0, 1, "the file should still be indexed");
+    }
+
+    /// A sliced directory event resumes where the last slice stopped — linear,
+    /// not quadratic. Asserted by resume point rather than by clock, because a
+    /// timing-based assertion says nothing reliable on a loaded CI runner.
     #[test]
     fn a_directory_event_resumes_where_its_budget_ran_out() {
         let mut f = Fixture::new();
@@ -388,14 +393,10 @@ mod tests {
         }
         let sub = f.dir.join("sub");
 
-        // Nothing may be spent, so nothing is applied and the resume point is
-        // where it started.
         let outcome = f.apply_within(&FsEvent::Create(sub.clone()), Duration::ZERO);
         assert_eq!(outcome, Applied::Unfinished { done: 0 });
         assert_eq!(f.counts().0, 0, "a spent budget must write nothing");
 
-        // Resuming past the first two entries applies only what is left, which
-        // is what makes slicing linear rather than quadratic.
         let outcome = f.apply_resuming(&FsEvent::Create(sub.clone()), Duration::from_secs(3600), 2);
         assert_eq!(outcome, Applied::Done);
         assert_eq!(
@@ -404,7 +405,6 @@ mod tests {
             "entries before the resume point must be skipped, not re-applied"
         );
 
-        // And from the start, the rest arrive.
         f.apply(&FsEvent::Create(sub));
         assert_eq!(f.counts().0, 4);
     }
@@ -423,16 +423,13 @@ mod tests {
         let canonical_tree = f.canonical(&tree);
         std::fs::remove_dir_all(&tree).unwrap();
 
-        // What a real `rm -rf` produces: the directory plus every path under it.
         let reported: Vec<std::path::PathBuf> = vec![
             canonical_tree.clone().into(),
             format!("{}/deep", canonical_tree).into(),
             format!("{}/a.txt", canonical_tree).into(),
             format!("{}/deep/b.txt", canonical_tree).into(),
         ];
-        // Collapsed to its root the way the coordinator collapses an
-        // arriving queue (`collapse_pending_removals`): one range covers the
-        // whole tree, which is what makes `remove_paths` cheap.
+        // Collapsed to its root, as the coordinator's `collapse_pending_removals` does.
         let roots = vec![reported[0].clone()];
         remove_paths(&mut f.conn, &roots, 200).unwrap();
         assert_eq!(f.counts(), (1, 1, 1), "only tree2 survives");
@@ -461,12 +458,10 @@ mod tests {
         let canonical = f.canonical(&p);
         let (id1, mtime1, _) = f.row(&canonical).unwrap();
 
-        // Same mtime → no-op (id unchanged, no re-extraction).
         f.apply(&FsEvent::Modify(p.clone()));
         let (id2, mtime2, _) = f.row(&canonical).unwrap();
         assert_eq!((id1, mtime1), (id2, mtime2));
 
-        // Bump mtime and content → re-extracted, FTS follows.
         std::fs::write(&p, "second edition entirely").unwrap();
         let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
         let file = std::fs::File::options().write(true).open(&p).unwrap();
@@ -535,7 +530,6 @@ mod tests {
         let hidden = f.write(".secret", "x");
         f.apply(&FsEvent::Create(ignored));
         f.apply(&FsEvent::Create(hidden));
-        // Missing file too.
         f.apply(&FsEvent::Create(f.dir.join("never-existed.txt")));
         assert_eq!(f.counts(), (0, 0, 0));
     }
@@ -576,9 +570,8 @@ mod tests {
         assert_eq!(f.counts(), (1, 0, 0));
     }
 
-    /// A Remove event whose path is spelled differently from the stored key
-    /// must still delete the row. `dir/./f.txt` and `dir/f.txt` are the same
-    /// file; only the canonicalized spelling is in the index.
+    /// `dir/./f.txt` and `dir/f.txt` are the same file; only the
+    /// canonicalized spelling is in the index, yet the row must still go.
     #[test]
     fn remove_with_a_non_canonical_spelling_still_deletes() {
         let mut f = Fixture::new();
@@ -587,14 +580,11 @@ mod tests {
         assert_eq!(f.counts(), (1, 1, 1));
 
         std::fs::remove_file(&p).unwrap();
-        // Same file, spelled with a redundant `.` component.
         let odd = f.dir.join("sub").join(".").join("gone.txt");
         f.apply(&FsEvent::Remove(odd));
         assert_eq!(f.counts(), (0, 0, 0), "row removed despite the spelling");
     }
 
-    /// The subtree sweep must not take siblings whose names merely share a
-    /// string prefix — `tree2` is not inside `tree`.
     #[test]
     fn subtree_sweep_spares_prefix_siblings() {
         let mut f = Fixture::new();
@@ -614,8 +604,6 @@ mod tests {
         assert!(f.row(&survivor).is_some(), "tree2 untouched");
     }
 
-    /// A directory whose name contains a LIKE metacharacter must be swept
-    /// literally, not as a wildcard.
     #[test]
     fn subtree_sweep_treats_like_metacharacters_literally() {
         let mut f = Fixture::new();
@@ -635,6 +623,65 @@ mod tests {
         assert!(f.row(&survivor).is_some());
     }
 
+    /// A lossy path must never become a DB key: for an unrepresentable path
+    /// the key names a *different*, real file, and the event would take that
+    /// file's row and its whole subtree for a file that was never indexed.
+    #[test]
+    fn removing_an_unrepresentable_path_spares_its_lossy_twin() {
+        let mut f = Fixture::new();
+        let twin = crate::testutil::lossy_twin("report", ".txt");
+        let kept = f.write(&twin, "the file that must survive");
+        f.apply(&FsEvent::Create(kept.clone()));
+        let canonical = f.canonical(&kept);
+        assert!(f.row(&canonical).is_some(), "seeded");
+
+        // Never written to disk: a Remove is for a path already gone anyway.
+        let bad = f
+            .dir
+            .join(crate::testutil::unrepresentable_name("report", ".txt"));
+        f.apply(&FsEvent::Remove(bad));
+
+        assert!(
+            f.row(&canonical).is_some(),
+            "the real file's row was deleted by an event for a different file"
+        );
+        assert_eq!(f.counts().0, 1);
+    }
+
+    /// `coordinator::inner::apply_pending` turns any `Err` here into
+    /// `needs_full_run`, and a full run screens the same subtree out — the
+    /// reindex would loop forever. Live on Windows, where a `\\wsl.localhost\`
+    /// or Samba tree can hold such a directory and the root watch is recursive.
+    #[test]
+    fn a_directory_event_for_an_unrepresentable_path_is_not_an_error() {
+        let mut f = Fixture::new();
+        let bad = f.dir.join(crate::testutil::unrepresentable_name("dir", ""));
+        if std::fs::create_dir_all(&bad).is_err() {
+            eprintln!("skipped: this filesystem will not store an unrepresentable name");
+            return;
+        }
+        std::fs::write(bad.join("inside.txt"), "body").unwrap();
+
+        let outcome = apply_fs_event(
+            &mut f.conn,
+            &FsEvent::Create(bad),
+            &f.config,
+            &f.ignore,
+            &f.registry,
+            &Budget {
+                deadline: Instant::now() + Duration::from_secs(3600),
+                cancel: &AtomicBool::new(false),
+                resume_from: 0,
+            },
+        );
+        assert_eq!(
+            outcome,
+            Ok(Applied::Done),
+            "an unindexable subtree is not a failure"
+        );
+        assert_eq!(f.counts().0, 0, "and nothing under it is indexed");
+    }
+
     #[test]
     fn oversize_files_get_content_na() {
         let mut f = Fixture::new();
@@ -644,5 +691,69 @@ mod tests {
         let canonical = f.canonical(&p);
         let (_, _, content_state) = f.row(&canonical).unwrap();
         assert_eq!(content_state, repo::STATE_NA);
+    }
+
+    /// Regression: `metadata` follows, so the link read as a directory, and
+    /// canonicalization stored rows under the target's real path that no
+    /// sweep range covers — nothing but a rebuild cleared them.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_directory_is_not_followed_when_following_is_off() {
+        let mut f = Fixture::new();
+        assert!(
+            !f.config.indexing.follow_symlinks,
+            "the default this test is about"
+        );
+
+        let outside = crate::testutil::scratch_dir("incr-outside");
+        std::fs::write(outside.join("secret.txt"), "content out of scope").unwrap();
+        let link = f.dir.join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        f.apply(&FsEvent::Create(link.clone()));
+        assert_eq!(
+            f.counts(),
+            (0, 0, 0),
+            "nothing under the link may be indexed"
+        );
+
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Canonicalization would file it under the target's path, outside the
+    /// root that produced the event.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_file_is_not_indexed_when_following_is_off() {
+        let mut f = Fixture::new();
+        let outside = crate::testutil::scratch_dir("incr-outside-file");
+        let target = outside.join("target.txt");
+        std::fs::write(&target, "content out of scope").unwrap();
+        let link = f.dir.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        f.apply(&FsEvent::Create(link.clone()));
+        assert_eq!(f.counts(), (0, 0, 0), "the link must not be indexed");
+
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// The other half of the guard: it must gate on the setting, not refuse
+    /// symlinks outright.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_file_is_indexed_when_following_is_on() {
+        let mut f = Fixture::new();
+        f.config.indexing.follow_symlinks = true;
+        let target = f.write("target.txt", "greetings earthling");
+        let link = f.dir.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        f.apply(&FsEvent::Create(link.clone()));
+        let canonical = f.canonical(&target);
+        assert!(
+            f.row(&canonical).is_some(),
+            "the link should have indexed its target"
+        );
     }
 }

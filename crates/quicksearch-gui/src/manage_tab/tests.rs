@@ -6,8 +6,7 @@ use std::sync::Arc;
 use quicksearch_core::coordinator::RootCount;
 use quicksearch_core::db::repo::RootCounts;
 
-// The widgets under test report themselves here so their identity can be
-// checked across frames.
+// Widgets under test report themselves here for cross-frame identity checks.
 thread_local! {
     static WIDGETS: RefCell<Vec<(&'static str, egui::Id, egui::Rect)>> =
         const { RefCell::new(Vec::new()) };
@@ -40,8 +39,7 @@ fn idle_state() -> IndexerState {
     }
 }
 
-/// An idle state carrying figures for `/data`, the root `cfg_with_root`
-/// configures.
+/// Idle, carrying figures for `/data` — the root `cfg_with_root` configures.
 fn counted_state(files: i64, fts: i64) -> IndexerState {
     IndexerState {
         root_counts: Arc::new(vec![RootCount {
@@ -52,8 +50,8 @@ fn counted_state(files: i64, fts: i64) -> IndexerState {
     }
 }
 
-/// A run in progress. `current_file` and the number of roots are the
-/// parts that come and go from frame to frame in a real run.
+/// A run in progress; `current_file` and the root count are the parts that
+/// come and go from frame to frame.
 fn running_state(roots: &[&str], current_file: Option<&str>) -> IndexerState {
     state_with(
         roots
@@ -73,19 +71,21 @@ fn running_state(roots: &[&str], current_file: Option<&str>) -> IndexerState {
     )
 }
 
-/// A run whose roots are described one by one, for the rows whose
-/// contents — not just their widget ids — are under test.
 fn state_with(roots: Vec<RootProgress>) -> IndexerState {
+    maintaining_state(roots, None)
+}
+
+fn maintaining_state(roots: Vec<RootProgress>, step: Option<MaintenanceStep>) -> IndexerState {
     IndexerState {
         activity: IndexingStatus::Running {
             start_time: std::time::Instant::now(),
             roots,
+            maintenance: step,
         },
         ..idle_state()
     }
 }
 
-/// A run still in its prologue, before the walk has produced anything.
 fn preparing_state(step: PrepStep) -> IndexerState {
     IndexerState {
         activity: IndexingStatus::Preparing {
@@ -102,7 +102,6 @@ fn raw_input(events: Vec<egui::Event>) -> egui::RawInput {
     crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), events)
 }
 
-/// One frame of the real tab, with `events` delivered to it.
 fn frame(
     ctx: &egui::Context,
     tab: &mut ManageTab,
@@ -121,8 +120,6 @@ fn frame(
     actions
 }
 
-/// Every string the tab actually painted this frame, read back off the
-/// shapes.
 fn frame_text(ctx: &egui::Context, tab: &mut ManageTab, state: &IndexerState) -> Vec<String> {
     frame_text_with(ctx, tab, &cfg_with_root(), state)
 }
@@ -167,9 +164,8 @@ fn staged_workers(tab: &ManageTab) -> Option<usize> {
         .copied()
 }
 
-/// The per-root worker field must keep the same widget id however the
-/// status above it changes: egui hangs focus and in-progress text off
-/// that id, so a field that is renamed mid-run silently drops the edit.
+/// egui hangs focus and in-progress text off the widget id, so a field
+/// renamed mid-run silently drops the edit.
 #[test]
 fn the_worker_field_keeps_its_identity_as_the_status_changes() {
     let ctx = crate::test_ui::ctx();
@@ -189,8 +185,8 @@ fn the_worker_field_keeps_its_identity_as_the_status_changes() {
         running_state(&["/data"], Some("/data/file")),
         running_state(&["/data", "/other"], None),
         idle_state(),
-        // The per-root figures appear and disappear on the same row as the
-        // field, which is the case a conditionally-drawn label would break.
+        // The per-root figures share the field's row — the case a
+        // conditionally-drawn label would break.
         counted_state(1_234_567, 456_789),
         IndexerState {
             watcher: WatcherStatus::Off,
@@ -210,8 +206,7 @@ fn the_worker_field_keeps_its_identity_as_the_status_changes() {
     }
 }
 
-/// Click the field, type a count, click Apply & Save — while a run is
-/// reporting progress the whole time.
+/// Type a count and apply it — while a run reports progress the whole time.
 #[test]
 fn a_typed_worker_count_reaches_the_applied_config() {
     let ctx = crate::test_ui::ctx();
@@ -257,7 +252,6 @@ fn a_typed_worker_count_reaches_the_applied_config() {
     assert_eq!(applied.indexing.root_workers.get("/data"), Some(&8));
 }
 
-/// The other way to set the field: drag it.
 #[test]
 fn a_dragged_worker_count_is_staged() {
     let ctx = crate::test_ui::ctx();
@@ -312,8 +306,8 @@ fn root_progress(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> 
     }
 }
 
-/// The walk-total estimate counts *tree entries* and runs far ahead of
-/// the files a walk emits; a finished root must show the exact count.
+/// The walk-total estimate counts *tree entries* and runs far ahead of the
+/// files a walk emits.
 #[test]
 fn a_finished_root_reports_its_exact_count_not_the_estimate() {
     let ctx = crate::test_ui::ctx();
@@ -336,8 +330,6 @@ fn a_finished_root_reports_its_exact_count_not_the_estimate() {
     );
 }
 
-/// The folder list carries the last completed run's figures, so what a root
-/// holds survives the run that counted it.
 #[test]
 fn a_configured_root_shows_what_the_last_run_counted() {
     let ctx = crate::test_ui::ctx();
@@ -351,8 +343,7 @@ fn a_configured_root_shows_what_the_last_run_counted() {
     );
 }
 
-/// A root with no stored figures says so. Zero would be a claim — that the
-/// folder is empty — where the truth is that nothing has counted it yet.
+/// Zero would claim the folder is empty; the truth is nothing counted it yet.
 #[test]
 fn a_root_the_index_has_never_counted_says_so() {
     let ctx = crate::test_ui::ctx();
@@ -367,9 +358,6 @@ fn a_root_the_index_has_never_counted_says_so() {
     );
 }
 
-/// Figures are matched to the root by the spelling the config uses, so a
-/// root the coordinator has not published anything for keeps the placeholder
-/// rather than borrowing another root's numbers.
 #[test]
 fn figures_belong_to_the_root_they_were_counted_for() {
     let ctx = crate::test_ui::ctx();
@@ -391,8 +379,7 @@ fn figures_belong_to_the_root_they_were_counted_for() {
     );
 }
 
-/// The estimate is shown while the walk runs — but never below what has
-/// already been walked, or the row would read as a hang at 100%.
+/// Never below what has already been walked, or the row reads as a hang at 100%.
 #[test]
 fn a_walking_root_shows_the_estimate_raised_to_what_it_has_walked() {
     let ctx = crate::test_ui::ctx();
@@ -419,8 +406,6 @@ fn a_walking_root_shows_the_estimate_raised_to_what_it_has_walked() {
     );
 }
 
-/// Like [`frame_text`], but keeping the color each run of text was
-/// painted in — the only way to check a hint.
 fn frame_spans(
     ctx: &egui::Context,
     tab: &mut ManageTab,
@@ -436,8 +421,6 @@ fn frame_spans(
     crate::test_ui::painted_spans(&out)
 }
 
-/// The phase word carries a color hint, and it has to hold up in both
-/// themes.
 #[test]
 fn every_phase_word_is_painted_in_its_hint_color() {
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
@@ -455,11 +438,150 @@ fn every_phase_word_is_painted_in_its_hint_color() {
             let spans = frame_spans(&ctx, &mut tab, &state);
             let hint = spans.iter().find(|(text, _)| text == word).map(|(_, c)| *c);
             assert_eq!(hint, Some(want), "{:?}: {:?} in {:?}", theme, word, spans);
+
+            // Upkeep blocks the writer whatever the root was doing, so it
+            // replaces the phase word rather than sitting beside it.
+            let state = maintaining_state(
+                vec![root_progress(phase, 100, Some(1000))],
+                Some(MaintenanceStep::Checkpoint),
+            );
+            let spans = frame_spans(&ctx, &mut tab, &state);
+            let painted = |want: &str| spans.iter().find(|(t, _)| t == want).map(|(_, c)| *c);
+            assert_eq!(
+                painted("maintenance"),
+                Some(colors.orange),
+                "{:?}: {:?}",
+                theme,
+                spans
+            );
+            assert_eq!(
+                painted(word),
+                None,
+                "{:?}: {:?} survived: {:?}",
+                theme,
+                word,
+                spans
+            );
         }
     }
 }
 
-/// No count has landed yet: an indeterminate row, not a fabricated one.
+/// Run-wide state: said once, however many roots are on screen. And said
+/// *alongside* the per-root file hints rather than instead of them.
+///
+/// The hint count is the assertion that matters. A checkpoint fires every few
+/// seconds on a large index, so a line that disappears per root and comes back
+/// reflowed the whole block on a loop. Keeping it costs a moment of staleness
+/// (it names the last file written, not one in flight) and buys a row that
+/// holds its height.
+#[test]
+fn an_upkeep_step_names_itself_once_and_keeps_the_file_hints() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = ManageTab::new();
+
+    let with_file = |root: &str| RootProgress {
+        root: root.to_string(),
+        current_file: Some("/data/a-file-that-already-landed.txt".to_string()),
+        ..root_progress(RootPhase::Extracting, 100, Some(1000))
+    };
+    let roots = vec![with_file("/data"), with_file("/media")];
+    let hints = |drawn: &[String]| {
+        drawn
+            .iter()
+            .filter(|t| t.contains("a-file-that-already-landed.txt"))
+            .count()
+    };
+
+    let running = frame_text(&ctx, &mut tab, &state_with(roots.clone()));
+    assert_eq!(
+        hints(&running),
+        2,
+        "the per-root file hint is drawn while files are moving: {:?}",
+        running
+    );
+
+    let text = frame_text(
+        &ctx,
+        &mut tab,
+        &maintaining_state(roots, Some(MaintenanceStep::RemovingStale)),
+    );
+    assert_eq!(
+        text.iter()
+            .filter(|t| t.contains("Removing entries for deleted files"))
+            .count(),
+        1,
+        "the step is run-wide, not per-root: {:?}",
+        text
+    );
+    assert_eq!(
+        hints(&text),
+        2,
+        "every root keeps its file hint through the step: {:?}",
+        text
+    );
+}
+
+/// The hint carries a whole path, which can outrun any window. It is elided to
+/// the panel rather than to a character count, so it stays one line: a hint
+/// that wrapped when the path got long would change the block's height as
+/// files came and went, the same reflow the line above is drawn to avoid.
+#[test]
+fn an_overlong_file_hint_loses_its_middle_rather_than_wrapping() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = ManageTab::new();
+    const FILE: &str = "deeply-buried-report.pdf";
+
+    let mut hint_shape = |file: &str| {
+        let state = state_with(vec![RootProgress {
+            current_file: Some(file.to_string()),
+            ..root_progress(RootPhase::Extracting, 100, Some(1000))
+        }]);
+        WIDGETS.with(|w| w.borrow_mut().clear());
+        let out = ctx.run(raw_input(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                tab.ui(ui, &state, &cfg_with_root());
+            });
+        });
+        crate::test_ui::painted(&out)
+            .into_iter()
+            .find(|(t, _)| t.ends_with(FILE))
+            .unwrap_or_else(|| panic!("no file hint drawn for {}", file))
+    };
+
+    let short = format!("/data/{}", FILE);
+    let (drawn_short, short_rect) = hint_shape(&short);
+    assert_eq!(drawn_short, short, "a path that fits is drawn whole");
+
+    let long = format!(
+        "/data/{}/{}",
+        ["a-rather-long-directory-name"; 12].join("/"),
+        FILE
+    );
+    let (drawn_long, long_rect) = hint_shape(&long);
+    assert!(
+        drawn_long.contains('…'),
+        "a path far past the panel was not elided: {}",
+        drawn_long
+    );
+    assert!(
+        drawn_long.starts_with("/data/"),
+        "the elide took the head rather than the middle: {}",
+        drawn_long
+    );
+    assert!(
+        long_rect.width() <= 1000.0,
+        "the hint is {} wide in a 1000 px viewport: {}",
+        long_rect.width(),
+        drawn_long
+    );
+    assert_eq!(
+        long_rect.height(),
+        short_rect.height(),
+        "the hint wrapped to a second line: {}",
+        drawn_long
+    );
+}
+
 #[test]
 fn a_walking_root_without_a_count_shows_no_denominator() {
     let ctx = crate::test_ui::ctx();
@@ -474,7 +596,6 @@ fn a_walking_root_without_a_count_shows_no_denominator() {
     assert!(!text.contains(" / "), "invented a denominator: {}", text);
 }
 
-/// Every step of the prologue names itself and carries a clock.
 #[test]
 fn each_prologue_step_says_what_it_is_waiting_on() {
     let ctx = crate::test_ui::ctx();
@@ -483,16 +604,14 @@ fn each_prologue_step_says_what_it_is_waiting_on() {
     for (step, expected) in [
         (PrepStep::PreviousRun, "Finishing the previous run…"),
         (PrepStep::OpeningIndex, "Opening the index…"),
+        (PrepStep::Starting, "Getting the index ready…"),
     ] {
         let text = frame_text(&ctx, &mut tab, &preparing_state(step)).join(" | ");
         assert!(text.contains(expected), "{}", text);
-        // The clock is the point of the row.
         assert!(text.contains("0:00"), "no elapsed time shown: {}", text);
     }
 }
 
-/// The reconcile is the long one, and the only prologue step with
-/// something to count. It reports its position in the scan.
 #[test]
 fn a_reconcile_reports_how_far_through_the_index_it_is() {
     let ctx = crate::test_ui::ctx();
@@ -518,8 +637,7 @@ fn a_reconcile_reports_how_far_through_the_index_it_is() {
     assert!(text.contains("1,204 entries removed"), "{}", text);
 }
 
-/// Whole-range deletions read no rows, so the scan can reach the display
-/// with nothing to divide by; it must not invent a denominator.
+/// Whole-range deletions read no rows; the display must not invent a denominator.
 #[test]
 fn a_reconcile_without_a_row_count_shows_no_denominator() {
     let ctx = crate::test_ui::ctx();
@@ -534,8 +652,7 @@ fn a_reconcile_without_a_row_count_shows_no_denominator() {
     assert!(!text.contains(" / "), "invented a denominator: {}", text);
 }
 
-/// A prune between runs is reported, even though the activity really is
-/// `Idle` while the thread scans every row.
+/// The activity really is `Idle` while a between-runs prune scans every row.
 #[test]
 fn a_prune_between_runs_is_reported_instead_of_idle() {
     let ctx = crate::test_ui::ctx();
@@ -564,8 +681,7 @@ fn a_prune_between_runs_is_reported_instead_of_idle() {
     );
 }
 
-/// The pass itself can be over between two frames; the lingering summary
-/// is the only evidence it happened.
+/// The lingering summary is the only evidence a fast pass happened.
 #[test]
 fn a_finished_prune_reports_what_it_did() {
     let ctx = crate::test_ui::ctx();
@@ -595,7 +711,6 @@ fn a_finished_prune_reports_what_it_did() {
     );
 }
 
-/// The static "Starting…" placeholder must not reappear.
 #[test]
 fn the_starting_placeholder_is_gone() {
     let ctx = crate::test_ui::ctx();
@@ -617,15 +732,12 @@ fn write_bytes(path: &Path, len: usize) {
     std::fs::write(path, vec![b'x'; len]).expect("write");
 }
 
-/// A config whose database is `path`, for the probe and the rendered row.
 fn cfg_with_db(path: &Path) -> Config {
     let mut cfg = cfg_with_root();
     cfg.paths.database_path = path.to_string_lossy().into_owned();
     cfg
 }
 
-/// Each of the three files SQLite keeps for one database is added, and
-/// nothing else that happens to sit beside them is.
 #[test]
 fn db_size_counts_the_database_and_both_sidecars() {
     let dir = scratch_dir("parts");
@@ -637,16 +749,13 @@ fn db_size_counts_the_database_and_both_sidecars() {
     write_bytes(&dir.join("index.sqlite-shm"), 32);
     assert_eq!(measure_db_size(&db), 5152, "-shm was not added");
 
-    // Decoys: a rollback journal (never present in WAL mode) and an
-    // unrelated neighbour.
+    // Decoys: a rollback journal and an unrelated neighbour.
     write_bytes(&dir.join("index.sqlite-journal"), 999);
     write_bytes(&dir.join("index.sqlite.bak"), 777);
     assert_eq!(measure_db_size(&db), 5152, "a decoy was counted");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Before the first indexing run there is no database at all, and a
-/// closed database has no sidecars — neither is an error.
 #[test]
 fn a_missing_database_measures_zero() {
     let dir = scratch_dir("missing");
@@ -659,7 +768,6 @@ fn a_missing_database_measures_zero() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The probe answers from cache until the interval is up.
 #[test]
 fn the_probe_caches_until_the_refresh_interval_is_up() {
     let dir = scratch_dir("cache");
@@ -684,8 +792,6 @@ fn the_probe_caches_until_the_refresh_interval_is_up() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A database path edited on the Settings tab must not keep showing the old
-/// database's size for the rest of the interval.
 #[test]
 fn the_probe_follows_a_changed_database_path() {
     let dir = scratch_dir("moved");
@@ -705,8 +811,6 @@ fn the_probe_follows_a_changed_database_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The number reaches the screen, and it is the total of all three files
-/// rather than the database on its own.
 #[test]
 fn the_status_row_shows_the_total_index_size() {
     let dir = scratch_dir("render");
@@ -726,8 +830,7 @@ fn the_status_row_shows_the_total_index_size() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The size tooltip's levers each have to keep matching a control that
-/// exists.
+/// The tooltip's levers each have to keep matching a control that exists.
 #[test]
 fn hovering_the_size_explains_how_to_shrink_the_index() {
     let dir = scratch_dir("hover");
@@ -735,8 +838,6 @@ fn hovering_the_size_explains_how_to_shrink_the_index() {
     write_bytes(&db, 2048);
 
     let ctx = crate::test_ui::ctx();
-    // egui holds tooltips back for a third of a second, and frames here
-    // are only 1/60 s of simulated time apart.
     ctx.style_mut(|s| s.interaction.tooltip_delay = 0.0);
     let mut tab = ManageTab::new();
     let cfg = cfg_with_db(&db);
@@ -780,7 +881,6 @@ fn synced_tab(config: &Config) -> ManageTab {
 fn identical_config_leaves_draft_untouched() {
     let cfg = Config::default();
     let mut tab = synced_tab(&cfg);
-    // Stage an edit, then sync against the unchanged config.
     tab.draft
         .as_mut()
         .unwrap()
@@ -912,8 +1012,6 @@ fn a_staged_edit_reads_dirty_and_discard_reverts_it() {
     assert!(!tab.is_dirty());
 }
 
-/// `parse_lines` drops blank lines and trims entries, so cosmetic
-/// whitespace in the extension editor must not read as an edit.
 #[test]
 fn a_trailing_newline_in_the_extension_editor_is_not_dirty() {
     let mut cfg = cfg_with_root();
@@ -925,9 +1023,8 @@ fn a_trailing_newline_in_the_extension_editor_is_not_dirty() {
     assert!(tab.is_dirty(), "a real entry is");
 }
 
-/// The mode buttons write `auto_index` straight to the live config; a
-/// stale copy frozen into the draft must not read dirty or revert the
-/// mode on apply.
+/// A stale `auto_index` frozen into the draft must not read dirty or
+/// revert the mode on apply.
 #[test]
 fn a_live_mode_flip_does_not_read_as_dirty() {
     let mut cfg = cfg_with_root();
@@ -940,8 +1037,7 @@ fn a_live_mode_flip_does_not_read_as_dirty() {
     tab.sync_editors(&stopped);
     assert!(!tab.is_dirty());
 
-    // Staged edit, then Return to Automatic: dirty because of the edit
-    // only, and the draft adopts the live mode.
+    // Staged edit, then Return to Automatic: dirty from the edit only.
     tab.draft
         .as_mut()
         .unwrap()
@@ -958,14 +1054,10 @@ fn a_live_mode_flip_does_not_read_as_dirty() {
         "applying must not revert the live mode"
     );
 
-    // Un-staging the edit reads clean again — not permanently dirty on
-    // a stale mode copy.
     tab.draft.as_mut().unwrap().indexing.ignore_patterns.pop();
     assert!(!tab.is_dirty());
 }
 
-/// `take_apply_config` must leave the editors intact, so a rejected
-/// config keeps the user's staged edits on screen.
 #[test]
 fn a_rejected_apply_keeps_the_draft() {
     let cfg = cfg_with_root();
@@ -990,8 +1082,7 @@ fn a_rejected_apply_keeps_the_draft() {
     assert!(!tab.is_dirty());
 }
 
-/// The dirty label's coming and going must never rename the Apply button,
-/// which egui hangs interaction state off.
+/// The label's coming and going must never rename the Apply button.
 #[test]
 fn the_unsaved_label_appears_without_renaming_the_apply_button() {
     let ctx = crate::test_ui::ctx();
@@ -1020,9 +1111,8 @@ fn the_unsaved_label_appears_without_renaming_the_apply_button() {
     assert_eq!(widget("apply").0, clean_id, "the label renamed the button");
 }
 
-/// The status area gains and loses rows as a prune runs; every frame must
-/// leave the widgets below it with the ids they had — an editor whose id
-/// changes mid-edit loses its buffer.
+/// The status area gains and loses rows as a prune runs; an editor whose
+/// id changes mid-edit loses its buffer.
 #[test]
 fn the_prune_rows_come_and_go_without_renaming_anything_below() {
     let ctx = crate::test_ui::ctx();
@@ -1052,4 +1142,157 @@ fn the_prune_rows_come_and_go_without_renaming_anything_below() {
         assert_eq!(widget("apply").0, apply, "renamed by {reconcile:?}");
         assert_eq!(widget("workers").0, workers, "renamed by {reconcile:?}");
     }
+}
+
+/// The cross-row adoption hazard: egui names widgets positionally, so after
+/// a Remove the surviving rows inherit earlier rows' ids — an in-progress
+/// DragValue edit must not carry over onto a different root.
+#[test]
+fn removing_a_root_does_not_leak_an_edit_onto_another_row() {
+    fn rects(tag: &str) -> Vec<egui::Rect> {
+        WIDGETS.with(|w| {
+            w.borrow()
+                .iter()
+                .filter(|(t, _, _)| *t == tag)
+                .map(|(_, _, rect)| *rect)
+                .collect()
+        })
+    }
+
+    let ctx = crate::test_ui::ctx();
+    let mut cfg = Config::default();
+    cfg.paths.indexing_paths = vec!["/aaa".into(), "/bbb".into(), "/ccc".into()];
+    let mut tab = synced_tab(&cfg);
+    let state = idle_state();
+    let staged = |tab: &ManageTab, root: &str| -> Option<usize> {
+        tab.draft
+            .as_ref()
+            .unwrap()
+            .indexing
+            .root_workers
+            .get(root)
+            .copied()
+    };
+
+    // Start editing row B's worker count.
+    frame(&ctx, &mut tab, &cfg, &state, vec![]);
+    let b_field = rects("workers")[1].center();
+    frame(&ctx, &mut tab, &cfg, &state, click_at(b_field));
+    frame(
+        &ctx,
+        &mut tab,
+        &cfg,
+        &state,
+        vec![egui::Event::Text("7".into())],
+    );
+    assert_eq!(staged(&tab, "/bbb"), Some(7), "the edit reached row B");
+    assert_eq!(staged(&tab, "/ccc"), None);
+
+    // Remove row A while the edit is live, then keep typing.
+    let a_remove = rects("remove")[0].center();
+    frame(&ctx, &mut tab, &cfg, &state, click_at(a_remove));
+    frame(&ctx, &mut tab, &cfg, &state, vec![]);
+    frame(
+        &ctx,
+        &mut tab,
+        &cfg,
+        &state,
+        vec![egui::Event::Text("9".into())],
+    );
+
+    let paths = &tab.draft.as_ref().unwrap().paths.indexing_paths;
+    assert_eq!(paths, &["/bbb".to_string(), "/ccc".to_string()]);
+    assert_eq!(
+        staged(&tab, "/bbb"),
+        Some(7),
+        "row B keeps its committed edit"
+    );
+    assert_eq!(
+        staged(&tab, "/ccc"),
+        None,
+        "the in-flight edit must not be adopted by row C"
+    );
+}
+
+/// The tour's folders page tells the reader to add a folder "here", and
+/// glows the row it means. All three ways in have to be inside that glow.
+#[test]
+fn the_tour_can_find_every_way_to_add_a_folder() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = ManageTab::new();
+    let cfg = cfg_with_root();
+    let state = idle_state();
+
+    let mut marked = None;
+    let out = ctx.run(raw_input(vec![]), |ctx| {
+        crate::spotlight::set_active(ctx, true);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            tab.ui(ui, &state, &cfg);
+        });
+        // Inside the pass: a mark is only live for the pass that wrote it.
+        marked = crate::spotlight::rect(ctx, crate::spotlight::Spot::IndexedFolderAdd);
+    });
+    let marked = marked.expect("the add-a-folder row was never marked");
+
+    let painted = crate::test_ui::painted(&out);
+    for needle in ["Add folder…", "or type a path", "Add"] {
+        let rect = painted
+            .iter()
+            .find(|(text, _)| text == needle)
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("nothing painted for {needle:?}"));
+        assert!(
+            marked.contains_rect(rect),
+            "{needle:?} at {rect:?} is outside the glow at {marked:?}"
+        );
+    }
+    // The row, not the whole folder list above it.
+    assert!(
+        marked.height() < 60.0,
+        "the mark covers {marked:?}, which is more than one row"
+    );
+}
+
+/// The tour's indexing page names both content filters and glows them. Each
+/// glow has to land on the box itself — not its label, not the list of
+/// patterns above it, and not nothing at all.
+#[test]
+fn the_tour_glows_both_content_filter_boxes() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = ManageTab::new();
+    let cfg = cfg_with_root();
+    let state = idle_state();
+
+    WIDGETS.with(|w| w.borrow_mut().clear());
+    let mut marks = (None, None);
+    let _ = ctx.run(raw_input(vec![]), |ctx| {
+        crate::spotlight::set_active(ctx, true);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            tab.ui(ui, &state, &cfg);
+        });
+        // Inside the pass: a mark is only live for the pass that wrote it.
+        marks = (
+            crate::spotlight::rect(ctx, crate::spotlight::Spot::IgnorePatterns),
+            crate::spotlight::rect(ctx, crate::spotlight::Spot::ExtWhitelist),
+        );
+    });
+
+    let ignore = widget("ignore-entry").1;
+    let whitelist = widget("ext-filter").1;
+    assert_eq!(
+        marks.0,
+        Some(ignore),
+        "the ignore-pattern box was not the thing glowed"
+    );
+    assert_eq!(
+        marks.1,
+        Some(whitelist),
+        "the extensions box was not the thing glowed"
+    );
+
+    // Reversed columns: ignore patterns first, the whitelist beside it.
+    assert!(
+        ignore.right() < whitelist.left(),
+        "the ignore box at {ignore:?} is not left of the whitelist at {whitelist:?}"
+    );
 }

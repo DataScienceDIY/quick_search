@@ -1,8 +1,10 @@
 use super::ignore::FOLD_BUF;
 use super::*;
 
-fn tmp_dir() -> PathBuf {
-    crate::testutil::scratch_dir("config")
+use crate::testutil::Scratch;
+
+fn tmp_dir() -> Scratch {
+    Scratch::dir("config")
 }
 
 #[test]
@@ -19,15 +21,12 @@ fn fresh_install_defaults_to_home_as_only_root() {
         vec![home],
         "the user's home folder must be the only default index root"
     );
-    // The auto-created file round-trips identically.
     let reloaded = Config::load_from(&path).unwrap();
     assert_eq!(reloaded.paths.indexing_paths, cfg.paths.indexing_paths);
-    // A [paths] section that omits indexing_paths also falls back to
-    // home, not to an empty list.
+    // A [paths] section that omits indexing_paths also falls back to home.
     fs::write(&path, "[paths]\ndatabase_path = \"x.sqlite\"\n").unwrap();
     let partial = Config::load_from(&path).unwrap();
     assert_eq!(partial.paths.indexing_paths, cfg.paths.indexing_paths);
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -40,7 +39,6 @@ fn missing_file_created_with_defaults() {
     assert_eq!(cfg.search.results_per_page, 100);
     assert!(cfg.indexing.auto_index);
     assert_eq!(cfg.source.as_deref(), Some(path.as_path()));
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -56,11 +54,8 @@ fn partial_file_gets_section_defaults() {
     assert_eq!(cfg.paths.indexing_paths, vec!["/x".to_string()]);
     assert_eq!(cfg.processing.batch_size, 500, "missing sections default");
     assert_eq!(cfg.search.debounce_ms, 150);
-    assert!((cfg.ui.scale - 1.1).abs() < f32::EPSILON);
-    // A config written before the shortcut existed must come back with
-    // one, not with no shortcut at all.
+    assert!((cfg.ui.scale - 1.25).abs() < f32::EPSILON);
     assert_eq!(cfg.ui.search_hotkey, "Ctrl+Shift+F");
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -75,7 +70,6 @@ fn relative_paths_resolve_against_config_dir() {
     let cfg = Config::load_from(&path).unwrap();
     assert_eq!(cfg.resolved_database_path(), dir.join("index.sqlite"));
     assert_eq!(cfg.resolved_indexing_paths(), vec![dir.join("data")]);
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -95,13 +89,12 @@ fn save_keeps_relative_paths_portable() {
         "relative path must survive a save round-trip: {}",
         text
     );
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn tilde_expansion() {
     if std::env::var_os("HOME").is_none() {
-        return; // nothing to assert without a home dir
+        return;
     }
     let mut cfg = Config::default();
     cfg.paths.database_path = "~/qs/index.sqlite".to_string();
@@ -146,20 +139,16 @@ fn content_allowed_extensionless_sentinel() {
         !content_allowed(Path::new("/a/b.pdf"), &cfg),
         "sentinel is not a wildcard"
     );
-    // The sentinel is not itself an extension: a file literally named
-    // `x.none` is not whitelisted by it.
+    // The sentinel is not itself an extension.
     assert!(!content_allowed(Path::new("/a/x.none"), &cfg));
     assert!(!content_allowed(Path::new("/a/x.(none)"), &cfg));
 
-    // Every capitalisation of the word means the same thing.
     for spelling in ["(none)", "(NONE)", "(NonE)", "(nOnE)"] {
         let mut c = Config::default();
         c.indexing.content_extensions = vec![spelling.to_string()];
         assert!(content_allowed(Path::new("/a/README"), &c), "{spelling}");
     }
 
-    // A leading dot is stripped for extensions but must not turn some
-    // other entry into the sentinel.
     let mut only_txt = Config::default();
     only_txt.indexing.content_extensions = vec!["txt".into()];
     assert!(!content_allowed(Path::new("/a/Makefile"), &only_txt));
@@ -190,7 +179,7 @@ fn content_allowed_comments() {
     assert!(!content_allowed(Path::new("/a/b.only"), &cfg));
     assert!(!content_allowed(Path::new("/a/b.docs"), &cfg));
 
-    // Nothing but comments filters nothing — same as an empty list.
+    // Nothing but comments = same as an empty list.
     let mut all_comments = Config::default();
     all_comments.indexing.content_extensions =
         vec!["# nothing enabled yet".into(), "  ".into(), "#".into()];
@@ -198,9 +187,8 @@ fn content_allowed_comments() {
     assert!(content_allowed(Path::new("/a/Makefile"), &all_comments));
 }
 
-/// Comments, spelling and order are not part of the content filter, so
-/// editing them is no work at all — and a real change to it is never a
-/// rebuild, only a re-decision of the text already stored.
+/// Comments, spelling and order are not part of the content filter; a real
+/// change is never a rebuild, only a re-decision of the text already stored.
 #[test]
 fn comment_only_edit_is_no_work_at_all() {
     let mut old = Config::default();
@@ -217,16 +205,14 @@ fn comment_only_edit_is_no_work_at_all() {
         assert_eq!(a, ConfigActions::default(), "cosmetic edit is not a change");
     }
 
-    // Adding an extension widens the filter: files already indexed by
-    // name need their text extracted, which takes a run.
+    // Widening: files already indexed by name need a run to extract text.
     let mut widened = old.clone();
     widened.indexing.content_extensions = vec!["txt".into(), "md".into(), "(none)".into()];
     let a = diff_actions(&old, &widened);
     assert!(!a.requires_rebuild);
     assert!(a.work.reconcile_content && a.work.reindex);
 
-    // Commenting one out narrows it: the stored text goes, and nothing
-    // needs walking to make that true.
+    // Narrowing: the stored text goes, and nothing needs walking.
     let mut narrowed = old.clone();
     narrowed.indexing.content_extensions = vec!["txt".into(), "# md".into()];
     let a = diff_actions(&old, &narrowed);
@@ -234,8 +220,8 @@ fn comment_only_edit_is_no_work_at_all() {
     assert!(a.work.reconcile_content && !a.work.reindex);
 }
 
-/// An empty list means "everything allowed", so it is a superset of every
-/// other list — the case plain set arithmetic reads backwards.
+/// An empty list means "everything allowed" — a superset of every other
+/// list, the case plain set arithmetic reads backwards.
 #[test]
 fn an_empty_content_filter_is_the_widest_one() {
     let mut listed = Config::default();
@@ -262,12 +248,10 @@ fn ignore_set_component_vs_path() {
     assert!(set.matches_component(".git"));
     assert!(set.matches_component("junk.tmp"));
     assert!(!set.matches_component("git"));
-    // Full-path checks catch both kinds.
     assert!(set.matches_path(Path::new("/repo/.git/config")));
     assert!(set.matches_path(Path::new("/x/y/file.tmp")));
     assert!(set.matches_path(Path::new("/home/bob/secret")));
-    // A dir-matching path pattern ignores everything beneath it, same
-    // as the walker pruning that directory.
+    // A dir-matching path pattern ignores everything beneath it.
     assert!(set.matches_path(Path::new("/home/bob/secret/inner/deep.txt")));
     assert!(!set.matches_path(Path::new("/home/bob/public")));
     assert!(!set.matches_path(Path::new("/repo/src/main.rs")));
@@ -282,21 +266,18 @@ fn directory_patterns_with_trailing_slash() {
         "/".to_string(),         // degenerate: trims to nothing, skipped
     ])
     .unwrap();
-    // The directory itself and everything beneath it.
     assert!(set.matches_path(Path::new("/tmp")));
     assert!(set.matches_path(Path::new("/tmp/a/b/c.txt")));
     assert!(!set.matches_path(Path::new("/tmpfoo/file.txt")));
     // "cache/" behaves like the component pattern "cache".
     assert!(set.matches_path(Path::new("/home/x/cache/obj.bin")));
-    // Suffix form matches the dir at any depth.
     assert!(set.matches_path(Path::new("/repo/sub/target/debug/app")));
     // A bare "/" must not ignore the universe.
     assert!(!set.matches_path(Path::new("/etc/passwd")));
 }
 
-/// A drive-root pattern must survive the trailing-separator trim as a
-/// path pattern — trimmed to "D:" it would land in the component set,
-/// where nothing is ever named "D:".
+/// A drive-root pattern must survive the trailing-separator trim as a path
+/// pattern — trimmed to "D:" it would land in the component set.
 #[test]
 fn drive_root_patterns_are_not_component_patterns() {
     let set = IgnoreSet::compile(&[r"D:\".to_string(), "E:/".to_string()]).unwrap();
@@ -305,9 +286,6 @@ fn drive_root_patterns_are_not_component_patterns() {
     assert!(!set.matches_component("E:"));
 }
 
-/// The full drive-root behavior needs Windows path semantics:
-/// `Path::parent` only walks up to `D:\` there, and globset only folds
-/// `\` to `/` where `\` is a separator.
 #[cfg(windows)]
 #[test]
 fn drive_root_pattern_ignores_the_whole_drive() {
@@ -318,9 +296,8 @@ fn drive_root_pattern_ignores_the_whole_drive() {
     assert!(!set.matches_path(Path::new(r"E:\file.txt")));
 }
 
-/// A bare "D:" (no separator) compiles but can only match a component
-/// literally named "D:", which no file ever is. The GUI warns about
-/// this shape; the compiler intentionally leaves it alone.
+/// A bare "D:" compiles but can only match a component literally named "D:";
+/// the GUI warns about this shape, the compiler leaves it alone.
 #[test]
 fn bare_drive_letter_stays_a_component_pattern() {
     let set = IgnoreSet::compile(&["D:".to_string()]).unwrap();
@@ -343,8 +320,8 @@ fn empty_ignore_set_matches_nothing() {
     assert!(!set.matches_component("anything"));
 }
 
-/// Pattern matching must follow the filesystem's own case rules, or
-/// `node_modules` silently fails to exclude `Node_Modules` on Windows.
+/// Matching must follow the filesystem's own case rules, or `node_modules`
+/// silently fails to exclude `Node_Modules` on Windows.
 #[test]
 fn ignore_matching_follows_platform_case_rules() {
     let set = IgnoreSet::compile(&["node_modules".to_string()]).unwrap();
@@ -361,9 +338,8 @@ fn ignore_matching_follows_platform_case_rules() {
     );
 }
 
-/// Which patterns take the fast path, and that taking it changes nothing
-/// observable. A plain name is matched whole — never as a prefix, a
-/// substring or a wildcard — and only its case is allowed to vary.
+/// Which patterns take the literal fast path, and that taking it changes
+/// nothing observable.
 #[test]
 fn the_literal_fast_path_matches_whole_names_only() {
     let literal = IgnoreSet::compile(&["node_modules".to_string()]).unwrap();
@@ -407,8 +383,7 @@ fn the_literal_fast_path_matches_whole_names_only() {
     }
 }
 
-/// A non-ASCII pattern keeps globset's Unicode folding rather than being
-/// silently downgraded to the ASCII fast path.
+/// A non-ASCII pattern must not be downgraded to the ASCII fast path.
 #[test]
 fn non_ascii_patterns_stay_on_the_glob_path() {
     let set = IgnoreSet::compile(&["café".to_string()]).unwrap();
@@ -420,8 +395,7 @@ fn non_ascii_patterns_stay_on_the_glob_path() {
     assert!(!set.matches_component("cafe"));
 }
 
-/// Names longer than the stack fold buffer take the heap path, and must
-/// come back with the same answer.
+/// Names longer than the stack fold buffer take the heap path.
 #[test]
 fn overlong_names_still_fold_correctly() {
     let long = "a".repeat(FOLD_BUF + 10);
@@ -434,9 +408,8 @@ fn overlong_names_still_fold_correctly() {
     assert!(!set.matches_component(&"a".repeat(FOLD_BUF + 9)));
 }
 
-/// Watcher events are matched by whole path, and the literal patterns have
-/// to be visible on that route too — otherwise the watcher indexes exactly
-/// what the walker prunes and the index churns every cycle.
+/// Literal patterns must be visible on the whole-path route too — otherwise
+/// the watcher indexes exactly what the walker prunes.
 #[test]
 fn full_path_matching_sees_literal_component_patterns() {
     let set = IgnoreSet::compile(&["node_modules".to_string()]).unwrap();
@@ -451,13 +424,9 @@ fn default_ignore_patterns_cover_the_platform() {
         assert!(d.iter().any(|p| p == shared), "missing {}", shared);
     }
 
-    // `$RECYCLE.BIN` holds deleted files; indexing it would surface their
-    // contents in search results.
     let recycle = d.iter().any(|p| p == "$RECYCLE.BIN");
     assert_eq!(recycle, cfg!(windows), "Windows-only exclusions");
 
-    // Whatever the platform, the defaults must actually compile — a
-    // pattern like `$RECYCLE.BIN` going through globset is the risk.
     let set = IgnoreSet::compile(&d).expect("default patterns compile");
     assert!(!set.is_empty());
     if cfg!(windows) {
@@ -470,22 +439,17 @@ fn default_ignore_patterns_cover_the_platform() {
 
 #[test]
 fn nested_roots_matrix() {
-    // Straight nesting (paths don't exist → compared as spelled).
     assert_eq!(
         nested_roots(&["/qs-x/b".into(), "/qs-x/b/c".into()]),
         vec![("/qs-x/b/c".to_string(), "/qs-x/b".to_string())]
     );
     // Component boundary: /a/bc is NOT under /a/b.
     assert!(nested_roots(&["/qs-x/b".into(), "/qs-x/bc".into()]).is_empty());
-    // Disjoint roots.
     assert!(nested_roots(&["/qs-x/b".into(), "/qs-x/c".into()]).is_empty());
-    // Exact duplicates flag once.
     assert_eq!(nested_roots(&["/qs-x".into(), "/qs-x".into()]).len(), 1);
-    // Empty and singleton lists are fine.
     assert!(nested_roots(&[]).is_empty());
     assert!(nested_roots(&["/qs-x".into()]).is_empty());
-    // Symlinked spellings of the same real directory are caught via
-    // canonicalization.
+    // Symlinked spellings of the same real directory are caught.
     #[cfg(unix)]
     {
         let dir = tmp_dir();
@@ -498,7 +462,6 @@ fn nested_roots_matrix() {
             link.to_string_lossy().into_owned(),
         ]);
         assert_eq!(pairs.len(), 1, "alias of the same dir counts as duplicate");
-        fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -513,7 +476,6 @@ fn removed_precount_key_still_parses() {
     .unwrap();
     let cfg = Config::load_from(&path).unwrap();
     assert_eq!(cfg.processing.batch_size, 42, "known keys still load");
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -534,13 +496,11 @@ fn root_workers_round_trip() {
         None,
         "absent = auto"
     );
-    fs::remove_dir_all(&dir).ok();
 }
 
 /// Only three settings may wipe the index: the FTS tokenizer, the hash
-/// length and the encryption key. Anything else that reaches
-/// `requires_rebuild` is a bug — it costs the user everything the index
-/// took hours to learn.
+/// length and the encryption key. Anything else reaching `requires_rebuild`
+/// is a bug.
 #[test]
 fn only_unreadable_data_forces_a_rebuild() {
     let base = Config::default();
@@ -564,8 +524,7 @@ fn only_unreadable_data_forces_a_rebuild() {
         );
     }
 
-    // The keychain only decides where the key is remembered, not what the
-    // file was written with.
+    // The keychain only decides where the key is remembered.
     let mut keychain = base.clone();
     keychain.security.use_keychain = true;
     assert_eq!(diff_actions(&base, &keychain), ConfigActions::default());
@@ -592,8 +551,7 @@ fn diff_actions_matrix() {
 
     assert_eq!(diff_actions(&base, &base.clone()), ConfigActions::default());
 
-    // Removing a root: its rows are deleted by range, and no walk is
-    // needed to establish that they should go.
+    // Removing a root: rows deleted by range, no walk needed.
     let mut c = base.clone();
     c.paths.indexing_paths = vec![kept.clone()];
     let a = diff_actions(&base, &c);
@@ -646,9 +604,7 @@ fn diff_actions_matrix() {
         );
     }
 
-    // Symlinks take their own route: with links on, a target inside a root
-    // is stored under exactly the path a direct walk would produce, so
-    // nothing in scope changes. What turning them off strands is the rows
+    // Symlinks take their own route: turning them off strands the rows
     // *outside* every root, which no per-root scan would ever revisit.
     let mut no_links = base.clone();
     no_links.indexing.follow_symlinks = false;
@@ -664,8 +620,7 @@ fn diff_actions_matrix() {
         "turning links on only adds"
     );
 
-    // Stored text: turning it on means re-extracting, turning it off means
-    // throwing the blobs away — never a rebuild either way.
+    // Stored text: on = re-extract, off = drop the blobs; never a rebuild.
     let mut off = base.clone();
     off.processing.store_text_for_snippets = false;
     let mut on = base.clone();
@@ -691,13 +646,10 @@ fn diff_actions_matrix() {
         ConfigActions::default(),
         "soft knobs are not index work"
     );
-
-    fs::remove_dir_all(&dir).ok();
 }
 
 /// A second edit landing while the first is still being applied must not
-/// lose the first's work: the two plans are computed against different
-/// configurations, so neither knows what the other left undone.
+/// lose the first's work.
 #[test]
 fn merging_two_plans_loses_nothing() {
     let first = IndexWork {
@@ -723,8 +675,8 @@ fn merging_two_plans_loses_nothing() {
     assert!(merged.prune_scope && merged.drop_text);
     assert!(merged.reconcile_content && merged.reindex);
 
-    // Merging an empty plan changes nothing, and merging a plan into
-    // itself is the identity — both are what make a restart safe.
+    // Empty merge is a no-op and self-merge is the identity — both are what
+    // make a restart safe.
     let mut untouched = first.clone();
     untouched.merge_from(&IndexWork::default());
     assert_eq!(untouched, first);
@@ -732,8 +684,7 @@ fn merging_two_plans_loses_nothing() {
     assert_eq!(untouched, first);
 }
 
-/// Order and spelling are not configuration: a reordered list or a
-/// re-spelled root must not cost the index anything.
+/// Order and spelling are not configuration.
 #[test]
 fn respelling_a_list_is_not_a_change() {
     let dir = tmp_dir();
@@ -754,8 +705,7 @@ fn respelling_a_list_is_not_a_change() {
     reordered.indexing.ignore_patterns.reverse();
     assert_eq!(diff_actions(&base, &reordered), ConfigActions::default());
 
-    // A trailing separator, a `.` hop and a duplicate entry all name the
-    // same two roots.
+    // A trailing separator, a `.` hop and a duplicate all name the same roots.
     let mut respelled = base.clone();
     respelled.paths.indexing_paths = vec![
         format!("{}{}", a_dir.to_string_lossy(), std::path::MAIN_SEPARATOR),
@@ -764,13 +714,10 @@ fn respelling_a_list_is_not_a_change() {
     ];
     assert_eq!(diff_actions(&base, &respelled), ConfigActions::default());
 
-    // Whitespace around an ignore pattern is trimmed before it compiles,
-    // so it cannot be a change either.
+    // Whitespace around an ignore pattern is trimmed before it compiles.
     let mut padded = base.clone();
     padded.indexing.ignore_patterns = vec!["  node_modules ".into(), "*.tmp".into()];
     assert_eq!(diff_actions(&base, &padded), ConfigActions::default());
-
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -778,15 +725,13 @@ fn security_config_round_trips_and_salt_is_omitted_when_none() {
     let dir = tmp_dir();
     let path = dir.join("config.toml");
 
-    // Defaults: protection off, no salt — and crucially the file must
-    // not contain an invented salt value.
+    // Crucially, the file must not contain an invented salt value.
     let cfg = Config::load_from(&path).unwrap();
     assert!(!cfg.security.password_protected);
     assert_eq!(cfg.security.salt, None);
     let text = fs::read_to_string(&path).unwrap();
     assert!(!text.contains("salt"), "no default salt may be written");
 
-    // With a salt set, it round-trips exactly.
     let mut cfg = cfg;
     cfg.security.password_protected = true;
     cfg.security.salt = Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string());
@@ -794,7 +739,6 @@ fn security_config_round_trips_and_salt_is_omitted_when_none() {
     cfg.save().unwrap();
     let reloaded = Config::load_from(&path).unwrap();
     assert_eq!(reloaded.security, cfg.security);
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -804,12 +748,10 @@ fn absent_security_section_is_default() {
     fs::write(&path, "[paths]\ndatabase_path = \"x.sqlite\"\n").unwrap();
     let cfg = Config::load_from(&path).unwrap();
     assert_eq!(cfg.security, SecurityConfig::default());
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn salt_bytes_validates_hostile_configs() {
-    // Protected but no salt: hard error, nothing invented.
     let mut sec = SecurityConfig {
         password_protected: true,
         salt: None,
@@ -817,8 +759,7 @@ fn salt_bytes_validates_hostile_configs() {
     };
     assert!(sec.salt_bytes().is_err());
 
-    // Hand-crafted hostile values: truncated, oversized, non-hex,
-    // embedded whitespace/quotes. All rejected.
+    // Truncated, oversized, non-hex, embedded whitespace/quotes.
     for bad in [
         "",
         "abcd",
@@ -832,94 +773,87 @@ fn salt_bytes_validates_hostile_configs() {
         assert!(sec.salt_bytes().is_err(), "must reject salt {:?}", bad);
     }
 
-    // A valid salt decodes, upper- or lowercase.
     sec.salt = Some("0F1E2D3C4B5A69788796A5B4C3D2E1F0".to_string());
     assert!(sec.salt_bytes().is_ok());
 }
 
-/// Dismissing the watch-cap warning must not trigger a rebuild or a
-/// watcher restart — it is pure UI bookkeeping, and restarting the
-/// watcher would re-trip the very warning being dismissed.
+/// Pure UI bookkeeping must never cost a rebuild or a watcher restart —
+/// restarting the watcher would re-trip the very warning being dismissed.
 #[test]
-fn watch_cap_warned_roots_is_a_soft_knob() {
+fn ui_bookkeeping_fields_are_soft_knobs() {
     let base = Config::default();
-    let mut c = base.clone();
-    c.ui.watch_cap_warned_roots = vec!["/media/ApolloStore".to_string()];
-    assert_eq!(diff_actions(&base, &c), ConfigActions::default());
+    // Named so the closures below coerce to fn pointers and share one array
+    // type; without an annotation each would be its own anonymous type.
+    type Knob = (&'static str, fn(&mut Config));
+    let cases: [Knob; 4] = [
+        ("watch_cap_warned_roots", |c| {
+            c.ui.watch_cap_warned_roots = vec!["/media/ApolloStore".to_string()]
+        }),
+        ("color_scheme", |c| c.ui.color_scheme = "light".to_string()),
+        // The duplicates filters decide what one tab lists and nothing else:
+        // a file left out of that listing is still indexed and still found.
+        ("duplicates.exclude_patterns", |c| {
+            c.duplicates.exclude_patterns = vec!["*.iso".to_string()]
+        }),
+        ("duplicates.hidden_groups", |c| {
+            c.duplicates.hidden_groups = vec!["ab".repeat(32)]
+        }),
+    ];
+    for (label, mutate) in cases {
+        let mut c = base.clone();
+        mutate(&mut c);
+        assert_eq!(diff_actions(&base, &c), ConfigActions::default(), "{label}");
+    }
 }
 
+/// Newer fields round-trip and default correctly in configs written before
+/// they existed; existing keys keep parsing either way.
 #[test]
-fn watch_cap_warned_roots_round_trips() {
+fn newer_fields_round_trip_and_default_when_absent() {
     let dir = tmp_dir();
     let path = dir.join("config.toml");
+
     let mut cfg = Config {
         source: Some(path.clone()),
         ..Config::default()
     };
     cfg.ui.watch_cap_warned_roots =
         vec!["/media/ApolloStore".to_string(), "/media/GSSD".to_string()];
+    cfg.ui.color_scheme = "light".to_string();
+    cfg.search.fuzzy_max_edits = 4;
+    cfg.duplicates.exclude_patterns = vec!["*.iso".to_string()];
+    cfg.duplicates.hidden_groups = vec!["ab".repeat(32)];
     cfg.save().unwrap();
-
     let loaded = Config::load_from(&path).unwrap();
     assert_eq!(
         loaded.ui.watch_cap_warned_roots,
         vec!["/media/ApolloStore".to_string(), "/media/GSSD".to_string()]
     );
-    fs::remove_dir_all(&dir).ok();
-}
+    assert_eq!(loaded.ui.color_scheme, "light");
+    assert_eq!(loaded.search.fuzzy_max_edits, 4);
+    assert_eq!(loaded.duplicates, cfg.duplicates);
 
-/// Configs written before this field existed must still load.
-#[test]
-fn config_without_watch_cap_warned_roots_parses() {
-    let dir = tmp_dir();
-    let path = dir.join("config.toml");
+    assert_eq!(Config::default().ui.color_scheme, "dark");
     fs::write(
         &path,
-        "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n[ui]\nscale=1.25\n",
+        "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n\
+         [ui]\nscale=1.25\n[search]\nfuzzy_default=true\ndisplay_limit=250\n",
     )
     .unwrap();
-
     let cfg = Config::load_from(&path).unwrap();
     assert!(cfg.ui.watch_cap_warned_roots.is_empty());
+    assert_eq!(
+        cfg.duplicates,
+        DuplicatesConfig::default(),
+        "a config predating the duplicates filters must not arrive with any"
+    );
+    assert_eq!(cfg.ui.color_scheme, "dark");
+    assert_eq!(cfg.search.fuzzy_max_edits, 2);
     assert_eq!(cfg.ui.scale, 1.25, "existing ui keys still parse");
-    fs::remove_dir_all(&dir).ok();
-}
+    assert!(cfg.search.fuzzy_default, "existing search keys still parse");
+    assert_eq!(cfg.search.display_limit, 250);
 
-/// Which theme the window uses is nobody's business but the window's: it
-/// must never cost a reindex or a watcher restart.
-#[test]
-fn color_scheme_is_a_soft_knob() {
-    let base = Config::default();
-    let mut c = base.clone();
-    c.ui.color_scheme = "light".to_string();
-    assert_eq!(diff_actions(&base, &c), ConfigActions::default());
-}
-
-#[test]
-fn color_scheme_round_trips_and_defaults_to_dark() {
-    let dir = tmp_dir();
-    let path = dir.join("config.toml");
-    assert_eq!(Config::default().ui.color_scheme, "dark");
-
-    let mut cfg = Config {
-        source: Some(path.clone()),
-        ..Config::default()
-    };
-    cfg.ui.color_scheme = "light".to_string();
-    cfg.save().unwrap();
-    assert_eq!(Config::load_from(&path).unwrap().ui.color_scheme, "light");
-
-    // A config written before the setting existed keeps the appearance it
-    // had, which was dark.
-    fs::write(
-        &path,
-        "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n[ui]\nscale=1.25\n",
-    )
-    .unwrap();
-    assert_eq!(Config::load_from(&path).unwrap().ui.color_scheme, "dark");
-
-    // A value nobody recognises is not a broken config file: the whole
-    // point of storing it as a string is that the app still starts.
+    // A value nobody recognises is not a broken config file.
     fs::write(
         &path,
         "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n\
@@ -927,42 +861,6 @@ fn color_scheme_round_trips_and_defaults_to_dark() {
     )
     .unwrap();
     assert_eq!(Config::load_from(&path).unwrap().ui.color_scheme, "drak");
-    fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn fuzzy_max_edits_round_trips() {
-    let dir = tmp_dir();
-    let path = dir.join("config.toml");
-    let mut cfg = Config {
-        source: Some(path.clone()),
-        ..Config::default()
-    };
-    cfg.search.fuzzy_max_edits = 4;
-    cfg.save().unwrap();
-
-    let loaded = Config::load_from(&path).unwrap();
-    assert_eq!(loaded.search.fuzzy_max_edits, 4);
-    fs::remove_dir_all(&dir).ok();
-}
-
-/// Configs written before this field existed keep the historic budget.
-#[test]
-fn config_without_fuzzy_max_edits_defaults_to_two() {
-    let dir = tmp_dir();
-    let path = dir.join("config.toml");
-    fs::write(
-        &path,
-        "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n\
-         [search]\nfuzzy_default=true\ndisplay_limit=250\n",
-    )
-    .unwrap();
-
-    let cfg = Config::load_from(&path).unwrap();
-    assert_eq!(cfg.search.fuzzy_max_edits, 2);
-    assert!(cfg.search.fuzzy_default, "existing search keys still parse");
-    assert_eq!(cfg.search.display_limit, 250);
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -986,10 +884,9 @@ fn fuzzy_edits_warning_only_above_the_threshold() {
     }
 }
 
-/// `config_example.toml` is the documentation for every setting, so a key
-/// renamed in the struct and not here would silently ship a config file that
-/// does nothing. Parsing it also proves the `[search.columns]` sub-table is
-/// spelled the way serde expects.
+/// `config_example.toml` is the documentation for every setting: a key
+/// renamed in the struct and not here would silently ship a config file
+/// that does nothing.
 #[test]
 fn the_documented_example_config_parses_to_the_defaults() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -999,22 +896,19 @@ fn the_documented_example_config_parses_to_the_defaults() {
     let text = std::fs::read_to_string(&path).expect("readable");
     let parsed: Config = toml::from_str(&text).expect("config_example.toml parses");
 
-    // The example documents the shipped defaults for everything that has one
-    // that does not depend on the machine (paths and the hotkey do).
     let d = Config::default();
     assert_eq!(
         parsed.search, d.search,
         "[search] drifted from the defaults"
     );
     assert_eq!(parsed.processing, d.processing);
+    assert_eq!(parsed.duplicates, d.duplicates);
     assert_eq!(parsed.ui.scale, d.ui.scale);
     assert_eq!(parsed.ui.color_scheme, d.ui.color_scheme);
     assert_eq!(parsed.ui.tutorial_seen, Some(false));
 }
 
-/// The tour is offered to an installation this version created, and to no
-/// other. A config written before the key existed reads as `None`, which is
-/// how "already found their way around" is distinguished from "brand new".
+/// The tour is offered to an installation this version created, and no other.
 #[test]
 fn only_a_freshly_written_config_asks_for_the_tour() {
     assert_eq!(UiConfig::default().tutorial_seen, Some(false));
@@ -1029,7 +923,6 @@ fn only_a_freshly_written_config_asks_for_the_tour() {
     assert_eq!(dismissed.ui.tutorial_seen, Some(true));
 }
 
-/// Size and modified cost more width than they earn for most searches.
 #[test]
 fn the_search_table_ships_without_size_or_modified() {
     let cols = ColumnsConfig::default();
@@ -1037,9 +930,110 @@ fn the_search_table_ships_without_size_or_modified() {
     assert!(!cols.size, "the size column is on by default");
     assert!(!cols.modified, "the modified column is on by default");
 
-    // A `[search]` block written before the picker existed still gets them.
     let older: Config = toml::from_str("[search]\ndisplay_limit = 500\n").expect("parses");
     assert_eq!(older.search.columns, cols);
     assert_eq!(older.search.display_limit, 500);
     assert!(older.search.live_results, "live results default to on");
+}
+
+/// The guard consulted before opening a path that came from a `files` row —
+/// see [`crate::file_handling::index_file_set`] for what opening one costs.
+#[test]
+fn the_index_and_every_sidecar_are_recognised() {
+    let mut c = Config::default();
+    c.paths.database_path = "/var/lib/qs/index.sqlite".to_string();
+
+    for name in [
+        "index.sqlite",
+        "index.sqlite-wal",
+        "index.sqlite-shm",
+        "index.sqlite-journal",
+        "index.sqlite.lock",
+    ] {
+        let p = PathBuf::from(format!("/var/lib/qs/{}", name));
+        assert!(c.is_index_file(&p), "{} should be recognised", name);
+    }
+
+    for p in [
+        "/var/lib/qs/index.sqlite-walrus",
+        "/var/lib/qs/notes-wal",
+        "/var/lib/qs/index.sqlite2",
+        "/var/lib/other/index.sqlite-wal",
+        "/var/lib/qs/sub/index.sqlite",
+    ] {
+        assert!(
+            !c.is_index_file(Path::new(p)),
+            "{} is not part of the index",
+            p
+        );
+    }
+}
+
+#[test]
+fn a_tilde_database_path_still_matches_the_real_file() {
+    let Some(home) = crate::platform::home_dir() else {
+        return;
+    };
+    let mut c = Config::default();
+    c.paths.database_path = "~/.local/share/quicksearch/index.sqlite".to_string();
+
+    let absolute = PathBuf::from(home).join(".local/share/quicksearch/index.sqlite");
+    assert!(c.is_index_file(&absolute));
+    let wal = absolute.with_file_name("index.sqlite-wal");
+    assert!(c.is_index_file(&wal));
+    assert!(!c.is_index_file(&absolute.with_file_name("other.sqlite")));
+}
+
+/// `display_limit = 0` would make *every* search return nothing; a
+/// hand-editable file must not be able to do that.
+#[test]
+fn out_of_range_numbers_are_clamped_not_rejected() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
+    fs::write(
+        &path,
+        "[search]\ndisplay_limit=0\n\
+         [processing]\nmaximum_text_file_size=0\nhash_length=8\nwriter_turn_slice_ms=18446744073709551615\n",
+    )
+    .unwrap();
+    let cfg = Config::load_from(&path).expect("a bad number must not stop the app starting");
+    assert_eq!(cfg.search.display_limit, 1);
+    assert_eq!(cfg.processing.maximum_text_file_size, 1);
+    assert_eq!(cfg.processing.hash_length, 262);
+    assert_eq!(cfg.processing.writer_turn_slice_ms, 10_000);
+}
+
+/// The clamp must be silent about values that are merely unusual, or
+/// `hash_length` would read as changed and force a rebuild on every start.
+#[test]
+fn in_range_numbers_are_left_exactly_alone() {
+    let mut cfg = Config::default();
+    let before = cfg.clone();
+    let warnings = cfg.clamp_out_of_range();
+    assert!(warnings.is_empty(), "defaults must not warn: {warnings:?}");
+    assert_eq!(cfg.search.display_limit, before.search.display_limit);
+    assert_eq!(cfg.processing.hash_length, before.processing.hash_length);
+    assert_eq!(
+        cfg.processing.maximum_text_file_size,
+        before.processing.maximum_text_file_size
+    );
+    assert_eq!(
+        cfg.processing.writer_turn_slice_ms,
+        before.processing.writer_turn_slice_ms
+    );
+
+    // Zero is a legal turn slice — one quantum per turn.
+    cfg.processing.writer_turn_slice_ms = 0;
+    assert!(cfg.clamp_out_of_range().is_empty());
+    assert_eq!(cfg.processing.writer_turn_slice_ms, 0);
+}
+
+#[test]
+fn a_clamped_field_is_named_in_its_warning() {
+    let mut cfg = Config::default();
+    cfg.search.display_limit = 0;
+    let warnings = cfg.clamp_out_of_range();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("display_limit"), "{warnings:?}");
+    assert!(warnings[0].contains('1'), "{warnings:?}");
 }

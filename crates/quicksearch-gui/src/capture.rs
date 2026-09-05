@@ -1,18 +1,10 @@
-//! Scripted self-capture (feature `capture`): the app drives itself through
-//! a scenario so `packaging/capture.sh` can regenerate the website
-//! screenshots and screencasts as the software changes.
+//! Scripted self-capture (feature `capture`): with `QS_CAPTURE_SCRIPT` set,
+//! a [`CaptureDriver`] drives the app one command per frame so
+//! `packaging/capture.sh` can regenerate screenshots and screencasts.
 //!
-//! With `QS_CAPTURE_SCRIPT` set, a [`CaptureDriver`] runs one command at a
-//! time: keystrokes are injected as real `egui::Event::Text` input, tabs
-//! switch through the same pending-nav route a click takes, waits watch
-//! live indexer/search/duplicates state, and screenshots and video frames
-//! are read back from the GL framebuffer via `ViewportCommand::Screenshot`.
-//!
-//! Captures come from inside the app: screen-grabbing depends on the
-//! display server — black frames from a rootless XWayland, portals on
-//! Wayland proper, whatever overlaps the window — while the framebuffer
-//! readback works identically on X11, Wayland and Windows and sees nothing
-//! but the app. The scenario grammar and command list live in [`script`].
+//! Captures come from inside the app via framebuffer readback: screen
+//! grabbing depends on the display server; readback works identically
+//! everywhere and sees nothing but the app. Grammar lives in [`script`].
 //!
 //! Exit codes, for the orchestrator: 2 script parse error, 3 wait timeout,
 //! 4 screenshot/recording I/O failure.
@@ -32,7 +24,6 @@ use script::{parse_script, Cmd};
 
 // --- Driver ---
 
-/// In-flight keystroke injection for one `type` command.
 struct Typing {
     chars: std::vec::IntoIter<char>,
     /// Nominal seconds per keystroke; each interval is jittered ±25%.
@@ -41,19 +32,15 @@ struct Typing {
     typed: u64,
 }
 
-/// Recording frame rate. Readback requests are paced to this, and
-/// [`CaptureDriver::feed_frame`] duplicates or drops frames so the encoded
-/// timeline tracks wall time even when frames arrive unevenly.
+/// Recording frame rate.
 const RECORD_FPS: u32 = 30;
 
 /// A recording in progress: paced framebuffer readbacks piped to ffmpeg.
 struct Recorder {
     path: PathBuf,
-    /// Nominal time per frame (1 / [`RECORD_FPS`]).
     interval: Duration,
-    /// When to ask for the next framebuffer readback.
     next_request: Instant,
-    /// Spawned when the first frame arrives — only then are the exact pixel
+    /// Spawned when the first frame arrives — only then are the pixel
     /// dimensions known, and ffmpeg needs them up front for raw video.
     encoder: Option<Encoder>,
 }
@@ -61,7 +48,6 @@ struct Recorder {
 struct Encoder {
     child: Child,
     size: [usize; 2],
-    /// When the first frame arrived; the video's t = 0.
     started: Instant,
     frames_written: u64,
 }
@@ -74,24 +60,19 @@ struct FrameTag;
 
 pub(crate) struct CaptureDriver {
     cmds: Vec<Cmd>,
-    /// Index of the command currently executing.
     pc: usize,
-    /// When `cmds[pc]`'s one-shot enter action ran; `None` before it has.
     cmd_started: Option<Instant>,
     typing: Option<Typing>,
-    /// Screenshot in flight: requested, PNG not yet written.
     shot: Option<PathBuf>,
     rec: Option<Recorder>,
-    /// Content Match cell row the pointer is pinned to (`hover_match`), and the
-    /// on-screen position it resolved to on the last rendered frame.
+    /// Content Match cell row the pointer is pinned to, and where it
+    /// resolved to on the last rendered frame.
     hover: Option<usize>,
     hover_pos: Option<egui::Pos2>,
-    /// The position last injected. Kept separate from `hover_pos` because
+    /// The position last injected — separate from `hover_pos` because
     /// injection must be edge-triggered: egui resets its pointer-stillness
-    /// clock on *every* `PointerMoved` event, moved or not, and tooltips
-    /// only appear once that clock outlives the tooltip delay.
+    /// clock on *every* `PointerMoved` event, moved or not.
     hover_injected: Option<egui::Pos2>,
-    /// One-shot `Event::PointerGone` injection, armed by `hover_off`.
     pointer_gone_pending: bool,
     out_dir: PathBuf,
     /// Set by `quit`; the app drops the driver once it is.
@@ -99,8 +80,6 @@ pub(crate) struct CaptureDriver {
 }
 
 impl CaptureDriver {
-    /// `None` unless `QS_CAPTURE_SCRIPT` names a scenario. A script that
-    /// cannot be read or parsed exits immediately.
     pub(crate) fn from_env() -> Option<Box<CaptureDriver>> {
         let script = std::env::var_os("QS_CAPTURE_SCRIPT")?;
         let src = match std::fs::read_to_string(&script) {
@@ -149,19 +128,15 @@ impl CaptureDriver {
         }))
     }
 
-    /// Advance the script by at most one command per frame. Runs at the top
-    /// of `update()`, so a command's effect is on screen before the next
-    /// command starts.
+    /// At most one command per frame, at the top of `update()`, so a
+    /// command's effect is on screen before the next starts.
     pub(crate) fn tick(&mut self, app: &mut QuickSearchApp, ctx: &egui::Context) {
         if self.finished {
             return;
         }
-        // The app repaints on demand when idle; the driver needs frames to
-        // keep its own clock ticking and recorded footage smooth.
+        // The idle app repaints on demand; the driver needs steady frames.
         ctx.request_repaint_after(Duration::from_millis(15));
 
-        // Pump the recording: one framebuffer readback per frame interval,
-        // harvested in `on_raw_input` a frame later.
         if let Some(rec) = self.rec.as_mut() {
             let now = Instant::now();
             if now >= rec.next_request {
@@ -172,9 +147,7 @@ impl CaptureDriver {
             }
         }
 
-        // Resolve the pinned hover against what the last frame rendered:
-        // rows can move while results stream, and the tooltip should track
-        // the cell, not a stale point.
+        // Rows can move while results stream; track the cell, not a stale point.
         if let Some(n) = self.hover {
             self.hover_pos = app.capture_match_cell(n).map(|r| r.center());
         }
@@ -212,7 +185,6 @@ impl CaptureDriver {
         }
     }
 
-    /// One-shot action when a command starts.
     fn enter(&mut self, cmd: &Cmd, app: &mut QuickSearchApp, ctx: &egui::Context) {
         match cmd {
             Cmd::WaitMs(_)
@@ -243,11 +215,9 @@ impl CaptureDriver {
                 self.pointer_gone_pending = true;
             }
             Cmd::Window { w, h } => {
-                // ViewportCommand sizes are in egui points, which fold in
-                // the UI zoom — divide it back out. The app's own 640x400
-                // floor must be lowered first for compact clip sizes to take
-                // effect, and the resize lands asynchronously (the window
-                // manager has the last word).
+                // ViewportCommand sizes are in egui points, which fold in the
+                // UI zoom — divide it back out. The 640x400 floor must be
+                // lowered first; the resize lands asynchronously.
                 let size = egui::vec2(*w, *h) / ctx.zoom_factor();
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
@@ -274,16 +244,14 @@ impl CaptureDriver {
         }
     }
 
-    /// Whether the current command has finished. Wait conditions treat a
-    /// `max` cap as "done anyway": the caps exist to bound clip length and to
-    /// tolerate a state change that happened before the wait began.
+    /// Wait conditions treat a `max` cap as "done anyway": the caps bound
+    /// clip length and tolerate a state change from before the wait began.
     fn done(&self, cmd: &Cmd, app: &QuickSearchApp, elapsed: Duration) -> bool {
         let capped =
             |max_ms: &Option<u64>| max_ms.is_some_and(|ms| elapsed >= Duration::from_millis(ms));
         match cmd {
             Cmd::WaitMs(ms) => elapsed >= Duration::from_millis(*ms),
             Cmd::Type { .. } => self.typing.is_none(),
-            // Done once the cell exists on screen and the pointer is on it.
             Cmd::HoverMatch(_) => self.hover_pos.is_some(),
             Cmd::ClearQuery
             | Cmd::FocusSearch
@@ -318,17 +286,15 @@ impl CaptureDriver {
 
     fn quit(&mut self, app: &mut QuickSearchApp, ctx: &egui::Context) {
         self.stop_recorder();
-        // Answer the close guards up front: a still-running reconcile's
-        // modal would otherwise hold the window open until the run timed out.
+        // Answer the close guards up front, or a reconcile modal would hold
+        // the window open until the run timed out.
         app.capture_confirm_quit();
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         self.finished = true;
     }
 
-    /// Runs in `raw_input_hook`, before egui processes this frame's input:
-    /// due keystrokes are appended as `Event::Text` (landing in the focused
-    /// search box exactly as real typing would), and a finished screenshot is
-    /// harvested from the incoming events and written out.
+    /// Runs in `raw_input_hook`: due keystrokes are appended as `Event::Text`
+    /// and finished screenshots are harvested from the incoming events.
     pub(crate) fn on_raw_input(&mut self, raw: &mut egui::RawInput) {
         let mut drained = false;
         if let Some(t) = self.typing.as_mut() {
@@ -353,12 +319,9 @@ impl CaptureDriver {
             raw.events.push(egui::Event::PointerGone);
         }
         if let Some(pos) = self.hover_pos {
-            // Edge-triggered on purpose: egui resets its pointer-stillness
-            // clock on every `PointerMoved` event even at an unchanged
-            // position, and the tooltip appears only after that clock
-            // outlives the tooltip delay. Inject when the pin moves — or
-            // after a real OS pointer event, which would otherwise unpin us
-            // (appending after it means the pin wins the frame).
+            // Edge-triggered (see `hover_injected`): inject when the pin
+            // moves, or after a real OS pointer event, which would otherwise
+            // unpin us — appending after it means the pin wins the frame.
             let foreign_pointer = raw.events.iter().any(|e| {
                 matches!(
                     e,
@@ -373,8 +336,6 @@ impl CaptureDriver {
             }
         }
 
-        // One pass over the incoming events harvests both kinds of
-        // framebuffer readback: recording frames and still screenshots.
         for event in &raw.events {
             let egui::Event::Screenshot {
                 user_data, image, ..
@@ -403,11 +364,9 @@ impl CaptureDriver {
 
     // -- recording ----------------------------------------------------------
 
-    /// Append one readback to the recording, spawning the encoder on the
-    /// first frame (which fixes the dimensions). The frame is written as many
-    /// times as whole intervals have elapsed since the recording began —
-    /// duplicated to catch up after a slow frame, dropped when readbacks
-    /// outpace [`RECORD_FPS`] — so the video's length tracks wall time.
+    /// Append one readback, spawning the encoder on the first frame. The
+    /// frame is written as many times as whole intervals have elapsed, so
+    /// the video's length tracks wall time.
     fn feed_frame(&mut self, image: &egui::ColorImage) -> Result<(), String> {
         let Some(rec) = self.rec.as_mut() else {
             return Ok(()); // stopped while this readback was in flight
@@ -443,8 +402,7 @@ impl CaptureDriver {
         Ok(())
     }
 
-    /// Close the encoder's stdin — end-of-input, on which ffmpeg encodes the
-    /// tail and exits — then wait, with a kill as backstop.
+    /// Close stdin (ffmpeg encodes the tail and exits), wait, kill as backstop.
     fn stop_recorder(&mut self) {
         let Some(rec) = self.rec.take() else {
             return;
@@ -484,11 +442,9 @@ impl CaptureDriver {
     }
 }
 
-/// ffmpeg encoding raw RGBA frames from stdin into a *lossless* intermediate;
-/// `capture.sh` transcodes to VP9 afterwards. Realtime VP9 at capture quality
-/// drops frames, while `libx264rgb -qp 0 -preset ultrafast` is cheap, keeps
-/// text crisp (no chroma subsampling at capture time), and mkv survives an
-/// unclean stop.
+/// ffmpeg encoding raw RGBA into a *lossless* intermediate; `capture.sh`
+/// transcodes to VP9 afterwards. Realtime VP9 drops frames; `libx264rgb -qp 0`
+/// is cheap, keeps text crisp, and mkv survives an unclean stop.
 fn spawn_encoder(path: &Path, size: [usize; 2]) -> Result<Child, String> {
     Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-y"])
@@ -514,8 +470,6 @@ fn spawn_encoder(path: &Path, size: [usize; 2]) -> Result<Child, String> {
         .map_err(|e| format!("failed to spawn ffmpeg: {e}"))
 }
 
-/// Deterministic per-keystroke pacing factor in [0.75, 1.25] — human enough
-/// on video, identical on every run, and no rand dependency.
 fn jitter(keystroke: u64) -> f32 {
     let mut x = keystroke
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -526,12 +480,9 @@ fn jitter(keystroke: u64) -> f32 {
     0.75 + (x % 1000) as f32 / 1000.0 * 0.5
 }
 
-/// Ceiling after which a wait without `max` aborts the run: generous enough
-/// for a full index of the demo tree, small enough that a wedged run fails
-/// instead of hanging the orchestrator.
+/// Abort ceiling for waits without `max`, so a wedged run fails instead of hanging.
 fn hard_timeout_ms(cmd: &Cmd) -> u64 {
     match cmd {
-        // Always finish on their own; the bound is just a backstop.
         Cmd::WaitMs(ms) => ms + 60_000,
         Cmd::Type { text, cps } => (text.chars().count() as f32 / cps * 1000.0) as u64 + 30_000,
         Cmd::ClearQuery
@@ -552,9 +503,6 @@ fn hard_timeout_ms(cmd: &Cmd) -> u64 {
     }
 }
 
-/// The GL framebuffer is opaque, so premultiplied and straight alpha agree
-/// and the pixels can be reused as-is. eframe's icon helper brings the PNG
-/// encoder — no extra dependency.
 fn write_png(image: &egui::ColorImage, path: &Path) -> Result<(), String> {
     use eframe::icon_data::IconDataExt as _;
     let icon = egui::IconData {
@@ -567,8 +515,7 @@ fn write_png(image: &egui::ColorImage, path: &Path) -> Result<(), String> {
 
 // --- App glue ---
 
-/// Take/call/put wrappers: the driver cannot stay a field of the app while
-/// borrowing all of it.
+/// Take/call/put: the driver cannot stay a field while borrowing the app.
 impl QuickSearchApp {
     pub(crate) fn capture_tick(&mut self, ctx: &egui::Context) {
         let Some(mut driver) = self.capture.take() else {

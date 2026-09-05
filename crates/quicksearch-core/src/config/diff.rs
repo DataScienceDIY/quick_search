@@ -8,53 +8,43 @@ use super::*;
 /// What must happen to the *stored index* to bring it back in line with the
 /// configuration, short of deleting and rebuilding it.
 ///
-/// Every field is independently satisfiable and the whole thing is
-/// idempotent: applying it twice does nothing the second time, which is what
-/// lets the same plan be produced from a live config edit and from the
-/// `config_validation` fingerprint of a config that was hand-edited while the
-/// app was closed. See [`crate::scope`] for the pass that applies it.
+/// Every field is independently satisfiable and applying the whole is
+/// idempotent — which is what lets the same plan come from a live edit and
+/// from the `config_validation` fingerprint of a config hand-edited while
+/// the app was closed. [`crate::scope`] applies it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IndexWork {
-    /// Roots that are no longer configured, in `files.path` spelling. Every
-    /// row beneath one is deleted; no filesystem access is involved, so a
-    /// root whose folder is gone is handled the same as one that still
-    /// exists.
+    /// Deconfigured roots, in stored spelling. Purely a row delete: a root
+    /// whose folder is gone is handled the same as one that still exists.
     pub drop_roots: Vec<String>,
-    /// The ignore/hidden rules narrowed. Stored rows under the surviving
-    /// roots are re-tested against them and the ones the walker would no
-    /// longer emit are deleted.
+    /// Ignore/hidden rules narrowed; surviving rows are re-tested.
     pub prune_scope: bool,
-    /// Symlink following was turned off. A followed target is stored under
-    /// its own canonical path, which can be outside every root; with links
-    /// off no walk can produce such a row, and no root's range would ever
-    /// visit it again, so every row outside the roots goes.
+    /// Symlink following turned off. A followed target is stored under its
+    /// own canonical path, which can be outside every root — with links off
+    /// no walk and no root range would ever reach it again, so every row
+    /// outside the roots goes.
     pub drop_aliases: bool,
-    /// The `content_extensions` filter changed. Kept rows are re-tested
-    /// against it in both directions: newly-included files go back to
-    /// pending, newly-excluded ones give up their text and FTS row but keep
-    /// the name/path row that filename search needs.
+    /// `content_extensions` changed. Re-tested both ways: newly-included
+    /// files go back to pending, newly-excluded ones give up text and FTS
+    /// but keep the name/path row filename search needs.
     pub reconcile_content: bool,
-    /// `store_text_for_snippets` turned on. Rows that finished extraction
-    /// under the old setting kept no text, so they must run again.
+    /// `store_text_for_snippets` turned on; rows extracted under the old
+    /// setting kept no text, so they must run again.
     pub restore_text: bool,
-    /// `store_text_for_snippets` turned off. The stored text is dead weight
-    /// now; dropping it leaves full-text search working and only costs
-    /// snippets.
+    /// `store_text_for_snippets` turned off.
     pub drop_text: bool,
-    /// Files that are newly in scope exist only on disk — nothing in the
-    /// index points at them, so a full walk has to go and find them.
+    /// Newly in-scope files exist only on disk, so only a walk can find them.
     pub reindex: bool,
 }
 
 impl IndexWork {
-    /// Whether there is nothing to do at all.
     pub fn is_empty(&self) -> bool {
         *self == IndexWork::default()
     }
 
-    /// Fold `other` in, so one pass satisfies both. For a second config edit
-    /// arriving while the first is still being applied: the union is the
-    /// only thing that is certainly enough, and every part is idempotent.
+    /// Fold `other` in so one pass satisfies both — for an edit arriving
+    /// while the previous one is still being applied. The union is the only
+    /// thing certainly enough, and every part is idempotent.
     pub fn merge_from(&mut self, other: &IndexWork) {
         for root in &other.drop_roots {
             if !self.drop_roots.contains(root) {
@@ -69,8 +59,7 @@ impl IndexWork {
         self.reindex |= other.reindex;
     }
 
-    /// Whether any part of this touches stored rows, as opposed to only
-    /// asking for another walk.
+    /// Whether this touches stored rows, as opposed to only asking for a walk.
     pub fn touches_index(&self) -> bool {
         !self.drop_roots.is_empty()
             || self.drop_aliases
@@ -80,14 +69,13 @@ impl IndexWork {
             || self.drop_text
     }
 
-    /// Whether applying this means scanning the rows under each surviving
-    /// root, rather than just deleting whole ranges.
+    /// Whether applying this scans rows under each surviving root, instead
+    /// of only deleting whole ranges.
     pub fn scans_rows(&self) -> bool {
         self.prune_scope || self.reconcile_content || self.restore_text || self.drop_text
     }
 
-    /// The plan in one line, for the log entry that announces the scan.
-    /// Names what changed rather than what will happen to the rows.
+    /// The plan in one line for the log, naming what changed.
     pub fn summary(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
         if !self.drop_roots.is_empty() {
@@ -112,38 +100,29 @@ impl IndexWork {
             parts.push("snippet text turned off".into());
         }
         if parts.is_empty() {
-            // `touches_index` is false here, so no caller logs this; a
-            // placeholder beats an empty pair of parentheses if one ever does.
+            // `touches_index` is false here, so no caller logs it today.
             return "no stored rows affected".into();
         }
         parts.join("; ")
     }
 }
 
-/// What running services must do after a config edit. Computed by the GUI
-/// (the only runtime editor) after saving, and by the coordinator from the
-/// config it was already holding.
+/// What running services must do after a config edit.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ConfigActions {
-    /// The stored file cannot be read or compared under the new
-    /// configuration and must be deleted and rebuilt from scratch. Reserved
-    /// for the three settings that leave no other option: the FTS tokenizer
-    /// (baked into the table definition), the hash length (stored hashes
-    /// become incomparable) and the encryption key.
+    /// The stored file cannot be read or compared under the new config.
+    /// Only three settings do this: the FTS tokenizer, `hash_length`, and
+    /// the encryption key (see [`diff_actions`]).
     pub requires_rebuild: bool,
-    /// Reconciliation the index can do in place. Empty when
-    /// `requires_rebuild` is set — a wipe subsumes all of it.
+    /// In-place reconciliation; empty when `requires_rebuild` is set.
     pub work: IndexWork,
-    /// Searches must reopen against a different database file.
     pub search_db_changed: bool,
 }
 
-/// Roots that live inside other roots, as `(child, parent)` pairs (exact
-/// duplicates are reported once). Nested roots are disallowed: with one
-/// walker per root they would race for the same files and split progress
-/// attribution. Comparison is on best-effort canonicalized paths (an
-/// unresolvable root is compared as spelled), component-wise per
-/// [`crate::file_handling::UnreadableDirs::covers`].
+/// Roots inside other roots, as `(child, parent)` pairs (exact duplicates
+/// reported once). Disallowed because one walker per root would race for the
+/// same files and split progress. Compared on best-effort canonicalized
+/// paths — an unresolvable root is compared as spelled.
 pub fn nested_roots(roots: &[String]) -> Vec<(String, String)> {
     let resolved: Vec<PathBuf> = roots
         .iter()
@@ -165,10 +144,9 @@ pub fn nested_roots(roots: &[String]) -> Vec<(String, String)> {
     out
 }
 
-/// The `content_extensions` entries that decide what a file is matched
-/// against, normalized the way [`content_allowed`] compares them: comments
-/// stripped, a leading dot optional, case-insensitive. Two lists with the
-/// same set here filter identically, however they are spelled or ordered.
+/// `content_extensions` normalized the way [`content_allowed`] compares:
+/// comments stripped, leading dot optional, case-insensitive. Equal sets
+/// filter identically however they are spelled or ordered.
 fn content_filter_set(list: &[String]) -> BTreeSet<String> {
     content_filter_entries(list)
         .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
@@ -177,9 +155,8 @@ fn content_filter_set(list: &[String]) -> BTreeSet<String> {
 
 /// Whether `new` accepts everything `old` did and more.
 ///
-/// An empty list means "no filter, everything allowed", so it is a superset
-/// of every other list rather than the empty set — the one case plain set
-/// arithmetic gets backwards.
+/// Trap: an empty list means "no filter, everything allowed" — a superset of
+/// every other list, which plain set arithmetic gets backwards.
 fn filter_widened(old: &BTreeSet<String>, new: &BTreeSet<String>) -> bool {
     match (old.is_empty(), new.is_empty()) {
         (_, true) => !old.is_empty(),
@@ -190,29 +167,18 @@ fn filter_widened(old: &BTreeSet<String>, new: &BTreeSet<String>) -> bool {
 
 /// What an edit means for the running services and the stored index.
 ///
-/// The guiding rule: a wipe is only for data that cannot be read or compared
-/// any more. Everything else is a difference between what the index holds and
-/// what the configuration would produce, and a difference can be reconciled —
-/// rows that fell out of scope are deleted ([`IndexWork::prune_scope`],
-/// [`IndexWork::drop_roots`]), rows whose content scope moved are re-tested
-/// ([`IndexWork::reconcile_content`]), and files that came *into* scope are
-/// found by another walk ([`IndexWork::reindex`]).
-///
-/// Roots, ignore patterns and content extensions are compared as **sets**
-/// after normalization, so reordering a list or re-spelling a root is not a
-/// change at all.
+/// The rule: a wipe is only for data that can no longer be read or compared;
+/// everything else is a difference, and differences reconcile. Roots, ignore
+/// patterns and content extensions compare as **sets** after normalization,
+/// so reordering or re-spelling is not a change.
 pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
     let old_roots = old.normalized_indexing_paths();
     let new_roots = new.normalized_indexing_paths();
 
-    // Encryption on↔off or a different salt (⇒ a different key) makes the
-    // on-disk file unreadable to the new configuration. The tokenizer is part
-    // of the FTS table's definition, and `hash_length` decides what bytes a
-    // stored hash covers, so old and new hashes cannot be compared. Those
-    // three are the whole of it; the GUI's security flows drive their own
-    // explicit dialog, and this covers hand-edited configs applied through
-    // the generic path. `use_keychain` only changes where the key is
-    // remembered, not the file.
+    // The only three: a different key makes the file unreadable, the
+    // tokenizer is baked into the FTS table definition, and `hash_length`
+    // decides what bytes a stored hash covers. (`use_keychain` changes only
+    // where the key is remembered.)
     let requires_rebuild = old.processing.hash_length != new.processing.hash_length
         || old.processing.tokenize != new.processing.tokenize
         || old.security.password_protected != new.security.password_protected
@@ -235,16 +201,13 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
             .map(|s| s.trim())
             .collect();
 
-        // Hidden files narrow the walk exactly the way an added ignore pattern
-        // does, so they take the same route.
+        // Hidden files narrow the walk exactly as an added ignore pattern does.
         work.prune_scope = new_ignores.difference(&old_ignores).next().is_some()
             || (old.indexing.include_hidden && !new.indexing.include_hidden);
 
-        // Symlinks do not: a followed target is stored under its own canonical
-        // path, which is either inside a root — where a direct walk produces
-        // exactly the same row, so nothing changes — or outside every root,
-        // where turning links off strands it somewhere no walk and no
-        // per-root scan will ever look again.
+        // Symlinks do not: a followed target inside a root is a row a direct
+        // walk produces anyway, but one outside every root is stranded where
+        // no walk and no per-root scan will look again.
         work.drop_aliases = old.indexing.follow_symlinks && !new.indexing.follow_symlinks;
 
         let old_content = content_filter_set(&old.indexing.content_extensions);
@@ -257,10 +220,9 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
         work.restore_text = !old_store && new_store;
         work.drop_text = old_store && !new_store;
 
-        // Widening only ever *adds* files, and a file that is not in the index
-        // is not findable from it: only a walk can produce those rows. Text
-        // that has to be extracted again needs a run for the same reason —
-        // the content pass runs as part of one.
+        // Widening only adds files, and a file absent from the index is not
+        // findable from it — only a walk produces those rows. Re-extraction
+        // needs a run too: the content pass runs as part of one.
         work.reindex = new_roots.difference(&old_roots).next().is_some()
             || old_ignores.difference(&new_ignores).next().is_some()
             || (!old.indexing.include_hidden && new.indexing.include_hidden)
