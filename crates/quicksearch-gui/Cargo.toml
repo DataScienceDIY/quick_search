@@ -53,9 +53,10 @@ rfd = "0.15"
 open = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# The system-wide search shortcut, where the display server lets an
-# application claim keys for itself: `RegisterHotKey` on Windows, `XGrabKey`
-# on X11. Wayland does not, and is handled by the portal below.
+# The shortcut QuickSearch claims for itself while running, where the display
+# server lets an application claim keys: `RegisterHotKey` on Windows,
+# `XGrabKey` on X11. Wayland does not, and is handled by the portal below.
+# This is the zero-setup path; `--toggle` covers the app not running.
 global-hotkey = "0.8"
 
 # Display backends, which only exist on Linux/BSD. `default-features = false`
@@ -67,24 +68,32 @@ eframe = { version = "0.32", default-features = false, features = [
     "x11",
 ] }
 
-# The Wayland half of the search shortcut: `org.freedesktop.portal.GlobalShortcuts`,
-# the only way a Wayland application can be told about a key it does not own.
-# `rfd` already pulls all four in (it uses the file-chooser portal), so the
-# versions here are the ones already resolved and nothing extra is compiled.
-# `default-features = false` matters: ashpd defaults to Tokio, which would add
-# a second async runtime and switch `zbus` over to it underneath `rfd`.
+# The Wayland half of the in-application shortcut:
+# `org.freedesktop.portal.GlobalShortcuts`, the only way a Wayland application
+# can be told about a key it does not own. `rfd` already pulls all four in (it
+# uses the file-chooser portal), so the versions here are the ones already
+# resolved and nothing extra is compiled. `default-features = false` matters:
+# ashpd defaults to Tokio, which would add a second async runtime and switch
+# `zbus` over to it underneath `rfd`.
 ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
 futures-channel = "0.3"
 futures-util = "0.3"
 pollster = "0.4"
 
-# Raising the window from the shortcut on X11, which winit cannot do: it asks
-# with a source indication of "application", and every mainstream window
-# manager refuses that from a window that is not already focused. See
-# `hotkey::raise`. Both are already in the tree (winit's own X11 backend, and
-# eframe's window handle), so neither adds a crate.
+# Raising the window from either shortcut on X11, which winit cannot
+# do: it asks with a source indication of "application", and every mainstream
+# window manager refuses that from a window that is not already focused. See
+# `activate::raise`. Both are already in the tree (winit's own X11 backend,
+# and eframe's window handle), so neither adds a crate.
 x11rb = "0.13"
 raw-window-handle = "0.6"
+
+# XTEST, for `examples/raiseprobe.rs` only: it synthesises the global key
+# press that proves the shortcut path end to end, which no command-line tool
+# here can do. A dev-dependency feature, so the shipped binary never gets it —
+# `cargo build --bin quicksearch` does not build dev-dependencies at all.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dev-dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }
 
 # Console attachment for the GUI binary (which has no stdio when launched from
 # Explorer) and VT-mode enabling for the CLI binary. 0.59 matches what eframe
@@ -93,4 +102,11 @@ raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    # The `--toggle` named pipe in `activate`. `Win32_System_IO` and
+    # `Win32_Security` are not used directly: they carry the `OVERLAPPED` and
+    # `SECURITY_ATTRIBUTES` types naming the pointers we pass as null.
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Security",
 ] }

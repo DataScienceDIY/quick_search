@@ -387,10 +387,10 @@ pub fn store_extracted(
             // Counted before anything can skip it: a failed row still leaves.
             done.consumed += 1;
             match bodies.get(i) {
-                Err(e) => crate::log_warn!("compress text for {}: {}", row.name(), e),
+                Err(e) => crate::log_warn!("compress text for {}: {}", row.path(), e),
                 Ok(zstd) => match store_content_outcome(&tx, row.file_id, &row.outcome, zstd) {
                     Ok(()) => done.written += 1,
-                    Err(e) => crate::log_warn!("content indexing for {}: {}", row.name(), e),
+                    Err(e) => crate::log_warn!("content indexing for {}: {}", row.path(), e),
                 },
             }
             if stop_flag.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {

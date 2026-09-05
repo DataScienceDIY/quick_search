@@ -247,7 +247,7 @@ mod census {
                 .iter()
                 .map(|r| {
                     (crate::file_handling::outcome_body(&r.outcome).map_or(0, str::len)
-                        + r.name().len()) as u64
+                        + r.path().len()) as u64
                 })
                 .sum();
             crate::log_info!(
@@ -529,8 +529,10 @@ impl RootPipeline {
             }
             let stored = store_extracted(&cx.conn_mutex, ready, cx.stop_flag, cx.config, deadline)?;
             if stored.consumed > 0 {
-                // The last row *written*, not the last fetched.
-                *current_file = Some(ready[stored.consumed - 1].name().to_string());
+                // The last row *written*, not the last fetched. The whole path,
+                // as the walk phase publishes: the hint must not change what it
+                // means to a shorter name when a root crosses into extraction.
+                *current_file = Some(ready[stored.consumed - 1].path().to_string());
             }
             ready.drain(..stored.consumed);
             *written += stored.written;

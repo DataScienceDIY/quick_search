@@ -235,13 +235,16 @@ impl QuickSearchApp {
         if let Some(query) = initial_query {
             search.seed(query);
         }
+        // Before `cfg` moves into the struct: the tab owns its filters from
+        // here on, and `pin_live_fields` keeps a Settings draft off them.
+        let dups = DuplicatesTab::new(&cfg.duplicates);
         Ok(QuickSearchApp {
             cfg,
             backend,
             tab,
             search,
             manage: ManageTab::new(),
-            dups: DuplicatesTab::new(),
+            dups,
             logs: LogsTab::new(),
             settings: SettingsTab::new(),
             rebuild_prompt: None,
@@ -289,7 +292,11 @@ impl QuickSearchApp {
     fn start_duplicates_scan(&mut self, ctx: &egui::Context) {
         self.dups.state = DupState::Loading;
         let cfg = self.cfg.clone();
-        self.backend.start_duplicates(&cfg, ctx.clone());
+        let limit = self.backend.start_duplicates(&cfg, ctx.clone());
+        // 0 means a scan was already running, whose limit still stands.
+        if limit > 0 {
+            self.dups.scan_limit = limit;
+        }
     }
 
     /// Drop a duplicate listing the index has moved out from under — a finished
@@ -597,13 +604,22 @@ pub(crate) fn pin_live_fields(new: &mut Config, live: &Config) {
     // protection — Apply must not put the rows away again.
     new.search.columns = live.search.columns.clone();
     new.ui.show_advanced_settings = live.ui.show_advanced_settings;
+    // Likewise the duplicates tab's own filters: hiding a group is a live
+    // edit, and a Settings draft taken before it must not bring the group back.
+    new.duplicates = live.duplicates.clone();
 }
+
+/// The zoom factors the GUI offers, and the range a hand-edited config is
+/// clamped into. One range: the Settings slider and the tour's both show it.
+pub(crate) const SCALE_RANGE: std::ops::RangeInclusive<f32> = 0.5..=2.5;
 
 fn clamp_scale(scale: f32) -> f32 {
     if scale.is_finite() {
-        scale.clamp(0.5, 2.5)
+        scale.clamp(*SCALE_RANGE.start(), *SCALE_RANGE.end())
     } else {
-        1.1
+        // Taken from the config rather than written out again: a hardcoded
+        // fallback drifts away from the default the moment it changes.
+        quicksearch_core::config::UiConfig::default().scale
     }
 }
 
@@ -747,9 +763,18 @@ impl eframe::App for QuickSearchApp {
                 }
             }
             Tab::Duplicates => {
-                let actions = self.dups.ui(ui, self.verify.is_some());
+                let actions =
+                    self.dups
+                        .ui(ui, self.verify.is_some(), self.cfg.processing.hash_length);
                 if actions.refresh {
                     self.start_duplicates_scan(ctx);
+                }
+                // Live state, written the moment it changes — the same path
+                // the search tab's column picker takes. Nothing here changes
+                // what is indexed, so there is no reconciliation to run.
+                if let Some(filters) = actions.save_filters {
+                    self.cfg.duplicates = filters;
+                    self.save_cfg();
                 }
                 if let Some(paths) = actions.verify {
                     let paths: Vec<std::path::PathBuf> =

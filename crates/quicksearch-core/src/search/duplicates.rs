@@ -36,6 +36,15 @@ pub struct DuplicateGroup {
     pub members: Vec<(i64, String, String, u64, i64)>,
 }
 
+impl DuplicateGroup {
+    /// The group's identity, for a UI that wants to remember one: lowercase
+    /// hex of the hash. Stable across renames and moves, because the hash
+    /// covers the content and nothing about where the files live.
+    pub fn hash_hex(&self) -> String {
+        crate::security::hex_encode(&self.hash)
+    }
+}
+
 /// A ranked group, ordered so that **greater is better**: more reclaimable
 /// bytes first, and the lower rowid on a tie so repeated scans of an unchanged
 /// index list the same groups in the same order.
@@ -293,6 +302,36 @@ mod tests {
         assert_eq!(
             over, all,
             "a limit above the group count returns everything"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// The identity a UI remembers a dismissed group by: it must be the hash
+    /// itself, spelled the one way, or a group hidden today comes back
+    /// tomorrow under a different spelling.
+    #[test]
+    fn a_group_spells_its_hash_the_one_way() {
+        let p = seed_db();
+        let groups = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
+        for group in &groups {
+            let hex = group.hash_hex();
+            assert_eq!(hex.len(), group.hash.len() * 2);
+            assert!(hex
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+            assert_eq!(hex, group.hash_hex(), "not stable across calls");
+        }
+        let again = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
+        let spelled = |gs: &[DuplicateGroup]| gs.iter().map(|g| g.hash_hex()).collect::<Vec<_>>();
+        assert_eq!(
+            spelled(&groups),
+            spelled(&again),
+            "an unchanged index names its groups the same way twice"
+        );
+        assert_ne!(
+            groups[0].hash_hex(),
+            groups[1].hash_hex(),
+            "two groups must not answer to one name"
         );
         std::fs::remove_file(&p).ok();
     }

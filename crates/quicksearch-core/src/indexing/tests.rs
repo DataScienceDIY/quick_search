@@ -279,6 +279,13 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
     assert_eq!(done, 5, "every row reached the index");
     assert_eq!(p.snapshot().extracted, 5);
     assert_eq!(p.snapshot().extract_total, Some(0));
+    // A whole path, as the walk phase publishes — not the bare `files.name`.
+    // The rows land in order, so the last one written is the last one seeded.
+    assert_eq!(
+        p.snapshot().current_file.as_deref(),
+        Some(format!("{}f4.txt", crate::file_handling::dir_to_db_parent(&tree)).as_str()),
+        "the extracting phase names the file by its full path"
+    );
 
     drop(p);
     std::fs::remove_dir_all(&dir).ok();

@@ -5,6 +5,9 @@ name: CI
 # DEFAULT_ACTIONS_URL, which points at data.forgejo.org, so nothing here reaches
 # out to github.com.
 
+# Release branches and tags only. Master is deliberately not a trigger: nothing
+# runs on a push to it or on a pull request against it, so a merge is unverified
+# until a release is cut or someone runs this by hand from the Actions tab.
 on:
   push:
     # Pushing a branch whose name starts with Release cuts a release: the version
@@ -13,15 +16,16 @@ on:
     # there because branch names are case-sensitive and a silent no-op would be a
     # miserable thing to debug, as is the fact that * does not match / in these
     # filters - Release/0.9.1 needs the ** form to be seen at all.
-    branches: [master, 'Release*', 'Release/**', 'release*', 'release/**']
+    branches: ['Release*', 'Release/**', 'release*', 'release/**']
     tags: ['v*']
-  pull_request:
-    branches: [master]
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Every run that reaches this workflow can publish a release, so none of them
+  # are safe to cancel partway through - an interrupted run can leave a release
+  # created with only some of its assets uploaded.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -205,10 +209,12 @@ jobs:
 
       # Everything from here down produces release assets, so it runs only
       # where a release can actually come out: a v* tag or a Release* branch.
-      # On master and pull requests the job stops after Build and Test, which
-      # is what those runs are for — the packaging that used to follow built a
-      # .deb, an AppImage, a tarball and a 14-day artifact upload that nothing
-      # would ever download, because the release job is skipped there anyway.
+      # The gate still earns its place now that those are the only push
+      # triggers, because workflow_dispatch is not restricted to them: running
+      # this by hand against master is the way to build and test that branch,
+      # and it stops after Build and Test rather than packaging a .deb, an
+      # AppImage, a tarball and a 14-day artifact upload that nothing would
+      # ever download, since the release job is skipped on that ref anyway.
       #
       # The condition is repeated rather than hoisted into an env var: Actions
       # has no workflow-level expression alias, YAML anchors are not supported,
@@ -296,8 +302,9 @@ jobs:
       # node16, which current Forgejo runner images no longer ship; the
       # -node20 tags are Forgejo's builds for precisely this combination.
       - uses: actions/upload-artifact@v3-node20
-        # `if-no-files-found: error` below would fail every master push once the
-        # packaging steps above are gated, so this carries the same gate.
+        # `if-no-files-found: error` below would fail any hand-dispatched run
+        # off a release ref, where the packaging steps above are skipped and
+        # dist/ stays empty, so this carries the same gate.
         if: >-
           startsWith(github.ref, 'refs/tags/v')
           || startsWith(github.ref, 'refs/heads/Release')
@@ -396,8 +403,8 @@ jobs:
       # As in the linux job, the asset-producing steps run only where a release
       # can come out. The DLL check above deliberately stays ungated: it
       # validates the .exe itself rather than packaging it, costs an objdump,
-      # and is exactly the kind of regression worth catching on master rather
-      # than at release time.
+      # and is exactly the kind of regression worth catching on a hand-run
+      # master build rather than at release time.
       - name: Build the installer
         if: >-
           startsWith(github.ref, 'refs/tags/v')

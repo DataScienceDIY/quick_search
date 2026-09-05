@@ -40,6 +40,8 @@ pub fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
 pub fn ctx() -> egui::Context {
     let ctx = egui::Context::default();
     crate::fonts::install(&ctx);
+    // The shipped text greys, so what a test measures is what the app paints.
+    crate::color::apply_text_contrast(&ctx);
     ctx
 }
 
@@ -133,6 +135,19 @@ pub fn painted_spans(out: &egui::FullOutput) -> Vec<(String, egui::Color32)> {
                 .iter()
                 .map(|s| (g.job.text[s.byte_range.clone()].to_string(), s.format.color))
                 .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Each galley with the font size its first run was laid out at — how big
+/// text actually came out, which the style alone cannot say once a widget
+/// has overridden it.
+pub fn painted_sizes(out: &egui::FullOutput) -> Vec<(String, f32)> {
+    painted_galleys(out)
+        .into_iter()
+        .filter_map(|(g, _)| {
+            let size = g.job.sections.first()?.format.font_id.size;
+            Some((g.text().to_string(), size))
         })
         .collect()
 }

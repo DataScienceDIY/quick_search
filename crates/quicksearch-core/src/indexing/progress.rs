@@ -42,6 +42,8 @@ pub struct RootProgress {
     /// The count of files that have or will have text — not of files under the
     /// root. `None` until the content pass has counted its range.
     pub extract_total: Option<usize>,
+    /// A file the root has recently reached, as a whole path in every phase —
+    /// sampled, not every file, and during extraction the last one *written*.
     pub current_file: Option<String>,
     /// Threads busy / pool size for the current phase's pool; both zero once done.
     pub active_workers: usize,

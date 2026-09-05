@@ -36,6 +36,19 @@ struct Page {
     spots: &'static [Spot],
     /// Typed into the search box a character at a time, on entry.
     type_query: Option<&'static str>,
+    /// A control of the page's own, under its prose.
+    extra: Option<Extra>,
+}
+
+/// What a page offers in the tour's own window. Most pages point at a widget
+/// in the app instead; these two are setup the user can do from here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Extra {
+    /// The zoom slider, on the welcome page.
+    Scale,
+    /// The command to bind to a key, with Copy and a way to the desktop's
+    /// keyboard settings.
+    Shortcut,
 }
 
 /// Field defaults for the pages that do not point anywhere.
@@ -47,15 +60,15 @@ const PLAIN: Page = Page {
     tab: None,
     spots: &[],
     type_query: None,
+    extra: None,
 };
 
 const PAGES: &[Page] = &[
     Page {
         title: "Welcome to QuickSearch",
         body: &[
-            "QuickSearch keeps an index of the folders you choose, and searches \
-             as you type.",
-            "By default only your user folder is indexed and searchable.",
+            "QuickSearch is a search engine for your local files and their contents.",
+            "By default, only your user folder is indexed and searchable.",
             "Because the answers come from the index rather than from reading \
              your disk, results appear as fast as you can type, even across \
              hundreds of thousands of files.",
@@ -65,6 +78,24 @@ const PAGES: &[Page] = &[
              if it covers something. Hit Skip to exit.",
         ),
         tab: Some(Tab::Search),
+        extra: Some(Extra::Scale),
+        ..PLAIN
+    },
+    Page {
+        title: "Open QuickSearch hotkey",
+        body: &[
+            "Would you like a keyboard shortcut that brings QuickSearch up \
+             from anywhere? Click the button below and press the keys you \
+             want — it takes effect at once.",
+            "QuickSearch does not sit in the background waiting for that key, \
+             though. When you close it, it closes completely and gives back \
+             the memory it was using; it starts again, index and all, in a \
+             moment. So to have a key start it as well, bind the command \
+             underneath in your desktop's own keyboard settings.",
+        ],
+        pointer: Some("Both of these are on the Settings tab too, under Interface."),
+        tab: Some(Tab::Search),
+        extra: Some(Extra::Shortcut),
         ..PLAIN
     },
     Page {
@@ -85,11 +116,16 @@ const PAGES: &[Page] = &[
              remembering what it found, so that searching later is instant. It \
              runs on its own in the background and keeps up with changes as you \
              make them.",
+            "You decide what gets read: [ignore patterns] keep files and folders \
+             out of the index entirely, while the [extensions whitelist] limits \
+             which file types have their contents read. Both are under Content \
+             filters on this tab.",
             "QuickSearch never connects to the internet, and always respects your privacy. \
              QuickSearch can encrypt your index to make this remembered data more secure.",
         ],
         pointer: Some("To set an index password, look near the bottom of the Settings tab."),
         tab: Some(Tab::Manage),
+        spots: &[Spot::IgnorePatterns, Spot::ExtWhitelist],
         ..PLAIN
     },
     Page {
@@ -139,13 +175,13 @@ const PAGES: &[Page] = &[
         ..PLAIN
     },
     Page {
-        title: "Typos, and what a result can do",
+        title: "Fuzzy Finding",
         body: &[
             "Tick [Fuzzy] beside the search box to also match words with typos \
-             in them — \"repot\" will find \"report\". It searches more \
-             thoroughly, so it is a little slower; leave it off until you need \
-             it.",
-            "Right-click any result for more: open it, open the folder holding \
+             in them! When checked, \"repot\" will find \"report\". It searches more \
+             thoroughly, so it is a little slower to find all results, but the exact \
+             matches will be found just as fast and be displayed first.",
+            "Right-click any result for more options: open it, open the folder holding \
              it, copy its path, or build a filter that hides files like it from \
              future searches.",
         ],
@@ -162,10 +198,16 @@ const PAGES: &[Page] = &[
             "It is a quick way to find the same download sitting in three \
              places. QuickSearch only shows you the groups; deleting anything is \
              left to you.",
+            "For speed, files are matched on their size and on how they begin — the \
+             first few kilobytes — which makes a group a strong suspicion rather \
+             than a certainty. Right-click any group and choose \"Verify copies are \
+             identical\" to read every byte before you delete anything. The tab says \
+             so at the top, every time.",
         ],
         pointer: Some(
-            "For speed, files are compared by size and by how they begin (first 8KB). \
-             This is not a guarantee of an exact match. You can right click a result to verify before you delete anything.",
+            "A group you never want to see again can be hidden, and a folder that is \
+             meant to hold copies can be excluded — both from that same right-click \
+             menu.",
         ),
         tab: Some(Tab::Duplicates),
         spots: &[Spot::TabButton(Tab::Duplicates)],
@@ -291,6 +333,77 @@ fn paragraph_job(ui: &egui::Ui, text: &str, next_keyword: &mut usize, pulse: f32
     job
 }
 
+/// The tour's own note size. `hint` is egui's `Small`, which is a touch fine
+/// to read in the one window a first-time user meets the app through; full
+/// Body would stop a note reading as an aside.
+fn note(ui: &egui::Ui, text: impl Into<egui::RichText>) -> egui::RichText {
+    hint(text).size(egui::TextStyle::Small.resolve(ui.style()).size + 2.0)
+}
+
+/// The live state the tour's own controls read, and the flag the shortcut
+/// capture keeps between frames.
+struct Live<'a> {
+    /// `ctx.zoom_factor()`, read before the window is laid out.
+    zoom: f32,
+    /// The shortcut in force, as the config spells it.
+    hotkey: &'a str,
+    capturing_hotkey: &'a mut bool,
+}
+
+/// The page's own control, under its prose. What they were used for goes
+/// back through `actions`: the config is the app's to write, not the tour's.
+fn extra_ui(ui: &mut egui::Ui, extra: Extra, live: &mut Live, actions: &mut TourActions) {
+    ui.add_space(6.0);
+    ui.separator();
+    match extra {
+        Extra::Scale => {
+            let mut scale = live.zoom;
+            ui.horizontal(|ui| {
+                ui.label("UI scale");
+                // Scoped to this row, which is the whole of its use.
+                ui.spacing_mut().slider_width = 220.0;
+                let slider = ui.add(
+                    egui::Slider::new(&mut scale, crate::app::SCALE_RANGE)
+                        .step_by(0.05)
+                        .fixed_decimals(2),
+                );
+                // Applied on every frame it moves, saved once it settles: a
+                // drag would otherwise rewrite the config file dozens of
+                // times on its way across. The release frame is not itself a
+                // change — the value stopped moving — so it is asked about
+                // separately, and carries the value with it so the app has
+                // one thing to act on.
+                let moved = slider.changed();
+                let settled = slider.drag_stopped() || (moved && !slider.dragged());
+                if moved || settled {
+                    actions.set_scale = Some(scale);
+                    actions.save_scale = settled;
+                }
+            });
+            ui.label(note(
+                ui,
+                "Makes everything larger or smaller together. You can change \
+                 it again on the Settings tab.",
+            ));
+        }
+        // Both of the Settings tab's shortcut controls, and the same two
+        // widgets rather than a second pair that could drift from them: the
+        // button that claims a key while QuickSearch is running, and under
+        // it the command a desktop shortcut binds to start it.
+        Extra::Shortcut => {
+            let mut setting = live.hotkey.to_string();
+            ui.horizontal(|ui| {
+                ui.label("Search shortcut");
+                crate::settings_tab::hotkey_edit(ui, &mut setting, live.capturing_hotkey);
+            });
+            if setting != live.hotkey {
+                actions.set_hotkey = Some(setting);
+            }
+            crate::settings_tab::shortcut_note(ui);
+        }
+    }
+}
+
 /// Rings around a widget, painted into the *panel* layer: over the widget,
 /// but under the tour's own window, which the user can drag aside rather
 /// than have the glow drawn across.
@@ -340,6 +453,12 @@ pub struct TourActions {
     pub goto_tab: Option<Tab>,
     pub set_query: Option<String>,
     pub focus_search: bool,
+    /// A new UI scale from the welcome page's slider, to apply live.
+    pub set_scale: Option<f32>,
+    /// The drag ended, so the scale above is worth writing to the config.
+    pub save_scale: bool,
+    /// A shortcut captured on the shortcut page, to register and save.
+    pub set_hotkey: Option<String>,
 }
 
 pub struct Tutorial {
@@ -351,6 +470,9 @@ pub struct Tutorial {
     typing: Option<Typing>,
     /// The user has dragged the window, so where it sits is their business.
     moved: bool,
+    /// The shortcut button is armed and the next key combination is the
+    /// answer — the Settings tab's own capture, and its own flag.
+    capturing_hotkey: bool,
 }
 
 impl Tutorial {
@@ -360,11 +482,14 @@ impl Tutorial {
             shown: None,
             typing: None,
             moved: false,
+            capturing_hotkey: false,
         }
     }
 
-    /// `roots` is the live indexed-folder list, which the folders page reads.
-    pub fn ui(&mut self, ctx: &egui::Context, roots: &[String]) -> TourActions {
+    /// `roots` is the live indexed-folder list, which the folders page reads;
+    /// `hotkey` is the shortcut in force, which the shortcut page both shows
+    /// and rebinds.
+    pub fn ui(&mut self, ctx: &egui::Context, roots: &[String], hotkey: &str) -> TourActions {
         let page = &PAGES[self.page.min(PAGES.len() - 1)];
         let (first, last) = (self.page == 0, self.page + 1 == PAGES.len());
         let mut actions = TourActions::default();
@@ -393,6 +518,14 @@ impl Tutorial {
         }
 
         let lit = pulse(now);
+        // Read before the window: `set_zoom_factor` stores the new value at
+        // once, so the slider reads back what it asked for on the next frame
+        // rather than snapping to the old value mid-drag. It also follows an
+        // ad-hoc Ctrl +/- zoom, which is the size the user is looking at.
+        let zoom = ctx.zoom_factor();
+        // Lifted out of `self` for the window's closure, and put back after:
+        // the closure already holds the page and the actions.
+        let mut capturing = self.capturing_hotkey;
         let mut dismissed = false;
         let mut window = egui::Window::new(page.title)
             .id(egui::Id::new(WINDOW_ID))
@@ -416,8 +549,19 @@ impl Tutorial {
                 ui.label(job);
                 ui.add_space(6.0);
             }
+            // The page's control first, then its note: a note that mentions
+            // what is on the page has to come after it, and it is the last
+            // and smallest thing before the footer either way.
+            if let Some(extra) = page.extra {
+                let mut live = Live {
+                    zoom,
+                    hotkey,
+                    capturing_hotkey: &mut capturing,
+                };
+                extra_ui(ui, extra, &mut live, &mut actions);
+            }
             if let Some(pointer) = page.pointer {
-                ui.label(hint(pointer));
+                ui.label(note(ui, pointer));
             }
 
             ui.add_space(10.0);
@@ -459,6 +603,7 @@ impl Tutorial {
         if shown.is_some_and(|window| window.response.dragged()) {
             self.moved = true;
         }
+        self.capturing_hotkey = capturing;
 
         // The widgets this page names, in the colours its keywords were given.
         let dark_mode = ctx.style().visuals.dark_mode;

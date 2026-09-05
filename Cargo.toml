@@ -12,7 +12,7 @@ pdf-extract = { path = "vendor/pdf-extract" } # Patched unbounded reads which co
 rtf-parser = { path = "vendor/rtf-parser" } # Patched a parsing error which occurs on UTF-16 characters
 
 [workspace.package]
-version = "1.1.6"
+version = "1.1.7"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Jeremy <jeremy@karsttech.com>"]

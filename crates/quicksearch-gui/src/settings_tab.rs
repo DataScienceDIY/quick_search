@@ -261,10 +261,6 @@ impl SettingsTab {
                 ));
                 ui.separator();
 
-                ui.heading(egui::RichText::new("Processing").strong());
-                config_editor_ui(ui, draft, Section::Processing, indexed_files, form);
-                ui.separator();
-
                 ui.heading(egui::RichText::new("Search").strong());
                 config_editor_ui(ui, draft, Section::Search, indexed_files, form);
                 ui.add_space(6.0);
@@ -276,7 +272,7 @@ impl SettingsTab {
                 egui::Grid::new("opt-ui").num_columns(2).show(ui, |ui| {
                     form.row(Level::Everyday, ui, "UI scale", &tips::UI_SCALE, |ui| {
                         ui.add(
-                            egui::Slider::new(&mut draft.ui.scale, 0.5..=2.5)
+                            egui::Slider::new(&mut draft.ui.scale, crate::app::SCALE_RANGE)
                                 .step_by(0.05)
                                 .fixed_decimals(2),
                         )
@@ -297,12 +293,17 @@ impl SettingsTab {
                     );
                 });
                 hotkey_note(ui, &draft.ui.search_hotkey, &current.ui.search_hotkey);
+                shortcut_note(ui);
                 ui.separator();
 
                 // Security acts on the live config, not the draft; the KDF
                 // salt is never shown anywhere in the GUI.
                 ui.heading(egui::RichText::new("Security").strong());
                 out.security = security_ui(ui, current, keychain_active, form);
+                ui.separator();
+
+                ui.heading(egui::RichText::new("Processing").strong());
+                config_editor_ui(ui, draft, Section::Processing, indexed_files, form);
                 ui.separator();
 
                 let p = crate::color::palette(ui.visuals().dark_mode);
@@ -367,7 +368,13 @@ fn color_scheme_edit(ui: &mut egui::Ui, setting: &mut String) -> egui::Response 
 
 /// A button showing the current binding that turns into a key-press reader
 /// when clicked, and a Clear beside it.
-fn hotkey_edit(ui: &mut egui::Ui, setting: &mut String, capturing: &mut bool) -> egui::Response {
+/// The shortcut button: click it, press a combination, or Clear. Shared with
+/// the tour's shortcut page, which offers the same setting.
+pub(crate) fn hotkey_edit(
+    ui: &mut egui::Ui,
+    setting: &mut String,
+    capturing: &mut bool,
+) -> egui::Response {
     let p = crate::color::palette(ui.visuals().dark_mode);
     ui.horizontal(|ui| {
         let label = if *capturing {
@@ -474,6 +481,55 @@ fn hotkey_note(ui: &mut egui::Ui, draft: &str, live: &str) {
             Some(color) => rich.color(color),
             None => rich.weak(),
         });
+    });
+}
+
+/// How to get a shortcut that also *starts* QuickSearch.
+///
+/// The shortcut above is ours and needs no setup, but it cannot fire while
+/// QuickSearch is not running — see `crate::activate`. Only the desktop can
+/// bind a key that launches something, so this says what to bind and opens
+/// the place to bind it. Writing the desktop's own configuration instead was
+/// considered and rejected: it differs per desktop and between versions of
+/// the same one, and a shortcut we wrote and the user cannot see is worse
+/// than one they created.
+///
+/// Shared with the tour's shortcut page, which puts it under the same
+/// shortcut button this sentence says is "above".
+pub(crate) fn shortcut_note(ui: &mut egui::Ui) {
+    let command = format!("{} --toggle", crate::activate::command_name());
+    crate::ui_util::stable_section(ui, |ui| {
+        ui.label(
+            egui::RichText::new(
+                "The shortcut above works while QuickSearch is open. To have a key \
+                 start it as well, bind this command in your desktop's keyboard \
+                 settings:",
+            )
+            .small()
+            .weak(),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(&command).small().monospace());
+            if ui.add(egui::Button::new("Copy").small()).clicked() {
+                ui.ctx().copy_text(command.clone());
+            }
+            if let Some(label) = crate::platform::keyboard_settings_label() {
+                if ui.add(egui::Button::new(label).small()).clicked() {
+                    crate::platform::open_keyboard_settings();
+                }
+            }
+        });
+        if crate::activate::raise::is_wayland() {
+            ui.label(
+                egui::RichText::new(
+                    "On Wayland a window that is already open cannot be raised by \
+                     another process, so the shortcut will highlight QuickSearch in \
+                     the task bar rather than bring it to the front.",
+                )
+                .small()
+                .weak(),
+            );
+        }
     });
 }
 

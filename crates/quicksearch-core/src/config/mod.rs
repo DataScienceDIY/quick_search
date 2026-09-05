@@ -23,6 +23,7 @@ pub struct Config {
     pub indexing: IndexingConfig,
     pub processing: ProcessingConfig,
     pub search: SearchConfig,
+    pub duplicates: DuplicatesConfig,
     pub ui: UiConfig,
     pub security: SecurityConfig,
     /// File this config was loaded from; `save()` writes back to it.
@@ -172,6 +173,27 @@ impl Default for ColumnsConfig {
     }
 }
 
+/// What the Duplicates tab lists. Nothing here changes what is indexed or
+/// what a search finds — a file excluded from the duplicate listing is still
+/// in the index and still turns up in results.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DuplicatesConfig {
+    /// Globs, the same syntax and the same matcher as
+    /// `indexing.ignore_patterns` ([`IgnoreSet`]). A member whose path matches
+    /// is not counted, and a group left with fewer than two members is not
+    /// listed at all.
+    pub exclude_patterns: Vec<String>,
+    /// Content hashes of groups dismissed with "Hide this group", lowercase
+    /// hex — see [`crate::search::DuplicateGroup::hash_hex`]. Keyed by hash
+    /// rather than by path so a hidden group stays hidden when its files are
+    /// renamed or moved, and comes back when their contents change.
+    ///
+    /// The hash covers `processing.hash_length` bytes, so changing that
+    /// setting (which rebuilds the index anyway) strands every entry here.
+    pub hidden_groups: Vec<String>,
+}
+
 impl SearchConfig {
     /// The caution to show next to `fuzzy_max_edits`, or `None` when sane.
     pub fn fuzzy_edits_warning(&self) -> Option<String> {
@@ -286,9 +308,11 @@ pub struct UiConfig {
     /// for. Keyed by root so that adding a folder warns again while
     /// restarting the app does not.
     pub watch_cap_warned_roots: Vec<String>,
-    /// System-wide shortcut that raises the window, as `Ctrl+Shift+F`. Empty
-    /// disables it; an unparseable value degrades to "no shortcut". On
-    /// Wayland the desktop, not this value, has the final say.
+    /// The shortcut QuickSearch claims for itself while running, as
+    /// `Ctrl+Shift+F`. Empty disables it; an unparseable value degrades to
+    /// "no shortcut". On Wayland the desktop, not this value, has the final
+    /// say. It cannot fire while QuickSearch is not running: that is what a
+    /// desktop binding to `quicksearch --toggle` is for.
     pub search_hotkey: String,
     /// `dark` or `light`. An unrecognised value falls back to dark, where a
     /// typed-out enum would fail to deserialize and take the whole config
@@ -319,7 +343,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         UiConfig {
-            scale: 1.1,
+            scale: 1.25,
             watch_cap_warned_roots: Vec::new(),
             search_hotkey: "Ctrl+Shift+F".to_string(),
             color_scheme: "dark".to_string(),

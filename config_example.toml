@@ -141,18 +141,17 @@ use_keychain = false
 # Zoom factor for the whole GUI: fonts, spacing, and widgets scale
 # together (0.5 – 2.5). Ctrl +/- and Ctrl 0 adjust it temporarily at
 # runtime; this value is the persistent baseline.
-scale = 1.1
+scale = 1.25
 # Written by QuickSearch, not by you: the folders that have already shown
 # the "more subfolders than the watcher can follow" warning, so restarting
 # does not repeat it. Deleting it just means the warnings come back once
 # each.
 watch_cap_warned_roots = []
-# System-wide shortcut that raises QuickSearch, switches to the Search tab
-# and selects whatever is in the search box, from anywhere. Modifiers are
-# Ctrl, Alt and Shift, joined to one key with "+". Leave it empty ("") for
-# no shortcut. On Wayland this is only a preference: the shortcut is
-# registered with your desktop, which may assign a different key and lets
-# you change it in its own keyboard settings.
+# The shortcut QuickSearch claims for itself while it is running: brings it to
+# the front, switches to the Search tab and selects whatever is in the search
+# box. Modifiers are Ctrl, Alt and Shift, joined to one key with "+". Leave it
+# empty ("") for no shortcut. To start QuickSearch when it is closed, bind
+# "quicksearch --toggle" in your desktop's keyboard settings.
 search_hotkey = "Ctrl+Shift+F"
 # 'dark' or 'light'; anything other than 'light' is dark. Applied as soon
 # as it is changed on the Settings tab. Following the desktop's own
@@ -228,3 +227,29 @@ content_match = true
 size = false
 modified = false
 rank = true
+
+# What the Duplicates tab lists. Both keys are written by the tab itself, from
+# its exclusion box and its right-click menu; they are here because they are
+# yours to read and edit. Neither changes what is indexed or what a search
+# finds: a file left out of the duplicate listing is still in the index.
+[duplicates]
+# Paths left out of the listing. Same syntax and same matcher as
+# indexing.ignore_patterns - a pattern without a separator matches any single
+# name ("*.iso"), one with a separator matches a whole path and everything
+# under it ("/home/you/Backups/*").
+#
+# A member whose path matches is not counted, and the group is re-priced
+# around the copies that are left; a group down to one copy is not a duplicate
+# of anything and is not listed at all. For a folder that is *meant* to hold
+# copies, this is the key to use.
+exclude_patterns = []
+# Groups dismissed with "Hide this group", by content hash, lowercase hex.
+# For the other case: a group that is not really a duplicate at all, because
+# grouping only reads each file's size and its first processing.hash_length
+# bytes.
+#
+# Keyed by hash, not by path, so a hidden group stays hidden when its files
+# are renamed or moved, and comes back if their contents change. Changing
+# processing.hash_length rebuilds the index and gives every file a new hash,
+# which strands every entry here; the tab's Clear button empties the list.
+hidden_groups = []

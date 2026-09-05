@@ -21,8 +21,7 @@ mod snippet_render;
 #[cfg(test)]
 mod tests;
 
-use crate::ui_util::hint;
-use ignore_dialog::dir_ignore_pattern;
+use crate::ui_util::{dir_ignore_pattern, hint};
 pub use ignore_dialog::IgnoreDialog;
 use snippet_render::{centered_match_job, marked_field_job, path_cell_job, snippet_job};
 

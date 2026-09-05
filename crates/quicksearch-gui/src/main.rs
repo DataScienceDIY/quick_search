@@ -10,6 +10,7 @@
 #[global_allocator]
 static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
 
+mod activate;
 mod app;
 mod backend;
 #[cfg(feature = "capture")]
@@ -64,14 +65,27 @@ fn seed_query() -> Option<String> {
     }
 }
 
+/// What the desktop's search shortcut runs. Not a query flag: it is checked
+/// before terminal mode, because `--toggle` is about the window.
+const TOGGLE_FLAG: &str = "--toggle";
+
+fn wants_toggle() -> bool {
+    std::env::args().skip(1).any(|a| a == TOGGLE_FLAG)
+}
+
 fn main() {
     // First: printing without a stdio handle panics rather than failing quietly.
     #[cfg(windows)]
     platform::redirect_null_stdio();
 
+    let toggle = wants_toggle();
+
+    // Before terminal mode, which would read `--toggle` as an unknown flag.
     #[cfg(not(windows))]
-    if let Some(code) = cli::maybe_run_cli() {
-        std::process::exit(code);
+    if !toggle {
+        if let Some(code) = cli::maybe_run_cli() {
+            std::process::exit(code);
+        }
     }
 
     // A broken config must never keep the window from opening.
@@ -79,6 +93,14 @@ fn main() {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(e)),
     };
+
+    // The desktop's shortcut, on an app that is already up: hand the
+    // activation over and get out of the way. Failure is the normal case —
+    // nothing is running — and falls through to starting the GUI, which is
+    // what makes one binding both "raise it" and "launch it".
+    if toggle && activate::signal(&Config::config_path()) {
+        return;
+    }
     // Before any search connection exists: the ceiling is applied at open, and
     // `0` leaves it derived from the index.
     quicksearch_core::db::set_search_cache_override(
@@ -93,6 +115,12 @@ fn main() {
     match IndexLock::hold(&config.resolved_database_path()) {
         Ok(()) => {}
         Err(LockError::Held { pid }) => {
+            // Losing the race to an instance that came up between the signal
+            // above and here, or a plain second launch: either way the user
+            // asked to see QuickSearch, and there is one to show them.
+            if activate::signal(&Config::config_path()) {
+                return;
+            }
             let who = match pid {
                 Some(pid) => format!(" (process {})", pid),
                 None => String::new(),
@@ -146,12 +174,21 @@ fn main() {
             // egui has no bundled fonts; this closure is the last place
             // still ahead of frame 1.
             fonts::install(&cc.egui_ctx);
+            // Only once the index lock is held, which `main` has by now:
+            // binding the socket unlinks whatever is in the way, and the
+            // lock is what proves nobody else is listening on it. Before the
+            // gate, so the shortcut works while the unlock screen is up.
+            activate::listen(&cc.egui_ctx, &Config::config_path());
             // Must run on the event-loop thread with the loop running — this
             // closure is the first place that is true. Before the gate, so
             // the shortcut works while the unlock screen is up.
             hotkey::init(&cc.egui_ctx, &config.ui.search_hotkey);
             // Before the gate so the unlock screen honors the setting.
             app::apply_theme(&cc.egui_ctx, &config.ui.color_scheme);
+            // Both themes at once, so this survives a scheme switch — and
+            // before the gate, since the unlock screen is drawn without the
+            // app ever being built.
+            color::apply_text_contrast(&cc.egui_ctx);
             let gate = match key_source {
                 Some(source) => {
                     unlock::Gate::running(&cc.egui_ctx, config, config_error, initial_query, source)

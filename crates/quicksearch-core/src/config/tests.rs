@@ -54,7 +54,7 @@ fn partial_file_gets_section_defaults() {
     assert_eq!(cfg.paths.indexing_paths, vec!["/x".to_string()]);
     assert_eq!(cfg.processing.batch_size, 500, "missing sections default");
     assert_eq!(cfg.search.debounce_ms, 150);
-    assert!((cfg.ui.scale - 1.1).abs() < f32::EPSILON);
+    assert!((cfg.ui.scale - 1.25).abs() < f32::EPSILON);
     assert_eq!(cfg.ui.search_hotkey, "Ctrl+Shift+F");
 }
 
@@ -785,11 +785,19 @@ fn ui_bookkeeping_fields_are_soft_knobs() {
     // Named so the closures below coerce to fn pointers and share one array
     // type; without an annotation each would be its own anonymous type.
     type Knob = (&'static str, fn(&mut Config));
-    let cases: [Knob; 2] = [
+    let cases: [Knob; 4] = [
         ("watch_cap_warned_roots", |c| {
             c.ui.watch_cap_warned_roots = vec!["/media/ApolloStore".to_string()]
         }),
         ("color_scheme", |c| c.ui.color_scheme = "light".to_string()),
+        // The duplicates filters decide what one tab lists and nothing else:
+        // a file left out of that listing is still indexed and still found.
+        ("duplicates.exclude_patterns", |c| {
+            c.duplicates.exclude_patterns = vec!["*.iso".to_string()]
+        }),
+        ("duplicates.hidden_groups", |c| {
+            c.duplicates.hidden_groups = vec!["ab".repeat(32)]
+        }),
     ];
     for (label, mutate) in cases {
         let mut c = base.clone();
@@ -813,6 +821,8 @@ fn newer_fields_round_trip_and_default_when_absent() {
         vec!["/media/ApolloStore".to_string(), "/media/GSSD".to_string()];
     cfg.ui.color_scheme = "light".to_string();
     cfg.search.fuzzy_max_edits = 4;
+    cfg.duplicates.exclude_patterns = vec!["*.iso".to_string()];
+    cfg.duplicates.hidden_groups = vec!["ab".repeat(32)];
     cfg.save().unwrap();
     let loaded = Config::load_from(&path).unwrap();
     assert_eq!(
@@ -821,6 +831,7 @@ fn newer_fields_round_trip_and_default_when_absent() {
     );
     assert_eq!(loaded.ui.color_scheme, "light");
     assert_eq!(loaded.search.fuzzy_max_edits, 4);
+    assert_eq!(loaded.duplicates, cfg.duplicates);
 
     assert_eq!(Config::default().ui.color_scheme, "dark");
     fs::write(
@@ -831,6 +842,11 @@ fn newer_fields_round_trip_and_default_when_absent() {
     .unwrap();
     let cfg = Config::load_from(&path).unwrap();
     assert!(cfg.ui.watch_cap_warned_roots.is_empty());
+    assert_eq!(
+        cfg.duplicates,
+        DuplicatesConfig::default(),
+        "a config predating the duplicates filters must not arrive with any"
+    );
     assert_eq!(cfg.ui.color_scheme, "dark");
     assert_eq!(cfg.search.fuzzy_max_edits, 2);
     assert_eq!(cfg.ui.scale, 1.25, "existing ui keys still parse");
@@ -886,6 +902,7 @@ fn the_documented_example_config_parses_to_the_defaults() {
         "[search] drifted from the defaults"
     );
     assert_eq!(parsed.processing, d.processing);
+    assert_eq!(parsed.duplicates, d.duplicates);
     assert_eq!(parsed.ui.scale, d.ui.scale);
     assert_eq!(parsed.ui.color_scheme, d.ui.color_scheme);
     assert_eq!(parsed.ui.tutorial_seen, Some(false));

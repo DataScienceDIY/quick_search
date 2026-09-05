@@ -49,9 +49,9 @@ impl ExtractedRow {
         }
     }
 
-    /// The `files.name` the FTS row is indexed under.
-    pub fn name(&self) -> &str {
-        self.path.name()
+    /// The whole path, parent and all — what progress and logs name the file by.
+    pub fn path(&self) -> &str {
+        self.path.as_str()
     }
 }
 

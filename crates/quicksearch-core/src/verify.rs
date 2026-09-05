@@ -45,6 +45,9 @@ pub struct VerifyReport {
     /// Index into the input paths of the file everything else was compared
     /// against: the first one that opened. `None` when none of them did.
     pub reference: Option<usize>,
+    /// How long that reference was, so a report can say *where* in the file a
+    /// difference landed. 0 when there was no reference to measure.
+    pub reference_len: u64,
     pub verdicts: Vec<MemberVerdict>,
     pub bytes_read: u64,
 }
@@ -109,6 +112,7 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
     let Some((reference, mut reference_file, reference_len)) = reference else {
         on(VerifyUpdate::Done(VerifyReport {
             reference: None,
+            reference_len: 0,
             verdicts,
             bytes_read: 0,
         }));
@@ -232,6 +236,7 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
 
     on(VerifyUpdate::Done(VerifyReport {
         reference: Some(reference),
+        reference_len,
         verdicts,
         bytes_read,
     }));

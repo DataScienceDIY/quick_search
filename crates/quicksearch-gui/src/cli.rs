@@ -24,10 +24,15 @@ QuickSearch: indexed file search
 
 USAGE:
     quicksearch                          open the GUI
+    quicksearch --toggle                 focus the running GUI, or start it
     quicksearch [FLAGS] <query terms>    search from the terminal
                                          (Windows: quicksearch-cli)
 
 FLAGS:
+    --toggle        bring the running GUI forward with the search box
+                    focused, starting it if none is running. Bind a key to
+                    this in your desktop's keyboard settings for a
+                    system-wide search shortcut.
     --fuzzy         also run the fuzzy filename/full-text passes
     --limit <N>     maximum results (default: [search].display_limit)
     --long          rank, size, mtime, and snippets instead of bare paths

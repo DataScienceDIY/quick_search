@@ -521,6 +521,67 @@ fn an_upkeep_step_names_itself_once_and_keeps_the_file_hints() {
     );
 }
 
+/// The hint carries a whole path, which can outrun any window. It is elided to
+/// the panel rather than to a character count, so it stays one line: a hint
+/// that wrapped when the path got long would change the block's height as
+/// files came and went, the same reflow the line above is drawn to avoid.
+#[test]
+fn an_overlong_file_hint_loses_its_middle_rather_than_wrapping() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = ManageTab::new();
+    const FILE: &str = "deeply-buried-report.pdf";
+
+    let mut hint_shape = |file: &str| {
+        let state = state_with(vec![RootProgress {
+            current_file: Some(file.to_string()),
+            ..root_progress(RootPhase::Extracting, 100, Some(1000))
+        }]);
+        WIDGETS.with(|w| w.borrow_mut().clear());
+        let out = ctx.run(raw_input(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                tab.ui(ui, &state, &cfg_with_root());
+            });
+        });
+        crate::test_ui::painted(&out)
+            .into_iter()
+            .find(|(t, _)| t.ends_with(FILE))
+            .unwrap_or_else(|| panic!("no file hint drawn for {}", file))
+    };
+
+    let short = format!("/data/{}", FILE);
+    let (drawn_short, short_rect) = hint_shape(&short);
+    assert_eq!(drawn_short, short, "a path that fits is drawn whole");
+
+    let long = format!(
+        "/data/{}/{}",
+        ["a-rather-long-directory-name"; 12].join("/"),
+        FILE
+    );
+    let (drawn_long, long_rect) = hint_shape(&long);
+    assert!(
+        drawn_long.contains('…'),
+        "a path far past the panel was not elided: {}",
+        drawn_long
+    );
+    assert!(
+        drawn_long.starts_with("/data/"),
+        "the elide took the head rather than the middle: {}",
+        drawn_long
+    );
+    assert!(
+        long_rect.width() <= 1000.0,
+        "the hint is {} wide in a 1000 px viewport: {}",
+        long_rect.width(),
+        drawn_long
+    );
+    assert_eq!(
+        long_rect.height(),
+        short_rect.height(),
+        "the hint wrapped to a second line: {}",
+        drawn_long
+    );
+}
+
 #[test]
 fn a_walking_root_without_a_count_shows_no_denominator() {
     let ctx = crate::test_ui::ctx();
@@ -1189,5 +1250,49 @@ fn the_tour_can_find_every_way_to_add_a_folder() {
     assert!(
         marked.height() < 60.0,
         "the mark covers {marked:?}, which is more than one row"
+    );
+}
+
+/// The tour's indexing page names both content filters and glows them. Each
+/// glow has to land on the box itself — not its label, not the list of
+/// patterns above it, and not nothing at all.
+#[test]
+fn the_tour_glows_both_content_filter_boxes() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = ManageTab::new();
+    let cfg = cfg_with_root();
+    let state = idle_state();
+
+    WIDGETS.with(|w| w.borrow_mut().clear());
+    let mut marks = (None, None);
+    let _ = ctx.run(raw_input(vec![]), |ctx| {
+        crate::spotlight::set_active(ctx, true);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            tab.ui(ui, &state, &cfg);
+        });
+        // Inside the pass: a mark is only live for the pass that wrote it.
+        marks = (
+            crate::spotlight::rect(ctx, crate::spotlight::Spot::IgnorePatterns),
+            crate::spotlight::rect(ctx, crate::spotlight::Spot::ExtWhitelist),
+        );
+    });
+
+    let ignore = widget("ignore-entry").1;
+    let whitelist = widget("ext-filter").1;
+    assert_eq!(
+        marks.0,
+        Some(ignore),
+        "the ignore-pattern box was not the thing glowed"
+    );
+    assert_eq!(
+        marks.1,
+        Some(whitelist),
+        "the extensions box was not the thing glowed"
+    );
+
+    // Reversed columns: ignore patterns first, the whitelist beside it.
+    assert!(
+        ignore.right() < whitelist.left(),
+        "the ignore box at {ignore:?} is not left of the whitelist at {whitelist:?}"
     );
 }

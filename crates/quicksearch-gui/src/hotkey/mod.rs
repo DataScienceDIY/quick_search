@@ -1,7 +1,14 @@
-//! The system-wide shortcut that raises QuickSearch and focuses the search
-//! box. Windows and X11 claim the key via `global-hotkey`
-//! (`RegisterHotKey`/`XGrabKey`); Wayland refuses grabs by design, so the
-//! shortcut goes through the XDG portal and the *desktop* owns the binding.
+//! The in-application half of the search shortcut: the key QuickSearch
+//! claims for itself while it is running. Windows and X11 grant that via
+//! `global-hotkey` (`RegisterHotKey`/`XGrabKey`); Wayland refuses grabs by
+//! design, so it goes through the XDG portal and the *desktop* picks the key.
+//!
+//! This is the path that needs no setup at all, and it is why the Settings
+//! tab can offer an arbitrary combination on every platform. It cannot fire
+//! while QuickSearch is not running — nothing an application registers for
+//! itself can — which is what [`crate::activate`] and `--toggle` are for.
+//! Both funnel into the same pending flag, so the window comes forward the
+//! same way whichever one fired.
 //!
 //! Held in a thread-local global rather than a field: the registration is
 //! process-wide, the event handler is set-once, and on Windows
@@ -11,20 +18,13 @@
 mod binding;
 #[cfg(all(unix, not(target_os = "macos")))]
 mod portal;
-mod raise;
 
 pub use binding::{parse_setting, Binding};
-pub use raise::raise;
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-
-/// A flag rather than a queue: two presses before the app can redraw mean
-/// the same thing as one.
-static FIRED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static REGISTRY: RefCell<Option<Registry>> = const { RefCell::new(None) };
@@ -128,10 +128,6 @@ pub fn apply(setting: &str) {
     });
 }
 
-pub fn take_fired() -> bool {
-    FIRED.swap(false, Ordering::SeqCst)
-}
-
 pub fn status() -> Status {
     REGISTRY.with_borrow(|slot| match slot.as_ref() {
         None => Status::Disabled,
@@ -145,10 +141,11 @@ pub fn status() -> Status {
     })
 }
 
-/// Without the repaint an idle window would leave the flag unread.
+/// Hand the press to [`crate::activate`], which owns the pending flag and
+/// the repaint. One place to consume, whether the press came from our own
+/// registration or from a `--toggle` the desktop launched.
 fn fire(ctx: &egui::Context) {
-    FIRED.store(true, Ordering::SeqCst);
-    ctx.request_repaint();
+    crate::activate::fire(ctx);
 }
 
 impl Backend {
@@ -225,14 +222,7 @@ mod tests {
     fn an_uninitialised_registry_is_inert() {
         apply("Ctrl+Shift+F");
         assert_eq!(status(), Status::Disabled);
-        assert!(!take_fired());
-    }
-
-    #[test]
-    fn a_press_is_reported_once() {
-        FIRED.store(true, Ordering::SeqCst);
-        assert!(take_fired());
-        assert!(!take_fired(), "the flag is consumed");
+        assert!(!crate::activate::take_pending());
     }
 
     /// `Idle` must accept every call: `apply` runs on every config save.

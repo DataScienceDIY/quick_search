@@ -222,6 +222,119 @@ fn every_color_clears_wcag_aa_on_its_own_background() {
     }
 }
 
+/// One call has to reach both themes: the live one alone is thrown away the
+/// moment the color scheme is switched.
+#[test]
+fn the_text_greys_land_on_both_themes() {
+    let ctx = egui::Context::default();
+    apply_text_contrast(&ctx);
+    for (theme, stock) in [
+        (egui::Theme::Dark, egui::Visuals::dark()),
+        (egui::Theme::Light, egui::Visuals::light()),
+    ] {
+        let visuals = &ctx.style_of(theme).visuals;
+        assert_ne!(
+            visuals.text_color(),
+            stock.text_color(),
+            "body text in {:?} is still egui's",
+            theme
+        );
+        assert_ne!(
+            visuals.widgets.inactive.text_color(),
+            stock.widgets.inactive.text_color(),
+            "widget text in {:?} is still egui's",
+            theme
+        );
+    }
+}
+
+/// Which way each theme moved. Written against egui's own defaults so that an
+/// upgrade quietly moving the baseline past us fails here instead of shipping.
+#[test]
+fn dark_text_lightens_and_light_text_darkens() {
+    let ctx = egui::Context::default();
+    apply_text_contrast(&ctx);
+    let dark = &ctx.style_of(egui::Theme::Dark).visuals;
+    let light = &ctx.style_of(egui::Theme::Light).visuals;
+    for (name, ours, stock) in [
+        (
+            "dark body",
+            dark.text_color(),
+            egui::Visuals::dark().text_color(),
+        ),
+        (
+            "dark widget",
+            dark.widgets.inactive.text_color(),
+            egui::Visuals::dark().widgets.inactive.text_color(),
+        ),
+    ] {
+        assert!(
+            luminance(ours) > luminance(stock),
+            "{} is not lighter than egui's: {:?} vs {:?}",
+            name,
+            ours,
+            stock
+        );
+    }
+    for (name, ours, stock) in [
+        (
+            "light body",
+            light.text_color(),
+            egui::Visuals::light().text_color(),
+        ),
+        (
+            "light widget",
+            light.widgets.inactive.text_color(),
+            egui::Visuals::light().widgets.inactive.text_color(),
+        ),
+    ] {
+        assert!(
+            luminance(ours) < luminance(stock),
+            "{} is not darker than egui's: {:?} vs {:?}",
+            name,
+            ours,
+            stock
+        );
+    }
+}
+
+/// The floors the greys were picked to clear, each on the fills it is
+/// actually painted over.
+#[test]
+fn plain_text_clears_its_backgrounds() {
+    let ctx = egui::Context::default();
+    apply_text_contrast(&ctx);
+    for (theme, floor) in [(egui::Theme::Dark, 5.5), (egui::Theme::Light, 8.5)] {
+        let visuals = &ctx.style_of(theme).visuals;
+        // Widget text is painted on the button fill, not on the panel.
+        for (name, color, bgs) in [
+            (
+                "body",
+                visuals.text_color(),
+                [visuals.panel_fill, visuals.extreme_bg_color],
+            ),
+            (
+                "widget",
+                visuals.widgets.inactive.text_color(),
+                // A frameless button (the tab strip) keeps the panel behind it.
+                [visuals.widgets.inactive.weak_bg_fill, visuals.panel_fill],
+            ),
+        ] {
+            for bg in bgs {
+                let ratio = contrast(color, bg);
+                assert!(
+                    ratio >= floor,
+                    "{} text in {:?} is {:.2}:1 on {:?}",
+                    name,
+                    theme,
+                    ratio,
+                    bg
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn the_rank_ramp_is_an_even_sweep_from_blue_to_red() {
     let mut prev: Option<f64> = None;

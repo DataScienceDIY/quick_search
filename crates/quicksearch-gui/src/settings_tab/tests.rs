@@ -361,8 +361,9 @@ fn every_row_shows_its_own_tip() {
         let mut run = |events: Vec<egui::Event>| {
             let input = crate::test_ui::raw_input(egui::vec2(600.0, 800.0), events);
             ctx.run(input, |ctx| {
-                egui::CentralPanel::default()
-                    .show(ctx, |ui| config_editor_ui(ui, &mut cfg, *section, None, form));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    config_editor_ui(ui, &mut cfg, *section, None, form)
+                });
             })
         };
 
@@ -726,4 +727,21 @@ fn showing_advanced_settings_is_not_an_unsaved_edit() {
         applied.ui.show_advanced_settings,
         "applying the stale draft hid the advanced settings again"
     );
+}
+
+/// The panel that tells a user how to get a shortcut that also starts
+/// QuickSearch has to actually show the command they must bind.
+#[test]
+fn the_shortcut_note_names_the_command_to_bind() {
+    let ctx = crate::test_ui::ctx();
+    let input = crate::test_ui::raw_input(egui::vec2(700.0, 300.0), vec![]);
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| super::shortcut_note(ui));
+    });
+    let painted = painted_text(&out).join("\n");
+    assert!(
+        painted.contains("--toggle"),
+        "the command to bind was not shown: {painted}"
+    );
+    assert!(painted.contains("Copy"), "no way to copy it: {painted}");
 }

@@ -20,6 +20,10 @@ use crate::app::Tab;
 pub enum Spot {
     /// The *Add folder… / path box / Add* row of Manage Index's folder list.
     IndexedFolderAdd,
+    /// The box new ignore patterns are typed into, under Content filters.
+    IgnorePatterns,
+    /// The full-text extensions box beside it.
+    ExtWhitelist,
     /// The query box on the Search tab.
     SearchBar,
     /// The `?` button that opens the query-syntax window.

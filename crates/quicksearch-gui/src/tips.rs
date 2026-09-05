@@ -421,16 +421,15 @@ pub static SEARCH_HOTKEY: Tip = Tip {
            start typing.\n\n\
            Click the button and press the keys you want. Combine Ctrl, Alt \
            and Shift with one other key. Clear switches the shortcut off.\n\n\
-           On Wayland the shortcut is registered with your desktop rather \
-           than claimed directly, so your desktop may assign a different key \
-           or ask you to confirm it, and its own keyboard settings are where \
-           to change it afterwards. Wayland also does not let any application \
-           put itself in front of what you are doing, so there the shortcut \
-           selects the Search tab and the search box, but bringing the window \
-           forward is up to your desktop.",
+           This works whenever QuickSearch is running and needs no setting \
+           up, but it cannot start QuickSearch. For a shortcut that opens it \
+           too, bind the command shown below in your desktop's own keyboard \
+           settings.\n\n\
+           On Wayland your desktop registers the shortcut, so it may pick a \
+           different key and owns it afterwards, and it decides whether the \
+           window comes forward.",
     examples: &[
-        "Ctrl+Shift+F, the default, which few other programs use.",
-        "Ctrl+Alt+Space if something else on your system already answers to it.",
+        "Ctrl+Shift+F, the default, which few other programs use."
     ],
     caution: None,
 };
@@ -567,18 +566,22 @@ pub static ADD_ROOT: Tip = Tip {
     body: "Adds a folder for QuickSearch to index, along with everything \
            inside it. Choose it with the browser, or type the path and press \
            Add.\n\n\
+           Adding a folder does not replace the current index, it adds to it: \
+           an indexing pass picks up the new folder and the rest of the index \
+           is left alone. Nothing is rebuilt.\n\n\
            Indexed folders may not overlap, so a folder already inside \
-           another one is refused. Adding a folder starts an indexing pass to \
-           pick it up and leaves the rest of the index alone.",
+           another one is refused.",
     examples: &["a second drive, or a network share you search often."],
     caution: None,
 };
 
 pub static REMOVE_ROOT: Tip = Tip {
     title: "Remove this folder",
-    body: "Stops indexing this folder and removes its entries from the \
-           index. The rest of the index is left alone, and the files \
-           themselves are not touched.\n\n\
+    body: "Stops indexing the folder named on this line, and removes that \
+           folder's entries from the index.\n\n\
+           Removing a folder does not affect the whole index, only its own \
+           entries; everything else stays searchable and nothing is rebuilt. \
+           Your files themselves are never touched.\n\n\
            Takes effect when you click Apply & Save.",
     examples: &[],
     caution: None,
@@ -618,18 +621,20 @@ pub static ROOT_COUNTS: Tip = Tip {
 
 pub static EXT_WHITELIST: Tip = Tip {
     title: "Full-text extensions whitelist",
-    body: "Which kinds of file QuickSearch reads the text out of, one \
-           extension per line, the leading dot optional. Empty means every \
-           kind it understands.\n\n\
-           Every file is still indexed by name whatever you put here. A list \
-           also leaves out files with no extension at all, such as Makefile \
-           or README, unless you add the line (none). Anything after a # is a \
-           comment, so a file type can be switched off without losing the \
-           line.\n\n\
+    body: "Which kinds of file QuickSearch is allowed to read the text out \
+           of. It limits contents only: every file is still indexed and still \
+           found by its name and its path, whatever you put here. A file left \
+           off the list simply cannot be found by the words inside it.\n\n\
+           Empty, the default, means every kind QuickSearch understands. To \
+           narrow it, enter one extension per line, the leading dot optional. \
+           A non-empty list also leaves out files with no extension at all, \
+           such as Makefile or README, unless you add the line (none). \
+           Anything after a # is a comment.\n\n\
            Narrowing the list discards the text it now excludes; widening it \
            reads those files again.",
     examples: &[
-        "txt, md and pdf to keep the index small and focused on documents.",
+        "txt, md and pdf to keep the stored text small and focused on documents, \
+         with everything else still findable by name.",
         "empty to search inside everything QuickSearch can read.",
     ],
     caution: None,
@@ -637,19 +642,21 @@ pub static EXT_WHITELIST: Tip = Tip {
 
 pub static IGNORE_PATTERNS: Tip = Tip {
     title: "Ignore patterns",
-    body: "Files and folders left out of the index entirely, by name and by \
-           content alike. Type one pattern and click Add.\n\n\
-           A pattern without a slash matches a file or folder name anywhere, \
-           and must match the whole name: .jpg matches only something called \
-           exactly that, while *.jpg matches every JPEG. A pattern with a \
-           slash in it is matched against the whole path, and skips \
-           everything underneath. * stands for any run of characters and ? \
-           for a single one.\n\n\
-           Adding a pattern removes the entries it matches; removing one \
-           indexes them again.",
+    body: "Whole files and folders kept out of the index. A pattern is \
+           compared against names and paths, never against what is inside a \
+           file: nothing is excluded for the words it holds, and a file \
+           excluded here loses its text along with its name. Type one pattern \
+           and click Add.\n\n\
+           A pattern with no slash matches a file or folder name anywhere \
+           under your indexed folders, and must match that name in full. A \
+           pattern with a slash is matched against the whole path, and skips \
+           everything under it. * is any run of characters, ? exactly one.\n\n\
+           Adding a pattern removes the entries it matches; deleting a \
+           pattern from this list indexes those files again. Worked examples \
+           are on the Help tab.",
     examples: &[
         "node_modules to skip that folder wherever it turns up.",
-        "*.tmp to skip temporary files by extension.",
+        "*.log to skip every file ending in .log, whatever it is called.",
         "a full path such as the Videos folder to skip it and everything inside it.",
     ],
     caution: None,

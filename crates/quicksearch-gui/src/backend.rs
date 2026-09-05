@@ -30,6 +30,22 @@ impl VerifyJob {
     }
 }
 
+/// Duplicate groups a scan is asked for. Every group listed costs one row
+/// fetch and one member query to hydrate, so this is a real cost, not a
+/// display cap.
+pub const DUP_SCAN_LIMIT: u32 = 500;
+/// …and the most the hidden set may add to it.
+const DUP_HIDDEN_ALLOWANCE: u32 = 4_500;
+
+/// The limit for a scan whose result `hidden` groups will be dropped from.
+/// Hidden groups are groups the scan returns and the tab discards, so a flat
+/// limit would quietly charge the user for every group they dismissed — the
+/// opposite of what hiding one is for. Bounded, so a config with a million
+/// hidden hashes cannot turn one scan into a full hydration of the index.
+fn dup_scan_limit(hidden: usize) -> u32 {
+    DUP_SCAN_LIMIT + (hidden.min(DUP_HIDDEN_ALLOWANCE as usize) as u32)
+}
+
 pub struct Backend {
     pub coordinator: Arc<IndexCoordinator>,
     pub search: Option<SearchService>,
@@ -132,20 +148,24 @@ impl Backend {
     }
 
     /// Ignored while a scan is already running: a second one would re-read the
-    /// whole hash index for an answer the first is about to produce.
-    pub fn start_duplicates(&mut self, config: &Config, ctx: egui::Context) {
+    /// whole hash index for an answer the first is about to produce. Returns
+    /// the limit it asked for, which is what tells the tab a full page from a
+    /// complete one; 0 when nothing was started.
+    pub fn start_duplicates(&mut self, config: &Config, ctx: egui::Context) -> u32 {
         if self.dup_job.is_some() {
-            return;
+            return 0;
         }
+        let limit = dup_scan_limit(config.duplicates.hidden_groups.len());
         let (tx, rx) = mpsc::channel();
         let db = config.resolved_database_path();
         std::thread::spawn(move || {
             let result =
-                quicksearch_core::search::find_duplicate_groups(&db.to_string_lossy(), 500);
+                quicksearch_core::search::find_duplicate_groups(&db.to_string_lossy(), limit);
             let _ = tx.send(result);
             ctx.request_repaint();
         });
         self.dup_job = Some(rx);
+        limit
     }
 
     /// Compare every member against the first, byte for byte, on a worker

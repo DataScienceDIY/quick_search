@@ -293,6 +293,28 @@ pub fn palette(dark_mode: bool) -> Palette {
     }
 }
 
+// --- Plain text ---
+
+/// egui's stock text greys read thin on its own panel fills: 5.1:1 in dark,
+/// 7.6:1 in light. Both themes get a step, applied to *both* styles at once —
+/// styling only the live theme reverts to egui's the moment the color scheme
+/// is switched.
+pub fn apply_text_contrast(ctx: &egui::Context) {
+    ctx.all_styles_mut(|style| {
+        // Body text is the noninteractive stroke; button and widget labels
+        // are the inactive one. Hovered, active and open already sit at
+        // gray 240 / white / black, with nothing left to gain.
+        let (body, widget) = if style.visuals.dark_mode {
+            (Color32::from_gray(152), Color32::from_gray(188))
+        } else {
+            (Color32::from_gray(70), Color32::from_gray(52))
+        };
+        let widgets = &mut style.visuals.widgets;
+        widgets.noninteractive.fg_stroke.color = body;
+        widgets.inactive.fg_stroke.color = widget;
+    });
+}
+
 // --- The rank ramp ---
 
 const RANK_HUE_BEST: f64 = 250.0;

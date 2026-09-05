@@ -77,7 +77,9 @@ pub fn derive_key(password: &str, salt: &[u8; SALT_LEN]) -> IndexKey {
     IndexKey(out)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+/// The crate's only hex encoder — also how a duplicate group spells its hash
+/// ([`crate::search::DuplicateGroup::hash_hex`]).
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         use std::fmt::Write;

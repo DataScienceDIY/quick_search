@@ -23,6 +23,15 @@ pub fn stable_section<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)
     ui.vertical(contents).inner
 }
 
+/// Glob matching everything under `dir`, spelled with the platform
+/// separator. `Path::join` inserts a separator only where one is needed, so
+/// a drive root yields `C:\*` rather than the never-matching `C:\/*` a
+/// `format!("{}/*")` would produce. Shared by the search tab's ignore dialog
+/// and the duplicates tab's exclusions, which speak the same glob syntax.
+pub fn dir_ignore_pattern(dir: &std::path::Path) -> String {
+    dir.join("*").to_string_lossy().into_owned()
+}
+
 /// `IgnoreSet::compile` silently *skips* patterns that trim to nothing, so
 /// emptiness is checked here with the same trimming rules.
 pub fn ignore_pattern_valid(pattern: &str) -> bool {

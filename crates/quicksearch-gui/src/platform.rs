@@ -104,6 +104,39 @@ fn uri_escape_path(path: &str) -> String {
 }
 
 #[cfg(test)]
+mod keyboard_settings_tests {
+    /// The first entry that is recognised wins, so a desktop that lists
+    /// itself ahead of a generic fallback gets its own settings application.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_most_specific_desktop_wins() {
+        let (program, args, _) = super::keyboard_settings_for("KDE").expect("KDE is known");
+        assert_eq!(program, "systemsettings");
+        assert_eq!(args, ["kcm_keys"]);
+
+        let (program, _, _) =
+            super::keyboard_settings_for("ubuntu:GNOME").expect("GNOME after a vendor prefix");
+        assert_eq!(program, "gnome-control-center");
+    }
+
+    /// The spec does not pin the case and desktops disagree.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_match_ignores_case() {
+        assert!(super::keyboard_settings_for("kde").is_some());
+        assert!(super::keyboard_settings_for("Kde").is_some());
+    }
+
+    /// An unknown or absent desktop offers no button rather than a broken one.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn an_unknown_desktop_offers_nothing() {
+        assert!(super::keyboard_settings_for("").is_none());
+        assert!(super::keyboard_settings_for("i3:sway").is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
@@ -114,5 +147,88 @@ mod tests {
             uri_escape_path("/with space/ünïcode&.txt"),
             "/with%20space/%C3%BCn%C3%AFcode%26.txt"
         );
+    }
+}
+
+/// The desktop's keyboard-shortcut settings, when this is a desktop whose
+/// settings application we know how to name.
+///
+/// A pair with [`open_keyboard_settings`]: the Settings tab only offers the
+/// button when there is something to open, rather than showing one that may
+/// do nothing.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn keyboard_settings_command() -> Option<(&'static str, &'static [&'static str], &'static str)> {
+    keyboard_settings_for(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
+}
+
+/// The mapping itself, split from the environment so it can be tested
+/// without one. `desktops` is `XDG_CURRENT_DESKTOP`: a colon-separated list,
+/// most specific first, and matched case-insensitively because the spec does
+/// not pin the case and desktops disagree in practice.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn keyboard_settings_for(
+    desktops: &str,
+) -> Option<(&'static str, &'static [&'static str], &'static str)> {
+    for desktop in desktops.split(':') {
+        let found = match desktop.to_ascii_uppercase().as_str() {
+            "KDE" => Some((
+                "systemsettings",
+                &["kcm_keys"][..],
+                "Open Shortcuts settings",
+            )),
+            "GNOME" | "UNITY" => Some((
+                "gnome-control-center",
+                &["keyboard"][..],
+                "Open Keyboard settings",
+            )),
+            "XFCE" => Some(("xfce4-keyboard-settings", &[][..], "Open Keyboard settings")),
+            "CINNAMON" => Some((
+                "cinnamon-settings",
+                &["keyboard"][..],
+                "Open Keyboard settings",
+            )),
+            _ => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// The button label for [`open_keyboard_settings`], or `None` when this
+/// desktop has no settings application we can name.
+pub fn keyboard_settings_label() -> Option<&'static str> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // Naming it is not enough; it also has to be installed, or the button
+        // would promise something that silently fails.
+        let (program, _, label) = keyboard_settings_command()?;
+        which(program).then_some(label)
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        None
+    }
+}
+
+/// Whether `program` is on PATH. `Command::spawn` would tell us, but only by
+/// running it, and this decides whether to offer the button at all.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn which(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
+}
+
+/// Open the desktop's keyboard settings, detached, so the user can bind
+/// `quicksearch --toggle` without hunting for the page.
+pub fn open_keyboard_settings() {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Some((program, args, _)) = keyboard_settings_command() {
+        if let Err(e) = Command::new(program).args(args).spawn() {
+            quicksearch_core::log_warn!("opening {}: {}", program, e);
+        }
     }
 }

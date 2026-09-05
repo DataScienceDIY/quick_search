@@ -203,7 +203,8 @@ impl QuickSearchApp {
             return;
         };
         let roots = self.cfg.paths.indexing_paths.clone();
-        let actions = tour.ui(ctx, &roots);
+        let hotkey = self.cfg.ui.search_hotkey.clone();
+        let actions = tour.ui(ctx, &roots, &hotkey);
         // Through the same path a keystroke takes: `seed` arms the debounce,
         // so the demonstration search runs once the typing stops.
         if let Some(query) = actions.set_query {
@@ -211,6 +212,23 @@ impl QuickSearchApp {
         }
         if actions.focus_search {
             self.search.request_focus();
+        }
+        // Live, like the Settings slider on Apply — but saved only when the
+        // drag ends, so crossing the slider does not rewrite the config file
+        // on every frame.
+        if let Some(scale) = actions.set_scale {
+            self.cfg.ui.scale = scale;
+            ctx.set_zoom_factor(super::clamp_scale(scale));
+            if actions.save_scale {
+                self.save_cfg();
+            }
+        }
+        // Registered as it is captured, not on an Apply the tour has no
+        // button for — the page says it takes effect at once.
+        if let Some(hotkey) = actions.set_hotkey {
+            crate::hotkey::apply(&hotkey);
+            self.cfg.ui.search_hotkey = hotkey;
+            self.save_cfg();
         }
         // Through the guard, so a dirty draft still gets its say.
         if let Some(tab) = actions.goto_tab {

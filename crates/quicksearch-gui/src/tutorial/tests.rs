@@ -6,6 +6,8 @@ const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
 /// Deliberately not the real home directory: the folders page's fallback
 /// wording is the one every other test should see, whatever machine it runs on.
 const ROOT: &str = "/srv/projects";
+/// The shortcut in force, as the app would pass it in.
+const HOTKEY: &str = "Ctrl+Shift+F";
 
 fn roots() -> Vec<String> {
     vec![ROOT.to_string()]
@@ -19,6 +21,7 @@ fn at(page: usize) -> Tutorial {
         shown: Some(page),
         typing: None,
         moved: false,
+        capturing_hotkey: false,
     }
 }
 
@@ -30,6 +33,7 @@ fn entering(page: usize) -> Tutorial {
         shown: None,
         typing: None,
         moved: false,
+        capturing_hotkey: false,
     }
 }
 
@@ -43,7 +47,7 @@ fn pass(
     let roots = roots();
     let mut actions = TourActions::default();
     let out = ctx.run(raw_input_at(SCREEN, events, time), |ctx| {
-        actions = tour.ui(ctx, &roots);
+        actions = tour.ui(ctx, &roots, HOTKEY);
     });
     (out, actions)
 }
@@ -54,6 +58,9 @@ fn merge(a: TourActions, b: TourActions) -> TourActions {
         goto_tab: b.goto_tab.or(a.goto_tab),
         set_query: b.set_query.or(a.set_query),
         focus_search: a.focus_search || b.focus_search,
+        set_scale: b.set_scale.or(a.set_scale),
+        save_scale: a.save_scale || b.save_scale,
+        set_hotkey: b.set_hotkey.or(a.set_hotkey),
     }
 }
 
@@ -197,7 +204,7 @@ fn the_keyword_and_its_ring_pulse_in_step() {
             ctx.run(raw_input_at(SCREEN, Vec::new(), time), |ctx| {
                 crate::spotlight::set_active(ctx, true);
                 crate::spotlight::mark(ctx, Spot::StatusBar, target);
-                tour.ui(ctx, &roots);
+                tour.ui(ctx, &roots, HOTKEY);
             })
         };
         run();
@@ -258,6 +265,245 @@ fn an_unmarked_spot_is_not_ringed() {
             .into_iter()
             .any(|r| r.stroke.color.to_opaque() == ring.to_opaque() && r.stroke.width > 0.0),
         "something was ringed with nothing to ring"
+    );
+}
+
+/// The page carrying `extra`, which every test about one of them wants.
+fn page_with(extra: Extra) -> usize {
+    PAGES
+        .iter()
+        .position(|p| p.extra == Some(extra))
+        .unwrap_or_else(|| panic!("no page carries {extra:?}"))
+}
+
+/// A press, a move and a release, one frame each — a slider only follows a
+/// pointer that is already down, so a drag cannot be squeezed into one pass.
+fn drag(
+    ctx: &egui::Context,
+    tour: &mut Tutorial,
+    from: egui::Pos2,
+    to: egui::Pos2,
+) -> [TourActions; 3] {
+    let button = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let (_, press) = pass(
+        ctx,
+        tour,
+        vec![egui::Event::PointerMoved(from), button(from, true)],
+        1.0,
+    );
+    let (_, moved) = pass(ctx, tour, vec![egui::Event::PointerMoved(to)], 1.1);
+    let (_, release) = pass(ctx, tour, vec![button(to, false)], 1.2);
+    [press, moved, release]
+}
+
+/// The whole point of putting it on the first page: someone who cannot read
+/// the window can fix that without finding the Settings tab first.
+#[test]
+fn the_welcome_page_slider_sets_the_ui_scale() {
+    let ctx = crate::test_ui::ctx();
+    let scale_page = page_with(Extra::Scale);
+    let mut tour = at(scale_page);
+    let (out, _) = frame(&ctx, &mut tour, Vec::new());
+    let label = painted(&out)
+        .into_iter()
+        .find(|(text, _)| text == "UI scale")
+        .expect("the slider is labelled")
+        .1;
+    // The rail runs to the right of its label, on the same row.
+    let from = egui::pos2(label.right() + 30.0, label.center().y);
+    let [_, moved, release] = drag(&ctx, &mut tour, from, from + egui::vec2(120.0, 0.0));
+
+    let dragged = moved
+        .set_scale
+        .expect("dragging the slider changed nothing");
+    assert!(
+        crate::app::SCALE_RANGE.contains(&dragged),
+        "{dragged} is outside the range the slider offers"
+    );
+    assert_ne!(dragged, 1.0, "the drag did not move the value");
+    assert!(!moved.save_scale, "the config was written mid-drag");
+    assert_eq!(
+        release.set_scale,
+        Some(dragged),
+        "the release did not hand the settled value over to be saved"
+    );
+    assert!(release.save_scale, "the drag ended without being saved");
+
+    // And nothing happens on a frame nobody touched it.
+    let (_, quiet) = pass(&ctx, &mut tour, Vec::new(), 2.0);
+    assert_eq!(quiet.set_scale, None);
+    assert!(!quiet.save_scale);
+}
+
+/// The slider shows the size the window is already at — the config's, or
+/// whatever Ctrl +/- has done to it since — rather than offering a value
+/// that is not the user's.
+#[test]
+fn the_slider_starts_at_the_current_zoom() {
+    let ctx = crate::test_ui::ctx();
+    ctx.set_zoom_factor(1.4);
+    let mut tour = at(page_with(Extra::Scale));
+    let (out, _) = frame(&ctx, &mut tour, Vec::new());
+    let painted = painted_text(&out);
+    assert!(
+        painted.iter().any(|t| t == "1.40"),
+        "the slider does not read back a 1.4 zoom: {painted:?}"
+    );
+}
+
+/// The slider belongs to its page: on every other one the tour is prose and
+/// a footer, and a stray control would be pointing at nothing.
+#[test]
+fn only_the_welcome_page_offers_the_slider() {
+    let ctx = crate::test_ui::ctx();
+    for (page, spec) in PAGES.iter().enumerate() {
+        if page == page_with(Extra::Scale) {
+            continue;
+        }
+        let mut tour = at(page);
+        let (out, _) = frame(&ctx, &mut tour, Vec::new());
+        assert!(
+            !painted_text(&out).iter().any(|t| t == "UI scale"),
+            "page {page} ({}) also carries the scale slider",
+            spec.title
+        );
+    }
+}
+
+/// The command has to be the one that would actually work — a wrong one is
+/// worse than none, because the key it is bound to fails silently.
+#[test]
+fn the_shortcut_page_offers_the_command_to_bind() {
+    let ctx = crate::test_ui::ctx();
+    let mut tour = at(page_with(Extra::Shortcut));
+    let (out, actions) = frame(&ctx, &mut tour, Vec::new());
+    let want = format!("{} --toggle", crate::activate::command_name());
+    assert!(
+        painted_text(&out).contains(&want),
+        "the page does not show {want:?}: {:?}",
+        painted_text(&out)
+    );
+    assert!(
+        actions.set_hotkey.is_none(),
+        "nothing was pressed, but the tour asked to rebind the shortcut"
+    );
+    // The command is a full path when the app is not installed — this test
+    // binary's own, which is as long as it gets. It has to wrap inside the
+    // window rather than be what decides how wide the window is.
+    let width = ctx
+        .memory(|m| m.area_rect(egui::Id::new(WINDOW_ID)))
+        .expect("the tour's window")
+        .width();
+    assert!(
+        width <= 560.0,
+        "the command ({} points long) stretched the window to {width}",
+        want.len()
+    );
+
+    // Copy hands over the same string, verbatim.
+    let copy = crate::test_ui::painted_text_center(&out, "Copy").expect("a Copy button");
+    let (out, _) = pass(&ctx, &mut tour, click_at(copy), 1.0);
+    let copied: Vec<&String> = out
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(text) => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(copied, [&want], "Copy put something else on the clipboard");
+}
+
+/// The other half of the page: the same button the Settings tab uses to
+/// claim a key while QuickSearch is running, acting the moment it is pressed
+/// — the tour has no Apply to wait for.
+#[test]
+fn the_shortcut_page_rebinds_the_shortcut_it_shows() {
+    let ctx = crate::test_ui::ctx();
+    let mut tour = at(page_with(Extra::Shortcut));
+    let (out, _) = frame(&ctx, &mut tour, Vec::new());
+    // The button carries the shortcut in force, which is what the app passed.
+    let button = crate::test_ui::painted_text_center(&out, HOTKEY)
+        .expect("the shortcut button shows the shortcut in force");
+
+    // Armed by a click, and it says so rather than looking unchanged. The
+    // label is chosen before the click is known, so the next frame is the
+    // one that shows it.
+    let (_, actions) = pass(&ctx, &mut tour, click_at(button), 1.0);
+    assert!(tour.capturing_hotkey, "the click did not arm the capture");
+    assert!(
+        actions.set_hotkey.is_none(),
+        "armed, but nothing pressed yet"
+    );
+    let (out, _) = pass(&ctx, &mut tour, Vec::new(), 1.05);
+    assert!(
+        painted_text(&out)
+            .iter()
+            .any(|t| t.contains("Press a key combination")),
+        "nothing says the tour is waiting for keys: {:?}",
+        painted_text(&out)
+    );
+
+    // And the combination pressed next is the one handed back.
+    let press = vec![egui::Event::Key {
+        key: egui::Key::J,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::CTRL | egui::Modifiers::ALT,
+    }];
+    let (_, actions) = pass(&ctx, &mut tour, press, 1.1);
+    assert_eq!(actions.set_hotkey.as_deref(), Some("Ctrl+Alt+J"));
+    assert!(
+        !tour.capturing_hotkey,
+        "the capture stayed armed after taking a shortcut"
+    );
+
+    // The value comes from the app, so on the next frame — with the config
+    // not yet updated in this test — the tour asks for nothing further.
+    let (_, actions) = pass(&ctx, &mut tour, Vec::new(), 1.2);
+    assert_eq!(actions.set_hotkey, None, "it asked twice for one press");
+}
+
+/// The page a first-time user reads is not the place for egui's smallest
+/// text: the notes are 2 points up on `hint`, and this is what says so.
+#[test]
+fn the_notes_read_larger_than_the_page_counter() {
+    let ctx = crate::test_ui::ctx();
+    // No spots, so no keywords: the body is painted as it is written, and a
+    // paragraph can be looked up by the string in the table.
+    let page = PAGES
+        .iter()
+        .position(|p| p.pointer.is_some() && p.spots.is_empty() && !p.body.is_empty())
+        .expect("a page with a note and plain prose");
+    let mut tour = at(page);
+    let (out, _) = frame(&ctx, &mut tour, Vec::new());
+    let sizes = crate::test_ui::painted_sizes(&out);
+    let counter = format!("{} of {}", page + 1, PAGES.len());
+    let size_of = |needle: &str| {
+        sizes
+            .iter()
+            .find(|(text, _)| text == needle)
+            .unwrap_or_else(|| panic!("{needle:?} was not painted: {sizes:?}"))
+            .1
+    };
+    let note = size_of(PAGES[page].pointer.expect("checked above"));
+    let counter = size_of(&counter);
+    assert!(
+        note > counter,
+        "the note is {note} against the footer's {counter}"
+    );
+    let body = size_of(PAGES[page].body[0]);
+    assert!(
+        note < body,
+        "the note is {note}, no smaller than the body's {body} — it stops \
+         reading as an aside"
     );
 }
 
@@ -549,6 +795,17 @@ impl Span {
     }
 }
 
+/// A middle page with no control of its own: `footer_spans` clicks every x
+/// across a row, and a page carrying buttons or a slider is a page where a
+/// probe can hit something other than what it came for.
+fn plain_middle_page() -> usize {
+    PAGES
+        .iter()
+        .enumerate()
+        .position(|(n, page)| n > 0 && n + 1 < PAGES.len() && page.extra.is_none())
+        .expect("a middle page without an extra")
+}
+
 /// The three footer buttons, found by what clicking each one does. Must
 /// run on a middle page: on the last, Finish and Skip both dismiss
 /// without moving; on the first, Back is disabled.
@@ -583,7 +840,7 @@ fn footer_spans(ctx: &egui::Context, page: usize) -> [Option<Span>; 3] {
 #[test]
 fn the_footer_runs_back_then_skip_then_next_at_the_same_size() {
     let ctx = crate::test_ui::ctx();
-    let [back, skip, next] = footer_spans(&ctx, 1);
+    let [back, skip, next] = footer_spans(&ctx, plain_middle_page());
     let back = back.expect("no Back button in the footer");
     let skip = skip.expect("no Skip button in the footer");
     let next = next.expect("no Next button in the footer");
@@ -676,7 +933,7 @@ fn the_window_centres_itself_on_the_window_it_is_in() {
     let roots = roots();
     let mut run = |size: egui::Vec2| {
         let _ = ctx.run(raw_input_at(size, Vec::new(), 0.0), |ctx| {
-            tour.ui(ctx, &roots);
+            tour.ui(ctx, &roots, HOTKEY);
         });
         let rect = ctx
             .memory(|m| m.area_rect(egui::Id::new(WINDOW_ID)))

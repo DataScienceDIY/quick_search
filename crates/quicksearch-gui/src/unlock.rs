@@ -52,10 +52,11 @@ impl Gate {
         Gate::Locked(UnlockScreen::new(cfg, config_error, initial_query))
     }
 
-    /// Act on the system-wide search shortcut. Handled here because while
-    /// locked the unlock screen *is* the window.
-    fn handle_hotkey(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        if !crate::hotkey::take_fired() {
+    /// Act on a search shortcut, whether QuickSearch's own registration fired
+    /// it or a `--toggle` process relayed the desktop's. Handled here because
+    /// while locked the unlock screen *is* the window.
+    fn handle_activation(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if !crate::activate::take_pending() {
             return;
         }
         if let Gate::Running(app) = self {
@@ -65,13 +66,13 @@ impl Gate {
             }
             app.activate_search(ctx);
         }
-        crate::hotkey::raise(ctx, frame);
+        crate::activate::raise(ctx, frame);
     }
 }
 
 impl eframe::App for Gate {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.handle_hotkey(ctx, frame);
+        self.handle_activation(ctx, frame);
         match self {
             Gate::Running(app) => app.update(ctx, frame),
             Gate::Locked(screen) => {

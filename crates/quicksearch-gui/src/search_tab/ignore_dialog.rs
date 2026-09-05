@@ -11,14 +11,6 @@ pub struct IgnoreDialog {
     pub persist: bool,
 }
 
-/// Glob ignoring everything under `dir`, spelled with the platform
-/// separator. `Path::join` inserts a separator only where one is needed, so
-/// a drive root yields `C:\*` rather than the never-matching `C:\/*` a
-/// `format!("{}/*")` would produce.
-pub(super) fn dir_ignore_pattern(dir: &std::path::Path) -> String {
-    dir.join("*").to_string_lossy().into_owned()
-}
-
 impl SearchTab {
     pub(super) fn ignore_dialog_ui(&mut self, ctx: &egui::Context, actions: &mut SearchActions) {
         use crate::ui_util::{bordered_button, pattern_edit};

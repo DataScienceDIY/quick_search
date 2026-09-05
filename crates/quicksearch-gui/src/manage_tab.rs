@@ -241,10 +241,17 @@ impl ManageTab {
                 // Safe because the Remove click surrenders focus before the
                 // shift — pinned by tests::removing_a_root_does_not_leak_an_edit_onto_another_row.
                 for (i, root) in paths.indexing_paths.iter().enumerate() {
+                    // One rule per row, plus the closing one below the loop:
+                    // the Remove button then sits inside a bounded band with
+                    // the folder it belongs to, even with a single folder
+                    // listed. Drawn for every row alike, so the positional
+                    // widget ids below shift by a constant.
+                    ui.separator();
                     ui.horizontal(|ui| {
                         // Controls claim the right edge first.
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let remove_btn = ui.small_button("Remove").tip(&tips::REMOVE_ROOT);
+                            let remove_btn =
+                                ui.small_button("Remove Folder").tip(&tips::REMOVE_ROOT);
                             #[cfg(test)]
                             tests::record_widget("remove", &remove_btn);
                             if remove_btn.clicked() {
@@ -304,6 +311,9 @@ impl ManageTab {
                         });
                     });
                 }
+                // Closes the last row's band; the add controls below belong to
+                // no folder and must not read as another row.
+                ui.separator();
                 if let Some(i) = remove {
                     let removed = draft.paths.indexing_paths.remove(i);
                     draft.indexing.root_workers.remove(&removed);
@@ -342,33 +352,35 @@ impl ManageTab {
                     }
                 });
                 ui.label(hint(
-                    "Removing a folder removes its entries and leaves the rest of \
-                         the index untouched; adding one reindexes to pick it up. \
-                         Neither rebuilds.",
+                    "Adding a folder does not replace the current index, it adds to it.",
+                ));
+                ui.label(hint(
+                    "Removing a folder does not affect the whole index, only that \
+                         folder's entries.",
+                ));
+                ui.label(hint(
+                    "Neither action causes the index to be rebuilt from scratch.",
                 ));
                 ui.separator();
 
                 // --- Filters ---------------------------------------------------
                 ui.heading(egui::RichText::new("Content filters").strong());
+                // A box scrolled out of this tab's scroll area is still laid
+                // out, so its rect is somewhere off the panel: marking it
+                // would ring whatever now sits at those coordinates.
+                let mark_visible = |ui: &egui::Ui, spot, rect: egui::Rect| {
+                    if ui.is_rect_visible(rect) {
+                        crate::spotlight::mark(ui.ctx(), spot, rect);
+                    }
+                };
                 ui.columns(2, |cols| {
                     cols[0]
-                        .label("Full-text extensions whitelist (empty = all supported):")
-                        .tip(&tips::EXT_WHITELIST);
-                    cols[0]
-                        .add(
-                            egui::TextEdit::multiline(&mut self.ext_filter_text)
-                                .desired_rows(4)
-                                .desired_width(f32::INFINITY)
-                                .hint_text("txt\nmd\npdf  # comments allowed\n(none)"),
-                        )
-                        .tip(&tips::EXT_WHITELIST);
-                    cols[1]
-                        .label("Ignore patterns (excluded entirely):")
+                        .label("Ignore patterns (files and folders never indexed):")
                         .tip(&tips::IGNORE_PATTERNS);
                     let mut remove_pat: Option<usize> = None;
                     // The list grows and shrinks: keep it off the id of the
                     // editor below it (see `ui_util::stable_section`).
-                    crate::ui_util::stable_section(&mut cols[1], |ui| {
+                    crate::ui_util::stable_section(&mut cols[0], |ui| {
                         for (i, pat) in draft.indexing.ignore_patterns.iter().enumerate() {
                             ui.horizontal(|ui| {
                                 ui.with_layout(
@@ -394,7 +406,7 @@ impl ManageTab {
                     if let Some(i) = remove_pat {
                         draft.indexing.ignore_patterns.remove(i);
                     }
-                    cols[1].horizontal(|ui| {
+                    cols[0].horizontal(|ui| {
                         let (response, valid) = crate::ui_util::pattern_edit(
                             ui,
                             &mut self.new_ignore,
@@ -403,6 +415,9 @@ impl ManageTab {
                         );
                         let submitted =
                             response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        mark_visible(ui, crate::spotlight::Spot::IgnorePatterns, response.rect);
+                        #[cfg(test)]
+                        tests::record_widget("ignore-entry", &response);
                         response.tip(&tips::IGNORE_PATTERNS);
                         if ui
                             .add_enabled(valid, egui::Button::new("Add"))
@@ -417,12 +432,29 @@ impl ManageTab {
                             self.new_ignore.clear();
                         }
                     });
-                    crate::ui_util::pattern_hint_label(&mut cols[1], &self.new_ignore);
-                    cols[1].label(hint(
+                    crate::ui_util::pattern_hint_label(&mut cols[0], &self.new_ignore);
+                    cols[0].label(hint(
                         "Changes apply on Apply & Save. A new pattern removes the \
-                             entries it matches; removing one reindexes to bring them \
-                             back.",
+                             entries it matches; deleting a pattern from this list \
+                             reindexes to bring those files back.",
                     ));
+
+                    cols[1]
+                        .label("Full-text extensions whitelist (empty = read all supported types):")
+                        .tip(&tips::EXT_WHITELIST);
+                    let ext = cols[1]
+                        .add(
+                            egui::TextEdit::multiline(&mut self.ext_filter_text)
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("#EXAMPLE WHITELISTED FILE EXTENSIONS FOR FULL-TEXT-SEARCH:\n#MOUSE \
+                                OVER FOR MORE INFO\n#------------------------------------------------\ntxt\nmd\n \
+                                pdf  # comments allowed\n(none)"),
+                        )
+                        .tip(&tips::EXT_WHITELIST);
+                    mark_visible(&cols[1], crate::spotlight::Spot::ExtWhitelist, ext.rect);
+                    #[cfg(test)]
+                    tests::record_widget("ext-filter", &ext);
                 });
                 ui.separator();
 
@@ -597,7 +629,7 @@ fn watch_contents(ui: &mut egui::Ui, state: &IndexerState, config: &Config) {
         WatcherStatus::Active { dirs } => {
             ui.label(
                 egui::RichText::new(format!(
-                    "Live updates on, watching {} folders",
+                    "Live index updates, watching {} folders",
                     group_thousands(*dirs as u64)
                 ))
                 .small()
@@ -608,7 +640,7 @@ fn watch_contents(ui: &mut egui::Ui, state: &IndexerState, config: &Config) {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
                 format!(
-                    "Live updates off; reindexing every {}",
+                    "Periodic index updates; updating every {}",
                     fmt_interval(config.indexing.reindex_interval_minutes)
                 ),
             )
@@ -836,8 +868,14 @@ fn root_row(ui: &mut egui::Ui, r: &RootProgress, maintenance: Option<Maintenance
     // than one in flight. That moment of staleness is worth less than the row
     // keeping its height: with a checkpoint every few seconds, a line
     // vanishing and returning per root reflowed the whole block on a loop.
+    // Elided to the panel rather than to a character count: a full path over
+    // the width would wrap, and a hint that is one line or two is the very
+    // height change this row is drawn unconditionally to avoid. `Small` is the
+    // font `hint` paints in, and the budget has to be measured in that one.
     if let Some(f) = &r.current_file {
-        ui.label(hint(middle_truncate(f, 90)));
+        let font_id = egui::TextStyle::Small.resolve(ui.style());
+        let shown = middle_elide(ui, f, ui.available_width(), &font_id);
+        ui.label(hint(shown.as_ref()));
     }
 }
 

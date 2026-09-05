@@ -41,14 +41,19 @@ impl VerifyModal {
     }
 }
 
-/// One line of the report, in the words the modal paints.
-pub(crate) fn verdict_line(verdict: &MemberVerdict, reference: bool) -> String {
+/// One line of the report, in the words the modal paints. `reference_len` is
+/// how long the file everything was compared against was: an offset means
+/// little on its own, and "byte 91 of 2.1 MB" is what says the difference is
+/// in the header rather than in anything anyone typed.
+pub(crate) fn verdict_line(verdict: &MemberVerdict, reference: bool, reference_len: u64) -> String {
     match verdict {
         MemberVerdict::Identical if reference => "compared against".to_string(),
         MemberVerdict::Identical => "identical".to_string(),
-        MemberVerdict::DiffersAt(offset) => {
-            format!("differs at byte {}", group_thousands(*offset))
-        }
+        MemberVerdict::DiffersAt(offset) => format!(
+            "differs at byte {} of {}",
+            group_thousands(*offset),
+            human_size(reference_len)
+        ),
         MemberVerdict::LengthDiffers { len, reference_len } => format!(
             "size differs: {} against {}",
             human_size(*len),
@@ -181,9 +186,20 @@ pub(crate) fn verify_modal(ctx: &egui::Context, modal: &VerifyModal) -> bool {
                 };
                 ui.colored_label(color, summary_line(report));
                 if !identical {
+                    ui.label(
+                        "Grouping only reads each file's size and how it begins; \
+                         this read every byte.",
+                    );
+                    // The question this answers is the one everybody asks next:
+                    // the files look the same when opened, so how can they
+                    // differ? Named formats, because those are the ones people
+                    // hit — a run of invoices or a folder of .docx.
                     ui.label(hint(
-                        "Files are grouped by size and how they begin, which is all \
-                         indexing reads. This compared every byte.",
+                        "A difference near the start of a file is usually metadata you \
+                         never see. PDFs and Office documents store creation and \
+                         modification times, document IDs and revision numbers inside \
+                         the file itself, so copies that look and print identically are \
+                         still different files on disk.",
                     ));
                 }
                 ui.add_space(6.0);
@@ -201,7 +217,8 @@ pub(crate) fn verify_modal(ctx: &egui::Context, modal: &VerifyModal) -> bool {
                                 ui.label(
                                     egui::RichText::new(path.display().to_string()).monospace(),
                                 );
-                                let line = verdict_line(verdict, is_reference);
+                                let line =
+                                    verdict_line(verdict, is_reference, report.reference_len);
                                 if verdict.is_identical() {
                                     ui.label(hint(line));
                                 } else {
