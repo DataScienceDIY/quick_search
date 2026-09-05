@@ -23,10 +23,23 @@
 //! page                 read the rows, decide nothing
 //! +cover               ...and run the scope test per row
 //! +files               ...and delete the doomed `files` rows
-//! +fts(all)            ...and tombstone every doomed id      <- ships today
+//! +fts(all)            ...and tombstone every doomed id
 //! +fts(done)           ...tombstoning only ids that can have an FTS row
 //! +subtree             ...range-deleting a doomed directory instead of paging it
 //! ```
+//!
+//! **No stage is what ships any more.** `scope::advance` tombstones only the
+//! ids that can hold a posting (`+fts(done)`), commits per slice rather than
+//! per page, and turns FTS5's delete-merging off for the pass
+//! (`file_handling::fts_begin_tombstone_burst`), so the `live` row below lands
+//! under every stage rather than on one of them. The stages remain the
+//! decomposition — they say where the time is — and `live` says what the sum
+//! of the shipped decisions costs.
+//!
+//! Two of them were measured and **not** adopted, which is why they are still
+//! here: `+subtree` bought nothing over `+fts(done)` (247 ms against 243 on the
+//! 40k corpus, with all 8,080 doomed rows genuinely skipping the page loop), and
+//! raising the page cache moved misses twelvefold while barely moving the clock.
 //!
 //! **Read the `commit` column, not `fts`.** FTS5 buffers a contentless delete
 //! in memory and writes the tombstone pages when the transaction is flushed, so
@@ -824,7 +837,8 @@ fn main() {
 
         // The reference number every stage above is decomposing: the real
         // `scope::advance`, driven to completion the way the coordinator drives
-        // it. It must land on `+fts(all)`.
+        // it. It lands *under* every stage — see the header for which decisions
+        // put it there.
         {
             let arm = clone_arm(&master, &format!("prune-{}-live", label));
             let mut conn = open(&arm);

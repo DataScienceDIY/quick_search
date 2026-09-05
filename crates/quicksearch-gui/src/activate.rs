@@ -7,9 +7,12 @@
 //! box whether or not the app was started", because a shortcut an application
 //! registers for itself cannot fire while the application is not there.
 //!
-//! The message carries nothing: "come forward" is the whole protocol, and
-//! the reply exists only so the sender can tell a live instance from a
-//! leftover socket. An xdg-activation token would be the natural thing to
+//! The message carries nothing: "come forward" is the whole protocol. On
+//! unix the reply exists only so the sender can tell a live instance from a
+//! leftover socket; on Windows it instead carries the server's PID, which
+//! the sender feeds to `AllowSetForegroundWindow` so the running window may
+//! actually take the foreground — see the `#[cfg(windows)]` module below.
+//! An xdg-activation token would be the natural thing to
 //! carry — it is what a compositor wants before letting a background client
 //! take focus — but nothing downstream can consume one: winit 0.30 applies a
 //! token only in `WindowAttributes`, and egui's `ViewportBuilder` has no
@@ -27,6 +30,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// A flag rather than a queue: two presses before the app can redraw mean
 /// the same thing as one.
 static PENDING: AtomicBool = AtomicBool::new(false);
+
+/// The most a PID reply can be: a 32-bit PID is at most ten digits, and the
+/// newline ends it. Also the pipe's buffer size, so the server's write never
+/// blocks on a client that reads nothing.
+#[cfg_attr(not(windows), allow(dead_code))]
+const PID_REPLY_CAP: usize = 16;
+
+/// The server's PID out of its reply: ASCII decimal up to a newline.
+/// Anything else — truncation, garbage, an empty read — is `None`, which
+/// skips the foreground grant rather than failing the activation.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_pid_reply(reply: &[u8]) -> Option<u32> {
+    let line = reply.split(|&b| b == b'\n').next()?;
+    std::str::from_utf8(line).ok()?.parse().ok()
+}
 
 /// The socket identifying the instance that `config_path` configures.
 ///
@@ -190,9 +208,15 @@ mod imp {
     /// Runs until the process exits; a connection is one activation.
     fn serve(ctx: &egui::Context, listener: UnixListener) {
         for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            match answer(stream) {
-                Ok(()) => fire(ctx),
+            let Ok(mut stream) = stream else { continue };
+            match request(&mut stream) {
+                // Fire *before* the ack: a client that saw the reply may act
+                // on "delivered", and delivered means the window was already
+                // asked to come forward.
+                Ok(()) => {
+                    fire(ctx);
+                    let _ = acknowledge(&mut stream);
+                }
                 // One stalled or truncated peer must not stop the loop, and
                 // must not raise the window on a request it never finished.
                 Err(e) => quicksearch_core::log_warn!("a search shortcut request: {}", e),
@@ -200,13 +224,13 @@ mod imp {
         }
     }
 
-    /// Read the request and acknowledge it.
+    /// Read the request.
     ///
     /// Hostile input is the norm rather than the exception: any process of
     /// this user can connect. The read is bounded in both bytes and time, so
     /// a peer that connects and stalls cannot wedge the one thread that
     /// answers every activation.
-    pub(super) fn answer(mut stream: UnixStream) -> std::io::Result<()> {
+    pub(super) fn request(stream: &mut UnixStream) -> std::io::Result<()> {
         let timeout = std::time::Duration::from_secs(5);
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
@@ -214,8 +238,12 @@ mod imp {
         // One byte is the whole request; the cap is what keeps a peer from
         // holding this thread for as long as it cares to send.
         let mut scratch = [0u8; 1];
-        stream.read_exact(&mut scratch)?;
+        stream.read_exact(&mut scratch)
+    }
 
+    /// The reply that lets the sender tell a live instance from a leftover
+    /// socket file.
+    pub(super) fn acknowledge(stream: &mut UnixStream) -> std::io::Result<()> {
         stream.write_all(b"\n")?;
         stream.flush()
     }
@@ -224,11 +252,17 @@ mod imp {
 /// The same handshake over a named pipe, which is what Windows has instead
 /// of a unix socket.
 ///
-/// **One deliberate difference: there is no reply.** A named pipe exists only
-/// while a server holds an instance open — there is no file left behind — so
-/// a successful `CreateFileW` already proves a live instance accepted us, and
-/// the reply the unix side needs to tell a listener from a leftover socket
-/// would be dead weight here.
+/// **One deliberate difference: the reply is the foreground grant, not a
+/// liveness check.** A named pipe exists only while a server holds an
+/// instance open — there is no file left behind — so a successful
+/// `CreateFileW` already proves a live instance accepted us. What Windows
+/// *does* need is permission: `SetForegroundWindow` is refused to a process
+/// the user did not just interact with, and the running instance is exactly
+/// that. The `--toggle` process was launched by the user's keypress and so
+/// holds the right — and may donate it with `AllowSetForegroundWindow`, given
+/// the server's PID. The server therefore opens every connection by writing
+/// its PID, and the sender grants before sending the request, so the grant
+/// is always in force by the time the server raises.
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -247,6 +281,8 @@ mod imp {
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
         PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
     /// `\\.\pipe\quicksearch-<key>`, keyed exactly as the unix socket is, so
     /// the two processes agree by the same rule on both platforms.
@@ -300,6 +336,29 @@ mod imp {
                 return false;
             }
             let pipe = Handle(handle);
+            // The server opens with its PID; hand it the foreground right we
+            // hold from the user's keypress *before* asking it to raise. A
+            // reply that does not parse skips the grant — the raise then
+            // degrades to a taskbar flash rather than the request being lost.
+            let mut reply = [0u8; PID_REPLY_CAP];
+            let mut got = 0u32;
+            // SAFETY: `reply` and `got` are live for the call; the buffer
+            // length passed is the buffer's real length.
+            let ok = unsafe {
+                ReadFile(
+                    pipe.0,
+                    reply.as_mut_ptr(),
+                    reply.len() as u32,
+                    &mut got,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok != 0 {
+                if let Some(pid) = parse_pid_reply(&reply[..got as usize]) {
+                    // SAFETY: no pointers; any PID value is acceptable input.
+                    unsafe { AllowSetForegroundWindow(pid) };
+                }
+            }
             let mut written = 0u32;
             // SAFETY: a one-byte buffer and an output slot, both live here.
             let ok = unsafe {
@@ -349,8 +408,8 @@ mod imp {
                     PIPE_ACCESS_DUPLEX,
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
                     PIPE_UNLIMITED_INSTANCES,
-                    16,
-                    16,
+                    PID_REPLY_CAP as u32,
+                    PID_REPLY_CAP as u32,
                     0,
                     std::ptr::null(),
                 )
@@ -368,6 +427,28 @@ mod imp {
             // the read below is what decides, so it is not checked here.
             let _ = connected;
 
+            // Our PID first, before reading anything: the client turns it
+            // into a foreground grant and only then sends the request, so
+            // the grant precedes the raise however the two threads interleave.
+            // SAFETY: reads this process's own id, always valid.
+            let pid = format!("{}\n", unsafe { GetCurrentProcessId() });
+            let mut written = 0u32;
+            // SAFETY: the buffer and output slot are live; the length passed
+            // is the buffer's real length.
+            let wrote = unsafe {
+                WriteFile(
+                    pipe.0,
+                    pid.as_ptr(),
+                    pid.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            if wrote != 0 {
+                // SAFETY: the handle is open for the length of this call.
+                unsafe { FlushFileBuffers(pipe.0) };
+            }
+
             let mut scratch = [0u8; 1];
             let mut read = 0u32;
             // SAFETY: a one-byte buffer and an output slot, both live here.
@@ -380,12 +461,14 @@ mod imp {
                     std::ptr::null_mut(),
                 )
             };
-            // SAFETY: the handle is open for the length of this call.
-            unsafe { DisconnectNamedPipe(pipe.0) };
             // A peer that connected and said nothing is not an activation.
+            // Fired before the disconnect, so a client watching the pipe
+            // close can already rely on the window having been asked.
             if ok != 0 && read == 1 {
                 fire(ctx);
             }
+            // SAFETY: the handle is open for the length of this call.
+            unsafe { DisconnectNamedPipe(pipe.0) };
         }
     }
 }
@@ -436,6 +519,25 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// The Windows reply parser, which faces whatever a squatting process
+    /// cares to write into the well-known pipe name.
+    #[test]
+    fn the_pid_reply_parses_strictly() {
+        assert_eq!(parse_pid_reply(b"12345\n"), Some(12345));
+        assert_eq!(parse_pid_reply(b"1\nrest ignored"), Some(1));
+        for garbage in [
+            &b""[..],
+            b"\n",
+            b"-4\n",
+            b"12345678901234567890\n", // overflows a u32
+            b"abc\n",
+            b"12 34\n",
+            b"\xff\xfe\n",
+        ] {
+            assert_eq!(parse_pid_reply(garbage), None, "{:?}", garbage);
+        }
+    }
+
     #[test]
     fn a_pending_activation_is_consumed_once() {
         let _serial = pending_guard();
@@ -482,12 +584,13 @@ mod tests {
 
         let sender = std::thread::spawn(move || signal(&db));
 
-        let stream = listener
+        let mut stream = listener
             .incoming()
             .next()
             .expect("a connection")
             .expect("accepted");
-        imp::answer(stream).expect("a well-formed request");
+        imp::request(&mut stream).expect("a well-formed request");
+        imp::acknowledge(&mut stream).expect("acknowledged");
 
         assert!(sender.join().expect("sender"), "the client saw the reply");
     }
@@ -525,12 +628,15 @@ mod tests {
         let peer = UnixStream::connect(&path).expect("connect");
         drop(peer);
 
-        let stream = listener
+        let mut stream = listener
             .incoming()
             .next()
             .expect("a connection")
             .expect("accepted");
-        assert!(imp::answer(stream).is_err(), "an empty request is refused");
+        assert!(
+            imp::request(&mut stream).is_err(),
+            "an empty request is refused"
+        );
     }
 
     /// A config path unique to this test. Never opened as a file — only
@@ -585,6 +691,16 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(delivered, "the listener never answered");
-        assert!(take_pending(), "and the window was asked to come forward");
+        // Unlike unix there is no ack after the fire: the server reads the
+        // request after the client's write returns, so give it a moment.
+        let mut fired = false;
+        for _ in 0..100 {
+            if take_pending() {
+                fired = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(fired, "the window was never asked to come forward");
     }
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::walk::{walk_indexable_files, WalkEvent};
+use rusqlite::OptionalExtension;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -205,6 +206,97 @@ fn the_scan_reports_its_way_through_every_row() {
         seen.len() > 2 && seen[0] < end.examined,
         "progress was reported during the scan, not only at its end: {:?}",
         seen
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&db_dir).ok();
+}
+
+/// FTS5's delete-merge threshold is turned off for the length of a pass and
+/// must come back on at the end of it.
+///
+/// Both halves are asserted, and both matter. Without the first the pass is
+/// several times slower than it needs to be
+/// (`file_handling::fts_begin_tombstone_burst` carries the table). Without the
+/// second the index is left in a state where **no** later `'merge'` ever
+/// reclaims a tombstone again — `fts5IndexFindDeleteMerge` returns early on a
+/// zero threshold — and because FTS5 persists the setting in its `%_config`
+/// shadow table, that outlives the process. It is a silent, permanent
+/// degradation, which is exactly the kind of thing that needs a test rather
+/// than a comment.
+#[test]
+fn a_pass_turns_delete_merging_off_and_puts_it_back() {
+    let root = tmp_tree("burst");
+    for i in 0..6 {
+        touch(&root.join(format!("f{}.log", i)));
+    }
+    touch(&root.join("keep.txt"));
+
+    let db_dir = tmp_tree("burst-db");
+    let db = empty_db(&db_dir);
+    let mut conn = crate::db::open_existing(db.to_str().unwrap(), true).unwrap();
+    let mut config = Config::default();
+    config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
+    config.processing.batch_size = 1;
+    seed(&mut conn, &on_disk(&root));
+
+    // Read back out of FTS5's own `%_config`, not out of a value we remember:
+    // what outlives the process is what is written there.
+    let threshold = |conn: &Connection| -> Option<i64> {
+        conn.query_row(
+            "SELECT v FROM searchabletext_config WHERE k = 'deletemerge'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap()
+    };
+    assert_eq!(
+        threshold(&conn),
+        None,
+        "a fresh index leaves FTS5 on its own default and records nothing"
+    );
+
+    let mut narrowed = config.clone();
+    narrowed.indexing.ignore_patterns = vec!["*.log".into()];
+    let work = crate::config::diff_actions(&config, &narrowed).work;
+    let mut cursor = WorkCursor::new(work, &narrowed).unwrap();
+    let registry = Registry::default_set();
+    let run = AtomicBool::new(false);
+
+    // One slice, with a deadline already past: the pass is under way and has
+    // committed at least one page, so the threshold is off and durably so.
+    advance(
+        &mut conn,
+        &narrowed,
+        &registry,
+        &mut cursor,
+        Instant::now(),
+        &run,
+    )
+    .unwrap();
+    assert!(!cursor.done(), "one page cannot have finished seven rows");
+    assert_eq!(
+        threshold(&conn),
+        Some(0),
+        "delete-merging is off while the pass is creating tombstones"
+    );
+
+    while !cursor.done() {
+        advance(
+            &mut conn,
+            &narrowed,
+            &registry,
+            &mut cursor,
+            Instant::now(),
+            &run,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        threshold(&conn),
+        Some(i64::from(crate::file_handling::FTS_DELETEMERGE)),
+        "a finished pass leaves tombstone reclamation working again"
     );
 
     std::fs::remove_dir_all(&root).ok();

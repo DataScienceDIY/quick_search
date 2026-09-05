@@ -56,14 +56,18 @@ impl Gate {
     /// it or a `--toggle` process relayed the desktop's. Handled here because
     /// while locked the unlock screen *is* the window.
     fn handle_activation(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        if let Gate::Running(app) = self {
+            // The shortcut must not reshuffle the window under a key capture.
+            // The flag is left set, not consumed: capture ends on a key
+            // event, which repaints, and the press is acted on that frame.
+            if app.capturing_hotkey() {
+                return;
+            }
+        }
         if !crate::activate::take_pending() {
             return;
         }
         if let Gate::Running(app) = self {
-            // The shortcut must not reshuffle the window under a key capture.
-            if app.capturing_hotkey() {
-                return;
-            }
             app.activate_search(ctx);
         }
         crate::activate::raise(ctx, frame);

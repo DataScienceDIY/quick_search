@@ -391,6 +391,8 @@ impl QuickSearchApp {
             // Only when moved: on Wayland re-registering opens a new portal
             // session, which some desktops confirm with the user.
             crate::hotkey::apply(&new.ui.search_hotkey);
+            // And the system-wide binding follows, where one is written.
+            crate::shortcut_setup::hotkey_changed(&new.ui.search_hotkey);
         }
         if new.ui.color_scheme != self.cfg.ui.color_scheme {
             apply_theme(ctx, &new.ui.color_scheme);

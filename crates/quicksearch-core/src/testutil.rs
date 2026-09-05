@@ -286,7 +286,34 @@ pub struct SeedSpec {
     /// file cannot be reopened without it. Ignored on a plain arm, which has
     /// no reserve.
     pub hmac: Option<crate::db::schema::HmacMode>,
+    /// `(extension, mime)` pairs cycled across the rows, deciding what a
+    /// `content_extensions` filter can select. [`EXT_PLAIN`] — one pair, so
+    /// every row is `.txt`/`text/plain` — is what every harness measuring
+    /// search or indexing wants, and it is the default so their corpora are
+    /// byte-identical to what they have always been.
+    ///
+    /// It exists for `contentprobe`, where a filter that either takes the
+    /// whole index or none of it answers nothing. **A mix whose length shares
+    /// a factor with `content_every` puts every document behind the same few
+    /// extensions** — the degenerate-corpus trap `pruneprobe` documents
+    /// against its own strides — so a harness using this should assert the
+    /// fractions it ends up with rather than trusting the arithmetic.
+    pub ext_mix: &'static [(&'static str, &'static str)],
+    /// One row in every `pending_every` that *would* hold content is left in
+    /// the pending queue instead — born `STATE_PENDING` and never extracted,
+    /// which is the residue an interrupted content pass leaves behind. `0`
+    /// (the default) seeds none.
+    ///
+    /// It exists because such a row is the case a re-decision can skip the
+    /// most work on: it is neither `STATE_NA` (so a narrowed filter must still
+    /// flip it) nor `STATE_DONE` (so it has no posting and no stored text to
+    /// clear). A corpus without any cannot tell whether clearing content for
+    /// rows that cannot hold it costs anything.
+    pub pending_every: usize,
 }
+
+/// The single-extension corpus every harness but `contentprobe` seeds.
+pub const EXT_PLAIN: &[(&str, &str)] = &[("txt", "text/plain")];
 
 impl Default for SeedSpec {
     fn default() -> SeedSpec {
@@ -306,6 +333,8 @@ impl Default for SeedSpec {
             page_size: None,
             pgsz: None,
             hmac: None,
+            ext_mix: EXT_PLAIN,
+            pending_every: 0,
         }
     }
 }
@@ -314,7 +343,7 @@ impl Default for SeedSpec {
 /// measurement harnesses so they all describe the same corpus.
 pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
     use crate::db::repo::{insert_file, set_content_done, NewFile};
-    use crate::mime::FileType;
+    use crate::mime::mime_to_type;
 
     // Before the open, not after: the profile decides how the file is
     // *created*, and on a keyed file it decides whether it can be read at all.
@@ -335,6 +364,19 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
         .unwrap();
     }
     let mut rng = Lcg::new(0x5eed);
+    let ext_mix = if spec.ext_mix.is_empty() {
+        EXT_PLAIN
+    } else {
+        spec.ext_mix
+    };
+    // A row gets content only if an extractor would have claimed its MIME, so
+    // the seeded `content_state` is what a real run under an *unfiltered*
+    // config would have left. Without this a corpus of mixed extensions is
+    // born disagreeing with its own configuration, and the first reconcile
+    // against it spends its time repairing the seed rather than applying the
+    // edit. `EXT_PLAIN` is claimed by the plaintext extractor, so the
+    // single-extension corpus every other harness seeds is unchanged.
+    let registry = crate::extract::Registry::default_set();
     // Spacing, not a random draw: a cluster at the front would let a pass
     // stop early and report a fraction of the work a real rare query costs.
     let name_stride = spec.files / spec.needle_names.max(1);
@@ -346,10 +388,14 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
     for i in 0..spec.files {
         let w1 = rng.pick(WORDS);
         let w2 = rng.pick(WORDS);
+        // Extension and MIME move together: a row whose name says `.pdf` and
+        // whose MIME says `text/plain` would let `content_extractable`'s two
+        // halves disagree, which is exactly what a content filter is testing.
+        let (ext, mime) = ext_mix[i % ext_mix.len()];
         let name = if spec.needle_names > 0 && i % name_stride.max(1) == 0 {
-            format!("{}-{}-{:07}.txt", w1, NEEDLE, i)
+            format!("{}-{}-{:07}.{}", w1, NEEDLE, i, ext)
         } else {
-            format!("{}-{}-{:07}.txt", w1, w2, i)
+            format!("{}-{}-{:07}.{}", w1, w2, i, ext)
         };
         // Stored parents always end in a separator; see `dir_to_db_parent`.
         // Deeper segments are derived from the directory index, not the file
@@ -376,6 +422,11 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
             }
             bytes
         });
+        // `needs_content` is what the row is *born* as — `insert_file` gives it
+        // `STATE_PENDING`. Skipping the `set_content_done` below is therefore
+        // all it takes to leave one behind in the queue.
+        let needs_content = i % spec.content_every.max(1) == 0 && registry.supports(mime);
+        let extracted = needs_content && (spec.pending_every == 0 || i % spec.pending_every != 0);
         let id = insert_file(
             &tx,
             &NewFile {
@@ -383,15 +434,15 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
                 parent: &dir,
                 size: 4096,
                 mtime: 1_700_000_000 + i as u64,
-                mime: Some("text/plain"),
-                ftype: FileType::TEXT,
+                mime: Some(mime),
+                ftype: mime_to_type(mime),
                 hash: hash.as_ref().map(|h| h.as_slice()),
-                needs_content: i % spec.content_every.max(1) == 0,
+                needs_content,
             },
         )
         .unwrap()
         .expect("unique path");
-        if i % spec.content_every.max(1) == 0 {
+        if extracted {
             let mut body: Vec<&str> = (0..spec.body_words).map(|_| *rng.pick(WORDS)).collect();
             if spec.needle_docs > 0 && i % doc_stride.max(1) == 0 {
                 // Mid-body, so a snippet window has to be cut around it.

@@ -447,8 +447,8 @@ impl ManageTab {
                             egui::TextEdit::multiline(&mut self.ext_filter_text)
                                 .desired_rows(4)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("#EXAMPLE WHITELISTED FILE EXTENSIONS FOR FULL-TEXT-SEARCH:\n#MOUSE \
-                                OVER FOR MORE INFO\n#------------------------------------------------\ntxt\nmd\n \
+                                .hint_text("#EXAMPLE WHITELISTED FILE EXTENSIONS FOR FULL-TEXT-SEARCH\n#MOUSE \
+                                OVER FOR MORE INFO\ntxt\nmd\n \
                                 pdf  # comments allowed\n(none)"),
                         )
                         .tip(&tips::EXT_WHITELIST);

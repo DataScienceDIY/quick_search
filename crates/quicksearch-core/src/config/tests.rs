@@ -837,7 +837,7 @@ fn newer_fields_round_trip_and_default_when_absent() {
     fs::write(
         &path,
         "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n\
-         [ui]\nscale=1.25\n[search]\nfuzzy_default=true\ndisplay_limit=250\n",
+         [ui]\nscale=1.25\n[search]\nfuzzy_default=false\ndisplay_limit=250\n",
     )
     .unwrap();
     let cfg = Config::load_from(&path).unwrap();
@@ -850,7 +850,8 @@ fn newer_fields_round_trip_and_default_when_absent() {
     assert_eq!(cfg.ui.color_scheme, "dark");
     assert_eq!(cfg.search.fuzzy_max_edits, 2);
     assert_eq!(cfg.ui.scale, 1.25, "existing ui keys still parse");
-    assert!(cfg.search.fuzzy_default, "existing search keys still parse");
+    // `false` is the non-default value, so this only passes if the key parsed.
+    assert!(!cfg.search.fuzzy_default, "existing search keys still parse");
     assert_eq!(cfg.search.display_limit, 250);
 
     // A value nobody recognises is not a broken config file.

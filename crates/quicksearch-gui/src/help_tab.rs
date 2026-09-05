@@ -232,34 +232,50 @@ fn ranking_section(ui: &mut egui::Ui) {
         .spacing([CELL_SPACING, 5.0])
         .striped(true)
         .show(ui, |ui| {
-            let row = |ui: &mut egui::Ui, tier: &str, what: &str| {
-                ui.strong(tier);
+            // Each tier's chip wears the colour its results wear in the Rank
+            // column, keyed by the *first* cascade stage the collapsed tier
+            // covers (see the rank table in `search::cascade`): exact name
+            // 1–2, name contains 3–4, text inside 5–6, fuzzy 7–8, path 9–11.
+            let row = |ui: &mut egui::Ui, stage: u8, tier: &str, what: &str| {
+                ui.label(
+                    egui::RichText::new(format!(" {} ", tier))
+                        .strong()
+                        .background_color(crate::color::rank_tier_color(stage))
+                        // The same near-black the Search tab's chips carry,
+                        // which every ramp colour holds contrast against.
+                        .color(egui::Color32::from_rgb(32, 32, 32)),
+                );
                 cell(ui, prose, what);
                 ui.end_row();
             };
             row(
                 ui,
+                1,
                 "Exact name",
                 "the file is called exactly what you typed",
             );
             row(
                 ui,
+                3,
                 "Name contains",
                 "what you typed appears somewhere in the file's name",
             );
             row(
                 ui,
+                5,
                 "Text inside",
                 "the words are in the file's contents, most mentions first",
             );
             row(
                 ui,
+                7,
                 "Close spelling",
                 "a name or some text within a typo or two of what you typed, \
                  only while Fuzzy is ticked",
             );
             row(
                 ui,
+                9,
                 "Path only",
                 "nothing in the name or the text matched, but a folder along \
                  the way did",
@@ -601,8 +617,9 @@ mod tests {
     #[test]
     fn a_window_narrower_than_the_column_reflows_rather_than_clipping() {
         // 640 is the smallest window the app allows, and the UI scale
-        // divides it: 400 is roughly that window at 1.6x.
-        for width in [400.0_f32, 480.0, 560.0, 620.0] {
+        // divides it: 400 is roughly that window at 1.6x, and 250 is it at
+        // the 2.5x ceiling — the narrowest layout the app can produce.
+        for width in [250.0_f32, 320.0, 400.0, 480.0, 560.0, 620.0] {
             let ctx = crate::test_ui::ctx();
             let input = crate::test_ui::raw_input(egui::vec2(width, 6000.0), vec![]);
             let out = ctx.run(input, |ctx| {
@@ -620,6 +637,39 @@ mod tests {
                 "text laid out past the {}pt panel: {:#?}",
                 width,
                 overflowing
+            );
+        }
+    }
+
+    /// Every tier chip wears the Rank column's own colour for its first
+    /// cascade stage — the chips exist to demonstrate the blue→red ramp the
+    /// paragraph under the table describes.
+    #[test]
+    fn the_ranking_tiers_wear_the_rank_colors() {
+        let ctx = crate::test_ui::ctx();
+        let input = crate::test_ui::raw_input(egui::vec2(1000.0, 4000.0), vec![]);
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::ui(ui);
+            });
+        });
+        // A RichText background is a section format in the galley, not a
+        // separate rect shape.
+        let mut backgrounds = Vec::new();
+        for clipped in &out.shapes {
+            if let egui::epaint::Shape::Text(text) = &clipped.shape {
+                for section in &text.galley.job.sections {
+                    backgrounds.push(section.format.background);
+                }
+            }
+        }
+        for stage in [1u8, 3, 5, 7, 9] {
+            let color = crate::color::rank_tier_color(stage);
+            assert!(
+                backgrounds.contains(&color),
+                "no chip painted in stage {}'s colour {:?}",
+                stage,
+                color
             );
         }
     }

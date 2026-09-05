@@ -213,20 +213,20 @@ impl QuickSearchApp {
         if actions.focus_search {
             self.search.request_focus();
         }
-        // Live, like the Settings slider on Apply — but saved only when the
-        // drag ends, so crossing the slider does not rewrite the config file
-        // on every frame.
+        // Only ever emitted by the page's Apply button, so applying and
+        // saving belong together — the same pair the Settings tab's Apply
+        // performs.
         if let Some(scale) = actions.set_scale {
             self.cfg.ui.scale = scale;
             ctx.set_zoom_factor(super::clamp_scale(scale));
-            if actions.save_scale {
-                self.save_cfg();
-            }
+            self.save_cfg();
         }
         // Registered as it is captured, not on an Apply the tour has no
         // button for — the page says it takes effect at once.
         if let Some(hotkey) = actions.set_hotkey {
             crate::hotkey::apply(&hotkey);
+            // The system-wide binding follows, where one is written.
+            crate::shortcut_setup::hotkey_changed(&hotkey);
             self.cfg.ui.search_hotkey = hotkey;
             self.save_cfg();
         }

@@ -30,6 +30,7 @@ mod platform;
 mod query_highlight;
 mod search_tab;
 mod settings_tab;
+mod shortcut_setup;
 mod spotlight;
 #[cfg(test)]
 mod test_ui;
@@ -118,8 +119,17 @@ fn main() {
             // Losing the race to an instance that came up between the signal
             // above and here, or a plain second launch: either way the user
             // asked to see QuickSearch, and there is one to show them.
-            if activate::signal(&Config::config_path()) {
-                return;
+            //
+            // Retried, not tried once: the winner holds the lock the moment
+            // `main` reaches it but only listens once eframe's creation
+            // closure has run, so a `--toggle` landing in that gap would see
+            // the lock held and no socket. Two seconds outlasts that gap by
+            // orders of magnitude; a wedged instance still gets the dialog.
+            for _ in 0..20 {
+                if activate::signal(&Config::config_path()) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
             let who = match pid {
                 Some(pid) => format!(" (process {})", pid),

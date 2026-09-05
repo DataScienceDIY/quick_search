@@ -559,7 +559,7 @@ fn the_key_button_appears_only_while_the_index_is_encrypted() {
 
     let (_, full) = run_security(&ctx, &cfg, vec![]);
     assert!(
-        painted_text_center(&full, "Show database key…").is_none(),
+        painted_text_center(&full, "Show database key").is_none(),
         "offered the key of an unencrypted index: {:?}",
         painted_text(&full)
     );
@@ -567,7 +567,7 @@ fn the_key_button_appears_only_while_the_index_is_encrypted() {
     cfg.security.password_protected = true;
     let (_, full) = run_security(&ctx, &cfg, vec![]);
     assert!(
-        painted_text_center(&full, "Show database key…").is_some(),
+        painted_text_center(&full, "Show database key").is_some(),
         "no key button while encrypted: {:?}",
         painted_text(&full)
     );
@@ -587,7 +587,7 @@ fn clicking_the_key_button_reports_show_key() {
 
     let (quiet, full) = run_security(&ctx, &cfg, vec![]);
     assert!(quiet.is_none(), "reported an action nobody clicked");
-    let target = painted_text_center(&full, "Show database key…").expect("no key button");
+    let target = painted_text_center(&full, "Show database key").expect("no key button");
 
     let (action, _) = run_security(&ctx, &cfg, click_at(target));
     assert_eq!(action, Some(SecurityAction::ShowKey));
@@ -730,13 +730,20 @@ fn showing_advanced_settings_is_not_an_unsaved_edit() {
 }
 
 /// The panel that tells a user how to get a shortcut that also starts
-/// QuickSearch has to actually show the command they must bind.
+/// QuickSearch has to actually show the command they must bind — with or
+/// without a one-click desktop to lean on.
 #[test]
 fn the_shortcut_note_names_the_command_to_bind() {
     let ctx = crate::test_ui::ctx();
     let input = crate::test_ui::raw_input(egui::vec2(700.0, 300.0), vec![]);
     let out = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| super::shortcut_note(ui));
+        egui::CentralPanel::default().show(ctx, |ui| {
+            super::shortcut_note_for(
+                ui,
+                "Ctrl+Shift+F",
+                crate::shortcut_setup::Desktop::Unsupported,
+            )
+        });
     });
     let painted = painted_text(&out).join("\n");
     assert!(
@@ -744,4 +751,71 @@ fn the_shortcut_note_names_the_command_to_bind() {
         "the command to bind was not shown: {painted}"
     );
     assert!(painted.contains("Copy"), "no way to copy it: {painted}");
+}
+
+/// On a desktop we can write, the note leads with the one-click button (the
+/// probe is skipped by seeding the cached state, so the test stays
+/// hermetic), and the manual command stays as the fallback.
+#[test]
+fn a_supported_desktop_gets_the_one_click_button() {
+    let ctx = crate::test_ui::ctx();
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new("system-shortcut-state"),
+            super::SystemShortcutState {
+                installed: false,
+                feedback: None,
+            },
+        )
+    });
+    let input = crate::test_ui::raw_input(egui::vec2(700.0, 300.0), vec![]);
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            super::shortcut_note_for(ui, "Ctrl+Shift+F", crate::shortcut_setup::Desktop::Gnome)
+        });
+    });
+    let painted = painted_text(&out).join("\n");
+    assert!(
+        painted.contains("Set up Ctrl+Shift+F system-wide"),
+        "no one-click button: {painted}"
+    );
+    assert!(painted.contains("--toggle"), "the fallback vanished: {painted}");
+
+    // Already installed: the button flips to removal.
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            egui::Id::new("system-shortcut-state"),
+            super::SystemShortcutState {
+                installed: true,
+                feedback: None,
+            },
+        )
+    });
+    let input = crate::test_ui::raw_input(egui::vec2(700.0, 300.0), vec![]);
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            super::shortcut_note_for(ui, "Ctrl+Shift+F", crate::shortcut_setup::Desktop::Gnome)
+        });
+    });
+    let painted = painted_text(&out).join("\n");
+    assert!(painted.contains("Remove"), "no removal offered: {painted}");
+}
+
+/// No usable binding means nothing to write: the one-click flow bows out
+/// even on a supported desktop.
+#[test]
+fn no_binding_means_no_one_click_button() {
+    let ctx = crate::test_ui::ctx();
+    let input = crate::test_ui::raw_input(egui::vec2(700.0, 300.0), vec![]);
+    let out = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            super::shortcut_note_for(ui, "", crate::shortcut_setup::Desktop::Gnome)
+        });
+    });
+    let painted = painted_text(&out).join("\n");
+    assert!(
+        !painted.contains("system-wide"),
+        "offered to bind nothing: {painted}"
+    );
+    assert!(painted.contains("--toggle"), "the manual flow vanished: {painted}");
 }

@@ -156,6 +156,24 @@ impl Binding {
             .expect("every Binding key comes from KEYS")
     }
 
+    /// The accelerator in GTK's syntax — `<Ctrl><Shift>f` — which is what a
+    /// GNOME custom keybinding's `binding` key stores. GTK keyval names are
+    /// the X11 keysym names, so the keysym column serves both spellings.
+    pub fn gtk_accelerator(&self) -> String {
+        let mut out = String::new();
+        for (held, name) in [
+            (self.ctrl, "<Ctrl>"),
+            (self.alt, "<Alt>"),
+            (self.shift, "<Shift>"),
+        ] {
+            if held {
+                out.push_str(name);
+            }
+        }
+        out.push_str(self.row().1);
+        out
+    }
+
     /// The trigger in the XDG shortcuts spec's syntax: uppercase modifiers
     /// and an xkbcommon keysym, joined with `+`.
     pub fn portal_trigger(&self) -> String {
@@ -250,6 +268,17 @@ mod tests {
         let binding: Binding = cfg.search_hotkey.parse().expect("the default is valid");
         assert_eq!(binding.to_string(), "Ctrl+Shift+F");
         assert_eq!(binding.portal_trigger(), "CTRL+SHIFT+f");
+        assert_eq!(binding.gtk_accelerator(), "<Ctrl><Shift>f");
+    }
+
+    /// The keysym column doubles as the GTK keyval, so a named key must come
+    /// out under GTK's name for it, not egui's.
+    #[test]
+    fn gtk_accelerators_use_keysym_names() {
+        let binding: Binding = "Ctrl+Alt+PageUp".parse().unwrap();
+        assert_eq!(binding.gtk_accelerator(), "<Ctrl><Alt>Prior");
+        let binding: Binding = "Shift+Enter".parse().unwrap();
+        assert_eq!(binding.gtk_accelerator(), "<Shift>Return");
     }
 
     #[test]

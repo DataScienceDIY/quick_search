@@ -527,9 +527,12 @@ fn delete_ids_clears_every_dependent_table() {
     }
 
     let doomed = vec![ids["/t/b.log"], ids["/t/deep/c.log"]];
+    // `c.log` is FAILED and so holds no posting — the distinction the second
+    // argument draws, and the whole reason it is a separate list.
+    let with_postings = vec![ids["/t/b.log"]];
     let removed = {
         let tx = conn.transaction().unwrap();
-        let n = delete_ids(&tx, &doomed).unwrap();
+        let n = delete_ids(&tx, &doomed, &with_postings).unwrap();
         tx.commit().unwrap();
         n
     };
@@ -553,7 +556,7 @@ fn delete_ids_clears_every_dependent_table() {
 
     // Empty input is a no-op, not a statement with an empty `IN ()`.
     let tx = conn.transaction().unwrap();
-    assert_eq!(delete_ids(&tx, &[]).unwrap(), 0);
+    assert_eq!(delete_ids(&tx, &[], &[]).unwrap(), 0);
     tx.commit().unwrap();
 }
 
@@ -572,7 +575,8 @@ fn delete_ids_spans_chunk_boundaries() {
     let keep = all.pop().unwrap();
     let removed = {
         let tx = conn.transaction().unwrap();
-        let n = delete_ids(&tx, &all).unwrap();
+        // `seeded` leaves every row DONE, so both lists span the boundary.
+        let n = delete_ids(&tx, &all, &all).unwrap();
         tx.commit().unwrap();
         n
     };
@@ -1199,6 +1203,74 @@ fn fts_rows(conn: &Connection) -> i64 {
         .unwrap()
 }
 
+/// Every transition *out* of `STATE_DONE` takes the posting and the stored
+/// body with it, so "a `searchabletext` row exists exactly when `content_state`
+/// is `STATE_DONE`" holds however a row got where it is.
+///
+/// `count_root_counts_the_fts_rows_it_says_it_does` below checks the same
+/// equivalence over rows that were *never* DONE, which is the easy half — it
+/// passes even for a transition that leaves a stale posting behind. This is the
+/// half that does not, and `delete_files_matching` narrows its tombstone
+/// statement on the strength of it: a row that kept a posting past `DONE` would
+/// keep it past deletion too, and answer searches for a file that is gone.
+#[test]
+fn leaving_done_always_takes_the_posting_with_it() {
+    let (_dir, p) = tmp_path();
+    let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+
+    // Each row starts DONE — with a posting and a stored body — and then takes
+    // one of the four ways out.
+    let leave: [(&str, fn(&rusqlite::Transaction<'_>, i64)); 4] = [
+        ("/t/failed.txt", |tx, id| {
+            set_content_failed(tx, id, "bad parse").unwrap()
+        }),
+        ("/t/na.txt", |tx, id| set_content_na(tx, id).unwrap()),
+        ("/t/pending.txt", |tx, id| {
+            reset_content_pending(tx, id).unwrap()
+        }),
+        ("/t/rewritten.txt", |tx, id| {
+            // The shape a changed file takes: metadata updated in place.
+            update_file_basic(
+                tx,
+                &NewFile {
+                    name: "rewritten.txt",
+                    parent: "/t/",
+                    size: 99,
+                    mtime: 99,
+                    mime: Some("text/plain"),
+                    ftype: FileType::TEXT,
+                    hash: None,
+                    needs_content: true,
+                },
+            )
+            .unwrap()
+            .expect("the row is there");
+            let _ = id;
+        }),
+    ];
+
+    for (path, transition) in leave {
+        let tx = conn.transaction().unwrap();
+        let id = insert_at(&tx, path, true);
+        set_content_done(&tx, id, "body text", zstd_of("body text").as_deref()).unwrap();
+        transition(&tx, id);
+        tx.commit().unwrap();
+    }
+
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM files WHERE content_state = 1"),
+        0,
+        "every row left DONE"
+    );
+    assert_eq!(fts_rows(&conn), 0, "and none of them kept its posting");
+    assert_eq!(
+        count("SELECT COUNT(*) FROM documents_text"),
+        0,
+        "nor its stored body, which would outlive the file it was read from"
+    );
+}
+
 /// The premise of `count_root`: `content_state = DONE` exactly when a
 /// `searchabletext` row exists. Pinned against the FTS table itself, because
 /// the equivalence is what breaks if a transition writes one without the
@@ -1348,12 +1420,16 @@ fn the_parent_scan_reaches_the_roots_own_directory() {
 fn deleting_a_file_row_cascades_the_fk_tables() {
     let (_dir, path) = tmp_path();
     let mut conn = open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
-    let ids = seeded(&mut conn, &["/casc/a.txt", "/casc/b.txt"]);
+    seeded(&mut conn, &["/casc/a.txt", "/casc/b.txt"]);
     let count =
         |conn: &Connection, sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     {
+        // The failure goes on a row that never extracted, which is the only
+        // way a run reaches `set_content_failed` — and keeps the two searchable
+        // rows searchable, so the FTS figures below stay about the cascade.
         let tx = conn.transaction().unwrap();
-        set_content_failed(&tx, ids["/casc/b.txt"], "boom").unwrap();
+        let never = insert_at(&tx, "/casc/c.bin", true);
+        set_content_failed(&tx, never, "boom").unwrap();
         tx.commit().unwrap();
     }
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents_text"), 2);

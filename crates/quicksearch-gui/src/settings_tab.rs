@@ -293,7 +293,7 @@ impl SettingsTab {
                     );
                 });
                 hotkey_note(ui, &draft.ui.search_hotkey, &current.ui.search_hotkey);
-                shortcut_note(ui);
+                shortcut_note(ui, &current.ui.search_hotkey);
                 ui.separator();
 
                 // Security acts on the live config, not the draft; the KDF
@@ -378,7 +378,7 @@ pub(crate) fn hotkey_edit(
     let p = crate::color::palette(ui.visuals().dark_mode);
     ui.horizontal(|ui| {
         let label = if *capturing {
-            "Press a key combination...".to_string()
+            "Press a key combination…".to_string()
         } else if setting.trim().is_empty() {
             "None".to_string()
         } else {
@@ -488,26 +488,123 @@ fn hotkey_note(ui: &mut egui::Ui, draft: &str, live: &str) {
 ///
 /// The shortcut above is ours and needs no setup, but it cannot fire while
 /// QuickSearch is not running — see `crate::activate`. Only the desktop can
-/// bind a key that launches something, so this says what to bind and opens
-/// the place to bind it. Writing the desktop's own configuration instead was
-/// considered and rejected: it differs per desktop and between versions of
-/// the same one, and a shortcut we wrote and the user cannot see is worse
-/// than one they created.
+/// bind a key that launches something. Where the desktop's own configuration
+/// has a known home for that binding (`crate::shortcut_setup`), one button
+/// writes it — into the place the desktop's settings UI lists and edits, so
+/// it stays the user's to see and change. Everywhere else this says what to
+/// bind and opens the place to bind it.
+///
+/// `hotkey_setting` is the shortcut in force, which the one-click binding
+/// mirrors system-wide.
 ///
 /// Shared with the tour's shortcut page, which puts it under the same
 /// shortcut button this sentence says is "above".
-pub(crate) fn shortcut_note(ui: &mut egui::Ui) {
+pub(crate) fn shortcut_note(ui: &mut egui::Ui, hotkey_setting: &str) {
+    // Tests reach this through the tour's shortcut page; probing the real
+    // desktop there would make them depend on the machine they run on and
+    // spawn `gsettings`. Tests that want a desktop pin one through
+    // `shortcut_note_for`.
+    let desktop = if cfg!(test) {
+        crate::shortcut_setup::Desktop::Unsupported
+    } else {
+        crate::shortcut_setup::detect()
+    };
+    shortcut_note_for(ui, hotkey_setting, desktop);
+}
+
+/// One frame's answer from [`crate::shortcut_setup`], cached: `installed`
+/// probes the desktop with a subprocess, which must not run per frame.
+#[derive(Clone)]
+struct SystemShortcutState {
+    installed: bool,
+    /// The last install/remove outcome, `(succeeded, what to say)`.
+    feedback: Option<(bool, String)>,
+}
+
+/// The desktop split out of the environment so tests can pick one.
+fn shortcut_note_for(ui: &mut egui::Ui, hotkey_setting: &str, desktop: crate::shortcut_setup::Desktop) {
     let command = format!("{} --toggle", crate::activate::command_name());
     crate::ui_util::stable_section(ui, |ui| {
-        ui.label(
-            egui::RichText::new(
-                "The shortcut above works while QuickSearch is open. To have a key \
-                 start it as well, bind this command in your desktop's keyboard \
-                 settings:",
-            )
-            .small()
-            .weak(),
-        );
+        // One-click only with a key to write: an unset or unparseable
+        // shortcut leaves nothing to bind system-wide.
+        let binding = crate::hotkey::parse_setting(hotkey_setting).ok().flatten();
+        let one_click = binding.filter(|_| desktop != crate::shortcut_setup::Desktop::Unsupported);
+
+        if let Some(binding) = one_click {
+            // One id for the settings tab and the tour: they show one fact.
+            let id = egui::Id::new("system-shortcut-state");
+            let mut state = ui
+                .data_mut(|d| d.get_temp::<SystemShortcutState>(id))
+                .unwrap_or_else(|| SystemShortcutState {
+                    installed: crate::shortcut_setup::installed(),
+                    feedback: None,
+                });
+            ui.label(
+                egui::RichText::new(
+                    "The shortcut above works while QuickSearch is open. Your \
+                     desktop can also bind it to start QuickSearch when it is \
+                     not:",
+                )
+                .small()
+                .weak(),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if state.installed {
+                    ui.label(egui::RichText::new("The system shortcut is set up.").small());
+                    if ui.add(egui::Button::new("Remove").small()).clicked() {
+                        match crate::shortcut_setup::remove() {
+                            Ok(()) => {
+                                state.installed = false;
+                                state.feedback =
+                                    Some((true, "System shortcut removed.".to_string()));
+                            }
+                            Err(e) => state.feedback = Some((false, e)),
+                        }
+                    }
+                } else if ui
+                    .add(egui::Button::new(format!("Set up {} system-wide", binding)).small())
+                    .clicked()
+                {
+                    match crate::shortcut_setup::install(&binding) {
+                        Ok(()) => {
+                            state.installed = true;
+                            state.feedback = Some((
+                                true,
+                                "Added to your desktop's keyboard shortcuts. If the \
+                                 key does not answer right away, it will after the \
+                                 next login."
+                                    .to_string(),
+                            ));
+                        }
+                        Err(e) => state.feedback = Some((false, e)),
+                    }
+                }
+            });
+            if let Some((ok, text)) = &state.feedback {
+                let rich = egui::RichText::new(text).small();
+                ui.label(if *ok {
+                    rich.weak()
+                } else {
+                    rich.color(crate::color::palette(ui.visuals().dark_mode).orange)
+                });
+            }
+            ui.data_mut(|d| d.insert_temp(id, state));
+            ui.label(
+                egui::RichText::new("Or bind this command there yourself:")
+                    .small()
+                    .weak(),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "The shortcut above works while QuickSearch is open. To have a key \
+                     start it as well, bind this command in your desktop's keyboard \
+                     settings:",
+                )
+                .small()
+                .weak(),
+            );
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(&command).small().monospace());
             if ui.add(egui::Button::new("Copy").small()).clicked() {
@@ -580,30 +677,30 @@ fn security_ui(
         }
         ui.horizontal(|ui| {
             if ui
-                .button("Change password…")
+                .button("Change password")
                 .tip(&tips::CHANGE_PASSWORD)
                 .clicked()
             {
                 action = Some(SecurityAction::ChangePassword);
             }
             if ui
-                .button("Disable protection…")
+                .button("Disable protection")
                 .tip(&tips::DISABLE_PASSWORD)
                 .clicked()
             {
                 action = Some(SecurityAction::Disable);
             }
+            // The raw key is for someone recovering the file by hand; the
+            // password controls beside it are for everyone.
+            if form.advanced
+                && ui
+                    .button("Show database key")
+                    .tip(&tips::SHOW_KEY)
+                    .clicked()
+            {
+                action = Some(SecurityAction::ShowKey);
+            }
         });
-        // The raw key is for someone recovering the file by hand; the password
-        // controls above it are for everyone.
-        if form.advanced
-            && ui
-                .button("Show database key…")
-                .tip(&tips::SHOW_KEY)
-                .clicked()
-        {
-            action = Some(SecurityAction::ShowKey);
-        }
         let mut remember = current.security.use_keychain;
         if ui
             .checkbox(&mut remember, "Remember on this device")
@@ -615,7 +712,7 @@ fn security_ui(
     } else {
         ui.label("The index is not encrypted.");
         if ui
-            .button("Enable password protection…")
+            .button("Enable password protection")
             .tip(&tips::ENABLE_PASSWORD)
             .clicked()
         {

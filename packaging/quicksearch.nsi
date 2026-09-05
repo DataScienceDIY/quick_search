@@ -174,21 +174,23 @@ Section "Start Menu shortcut" SecStartMenu
     CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\quicksearch.exe" "--toggle" "$INSTDIR\quicksearch.ico"
 SectionEnd
 
-Section "Search hotkey (Ctrl+Alt+F)" SecHotkey
+Section "Search hotkey (Ctrl+Shift+F)" SecHotkey
     ; The .lnk "shortcut key" field is the only thing on Windows that binds a
     ; key to a command, and it is what makes the shortcut work while
     ; QuickSearch is closed - nothing an application registers for itself can
     ; fire when it is not running. Windows only honours the field on a
-    ; shortcut in the Start menu or on the desktop, and only for combinations
-    ; including Ctrl+Alt, which is why this is Ctrl+Alt+F and not the
-    ; Ctrl+Shift+F the Settings tab offers. The in-application shortcut takes
-    ; any combination but only answers while the window is already open, so
-    ; the two are complementary rather than duplicates.
+    ; shortcut in the Start menu or on the desktop. Modifier combinations
+    ; like Ctrl+Shift are accepted as-is; only a bare key gets Ctrl+Alt added
+    ; for it. Ctrl+Shift+F matches the in-application default, which answers
+    ; the key instantly while the window is open; this .lnk binding is the
+    ; slower launch path Explorer takes when it is not. Changing the shortcut
+    ; on the Settings tab rewrites this .lnk to match (per-user installs
+    ; only; this all-users file needs elevation).
     ;
     ; Rewrites the same shortcut the section above creates: NSIS cannot add a
     ; hotkey to an existing .lnk, and creating it twice is harmless.
     CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\quicksearch.exe" "--toggle" \
-        "$INSTDIR\quicksearch.ico" 0 SW_SHOWNORMAL ALT|CONTROL|F \
+        "$INSTDIR\quicksearch.ico" 0 SW_SHOWNORMAL CONTROL|SHIFT|F \
         "Search your files with ${APP}"
 SectionEnd
 
@@ -212,9 +214,8 @@ SectionEnd
     !insertmacro MUI_DESCRIPTION_TEXT ${SecStartMenu} \
         "Add ${APP} to the Start menu for all users."
     !insertmacro MUI_DESCRIPTION_TEXT ${SecHotkey} \
-        "Press Ctrl+Alt+F anywhere to search, starting ${APP} if it is not \
-         already running. Windows allows this only on Ctrl+Alt combinations; \
-         the Settings tab has one that takes any keys while ${APP} is open."
+        "Press Ctrl+Shift+F anywhere to search, starting ${APP} if it is not \
+         already running. The Settings tab can rebind it."
     !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} \
         "Add a ${APP} shortcut to the desktop."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END

@@ -20,8 +20,14 @@
 //!   which shows up as a highlighted task entry. Closing that gap means
 //!   patching both winit (to activate a live surface) and eframe (to carry
 //!   the token), the way `vendor/` already patches two other crates.
-//! * **Windows**: `SetForegroundWindow` is refused to background processes,
-//!   so the same limit applies to a process that did not just receive input.
+//! * **Windows**: `SetForegroundWindow` is refused to background processes —
+//!   but the `--toggle` sender was launched by the user's keypress and
+//!   donates its right over the pipe with `AllowSetForegroundWindow` (see
+//!   `crate::activate`'s Windows module), after which [`win32_activate`]'s
+//!   `SetForegroundWindow` is honoured. The in-app hotkey path needs no
+//!   grant: the press was delivered to this process. Only the portal-less
+//!   case with no grant — e.g. some other process poking the pipe — degrades
+//!   to a taskbar flash.
 
 /// Whether this is a Wayland session, where an already-open window cannot be
 /// raised. The Settings tab says so rather than letting the shortcut look
@@ -50,7 +56,13 @@ pub fn raise(ctx: &egui::Context, frame: &eframe::Frame) {
             return;
         }
     }
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    #[cfg(windows)]
+    {
+        if win32_activate(frame) {
+            return;
+        }
+    }
+    #[cfg(not(any(all(unix, not(target_os = "macos")), windows)))]
     {
         let _ = frame;
     }
@@ -58,6 +70,56 @@ pub fn raise(ctx: &egui::Context, frame: &eframe::Frame) {
     // A window still minimised cannot take focus.
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+}
+
+/// Restore and foreground our window with the Win32 calls themselves.
+/// `false` falls back to winit's viewport commands.
+///
+/// Not `ViewportCommand::Focus`: winit's `focus_window` routes through the
+/// same `SetForegroundWindow`, but only after the event loop wakes and with
+/// its own preconditions, and it neither restores a minimised window nor
+/// reports failure. Calling the API here keeps restore-then-foreground in
+/// one place, immediately, while the `AllowSetForegroundWindow` grant from
+/// the `--toggle` sender is fresh.
+#[cfg(windows)]
+fn win32_activate(frame: &eframe::Frame) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    let handle = match frame.window_handle() {
+        Ok(handle) => handle,
+        Err(e) => {
+            quicksearch_core::log_warn!("raising the window: no window handle: {}", e);
+            return false;
+        }
+    };
+    let hwnd = match handle.as_raw() {
+        RawWindowHandle::Win32(win32) => win32.hwnd.get() as _,
+        other => {
+            quicksearch_core::log_warn!("raising the window: not a Win32 window: {:?}", other);
+            return false;
+        }
+    };
+    // SAFETY: `hwnd` is this process's live window for the whole call; these
+    // APIs accept any window handle and merely fail on a bad one.
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindow(hwnd, SW_RESTORE);
+        }
+        if SetForegroundWindow(hwnd) == 0 {
+            // No grant in force (see the module docs): the most Windows
+            // allows from here is a taskbar flash, which the winit fallback
+            // produces. Logged so a shortcut that only flashes is traceable.
+            quicksearch_core::log_warn!(
+                "raising the window: SetForegroundWindow was refused; \
+                 flashing the taskbar instead"
+            );
+            return false;
+        }
+    }
+    true
 }
 
 // The X connection used for activation, kept open across presses.

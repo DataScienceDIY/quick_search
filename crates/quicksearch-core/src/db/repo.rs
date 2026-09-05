@@ -318,7 +318,23 @@ pub fn raw_text_len(blob: &[u8]) -> Option<u64> {
 }
 
 /// Mark a file's content extraction as failed. Keeps the basic row in place.
+///
+/// Clears any posting and stored body first, which matters twice over. It is
+/// what a re-extraction that fails *owes* the reader: the text that is there
+/// came out of an earlier version of a file that has since changed, so leaving
+/// it serves hits for content the file no longer has. And it is what makes
+/// "a `searchabletext` row exists exactly when `content_state` is
+/// `STATE_DONE`" true of every transition rather than of most of them —
+/// an equivalence `count_root` reports from and `delete_files_matching` now
+/// narrows on, so a transition that quietly broke it would leave postings
+/// behind for files that are no longer indexed.
+///
+/// Every path that reaches here today is already re-extracting a row it has
+/// just reset (`update_file_basic`) or that was born pending, so the two
+/// deletes are normally no-ops; extraction failures are rare enough that
+/// paying for the guarantee is not worth measuring.
 pub fn set_content_failed(tx: &Transaction<'_>, file_id: i64, reason: &str) -> Result<(), String> {
+    remove_content_for_id(tx, file_id)?;
     let now = crate::log::now_unix() as i64;
     exec(
         tx,
@@ -337,7 +353,15 @@ pub fn set_content_failed(tx: &Transaction<'_>, file_id: i64, reason: &str) -> R
 
 /// Mark content extraction as not applicable; the row still serves filename
 /// search.
+///
+/// Clears any posting and stored body first, for the reasons spelled out on
+/// [`set_content_failed`] — a row arrives here because its content should no
+/// longer be searchable, so leaving the old text behind contradicts the very
+/// transition. Every caller already cleared first or had nothing to clear, so
+/// this changes no behaviour; what it changes is that the invariant no longer
+/// depends on all of them remembering.
 pub fn set_content_na(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
+    remove_content_for_id(tx, file_id)?;
     set_state_clearing_failure(tx, file_id, STATE_NA, "update NA")
 }
 
@@ -380,6 +404,16 @@ pub fn delete_subtree(tx: &Transaction<'_>, lo: &str, hi: &str) -> Result<usize,
 /// and reconcile's `orphans()` sweep. `searchabletext` cannot cascade — an
 /// FTS5 virtual table takes no foreign key — so its contentless delete must
 /// stay explicit.
+///
+/// **Deliberately *not* narrowed to `content_state = STATE_DONE`**, though the
+/// rows it would exclude are provably the ones with nothing to tombstone (see
+/// [`delete_ids`], which does narrow). The two are not the same trade: this one
+/// works from a range rather than a list of decided rows, so reading
+/// `content_state` costs a `files` row fetch per candidate — the very rows the
+/// `DELETE` below is about to fetch anyway, but a second traversal of them all
+/// the same. That is a certain cost against an uncertain saving, and the saving
+/// it buys is one `%_docsize` seek into a b-tree far smaller than `files`.
+/// `examples/pruneprobe.rs` prices the range form; narrow this when it says to.
 fn delete_files_matching(
     tx: &Transaction<'_>,
     files_where: &str,
@@ -437,23 +471,118 @@ fn placeholders(n: usize) -> String {
 
 /// Delete the given file ids and everything keyed to them. Returns how many
 /// `files` rows went. Dependent tables: see `delete_files_matching`.
-pub fn delete_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<usize, String> {
-    let mut removed = 0;
-    for chunk in ids.chunks(DELETE_IDS_CHUNK) {
-        let placeholders = placeholders(chunk.len());
+///
+/// `with_postings` is the subset of `ids` whose `content_state` was
+/// `STATE_DONE`, and so the only ones FTS5 can have anything to tombstone for —
+/// `repo_tests::leaving_done_always_takes_the_posting_with_it` is what makes
+/// that true of every transition. Handing FTS5 the rest is not free: each is a
+/// `%_docsize` seek to discover an absence, and on an index where most rows
+/// carry no text that is most of the list.
+///
+/// Taking it as a second argument rather than deriving it here is the point:
+/// the caller decided these rows from a page it had already read, so it holds
+/// `content_state` for nothing, where a `SELECT` back out of `files` would cost
+/// a row fetch each (see `delete_files_matching`, which for that reason does
+/// not narrow).
+///
+/// It must be a subset: an id left out keeps its posting after its `files` row
+/// is gone, which surfaces as a hit for a file that is no longer indexed.
+pub fn delete_ids(
+    tx: &Transaction<'_>,
+    ids: &[i64],
+    with_postings: &[i64],
+) -> Result<usize, String> {
+    for chunk in with_postings.chunks(DELETE_IDS_CHUNK) {
         let sql = format!(
             "DELETE FROM searchabletext WHERE rowid IN ({})",
-            placeholders
+            placeholders(chunk.len())
         );
         exec(tx, &sql, params_from_iter(chunk.iter()), || {
             format!("delete searchabletext for {} ids", chunk.len())
         })?;
-        let sql = format!("DELETE FROM files WHERE id IN ({})", placeholders);
+    }
+    let mut removed = 0;
+    for chunk in ids.chunks(DELETE_IDS_CHUNK) {
+        let sql = format!(
+            "DELETE FROM files WHERE id IN ({})",
+            placeholders(chunk.len())
+        );
         removed += exec(tx, &sql, params_from_iter(chunk.iter()), || {
             format!("delete {} file rows", chunk.len())
         })?;
     }
     Ok(removed)
+}
+
+/// Set `content_state` on many rows at once, leaving everything else alone.
+///
+/// The batch form of the `UPDATE` inside [`set_state_clearing_failure`], and
+/// deliberately *without* its `failed_files` sweep: only a `STATE_FAILED` row
+/// can hold such a record, so a caller that knows the stored states can clear
+/// the few that need it with [`clear_failed_for_ids`] instead of paying a
+/// delete per row. A caller that does not know them must call the per-row
+/// helpers, which cannot get this wrong.
+pub fn set_content_state(tx: &Transaction<'_>, ids: &[i64], state: i64) -> Result<usize, String> {
+    let mut changed = 0;
+    for chunk in ids.chunks(DELETE_IDS_CHUNK) {
+        let sql = format!(
+            "UPDATE files SET content_state = ?1 WHERE id IN ({})",
+            placeholders(chunk.len())
+        );
+        let params = params_from_iter(
+            std::iter::once(&state as &dyn rusqlite::ToSql)
+                .chain(chunk.iter().map(|id| id as &dyn rusqlite::ToSql)),
+        );
+        changed += exec(tx, &sql, params, || {
+            format!("set content_state {} on {} rows", state, chunk.len())
+        })?;
+    }
+    Ok(changed)
+}
+
+/// Drop the FTS posting and the stored body of many rows at once, leaving
+/// their `files` rows in place: the batch form of [`remove_content_for_id`].
+///
+/// Pass only ids whose stored `content_state` was `STATE_DONE`; the others
+/// have neither, and asking is what costs (see `delete_files_matching`).
+pub fn clear_content_for_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<(), String> {
+    for chunk in ids.chunks(DELETE_IDS_CHUNK) {
+        let list = placeholders(chunk.len());
+        for (what, sql) in [
+            (
+                "searchabletext",
+                format!("DELETE FROM searchabletext WHERE rowid IN ({})", list),
+            ),
+            (
+                "documents_text",
+                format!("DELETE FROM documents_text WHERE file_id IN ({})", list),
+            ),
+        ] {
+            exec(tx, &sql, params_from_iter(chunk.iter()), || {
+                format!("clear {} for {} ids", what, chunk.len())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Forget the failure records of many rows at once. `list-failed` reads
+/// `failed_files` directly, so a stale entry keeps reporting a file broken —
+/// this is the batch half of what [`set_state_clearing_failure`] does per row.
+///
+/// Pass only ids whose stored `content_state` was `STATE_FAILED`: nothing else
+/// can hold a record here.
+pub fn clear_failed_for_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<(), String> {
+    for chunk in ids.chunks(DELETE_IDS_CHUNK) {
+        let sql = format!(
+            "DELETE FROM failed_files WHERE file_id IN ({})",
+            placeholders(chunk.len())
+        );
+        exec(tx, &sql, params_from_iter(chunk.iter()), || {
+            format!("clear failed_files for {} ids", chunk.len())
+        })?;
+    }
+    Ok(())
 }
 
 /// Every indexed file directly inside `parent`, as `name -> mtime`. `parent`

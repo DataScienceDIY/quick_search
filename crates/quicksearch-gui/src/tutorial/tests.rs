@@ -22,6 +22,7 @@ fn at(page: usize) -> Tutorial {
         typing: None,
         moved: false,
         capturing_hotkey: false,
+        staged_scale: None,
     }
 }
 
@@ -34,6 +35,7 @@ fn entering(page: usize) -> Tutorial {
         typing: None,
         moved: false,
         capturing_hotkey: false,
+        staged_scale: None,
     }
 }
 
@@ -59,7 +61,6 @@ fn merge(a: TourActions, b: TourActions) -> TourActions {
         set_query: b.set_query.or(a.set_query),
         focus_search: a.focus_search || b.focus_search,
         set_scale: b.set_scale.or(a.set_scale),
-        save_scale: a.save_scale || b.save_scale,
         set_hotkey: b.set_hotkey.or(a.set_hotkey),
     }
 }
@@ -302,9 +303,11 @@ fn drag(
 }
 
 /// The whole point of putting it on the first page: someone who cannot read
-/// the window can fix that without finding the Settings tab first.
+/// the window can fix that without finding the Settings tab first. Staged
+/// until Apply: applying mid-drag would rescale the slider under the
+/// pointer, and the handle would chase its own tail.
 #[test]
-fn the_welcome_page_slider_sets_the_ui_scale() {
+fn the_welcome_page_slider_applies_only_on_its_button() {
     let ctx = crate::test_ui::ctx();
     let scale_page = page_with(Extra::Scale);
     let mut tour = at(scale_page);
@@ -316,28 +319,36 @@ fn the_welcome_page_slider_sets_the_ui_scale() {
         .1;
     // The rail runs to the right of its label, on the same row.
     let from = egui::pos2(label.right() + 30.0, label.center().y);
-    let [_, moved, release] = drag(&ctx, &mut tour, from, from + egui::vec2(120.0, 0.0));
-
-    let dragged = moved
-        .set_scale
-        .expect("dragging the slider changed nothing");
+    let [press, moved, release] = drag(&ctx, &mut tour, from, from + egui::vec2(120.0, 0.0));
+    for (what, actions) in [("press", &press), ("move", &moved), ("release", &release)] {
+        assert_eq!(
+            actions.set_scale, None,
+            "the {what} applied the scale without Apply being clicked"
+        );
+    }
+    let staged = tour.staged_scale.expect("the drag staged nothing");
     assert!(
-        crate::app::SCALE_RANGE.contains(&dragged),
-        "{dragged} is outside the range the slider offers"
+        crate::app::SCALE_RANGE.contains(&staged),
+        "{staged} is outside the range the slider offers"
     );
-    assert_ne!(dragged, 1.0, "the drag did not move the value");
-    assert!(!moved.save_scale, "the config was written mid-drag");
-    assert_eq!(
-        release.set_scale,
-        Some(dragged),
-        "the release did not hand the settled value over to be saved"
-    );
-    assert!(release.save_scale, "the drag ended without being saved");
+    assert_ne!(staged, 1.0, "the drag did not move the value");
 
-    // And nothing happens on a frame nobody touched it.
-    let (_, quiet) = pass(&ctx, &mut tour, Vec::new(), 2.0);
+    // The staged value survives idle frames, then Apply hands it over once.
+    let (out, quiet) = pass(&ctx, &mut tour, Vec::new(), 2.0);
     assert_eq!(quiet.set_scale, None);
-    assert!(!quiet.save_scale);
+    assert_eq!(tour.staged_scale, Some(staged));
+    let apply = painted(&out)
+        .into_iter()
+        .find(|(text, _)| text == "Apply")
+        .expect("no Apply button beside the slider")
+        .1;
+    let (_, applied) = pass(&ctx, &mut tour, click_at(apply.center()), 2.1);
+    assert_eq!(
+        applied.set_scale,
+        Some(staged),
+        "Apply did not hand the staged value over"
+    );
+    assert_eq!(tour.staged_scale, None, "Apply left the value staged");
 }
 
 /// The slider shows the size the window is already at — the config's, or

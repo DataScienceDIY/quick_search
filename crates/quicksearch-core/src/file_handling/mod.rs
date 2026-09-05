@@ -27,7 +27,8 @@ pub(crate) use paths::{
 };
 pub use records::{
     classify_by_mtime, classify_for_indexing, content_extractable, decide_content,
-    extract_and_store, fts_begin_bulk_write, fts_finalize_after_text_indexing, fts_set_automerge,
+    extract_and_store, fts_begin_bulk_write, fts_begin_tombstone_burst, fts_end_tombstone_burst,
+    fts_finalize_after_text_indexing, fts_set_automerge, FTS_DELETEMERGE,
     get_file_hash, hash_failure_counts, outcome_body, prepare_file_record,
     prepare_file_record_from_path, reset_run_warnings, store_content_outcome, ContentOutcome,
     DirRows, FileIndexAction, OwnedNewFile,

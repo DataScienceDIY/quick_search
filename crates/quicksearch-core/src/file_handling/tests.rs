@@ -600,3 +600,38 @@ fn a_symlinked_root_yields_no_directories_when_following_is_off() {
 
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// A reconcile killed mid-burst leaves `deletemerge` at 0, where no later
+/// `'merge'` would reclaim a tombstone again. The next indexing run repairs it.
+///
+/// This is the whole reason [`fts_begin_bulk_write`] writes a value it never
+/// lowers: the pairing in `scope::advance` covers the orderly cases, and this
+/// covers the process simply not coming back.
+#[test]
+fn a_bulk_write_repairs_a_delete_merge_threshold_left_off() {
+    let dir = crate::testutil::scratch_dir("deletemerge-repair");
+    let db = dir.join("index.sqlite");
+    let conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+
+    let threshold = || -> Option<i64> {
+        conn.query_row(
+            "SELECT v FROM searchabletext_config WHERE k = 'deletemerge'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+    };
+
+    // What a killed burst leaves behind.
+    fts_begin_tombstone_burst(&conn);
+    assert_eq!(threshold(), Some(0), "the burst is in effect");
+
+    fts_begin_bulk_write(&conn);
+    assert_eq!(
+        threshold(),
+        Some(i64::from(FTS_DELETEMERGE)),
+        "the next run puts tombstone reclamation back"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

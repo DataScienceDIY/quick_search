@@ -116,6 +116,147 @@ pub fn fts_set_automerge(conn: &Connection, segments: u8) {
 /// smaller, more build-stable index for no cost; 64 measured identically.
 const WRITE_CRISISMERGE: u8 = 32;
 
+/// Percentage of a level's entries that must be tombstones before FTS5 rewrites
+/// the level to reclaim them, and **the single most expensive setting a bulk
+/// withdrawal of content runs into.** FTS5's own default, restored by
+/// [`fts_begin_bulk_write`] and by [`fts_end_tombstone_burst`].
+///
+/// `0` disables delete-merging entirely — including from an explicit `'merge'`,
+/// because `fts5IndexFindDeleteMerge` returns early on it — so it must never be
+/// the resting value of an index. [`fts_begin_tombstone_burst`] is the only
+/// thing that sets it, and always in a pair.
+pub const FTS_DELETEMERGE: u8 = 10;
+
+/// Set FTS5's delete-merge threshold. Best-effort; failure is logged.
+fn fts_set_deletemerge(conn: &Connection, percent: u8) {
+    if let Err(e) = conn.execute(
+        "INSERT INTO searchabletext(searchabletext, rank) VALUES('deletemerge', ?1)",
+        [percent as i64],
+    ) {
+        crate::log_warn!("FTS deletemerge failed (non-fatal): {}", e);
+    }
+}
+
+/// Stop FTS5 reclaiming tombstones *while* a pass is creating them, for a
+/// caller that is about to delete a great many postings in one go and will call
+/// [`fts_end_tombstone_burst`] when it is done.
+///
+/// # What it is worth
+///
+/// `examples/contentprobe.rs`, 40k rows of which 7,273 lose their content
+/// (6,909 of them holding a posting), chunked deletes, committing per
+/// `scope::SLICE`. Both arms, each pair from one run:
+///
+/// | arm | | fts | commit | pass | + merge | misses |
+/// |---|---|---|---|---|---|---|
+/// | plain | `deletemerge` 10 | 734 ms | 96 ms | **891 ms** | 892 ms | 97,130 |
+/// | plain | `deletemerge` 0 | 86 ms | 11 ms | **141 ms** | 218 ms | 9,654 |
+/// | keyed | `deletemerge` 10 | 1174 ms | 263 ms | **1576 ms** | 1579 ms | 96,181 |
+/// | keyed | `deletemerge` 0 | 128 ms | 17 ms | **211 ms** | 373 ms | 9,476 |
+///
+/// 6.3x on the pass plain and 7.5x keyed; 4.1x and 4.2x once the trailing merge
+/// is counted. Page-cache misses fall tenfold, which is why the keyed arm gains
+/// more — every one of those pages was being decrypted and re-encrypted.
+///
+/// It also lands on a **smaller** index than the shipped path does — `%_data`
+/// 1,753 rows against 1,886 — because one merge at the end consolidates better
+/// than many mid-pass ones. That is the whole bargain: the mid-pass merges are
+/// not just expensive, they are worse at the job.
+///
+/// End to end — `scope::advance` driven to completion the way the coordinator
+/// drives it, on an idle machine — this and the two changes beside it are worth
+/// **4.3x to 5.6x**, and the ratio *grows* with the index, because the levels
+/// being needlessly rewritten grow with it:
+///
+/// | corpus | arm | before | after | |
+/// |---|---|---|---|---|
+/// | 40k | plain | 1,066 ms | **248 ms** | 4.3x |
+/// | 40k | keyed | 1,814 ms | **417 ms** | 4.4x |
+/// | 200k | plain | 4,600 ms | **925 ms** | 5.0x |
+/// | 200k | keyed | 8,598 ms | **1,530 ms** | 5.6x |
+///
+/// The 40k pair is a true A/B: the same probe and corpus run against this tree
+/// and against `HEAD` without these changes. Its *control* is what makes it a
+/// measurement rather than two numbers from two binaries —
+/// `contentprobe`'s `+clear(all)` stage reproduces the old shape in the probe's
+/// own code, so it must not move between the builds, and it did not (1000 → 996
+/// plain, 1801 → 1770 keyed). The 200k rows use that validated stage as the
+/// "before", which is why they can come from a single run.
+///
+/// Measured and rejected alongside it: sorting each page's ids into rowid order
+/// before deleting, which moved nothing (898 ms against 891 plain, 1565 against
+/// 1576 keyed). FTS5 picks a tombstone page by *hashing* the rowid, so there is
+/// no locality to restore.
+///
+/// # Why it is so large
+///
+/// Every contentless delete counts into the same write-counter that drives
+/// `fts5IndexAutomerge`, and once a level passes this threshold
+/// `fts5IndexFindDeleteMerge` picks it and rewrites the whole level — inline
+/// with the scan, and then again as the pass keeps deleting. Rewriting the
+/// full-text index is what building it was.
+///
+/// # The pairing is load-bearing
+///
+/// `deletemerge` is persisted in FTS5's `%_config` shadow table, so a value
+/// left at `0` outlives the process and no later `'merge'` would ever reclaim a
+/// tombstone again. [`fts_end_tombstone_burst`] restores it, and
+/// [`fts_begin_bulk_write`] sets it unconditionally so that a crash between the
+/// two is repaired by the next indexing run rather than being permanent.
+pub fn fts_begin_tombstone_burst(conn: &Connection) {
+    fts_set_deletemerge(conn, 0);
+}
+
+/// Rounds of [`fts_finalize_after_text_indexing`] a burst may spend
+/// consolidating before it gives up and leaves the rest to the next run.
+///
+/// Three is what the corpus in [`fts_begin_tombstone_burst`] needed; the cap is
+/// above that so the common case finishes, and exists only so a pathological
+/// index cannot hold the coordinator thread indefinitely.
+const BURST_MERGE_ROUNDS: u32 = 8;
+
+/// Restore delete-merging and consolidate what the burst left behind. The
+/// mirror of [`fts_begin_tombstone_burst`]; see there for the measurements.
+///
+/// The order matters twice: the merge would reclaim nothing with the threshold
+/// still at `0`, and the threshold must go back even when there is nothing to
+/// merge, because a value left there would outlive the process.
+///
+/// # Why this merges to quiescence and `fts_finalize_after_text_indexing`
+/// does not
+///
+/// A single 1000-page `'merge'` is the right bargain at the end of an indexing
+/// run — whatever it leaves, the next run's merge finishes, and it was never
+/// far behind. A burst is a different bargain: it deliberately built up a
+/// backlog several times larger than a run ever does (`%_data` 4,931 rows
+/// against the 1,886 the shipped path leaves), and searching against that until
+/// some future run is a cost this pass created and should pay. It takes 77 ms
+/// plain and 162 ms keyed, against the ~750 ms and ~1,450 ms the burst saved.
+///
+/// The quiescence signal is the `%_data` row count, and it has to be: measured
+/// in `examples/pruneprobe.rs`, `sqlite3_changes()` after a `'merge'` reports
+/// non-zero forever, so the obvious `while changes() != 0` never terminates.
+pub fn fts_end_tombstone_burst(conn: &Connection) {
+    fts_set_deletemerge(conn, FTS_DELETEMERGE);
+    let mut last = fts_data_rows(conn);
+    for _ in 0..BURST_MERGE_ROUNDS {
+        fts_finalize_after_text_indexing(conn);
+        let now = fts_data_rows(conn);
+        if now == last {
+            return;
+        }
+        last = now;
+    }
+}
+
+/// Rows in FTS5's `%_data` shadow table — how much the full-text index is
+/// physically holding, tombstones and all. `None` if it cannot be read, which
+/// stops [`fts_end_tombstone_burst`]'s loop rather than spinning it.
+fn fts_data_rows(conn: &Connection) -> Option<i64> {
+    conn.query_row("SELECT COUNT(*) FROM searchabletext_data", [], |r| r.get(0))
+        .ok()
+}
+
 /// Apply the write-side FTS5 settings, before a run starts writing.
 ///
 /// `pgsz` is deliberately absent: it is not a per-run setting. Sweeping it
@@ -123,8 +264,13 @@ const WRITE_CRISISMERGE: u8 = 32;
 /// default 4050 stands there. Keyed is the opposite — SQLCipher's page reserve
 /// makes 4050 a cliff — and that case is handled once at schema creation; see
 /// [`crate::db::schema::FTS_PGSZ_ENCRYPTED`].
+///
+/// `deletemerge` is set even though this never lowers it: it is how an index
+/// whose reconcile was killed mid-burst gets its tombstone reclamation back.
+/// See [`fts_begin_tombstone_burst`].
 pub fn fts_begin_bulk_write(conn: &Connection) {
     fts_set_automerge(conn, WRITE_AUTOMERGE);
+    fts_set_deletemerge(conn, FTS_DELETEMERGE);
     if let Err(e) = conn.execute(
         "INSERT INTO searchabletext(searchabletext, rank) VALUES('crisismerge', ?1)",
         [WRITE_CRISISMERGE as i64],

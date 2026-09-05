@@ -506,9 +506,9 @@ pub static REMEMBER_KEYCHAIN: Tip = Tip {
     body: "Hands the key to the password store your system already has, such \
            as GNOME Keyring, KWallet, or Windows Credential Manager, so that \
            QuickSearch can unlock the index without asking at startup.\n\n\
-           The password itself is never stored, only the key worked out from \
-           it, and only on this machine. Off, you type the password each time \
-           QuickSearch starts.",
+           The password itself is never stored, only key securely created from \
+           it, and only on this machine. When off you must type the password each \
+           time QuickSearch starts.",
     examples: &[],
     caution: None,
 };

@@ -251,7 +251,7 @@ impl Default for ProcessingConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         SearchConfig {
-            fuzzy_default: false,
+            fuzzy_default: true,
             fuzzy_max_edits: 2,
             display_limit: 1000,
             results_per_page: 100,

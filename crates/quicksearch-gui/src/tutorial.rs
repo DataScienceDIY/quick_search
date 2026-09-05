@@ -345,6 +345,9 @@ fn note(ui: &egui::Ui, text: impl Into<egui::RichText>) -> egui::RichText {
 struct Live<'a> {
     /// `ctx.zoom_factor()`, read before the window is laid out.
     zoom: f32,
+    /// The slider's position while it differs from `zoom` — chosen but not
+    /// yet applied. `None` once Apply is clicked or nothing is pending.
+    staged_scale: &'a mut Option<f32>,
     /// The shortcut in force, as the config spells it.
     hotkey: &'a str,
     capturing_hotkey: &'a mut bool,
@@ -357,27 +360,24 @@ fn extra_ui(ui: &mut egui::Ui, extra: Extra, live: &mut Live, actions: &mut Tour
     ui.separator();
     match extra {
         Extra::Scale => {
-            let mut scale = live.zoom;
+            // Staged until Apply, like the Settings tab's slider: applying
+            // mid-drag rescales the slider under the pointer, so the handle
+            // chases its own tail and the value cannot be chosen.
+            let mut scale = live.staged_scale.unwrap_or(live.zoom);
             ui.horizontal(|ui| {
                 ui.label("UI scale");
                 // Scoped to this row, which is the whole of its use.
                 ui.spacing_mut().slider_width = 220.0;
-                let slider = ui.add(
+                ui.add(
                     egui::Slider::new(&mut scale, crate::app::SCALE_RANGE)
                         .step_by(0.05)
                         .fixed_decimals(2),
                 );
-                // Applied on every frame it moves, saved once it settles: a
-                // drag would otherwise rewrite the config file dozens of
-                // times on its way across. The release frame is not itself a
-                // change — the value stopped moving — so it is asked about
-                // separately, and carries the value with it so the app has
-                // one thing to act on.
-                let moved = slider.changed();
-                let settled = slider.drag_stopped() || (moved && !slider.dragged());
-                if moved || settled {
+                let pending = (scale - live.zoom).abs() > f32::EPSILON;
+                *live.staged_scale = pending.then_some(scale);
+                if ui.add_enabled(pending, egui::Button::new("Apply")).clicked() {
                     actions.set_scale = Some(scale);
-                    actions.save_scale = settled;
+                    *live.staged_scale = None;
                 }
             });
             ui.label(note(
@@ -399,7 +399,7 @@ fn extra_ui(ui: &mut egui::Ui, extra: Extra, live: &mut Live, actions: &mut Tour
             if setting != live.hotkey {
                 actions.set_hotkey = Some(setting);
             }
-            crate::settings_tab::shortcut_note(ui);
+            crate::settings_tab::shortcut_note(ui, live.hotkey);
         }
     }
 }
@@ -453,10 +453,10 @@ pub struct TourActions {
     pub goto_tab: Option<Tab>,
     pub set_query: Option<String>,
     pub focus_search: bool,
-    /// A new UI scale from the welcome page's slider, to apply live.
+    /// A new UI scale from the welcome page's slider, applied and saved on
+    /// its Apply button — never mid-drag, which would rescale the slider
+    /// under the pointer.
     pub set_scale: Option<f32>,
-    /// The drag ended, so the scale above is worth writing to the config.
-    pub save_scale: bool,
     /// A shortcut captured on the shortcut page, to register and save.
     pub set_hotkey: Option<String>,
 }
@@ -473,6 +473,8 @@ pub struct Tutorial {
     /// The shortcut button is armed and the next key combination is the
     /// answer — the Settings tab's own capture, and its own flag.
     capturing_hotkey: bool,
+    /// The welcome page's scale slider, between moving and Apply.
+    staged_scale: Option<f32>,
 }
 
 impl Tutorial {
@@ -483,6 +485,7 @@ impl Tutorial {
             typing: None,
             moved: false,
             capturing_hotkey: false,
+            staged_scale: None,
         }
     }
 
@@ -526,6 +529,7 @@ impl Tutorial {
         // Lifted out of `self` for the window's closure, and put back after:
         // the closure already holds the page and the actions.
         let mut capturing = self.capturing_hotkey;
+        let mut staged_scale = self.staged_scale;
         let mut dismissed = false;
         let mut window = egui::Window::new(page.title)
             .id(egui::Id::new(WINDOW_ID))
@@ -555,6 +559,7 @@ impl Tutorial {
             if let Some(extra) = page.extra {
                 let mut live = Live {
                     zoom,
+                    staged_scale: &mut staged_scale,
                     hotkey,
                     capturing_hotkey: &mut capturing,
                 };
@@ -604,6 +609,7 @@ impl Tutorial {
             self.moved = true;
         }
         self.capturing_hotkey = capturing;
+        self.staged_scale = staged_scale;
 
         // The widgets this page names, in the colours its keywords were given.
         let dark_mode = ctx.style().visuals.dark_mode;
