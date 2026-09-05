@@ -466,6 +466,21 @@ fn hotkey_note(ui: &mut egui::Ui, draft: &str, live: &str) {
                 ),
                 None,
             ),
+            // On Windows a failed registration is the *expected* state
+            // whenever the Start-menu shortcut owns the same key — Explorer
+            // registers it at logon, wins, and every press then reaches us
+            // through the `--toggle` relay anyway. An error color would cry
+            // wolf on every installed copy.
+            Status::Error(why) if cfg!(windows) => (
+                format!(
+                    "Another program holds this key ({}) — usually the Start \
+                     menu shortcut that starts QuickSearch, which also brings \
+                     it forward while it is running. If the key does nothing, \
+                     pick a different combination.",
+                    why
+                ),
+                None,
+            ),
             Status::Error(why) => (
                 format!("The shortcut is not active: {}.", why),
                 Some(crate::color::palette(ui.visuals().dark_mode).orange),
@@ -570,10 +585,7 @@ fn shortcut_note_for(ui: &mut egui::Ui, hotkey_setting: &str, desktop: crate::sh
                             state.installed = true;
                             state.feedback = Some((
                                 true,
-                                "Added to your desktop's keyboard shortcuts. If the \
-                                 key does not answer right away, it will after the \
-                                 next login."
-                                    .to_string(),
+                                "Added to your desktop's keyboard shortcuts.".to_string(),
                             ));
                         }
                         Err(e) => state.feedback = Some((false, e)),

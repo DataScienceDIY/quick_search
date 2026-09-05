@@ -2,6 +2,7 @@
 
 use super::*;
 
+use crate::tips::{self, Tipped};
 use crate::ui_util::hint;
 
 impl QuickSearchApp {
@@ -48,18 +49,19 @@ impl QuickSearchApp {
                                 ui.label(
                                     egui::RichText::new(match (r.total, r.fraction()) {
                                         (Some(total), Some(frac)) => format!(
-                                            "Applying configuration change · {} / {} ({:.0}%)",
+                                            "Rebuilding FTS cache · {} / {} ({:.0}%)",
                                             group_thousands(r.examined as u64),
                                             group_thousands(total as u64),
                                             frac * 100.0
                                         ),
                                         _ => format!(
-                                            "Applying configuration change · {} entries",
+                                            "Rebuilding FTS cache · {} entries",
                                             group_thousands(r.examined as u64)
                                         ),
                                     })
                                     .small(),
-                                );
+                                )
+                                .tip(&tips::REBUILDING_FTS);
                                 progress_widget(ui, r.fraction());
                             }
                             ReconcileState::Finished(r) => {
@@ -74,21 +76,28 @@ impl QuickSearchApp {
                         }
                     }
                     IndexingStatus::Preparing { start_time, step } => {
-                        let (label, frac) = match step {
+                        // Only the reconcile step has a wait worth explaining;
+                        // the rest are over in a moment.
+                        let (label, frac, tip) = match step {
                             PrepStep::PreviousRun => {
-                                ("Finishing the previous run…".to_string(), None)
+                                ("Finishing the previous run…".to_string(), None, None)
                             }
-                            PrepStep::OpeningIndex => ("Opening the index…".to_string(), None),
-                            PrepStep::Starting => ("Getting the index ready…".to_string(), None),
+                            PrepStep::OpeningIndex => {
+                                ("Opening the index…".to_string(), None, None)
+                            }
+                            PrepStep::Starting => {
+                                ("Getting the index ready…".to_string(), None, None)
+                            }
                             PrepStep::Reconciling(r) => (
                                 format!(
-                                    "Applying configuration change · {} entries",
+                                    "Rebuilding FTS cache · {} entries",
                                     group_thousands(r.examined as u64)
                                 ),
                                 r.fraction(),
+                                Some(&tips::REBUILDING_FTS),
                             ),
                         };
-                        ui.label(
+                        let response = ui.label(
                             egui::RichText::new(format!(
                                 "{} · {}",
                                 label,
@@ -96,6 +105,9 @@ impl QuickSearchApp {
                             ))
                             .small(),
                         );
+                        if let Some(tip) = tip {
+                            response.tip(tip);
+                        }
                         progress_widget(ui, frac);
                     }
                     IndexingStatus::Idle => {

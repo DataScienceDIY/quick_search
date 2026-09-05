@@ -18,6 +18,11 @@ use crate::hotkey::Binding;
 
 /// Where a binding can be written. `Unsupported` hides the one-click button
 /// and leaves the manual flow.
+///
+/// Off unix the two named desktops are unreachable — [`detect`] answers
+/// `Unsupported` and the dispatchers below never name them — so the variants
+/// exist there only to keep this one enum for every platform.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Desktop {
     Gnome,
@@ -52,31 +57,75 @@ fn desktop_for(desktops: &str) -> Desktop {
 
 /// Whether the binding this module writes is currently present. Asks the
 /// desktop, so callers should cache rather than poll every frame.
+///
+/// The three functions here are split by platform the same way [`detect`] is:
+/// the desktops that have a home for a binding are all unix, and their modules
+/// only exist there, so naming them off unix would not compile.
 pub fn installed() -> bool {
-    match detect() {
-        Desktop::Gnome => gnome::installed(),
-        Desktop::Kde => kde::installed(),
-        Desktop::Unsupported => false,
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        match detect() {
+            Desktop::Gnome => gnome::installed(),
+            Desktop::Kde => kde::installed(),
+            Desktop::Unsupported => false,
+        }
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        false
     }
 }
 
 /// Write `binding` → `quicksearch --toggle` into the desktop's keyboard
 /// configuration. Idempotent: a second install rewrites the same entry.
 pub fn install(binding: &Binding) -> Result<(), String> {
-    let command = format!("{} --toggle", crate::activate::command_name());
-    match detect() {
-        Desktop::Gnome => gnome::install(binding, &command),
-        Desktop::Kde => kde::install(binding),
-        Desktop::Unsupported => Err("this desktop is not supported".to_string()),
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let command = toggle_command();
+        match detect() {
+            Desktop::Gnome => gnome::install(binding, &command),
+            Desktop::Kde => kde::install(binding, &command),
+            Desktop::Unsupported => Err(UNSUPPORTED.to_string()),
+        }
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let _ = binding;
+        Err(UNSUPPORTED.to_string())
+    }
+}
+
+/// What every platform without a home for a binding answers. On Windows the
+/// closed-app binding is the installer's `.lnk`, so there is nothing here to
+/// write and the Settings tab shows the manual note instead.
+const UNSUPPORTED: &str = "this desktop is not supported";
+
+/// The command line the key runs, quoted for a path with spaces in it —
+/// both GNOME's `command` key and a desktop file's `Exec` split on
+/// whitespace and honour double quotes.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn toggle_command() -> String {
+    let exe = crate::activate::command_name();
+    if exe.contains(char::is_whitespace) {
+        format!("\"{}\" --toggle", exe)
+    } else {
+        format!("{} --toggle", exe)
     }
 }
 
 /// Delete the entry [`install`] wrote; a no-op if it is already gone.
 pub fn remove() -> Result<(), String> {
-    match detect() {
-        Desktop::Gnome => gnome::remove(),
-        Desktop::Kde => kde::remove(),
-        Desktop::Unsupported => Err("this desktop is not supported".to_string()),
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        match detect() {
+            Desktop::Gnome => gnome::remove(),
+            Desktop::Kde => kde::remove(),
+            Desktop::Unsupported => Err(UNSUPPORTED.to_string()),
+        }
+    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        Err(UNSUPPORTED.to_string())
     }
 }
 
@@ -222,89 +271,133 @@ fn format_string_list(paths: &[String]) -> String {
     format!("[{}]", quoted.join(", "))
 }
 
-/// KDE: the global-shortcuts entry for the `Search` action that
-/// `packaging/quicksearch.desktop` declares (`Exec=quicksearch --toggle`).
-/// kglobalaccel launches desktop-file actions itself, so no command is
-/// written here — only the key, in the file KDE's own Shortcuts settings
-/// page reads and edits.
+/// KDE: registration with the kglobalaccel daemon over DBus, which is the
+/// only writer `kglobalshortcutsrc` has — the daemon rewrites that file at
+/// will and *drops* groups it did not create, so editing it directly (the
+/// first version of this module) produced an entry that neither fired nor
+/// survived. `setShortcut` takes effect immediately and the daemon does its
+/// own persisting.
+///
+/// What the key *runs* is a small desktop file in
+/// `~/.local/share/kglobalaccel/`, the directory Plasma itself uses for
+/// custom command shortcuts: a component whose name ends in `.desktop`
+/// resolves to that file, and its `_launch` action runs the `Exec` line.
+/// The file's presence is also this module's "installed" marker — written
+/// last on install, deleted on remove, and free of a per-frame DBus call.
+///
+/// Verified live against Plasma 6.6: register → the key launches a closed
+/// QuickSearch; `unregister` → the daemon drops the entry from its config.
 #[cfg(all(unix, not(target_os = "macos")))]
 mod kde {
     use super::*;
+    use std::path::PathBuf;
 
-    const FILE: &str = "kglobalshortcutsrc";
-    const GROUP: &str = "quicksearch.desktop";
+    /// Ends in `.desktop`: what makes the daemon treat the component as a
+    /// service it can launch rather than an app that must be running.
+    const COMPONENT: &str = "quicksearch-search.desktop";
+    const ACTION: &str = "_launch";
+    /// KGlobalAccel's NoAutoloading flag: set the key now, not merely as a
+    /// default for the next load.
+    const SET_NOW: &str = "4";
 
-    /// Plasma 6's tool first; 5's second. The first present wins.
-    fn config_tool(names: [&'static str; 2]) -> &'static str {
-        let on_path = |name: &str| {
-            std::env::var_os("PATH").is_some_and(|path| {
-                std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
-            })
-        };
-        if on_path(names[0]) {
-            names[0]
-        } else {
-            names[1]
-        }
+    /// The action id every `org.kde.KGlobalAccel` call takes, in GVariant
+    /// text: `[component, action, component friendly, action friendly]`.
+    pub(super) fn action_id() -> String {
+        format!("['{}', '{}', 'QuickSearch', 'QuickSearch']", COMPONENT, ACTION)
     }
 
-    /// The entry format is `active,default,description`.
-    pub(super) fn entry(binding: &Binding) -> String {
-        format!("{},none,Search", binding)
+    /// One `gdbus call` against the daemon. gdbus over qdbus because it
+    /// takes GVariant text for the list arguments, which qdbus cannot spell.
+    fn call(method: &str, args: &[&str]) -> Result<String, String> {
+        let method = format!("org.kde.KGlobalAccel.{}", method);
+        let mut argv = vec![
+            "call",
+            "--session",
+            "--dest",
+            "org.kde.kglobalaccel",
+            "--object-path",
+            "/kglobalaccel",
+            "--method",
+            &method,
+        ];
+        argv.extend(args);
+        run("gdbus", &argv)
+    }
+
+    /// Where the launch target lives; the daemon looks here by name.
+    pub(super) fn desktop_file() -> PathBuf {
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                    .join(".local/share")
+            });
+        data.join("kglobalaccel").join(COMPONENT)
+    }
+
+    /// `NoDisplay`: the entry exists to be launched by a key, not to appear
+    /// in menus next to the real QuickSearch entry.
+    pub(super) fn desktop_entry(command: &str) -> String {
+        format!(
+            "[Desktop Entry]\nType=Application\nName=QuickSearch\nNoDisplay=true\nExec={}\n",
+            command
+        )
     }
 
     pub(super) fn installed() -> bool {
-        let tool = config_tool(["kreadconfig6", "kreadconfig5"]);
-        run(tool, &["--file", FILE, "--group", GROUP, "--key", "Search"])
-            .map(|out| {
-                let active = out.trim().split(',').next().unwrap_or("");
-                !active.is_empty() && active != "none"
-            })
-            .unwrap_or(false)
+        desktop_file().is_file()
     }
 
-    pub(super) fn install(binding: &Binding) -> Result<(), String> {
-        let tool = config_tool(["kwriteconfig6", "kwriteconfig5"]);
-        let entry = entry(binding);
-        for (key, value) in [("_k_friendly_name", "QuickSearch"), ("Search", &entry)] {
-            run(
-                tool,
-                &["--file", FILE, "--group", GROUP, "--key", key, value],
-            )?;
+    pub(super) fn install(binding: &Binding, command: &str) -> Result<(), String> {
+        let id = action_id();
+        call("doRegister", &[&id])?;
+        let keys = format!("[{}]", binding.qt_key_code());
+        let reply = call("setShortcut", &[&id, &keys, SET_NOW])?;
+        // The daemon answers with the keys now in force; ours missing means
+        // it kept something else — the key is taken.
+        if !reply_ints(&reply).contains(&binding.qt_key_code()) {
+            let _ = call("unregister", &[COMPONENT, ACTION]);
+            return Err(format!(
+                "your desktop refused {} — probably already in use",
+                binding
+            ));
         }
-        reload();
+        // The file last: it is the installed marker, so nothing marks this
+        // installed until the key is actually in force.
+        let path = desktop_file();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {}", dir.display(), e))?;
+        }
+        std::fs::write(&path, desktop_entry(command))
+            .map_err(|e| format!("writing {}: {}", path.display(), e))?;
+        // Executable, or KConfig refuses to trust the file's Exec line
+        // ("not owned by root and executable flag not set") — the same bit
+        // Plasma's own Shortcuts page sets on the files it creates here.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("marking {} executable: {}", path.display(), e))?;
         Ok(())
     }
 
     pub(super) fn remove() -> Result<(), String> {
-        let tool = config_tool(["kwriteconfig6", "kwriteconfig5"]);
-        for key in ["Search", "_k_friendly_name"] {
-            run(
-                tool,
-                &["--file", FILE, "--group", GROUP, "--key", key, "--delete"],
-            )?;
+        call("unregister", &[COMPONENT, ACTION])?;
+        let path = desktop_file();
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("deleting {}: {}", path.display(), e)),
         }
-        reload();
-        Ok(())
     }
 
-    /// Ask kglobalaccel to re-read its file. Best-effort: without it the
-    /// binding takes effect at the next login, which install's caller says.
-    fn reload() {
-        for qdbus in ["qdbus6", "qdbus"] {
-            if run(
-                qdbus,
-                &[
-                    "org.kde.kglobalaccel",
-                    "/kglobalaccel",
-                    "org.kde.KGlobalAccel.reloadConfig",
-                ],
-            )
-            .is_ok()
-            {
-                return;
-            }
-        }
+    /// The integers out of a gdbus reply like `([100663366],)`. Wrong or
+    /// hostile shapes yield fewer integers, never a panic.
+    pub(super) fn reply_ints(reply: &str) -> Vec<u32> {
+        reply
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse().ok())
+            .collect()
     }
 }
 
@@ -402,11 +495,50 @@ mod tests {
         }
     }
 
+    /// What the KDE launch key runs: a well-formed desktop entry whose Exec
+    /// is the toggle command, hidden from menus.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
-    fn the_kde_entry_carries_the_binding_first() {
-        let binding: Binding = "Ctrl+Shift+F".parse().unwrap();
-        assert_eq!(kde::entry(&binding), "Ctrl+Shift+F,none,Search");
+    fn the_kde_desktop_entry_launches_the_toggle() {
+        let entry = kde::desktop_entry("/opt/qs/quicksearch --toggle");
+        assert!(entry.starts_with("[Desktop Entry]\n"));
+        assert!(entry.contains("Exec=/opt/qs/quicksearch --toggle\n"));
+        assert!(entry.contains("NoDisplay=true\n"));
+        assert!(kde::desktop_file().ends_with("kglobalaccel/quicksearch-search.desktop"));
+    }
+
+    /// The GVariant action id every KGlobalAccel call names; `_launch` is
+    /// the action that runs a `.desktop` component's Exec.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_kde_action_id_names_the_launch_action() {
+        assert_eq!(
+            kde::action_id(),
+            "['quicksearch-search.desktop', '_launch', 'QuickSearch', 'QuickSearch']"
+        );
+    }
+
+    /// gdbus replies, including hostile ones, must parse to integers or to
+    /// nothing — never panic.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn gdbus_replies_parse_to_integers_or_nothing() {
+        assert_eq!(kde::reply_ints("([100663366],)"), [100663366]);
+        assert_eq!(kde::reply_ints("([1, 2],)"), [1, 2]);
+        assert_eq!(kde::reply_ints("([],)"), Vec::<u32>::new());
+        for garbage in ["", "(true,)", "nonsense", "([99999999999999999999],)"] {
+            let _ = kde::reply_ints(garbage);
+        }
+    }
+
+    /// A path with a space would otherwise split into a broken Exec line.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_toggle_command_survives_spaces_in_the_path() {
+        // `toggle_command` reads the real exe path; both shapes it can
+        // produce must parse back to program + one flag.
+        let command = toggle_command();
+        assert!(command.ends_with(" --toggle"), "{command}");
     }
 
     /// The fixed GNOME path is load-bearing twice over: idempotence and

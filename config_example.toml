@@ -173,7 +173,7 @@ tutorial_seen = false
 
 [search]
 # Start with the fuzzy passes enabled.
-fuzzy_default = true
+fuzzy_default = false
 # Ceiling on the fuzzy stages' typo budget. The allowance grows with the
 # search term, one edit per three characters, up to this value, so 2
 # means "1 edit for 3-5 character terms, 2 for anything longer". 0 turns

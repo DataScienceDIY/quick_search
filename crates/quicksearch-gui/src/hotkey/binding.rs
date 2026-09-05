@@ -156,9 +156,33 @@ impl Binding {
             .expect("every Binding key comes from KEYS")
     }
 
+    /// The key combination as the integer `Qt::Key | Qt::Modifier` value
+    /// KGlobalAccel's DBus `setShortcut` takes. Covered like [`Self::row`]:
+    /// `tests::every_key_has_a_qt_code` proves the mapping total over
+    /// [`KEYS`], so a new row cannot reach KDE as a panic.
+    ///
+    /// This and the two spellings below exist for the desktops
+    /// `crate::shortcut_setup` and [`super::portal`] write to, all of which
+    /// are unix; off unix nothing calls them and the lint would say so.
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+    pub fn qt_key_code(&self) -> u32 {
+        let mut code = qt_key(self.key);
+        for (held, bit) in [
+            (self.shift, 0x0200_0000),
+            (self.ctrl, 0x0400_0000),
+            (self.alt, 0x0800_0000),
+        ] {
+            if held {
+                code |= bit;
+            }
+        }
+        code
+    }
+
     /// The accelerator in GTK's syntax — `<Ctrl><Shift>f` — which is what a
     /// GNOME custom keybinding's `binding` key stores. GTK keyval names are
     /// the X11 keysym names, so the keysym column serves both spellings.
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     pub fn gtk_accelerator(&self) -> String {
         let mut out = String::new();
         for (held, name) in [
@@ -176,6 +200,7 @@ impl Binding {
 
     /// The trigger in the XDG shortcuts spec's syntax: uppercase modifiers
     /// and an xkbcommon keysym, joined with `+`.
+    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     pub fn portal_trigger(&self) -> String {
         let mut out = String::new();
         for (held, name) in [
@@ -250,6 +275,90 @@ impl FromStr for Binding {
     }
 }
 
+/// The `Qt::Key` value for a bindable key. Printable keys are their ASCII
+/// uppercase; the named keys are Qt's `0x0100_00xx` block. A fourth [`KEYS`]
+/// column in all but layout: kept as a match so the table stays readable,
+/// with `tests::every_key_has_a_qt_code` holding the two together.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn qt_key(key: Key) -> u32 {
+    match key {
+        Key::A => 0x41,
+        Key::B => 0x42,
+        Key::C => 0x43,
+        Key::D => 0x44,
+        Key::E => 0x45,
+        Key::F => 0x46,
+        Key::G => 0x47,
+        Key::H => 0x48,
+        Key::I => 0x49,
+        Key::J => 0x4A,
+        Key::K => 0x4B,
+        Key::L => 0x4C,
+        Key::M => 0x4D,
+        Key::N => 0x4E,
+        Key::O => 0x4F,
+        Key::P => 0x50,
+        Key::Q => 0x51,
+        Key::R => 0x52,
+        Key::S => 0x53,
+        Key::T => 0x54,
+        Key::U => 0x55,
+        Key::V => 0x56,
+        Key::W => 0x57,
+        Key::X => 0x58,
+        Key::Y => 0x59,
+        Key::Z => 0x5A,
+        Key::Num0 => 0x30,
+        Key::Num1 => 0x31,
+        Key::Num2 => 0x32,
+        Key::Num3 => 0x33,
+        Key::Num4 => 0x34,
+        Key::Num5 => 0x35,
+        Key::Num6 => 0x36,
+        Key::Num7 => 0x37,
+        Key::Num8 => 0x38,
+        Key::Num9 => 0x39,
+        Key::F1 => 0x0100_0030,
+        Key::F2 => 0x0100_0031,
+        Key::F3 => 0x0100_0032,
+        Key::F4 => 0x0100_0033,
+        Key::F5 => 0x0100_0034,
+        Key::F6 => 0x0100_0035,
+        Key::F7 => 0x0100_0036,
+        Key::F8 => 0x0100_0037,
+        Key::F9 => 0x0100_0038,
+        Key::F10 => 0x0100_0039,
+        Key::F11 => 0x0100_003A,
+        Key::F12 => 0x0100_003B,
+        Key::Space => 0x20,
+        Key::Enter => 0x0100_0004,
+        Key::Tab => 0x0100_0001,
+        Key::Backspace => 0x0100_0003,
+        Key::Delete => 0x0100_0007,
+        Key::Insert => 0x0100_0006,
+        Key::Home => 0x0100_0010,
+        Key::End => 0x0100_0011,
+        Key::PageUp => 0x0100_0016,
+        Key::PageDown => 0x0100_0017,
+        Key::ArrowUp => 0x0100_0013,
+        Key::ArrowDown => 0x0100_0015,
+        Key::ArrowLeft => 0x0100_0012,
+        Key::ArrowRight => 0x0100_0014,
+        Key::Comma => 0x2C,
+        Key::Period => 0x2E,
+        Key::Slash => 0x2F,
+        Key::Backslash => 0x5C,
+        Key::Semicolon => 0x3B,
+        Key::Quote => 0x27,
+        Key::Backtick => 0x60,
+        Key::Minus => 0x2D,
+        Key::Equals => 0x3D,
+        Key::OpenBracket => 0x5B,
+        Key::CloseBracket => 0x5D,
+        other => unreachable!("{other:?} is not in KEYS; see every_key_has_a_qt_code"),
+    }
+}
+
 /// Empty means "no shortcut" rather than an error.
 pub fn parse_setting(setting: &str) -> Result<Option<Binding>, BindingError> {
     if setting.trim().is_empty() {
@@ -269,6 +378,29 @@ mod tests {
         assert_eq!(binding.to_string(), "Ctrl+Shift+F");
         assert_eq!(binding.portal_trigger(), "CTRL+SHIFT+f");
         assert_eq!(binding.gtk_accelerator(), "<Ctrl><Shift>f");
+    }
+
+    /// `qt_key`'s `unreachable!` is only sound while every row of [`KEYS`]
+    /// has an arm; this is what holds the match and the table together.
+    #[test]
+    fn every_key_has_a_qt_code() {
+        for (key, token, _) in KEYS {
+            let code = qt_key(*key);
+            assert_ne!(code, 0, "{token} has no Qt key code");
+        }
+    }
+
+    /// The values KGlobalAccel actually receives, spot-checked against
+    /// `Qt::Key`: the default binding (verified live against Plasma 6.6),
+    /// a named key, and a punctuation key.
+    #[test]
+    fn qt_key_codes_match_qt() {
+        let binding: Binding = "Ctrl+Shift+F".parse().unwrap();
+        assert_eq!(binding.qt_key_code(), 0x0600_0046);
+        let binding: Binding = "Alt+PageUp".parse().unwrap();
+        assert_eq!(binding.qt_key_code(), 0x0900_0016);
+        let binding: Binding = "Ctrl+Comma".parse().unwrap();
+        assert_eq!(binding.qt_key_code(), 0x0400_002C);
     }
 
     /// The keysym column doubles as the GTK keyval, so a named key must come

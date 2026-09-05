@@ -23,7 +23,6 @@ pub mod raise;
 
 pub use raise::raise;
 
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -133,6 +132,9 @@ pub(crate) fn fire(ctx: &egui::Context) {
 #[cfg(unix)]
 mod imp {
     use super::*;
+    // The socket is the only reader and writer here; Windows uses the Win32
+    // pipe calls rather than `std::io`.
+    use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
 
     /// Ask the instance configured by `config_path` to come forward.

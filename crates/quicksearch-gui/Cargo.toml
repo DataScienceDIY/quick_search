@@ -59,6 +59,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # This is the zero-setup path; `--toggle` covers the app not running.
 global-hotkey = "0.8"
 
+# The window handle behind both native raise paths — `activate::raise`'s X11
+# `_NET_ACTIVE_WINDOW` message and its Win32 `SetForegroundWindow` — neither of
+# which winit will do for us. Not target-gated: eframe depends on this
+# unconditionally (it is what `HasWindowHandle for Frame` is written against),
+# so naming it here adds no crate on any platform.
+raw-window-handle = "0.6"
+
 # Display backends, which only exist on Linux/BSD. `default-features = false`
 # has to be repeated: feature resolution unions the two stanzas, so a single
 # permissive one would switch defaults back on for every target.
@@ -83,10 +90,9 @@ pollster = "0.4"
 # Raising the window from either shortcut on X11, which winit cannot
 # do: it asks with a source indication of "application", and every mainstream
 # window manager refuses that from a window that is not already focused. See
-# `activate::raise`. Both are already in the tree (winit's own X11 backend,
-# and eframe's window handle), so neither adds a crate.
+# `activate::raise`. Already in the tree as winit's own X11 backend, so this
+# adds no crate.
 x11rb = "0.13"
-raw-window-handle = "0.6"
 
 # XTEST, for `examples/raiseprobe.rs` only: it synthesises the global key
 # press that proves the shortcut path end to end, which no command-line tool

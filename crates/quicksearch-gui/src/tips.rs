@@ -1,4 +1,5 @@
-//! Plain-language tooltips: every configuration control explains itself on hover.
+//! Plain-language tooltips: every configuration control, and any status line
+//! whose wait needs explaining, explains itself on hover.
 
 const TIP_WIDTH: f32 = 420.0;
 
@@ -559,6 +560,18 @@ pub static CLEAR_INDEX: Tip = Tip {
     caution: Some("This cannot be undone: the index has to be built from scratch again."),
 };
 
+// --- Index status --------------------------------------------------------
+
+pub static REBUILDING_FTS: Tip = Tip {
+    title: "Rebuilding the full-text search cache",
+    body: "A setting changed that affects which text is searchable, so \
+           QuickSearch is modifying the search index. On a \
+           large index this can take several minutes, and the progress may look \
+           frozen while it runs. You can still search during this time!",
+    examples: &[],
+    caution: None,
+};
+
 // --- Manage Index tab: indexed folders -----------------------------------
 
 pub static ADD_ROOT: Tip = Tip {
@@ -711,6 +724,7 @@ mod tests {
         &STOP_INDEXING,
         &RETURN_TO_AUTO,
         &CLEAR_INDEX,
+        &REBUILDING_FTS,
         &ADD_ROOT,
         &REMOVE_ROOT,
         &ROOT_WORKERS,

@@ -187,6 +187,10 @@ Section "Search hotkey (Ctrl+Shift+F)" SecHotkey
     ; on the Settings tab rewrites this .lnk to match (per-user installs
     ; only; this all-users file needs elevation).
     ;
+    ; Explorer registers this key at logon, so the app's own RegisterHotKey
+    ; for the same combination loses; either way the press works — directly,
+    ; or by Explorer launching `--toggle`, which relays to a running window.
+    ;
     ; Rewrites the same shortcut the section above creates: NSIS cannot add a
     ; hotkey to an existing .lnk, and creating it twice is harmless.
     CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\quicksearch.exe" "--toggle" \

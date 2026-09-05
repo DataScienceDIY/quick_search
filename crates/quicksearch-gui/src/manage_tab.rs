@@ -735,7 +735,7 @@ fn waiting_row(ui: &mut egui::Ui, label: &str, elapsed: Duration) {
 /// `elapsed` is `Some` for a run's prologue; the between-runs pass has none.
 fn reconcile_row(ui: &mut egui::Ui, r: &ReconcileProgress, elapsed: Option<Duration>) {
     ui.horizontal(|ui| {
-        ui.label("Applying configuration change");
+        ui.label("Rebuilding FTS cache").tip(&tips::REBUILDING_FTS);
         ui.label(egui::RichText::new("|").weak());
         match (r.total, r.fraction()) {
             (Some(total), Some(frac)) => {

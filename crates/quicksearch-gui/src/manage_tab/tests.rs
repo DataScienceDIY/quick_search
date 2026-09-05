@@ -628,13 +628,48 @@ fn a_reconcile_reports_how_far_through_the_index_it_is() {
     )
     .join(" | ");
 
-    assert!(text.contains("Applying configuration change"), "{}", text);
+    assert!(text.contains("Rebuilding FTS cache"), "{}", text);
     assert!(
         text.contains("2,500,000 / 8,000,000 (31%) entries checked"),
         "{}",
         text
     );
     assert!(text.contains("1,204 entries removed"), "{}", text);
+}
+
+/// The pass can run for minutes with the window unresponsive, so the line
+/// that names it has to be where the explanation is reachable from.
+#[test]
+fn the_reconcile_status_explains_the_wait_on_hover() {
+    let ctx = crate::test_ui::ctx();
+    ctx.style_mut(|s| {
+        s.interaction.tooltip_delay = 0.0;
+        s.interaction.show_tooltips_only_when_still = false;
+    });
+    let mut tab = ManageTab::new();
+    let cfg = cfg_with_root();
+    let state = preparing_state(PrepStep::Reconciling(ReconcileProgress::default()));
+    let mut run = |events: Vec<egui::Event>| {
+        ctx.run(raw_input(events), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                tab.ui(ui, &state, &cfg);
+            });
+        })
+    };
+
+    run(vec![]);
+    let settled = run(vec![]);
+    let pos = crate::test_ui::painted_text_center(&settled, "Rebuilding FTS cache")
+        .expect("status line painted");
+    let opening: String = crate::tips::REBUILDING_FTS.body.chars().take(40).collect();
+    let mut out = run(vec![egui::Event::PointerMoved(pos)]);
+    for _ in 0..3 {
+        if painted_text(&out).join("\n").contains(&opening) {
+            return;
+        }
+        out = run(vec![]);
+    }
+    panic!("no tooltip on the status line: {:?}", painted_text(&out));
 }
 
 /// Whole-range deletions read no rows; the display must not invent a denominator.
@@ -669,7 +704,7 @@ fn a_prune_between_runs_is_reported_instead_of_idle() {
 
     let text = frame_text(&ctx, &mut tab, &state).join(" | ");
     assert!(
-        text.contains("Applying configuration change"),
+        text.contains("Rebuilding FTS cache"),
         "the scan is invisible: {}",
         text
     );
