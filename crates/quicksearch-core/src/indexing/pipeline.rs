@@ -27,8 +27,13 @@ use super::*;
 /// wholesale — or newly excluded — is never read, so per-directory
 /// reconciliation cannot see its rows. Not deletions: parents under an
 /// unreadable directory, and paths reached via symlink (`aliased`).
+///
+/// Takes a read connection, not the writer's: this scans every stored parent
+/// under the root, and roots still `Extracting` need the writer while it
+/// runs. Read-your-writes is safe — every walk batch was committed before
+/// the sweep starts. Same reasoning as `count_extract_scope`.
 fn sweep_unvisited_parents(
-    conn_mutex: &Arc<Mutex<Connection>>,
+    conn: &Connection,
     root: &str,
     seen_dirs: &HashSet<String>,
     unreadable: &crate::file_handling::UnreadableDirs,
@@ -37,17 +42,16 @@ fn sweep_unvisited_parents(
 ) -> Result<(), String> {
     // Same keyset range the extraction cursor uses: `[root + "/", root + "0")`.
     let range = ExtractCursor::for_root(root);
-    let conn = crate::lock_ok(conn_mutex);
 
     let mut unvisited: Vec<String> = Vec::new();
-    repo::for_each_parent_in_range(&conn, &range.lo, &range.hi, |parent| {
+    repo::for_each_parent_in_range(conn, &range.lo, &range.hi, |parent| {
         if !seen_dirs.contains(&parent) && !unreadable.covers(&parent) {
             unvisited.push(parent);
         }
     })?;
 
     for parent in unvisited {
-        for path in repo::paths_in_dir(&conn, &parent)? {
+        for path in repo::paths_in_dir(conn, &parent)? {
             if !aliased.contains(&path) {
                 out.push(path);
             }
@@ -742,9 +746,12 @@ fn cleanup_stale(pipelines: &[RootPipeline], cx: &mut RunCx<'_>) -> Result<(), S
     // stored parent under every root, and the merge that ends the deletion is
     // minutes of writer time on a big index.
     let _maintaining = cx.maintaining(MaintenanceStep::RemovingStale);
+    // One read connection for the whole sweep, so the writer stays free for
+    // any root still extracting; see `sweep_unvisited_parents`.
+    let sweep_conn = crate::db::open::open_walk_reader(cx.db_path)?;
     for p in pipelines.iter() {
         sweep_unvisited_parents(
-            &cx.conn_mutex,
+            &sweep_conn,
             &p.root,
             &p.walk.seen_dirs(),
             p.walk.unreadable(),
@@ -752,6 +759,7 @@ fn cleanup_stale(pipelines: &[RootPipeline], cx: &mut RunCx<'_>) -> Result<(), S
             &mut cx.stale_candidates,
         )?;
     }
+    drop(sweep_conn);
     // The aliased filter applies to both sources: per-directory
     // reconciliation can flag a symlink target as stale while the alias route
     // inserted it — the row would be written and deleted on every run.

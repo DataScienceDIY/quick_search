@@ -1,8 +1,8 @@
-//! The one representation of a shortcut and its three spellings: the config
-//! text (which is also the `global-hotkey` token), and the xkbcommon keysym
-//! the XDG shortcuts spec wants for the Wayland portal. All three come out
-//! of [`KEYS`], so a key cannot be spelled correctly for one backend and
-//! wrongly for the other.
+//! The one representation of a shortcut and its spellings: the config text
+//! (which is also the `global-hotkey` token), the X11 keysym name (which
+//! doubles as the GTK keyval for GNOME bindings), and the Qt key code KDE's
+//! KGlobalAccel takes. All of them come out of [`KEYS`] and [`qt_key`], so a
+//! key cannot be spelled correctly for one backend and wrongly for another.
 
 use std::fmt;
 use std::str::FromStr;
@@ -161,9 +161,9 @@ impl Binding {
     /// `tests::every_key_has_a_qt_code` proves the mapping total over
     /// [`KEYS`], so a new row cannot reach KDE as a panic.
     ///
-    /// This and the two spellings below exist for the desktops
-    /// `crate::shortcut_setup` and [`super::portal`] write to, all of which
-    /// are unix; off unix nothing calls them and the lint would say so.
+    /// This and the GTK spelling below exist for the desktops
+    /// `crate::shortcut_setup` writes to, all of which are unix; off unix
+    /// nothing calls them and the lint would say so.
     #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
     pub fn qt_key_code(&self) -> u32 {
         let mut code = qt_key(self.key);
@@ -192,25 +192,6 @@ impl Binding {
         ] {
             if held {
                 out.push_str(name);
-            }
-        }
-        out.push_str(self.row().1);
-        out
-    }
-
-    /// The trigger in the XDG shortcuts spec's syntax: uppercase modifiers
-    /// and an xkbcommon keysym, joined with `+`.
-    #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
-    pub fn portal_trigger(&self) -> String {
-        let mut out = String::new();
-        for (held, name) in [
-            (self.ctrl, "CTRL"),
-            (self.alt, "ALT"),
-            (self.shift, "SHIFT"),
-        ] {
-            if held {
-                out.push_str(name);
-                out.push('+');
             }
         }
         out.push_str(self.row().1);
@@ -376,7 +357,6 @@ mod tests {
         let cfg = quicksearch_core::config::UiConfig::default();
         let binding: Binding = cfg.search_hotkey.parse().expect("the default is valid");
         assert_eq!(binding.to_string(), "Ctrl+Shift+F");
-        assert_eq!(binding.portal_trigger(), "CTRL+SHIFT+f");
         assert_eq!(binding.gtk_accelerator(), "<Ctrl><Shift>f");
     }
 
@@ -456,7 +436,7 @@ mod tests {
     fn modifiers_are_ordered_and_case_insensitive() {
         let binding: Binding = "shift+ALT+ctrl+f".parse().unwrap();
         assert_eq!(binding.to_string(), "Ctrl+Alt+Shift+F");
-        assert_eq!(binding.portal_trigger(), "CTRL+ALT+SHIFT+f");
+        assert_eq!(binding.gtk_accelerator(), "<Ctrl><Alt><Shift>f");
         assert_eq!(
             " Ctrl + Shift + F ".parse::<Binding>(),
             Ok(binding_of("Ctrl+Shift+F"))

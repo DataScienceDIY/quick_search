@@ -537,6 +537,191 @@ fn every_document_within_the_budget_is_found_and_nothing_outside_it_is() {
 }
 
 // ---------------------------------------------------------------------------
+// The filename pass
+// ---------------------------------------------------------------------------
+
+/// Names and parents from the same hostile vocabulary as the bodies, plus
+/// `LIKE`'s own metacharacters: a `%` or `_` cut into a term must reach the
+/// filename prefilter escaped (`translator::escape_like`), or the pattern
+/// stops meaning the literal it was cut from. Unique suffix per row.
+fn file_paths() -> Vec<(String, String)> {
+    let words = [
+        "quartzite",
+        "Report",
+        "SUMMARY",
+        "café",
+        "naïve",
+        "Ünicode",
+        "日本語テキスト",
+        "emoji🙂here",
+        "wild*card",
+        "100%_done",
+        "under_score",
+        "dash-joined",
+        "mixedCaseWord",
+        "budget",
+        "revenue",
+        "planning",
+        "aaaaaaaaaa",
+    ];
+    let mut lcg = Lcg::new(0xf11e);
+    let mut out = Vec::new();
+    for i in 0..DOCS {
+        let word = |lcg: &mut Lcg| words[lcg.next_u64() as usize % words.len()];
+        let depth = 1 + (lcg.next_u64() as usize % 3);
+        let mut parent = String::from("/fz");
+        for _ in 0..depth {
+            parent.push('/');
+            parent.push_str(word(&mut lcg));
+        }
+        parent.push('/');
+        let name = format!("{}-{}-{:03}.txt", word(&mut lcg), word(&mut lcg), i);
+        out.push((parent, name));
+    }
+    out
+}
+
+fn seed_files(path: &std::path::Path, rows: &[(String, String)]) -> Vec<i64> {
+    use quicksearch_core::db::repo::{insert_file, NewFile};
+    use quicksearch_core::mime::FileType;
+
+    let mut conn =
+        quicksearch_core::db::open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+    let tx = conn.transaction().unwrap();
+    let mut ids = Vec::with_capacity(rows.len());
+    for (parent, name) in rows {
+        let id = insert_file(
+            &tx,
+            &NewFile {
+                name,
+                parent,
+                size: 1,
+                mtime: 1_700_000_000,
+                mime: None,
+                ftype: FileType::EMPTY,
+                hash: None,
+                // No content anywhere: a hit can only come from a filename
+                // or path tier, which is the pass under test.
+                needs_content: false,
+            },
+        )
+        .unwrap()
+        .expect("unique path");
+        ids.push(id);
+    }
+    tx.commit().unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+    ids
+}
+
+/// The filename analog of [`a_corrupted_substring_still_finds_the_document_it_came_from`]:
+/// cut a substring from a stored name or full path, corrupt it within the
+/// byte budget, and the row must still be found — the recall direction pass
+/// C's pigeonhole `LIKE` prefilter can break with no symptom. Terms cut from
+/// a path can carry a separator, which disqualifies the chunk set and
+/// exercises the full-scan fallback in the same sweep.
+#[test]
+fn a_corrupted_path_substring_still_finds_the_file_it_came_from() {
+    let rows = file_paths();
+    let (_dir, db) = Scratch::db("fuzzprefilter-name");
+    let ids = seed_files(&db, &rows);
+    let conn = quicksearch_core::db::open::open_search_reader(&db.to_string_lossy())
+        .expect("open the seeded index");
+
+    let mut lcg = Lcg::new(0xf00d);
+    let mut checked = 0usize;
+    let mut via_path = 0usize;
+
+    for &cap in caps() {
+        for len in sweep_lengths() {
+            for _ in 0..iters_per_len() {
+                let at = lcg.next_u64() as usize % rows.len();
+                let (parent, name) = &rows[at];
+                let full = format!("{}{}", parent, name);
+                let source: &str = if lcg.next_u64() % 2 == 0 { name } else { &full };
+                let Some(original) = substring_of(source, len, &mut lcg) else {
+                    continue;
+                };
+
+                let mut chars: Vec<char> = original.chars().collect();
+                let planned = edit_budget(original.len(), cap).unwrap_or(0);
+                let edits = if planned == 0 {
+                    0
+                } else {
+                    lcg.next_u64() as usize % (planned + 1)
+                };
+                for _ in 0..edits {
+                    corrupt(&mut chars, &mut lcg);
+                }
+                let term: String = chars.into_iter().collect();
+                if term.trim().is_empty() {
+                    continue;
+                }
+                let Ok(split) = split_for_cascade(&term) else {
+                    continue;
+                };
+                if split.pattern.is_wildcard() || split.regex.is_some() {
+                    continue;
+                }
+                let effective = split.term.as_str();
+                let Some(k) = edit_budget(effective.len(), cap) else {
+                    let _ = search_ids(&conn, &term, cap);
+                    continue;
+                };
+                if Bitap::new(effective.as_bytes(), k).is_none() {
+                    continue;
+                }
+
+                // The pass verifies the name always, the path only at three
+                // *characters* of pattern (`cascade::path_tiers_enabled`) —
+                // a three-byte term can be one CJK character, under the tier
+                // floor while over the fuzzy one.
+                let name_hit = oracle_distance(effective.as_bytes(), name.as_bytes()) <= k;
+                let path_hit = effective.chars().count() >= 3
+                    && oracle_distance(effective.as_bytes(), full.as_bytes()) <= k;
+                if !name_hit && !path_hit {
+                    continue;
+                }
+
+                let found = search_ids(&conn, &term, cap);
+                assert!(
+                    found.contains(&ids[at]),
+                    "lost the file the term was cut from\n  typed    {:?}\n  \
+                     parsed   {:?}\n  original {:?}\n  cap {} k {} edits {}\n  \
+                     chunks   {:?}\n  path     {:?}",
+                    term,
+                    effective,
+                    original,
+                    cap,
+                    k,
+                    edits,
+                    pigeonhole_chunks(effective, k),
+                    full,
+                );
+                checked += 1;
+                via_path += usize::from(!name_hit);
+            }
+        }
+    }
+
+    eprintln!(
+        "filename prefilter fuzz: {} recall assertions, {} of them path-tier",
+        checked, via_path
+    );
+    assert!(
+        checked > 200,
+        "only {} recall assertions ran; the generator is not producing \
+         in-budget terms",
+        checked
+    );
+    assert!(
+        via_path > 10,
+        "only {} path-tier assertions; the path arm is not being exercised",
+        via_path
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The regex prefilter
 // ---------------------------------------------------------------------------
 

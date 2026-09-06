@@ -38,9 +38,10 @@ tracking: https://github.com/DataScienceDIY/quick_search
 - **Password protection** — optionally encrypt the index, since it contains
   the names and text of everything indexed. The password can be remembered
   in your system keychain.
-- **Global shortcut** — Ctrl+Shift+F brings up the window from anywhere
-  while QuickSearch is running, and `quicksearch --toggle` can be bound in
-  your desktop's keyboard settings to also start it.
+- **Global shortcut** — Ctrl+Shift+F brings up the window from anywhere,
+  starting QuickSearch if it is closed. One click on the Settings tab binds
+  it on KDE and GNOME; elsewhere, bind `quicksearch --toggle` in your
+  desktop's keyboard settings.
 - **Terminal search** — `quicksearch <query>` prints ranked, pipe-friendly
   paths; `--long` adds sizes, dates, and highlighted snippets.
 - **Portable mode** — keep the program, its config, and its index together

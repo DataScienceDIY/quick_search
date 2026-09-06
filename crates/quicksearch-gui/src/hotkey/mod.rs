@@ -1,7 +1,12 @@
 //! The in-application half of the search shortcut: the key QuickSearch
 //! claims for itself while it is running. Windows and X11 grant that via
-//! `global-hotkey` (`RegisterHotKey`/`XGrabKey`); Wayland refuses grabs by
-//! design, so it goes through the XDG portal and the *desktop* picks the key.
+//! `global-hotkey` (`RegisterHotKey`/`XGrabKey`). Wayland refuses grabs by
+//! design and gets no in-app half at all ([`Status::DesktopOnly`]): the XDG
+//! GlobalShortcuts portal was tried and removed — it prompted a dialog on
+//! every launch, bound an action that only worked while the app ran, and
+//! its persisted claim on the key blocked the desktop's own launch binding.
+//! On Wayland the desktop's binding (`crate::shortcut_setup`, `--toggle`)
+//! is the whole story.
 //!
 //! This is the path that needs no setup at all, and it is why the Settings
 //! tab can offer an arbitrary combination on every platform. It cannot fire
@@ -10,14 +15,17 @@
 //! Both funnel into the same pending flag, so the window comes forward the
 //! same way whichever one fired.
 //!
+//! When a [`crate::shortcut_setup`] system binding is installed, this half
+//! stands down entirely ([`Status::SystemOwned`]): the desktop delivers the
+//! key whether QuickSearch is running or not, and holding our own claim as
+//! well would fight it for the key.
+//!
 //! Held in a thread-local global rather than a field: the registration is
 //! process-wide, the event handler is set-once, and on Windows
 //! `GlobalHotKeyManager` is not `Send`. Every entry point is inert until
 //! [`init`] runs, so headless UI tests never touch an OS registration.
 
 mod binding;
-#[cfg(all(unix, not(target_os = "macos")))]
-mod portal;
 
 pub use binding::{parse_setting, Binding};
 
@@ -35,30 +43,31 @@ thread_local! {
 pub enum Status {
     Disabled,
     Active,
-    /// Asked for; the desktop has not answered yet.
-    Pending,
-    /// Wayland: described in the desktop's own words, because the desktop,
-    /// not the setting, decides the key.
-    PortalBound(String),
+    /// Wayland without a system binding: the compositor refuses in-app
+    /// grabs, so only the desktop's own binding can deliver the key.
+    DesktopOnly,
+    /// A `crate::shortcut_setup` binding is installed, so the desktop owns
+    /// the key and nothing is registered in-app: every press arrives through
+    /// `--toggle`, which also works while QuickSearch is closed. Registering
+    /// here as well would fight the desktop over the key.
+    SystemOwned,
     Error(String),
 }
 
 struct Registry {
     backend: Backend,
-    /// Everything except the portal, which reports its own asynchronously.
     status: Status,
 }
 
 enum Backend {
-    /// Nothing registered: no shortcut set, or the backend never started.
+    /// Nothing registered: no shortcut set, a Wayland session (see the
+    /// module docs), or the backend never started.
     Idle,
     /// Windows and X11.
     Grab {
         manager: GlobalHotKeyManager,
         registered: Option<HotKey>,
     },
-    #[cfg(all(unix, not(target_os = "macos")))]
-    Portal(portal::Portal),
 }
 
 /// Start the shortcut and register `setting`. Must be called on the
@@ -73,7 +82,7 @@ pub fn init(ctx: &egui::Context, setting: &str) {
         }
     }));
 
-    let backend = match choose_backend(ctx) {
+    let backend = match choose_backend() {
         Ok(backend) => backend,
         Err(message) => {
             quicksearch_core::log_warn!("global shortcut: {}", message);
@@ -103,6 +112,22 @@ pub fn apply(setting: &str) {
         let Some(registry) = slot.as_mut() else {
             return;
         };
+        // The desktop's own binding outranks ours: release whatever is held
+        // and stand down (see `Status::SystemOwned`). Checked here rather
+        // than by the callers so init and every save agree; the probe is a
+        // file check on KDE and a one-off subprocess on GNOME, and `apply`
+        // only runs on saves.
+        if crate::shortcut_setup::installed() {
+            let _ = registry.backend.register(None);
+            registry.status = Status::SystemOwned;
+            return;
+        }
+        // Wayland with nothing installed: there is nothing to register —
+        // the compositor refuses grabs — so say where the key has to live.
+        if crate::activate::raise::is_wayland() {
+            registry.status = Status::DesktopOnly;
+            return;
+        }
         let wanted = match parse_setting(setting) {
             Ok(binding) => binding,
             Err(e) => {
@@ -131,12 +156,6 @@ pub fn apply(setting: &str) {
 pub fn status() -> Status {
     REGISTRY.with_borrow(|slot| match slot.as_ref() {
         None => Status::Disabled,
-        // The portal answers on its own schedule and keeps its own status.
-        #[cfg(all(unix, not(target_os = "macos")))]
-        Some(Registry {
-            backend: Backend::Portal(portal),
-            ..
-        }) => portal.status(),
         Some(registry) => registry.status.clone(),
     })
 }
@@ -179,28 +198,18 @@ impl Backend {
                 *registered = Some(hotkey);
                 Ok(())
             }
-            #[cfg(all(unix, not(target_os = "macos")))]
-            Backend::Portal(portal) => {
-                portal.bind(wanted.map(|b| b.portal_trigger()));
-                Ok(())
-            }
         }
     }
 }
 
-/// A Wayland session gets the portal, everything else a grab. No falling
-/// back: an X11 grab inside a Wayland session succeeds and then only fires
-/// while an XWayland window has focus — a broken-looking shortcut.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn choose_backend(ctx: &egui::Context) -> Result<Backend, String> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        return Ok(Backend::Portal(portal::Portal::new(ctx)));
+/// A Wayland session gets no backend at all — the desktop's binding is the
+/// Wayland path; see the module docs. No X11 grab as a fallback either: it
+/// succeeds inside a Wayland session and then only fires while an XWayland
+/// window has focus — a broken-looking shortcut.
+fn choose_backend() -> Result<Backend, String> {
+    if crate::activate::raise::is_wayland() {
+        return Ok(Backend::Idle);
     }
-    grab_backend()
-}
-
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn choose_backend(_ctx: &egui::Context) -> Result<Backend, String> {
     grab_backend()
 }
 

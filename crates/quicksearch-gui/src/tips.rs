@@ -422,13 +422,11 @@ pub static SEARCH_HOTKEY: Tip = Tip {
            start typing.\n\n\
            Click the button and press the keys you want. Combine Ctrl, Alt \
            and Shift with one other key. Clear switches the shortcut off.\n\n\
-           This works whenever QuickSearch is running and needs no setting \
-           up, but it cannot start QuickSearch. For a shortcut that opens it \
-           too, bind the command shown below in your desktop's own keyboard \
-           settings.\n\n\
-           On Wayland your desktop registers the shortcut, so it may pick a \
-           different key and owns it afterwards, and it decides whether the \
-           window comes forward.",
+           While QuickSearch is running it holds this key itself where the \
+           system allows that (Windows and X11), with no setting up. A key \
+           that also starts QuickSearch has to be bound by the desktop: the \
+           set-up button below does that where it can, and on Wayland the \
+           desktop binding is the only kind there is.",
     examples: &[
         "Ctrl+Shift+F, the default, which few other programs use."
     ],
@@ -567,7 +565,7 @@ pub static REBUILDING_FTS: Tip = Tip {
     body: "A setting changed that affects which text is searchable, so \
            QuickSearch is modifying the search index. On a \
            large index this can take several minutes, and the progress may look \
-           frozen while it runs. You can still search during this time!",
+           frozen while it runs. You can still search during this time.",
     examples: &[],
     caution: None,
 };
@@ -603,15 +601,12 @@ pub static REMOVE_ROOT: Tip = Tip {
 pub static ROOT_WORKERS: Tip = Tip {
     title: "Workers",
     body: "How many folders QuickSearch explores at once inside this indexed \
-           folder. More of them finish sooner on storage that answers many \
-           requests at a time, which network drives do especially well, but \
-           they compete for the same disk.\n\n\
+           folder. More workers finish sooner on faster storage or network shares, \
+           but they compete for the same disk and could slow your system.\n\n\
            auto reads 4 on local storage and 16 on a network mount. Takes \
            effect on the next indexing run.",
     examples: &[
-        "auto unless indexing is slower than you would expect.",
-        "16 or more for a network share that is slow to answer each request.",
-        "2 to keep indexing out of the way on an older machine.",
+        "You can override to 1-2 to keep indexing low-priority.",
     ],
     caution: None,
 };
@@ -624,8 +619,7 @@ pub static ROOT_COUNTS: Tip = Tip {
            files nothing could read text from (images, videos, archives, \
            program binaries) plus anything the extension whitelist \
            excludes.\n\n\
-           Both are counted when an indexing run finishes, so they do not \
-           move as live updates apply single changes in between.",
+           Both are updated when an indexing run finishes.",
     examples: &[],
     caution: None,
 };
@@ -634,17 +628,15 @@ pub static ROOT_COUNTS: Tip = Tip {
 
 pub static EXT_WHITELIST: Tip = Tip {
     title: "Full-text extensions whitelist",
-    body: "Which kinds of file QuickSearch is allowed to read the text out \
+    body: "Which kinds of files QuickSearch is allowed to read the text out \
            of. It limits contents only: every file is still indexed and still \
            found by its name and its path, whatever you put here. A file left \
-           off the list simply cannot be found by the words inside it.\n\n\
-           Empty, the default, means every kind QuickSearch understands. To \
+           off the list cannot be found by the text inside of it.\n\n\
+           Empty, the default, means every kind of file QuickSearch understands. To \
            narrow it, enter one extension per line, the leading dot optional. \
            A non-empty list also leaves out files with no extension at all, \
            such as Makefile or README, unless you add the line (none). \
-           Anything after a # is a comment.\n\n\
-           Narrowing the list discards the text it now excludes; widening it \
-           reads those files again.",
+           Anything after a # is a comment.",
     examples: &[
         "txt, md and pdf to keep the stored text small and focused on documents, \
          with everything else still findable by name.",

@@ -635,3 +635,159 @@ fn a_bulk_write_repairs_a_delete_merge_threshold_left_off() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Seed one row per content state under `/t/`, plus a survivor. Returns
+/// `name -> id`. States: the two `done-*` rows hold postings, the others do
+/// not — the distinction stale cleanup's `with_postings` narrowing draws.
+#[cfg(unix)]
+fn seed_stale_corpus(
+    conn: &mut rusqlite::Connection,
+) -> std::collections::HashMap<&'static str, i64> {
+    use crate::db::repo::{self, NewFile};
+    let tx = conn.transaction().unwrap();
+    let mut ids = std::collections::HashMap::new();
+    for (name, needs_content) in [
+        ("done-stale.txt", true),
+        ("done-kept.txt", true),
+        ("na-stale.bin", false),
+        ("pending-stale.txt", true),
+        ("failed-stale.txt", true),
+    ] {
+        let id = repo::insert_file(
+            &tx,
+            &NewFile {
+                name,
+                parent: "/t/",
+                size: 1,
+                mtime: 1,
+                mime: Some("text/plain"),
+                ftype: crate::mime::FileType::TEXT,
+                hash: None,
+                needs_content,
+            },
+        )
+        .unwrap()
+        .expect("unique path");
+        ids.insert(name, id);
+    }
+    repo::set_content_done(&tx, ids["done-stale.txt"], "body one", None).unwrap();
+    repo::set_content_done(&tx, ids["done-kept.txt"], "body two", None).unwrap();
+    repo::set_content_failed(&tx, ids["failed-stale.txt"], "bad parse").unwrap();
+    tx.commit().unwrap();
+    ids
+}
+
+/// The stale pass over rows in every content state: exactly the stale rows
+/// go, a posting survives exactly for the surviving DONE row, and the
+/// delete-merge threshold the pass held off is back afterwards. An orphan
+/// posting would surface as a hit for a file no longer indexed, with no error
+/// anywhere — the failure mode this pins.
+#[test]
+#[cfg(unix)]
+fn stale_cleanup_deletes_exactly_the_stale_rows_and_their_postings() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    let dir = crate::testutil::scratch_dir("stale-cleanup");
+    let db = dir.join("index.sqlite");
+    let mut conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+    let ids = seed_stale_corpus(&mut conn);
+
+    // `vanished.txt` was never indexed: a stale list can legitimately name a
+    // path another writer already removed, and it must not fail the pass.
+    let stale: Vec<String> = [
+        "done-stale.txt",
+        "na-stale.bin",
+        "pending-stale.txt",
+        "failed-stale.txt",
+        "vanished.txt",
+    ]
+    .iter()
+    .map(|n| format!("/t/{}", n))
+    .collect();
+
+    let conn_mutex = Arc::new(Mutex::new(conn));
+    let stop = Arc::new(AtomicBool::new(false));
+    let deleted =
+        cleanup_stale_index_entries(&conn_mutex, &stale, &stop, &crate::config::Config::default())
+            .unwrap();
+    assert_eq!(deleted, 4);
+
+    let conn = Arc::try_unwrap(conn_mutex)
+        .map_err(|_| ())
+        .expect("sole owner")
+        .into_inner()
+        .unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("SELECT COUNT(*) FROM files"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM searchabletext"), 1);
+    assert_eq!(count("SELECT COUNT(*) FROM documents_text"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM failed_files"), 0);
+    let hit: i64 = conn
+        .query_row(
+            "SELECT rowid FROM searchabletext WHERE searchabletext MATCH 'body'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hit, ids["done-kept.txt"], "the survivor is still findable");
+    assert_eq!(
+        conn.query_row(
+            "SELECT v FROM searchabletext_config WHERE k = 'deletemerge'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap(),
+        i64::from(FTS_DELETEMERGE),
+        "the pass restored the threshold it held off"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A stop mid-pass returns without restoring `deletemerge` — the abandonment
+/// semantics `a_bulk_write_repairs_a_delete_merge_threshold_left_off` exists
+/// for. If this ever starts restoring it eagerly, that test loses its
+/// subject; if it starts deleting under a stop, a stopped run reconciles.
+#[test]
+#[cfg(unix)]
+fn a_stopped_stale_cleanup_deletes_nothing_and_leaves_the_burst() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    let dir = crate::testutil::scratch_dir("stale-cleanup-stop");
+    let db = dir.join("index.sqlite");
+    let mut conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+    seed_stale_corpus(&mut conn);
+
+    let conn_mutex = Arc::new(Mutex::new(conn));
+    let stop = Arc::new(AtomicBool::new(true));
+    let deleted = cleanup_stale_index_entries(
+        &conn_mutex,
+        &["/t/done-stale.txt".to_string()],
+        &stop,
+        &crate::config::Config::default(),
+    )
+    .unwrap();
+    assert_eq!(deleted, 0);
+
+    let conn = Arc::try_unwrap(conn_mutex)
+        .map_err(|_| ())
+        .expect("sole owner")
+        .into_inner()
+        .unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(count("SELECT COUNT(*) FROM files"), 5, "a stop deletes nothing");
+    assert_eq!(
+        conn.query_row(
+            "SELECT v FROM searchabletext_config WHERE k = 'deletemerge'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap(),
+        0,
+        "the burst is left for the next run's bulk write to repair"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

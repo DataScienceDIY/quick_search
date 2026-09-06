@@ -67,10 +67,13 @@ impl Gate {
         if !crate::activate::take_pending() {
             return;
         }
+        // The token travels with the press: on Wayland it is the
+        // compositor's permission for the raise below to take focus.
+        let token = crate::activate::take_token();
         if let Gate::Running(app) = self {
             app.activate_search(ctx);
         }
-        crate::activate::raise(ctx, frame);
+        crate::activate::raise(ctx, frame, token.as_deref());
     }
 }
 

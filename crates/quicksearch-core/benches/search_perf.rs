@@ -12,9 +12,10 @@
 //! What has to stay resident is the **`files` table**, not the FTS index.
 //! `search/cascade/passes.rs` answers filename queries (ranks 1–4, 9–10) with
 //! `SELECT … FROM files f WHERE f.name LIKE '%…%'` — a full table scan, no FTS
-//! at all — and the fuzzy pass scans it again with `WHERE 1=1`. So the working
-//! set scales with **file count**, not with document volume, and the corpus
-//! dimension below is what makes that visible.
+//! at all — and the fuzzy pass scans it again (`LIKE`-narrowed for terms of
+//! 9+ characters, unpredicated below that). So the working set scales with
+//! **file count**, not with document volume, and the corpus dimension below
+//! is what makes that visible.
 //!
 //! The keyed rows are where an undersized cache hurts first: a page-cache miss
 //! costs an AES-CBC decrypt, not a `memcpy`.
@@ -155,18 +156,61 @@ fn mib(bytes: u64) -> f64 {
 
 /// Run one query; hits are counted, not kept — holding 200k `SearchHit`s
 /// would measure the allocator instead of the scan.
-fn time_query(conn: &Connection, query: &str) -> (Duration, usize) {
+fn time_query(conn: &Connection, query: &str, options: &SearchOptions) -> (Duration, usize) {
     let split = split_for_cascade(query).unwrap();
     let latest = std::sync::atomic::AtomicU64::new(1);
     let mut count = 0usize;
     let mut sink = |hits: Vec<SearchHit>| count += hits.len();
-    let options = SearchOptions {
-        limit: 1000,
-        ..SearchOptions::default()
-    };
     let start = Instant::now();
-    cascade::run(conn, &split, &options, 1, &latest, &mut sink).unwrap();
+    cascade::run(conn, &split, options, 1, &latest, &mut sink).unwrap();
     (start.elapsed(), count)
+}
+
+/// The options every measurement here runs under: the sweep's, with `fuzzy`
+/// the variable. Both `SearchOptions::default()` and the GUI default
+/// (`[search] fuzzy_default`) have fuzzy **off** — the fuzzy rows below are
+/// what a user opts into, not what a default install pays per keystroke.
+fn options(fuzzy: bool) -> SearchOptions {
+    SearchOptions {
+        limit: 1000,
+        fuzzy,
+        ..SearchOptions::default()
+    }
+}
+
+/// The fuzzy pairing's keystroke sequence, per-term rather than averaged:
+/// under the default `fuzzy_max_edits` of 2, `pigeonhole_chunks` needs
+/// `3 × (k + 1)` characters, so terms under 9 characters keep the full scan
+/// (`edit_budget` gives k=1 at 3–5 and k=2 from 6) and only the 9+ ones can
+/// be prefiltered. Both shapes are in the sequence on purpose: the short
+/// terms are the control a pass-C narrowing must not move, the long ones are
+/// what it narrows. `quartzite` is `testutil::NEEDLE`, present in seeded
+/// names, so the engaged rows return real hits.
+const FUZZY_SEQUENCE: [&str; 4] = ["quar", "quartz", "quartzite", "quartzites"];
+
+/// Warm per-term timings, fuzzy off against on, at the shipped cache — the
+/// gate for the fuzzy filename pass's shape (`passes::pass_fuzzy_filename`).
+/// The off column is the control: a pass-C change has no business moving it.
+fn run_fuzzy_pairing(arm: &Arm) {
+    let conn = arm.open_search();
+    conn.execute_batch(&format!("PRAGMA cache_size = {};", SHIPPED_CACHE))
+        .unwrap();
+    // One settling pass per mode so every printed number is warm.
+    for fuzzy in [false, true] {
+        let opts = options(fuzzy);
+        for query in FUZZY_SEQUENCE {
+            time_query(&conn, query, &opts);
+        }
+    }
+    println!(
+        "{:>12}  {:>10}  {:>10}  {:>8}   (fuzzy pairing, shipped cache, warm)",
+        "term", "off", "on", "hits"
+    );
+    for query in FUZZY_SEQUENCE {
+        let (off, _) = time_query(&conn, query, &options(false));
+        let (on, hits) = time_query(&conn, query, &options(true));
+        println!("{:>12}  {:>9.1?}  {:>9.1?}  {:>8}", query, off, on, hits);
+    }
 }
 
 /// One arm at one cache ceiling: the first keystroke on a fresh connection,
@@ -182,13 +226,17 @@ fn measure(arm: &Arm, cache_size: i64) -> (Duration, Duration, usize) {
     conn.execute_batch(&format!("PRAGMA cache_size = {};", cache_size))
         .unwrap();
 
-    let (cold, hits) = time_query(&conn, SEQUENCE[0]);
+    let opts = options(false);
+    let (cold, hits) = time_query(&conn, SEQUENCE[0], &opts);
     // A priming pass, so "warm" is a settled session rather than the three
     // keystrokes after the first.
     for query in SEQUENCE {
-        time_query(&conn, query);
+        time_query(&conn, query, &opts);
     }
-    let total: Duration = SEQUENCE.iter().map(|q| time_query(&conn, q).0).sum();
+    let total: Duration = SEQUENCE
+        .iter()
+        .map(|q| time_query(&conn, q, &opts).0)
+        .sum();
     (cold, total / SEQUENCE.len() as u32, hits)
 }
 
@@ -302,7 +350,21 @@ fn main() {
             std::env::temp_dir().display()
         );
     }
-    for files in CORPORA {
+    // `QSB_SEARCH_PERF=fuzzy` runs only the fuzzy pairing — the cache sweep
+    // is minutes per arm and a pass-C gate does not need it. `QSB_CORPORA`
+    // trims the corpus list the same way (comma-separated file counts).
+    let fuzzy_only = std::env::var("QSB_SEARCH_PERF").as_deref() == Ok("fuzzy");
+    let corpora: Vec<usize> = std::env::var("QSB_CORPORA")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter_map(|n| n.trim().parse().ok())
+                .collect()
+        })
+        .filter(|v: &Vec<usize>| !v.is_empty())
+        .unwrap_or_else(|| CORPORA.to_vec());
+
+    for files in corpora {
         for keyed in [false, true] {
             let arm = Arm::seed(
                 format!(
@@ -312,10 +374,31 @@ fn main() {
                 ),
                 &format!("searchperf-{}-{}", files, keyed),
                 keyed,
-                &spec(files),
+                &if fuzzy_only {
+                    light_spec(files)
+                } else {
+                    spec(files)
+                },
             );
-            run_matrix(&arm, files);
+            if fuzzy_only {
+                println!("\n=== {} ===  seeded in {:.1?}", arm.what, arm.seeded_in);
+            } else {
+                run_matrix(&arm, files);
+            }
+            run_fuzzy_pairing(&arm);
             arm.discard();
         }
+    }
+}
+
+/// The fuzzy-only corpus: `files` rows and nothing else. Pass C never reads a
+/// document — its whole cost is the `files` scan plus the bitap — and 2 KB
+/// bodies turn a minutes-long seed into hours on slow storage while adding
+/// only pass-D noise to the number under test. One row in `usize::MAX` still
+/// gets content, which keeps pass D exercised without costing anything.
+fn light_spec(files: usize) -> SeedSpec {
+    SeedSpec {
+        content_every: usize::MAX,
+        ..spec(files)
     }
 }

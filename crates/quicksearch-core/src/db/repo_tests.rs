@@ -587,6 +587,166 @@ fn delete_ids_spans_chunk_boundaries() {
     assert_eq!(left, keep);
 }
 
+/// `update_file_basic` narrows its clearing by the stored state: only DONE
+/// holds content, only FAILED holds a failure record, and everything else
+/// must pay a single statement. The dangerous direction is under-clearing —
+/// a DONE row keeping its posting surfaces a hit whose text no longer
+/// matches — so every holding state is exercised.
+#[test]
+fn updating_clears_content_exactly_for_the_states_that_hold_it() {
+    let (_dir, p) = tmp_path();
+    let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    let ids = seeded(&mut conn, &["/t/done.txt", "/t/failed.txt", "/t/keep.txt"]);
+
+    let na_id = {
+        let tx = conn.transaction().unwrap();
+        // Clears failed.txt's posting too — the invariant the narrowing rests on.
+        set_content_failed(&tx, ids["/t/failed.txt"], "bad parse").unwrap();
+        let id = insert_file(
+            &tx,
+            &NewFile {
+                name: "na.bin",
+                parent: "/t/",
+                size: 1,
+                mtime: 1,
+                mime: None,
+                ftype: crate::mime::FileType::EMPTY,
+                hash: None,
+                needs_content: false,
+            },
+        )
+        .unwrap()
+        .expect("unique path");
+        tx.commit().unwrap();
+        id
+    };
+
+    let update = |conn: &mut Connection, name: &str, needs_content: bool| {
+        let tx = conn.transaction().unwrap();
+        let id = update_file_basic(
+            &tx,
+            &NewFile {
+                name,
+                parent: "/t/",
+                size: 9,
+                mtime: 9,
+                mime: Some("text/plain"),
+                ftype: crate::mime::FileType::TEXT,
+                hash: None,
+                needs_content,
+            },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        id
+    };
+    let count = |conn: &Connection, sql: &str| -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    };
+    let state = |conn: &Connection, id: i64| -> i64 {
+        conn.query_row(
+            "SELECT content_state FROM files WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+
+    // DONE → PENDING: the posting and the body go, in the same transaction.
+    assert_eq!(
+        update(&mut conn, "done.txt", true),
+        Some(ids["/t/done.txt"])
+    );
+    assert_eq!(state(&conn, ids["/t/done.txt"]), STATE_PENDING);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM searchabletext WHERE rowid IN \
+             (SELECT id FROM files WHERE name = 'done.txt')"
+        ),
+        0
+    );
+
+    // FAILED → PENDING: the failure record goes with the transition.
+    assert_eq!(
+        update(&mut conn, "failed.txt", true),
+        Some(ids["/t/failed.txt"])
+    );
+    assert_eq!(state(&conn, ids["/t/failed.txt"]), STATE_PENDING);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM failed_files"), 0);
+
+    // NA → NA: nothing to clear, and the metadata still lands.
+    assert_eq!(update(&mut conn, "na.bin", false), Some(na_id));
+    assert_eq!(state(&conn, na_id), STATE_NA);
+    assert_eq!(
+        conn.query_row("SELECT mtime FROM files WHERE id = ?1", [na_id], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        9
+    );
+
+    // PENDING → NA: the state transition alone.
+    assert_eq!(
+        update(&mut conn, "done.txt", false),
+        Some(ids["/t/done.txt"])
+    );
+    assert_eq!(state(&conn, ids["/t/done.txt"]), STATE_NA);
+
+    // keep.txt, never updated, keeps its posting — and it is the only one.
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM searchabletext"), 1);
+    assert_eq!(state(&conn, ids["/t/keep.txt"]), STATE_DONE);
+
+    // No row: `None`, not an invented insert.
+    assert_eq!(update(&mut conn, "vanished.txt", true), None);
+}
+
+/// The resolver behind stale cleanup's `with_postings` decision: the state it
+/// returns is what decides whether FTS gets handed the id, so it must be the
+/// stored state, and the unresolvable inputs must be `None`, not errors — a
+/// stale list can legitimately name paths another writer already removed.
+#[test]
+fn id_and_state_for_path_reads_the_stored_state() {
+    let (_dir, p) = tmp_path();
+    let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    let ids = seeded(&mut conn, &["/t/done.txt"]);
+
+    let na_id = {
+        let tx = conn.transaction().unwrap();
+        let id = insert_file(
+            &tx,
+            &NewFile {
+                name: "na.bin",
+                parent: "/t/",
+                size: 1,
+                mtime: 1,
+                mime: None,
+                ftype: crate::mime::FileType::EMPTY,
+                hash: None,
+                needs_content: false,
+            },
+        )
+        .unwrap()
+        .expect("unique path");
+        tx.commit().unwrap();
+        id
+    };
+
+    assert_eq!(
+        id_and_state_for_path(&conn, "/t/done.txt").unwrap(),
+        Some((ids["/t/done.txt"], STATE_DONE))
+    );
+    assert_eq!(
+        id_and_state_for_path(&conn, "/t/na.bin").unwrap(),
+        Some((na_id, STATE_NA))
+    );
+    assert_eq!(id_and_state_for_path(&conn, "/t/vanished.txt").unwrap(), None);
+    assert_eq!(
+        id_and_state_for_path(&conn, "no-separator").unwrap(),
+        None,
+        "an unsplittable path resolves to nothing rather than erroring"
+    );
+}
+
 /// Dropping stored text must cost the file its snippets and nothing else.
 #[test]
 fn drop_stored_text_keeps_the_file_searchable() {

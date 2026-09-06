@@ -3,7 +3,12 @@
 # duplicates.png, query-highlight.png — all landing in packaging/captures/
 # (gitignored). Needs a graphical session (X11 or Wayland — screenshots and
 # video frames are read back from the app's own framebuffer, so the display
-# server does not matter) and ffmpeg with libx264rgb and libvpx-vp9.
+# server does not matter) and ffmpeg with libx264rgb, libvpx-vp9 and libwebp.
+#
+# Alongside those masters it emits the derivatives the website actually ships:
+# -700.webp thumbnails, -1400.webp for the lightbox, and a -poster.webp first
+# frame per clip. The website only needs the .webm and .webp files; the PNG
+# masters stay here.
 #
 # The app is built with the `capture` feature and drives itself through
 # packaging/capture-scenario.txt (see crates/quicksearch-gui/src/capture.rs
@@ -33,7 +38,7 @@ done
 # The encoder list is captured first: `grep -q` closing the pipe early would
 # make ffmpeg exit on SIGPIPE, which pipefail reports as failure.
 encoders="$(ffmpeg -hide_banner -encoders 2>/dev/null)"
-for enc in libx264rgb libvpx-vp9; do
+for enc in libx264rgb libvpx-vp9 libwebp; do
     grep -q "$enc" <<< "$encoders" \
         || { echo "ffmpeg lacks the $enc encoder" >&2; exit 1; }
 done
@@ -132,6 +137,41 @@ for clip in manage-indexing search; do
 done
 mv "$work/tmp/query-highlight.png" "$work/tmp/duplicates.png" "$out/"
 
+# --- web derivatives --------------------------------------------------------
+# The PNG masters are ~1400x980 and 350-700 KB each, but the website renders
+# them in a ~320 CSS px column (~350 px full-width on a phone). Shipping the
+# masters was costing about a megabyte for two thumbnails, so the site loads
+# -700.webp inline and only fetches -1400.webp when the lightbox opens.
+# QS_WEBP_Q is the inline-thumbnail quality; the lightbox copy is encoded
+# higher because it is the one people zoom into to read UI text.
+webp_q="${QS_WEBP_Q:-82}"
+webp_q_full="${QS_WEBP_Q_FULL:-90}"
+for shot in duplicates query-highlight; do
+    ffmpeg -y -hide_banner -loglevel warning -i "$out/$shot.png" \
+        -vf "scale=700:-2:flags=lanczos" \
+        -c:v libwebp -quality "$webp_q" -compression_level 6 \
+        "$out/$shot-700.webp"
+    ffmpeg -y -hide_banner -loglevel warning -i "$out/$shot.png" \
+        -c:v libwebp -quality "$webp_q_full" -compression_level 6 \
+        "$out/$shot-1400.webp"
+done
+# Poster frames: with the videos deferred behind an IntersectionObserver these
+# are what the page paints on first load, so each is sized to the slot it
+# actually renders in — search is the full-width hero, manage-indexing is one
+# column of a three-up grid. The frame is taken from 80% through rather than
+# frame 0: every clip opens on an empty results list, which is the worst
+# possible still to hold on the hero while the video is still downloading.
+for spec in "search:1200" "manage-indexing:700"; do
+    clip="${spec%:*}"; pw="${spec#*:}"
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 \
+        "$out/$clip.webm")
+    at=$(awk -v d="$dur" 'BEGIN{printf "%.2f", d*0.8}')
+    ffmpeg -y -hide_banner -loglevel warning -ss "$at" -i "$out/$clip.webm" \
+        -frames:v 1 -vf "scale=$pw:-2:flags=lanczos" \
+        -c:v libwebp -quality "$webp_q" -compression_level 6 \
+        "$out/$clip-poster.webp"
+done
+
 # --- verify -----------------------------------------------------------------
 fail=0
 for f in "$out/search.webm" "$out/manage-indexing.webm"; do
@@ -148,10 +188,20 @@ for f in "$out/duplicates.png" "$out/query-highlight.png"; do
         -show_entries stream=width,height -of csv=p=0 "$f")
     echo "OK: $f (${dims})"
 done
+# The derivatives are what the website ships, so a silent encode failure here
+# would ship broken <img> tags rather than merely large ones.
+for f in "$out/duplicates-700.webp" "$out/duplicates-1400.webp" \
+         "$out/query-highlight-700.webp" "$out/query-highlight-1400.webp" \
+         "$out/search-poster.webp" "$out/manage-indexing-poster.webp"; do
+    [ -s "$f" ] || { echo "FAIL: missing or empty $f" >&2; fail=1; continue; }
+    dims=$(ffprobe -v error -select_streams v:0 \
+        -show_entries stream=width,height -of csv=p=0 "$f")
+    echo "OK: $f (${dims}, $(stat -c%s "$f") bytes)"
+done
 [ "$fail" -eq 0 ]
 
 # $work is kept for post-mortems (app stderr is on this terminal; the scratch
 # index and raw .cap.mkv files live there) and recreated fresh next run.
 echo
-echo "Assets:"
-ls -l "$out"/*.webm "$out"/*.png
+echo "Assets (the website needs the .webm and .webp files; PNGs stay here):"
+ls -l "$out"/*.webm "$out"/*.png "$out"/*.webp

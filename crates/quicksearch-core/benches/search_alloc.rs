@@ -255,6 +255,16 @@ const CASES: &[Case] = &[
         passes: "regex name + content, no prefilter possible",
     },
     Case {
+        // The accept-predicate: a common term beside a regex whose path
+        // check misses everything, so every pass-A candidate fetches and
+        // decodes its stored body (or discovers its absence) through
+        // `Cx::regex_accepts` — per row, the shape `DocDecoder` exists for.
+        label: "term + regex",
+        query: r"content regex:zzznever\d",
+        fuzzy: false,
+        passes: "A hits many, regex accept-predicate decodes per candidate",
+    },
+    Case {
         label: "common (capped)",
         query: "content",
         fuzzy: false,

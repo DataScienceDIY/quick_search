@@ -388,8 +388,8 @@ impl QuickSearchApp {
             ctx.set_zoom_factor(clamp_scale(new.ui.scale));
         }
         if new.ui.search_hotkey != self.cfg.ui.search_hotkey {
-            // Only when moved: on Wayland re-registering opens a new portal
-            // session, which some desktops confirm with the user.
+            // Only when moved: re-registering an unchanged key would still
+            // release and re-grab it, a window in which a press is lost.
             crate::hotkey::apply(&new.ui.search_hotkey);
             // And the system-wide binding follows, where one is written.
             crate::shortcut_setup::hotkey_changed(&new.ui.search_hotkey);

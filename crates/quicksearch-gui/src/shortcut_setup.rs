@@ -76,14 +76,27 @@ pub fn installed() -> bool {
     }
 }
 
+/// A successful install, and when the key starts answering.
+///
+/// Off unix nothing installs, so nothing constructs these; the match arms
+/// in the Settings tab still name them on every platform.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Installed {
+    Immediately,
+    /// Durably written, but the desktop only picks it up at the next login
+    /// (KDE with no `kbuildsycoca` on the PATH).
+    AfterRelogin,
+}
+
 /// Write `binding` → `quicksearch --toggle` into the desktop's keyboard
 /// configuration. Idempotent: a second install rewrites the same entry.
-pub fn install(binding: &Binding) -> Result<(), String> {
+pub fn install(binding: &Binding) -> Result<Installed, String> {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let command = toggle_command();
         match detect() {
-            Desktop::Gnome => gnome::install(binding, &command),
+            Desktop::Gnome => gnome::install(binding, &command).map(|()| Installed::Immediately),
             Desktop::Kde => kde::install(binding, &command),
             Desktop::Unsupported => Err(UNSUPPORTED.to_string()),
         }
@@ -271,40 +284,40 @@ fn format_string_list(paths: &[String]) -> String {
     format!("[{}]", quoted.join(", "))
 }
 
-/// KDE: registration with the kglobalaccel daemon over DBus, which is the
-/// only writer `kglobalshortcutsrc` has — the daemon rewrites that file at
-/// will and *drops* groups it did not create, so editing it directly (the
-/// first version of this module) produced an entry that neither fired nor
-/// survived. `setShortcut` takes effect immediately and the daemon does its
-/// own persisting.
+/// KDE: a desktop file carrying its own key, discovered through the service
+/// database. Grounded in the kglobalacceld source (v6.6.5,
+/// `globalshortcutsregistry.cpp`) after three approaches failed in the field:
 ///
-/// What the key *runs* is a small desktop file in
-/// `~/.local/share/kglobalaccel/`, the directory Plasma itself uses for
-/// custom command shortcuts: a component whose name ends in `.desktop`
-/// resolves to that file, and its `_launch` action runs the `Exec` line.
-/// The file's presence is also this module's "installed" marker — written
-/// last on install, deleted on remove, and free of a per-frame DBus call.
+/// * DBus `doRegister`+`setShortcut` records a mapping but can never *arm*
+///   it: `getOrCreateComponent` deliberately skips `loadSettings`, and only
+///   that path reaches `registerKey` (the actual grab). Worse, the claim is
+///   bound to the registering connection and dropped when it exits.
+/// * Editing `kglobalshortcutsrc` around a daemon restart loses a race on
+///   any live desktop: KDE clients DBus-activate the daemon back within
+///   milliseconds of `stop`, before the edit lands, and its debounced
+///   `writeSettings` then erases the entry.
+/// * The daemon's startup scan of `~/.local/share/kglobalaccel/` skips
+///   `NoDisplay=true` files outright.
 ///
-/// Verified live against Plasma 6.6: register → the key launches a closed
-/// QuickSearch; `unregister` → the daemon drops the entry from its config.
+/// What does work, restart-free: `detectAppsWithShortcuts()` queries the
+/// service database for applications whose desktop file carries
+/// `X-KDE-Shortcuts=`, arming their `_launch` — and it runs both at daemon
+/// startup and at runtime on every `KSycoca::databaseChanged`. So install
+/// writes a hidden desktop entry with the key inside it into
+/// `~/.local/share/applications/` and pokes `kbuildsycoca6`; the daemon
+/// arms it live, and every later login re-arms it from the same detection.
+/// The file is also this module's "installed" marker. `unregister` over
+/// DBus disarms live (verified by synthesized keypress), so removal needs
+/// no database round trip to take effect.
 #[cfg(all(unix, not(target_os = "macos")))]
 mod kde {
     use super::*;
     use std::path::PathBuf;
 
-    /// Ends in `.desktop`: what makes the daemon treat the component as a
-    /// service it can launch rather than an app that must be running.
+    /// The service's storage id — its filename — which is also the
+    /// component name every DBus query answers with.
     const COMPONENT: &str = "quicksearch-search.desktop";
     const ACTION: &str = "_launch";
-    /// KGlobalAccel's NoAutoloading flag: set the key now, not merely as a
-    /// default for the next load.
-    const SET_NOW: &str = "4";
-
-    /// The action id every `org.kde.KGlobalAccel` call takes, in GVariant
-    /// text: `[component, action, component friendly, action friendly]`.
-    pub(super) fn action_id() -> String {
-        format!("['{}', '{}', 'QuickSearch', 'QuickSearch']", COMPONENT, ACTION)
-    }
 
     /// One `gdbus call` against the daemon. gdbus over qdbus because it
     /// takes GVariant text for the list arguments, which qdbus cannot spell.
@@ -324,81 +337,187 @@ mod kde {
         run("gdbus", &argv)
     }
 
-    /// Where the launch target lives; the daemon looks here by name.
-    pub(super) fn desktop_file() -> PathBuf {
-        let data = std::env::var_os("XDG_DATA_HOME")
+    fn data_dir() -> PathBuf {
+        std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
             .unwrap_or_else(|| {
                 PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
                     .join(".local/share")
-            });
-        data.join("kglobalaccel").join(COMPONENT)
+            })
     }
 
-    /// `NoDisplay`: the entry exists to be launched by a key, not to appear
-    /// in menus next to the real QuickSearch entry.
-    pub(super) fn desktop_entry(command: &str) -> String {
+    /// In the applications directory — the one place the service database
+    /// indexes, which is what `detectAppsWithShortcuts` queries.
+    pub(super) fn desktop_file() -> PathBuf {
+        data_dir().join("applications").join(COMPONENT)
+    }
+
+    /// Where an earlier build put the file; deleted on sight so upgrades
+    /// leave one binding, not two.
+    fn legacy_desktop_file() -> PathBuf {
+        data_dir().join("kglobalaccel").join(COMPONENT)
+    }
+
+    /// `NoDisplay` keeps it out of menus next to the real QuickSearch entry
+    /// (the shortcut detection reads `X-KDE-Shortcuts` regardless);
+    /// `X-KDE-Shortcuts` is the key itself, in QKeySequence text — the
+    /// daemon arms `_launch` with it wherever the service turns up.
+    pub(super) fn desktop_entry(command: &str, binding: &Binding) -> String {
         format!(
-            "[Desktop Entry]\nType=Application\nName=QuickSearch\nNoDisplay=true\nExec={}\n",
-            command
+            "[Desktop Entry]\nType=Application\nName=QuickSearch\nNoDisplay=true\n\
+             Exec={}\nX-KDE-Shortcuts={}\n",
+            command, binding
         )
     }
 
     pub(super) fn installed() -> bool {
-        desktop_file().is_file()
+        desktop_file().is_file() || legacy_desktop_file().is_file()
     }
 
-    pub(super) fn install(binding: &Binding, command: &str) -> Result<(), String> {
-        let id = action_id();
-        call("doRegister", &[&id])?;
-        let keys = format!("[{}]", binding.qt_key_code());
-        let reply = call("setShortcut", &[&id, &keys, SET_NOW])?;
-        // The daemon answers with the keys now in force; ours missing means
-        // it kept something else — the key is taken.
-        if !reply_ints(&reply).contains(&binding.qt_key_code()) {
-            let _ = call("unregister", &[COMPONENT, ACTION]);
+    pub(super) fn install(binding: &Binding, command: &str) -> Result<super::Installed, String> {
+        let code = binding.qt_key_code();
+        // Evict any claim of *ours* on the key first — above all the
+        // popup-bound portal shortcut ("Focus the QuickSearch search box")
+        // that builds which still registered in-app on Wayland left behind:
+        // its persisted claim keeps the launch binding from ever firing.
+        // Looked up rather than guessed — the daemon says who holds the key
+        // — and a foreign application's claim is never touched.
+        for holder in holders_of(code) {
+            if holder.is_ours() && holder.component != COMPONENT {
+                let _ = call("unregister", &[&holder.component, &holder.action]);
+            }
+        }
+        // A key another application still claims is reported before anything
+        // is registered: the daemon happily records two claims and then
+        // delivers the press to neither, which read as "set up" and did
+        // nothing (the user's "View Full Screen Mode" collision).
+        if let Some(holder) = holders_of(code).iter().find(|h| !h.is_ours()) {
             return Err(format!(
-                "your desktop refused {} — probably already in use",
-                binding
+                "{} is taken by \"{}\" ({}); free it under System Settings → \
+                 Keyboard → Shortcuts, or pick a different combination",
+                binding, holder.action_friendly, holder.component_friendly,
             ));
         }
-        // The file last: it is the installed marker, so nothing marks this
-        // installed until the key is actually in force.
+        // An earlier build's file in the old location would leave a second
+        // component claiming a key; gone before the new one appears.
+        let _ = std::fs::remove_file(legacy_desktop_file());
+
+        // The file is the whole registration — key included — and the
+        // installed marker, so a failure below deletes it again.
         let path = desktop_file();
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {}", dir.display(), e))?;
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("creating {}: {}", dir.display(), e))?;
         }
-        std::fs::write(&path, desktop_entry(command))
+        std::fs::write(&path, desktop_entry(command, binding))
             .map_err(|e| format!("writing {}: {}", path.display(), e))?;
-        // Executable, or KConfig refuses to trust the file's Exec line
-        // ("not owned by root and executable flag not set") — the same bit
-        // Plasma's own Shortcuts page sets on the files it creates here.
+        // Executable, matching the trust rules KIO applies to desktop files
+        // before launching what they name.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("marking {} executable: {}", path.display(), e))?;
-        Ok(())
+
+        // The service database rebuild is what tells the running daemon: it
+        // arms new X-KDE-Shortcuts services on every database-changed
+        // signal (see the module docs). Without the tool the file still
+        // arms at the next login, when the daemon re-detects on startup.
+        let rebuilt = run("kbuildsycoca6", &[])
+            .or_else(|_| run("kbuildsycoca5", &[]))
+            .is_ok();
+        if !rebuilt {
+            return Ok(super::Installed::AfterRelogin);
+        }
+        // The daemon's own routing table is the proof the key is armed;
+        // three earlier versions of this function reported success for keys
+        // that could never fire, and this check is what closes that class.
+        // Retried: the database-changed signal reaches the daemon
+        // asynchronously.
+        let mut armed = false;
+        for _ in 0..20 {
+            armed = call("action", &[&code.to_string()])
+                .map(|reply| parse_string_list(&reply).iter().any(|s| s == COMPONENT))
+                .unwrap_or(false);
+            if armed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        if !armed {
+            let _ = std::fs::remove_file(&path);
+            let _ = run("kbuildsycoca6", &[]).or_else(|_| run("kbuildsycoca5", &[]));
+            return Err(format!(
+                "your desktop did not arm {}; if this keeps happening, add a \
+                 shortcut for the command by hand in System Settings",
+                binding
+            ));
+        }
+        Ok(super::Installed::Immediately)
     }
 
     pub(super) fn remove() -> Result<(), String> {
-        call("unregister", &[COMPONENT, ACTION])?;
-        let path = desktop_file();
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("deleting {}: {}", path.display(), e)),
+        // Disarms live (verified by synthesized keypress); the file deletion
+        // plus database rebuild below is what keeps the next login from
+        // re-detecting it.
+        let _ = call("unregister", &[COMPONENT, ACTION]);
+        for path in [desktop_file(), legacy_desktop_file()] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("deleting {}: {}", path.display(), e)),
+            }
+        }
+        let _ = run("kbuildsycoca6", &[]).or_else(|_| run("kbuildsycoca5", &[]));
+        Ok(())
+    }
+
+    /// One current owner of a key, out of `getGlobalShortcutsByKey`.
+    pub(super) struct Holder {
+        pub(super) action: String,
+        pub(super) action_friendly: String,
+        pub(super) component: String,
+        pub(super) component_friendly: String,
+    }
+
+    impl Holder {
+        /// Whether this claim is QuickSearch's own — under any of the names
+        /// a portal or an older build may have registered it as.
+        pub(super) fn is_ours(&self) -> bool {
+            [
+                &self.action,
+                &self.action_friendly,
+                &self.component,
+                &self.component_friendly,
+            ]
+            .iter()
+            .any(|name| name.to_ascii_lowercase().contains("quicksearch"))
         }
     }
 
-    /// The integers out of a gdbus reply like `([100663366],)`. Wrong or
-    /// hostile shapes yield fewer integers, never a panic.
-    pub(super) fn reply_ints(reply: &str) -> Vec<u32> {
-        reply
-            .split(|c: char| !c.is_ascii_digit())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse().ok())
+    fn holders_of(code: u32) -> Vec<Holder> {
+        call("getGlobalShortcutsByKey", &[&code.to_string()])
+            .map(|reply| parse_holders(&reply))
+            .unwrap_or_default()
+    }
+
+    /// The holders out of a reply like
+    /// `([('action', 'Action', 'comp', 'Component', 'default',
+    /// 'Default Context', [100663366], @ai [])],)` — six strings then two
+    /// int lists per tuple, an order taken from the daemon itself (probed
+    /// live against Plasma 6.6). Short or hostile shapes yield fewer
+    /// holders, never a panic.
+    pub(super) fn parse_holders(reply: &str) -> Vec<Holder> {
+        super::parse_string_list(reply)
+            .chunks_exact(6)
+            .map(|names| Holder {
+                action: names[0].clone(),
+                action_friendly: names[1].clone(),
+                component: names[2].clone(),
+                component_friendly: names[3].clone(),
+            })
             .collect()
     }
+
 }
 
 /// Windows: the hotkey field of the Start-menu `.lnk` is the closed-app
@@ -500,36 +619,47 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn the_kde_desktop_entry_launches_the_toggle() {
-        let entry = kde::desktop_entry("/opt/qs/quicksearch --toggle");
+        let binding: Binding = "Ctrl+Shift+F".parse().unwrap();
+        let entry = kde::desktop_entry("/opt/qs/quicksearch --toggle", &binding);
         assert!(entry.starts_with("[Desktop Entry]\n"));
         assert!(entry.contains("Exec=/opt/qs/quicksearch --toggle\n"));
         assert!(entry.contains("NoDisplay=true\n"));
-        assert!(kde::desktop_file().ends_with("kglobalaccel/quicksearch-search.desktop"));
+        // The key rides inside the file: it is what `detectAppsWithShortcuts`
+        // arms, with no config entry and no daemon restart.
+        assert!(entry.contains("X-KDE-Shortcuts=Ctrl+Shift+F\n"));
+        // The applications dir, because that is the one the service database
+        // indexes and the shortcut detection queries.
+        assert!(kde::desktop_file().ends_with("applications/quicksearch-search.desktop"));
     }
 
-    /// The GVariant action id every KGlobalAccel call names; `_launch` is
-    /// the action that runs a `.desktop` component's Exec.
+
+    /// The holder tuples come out in the daemon's own field order (captured
+    /// live from Plasma 6.6), and it is the portal's leftover entry that the
+    /// ours-test must recognise.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
-    fn the_kde_action_id_names_the_launch_action() {
-        assert_eq!(
-            kde::action_id(),
-            "['quicksearch-search.desktop', '_launch', 'QuickSearch', 'QuickSearch']"
+    fn key_holders_parse_and_ours_is_recognised() {
+        let reply = "([('search', 'Focus the QuickSearch search box', \
+                     'some-portal-id', 'Portal App', 'default', \
+                     'Default Context', [100663366], @ai [])],)";
+        let holders = kde::parse_holders(reply);
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0].action, "search");
+        assert_eq!(holders[0].component, "some-portal-id");
+        assert!(holders[0].is_ours(), "the portal leftover was not recognised");
+
+        let foreign = kde::parse_holders(
+            "([('copy', 'Copy Screenshot', 'org.kde.spectacle.desktop', \
+             'Spectacle', 'default', 'Default Context', [1], @ai [])],)",
         );
-    }
+        assert!(!foreign[0].is_ours(), "a foreign claim must never be evicted");
 
-    /// gdbus replies, including hostile ones, must parse to integers or to
-    /// nothing — never panic.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn gdbus_replies_parse_to_integers_or_nothing() {
-        assert_eq!(kde::reply_ints("([100663366],)"), [100663366]);
-        assert_eq!(kde::reply_ints("([1, 2],)"), [1, 2]);
-        assert_eq!(kde::reply_ints("([],)"), Vec::<u32>::new());
-        for garbage in ["", "(true,)", "nonsense", "([99999999999999999999],)"] {
-            let _ = kde::reply_ints(garbage);
+        assert!(kde::parse_holders("(@a(ssssssaiai) [],)").is_empty());
+        for garbage in ["", "([('a', 'b')],)", "no quotes at all"] {
+            let _ = kde::parse_holders(garbage);
         }
     }
+
 
     /// A path with a space would otherwise split into a broken Exec line.
     #[cfg(all(unix, not(target_os = "macos")))]

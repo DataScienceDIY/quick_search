@@ -811,6 +811,93 @@ fn a_wildcard_prefilter_never_loses_a_hit_the_full_scan_finds() {
     }
 }
 
+/// The pigeonhole `LIKE` prefilter the fuzzy filename pass gained must be a
+/// superset of what the bitap accepts over name and path, or fuzzy hits
+/// vanish silently. The reference set is computed with the same matcher the
+/// pass uses, so the assertion is against the semantics, not a copy of the
+/// SQL. `fuzzy_max_edits: 1` keeps `k` at 1, which "report" is long enough
+/// to split for — at the default 2 the term is too short and the pass would
+/// scan, exercising nothing.
+#[test]
+fn a_fuzzy_prefilter_never_loses_a_hit_the_full_scan_finds() {
+    use quicksearch_core::search::fuzzy::{edit_budget, Bitap};
+
+    let (_dir, p) = Scratch::db("fuzzyprefilter");
+    let mut s = Seeder::new(&p, true);
+    let rows = [
+        ("report.txt", "/data"),  // exact
+        ("REPORT.TXT", "/upper"), // ASCII case is free for LIKE and bitap both
+        ("xeport.txt", "/data"),  // first chunk broken; the OR reaches the second
+        ("repXrt.txt", "/data"),  // second chunk broken; the first carries it
+        ("ort.txt", "/rep"),      // name over budget, path-tier hit across the join
+        ("summary.txt", "/data"), // miss
+        ("rep\u{f6}rt.txt", "/data"), // non-ASCII: two byte edits, over a k of 1
+    ];
+    let seeded: Vec<(i64, String)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (name, dir))| {
+            let id = s.add(name, dir, i as u64 + 1, None);
+            (id, format!("{}/{}", dir, name))
+        })
+        .collect();
+    let conn = s.done();
+
+    let opts = SearchOptions {
+        fuzzy: true,
+        fuzzy_max_edits: 1,
+        ..SearchOptions::default()
+    };
+    let term = "report";
+    let (hits, _) = run_collect(&conn, term, &opts);
+    let mut got: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
+    got.sort();
+
+    let k = edit_budget(term.len(), opts.fuzzy_max_edits).unwrap();
+    let bitap = Bitap::new(term.as_bytes(), k).unwrap();
+    let mut want: Vec<i64> = seeded
+        .iter()
+        .filter(|(_, path)| {
+            let name = path.rsplit('/').next().unwrap();
+            bitap.best_distance_and_first(name.as_bytes()).is_some()
+                || bitap.best_distance_and_first(path.as_bytes()).is_some()
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    want.sort();
+    assert_eq!(got, want);
+    assert!(
+        (5..seeded.len()).contains(&got.len()),
+        "the corpus must exercise both hits and misses: {:?}",
+        got
+    );
+}
+
+/// A term carrying a separator disqualifies every chunk set
+/// (`prefilter::Required::like_predicate`), so the fuzzy pass falls back to
+/// the full scan — and must still find a hit whose only match spans the
+/// `parent‖name` join.
+#[test]
+fn a_fuzzy_term_with_a_separator_still_scans_and_matches() {
+    let (_dir, p) = Scratch::db("fuzzysep");
+    let mut s = Seeder::new(&p, true);
+    let hit = s.add("orts.txt", "/a/rep", 1, None);
+    let _miss = s.add("plans.txt", "/a/sum", 2, None);
+    let conn = s.done();
+
+    let opts = SearchOptions {
+        fuzzy: true,
+        fuzzy_max_edits: 1,
+        ..SearchOptions::default()
+    };
+    // Within one edit of "/a/rep/orts" read across the join.
+    let (hits, _) = run_collect(&conn, "rep/orts", &opts);
+    assert_eq!(
+        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        vec![hit]
+    );
+}
+
 /// A pattern every segment of which carries a separator has nothing to anchor
 /// on, so the pass falls back to scanning — and must still find its hits.
 #[test]

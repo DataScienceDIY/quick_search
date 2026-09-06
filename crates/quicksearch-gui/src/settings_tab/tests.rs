@@ -729,6 +729,27 @@ fn showing_advanced_settings_is_not_an_unsaved_edit() {
     );
 }
 
+/// Each registration state gets its sentence; only a real failure (and not
+/// Windows' expected .lnk contention) earns the warning colour.
+#[test]
+fn the_hotkey_status_lines_match_their_states() {
+    use crate::hotkey::Status;
+    let (none, err) = super::hotkey_status_line(Status::Active);
+    assert!(none.is_empty() && !err);
+    let (owned, err) = super::hotkey_status_line(Status::SystemOwned);
+    assert!(
+        owned.contains("starts QuickSearch when closed"),
+        "{owned}"
+    );
+    assert!(!err, "SystemOwned is the working state, not a warning");
+    let (desktop, err) = super::hotkey_status_line(Status::DesktopOnly);
+    assert!(desktop.contains("Set up system shortcut"), "{desktop}");
+    assert!(!err, "DesktopOnly is a pointer, not a failure");
+    let (error, err) = super::hotkey_status_line(Status::Error("taken".to_string()));
+    assert!(error.contains("taken"));
+    assert_eq!(err, !cfg!(windows), "only non-Windows colours the failure");
+}
+
 /// The panel that tells a user how to get a shortcut that also starts
 /// QuickSearch has to actually show the command they must bind — with or
 /// without a one-click desktop to lean on.

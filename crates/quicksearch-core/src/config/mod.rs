@@ -84,7 +84,6 @@ pub struct ProcessingConfig {
     /// milliseconds — the bound on how long any one root can hold up the
     /// others. `0` gives each turn one `batch_size` quantum and no more.
     pub writer_turn_slice_ms: u64,
-    pub fts_update_batch_size: usize,
     /// How large the WAL may grow during a run before the indexer forces a
     /// checkpoint, in bytes. `0` disables; else raised to [`MINIMUM_WAL_SIZE`].
     /// Needed because autocheckpoint can only *reset* the log when no reader
@@ -240,7 +239,6 @@ impl Default for ProcessingConfig {
             maximum_text_file_size: 1024 * 1024 * 2,
             batch_size: 500,
             writer_turn_slice_ms: 100,
-            fts_update_batch_size: 1000,
             maximum_wal_size: 1024 * 1024 * 1024 * 2,
             tokenize: "trigram".to_string(),
             store_text_for_snippets: true,
@@ -251,7 +249,7 @@ impl Default for ProcessingConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         SearchConfig {
-            fuzzy_default: true,
+            fuzzy_default: false,
             fuzzy_max_edits: 2,
             display_limit: 1000,
             results_per_page: 100,

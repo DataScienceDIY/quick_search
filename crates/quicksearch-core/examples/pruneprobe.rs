@@ -51,18 +51,28 @@
 //! Every stage runs against a byte-identical copy of one seeded index rather
 //! than a fresh seed: FTS5 segment layout is most of what decides delete cost,
 //! and reseeding would let it drift between the rows of the table.
+//!
+//! The final table prices the *other* bulk withdrawal, a completed run's stale
+//! cleanup (`file_handling::cleanup_stale_index_entries`): the same doomed
+//! rows, deleted by path the way that pass does. Its stages are spelled out in
+//! probe code for the same reason as above — they are the fixed decomposition
+//! — and its `live` row is the shipped function, which is the row that moves
+//! when `file_handling::batch` is reshaped.
 
 mod common;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use quicksearch_core::config::Config;
 use quicksearch_core::db::{self, repo};
 use quicksearch_core::extract::Registry;
-use quicksearch_core::file_handling::ExtractCursor;
+use quicksearch_core::file_handling::{
+    cleanup_stale_index_entries, fts_begin_tombstone_burst, fts_end_tombstone_burst,
+    fts_finalize_after_text_indexing, split_db_path, ExtractCursor,
+};
 use quicksearch_core::scope::{self, Scope, WorkCursor};
 use quicksearch_core::testutil::{self, Arm, SeedSpec};
 
@@ -395,6 +405,165 @@ fn delete_range(tx: &Connection, lo: &str, hi: &str) -> (usize, Duration, Durati
         )
         .expect("delete range");
     (removed, fts, at.elapsed())
+}
+
+// ---------------------------------------------------------------------------
+// Stale cleanup stages
+// ---------------------------------------------------------------------------
+
+/// Cumulative slices of a completed run's stale cleanup, which deletes by
+/// *path* rather than deciding rows from a page it already read.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StaleShape {
+    /// Per-path deletes, three statements each, FTS handed every id — the
+    /// pass as originally shipped. This is the control row: it reproduces
+    /// that shape in probe code, so it must not move when
+    /// `cleanup_stale_index_entries` is reshaped.
+    PerRow,
+    /// ...resolve `(id, content_state)` per path instead, then chunked
+    /// `IN (...)` deletes with FTS narrowed to ids that can hold a posting.
+    Ids,
+    /// ...and hold FTS5's delete-merging off for the whole pass.
+    Burst,
+}
+
+impl StaleShape {
+    const ALL: [StaleShape; 3] = [StaleShape::PerRow, StaleShape::Ids, StaleShape::Burst];
+
+    fn label(self) -> &'static str {
+        match self {
+            StaleShape::PerRow => "per-row",
+            StaleShape::Ids => "+ids",
+            StaleShape::Burst => "+burst",
+        }
+    }
+
+    fn tag(self) -> &'static str {
+        match self {
+            StaleShape::PerRow => "row",
+            StaleShape::Ids => "ids",
+            StaleShape::Burst => "burst",
+        }
+    }
+}
+
+/// Delete `paths` the way stale cleanup does, one transaction per `PAGE`
+/// chunk, timing each phase. Column mapping in the shared table: `cover` is
+/// the id resolution, `files` the `files` deletes, `fts` the tombstones plus
+/// the trailing consolidation.
+fn run_stale(conn: &Connection, paths: &[String], shape: StaleShape) -> Timing {
+    let mut t = Timing::default();
+    let io_before = Io::read();
+    let (_, misses_before) = testutil::cache_stats(conn);
+    let started = Instant::now();
+
+    if shape == StaleShape::Burst {
+        fts_begin_tombstone_burst(conn);
+    }
+    for page in paths.chunks(PAGE as usize) {
+        let tx = conn.unchecked_transaction().expect("begin");
+        if shape == StaleShape::PerRow {
+            for path in page {
+                let Some((parent, name)) = split_db_path(path) else {
+                    continue;
+                };
+                let at = Instant::now();
+                let id: Option<i64> = tx
+                    .prepare_cached(
+                        "DELETE FROM files WHERE parent = ?1 AND name = ?2 RETURNING id",
+                    )
+                    .expect("prepare")
+                    .query_row(rusqlite::params![parent, name], |r| r.get(0))
+                    .optional()
+                    .expect("delete row");
+                t.files += at.elapsed();
+                let Some(id) = id else { continue };
+                t.deleted += 1;
+                let at = Instant::now();
+                tx.prepare_cached("DELETE FROM searchabletext WHERE rowid = ?1")
+                    .expect("prepare")
+                    .execute([id])
+                    .expect("tombstone");
+                t.fts += at.elapsed();
+                let at = Instant::now();
+                tx.prepare_cached("DELETE FROM documents_text WHERE file_id = ?1")
+                    .expect("prepare")
+                    .execute([id])
+                    .expect("clear body");
+                t.files += at.elapsed();
+            }
+        } else {
+            let at = Instant::now();
+            let mut ids: Vec<i64> = Vec::new();
+            let mut with_postings: Vec<i64> = Vec::new();
+            {
+                let mut sel = tx
+                    .prepare_cached(
+                        "SELECT id, content_state FROM files WHERE parent = ?1 AND name = ?2",
+                    )
+                    .expect("prepare");
+                for path in page {
+                    let Some((parent, name)) = split_db_path(path) else {
+                        continue;
+                    };
+                    let row: Option<(i64, i64)> = sel
+                        .query_row(rusqlite::params![parent, name], |r| {
+                            Ok((r.get(0)?, r.get(1)?))
+                        })
+                        .optional()
+                        .expect("resolve");
+                    if let Some((id, state)) = row {
+                        ids.push(id);
+                        if state == repo::STATE_DONE {
+                            with_postings.push(id);
+                        }
+                    }
+                }
+            }
+            t.cover += at.elapsed();
+            for chunk in with_postings.chunks(CHUNK) {
+                let at = Instant::now();
+                tx.execute(
+                    &format!(
+                        "DELETE FROM searchabletext WHERE rowid IN ({})",
+                        placeholders(chunk.len())
+                    ),
+                    rusqlite::params_from_iter(chunk.iter()),
+                )
+                .expect("tombstone");
+                t.fts += at.elapsed();
+            }
+            for chunk in ids.chunks(CHUNK) {
+                let at = Instant::now();
+                t.deleted += tx
+                    .execute(
+                        &format!(
+                            "DELETE FROM files WHERE id IN ({})",
+                            placeholders(chunk.len())
+                        ),
+                        rusqlite::params_from_iter(chunk.iter()),
+                    )
+                    .expect("delete rows");
+                t.files += at.elapsed();
+            }
+        }
+        let at = Instant::now();
+        tx.commit().expect("commit");
+        t.commit += at.elapsed();
+    }
+    let at = Instant::now();
+    if shape == StaleShape::Burst {
+        fts_end_tombstone_burst(conn);
+    } else {
+        fts_finalize_after_text_indexing(conn);
+    }
+    t.fts += at.elapsed();
+
+    t.total = started.elapsed();
+    t.io = Io::read().since(&io_before);
+    let (_, misses_after) = testutil::cache_stats(conn);
+    t.misses = misses_after - misses_before;
+    t
 }
 
 /// How much data FTS5 is holding — the only quiescence signal that works.
@@ -870,6 +1039,91 @@ fn main() {
                 started.elapsed().as_secs_f64() * 1000.0,
                 "",
                 cursor.deleted,
+            );
+            drop(conn);
+            arm.discard();
+        }
+
+        // Stale cleanup, the pass a completed run ends with. Same doomed rows
+        // as the tables above, but deleted by *path* — the walk hands
+        // `cleanup_stale_index_entries` a list of paths it did not see, in
+        // directory order. Runs on `PRAGMAS_FAST` via `open_existing(_, true)`
+        // because that is the run's own writer connection, the one the real
+        // pass executes on — `open` here would measure the reconcile's 4 MiB
+        // cache instead.
+        {
+            let stale: Vec<String> = {
+                let conn = open(&master);
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT parent || name FROM files WHERE parent LIKE ?1 \
+                         ORDER BY parent, name",
+                    )
+                    .expect("prepare");
+                let rows = stmt
+                    .query_map([format!("%/{}/%", PRUNE_PATTERN)], |r| r.get(0))
+                    .expect("query stale paths");
+                rows.collect::<Result<Vec<_>, _>>().expect("read stale paths")
+            };
+            println!("\n  stale cleanup, {} doomed paths:", stale.len());
+            header();
+            for shape in StaleShape::ALL {
+                let arm = clone_arm(&master, &format!("prune-{}-stale-{}", label, shape.tag()));
+                let conn = arm.with_key(|| {
+                    db::open::open_existing(&arm.path.to_string_lossy(), true)
+                        .expect("open the copy")
+                });
+                let t = run_stale(&conn, &stale, shape);
+                row(shape.label(), &t);
+                let (took, rounds, before, after) = merge_to_quiescence(&conn);
+                println!(
+                    "  {:<11} merge: {:.0} ms over {} rounds, %_data {} -> {} rows",
+                    "",
+                    took.as_secs_f64() * 1000.0,
+                    rounds,
+                    before,
+                    after
+                );
+                drop(conn);
+                arm.discard();
+            }
+
+            // The shipped function, whole. The row that moves when
+            // `file_handling::batch` is reshaped; the stages above must not.
+            let arm = clone_arm(&master, &format!("prune-{}-stale-live", label));
+            let conn = arm.with_key(|| {
+                db::open::open_existing(&arm.path.to_string_lossy(), true).expect("open the copy")
+            });
+            let (_, misses_before) = testutil::cache_stats(&conn);
+            let conn_mutex = std::sync::Arc::new(std::sync::Mutex::new(conn));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let started = Instant::now();
+            let deleted = cleanup_stale_index_entries(&conn_mutex, &stale, &stop, &config)
+                .expect("cleanup stale");
+            let total = started.elapsed();
+            let conn = std::sync::Arc::try_unwrap(conn_mutex)
+                .map_err(|_| ())
+                .expect("sole owner")
+                .into_inner()
+                .expect("unpoisoned");
+            let (_, misses_after) = testutil::cache_stats(&conn);
+            row(
+                "live",
+                &Timing {
+                    total,
+                    deleted,
+                    misses: misses_after - misses_before,
+                    ..Timing::default()
+                },
+            );
+            let (took, rounds, before, after) = merge_to_quiescence(&conn);
+            println!(
+                "  {:<11} merge: {:.0} ms over {} rounds, %_data {} -> {} rows   <- cleanup_stale_index_entries",
+                "",
+                took.as_secs_f64() * 1000.0,
+                rounds,
+                before,
+                after
             );
             drop(conn);
             arm.discard();

@@ -446,47 +446,12 @@ fn read_capture(ui: &egui::Ui) -> Option<Option<crate::hotkey::Binding>> {
 /// Silent while registered and working; a line appears only when what is on
 /// the button is not what is in force.
 fn hotkey_note(ui: &mut egui::Ui, draft: &str, live: &str) {
-    use crate::hotkey::Status;
-    let (text, color) = if draft.trim() != live.trim() {
-        ("Not registered until Apply and Save.".to_string(), None)
+    let (text, is_error) = if draft.trim() != live.trim() {
+        ("Not registered until Apply and Save.".to_string(), false)
     } else {
-        match crate::hotkey::status() {
-            Status::Disabled | Status::Active => (String::new(), None),
-            Status::Pending => (
-                "Waiting for your desktop to accept the shortcut.".to_string(),
-                None,
-            ),
-            Status::PortalBound(trigger) => (
-                format!(
-                    "Your desktop registered this as {}. It has the final say; \
-                     change it in its own keyboard settings. On Wayland it also \
-                     decides whether the window comes forward, so a minimised \
-                     window may stay minimised.",
-                    trigger
-                ),
-                None,
-            ),
-            // On Windows a failed registration is the *expected* state
-            // whenever the Start-menu shortcut owns the same key — Explorer
-            // registers it at logon, wins, and every press then reaches us
-            // through the `--toggle` relay anyway. An error color would cry
-            // wolf on every installed copy.
-            Status::Error(why) if cfg!(windows) => (
-                format!(
-                    "Another program holds this key ({}) — usually the Start \
-                     menu shortcut that starts QuickSearch, which also brings \
-                     it forward while it is running. If the key does nothing, \
-                     pick a different combination.",
-                    why
-                ),
-                None,
-            ),
-            Status::Error(why) => (
-                format!("The shortcut is not active: {}.", why),
-                Some(crate::color::palette(ui.visuals().dark_mode).orange),
-            ),
-        }
+        hotkey_status_line(crate::hotkey::status())
     };
+    let color = is_error.then(|| crate::color::palette(ui.visuals().dark_mode).orange);
     crate::ui_util::stable_section(ui, |ui| {
         if text.is_empty() {
             return;
@@ -497,6 +462,44 @@ fn hotkey_note(ui: &mut egui::Ui, draft: &str, live: &str) {
             None => rich.weak(),
         });
     });
+}
+
+/// The sentence for a registration state, and whether it is an error worth
+/// the warning colour. Split from the rendering so the states are testable.
+fn hotkey_status_line(status: crate::hotkey::Status) -> (String, bool) {
+    use crate::hotkey::Status;
+    match status {
+        Status::Disabled | Status::Active => (String::new(), false),
+        Status::SystemOwned => (
+            "Your desktop delivers this key: it starts QuickSearch when \
+             closed and brings it forward when running."
+                .to_string(),
+            false,
+        ),
+        Status::DesktopOnly => (
+            "On Wayland only your desktop can hold a global key. Use \
+             \"Set up system shortcut\" below, or bind the command shown \
+             there by hand."
+                .to_string(),
+            false,
+        ),
+        // On Windows a failed registration is the *expected* state whenever
+        // the Start-menu shortcut owns the same key — Explorer registers it
+        // at logon, wins, and every press then reaches us through the
+        // `--toggle` relay anyway. An error color would cry wolf on every
+        // installed copy.
+        Status::Error(why) if cfg!(windows) => (
+            format!(
+                "Another program holds this key ({}) — usually the Start \
+                 menu shortcut that starts QuickSearch, which also brings \
+                 it forward while it is running. If the key does nothing, \
+                 pick a different combination.",
+                why
+            ),
+            false,
+        ),
+        Status::Error(why) => (format!("The shortcut is not active: {}.", why), true),
+    }
 }
 
 /// How to get a shortcut that also *starts* QuickSearch.
@@ -572,6 +575,9 @@ fn shortcut_note_for(ui: &mut egui::Ui, hotkey_setting: &str, desktop: crate::sh
                                 state.installed = false;
                                 state.feedback =
                                     Some((true, "System shortcut removed.".to_string()));
+                                // Take the key back in-app now, not at the
+                                // next save.
+                                crate::hotkey::apply(hotkey_setting);
                             }
                             Err(e) => state.feedback = Some((false, e)),
                         }
@@ -581,12 +587,26 @@ fn shortcut_note_for(ui: &mut egui::Ui, hotkey_setting: &str, desktop: crate::sh
                     .clicked()
                 {
                     match crate::shortcut_setup::install(&binding) {
-                        Ok(()) => {
+                        Ok(when) => {
                             state.installed = true;
                             state.feedback = Some((
                                 true,
-                                "Added to your desktop's keyboard shortcuts.".to_string(),
+                                match when {
+                                    crate::shortcut_setup::Installed::Immediately => {
+                                        "Added to your desktop's keyboard shortcuts."
+                                            .to_string()
+                                    }
+                                    crate::shortcut_setup::Installed::AfterRelogin => {
+                                        "Added to your desktop's keyboard shortcuts; \
+                                         the key starts answering after you next log in."
+                                            .to_string()
+                                    }
+                                },
                             ));
+                            // Stand the in-app registration down at once so
+                            // the desktop's binding is not fought for the key
+                            // (see `hotkey::Status::SystemOwned`).
+                            crate::hotkey::apply(hotkey_setting);
                         }
                         Err(e) => state.feedback = Some((false, e)),
                     }
@@ -631,9 +651,11 @@ fn shortcut_note_for(ui: &mut egui::Ui, hotkey_setting: &str, desktop: crate::sh
         if crate::activate::raise::is_wayland() {
             ui.label(
                 egui::RichText::new(
-                    "On Wayland a window that is already open cannot be raised by \
-                     another process, so the shortcut will highlight QuickSearch in \
-                     the task bar rather than bring it to the front.",
+                    "On Wayland, focus follows the shortcut's activation token: \
+                     the binding set up above passes one along, so QuickSearch \
+                     comes to the front. A binding made by hand whose launcher \
+                     provides no token can only highlight QuickSearch in the \
+                     task bar.",
                 )
                 .small()
                 .weak(),

@@ -84,9 +84,11 @@ fn write_prepared_records(
     records: &[OwnedNewFile],
     stop_flag: &Arc<AtomicBool>,
     config: &Config,
-    chunk_size: usize,
     write_row: impl Fn(&rusqlite::Transaction<'_>, &OwnedNewFile) -> Result<Option<i64>, String>,
 ) -> Result<(), String> {
+    // `.max(1)`: `chunks(0)` panics on the indexing thread, so a hand-edited
+    // `batch_size = 0` would wedge indexing while the UI reads "Running".
+    let chunk_size = config.processing.batch_size.max(1);
     // One set of buffers for every chunk this call writes.
     let mut bodies = Bodies::new()?;
     for batch in records.chunks(chunk_size) {
@@ -134,17 +136,15 @@ pub fn process_batch_updates(
         return Ok(());
     }
 
-    let fts_batch = config.processing.fts_update_batch_size.max(1);
-
-    // The row leaves this closure `_fresh`: `update_file_basic` cleared its
-    // content in this same transaction, and the insert fallback created the
-    // row outright.
+    // The row leaves this closure `_fresh`: `update_file_basic` cleared a
+    // DONE row's content in this same transaction — every other state
+    // provably holds none (`repo_tests::leaving_done_always_takes_the_posting_with_it`)
+    // — and the insert fallback created the row outright.
     write_prepared_records(
         conn_mutex,
         files_to_update,
         stop_flag,
         config,
-        fts_batch,
         |tx, rec| {
             let updated = repo::update_file_basic(tx, &rec.as_new_file()).map_err(|e| {
                 format!(
@@ -182,9 +182,6 @@ pub fn process_batch_inserts(
         return Ok(());
     }
 
-    // `.max(1)`: `chunks(0)` panics on the indexing thread, so a hand-edited
-    // `batch_size = 0` would wedge indexing while the UI reads "Running".
-    //
     // The row leaves this closure `_fresh`: `insert_file` returned `Some`
     // only by creating it, so it cannot carry content from anywhere.
     write_prepared_records(
@@ -192,7 +189,6 @@ pub fn process_batch_inserts(
         files_to_insert,
         stop_flag,
         config,
-        config.processing.batch_size.max(1),
         |tx, rec| {
             repo::insert_file(tx, &rec.as_new_file())
                 .map_err(|e| format!("Failed to insert file record: {}", e))
@@ -203,6 +199,26 @@ pub fn process_batch_inserts(
 /// Delete the rows a completed run found no file behind. Returns how many
 /// went. A chunk either commits whole or is not begun, so a stop cannot
 /// leave the index half-reconciled.
+///
+/// FTS5's delete-merging is held off for the whole pass
+/// ([`fts_begin_tombstone_burst`]) — this is a bulk withdrawal, the shape the
+/// burst was measured on. A stop mid-pass returns without restoring it, which
+/// is the established abandonment semantics: the next run's
+/// [`fts_begin_bulk_write`] puts the threshold back.
+///
+/// `examples/pruneprobe.rs`'s stale table prices the shape (200k-row index,
+/// 40k stale paths, 1 in 7 holding a posting): the per-path form this
+/// replaced took 794 ms plain / 1,627 ms keyed; this takes 532 / 1,226 —
+/// 1.5x and 1.3x, most of it the burst, the rest the batched deletes and the
+/// `with_postings` narrowing. The gain is smaller than the reconcile's
+/// because here only a seventh of the doomed rows hold a posting.
+///
+/// Each chunk resolves `(id, content_state)` **inside its own transaction**
+/// and hands [`repo::delete_ids`] the `STATE_DONE` subset as `with_postings`.
+/// The placement is load-bearing: extraction may still be running (its writes
+/// serialize on this same connection mutex), so between chunks a doomed row
+/// can flip PENDING→DONE — resolved any earlier, its posting would outlive
+/// the row.
 pub fn cleanup_stale_index_entries(
     conn_mutex: &Arc<Mutex<Connection>>,
     stale_paths: &[String],
@@ -215,6 +231,13 @@ pub fn cleanup_stale_index_entries(
     let chunk = config.processing.batch_size.max(1);
     let mut deleted_count = 0usize;
 
+    {
+        let conn = crate::lock_ok(conn_mutex);
+        fts_begin_tombstone_burst(&conn);
+    }
+
+    let mut ids: Vec<i64> = Vec::new();
+    let mut with_postings: Vec<i64> = Vec::new();
     for batch in stale_paths.chunks(chunk) {
         if stop_flag.load(Ordering::Relaxed) {
             return Ok(deleted_count);
@@ -223,26 +246,26 @@ pub fn cleanup_stale_index_entries(
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| format!("Failed to begin stale cleanup transaction: {}", e))?;
+        ids.clear();
+        with_postings.clear();
         for path in batch {
-            if stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            if repo::delete_file_by_path(&tx, path)
-                .map_err(|e| format!("Failed to remove stale index entry for {}: {}", path, e))?
+            if let Some((id, state)) = repo::id_and_state_for_path(&tx, path)
+                .map_err(|e| format!("Failed to resolve stale index entry: {}", e))?
             {
-                deleted_count += 1;
+                ids.push(id);
+                if state == repo::STATE_DONE {
+                    with_postings.push(id);
+                }
             }
         }
+        deleted_count += repo::delete_ids(&tx, &ids, &with_postings)?;
         tx.commit()
             .map_err(|e| format!("Failed to commit stale cleanup transaction: {}", e))?;
-        if stop_flag.load(Ordering::Relaxed) {
-            return Ok(deleted_count);
-        }
     }
 
-    if deleted_count > 0 && !stop_flag.load(Ordering::Relaxed) {
+    if !stop_flag.load(Ordering::Relaxed) {
         let conn = crate::lock_ok(conn_mutex);
-        fts_finalize_after_text_indexing(&conn);
+        fts_end_tombstone_burst(&conn);
     }
 
     Ok(deleted_count)

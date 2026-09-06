@@ -103,14 +103,26 @@ fn initial_content_state(f: &NewFile<'_>) -> i64 {
 
 /// Update a file's metadata in place and reset its content state, clearing
 /// any extracted content. `None` if no row matches.
+///
+/// The clearing is narrowed by the row's *stored* state, the way
+/// `scope::PagePlan` narrows: content rows exist exactly for `STATE_DONE`
+/// (`repo_tests::leaving_done_always_takes_the_posting_with_it`) and
+/// `failed_files` rows exactly for `STATE_FAILED`, so every other state has
+/// nothing to clear and pays one statement instead of four — most changed
+/// rows on a text-free tree are NA→NA, measured 1.24x on that shape
+/// (`benches/index.rs`, group `update_narrowing`; DONE→PENDING is unchanged
+/// by construction, the clearing happens either way).
+/// `content_state` is deliberately **not
+/// in the SET list**: `RETURNING` reports the post-update row, so assigning
+/// it there would return the new state and the narrowing would read its own
+/// write.
 pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option<i64>, String> {
-    let id: Option<i64> = tx
+    let row: Option<(i64, i64)> = tx
         .prepare_cached(
             "UPDATE files
-                SET size = ?1, mtime = ?2, hash = ?3, mime = ?4, type = ?5,
-                    content_state = ?6
-              WHERE parent = ?7 AND name = ?8
-          RETURNING id",
+                SET size = ?1, mtime = ?2, hash = ?3, mime = ?4, type = ?5
+              WHERE parent = ?6 AND name = ?7
+          RETURNING id, content_state",
         )
         .and_then(|mut stmt| {
             stmt.query_row(
@@ -120,27 +132,42 @@ pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option
                     f.hash,
                     f.mime,
                     f.ftype.bits() as i64,
-                    initial_content_state(f),
                     f.parent,
                     f.name,
                 ],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
         })
         .map_err(|e| format!("update file {}: {}", f.path(), e))?;
-    let Some(id) = id else {
+    let Some((id, old_state)) = row else {
         return Ok(None);
     };
-    remove_content_for_id(tx, id)?;
-    // Without this, a changed file that stops needing content keeps reading
-    // as "failed" in `list-failed` forever.
-    exec(
-        tx,
-        "DELETE FROM failed_files WHERE file_id = ?1",
-        params![id],
-        || format!("clear failed_files {}", id),
-    )?;
+    match old_state {
+        STATE_DONE => remove_content_for_id(tx, id)?,
+        // Without this, a changed file that stops needing content keeps
+        // reading as "failed" in `list-failed` forever.
+        STATE_FAILED => exec(
+            tx,
+            "DELETE FROM failed_files WHERE file_id = ?1",
+            params![id],
+            || format!("clear failed_files {}", id),
+        )
+        .map(|_| ())?,
+        _ => {}
+    }
+    let new_state = initial_content_state(f);
+    if old_state != new_state {
+        // A plain assignment, not `set_state_clearing_failure`: the FAILED
+        // arm above already took the failure record, and no other state can
+        // hold one.
+        exec(
+            tx,
+            "UPDATE files SET content_state = ?1 WHERE id = ?2",
+            params![new_state, id],
+            || format!("update reset content_state {}", id),
+        )?;
+    }
     Ok(Some(id))
 }
 
@@ -380,6 +407,24 @@ pub fn delete_file_by_path(tx: &Transaction<'_>, path: &str) -> Result<bool, Str
     let Some(id) = id else { return Ok(false) };
     remove_content_for_id(tx, id)?;
     Ok(true)
+}
+
+/// The stored id and `content_state` for one exact path, or `None` if the
+/// path is not indexed.
+///
+/// Read it in the same transaction as the decision it feeds: the caller that
+/// builds [`delete_ids`]'s `with_postings` from the state must see the state
+/// *at delete time*, and only the transaction makes that simultaneous.
+pub fn id_and_state_for_path(conn: &Connection, path: &str) -> Result<Option<(i64, i64)>, String> {
+    let Some((parent, name)) = crate::file_handling::split_db_path(path) else {
+        return Ok(None);
+    };
+    conn.prepare_cached("SELECT id, content_state FROM files WHERE parent = ?1 AND name = ?2")
+        .and_then(|mut stmt| {
+            stmt.query_row(params![parent, name], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()
+        })
+        .map_err(|e| format!("look up {}: {}", path, e))
 }
 
 /// Delete every row whose parent falls in `[lo, hi)`. Build the bounds with

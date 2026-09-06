@@ -75,24 +75,22 @@ eframe = { version = "0.32", default-features = false, features = [
     "x11",
 ] }
 
-# The Wayland half of the in-application shortcut:
-# `org.freedesktop.portal.GlobalShortcuts`, the only way a Wayland application
-# can be told about a key it does not own. `rfd` already pulls all four in (it
-# uses the file-chooser portal), so the versions here are the ones already
-# resolved and nothing extra is compiled. `default-features = false` matters:
-# ashpd defaults to Tokio, which would add a second async runtime and switch
-# `zbus` over to it underneath `rfd`.
-ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
-futures-channel = "0.3"
-futures-util = "0.3"
-pollster = "0.4"
-
 # Raising the window from either shortcut on X11, which winit cannot
 # do: it asks with a source indication of "application", and every mainstream
 # window manager refuses that from a window that is not already focused. See
 # `activate::raise`. Already in the tree as winit's own X11 backend, so this
 # adds no crate.
 x11rb = "0.13"
+
+# The Wayland half of activate::raise: a guest connection over winit's own
+# wl_display (wayland-backend's from_foreign_display), used to hand the
+# compositor an xdg-activation token for our live surface. All three are
+# already in the tree with these exact features — winit enables
+# wayland-backend/client_system and wayland-protocols/staging, sctk enables
+# wayland-protocols/client — so this compiles nothing new.
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
 # XTEST, for `examples/raiseprobe.rs` only: it synthesises the global key
 # press that proves the shortcut path end to end, which no command-line tool

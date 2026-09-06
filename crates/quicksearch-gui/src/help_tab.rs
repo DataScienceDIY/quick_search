@@ -518,7 +518,7 @@ const KEY_COL_WIDTH: f32 = 140.0;
 const CELL_SPACING: f32 = 14.0;
 
 /// A prose cell in one of this tab's tables, laid out in a child `Ui` of
-/// exactly `width`.
+/// exactly `width` and exactly as tall as the wrapped text came out.
 ///
 /// Two things force the explicit width. Grid cells default to
 /// `TextWrapMode::Extend`, which lays a long cell out past the panel and, far
@@ -529,9 +529,23 @@ const CELL_SPACING: f32 = 14.0;
 /// the column to that, squeezing prose into a two-word ribbon. A child `Ui`
 /// of a width we chose settles both. Pinned by
 /// `tests::a_window_narrower_than_the_column_reflows_rather_than_clipping`.
+///
+/// The height has to be measured rather than left at zero, which is why the
+/// galley is laid out here instead of by the `Label`. `Grid` aligns a cell
+/// `LEFT_CENTER` within its row, and centring a *zero-height* box lands it on
+/// the row's midpoint; the text then runs downward from there, half a row
+/// below the striped background painted behind it. Handing the measured
+/// height in makes that centring a no-op. Pinned by
+/// `tests::table_rows_line_up_with_their_stripes`.
 fn cell(ui: &mut egui::Ui, width: f32, text: impl Into<egui::WidgetText>) {
-    ui.allocate_ui(egui::vec2(width, 0.0), |ui| {
-        ui.add(egui::Label::new(text).wrap());
+    let galley = text.into().into_galley(
+        ui,
+        Some(egui::TextWrapMode::Wrap),
+        width,
+        egui::TextStyle::Body,
+    );
+    ui.allocate_ui(egui::vec2(width, galley.size().y), |ui| {
+        ui.add(egui::Label::new(galley));
     });
 }
 
@@ -670,6 +684,97 @@ mod tests {
                 "no chip painted in stage {}'s colour {:?}",
                 stage,
                 color
+            );
+        }
+    }
+
+    /// A table cell allocated with no height of its own is centred on its
+    /// row's midpoint by `Grid` and then laid out downward from there, which
+    /// leaves every prose column half a row below the striped background
+    /// painted behind it. Both halves of a row have to share a centre line,
+    /// and the text has to sit inside its own stripe.
+    #[test]
+    fn table_rows_line_up_with_their_stripes() {
+        let ctx = crate::test_ui::ctx();
+        let input = crate::test_ui::raw_input(egui::vec2(1000.0, 4000.0), vec![]);
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                super::ui(ui);
+            });
+        });
+        let painted = crate::test_ui::painted(&out);
+        let find = |needle: &str| {
+            painted
+                .iter()
+                .find(|(text, _)| text == needle)
+                .unwrap_or_else(|| panic!("nothing painted for {:?}", needle))
+                .1
+        };
+
+        // One single-line and one wrapping row from each striped table: the
+        // offset is half the row's height, so a wrapping row misses by twice
+        // as much as a single-line one.
+        for (key, prose) in [
+            (" Exact name ", "the file is called exactly what you typed"),
+            (
+                " Close spelling ",
+                "a name or some text within a typo or two of what you typed, \
+                 only while Fuzzy is ticked",
+            ),
+            ("*.jpg", "holiday.jpg, 1.jpg"),
+            (
+                "node_modules",
+                "a file or folder named exactly that, and all it holds",
+            ),
+        ] {
+            let (key_rect, prose_rect) = (find(key), find(prose));
+            assert!(
+                (key_rect.center().y - prose_rect.center().y).abs() < 1.0,
+                "{:?} is centred at {} but {:?} at {}",
+                key,
+                key_rect.center().y,
+                prose,
+                prose_rect.center().y
+            );
+        }
+
+        // The stripes themselves, so the rows are checked against what the
+        // user actually sees behind them rather than only against each other.
+        // Only every other row carries one, so both of these are rows egui
+        // paints: the ranking table's fourth, the examples' second.
+        let faint = ctx.style().visuals.faint_bg_color;
+        fn walk(shape: &egui::epaint::Shape, faint: egui::Color32, into: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::epaint::Shape::Rect(r) if r.fill == faint => into.push(r.rect),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        walk(s, faint, into);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut stripes = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, faint, &mut stripes);
+        }
+        assert!(!stripes.is_empty(), "no striped rows painted");
+        for prose in [
+            "a name or some text within a typo or two of what you typed, \
+             only while Fuzzy is ticked",
+            "a file or folder named exactly that, and all it holds",
+        ] {
+            let rect = find(prose);
+            let stripe = stripes
+                .iter()
+                .find(|s| s.contains(rect.center()))
+                .unwrap_or_else(|| panic!("{:?} sits on no stripe: {:#?}", prose, stripes));
+            assert!(
+                stripe.y_range().contains(rect.top()) && stripe.y_range().contains(rect.bottom()),
+                "{:?} spans {:?} but its stripe only {:?}",
+                prose,
+                rect.y_range(),
+                stripe.y_range()
             );
         }
     }

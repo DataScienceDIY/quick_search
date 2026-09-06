@@ -94,8 +94,6 @@ batch_size = 500
 # leave another root's walkers parked behind it. 0 gives each turn one
 # batch_size quantum and no more. Clamped to 0..10000 on load.
 writer_turn_slice_ms = 100
-# Files per transaction for incremental FTS updates.
-fts_update_batch_size = 1000
 # How large the write-ahead log (index.sqlite-wal) may grow during an
 # indexing run before the indexer forces a checkpoint (bytes); left
 # alone, the log grows for the whole run. Not a safety knob: on a volume
@@ -150,8 +148,9 @@ watch_cap_warned_roots = []
 # The shortcut QuickSearch claims for itself while it is running: brings it to
 # the front, switches to the Search tab and selects whatever is in the search
 # box. Modifiers are Ctrl, Alt and Shift, joined to one key with "+". Leave it
-# empty ("") for no shortcut. To start QuickSearch when it is closed, bind
-# "quicksearch --toggle" in your desktop's keyboard settings.
+# empty ("") for no shortcut. To start QuickSearch when it is closed, use
+# "Set up system shortcut" on the Settings tab, or bind "quicksearch
+# --toggle" in your desktop's keyboard settings yourself.
 search_hotkey = "Ctrl+Shift+F"
 # 'dark' or 'light'; anything other than 'light' is dark. Applied as soon
 # as it is changed on the Settings tab. Following the desktop's own
@@ -172,7 +171,10 @@ show_advanced_settings = false
 tutorial_seen = false
 
 [search]
-# Start with the fuzzy passes enabled.
+# Whether the Fuzzy box on the Search tab starts ticked. Off by default: the
+# fuzzy passes cost noticeable time on every keystroke, and most searches do
+# not need them. Tick it in the GUI whenever you want typo tolerance for a
+# session, or set it here to start that way every time.
 fuzzy_default = false
 # Ceiling on the fuzzy stages' typo budget. The allowance grows with the
 # search term, one edit per three characters, up to this value, so 2

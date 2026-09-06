@@ -7,17 +7,15 @@
 //! box whether or not the app was started", because a shortcut an application
 //! registers for itself cannot fire while the application is not there.
 //!
-//! The message carries nothing: "come forward" is the whole protocol. On
-//! unix the reply exists only so the sender can tell a live instance from a
-//! leftover socket; on Windows it instead carries the server's PID, which
-//! the sender feeds to `AllowSetForegroundWindow` so the running window may
-//! actually take the foreground — see the `#[cfg(windows)]` module below.
-//! An xdg-activation token would be the natural thing to
-//! carry — it is what a compositor wants before letting a background client
-//! take focus — but nothing downstream can consume one: winit 0.30 applies a
-//! token only in `WindowAttributes`, and egui's `ViewportBuilder` has no
-//! field for it, so eframe never plumbs one either. See [`raise`] for what
-//! that costs on Wayland.
+//! "Come forward" is nearly the whole protocol; what little each side says
+//! is the permission the other needs. On unix the request line carries the
+//! sender's `XDG_ACTIVATION_TOKEN` (usually empty) — on Wayland that token
+//! is the compositor's leave for the running window to take focus, spent in
+//! [`raise`]'s `xdg_activation_v1` path — and the reply exists so the
+//! sender can tell a live instance from a leftover socket. On Windows the
+//! reply instead carries the server's PID, which the sender feeds to
+//! `AllowSetForegroundWindow` so the running window may take the foreground
+//! — see the `#[cfg(windows)]` module below.
 
 pub mod raise;
 
@@ -29,6 +27,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// A flag rather than a queue: two presses before the app can redraw mean
 /// the same thing as one.
 static PENDING: AtomicBool = AtomicBool::new(false);
+
+/// The xdg-activation token that came with the pending press, when a
+/// `--toggle` sender forwarded one (see the unix module). Read together with
+/// [`take_pending`]; a later press's token simply replaces an unread one,
+/// matching the flag's "two presses mean one" rule.
+static TOKEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// The most a PID reply can be: a 32-bit PID is at most ten digits, and the
 /// newline ends it. Also the pipe's buffer size, so the server's write never
@@ -97,6 +101,12 @@ pub fn take_pending() -> bool {
     PENDING.swap(false, Ordering::SeqCst)
 }
 
+/// The token belonging to the press [`take_pending`] just returned; call
+/// right after it, on the same thread's handling of the same frame.
+pub fn take_token() -> Option<String> {
+    TOKEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+}
+
 /// What to tell the user to bind, as they would type it. The installed name
 /// when we are on the path under it, and the full path otherwise — a build
 /// run out of `target/` is the common case, and "quicksearch" would be wrong
@@ -125,6 +135,13 @@ pub fn command_name() -> String {
 /// application's own registration fires, so the two paths are identical from
 /// the UI's point of view.
 pub(crate) fn fire(ctx: &egui::Context) {
+    fire_with_token(ctx, None);
+}
+
+/// [`fire`], carrying the activation token a `--toggle` sender forwarded —
+/// on Wayland it is the compositor's permission to take focus.
+pub(crate) fn fire_with_token(ctx: &egui::Context, token: Option<String>) {
+    *TOKEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = token;
     PENDING.store(true, Ordering::SeqCst);
     ctx.request_repaint();
 }
@@ -137,6 +154,11 @@ mod imp {
     use std::io::{Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
 
+    /// The most a request line may be. Real xdg-activation tokens run some
+    /// tens of characters; the cap is what keeps a hostile peer from feeding
+    /// the listener forever.
+    const REQUEST_CAP: usize = 1024;
+
     /// Ask the instance configured by `config_path` to come forward.
     ///
     /// `true` means a live instance accepted it. `false` means there is none
@@ -144,7 +166,18 @@ mod imp {
     /// start the GUI itself. **A leftover socket file never counts as an
     /// instance**: the same rule `IndexLock` follows, so a crash cannot
     /// strand the user behind a file nobody is listening on.
+    ///
+    /// The request carries this process's `XDG_ACTIVATION_TOKEN`, when the
+    /// launcher behind the user's keypress minted one: on Wayland that token
+    /// is the compositor's permission to take focus, and the running
+    /// instance spends it on its own window (`raise`). Launched by hand
+    /// there is none, and the request is the empty line it always was.
     pub fn signal(config_path: &Path) -> bool {
+        let token = std::env::var("XDG_ACTIVATION_TOKEN").unwrap_or_default();
+        signal_with_token(config_path, &token)
+    }
+
+    pub(super) fn signal_with_token(config_path: &Path, token: &str) -> bool {
         let Ok(mut stream) = UnixStream::connect(path_for(config_path)) else {
             return false;
         };
@@ -156,7 +189,18 @@ mod imp {
         {
             return false;
         }
-        if stream.write_all(b"\n").is_err() || stream.flush().is_err() {
+        // One line is the whole request. A token that could not cross intact
+        // (absurd length, a newline of its own) is dropped rather than sent
+        // mangled: the press still lands, the raise just loses its token.
+        let token = if token.len() < REQUEST_CAP && !token.contains('\n') {
+            token
+        } else {
+            ""
+        };
+        if stream.write_all(token.as_bytes()).is_err()
+            || stream.write_all(b"\n").is_err()
+            || stream.flush().is_err()
+        {
             return false;
         }
         // The reply is what distinguishes "delivered" from "wrote into a
@@ -215,8 +259,8 @@ mod imp {
                 // Fire *before* the ack: a client that saw the reply may act
                 // on "delivered", and delivered means the window was already
                 // asked to come forward.
-                Ok(()) => {
-                    fire(ctx);
+                Ok(token) => {
+                    fire_with_token(ctx, (!token.is_empty()).then_some(token));
                     let _ = acknowledge(&mut stream);
                 }
                 // One stalled or truncated peer must not stop the loop, and
@@ -226,21 +270,40 @@ mod imp {
         }
     }
 
-    /// Read the request.
+    /// Read the request: one newline-terminated line carrying the sender's
+    /// activation token, usually empty.
     ///
     /// Hostile input is the norm rather than the exception: any process of
-    /// this user can connect. The read is bounded in both bytes and time, so
-    /// a peer that connects and stalls cannot wedge the one thread that
-    /// answers every activation.
-    pub(super) fn request(stream: &mut UnixStream) -> std::io::Result<()> {
+    /// this user can connect. The read is bounded in bytes ([`REQUEST_CAP`])
+    /// and time, so a peer that connects and stalls, or pours data without a
+    /// newline, cannot wedge the one thread that answers every activation.
+    pub(super) fn request(stream: &mut UnixStream) -> std::io::Result<String> {
+        use std::io::{Error, ErrorKind};
+
         let timeout = std::time::Duration::from_secs(5);
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
 
-        // One byte is the whole request; the cap is what keeps a peer from
-        // holding this thread for as long as it cares to send.
-        let mut scratch = [0u8; 1];
-        stream.read_exact(&mut scratch)
+        let mut buf = [0u8; REQUEST_CAP];
+        let mut len = 0;
+        loop {
+            let n = stream.read(&mut buf[len..])?;
+            if n == 0 {
+                return Err(ErrorKind::UnexpectedEof.into());
+            }
+            len += n;
+            if let Some(newline) = buf[..len].iter().position(|&b| b == b'\n') {
+                let token = std::str::from_utf8(&buf[..newline])
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+                return Ok(token.to_string());
+            }
+            if len == buf.len() {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "no newline within the request cap",
+                ));
+            }
+        }
     }
 
     /// The reply that lets the sender tell a live instance from a leftover
@@ -548,6 +611,23 @@ mod tests {
         assert!(!take_pending(), "the flag is consumed");
     }
 
+    /// The token rides the flag: consumed with it, and a fresh press without
+    /// one clears a stale token rather than resurrecting it.
+    #[test]
+    fn the_token_is_consumed_with_the_press() {
+        let _serial = pending_guard();
+        let ctx = egui::Context::default();
+        fire_with_token(&ctx, Some("tok".to_string()));
+        assert!(take_pending());
+        assert_eq!(take_token(), Some("tok".to_string()));
+        assert_eq!(take_token(), None, "the token is consumed");
+
+        fire_with_token(&ctx, Some("stale".to_string()));
+        fire(&ctx);
+        assert!(take_pending());
+        assert_eq!(take_token(), None, "a tokenless press cleared the older token");
+    }
+
     /// A config path unique to this test, so the sockets these bind never
     /// collide: they run on one process, in parallel.
     #[cfg(unix)]
@@ -575,7 +655,8 @@ mod tests {
     }
 
     /// The whole point, end to end: a signal to a live listener is accepted,
-    /// and the listener sees a well-formed request.
+    /// the listener sees a well-formed request, and the activation token it
+    /// carries crosses intact.
     #[cfg(unix)]
     #[test]
     fn a_signal_crosses_the_socket() {
@@ -584,17 +665,69 @@ mod tests {
         let db = scratch("roundtrip");
         let listener = UnixListener::bind(path_for(&db)).expect("bind");
 
-        let sender = std::thread::spawn(move || signal(&db));
+        let sender =
+            std::thread::spawn(move || imp::signal_with_token(&db, "wayland-token-123"));
 
         let mut stream = listener
             .incoming()
             .next()
             .expect("a connection")
             .expect("accepted");
-        imp::request(&mut stream).expect("a well-formed request");
+        let token = imp::request(&mut stream).expect("a well-formed request");
+        assert_eq!(token, "wayland-token-123");
         imp::acknowledge(&mut stream).expect("acknowledged");
 
         assert!(sender.join().expect("sender"), "the client saw the reply");
+    }
+
+    /// A token that cannot cross as one line is dropped, not sent mangled:
+    /// the press still lands and only the raise loses its token.
+    #[cfg(unix)]
+    #[test]
+    fn an_unsendable_token_degrades_to_an_empty_request() {
+        use std::os::unix::net::UnixListener;
+
+        for bad in ["with\nnewline".to_string(), "x".repeat(5000)] {
+            let db = scratch("badtoken");
+            let listener = UnixListener::bind(path_for(&db)).expect("bind");
+            let sender = std::thread::spawn(move || imp::signal_with_token(&db, &bad));
+            let mut stream = listener
+                .incoming()
+                .next()
+                .expect("a connection")
+                .expect("accepted");
+            assert_eq!(imp::request(&mut stream).expect("well-formed"), "");
+            imp::acknowledge(&mut stream).expect("acknowledged");
+            assert!(sender.join().expect("sender"));
+        }
+    }
+
+    /// A peer pouring bytes with no newline is cut off at the cap rather
+    /// than fed forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_newline_less_flood_is_refused_at_the_cap() {
+        use std::io::Write;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let db = scratch("flood");
+        let path = path_for(&db);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let mut peer = UnixStream::connect(&path).expect("connect");
+        std::thread::spawn(move || {
+            // More than the cap, never a newline; ignore the write error the
+            // refusal causes.
+            let _ = peer.write_all(&[b'x'; 4096]);
+        });
+        let mut stream = listener
+            .incoming()
+            .next()
+            .expect("a connection")
+            .expect("accepted");
+        assert!(
+            imp::request(&mut stream).is_err(),
+            "a capless request was accepted"
+        );
     }
 
     /// `listen` must replace a crashed predecessor's socket rather than

@@ -136,3 +136,103 @@ mod mime_sniff {
     }
 }
 
+
+/// `repo::update_file_basic`'s state narrowing: an NA→NA update — the whole
+/// of a re-run over a text-free tree — pays one statement instead of four.
+/// The pair: `clear_always` reimplements the pre-narrowing shape (the control
+/// that must not move between builds); `narrowed` is the shipped function.
+/// NA→NA is idempotent, so iterations are stable without re-seeding.
+/// DONE→PENDING is deliberately not benched: its statement count is identical
+/// in both shapes (clearing that must happen either way), so there is nothing
+/// to regress.
+mod update_narrowing {
+    use super::*;
+    use quicksearch_core::db::repo::{self, NewFile};
+    use quicksearch_core::mime::FileType;
+    use quicksearch_core::testutil::Scratch;
+    use rusqlite::{params, Connection, OptionalExtension};
+
+    const ROWS: usize = 1000;
+
+    fn new_file(name: &str) -> NewFile<'_> {
+        NewFile {
+            name,
+            parent: "/b/",
+            size: 7,
+            mtime: 7,
+            mime: None,
+            ftype: FileType::EMPTY,
+            hash: None,
+            needs_content: false,
+        }
+    }
+
+    fn seeded_na(tag: &str) -> (Scratch, Connection) {
+        let (dir, p) = Scratch::db(tag);
+        let mut conn =
+            quicksearch_core::db::open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        let tx = conn.transaction().unwrap();
+        let names: Vec<String> = (0..ROWS).map(|i| format!("f{:04}.txt", i)).collect();
+        for name in &names {
+            repo::insert_file(&tx, &new_file(name)).unwrap().unwrap();
+        }
+        tx.commit().unwrap();
+        (dir, conn)
+    }
+
+    #[divan::bench]
+    fn clear_always(bencher: Bencher) {
+        let (_dir, mut conn) = seeded_na("bench-update-old");
+        let names: Vec<String> = (0..ROWS).map(|i| format!("f{:04}.txt", i)).collect();
+        bencher.bench_local(move || {
+            let tx = conn.transaction().unwrap();
+            for name in &names {
+                let f = new_file(name);
+                let id: i64 = tx
+                    .prepare_cached(
+                        "UPDATE files
+                            SET size = ?1, mtime = ?2, hash = ?3, mime = ?4, type = ?5,
+                                content_state = ?6
+                          WHERE parent = ?7 AND name = ?8
+                      RETURNING id",
+                    )
+                    .unwrap()
+                    .query_row(
+                        params![
+                            f.size as i64,
+                            f.mtime as i64,
+                            f.hash,
+                            f.mime,
+                            f.ftype.bits() as i64,
+                            repo::STATE_NA,
+                            f.parent,
+                            f.name,
+                        ],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .unwrap()
+                    .unwrap();
+                repo::remove_content_for_id(&tx, id).unwrap();
+                tx.prepare_cached("DELETE FROM failed_files WHERE file_id = ?1")
+                    .unwrap()
+                    .execute([id])
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        });
+    }
+
+    #[divan::bench]
+    fn narrowed(bencher: Bencher) {
+        let (_dir, mut conn) = seeded_na("bench-update-new");
+        let names: Vec<String> = (0..ROWS).map(|i| format!("f{:04}.txt", i)).collect();
+        bencher.bench_local(move || {
+            let tx = conn.transaction().unwrap();
+            for name in &names {
+                repo::update_file_basic(&tx, &new_file(name)).unwrap().unwrap();
+            }
+            tx.commit().unwrap();
+        });
+    }
+}

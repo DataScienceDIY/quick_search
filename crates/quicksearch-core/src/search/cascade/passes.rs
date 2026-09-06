@@ -408,20 +408,42 @@ impl<'a> Cx<'a> {
         Bitap::new(self.query.term.as_bytes(), k).map(|bitap| (k, bitap))
     }
 
-    /// Pass C — rank 7 now, rank 11 deferred: one bitap sweep over every
-    /// filename, falling back to the full path where the name misses.
+    /// Pass C — rank 7 now, rank 11 deferred: one bitap sweep over the
+    /// filenames, falling back to the full path where the name misses.
+    ///
+    /// Narrowed by the same pigeonhole split pass D uses: at least one of the
+    /// `k+1` chunks survives `≤k` edits verbatim ([`pigeonhole_chunks`]), and
+    /// a separator-free chunk cannot span the `parent‖name` join, so
+    /// `(name LIKE OR parent LIKE)` per chunk covers the name tier and the
+    /// path tier both ([`prefilter::Required::like_predicate`]). `LIKE` folds
+    /// ASCII case, a superset of the matcher's own folding — the direction
+    /// the one rule in `search/prefilter.rs` allows. Any `None` along the way
+    /// keeps the full scan — which, under the default edit cap of 2, is every
+    /// term shorter than 9 characters (`3 × (k + 1)` with k already 2 at 6).
+    ///
+    /// Measured (`benches/search_perf.rs`, fuzzy pairing, 200k rows, warm):
+    /// `quartzite` 113 ms → 62 plain and 113 → 59 keyed; `quartzites`
+    /// 112 → 97 and 110 → 97 (its split ends in a weak 3-char chunk); the
+    /// short-term fallback rows did not move.
     pub(super) fn pass_fuzzy_filename(&mut self) -> Result<bool, String> {
-        let Some((_, bitap)) = self.fuzzy_matcher() else {
+        let Some((k, bitap)) = self.fuzzy_matcher() else {
             return Ok(true);
         };
         let query = self.query;
         let with_paths = path_tiers_enabled(&query.pattern);
 
+        let (predicate, terms) = pigeonhole_chunks(&query.term, k)
+            .and_then(|chunks| {
+                prefilter::Required::new(chunks.iter().map(|c| c.to_string()).collect())
+            })
+            .and_then(|req| req.like_predicate())
+            .unwrap_or_else(|| ("1=1".to_string(), Vec::new()));
+
         let sql = format!(
-            "SELECT {} FROM files f WHERE 1=1{}",
-            HIT_COLUMNS, query.filter_sql
+            "SELECT {} FROM files f WHERE {}{}",
+            HIT_COLUMNS, predicate, query.filter_sql
         );
-        let params = self.params_with_filters(Vec::new());
+        let params = self.params_with_filters(terms);
         self.scan_pass(
             &sql,
             params,

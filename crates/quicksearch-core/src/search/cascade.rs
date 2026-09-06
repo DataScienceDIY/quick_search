@@ -39,7 +39,7 @@ use crate::query::translator::{escape_like, quote_phrase};
 use crate::snippet;
 
 use super::fuzzy::{edit_budget, pigeonhole_chunks, Bitap};
-use super::{SearchHit, SearchOptions};
+use super::{prefilter, SearchHit, SearchOptions};
 
 mod passes;
 
@@ -137,6 +137,11 @@ pub fn run(
         emitted: IdSet::default(),
         deferred_path: Deferred::default(),
         deferred_fuzzy_path: Deferred::default(),
+        regex_doc: query
+            .regex
+            .as_ref()
+            .map(|_| crate::db::repo::DocDecoder::new())
+            .transpose()?,
         total: 0,
         limited: false,
         sink,
@@ -310,6 +315,11 @@ struct Cx<'a> {
     deferred_path: Deferred,
     /// Rank 11, filled by pass C.
     deferred_fuzzy_path: Deferred,
+    /// Decoder for [`Cx::regex_accepts`]'s content fetches, built once per
+    /// search and only when the query carries a regex — the predicate runs
+    /// per candidate row, exactly the shape [`crate::db::repo::DocDecoder`]
+    /// exists for.
+    regex_doc: Option<crate::db::repo::DocDecoder>,
     total: usize,
     limited: bool,
     sink: &'a mut dyn FnMut(Vec<SearchHit>),
@@ -370,9 +380,25 @@ impl<'a> Cx<'a> {
 
     /// The `regex:` accept-predicate when a regex accompanies a term. The
     /// path contains the name, so one path check covers both; content is
-    /// fetched only for rows whose path missed.
-    fn regex_accepts(&self, file_id: i64, path: &str, text: Option<&str>) -> Result<bool, String> {
-        let Some(re) = &self.query.regex else {
+    /// fetched only for rows whose path missed — per candidate row, which is
+    /// why the statement is cached and the decoder ([`Cx::regex_doc`]) is
+    /// reused, and the blob is decoded borrowed rather than copied out.
+    /// Measured (`benches/search_alloc.rs`, case "term + regex"): 42.6 MiB
+    /// churned per keystroke → 4.3, and ~1.3x on the case's time, over the
+    /// `query_row` + `decode_all` shape this replaced.
+    fn regex_accepts(
+        &mut self,
+        file_id: i64,
+        path: &str,
+        text: Option<&str>,
+    ) -> Result<bool, String> {
+        let Cx {
+            conn,
+            query,
+            regex_doc,
+            ..
+        } = self;
+        let Some(re) = &query.regex else {
             return Ok(true);
         };
         if re.is_match(path) {
@@ -381,19 +407,23 @@ impl<'a> Cx<'a> {
         if let Some(text) = text {
             return Ok(re.is_match(text));
         }
-        let blob: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT text_zstd FROM documents_text WHERE file_id = ?1",
-                [file_id],
-                |r| r.get(0),
-            )
-            .optional()
+        let doc = regex_doc
+            .as_mut()
+            .expect("built in run() whenever the query carries a regex");
+        let accepted = conn
+            .prepare_cached("SELECT text_zstd FROM documents_text WHERE file_id = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_row([file_id], |r| {
+                    let blob = r.get_ref(0)?.as_blob()?;
+                    // Strict UTF-8 via `decode` is not a behaviour change:
+                    // bodies are written from `&str` (`repo::set_content_done`),
+                    // and `stored_text` already treats non-UTF-8 as absent.
+                    Ok(doc.decode(blob).is_some_and(|t| re.is_match(t)))
+                })
+                .optional()
+            })
             .map_err(|e| e.to_string())?;
-        let Some(raw) = blob.and_then(|b| zstd::decode_all(b.as_slice()).ok()) else {
-            return Ok(false);
-        };
-        Ok(re.is_match(&String::from_utf8_lossy(&raw)))
+        Ok(accepted.unwrap_or(false))
     }
 
     /// Hand `buf` over mid-scan if it is due, leaving it empty when it goes.

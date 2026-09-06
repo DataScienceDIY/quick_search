@@ -59,8 +59,10 @@ binding runs so that a key can start it as well.
 The activation reaches the running instance over a unix socket in
 .IR $XDG_RUNTIME_DIR ,
 named after the configuration file; when nothing answers, this process becomes
-the application. On Wayland an already\-open window cannot be raised by another
-process, so it is highlighted in the task bar instead of coming to the front.
+the application. On Wayland the window comes forward when the desktop supplied
+an activation token for the launch (a binding made with the Settings tab's
+set\-up button does); run by hand with no token, the window is highlighted in
+the task bar instead.
 .TP
 .B \-\-fuzzy
 Also run the fuzzy filename and full\-text passes, which tolerate spelling
