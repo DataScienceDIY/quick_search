@@ -107,14 +107,28 @@ pub fn take_token() -> Option<String> {
     TOKEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
-/// What to tell the user to bind, as they would type it. The installed name
+/// What to tell the user (or a desktop binding) to run. The installed name
 /// when we are on the path under it, and the full path otherwise — a build
 /// run out of `target/` is the common case, and "quicksearch" would be wrong
 /// advice there.
+///
+/// An AppImage needs its own rule: `current_exe` there points into the
+/// runtime's FUSE mount (`/tmp/.mount_…`), which vanishes with the process,
+/// so a binding made from it dies the moment QuickSearch closes. The
+/// runtime exports the durable path of the `.AppImage` file itself as
+/// `$APPIMAGE`; that is the thing to run.
 pub fn command_name() -> String {
     let Ok(exe) = std::env::current_exe() else {
         return "quicksearch".to_string();
     };
+    durable_command(std::env::var_os("APPIMAGE").map(std::path::PathBuf::from), exe)
+}
+
+/// The rule itself, split from the environment for the tests.
+fn durable_command(appimage: Option<PathBuf>, exe: PathBuf) -> String {
+    if let Some(appimage) = appimage.filter(|p| p.is_absolute()) {
+        return appimage.display().to_string();
+    }
     let installed = exe
         .parent()
         .is_some_and(|dir| matches!(dir.to_str(), Some("/usr/bin") | Some("/usr/local/bin")));
@@ -582,6 +596,30 @@ mod tests {
         let a = key(Path::new("/a/config.toml"));
         let b = key(Path::new("/b/config.toml"));
         assert_ne!(a, b);
+    }
+
+    /// An AppImage's mount path dies with the process; a binding must run
+    /// the image file itself. Everything else keeps the old rule.
+    #[test]
+    fn the_bound_command_survives_the_appimage_exiting() {
+        let mount = PathBuf::from("/tmp/.mount_quicksjBMkDo/usr/bin/quicksearch");
+        assert_eq!(
+            durable_command(Some(PathBuf::from("/home/u/Apps/QuickSearch.AppImage")), mount.clone()),
+            "/home/u/Apps/QuickSearch.AppImage"
+        );
+        // A relative or empty APPIMAGE is somebody playing games; ignored.
+        assert_eq!(
+            durable_command(Some(PathBuf::from("games")), mount.clone()),
+            mount.display().to_string()
+        );
+        assert_eq!(
+            durable_command(None, PathBuf::from("/usr/bin/quicksearch")),
+            "quicksearch"
+        );
+        assert_eq!(
+            durable_command(None, PathBuf::from("/opt/qs/quicksearch")),
+            "/opt/qs/quicksearch"
+        );
     }
 
     /// The Windows reply parser, which faces whatever a squatting process

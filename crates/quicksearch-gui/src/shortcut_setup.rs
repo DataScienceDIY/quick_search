@@ -399,9 +399,31 @@ mod kde {
                 binding, holder.action_friendly, holder.component_friendly,
             ));
         }
-        // An earlier build's file in the old location would leave a second
-        // component claiming a key; gone before the new one appears.
-        let _ = std::fs::remove_file(legacy_desktop_file());
+        // A re-install must start from nothing. The daemon's service refresh
+        // only *drops* components whose file vanished — it never re-reads a
+        // changed one, and a component surviving `unregister` empty blocks
+        // re-detection by name — so an install over an existing binding
+        // would keep serving the old Exec line (fatal for an AppImage,
+        // whose old mount path died with the last run). Tear down like
+        // `remove` does and let the daemon notice before rebuilding.
+        if desktop_file().is_file() || legacy_desktop_file().is_file() {
+            let _ = call("unregister", &[COMPONENT, ACTION]);
+            let _ = std::fs::remove_file(desktop_file());
+            let _ = std::fs::remove_file(legacy_desktop_file());
+            if run("kbuildsycoca6", &[]).or_else(|_| run("kbuildsycoca5", &[])).is_ok() {
+                // Gone when getComponent stops answering; bounded, and a
+                // timeout just falls through to the rebuild below.
+                for _ in 0..10 {
+                    if call("getComponent", &[COMPONENT]).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        } else {
+            // No marker file, but an earlier claim may still be registered.
+            let _ = call("unregister", &[COMPONENT, ACTION]);
+        }
 
         // The file is the whole registration — key included — and the
         // installed marker, so a failure below deletes it again.
