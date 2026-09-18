@@ -1,6 +1,7 @@
 //! The Settings tab. Edits happen on a draft; Apply validates, saves, and
 //! hands the new config to the app.
 
+use crate::format;
 use crate::keychain;
 use crate::tips::{self, tip_row, Tipped};
 use crate::ui_util::hint;
@@ -59,6 +60,39 @@ impl Form {
     ) {
         self.row(level, ui, label, tip, |ui| {
             ui.add(egui::DragValue::new(value).range(range))
+        });
+    }
+
+    /// [`Form::drag`] for a byte count, grouped as `52,428,800`.
+    ///
+    /// Only the byte fields get this. They are the ones whose values run to
+    /// eight and ten digits, where a misplaced zero is invisible; the rest
+    /// of the form counts files, minutes and milliseconds and reads better
+    /// plain.
+    ///
+    /// The number still goes in either way — [`format::parse_grouped`]
+    /// takes it with the separators or without — so a pasted `52,428,800`
+    /// and a typed `52428800` are the same edit.
+    fn drag_bytes<N: egui::emath::Numeric>(
+        self,
+        level: Level,
+        ui: &mut egui::Ui,
+        label: impl Into<egui::WidgetText>,
+        tip: &'static tips::Tip,
+        value: &mut N,
+        range: std::ops::RangeInclusive<N>,
+    ) {
+        self.row(level, ui, label, tip, |ui| {
+            ui.add(
+                egui::DragValue::new(value)
+                    .range(range)
+                    // `DragValue` renders and parses through `f64`. Byte
+                    // counts here are bounded by the config's own clamps (8
+                    // GiB at the largest), far inside the 2^53 an `f64`
+                    // holds exactly, so the round trip cannot lose a digit.
+                    .custom_formatter(|n, _| format::group_thousands(n.max(0.0) as u64))
+                    .custom_parser(|s| format::parse_grouped(s).map(|n| n as f64)),
+            )
         });
     }
 }
@@ -884,7 +918,7 @@ fn config_editor_ui(
                         ui.end_row();
                     }
 
-                    form.drag(
+                    form.drag_bytes(
                         Level::Advanced,
                         ui,
                         "Hash sample size (bytes)",
@@ -893,7 +927,7 @@ fn config_editor_ui(
                         512..=1_048_576,
                     );
 
-                    form.drag(
+                    form.drag_bytes(
                         Level::Advanced,
                         ui,
                         "Max stored text (bytes)",
@@ -902,7 +936,7 @@ fn config_editor_ui(
                         1024..=16_777_216,
                     );
 
-                    form.drag(
+                    form.drag_bytes(
                         Level::Advanced,
                         ui,
                         "Max text file size (bytes)",
@@ -920,7 +954,7 @@ fn config_editor_ui(
                         10..=100_000,
                     );
 
-                    form.drag(
+                    form.drag_bytes(
                         Level::Advanced,
                         ui,
                         "Max WAL size (bytes)",

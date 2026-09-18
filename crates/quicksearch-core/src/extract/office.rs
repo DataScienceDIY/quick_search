@@ -2,8 +2,19 @@
 //! containers holding XML. Five share one event loop ([`collect_xml_text`],
 //! driven by a per-format [`TextSpec`]); XLSX keeps its own two loops because
 //! its text is not in the sheet at all but in a shared-string table the cells
-//! index into. Dispatch is by file extension, not MIME: `.docm` carries the
-//! same MIME as `.docx`, and the extension is what distinguishes them.
+//! index into.
+//!
+//! Each of those formats has template and macro-enabled siblings holding the
+//! same parts under the same names — `.pptx`, `.ppsx`, `.pptm`, `.potx` are
+//! one parser — so every extension an office suite writes is routed here
+//! rather than only the six default ones.
+//!
+//! Dispatch is by file extension, not MIME, because the pre-2007 formats
+//! give a document and its template one MIME between them: `.doc` and `.dot`
+//! are both `application/msword`, and only the name says which parser to
+//! run. [`is_office_mime`] decides *whether* to run, the extension decides
+//! *what*, and the two tables have to stay in step — the test at the bottom
+//! of this file is what holds them there.
 
 use std::error::Error;
 use std::fs::File;
@@ -18,19 +29,43 @@ use super::{ExtractError, Extractor, Scratch};
 
 pub struct OfficeExtractor;
 
-fn mime_to_ext(mime: &str) -> Option<&'static str> {
-    match mime {
-        "application/msword" => Some("doc"),
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
-        "application/vnd.ms-excel" => Some("xls"),
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
-        "application/vnd.ms-powerpoint" => Some("ppt"),
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => Some("pptx"),
-        "application/vnd.oasis.opendocument.text" => Some("odt"),
-        "application/vnd.oasis.opendocument.spreadsheet" => Some("ods"),
-        "application/vnd.oasis.opendocument.presentation" => Some("odp"),
-        _ => None,
-    }
+/// Every MIME this extractor claims, spelled lowercase because
+/// [`super::Registry::find`] folds case before dispatch — the registered
+/// spelling of the macro-enabled types is `macroEnabled`.
+///
+/// Membership only: it answers "is this an office document", never which
+/// parser runs. See the module docs for why that is the extension's job.
+fn is_office_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        // Word: .doc/.dot, .docx/.dotx, .docm/.dotm
+        "application/msword"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            | "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
+            | "application/vnd.ms-word.document.macroenabled.12"
+            | "application/vnd.ms-word.template.macroenabled.12"
+            // Excel: .xls/.xlt, .xlsx/.xltx, .xlsm/.xltm
+            | "application/vnd.ms-excel"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            | "application/vnd.openxmlformats-officedocument.spreadsheetml.template"
+            | "application/vnd.ms-excel.sheet.macroenabled.12"
+            | "application/vnd.ms-excel.template.macroenabled.12"
+            // PowerPoint: .ppt/.pps/.pot, .pptx/.ppsx/.potx, .pptm/.ppsm/.potm
+            | "application/vnd.ms-powerpoint"
+            | "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            | "application/vnd.openxmlformats-officedocument.presentationml.slideshow"
+            | "application/vnd.openxmlformats-officedocument.presentationml.template"
+            | "application/vnd.ms-powerpoint.presentation.macroenabled.12"
+            | "application/vnd.ms-powerpoint.slideshow.macroenabled.12"
+            | "application/vnd.ms-powerpoint.template.macroenabled.12"
+            // OpenDocument: .odt/.ott, .ods/.ots, .odp/.otp
+            | "application/vnd.oasis.opendocument.text"
+            | "application/vnd.oasis.opendocument.text-template"
+            | "application/vnd.oasis.opendocument.spreadsheet"
+            | "application/vnd.oasis.opendocument.spreadsheet-template"
+            | "application/vnd.oasis.opendocument.presentation"
+            | "application/vnd.oasis.opendocument.presentation-template"
+    )
 }
 
 // The shared XML text walk
@@ -286,6 +321,19 @@ fn collect_members(
     Ok(())
 }
 
+/// A deck's slides, then its speaker notes.
+///
+/// Notes live in parts of their own (`ppt/notesSlides/`) that the slide text
+/// never mentions, so a deck whose argument is in the notes was previously
+/// indexed with none of it.
+///
+/// They are appended in a block rather than placed under the slide each
+/// belongs to. A note is bound to its slide by that slide's `.rels` and
+/// **not** by its number — PowerPoint numbers notes parts in creation order,
+/// so a deck whose only note is on slide 5 stores it as `notesSlide1.xml`.
+/// Reading a relationship per slide to get the pairing right buys a search
+/// nothing, and guessing it from the number would file notes under the wrong
+/// slide in a snippet, which is worse than not claiming to know.
 fn extract_pptx(path: &Path, out: &mut String, scratch: &mut Scratch) -> Result<(), Box<dyn Error>> {
     let limits = scratch.limits();
     let mut archive = open_container(path)?;
@@ -300,6 +348,19 @@ fn extract_pptx(path: &Path, out: &mut String, scratch: &mut Scratch) -> Result<
             collect_xml_text(xml_over(bytes), &PPTX, out, limits.text, events)?;
             out.push_str("\n--- New Slide ---\n");
             Ok(())
+        },
+    )?;
+    // The marker leads here, where the slides' trails: it introduces the note
+    // that follows it, rather than separating one from the next.
+    collect_members(
+        &mut archive,
+        "ppt/notesSlides/notesSlide",
+        out,
+        limits.text,
+        |archive, name, out| {
+            member_bytes(archive, name, limits.inflate, bytes)?;
+            out.push_str("\n--- Speaker Notes ---\n");
+            collect_xml_text(xml_over(bytes), &PPTX, out, limits.text, events)
         },
     )
 }
@@ -475,6 +536,13 @@ fn extract_xlsx(path: &Path, out: &mut String, scratch: &mut Scratch) -> Result<
 /// Extract text from an office document, chosen by lowercase extension. An
 /// unhandled extension yields empty text: the MIME was claimed, so the file
 /// was simply named unlike its type.
+///
+/// A template (`.dotx`, `.xltx`, `.potx`) and a macro-enabled document
+/// (`.docm`, `.xlsm`, `.pptm`) hold their text in the same parts under the
+/// same names as the plain form, so each is an alias rather than a format.
+/// Leaving them off this list did not make them fail loudly — a claimed MIME
+/// falling through to `_` is a file recorded as *successfully* holding no
+/// text, which nothing later retries.
 fn extract_document_text(
     path: &Path,
     extension: &str,
@@ -482,20 +550,26 @@ fn extract_document_text(
     scratch: &mut Scratch,
 ) -> Result<(), Box<dyn Error>> {
     match extension {
-        "docx" => single_member(path, "word/document.xml", &DOCX, out, scratch),
-        "xlsx" => extract_xlsx(path, out, scratch),
-        "pptx" => extract_pptx(path, out, scratch),
-        "odt" | "odp" => single_member(path, "content.xml", &ODF_TEXT, out, scratch),
-        "ods" => single_member(path, "content.xml", &ODF_SHEET, out, scratch),
+        "docx" | "docm" | "dotx" | "dotm" => {
+            single_member(path, "word/document.xml", &DOCX, out, scratch)
+        }
+        "xlsx" | "xlsm" | "xltx" | "xltm" => extract_xlsx(path, out, scratch),
+        "pptx" | "pptm" | "ppsx" | "ppsm" | "potx" | "potm" => extract_pptx(path, out, scratch),
+        "odt" | "ott" | "odp" | "otp" => {
+            single_member(path, "content.xml", &ODF_TEXT, out, scratch)
+        }
+        "ods" | "ots" => single_member(path, "content.xml", &ODF_SHEET, out, scratch),
         // Pre-2007 binary formats: a different container entirely.
-        "doc" | "xls" | "ppt" => super::ole::extract_ole_text(path, extension, out, scratch),
+        "doc" | "dot" | "xls" | "xlt" | "ppt" | "pps" | "pot" => {
+            super::ole::extract_ole_text(path, extension, out, scratch)
+        }
         _ => Ok(()),
     }
 }
 
 impl Extractor for OfficeExtractor {
     fn supports(&self, mime: &str) -> bool {
-        mime_to_ext(mime).is_some()
+        is_office_mime(mime)
     }
 
     fn extract(
@@ -732,6 +806,14 @@ mod tests {
          <a:p><a:r><a:t>Body</a:t></a:r></a:p>\
          </p:txBody></p:sp></p:spTree></p:cSld></p:sld>";
 
+    /// A notes part: the note itself, then the slide-number field every
+    /// notes slide carries. The field's text is indexed like any other —
+    /// suppressing it would mean suppressing dates and footers too.
+    const PPTX_NOTES: &str = "<p:notes><p:cSld><p:spTree>\
+         <p:sp><p:txBody><a:p><a:r><a:t>Mention the budget</a:t></a:r></a:p></p:txBody></p:sp>\
+         <p:sp><p:txBody><a:p><a:fld><a:t>3</a:t></a:fld></a:p></p:txBody></p:sp>\
+         </p:spTree></p:cSld></p:notes>";
+
     const ODT_BODY: &str = "<office:document-content><office:body><office:text>\
          <text:h>Heading</text:h>\
          <text:p>Para<text:span>span</text:span></text:p>\
@@ -783,6 +865,127 @@ mod tests {
             extract_document_text(&p, "pptx").unwrap(),
             "Title\nBody\n\n--- New Slide ---\nTitle\nBody\n\n--- New Slide ---\n"
         );
+    }
+
+    /// Speaker notes are in parts of their own that the slide text never
+    /// mentions, so a deck arguing its case in the notes used to be indexed
+    /// with none of it.
+    #[test]
+    fn pptx_extracts_speaker_notes() {
+        let p = container(
+            "pptx-notes",
+            "pptx",
+            &[
+                ("ppt/slides/slide1.xml", PPTX_SLIDE),
+                ("ppt/notesSlides/notesSlide1.xml", PPTX_NOTES),
+            ],
+        );
+        assert_eq!(
+            extract_document_text(&p, "pptx").unwrap(),
+            "Title\nBody\n\n--- New Slide ---\n\n--- Speaker Notes ---\nMention the budget\n3\n"
+        );
+    }
+
+    /// The notes prefix must select notes *slides* and nothing that sits
+    /// beside them: the master is boilerplate on every deck, and a `.rels`
+    /// is a manifest whose text is filenames.
+    #[test]
+    fn the_notes_master_and_rels_are_not_notes() {
+        let p = container(
+            "pptx-notes-neighbours",
+            "pptx",
+            &[
+                ("ppt/slides/slide1.xml", PPTX_SLIDE),
+                (
+                    "ppt/notesMasters/notesMaster1.xml",
+                    "<p:notesMaster><a:p><a:r><a:t>MASTERTEXT</a:t></a:r></a:p></p:notesMaster>",
+                ),
+                (
+                    "ppt/notesSlides/_rels/notesSlide1.xml.rels",
+                    "<Relationships><Relationship Target=\"RELSTEXT\"/></Relationships>",
+                ),
+                ("ppt/notesSlides/notesSlide1.xml", PPTX_NOTES),
+            ],
+        );
+        let out = extract_document_text(&p, "pptx").unwrap();
+        assert!(out.contains("Mention the budget"), "{:?}", out);
+        assert!(
+            !out.contains("MASTERTEXT"),
+            "the notes master leaked: {:?}",
+            out
+        );
+        assert!(
+            !out.contains("RELSTEXT"),
+            "a rels manifest leaked: {:?}",
+            out
+        );
+    }
+
+    /// A deck with no notes at all must read exactly as it did before notes
+    /// were collected — no stray marker, no trailing blank run.
+    #[test]
+    fn a_deck_without_notes_is_unchanged() {
+        let p = container(
+            "pptx-no-notes",
+            "pptx",
+            &[("ppt/slides/slide1.xml", PPTX_SLIDE)],
+        );
+        assert_eq!(
+            extract_document_text(&p, "pptx").unwrap(),
+            "Title\nBody\n\n--- New Slide ---\n"
+        );
+    }
+
+    /// Templates and macro-enabled documents hold the same parts under the
+    /// same names, so each name is an alias for one parser. Leaving one off
+    /// the dispatch did not fail loudly: the MIME was still claimed, so the
+    /// file extracted to nothing and was recorded as *successfully* holding
+    /// no text, which nothing later retries.
+    #[test]
+    fn template_and_macro_enabled_names_reach_the_same_parser() {
+        /// One parser's aliases: the names, the members of a container to
+        /// try them against, and the text every one of them must produce.
+        type AliasCase = (
+            &'static [&'static str],
+            &'static [(&'static str, &'static str)],
+            &'static str,
+        );
+        let cases: &[AliasCase] = &[
+            (
+                &["docx", "docm", "dotx", "dotm"],
+                &[("word/document.xml", DOCX_BODY)],
+                "Helloworld\nSecond\n",
+            ),
+            (
+                &["pptx", "pptm", "ppsx", "ppsm", "potx", "potm"],
+                &[("ppt/slides/slide1.xml", PPTX_SLIDE)],
+                "Title\nBody\n\n--- New Slide ---\n",
+            ),
+            (
+                &["xlsx", "xlsm", "xltx", "xltm"],
+                &[
+                    ("xl/sharedStrings.xml", XLSX_SHARED),
+                    ("xl/worksheets/sheet1.xml", XLSX_SHEET),
+                ],
+                "Shared 42 \nSecond \n",
+            ),
+            (
+                &["odt", "ott", "odp", "otp"],
+                &[("content.xml", ODT_BODY)],
+                "Heading\nParaspan\n",
+            ),
+            (&["ods", "ots"], &[("content.xml", ODS_BODY)], "A1 \nB1 \n"),
+        ];
+        for (extensions, members, expected) in cases {
+            for ext in *extensions {
+                let p = container(&format!("alias-{ext}"), ext, members);
+                assert_eq!(
+                    &extract_document_text(&p, ext).unwrap(),
+                    expected,
+                    ".{ext} did not reach the same parser as its siblings"
+                );
+            }
+        }
     }
 
     #[test]
@@ -978,6 +1181,54 @@ mod tests {
             extract_document_text(&p, "odt").unwrap(),
             "beforeinsideafter\n"
         );
+    }
+
+    /// Every name this extractor handles, walked end to end: the sniffer
+    /// names the file, [`is_office_mime`] decides whether to run, and the
+    /// dispatch in [`extract_document_text`] decides what runs. All three
+    /// have to agree for one document to be indexed, and disagreeing costs
+    /// nothing visible at either end — an unclaimed MIME is never offered to
+    /// an extractor at all, and a claimed MIME whose extension the dispatch
+    /// does not know yields empty text on a file recorded as done.
+    const CLAIMED: &[&str] = &[
+        "docx", "docm", "dotx", "dotm", "xlsx", "xlsm", "xltx", "xltm", "pptx", "pptm", "ppsx",
+        "ppsm", "potx", "potm", "odt", "ott", "ods", "ots", "odp", "otp", "doc", "dot", "xls",
+        "xlt", "ppt", "pps",
+    ];
+
+    #[test]
+    fn every_claimed_name_is_sniffed_claimed_and_parsed() {
+        // Nothing opens it: a dispatched extension fails on a missing file,
+        // while the fall-through arm reports success with no text. That is
+        // what separates "no parser" from "parser found nothing".
+        let missing = Path::new("/nonexistent/quicksearch-office-probe");
+        for ext in CLAIMED {
+            let named = std::path::PathBuf::from(format!("probe.{ext}"));
+            let guessed = crate::mime::guess_mime_from_head(&named, b"")
+                .unwrap_or_else(|| panic!(".{ext} is sniffed as nothing at all"));
+            // Lowercased the way the registry lowercases before dispatch:
+            // the registered spelling is `macroEnabled`.
+            assert!(
+                OfficeExtractor.supports(&guessed.to_ascii_lowercase()),
+                ".{ext} is sniffed as {guessed}, which no extractor claims"
+            );
+            assert!(
+                extract_document_text(missing, ext).is_err(),
+                ".{ext} is claimed but falls through to the no-op arm, so a real \
+                 one would be stored as holding no text"
+            );
+        }
+    }
+
+    /// `.pot` is the one name shared with an unrelated text format (gettext
+    /// templates), so it is sniffed from content rather than the name — the
+    /// PowerPoint one has to survive that.
+    #[test]
+    fn a_gettext_template_is_not_a_powerpoint_template() {
+        let text = b"msgid \"\"\nmsgstr \"\"\n\"Project-Id-Version: x\\n\"\n";
+        let mime = crate::mime::guess_mime_from_head(Path::new("messages.pot"), text);
+        assert_eq!(mime, Some("text/plain"));
+        assert!(!OfficeExtractor.supports("text/plain"));
     }
 
     /// A self-closed `<text:p/>` has no `End` to hang the break on.

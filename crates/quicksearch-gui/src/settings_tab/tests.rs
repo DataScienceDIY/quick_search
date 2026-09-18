@@ -706,6 +706,46 @@ fn advanced_rows_are_hidden_until_asked_for() {
     );
 }
 
+/// The byte fields are shown grouped: their values run to eight and ten
+/// digits, where a misplaced zero is invisible. Everything else in the form
+/// counts files or milliseconds and stays plain, which is the other half of
+/// the assertion — the grouping is scoped to the fields that needed it.
+#[test]
+fn only_the_byte_fields_are_shown_with_thousands_separators() {
+    let ctx = crate::test_ui::ctx();
+    let mut cfg = Config::default();
+    // The top of its range, so the plain rendering is long enough that a
+    // separator would show up if one were being inserted.
+    cfg.processing.batch_size = 100_000;
+    let out = ctx.run(
+        crate::test_ui::raw_input(egui::vec2(600.0, 800.0), vec![]),
+        |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                config_editor_ui(
+                    ui,
+                    &mut cfg,
+                    Section::Processing,
+                    None,
+                    Form { advanced: true },
+                )
+            });
+        },
+    );
+    let text = painted_text(&out).join("\n");
+
+    // Hash sample size, max stored text, max text file size, max WAL size.
+    for grouped in ["8,192", "262,144", "52,428,800", "2,147,483,648"] {
+        assert!(
+            text.contains(grouped),
+            "{grouped} is not on screen; the byte fields read: {text}"
+        );
+    }
+    assert!(
+        text.contains("100000") && !text.contains("100,000"),
+        "batch size counts files, not bytes, and must stay plain: {text}"
+    );
+}
+
 /// Revealing a setting is not editing one: the toggle writes through
 /// `SettingsOutput` and must never make the tab read as dirty, or looking at
 /// an advanced setting would demand an Apply.

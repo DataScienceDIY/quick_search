@@ -86,7 +86,7 @@ hash_length = 8192
 maximum_text_size = 262144
 # Files larger than this skip text extraction entirely (bytes). Clamped to
 # 1..4294967296 on load.
-maximum_text_file_size = 2097152
+maximum_text_file_size = 52428800
 # Files per batch during walks / inserts / extraction.
 batch_size = 500
 # Writer time one indexing root's turn may take before the round-robin

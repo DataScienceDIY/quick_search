@@ -220,6 +220,50 @@ fn comment_only_edit_is_no_work_at_all() {
     assert!(a.work.reconcile_content && !a.work.reindex);
 }
 
+/// The size cap decides what gets read exactly as the extension filter
+/// does, so it has to be applied the same way. It was not: a raised cap left
+/// every file already written off as too large sitting at `NA`, and nothing
+/// re-asks about a file until the file itself changes — so the setting
+/// appeared to do nothing at all on an existing index.
+#[test]
+fn changing_the_text_file_size_cap_re_decides_the_stored_rows() {
+    let old = Config::default();
+
+    let mut raised = old.clone();
+    raised.processing.maximum_text_file_size = old.processing.maximum_text_file_size * 2;
+    let a = diff_actions(&old, &raised);
+    assert!(
+        !a.requires_rebuild,
+        "no rebuild: the rows are all still right"
+    );
+    assert!(
+        a.work.reconcile_content,
+        "rows written off as too large must be re-decided"
+    );
+    assert!(
+        a.work.reindex,
+        "widening needs a run: the content pass is what reads the newly eligible files"
+    );
+
+    let mut lowered = old.clone();
+    lowered.processing.maximum_text_file_size = old.processing.maximum_text_file_size / 2;
+    let a = diff_actions(&old, &lowered);
+    assert!(
+        a.work.reconcile_content,
+        "rows now over the cap must give up their text"
+    );
+    assert!(
+        !a.work.reindex,
+        "narrowing finds nothing new on disk, so there is nothing to walk for"
+    );
+
+    assert_eq!(
+        diff_actions(&old, &old.clone()),
+        ConfigActions::default(),
+        "an unchanged cap is not work"
+    );
+}
+
 /// An empty list means "everything allowed" — a superset of every other
 /// list, the case plain set arithmetic reads backwards.
 #[test]

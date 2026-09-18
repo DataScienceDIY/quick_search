@@ -236,7 +236,7 @@ impl Default for ProcessingConfig {
         ProcessingConfig {
             hash_length: 1024 * 8,
             maximum_text_size: 1024 * 256,
-            maximum_text_file_size: 1024 * 1024 * 2,
+            maximum_text_file_size: 1024 * 1024 * 50,
             batch_size: 500,
             writer_turn_slice_ms: 100,
             maximum_wal_size: 1024 * 1024 * 1024 * 2,

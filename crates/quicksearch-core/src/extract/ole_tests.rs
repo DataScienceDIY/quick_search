@@ -361,6 +361,69 @@ fn ppt_reads_both_atom_widths() {
     assert!(text.contains("Ωmega body"), "{text}");
 }
 
+/// A template and a slideshow are the same container under another name, and
+/// they share the plain form's MIME — so a name the dispatch did not know was
+/// claimed, opened, and extracted to nothing rather than failing.
+#[test]
+fn legacy_alias_names_reach_the_same_parser() {
+    let bytes = encoding_rs::WINDOWS_1252
+        .encode("Slide title")
+        .0
+        .into_owned();
+    let deck = container(
+        "ole-alias-ppt",
+        "ppt",
+        &[(
+            "PowerPoint Document",
+            ppt_record(0x0000, ppt::TEXT_BYTES_ATOM, &bytes),
+        )],
+    );
+    for ext in ["ppt", "pps", "pot"] {
+        assert!(
+            extract_ole_text(&deck, ext)
+                .unwrap()
+                .contains("Slide title"),
+            ".{ext} did not reach the PowerPoint parser"
+        );
+    }
+
+    // The trailing `\r` is Word's paragraph mark, which extracts as `\n`.
+    let prose = container(
+        "ole-alias-doc",
+        "doc",
+        &word_doc(&[("Hello from Word\r", true)]),
+    );
+    for ext in ["doc", "dot"] {
+        assert_eq!(
+            extract_ole_text(&prose, ext).unwrap(),
+            "Hello from Word\n",
+            ".{ext} did not reach the Word parser"
+        );
+    }
+
+    let mut sst = Vec::new();
+    sst.extend_from_slice(&le32(1));
+    sst.extend_from_slice(&le32(1));
+    sst.extend_from_slice(&sst_string("Revenue", false));
+    let mut book = biff(xls::REC_SST, &sst);
+    book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(0)));
+    let sheet = container("ole-alias-xls", "xls", &[("Workbook", book)]);
+    for ext in ["xls", "xlt"] {
+        assert!(
+            extract_ole_text(&sheet, ext).unwrap().contains("Revenue"),
+            ".{ext} did not reach the Excel parser"
+        );
+    }
+}
+
+/// An extension no parser handles must say so, not come back empty.
+#[test]
+fn an_unknown_extension_is_an_error() {
+    let deck = container("ole-unknown", "ppt", &[("PowerPoint Document", vec![])]);
+    let err = extract_ole_text(&deck, "zzz").unwrap_err().to_string();
+    assert!(err.contains("no OLE2 parser"), "{err}");
+}
+
 #[test]
 fn ppt_descends_into_containers() {
     let bytes = encoding_rs::WINDOWS_1252

@@ -211,8 +211,10 @@ pub static MAX_TEXT_FILE_SIZE: Tip = Tip {
            Those files still appear in results, found by their name, size or \
            date.",
     examples: &[
-        "2097152, 2 MB, skips very few ordinary documents.",
-        "52428800, 50 MB, when you search inside large log files or scanned PDFs.",
+        "52428800, 50 MB, the default, reads inside large log files, scanned PDFs \
+         and presentations whose size is mostly pictures.",
+        "2097152, 2 MB, to open ordinary documents only and leave anything larger \
+         to be found by name.",
     ],
     caution: None,
 };

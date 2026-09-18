@@ -23,7 +23,7 @@ pub type ExtractError = String;
 ///
 /// Every extractor used to carry its own 64 MiB constants, chosen
 /// independently of the settings that actually bound the work: the content
-/// pass never offers a file above `maximum_text_file_size` (2 MiB by
+/// pass never offers a file above `maximum_text_file_size` (50 MiB by
 /// default), and everything an extractor produces past `maximum_text_size`
 /// (256 KiB) is discarded by the caller moments later. A ceiling 256× above
 /// the largest result that can be kept is not a safety margin, it is the

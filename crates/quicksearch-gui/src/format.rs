@@ -65,6 +65,9 @@ pub fn fmt_interval(minutes: u64) -> String {
 }
 
 /// `1,234,567`.
+///
+/// Read as well as written: the byte fields in Settings are *edited* in this
+/// form, so [`parse_grouped`] has to take back whatever this puts out.
 pub fn group_thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -75,6 +78,30 @@ pub fn group_thousands(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// [`group_thousands`] read back, whether or not the separators were typed:
+/// `52,428,800`, `52428800` and `52 428 800` are one number.
+///
+/// `None` for anything that is not a whole number — including the empty
+/// string a half-cleared field holds. A `DragValue` whose parser declines
+/// keeps the value it had, so a number being retyped cannot land in the
+/// config as a zero on its way through.
+pub fn parse_grouped(text: &str) -> Option<u64> {
+    let mut digits = String::with_capacity(text.len());
+    for c in text.chars() {
+        // Every separator someone might type or paste in, including the
+        // narrow no-break space a spreadsheet copies out.
+        if c == ',' || c == '_' || c == '\u{202f}' || c.is_whitespace() {
+            continue;
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        digits.push(c);
+    }
+    // `parse` turns down the empty string and anything past `u64::MAX`.
+    digits.parse().ok()
 }
 
 /// Files/sec. A nonzero rate never renders as "0.0": slow rates go per-minute.
@@ -203,6 +230,66 @@ mod tests {
         assert_eq!(group_thousands(999), "999");
         assert_eq!(group_thousands(1000), "1,000");
         assert_eq!(group_thousands(1_234_567), "1,234,567");
+    }
+
+    /// A typed number goes in whether or not it is punctuated — the field
+    /// shows separators, and someone retyping the value will not.
+    #[test]
+    fn grouped_numbers_parse_with_or_without_their_separators() {
+        assert_eq!(parse_grouped("52,428,800"), Some(52_428_800));
+        assert_eq!(parse_grouped("52428800"), Some(52_428_800));
+        assert_eq!(parse_grouped("52 428 800"), Some(52_428_800));
+        assert_eq!(parse_grouped("52\u{202f}428\u{202f}800"), Some(52_428_800));
+        assert_eq!(parse_grouped("52_428_800"), Some(52_428_800));
+        // Separators are stripped, not validated: the field is for entering
+        // a number, not for spelling one correctly.
+        assert_eq!(parse_grouped("5,2,4,2,8,8,0,0"), Some(52_428_800));
+        assert_eq!(parse_grouped("  1024  "), Some(1024));
+        assert_eq!(parse_grouped("0"), Some(0));
+    }
+
+    /// Anything that is not a whole number leaves the field's value alone.
+    #[test]
+    fn a_partial_or_bogus_entry_declines() {
+        // Empty is what a cleared field holds mid-edit; taking it as zero
+        // would write a zero to the config between keystrokes.
+        assert_eq!(parse_grouped(""), None);
+        assert_eq!(parse_grouped("   "), None);
+        assert_eq!(parse_grouped(","), None);
+        assert_eq!(parse_grouped("1.5"), None);
+        assert_eq!(parse_grouped("-1"), None);
+        assert_eq!(parse_grouped("2 MB"), None);
+        assert_eq!(parse_grouped("1e6"), None);
+        assert_eq!(parse_grouped("٤٢"), None);
+        // Past `u64::MAX`, rather than wrapping to something plausible.
+        assert_eq!(parse_grouped("18,446,744,073,709,551,616"), None);
+    }
+
+    /// What the byte fields do every frame: render the stored number, then
+    /// read back exactly it. Every default and clamp bound, plus the widest
+    /// value any of those fields accepts.
+    #[test]
+    fn every_byte_field_value_survives_the_round_trip() {
+        for n in [
+            0,
+            1,
+            512,
+            1024,
+            8192,
+            262_144,
+            2_097_152,
+            52_428_800,
+            1_073_741_824,
+            8_589_934_592,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                parse_grouped(&group_thousands(n)),
+                Some(n),
+                "{} did not survive being displayed",
+                n
+            );
+        }
     }
 
     #[test]

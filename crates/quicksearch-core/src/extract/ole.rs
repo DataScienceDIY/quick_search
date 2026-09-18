@@ -1,5 +1,6 @@
-//! Legacy binary Office formats: `.doc`, `.xls`, `.ppt` — OLE2 compound
-//! files; three parsers sharing a reader, wanting only the *text*. Every
+//! Legacy binary Office formats: `.doc`, `.xls`, `.ppt` and the template and
+//! slideshow names for the same three containers — OLE2 compound files; three
+//! parsers sharing a reader, wanting only the *text*. Every
 //! offset and count in these formats is attacker-controlled, so every read is
 //! bounds-checked, declared lengths are clamped, nothing is preallocated from
 //! a declared count, and a malformed file yields `Err` — never a partial
@@ -26,10 +27,14 @@ pub fn extract_ole_text(
     let budget = scratch.limits().text;
     let mut cfb = cfb::CompoundFile::open(File::open(path)?)
         .map_err(|e| format!("not a readable OLE2 compound file: {}", e))?;
+    // A template holds the same streams as the document written from it, and
+    // a `.pps` is a `.ppt` that opens in the slideshow: one parser each, three
+    // names apiece. They share a MIME with the plain form, so leaving them out
+    // meant a claimed file extracting to nothing at all.
     let text = match extension {
-        "doc" => doc::extract(&mut cfb, budget),
-        "xls" => xls::extract(&mut cfb, budget),
-        "ppt" => ppt::extract(&mut cfb, budget),
+        "doc" | "dot" => doc::extract(&mut cfb, budget),
+        "xls" | "xlt" => xls::extract(&mut cfb, budget),
+        "ppt" | "pps" | "pot" => ppt::extract(&mut cfb, budget),
         other => Err(format!("no OLE2 parser for .{}", other).into()),
     }?;
     if out.is_empty() {

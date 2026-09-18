@@ -55,7 +55,7 @@ files are still right.
 
 `sample.ppt` is ~460 KB because the PowerPoint 97 export filter embeds the
 master slide. There is no filter option that trims it, and it is well inside
-the 2 MiB `maximum_text_file_size` the end-to-end run indexes with.
+the 50 MiB `maximum_text_file_size` the end-to-end run indexes with.
 
 Unlike the generated half of the corpus, the text in these three is fixed:
 `QUICKSEARCH_CORPUS_SEED` does not affect them.

@@ -1914,3 +1914,143 @@ fn repeated_warm_reindexes_do_not_grow_the_fts_index() {
         sizes
     );
 }
+
+// ---------------------------------------------------------------------------
+// Container size against extraction cost
+// ---------------------------------------------------------------------------
+
+/// A presentation carrying media: one slide of text inside megabytes of
+/// picture, which is the shape every real deck has.
+fn media_heavy_deck(path: &Path, media_bytes: usize) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file("ppt/slides/slide1.xml", zip::write::FileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(
+        &mut zip,
+        b"<p:sld><p:cSld><p:spTree><p:sp><p:txBody>\
+          <a:p><a:r><a:t>Quarterly chalcedony forecast</a:t></a:r></a:p>\
+          </p:txBody></p:sp></p:spTree></p:cSld></p:sld>",
+    )
+    .unwrap();
+    // Stored, not deflated: the file on disk has to really be this large, or
+    // the size gate under test never sees it.
+    zip.start_file(
+        "ppt/media/image1.png",
+        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored),
+    )
+    .unwrap();
+    std::io::Write::write_all(&mut zip, &vec![0u8; media_bytes]).unwrap();
+    zip.finish().unwrap();
+}
+
+/// The content pass gates on a file's *size*, which for a container is its
+/// media and not its text: a 5 MiB deck holds about 10 KiB of words, and
+/// reading them costs a seek through the central directory plus the one
+/// member named. A cap tuned to prose skipped every deck in the tree —
+/// indexed by name, with nothing inside findable and no failure to show for
+/// it. This pins the default cap against the shape that exposed it.
+#[test]
+fn a_media_heavy_presentation_is_indexed_under_the_default_cap() {
+    let root = Scratch::dir("deck-media");
+    let db_dir = Scratch::dir("deck-media-db");
+    let db = db_dir.join("index.sqlite");
+    let deck = root.join("quarterly.pptx");
+    media_heavy_deck(&deck, 5 * 1024 * 1024);
+
+    let config = Config::default();
+    let size = std::fs::metadata(&deck).unwrap().len();
+    assert!(
+        size > 2 * 1024 * 1024,
+        "the fixture is only a test of the cap if it is large: {} bytes",
+        size
+    );
+    assert!(
+        size <= config.processing.maximum_text_file_size,
+        "a {} byte deck is over the {} byte default cap, so its text is skipped",
+        size,
+        config.processing.maximum_text_file_size
+    );
+
+    index_once(&root, &db, &config);
+
+    let text = stored_text(&db, "quarterly.pptx").expect("the deck stored no text at all");
+    assert!(
+        text.contains("Quarterly chalcedony forecast"),
+        "the slide's text is not what was stored: {:?}",
+        text
+    );
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let hits: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH ?1",
+            ["\"chalcedony\""],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hits, 1, "a word inside the deck is not searchable");
+}
+
+/// Raising the cap has to reach an index that already wrote a file off. The
+/// row is `NA` and nothing re-asks about a file until the file itself
+/// changes, so without a reconcile the setting looks like it does nothing:
+/// the deck stays findable by name only, with no failure to explain it.
+#[test]
+fn raising_the_size_cap_reaches_files_already_written_off() {
+    use std::sync::atomic::AtomicBool;
+
+    let root = Scratch::dir("cap-raise");
+    let db_dir = Scratch::dir("cap-raise-db");
+    let db = db_dir.join("index.sqlite");
+    media_heavy_deck(&root.join("quarterly.pptx"), 5 * 1024 * 1024);
+
+    // A cap under the deck's size: its text is never read. The root goes in
+    // the config too — `WorkCursor` scans the roots the config names, not
+    // the ones an indexing run was handed.
+    let mut tight = Config::default();
+    tight.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
+    tight.processing.maximum_text_file_size = 1024 * 1024;
+    index_once(&root, &db, &tight);
+    assert!(
+        stored_text(&db, "quarterly.pptx").is_none(),
+        "the fixture has to start out skipped, or this proves nothing"
+    );
+
+    // Raised, the way Settings raises it: one field, nothing else.
+    let mut raised = tight.clone();
+    raised.processing.maximum_text_file_size = Config::default().processing.maximum_text_file_size;
+    let work = quicksearch_core::config::diff_actions(&tight, &raised).work;
+    assert!(
+        work.reconcile_content && work.reindex,
+        "a raised cap must ask for both halves: {:?}",
+        work
+    );
+
+    let mut conn = rusqlite::Connection::open(&db).unwrap();
+    let registry = quicksearch_core::extract::Registry::default_set();
+    let mut cursor = quicksearch_core::scope::WorkCursor::new(work, &raised).unwrap();
+    let cancel = AtomicBool::new(false);
+    while !cursor.done() {
+        quicksearch_core::scope::advance(
+            &mut conn,
+            &raised,
+            &registry,
+            &mut cursor,
+            Instant::now(),
+            &cancel,
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    index_once(&root, &db, &raised);
+
+    let text = stored_text(&db, "quarterly.pptx")
+        .expect("the deck is still skipped after the cap was raised");
+    assert!(
+        text.contains("Quarterly chalcedony forecast"),
+        "the deck's text is not what was stored: {:?}",
+        text
+    );
+}

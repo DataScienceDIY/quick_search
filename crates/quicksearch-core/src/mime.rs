@@ -218,9 +218,16 @@ pub fn mime_to_type(mime: &str) -> FileType {
     // Subtype-based classification for the `application/*` grab bag.
     match sub {
         // Office formats
+        // Each of the three families covers its template and macro-enabled
+        // names too: they are the same format, and a `.pptm` the Presentation
+        // filter hid would be a deck the user cannot find by type.
         "msword"
         | "vnd.openxmlformats-officedocument.wordprocessingml.document"
+        | "vnd.openxmlformats-officedocument.wordprocessingml.template"
+        | "vnd.ms-word.document.macroenabled.12"
+        | "vnd.ms-word.template.macroenabled.12"
         | "vnd.oasis.opendocument.text"
+        | "vnd.oasis.opendocument.text-template"
         | "rtf"
         | "pdf"
         | "epub+zip"
@@ -229,12 +236,22 @@ pub fn mime_to_type(mime: &str) -> FileType {
         }
         "vnd.ms-excel"
         | "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        | "vnd.oasis.opendocument.spreadsheet" => {
+        | "vnd.openxmlformats-officedocument.spreadsheetml.template"
+        | "vnd.ms-excel.sheet.macroenabled.12"
+        | "vnd.ms-excel.template.macroenabled.12"
+        | "vnd.oasis.opendocument.spreadsheet"
+        | "vnd.oasis.opendocument.spreadsheet-template" => {
             t |= FileType::DOCUMENT | FileType::SPREADSHEET;
         }
         "vnd.ms-powerpoint"
         | "vnd.openxmlformats-officedocument.presentationml.presentation"
-        | "vnd.oasis.opendocument.presentation" => {
+        | "vnd.openxmlformats-officedocument.presentationml.slideshow"
+        | "vnd.openxmlformats-officedocument.presentationml.template"
+        | "vnd.ms-powerpoint.presentation.macroenabled.12"
+        | "vnd.ms-powerpoint.slideshow.macroenabled.12"
+        | "vnd.ms-powerpoint.template.macroenabled.12"
+        | "vnd.oasis.opendocument.presentation"
+        | "vnd.oasis.opendocument.presentation-template" => {
             t |= FileType::DOCUMENT | FileType::PRESENTATION;
         }
         // Outlook saved messages and compiled HTML help are documents.
@@ -310,6 +327,79 @@ mod tests {
             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         );
         assert!(t.contains(FileType::PRESENTATION));
+    }
+
+    /// Every name an office suite writes classifies as the format it is, or
+    /// the type filter hides a deck the extractor happily read. Case is the
+    /// registered spelling — `macroEnabled` — because that is what reaches
+    /// the classifier from [`guess_mime_from_head`].
+    #[test]
+    fn template_and_macro_enabled_names_classify_as_their_format() {
+        let cases: &[(&str, FileType)] = &[
+            (
+                "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
+                FileType::PRESENTATION,
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+                FileType::PRESENTATION,
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.presentationml.template",
+                FileType::PRESENTATION,
+            ),
+            (
+                "application/vnd.ms-powerpoint.slideshow.macroEnabled.12",
+                FileType::PRESENTATION,
+            ),
+            (
+                "application/vnd.ms-powerpoint.template.macroEnabled.12",
+                FileType::PRESENTATION,
+            ),
+            (
+                "application/vnd.oasis.opendocument.presentation-template",
+                FileType::PRESENTATION,
+            ),
+            (
+                "application/vnd.ms-excel.sheet.macroEnabled.12",
+                FileType::SPREADSHEET,
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+                FileType::SPREADSHEET,
+            ),
+            (
+                "application/vnd.ms-excel.template.macroEnabled.12",
+                FileType::SPREADSHEET,
+            ),
+            (
+                "application/vnd.oasis.opendocument.spreadsheet-template",
+                FileType::SPREADSHEET,
+            ),
+            (
+                "application/vnd.ms-word.document.macroEnabled.12",
+                FileType::DOCUMENT,
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
+                FileType::DOCUMENT,
+            ),
+            (
+                "application/vnd.ms-word.template.macroEnabled.12",
+                FileType::DOCUMENT,
+            ),
+            (
+                "application/vnd.oasis.opendocument.text-template",
+                FileType::DOCUMENT,
+            ),
+        ];
+        for (mime, expected) in cases {
+            let t = mime_to_type(mime);
+            assert!(t.contains(*expected), "{} is not classified", mime);
+            // Presentations and spreadsheets are documents as well, the way
+            // Baloo counts them.
+            assert!(t.contains(FileType::DOCUMENT), "{} is not a document", mime);
+        }
     }
 
     #[test]

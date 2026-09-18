@@ -24,9 +24,12 @@ pub struct IndexWork {
     /// no walk and no root range would ever reach it again, so every row
     /// outside the roots goes.
     pub drop_aliases: bool,
-    /// `content_extensions` changed. Re-tested both ways: newly-included
-    /// files go back to pending, newly-excluded ones give up text and FTS
-    /// but keep the name/path row filename search needs.
+    /// `content_extensions` or `maximum_text_file_size` changed. Re-tested
+    /// both ways: newly-included files go back to pending, newly-excluded
+    /// ones give up text and FTS but keep the name/path row filename search
+    /// needs. Both settings decide the same thing — whether a file's text is
+    /// read — and [`crate::scope::advance`] re-runs the whole predicate,
+    /// size included, so one flag covers them.
     pub reconcile_content: bool,
     /// `store_text_for_snippets` turned on; rows extracted under the old
     /// setting kept no text, so they must run again.
@@ -91,7 +94,9 @@ impl IndexWork {
             parts.push("symlinks no longer followed".into());
         }
         if self.reconcile_content {
-            parts.push("changed content extensions".into());
+            // Either setting that decides it; the flag does not say which,
+            // and the effect on the index is the same line of work.
+            parts.push("changed which files have their text read".into());
         }
         if self.restore_text {
             parts.push("snippet text turned on".into());
@@ -213,7 +218,15 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
         let old_content = content_filter_set(&old.indexing.content_extensions);
         let new_content = content_filter_set(&new.indexing.content_extensions);
         let content_widened = filter_widened(&old_content, &new_content);
-        work.reconcile_content = old_content != new_content;
+
+        // The size cap decides the same thing the extension filter does —
+        // whether a file's text is read — so changing it has to be applied
+        // the same way. Without this a raised cap did nothing to an existing
+        // index: every file already written off as too large stays `NA`,
+        // because nothing re-asks until that file itself changes.
+        let old_cap = old.processing.maximum_text_file_size;
+        let new_cap = new.processing.maximum_text_file_size;
+        work.reconcile_content = old_content != new_content || old_cap != new_cap;
 
         let old_store = old.processing.store_text_for_snippets;
         let new_store = new.processing.store_text_for_snippets;
@@ -228,6 +241,10 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
             || (!old.indexing.include_hidden && new.indexing.include_hidden)
             || (!old.indexing.follow_symlinks && new.indexing.follow_symlinks)
             || content_widened
+            // A raised cap widens the same way an added extension does: the
+            // reconcile puts those rows back to pending, and the content
+            // pass that reads them runs as part of an indexing run.
+            || new_cap > old_cap
             || work.restore_text;
     }
 
