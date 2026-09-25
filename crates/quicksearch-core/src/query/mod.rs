@@ -21,12 +21,26 @@ pub use translator::TranslateError;
 /// The comparison in a `key op value` filter, as the lexer emits it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
-    /// `key:value` — substring / FTS MATCH semantics.
+    /// `key:value`: substring / FTS MATCH semantics.
     Contains,
-    /// `key=value` — exact match.
+    /// `key=value`: exact match.
     Eq,
     Lt,
     Le,
     Gt,
     Ge,
+}
+
+impl Op {
+    /// The operator as typed, which for the comparisons is also its SQL.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Op::Contains => ":",
+            Op::Eq => "=",
+            Op::Lt => "<",
+            Op::Le => "<=",
+            Op::Gt => ">",
+            Op::Ge => ">=",
+        }
+    }
 }

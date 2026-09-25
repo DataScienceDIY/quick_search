@@ -71,8 +71,8 @@ VIAddVersionKey "FileDescription" "${APP} ${VERSION} installer"
 !define MUI_FINISHPAGE_TEXT "Installed into $INSTDIR:$\r$\n\
     quicksearch.exe (the app), quicksearch-cli.exe (terminal search),$\r$\n\
     README.md, LICENSE.txt and config_example.toml.$\r$\n$\r$\n\
-    Your settings and search index are created on first run, under your \
-    own account. Upgrading and uninstalling leave both alone."
+    Your settings and index are created on first run, under your own \
+    account; upgrading and uninstalling leave both alone."
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "Run ${APP}"
 !define MUI_FINISHPAGE_RUN_FUNCTION LaunchAsUser
@@ -169,8 +169,8 @@ Section "Start Menu shortcut" SecStartMenu
     ; One shortcut, no program folder: a single-application folder is noise in
     ; the Windows 10/11 Start menu, and the uninstaller lives in Add/Remove
     ; Programs rather than next to it.
-    ; --toggle rather than a bare launch: it raises the running window
-    ; instead of a second copy refusing to start on the held index lock.
+    ; --toggle hands the activation straight to a running window, where a
+    ; bare launch would first load the config and try the index lock.
     CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\quicksearch.exe" "--toggle" "$INSTDIR\quicksearch.ico"
 SectionEnd
 
@@ -183,9 +183,9 @@ Section "Search hotkey (Ctrl+Shift+F)" SecHotkey
     ; like Ctrl+Shift are accepted as-is; only a bare key gets Ctrl+Alt added
     ; for it. Ctrl+Shift+F matches the in-application default, which answers
     ; the key instantly while the window is open; this .lnk binding is the
-    ; slower launch path Explorer takes when it is not. Changing the shortcut
-    ; on the Settings tab rewrites this .lnk to match (per-user installs
-    ; only; this all-users file needs elevation).
+    ; slower launch path Explorer takes when it is not. The Settings tab
+    ; rewrites the hotkey of a per-user .lnk only; this all-users one needs
+    ; elevation, so it keeps Ctrl+Shift+F.
     ;
     ; Explorer registers this key at logon, so the app's own RegisterHotKey
     ; for the same combination loses; either way the press works — directly,
@@ -209,8 +209,8 @@ SectionEnd
 ; writing it back, and NSIS strings in the standard build are capped at
 ; NSIS_MAX_STRLEN (1024 characters, `makensis -HDRINFO`). ReadRegStr truncates
 ; silently at that cap, so on any machine with a long PATH the write-back would
-; destroy the rest of it - a spectacular failure for an optional checkbox. The
-; README tells people to add the directory themselves.
+; destroy the rest of it - a spectacular failure for an optional checkbox.
+; Anyone who wants quicksearch-cli on PATH adds the directory themselves.
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
     !insertmacro MUI_DESCRIPTION_TEXT ${SecApp} \
@@ -219,7 +219,7 @@ SectionEnd
         "Add ${APP} to the Start menu for all users."
     !insertmacro MUI_DESCRIPTION_TEXT ${SecHotkey} \
         "Press Ctrl+Shift+F anywhere to search, starting ${APP} if it is not \
-         already running. The Settings tab can rebind it."
+         already running."
     !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} \
         "Add a ${APP} shortcut to the desktop."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END

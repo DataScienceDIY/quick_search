@@ -1,5 +1,5 @@
 //! Incremental single-path index updates, driven by watcher events, applying
-//! the same filters as the full walk — the two must agree. The watcher only
+//! the same filters as the full walk; the two must agree. The watcher only
 //! reports paths under the configured roots, so containment is not rechecked.
 
 use std::path::Path;
@@ -13,7 +13,7 @@ use crate::db::repo;
 use crate::extract::Registry;
 use crate::file_handling::{
     db_key_for_missing_path, extract_and_store, filtered_walk, prepare_file_record_from_path,
-    ExtractCursor, UnreadableDirs,
+    RootRange, UnreadableDirs,
 };
 use crate::platform::path_has_hidden_component_under;
 use crate::watcher::FsEvent;
@@ -21,8 +21,8 @@ use crate::watcher::FsEvent;
 /// How much of one event may be applied in this turn, and where the last turn
 /// stopped. One event is not always one file: a moved-in directory arrives as
 /// a single `Create` covering everything beneath it. This runs on the
-/// coordinator's own thread, so an unbounded call is a command loop that
-/// reads no commands — including the shutdown a closing window is waiting on.
+/// coordinator's own thread, so an unbounded call would leave the command loop
+/// reading no commands, including the shutdown a closing window waits on.
 pub struct Budget<'a> {
     pub deadline: Instant,
     pub cancel: &'a AtomicBool,
@@ -91,8 +91,8 @@ fn upsert_path(
     }
     // Checked before the followed `metadata` below: with following off the
     // walk records no symlinks, and `prepare_file_record_from_path`
-    // canonicalizes — a followed link targeting outside every root writes a
-    // row no sweep range covers, and nothing but a rebuild clears it.
+    // canonicalizes, so a followed link targeting outside every root would
+    // write a row no sweep range covers and only a rebuild clears.
     if !config.indexing.follow_symlinks {
         match std::fs::symlink_metadata(path) {
             Ok(md) if md.file_type().is_symlink() => return Ok(Applied::Done),
@@ -106,14 +106,15 @@ fn upsert_path(
     if meta.is_dir() {
         // A path the index cannot spell is "nothing indexable here", not an
         // error: an error would set `needs_full_run`, and a full run screens
-        // the same subtree out for the same reason — the reindex fixes nothing.
+        // the same subtree out for the same reason, so the reindex would fix
+        // nothing.
         let Some(root) = path.to_str() else {
             return Ok(Applied::Done);
         };
         // Resumed by `skip`, with two limits: the traversal itself is not
         // skipped (walk cost stays quadratic in turns), and `skip(n)` is
-        // positional — a tree that changes underneath skips the wrong files
-        // until the next full run. If either matters, resume by last-path.
+        // positional, so a tree that changes underneath skips the wrong files
+        // until the next full run. If either matters, resume by last path.
         let mut done = budget.resume_from;
         for entry in filtered_walk(
             root,
@@ -172,7 +173,7 @@ fn upsert_file(
         },
     };
 
-    // The only size gate on this path — `decide_content` has none, and falling
+    // The only size gate on this path: `decide_content` has none, and falling
     // through would read a multi-gigabyte `.txt` whole into memory.
     if !rec.needs_content {
         repo::set_content_na(&tx, file_id)?;
@@ -214,9 +215,8 @@ pub fn remove_paths(
             .map_err(|e| format!("begin incremental tx: {}", e))?;
         for path in batch {
             // A path the index cannot spell was never indexed, so there is
-            // nothing to delete — and a lossy path must never become a DB key:
-            // it would name whichever *different* file owns the lossy spelling
-            // and delete it, plus its whole subtree range.
+            // nothing to delete; its lossy spelling names another file (see
+            // `path_to_db_string`), whose row and subtree this would delete.
             if path.to_str().is_none() {
                 continue;
             }
@@ -224,8 +224,7 @@ pub fn remove_paths(
             // so `canonicalize` cannot run; `db_key_for_missing_path` approximates it.
             let path_str = db_key_for_missing_path(path);
             repo::delete_file_by_path(&tx, &path_str)?;
-            let range = ExtractCursor::for_root(&path_str);
-            repo::delete_subtree(&tx, &range.lo, &range.hi)?;
+            repo::delete_subtree(&tx, &RootRange::for_root(&path_str))?;
         }
         tx.commit()
             .map_err(|e| format!("commit incremental tx: {}", e))?;
@@ -371,8 +370,8 @@ mod tests {
     }
 
     /// `chunks(0)` panics on the indexing thread above the arm that publishes
-    /// `IndexingStatus::Error` — a hand-edited zero wedged indexing for the
-    /// session while the UI went on reading "Running".
+    /// `IndexingStatus::Error`, so a hand-edited zero would wedge indexing for
+    /// the session while the UI reads "Running".
     #[test]
     fn a_zero_batch_size_does_not_panic_the_writer() {
         let mut f = Fixture::new();
@@ -382,9 +381,9 @@ mod tests {
         assert_eq!(f.counts().0, 1, "the file should still be indexed");
     }
 
-    /// A sliced directory event resumes where the last slice stopped — linear,
-    /// not quadratic. Asserted by resume point rather than by clock, because a
-    /// timing-based assertion says nothing reliable on a loaded CI runner.
+    /// A sliced directory event resumes where the last slice stopped: linear,
+    /// not quadratic. Asserted by resume point rather than by clock, which says
+    /// nothing reliable on a loaded CI runner.
     #[test]
     fn a_directory_event_resumes_where_its_budget_ran_out() {
         let mut f = Fixture::new();
@@ -649,7 +648,7 @@ mod tests {
     }
 
     /// `coordinator::inner::apply_pending` turns any `Err` here into
-    /// `needs_full_run`, and a full run screens the same subtree out — the
+    /// `needs_full_run`, and a full run screens the same subtree out, so the
     /// reindex would loop forever. Live on Windows, where a `\\wsl.localhost\`
     /// or Samba tree can hold such a directory and the root watch is recursive.
     #[test]
@@ -693,9 +692,10 @@ mod tests {
         assert_eq!(content_state, repo::STATE_NA);
     }
 
-    /// Regression: `metadata` follows, so the link read as a directory, and
-    /// canonicalization stored rows under the target's real path that no
-    /// sweep range covers — nothing but a rebuild cleared them.
+    /// With following off, a symlinked directory is not walked: `metadata`
+    /// follows, so the link would read as a directory, and canonicalization
+    /// would store rows under the target's real path that no sweep range
+    /// covers and only a rebuild clears.
     #[test]
     #[cfg(unix)]
     fn a_symlinked_directory_is_not_followed_when_following_is_off() {

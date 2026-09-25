@@ -10,19 +10,14 @@ use quicksearch_core::db;
 use quicksearch_core::indexing::{IndexingService, IndexingStatus};
 
 #[allow(unused_imports)]
-pub use quicksearch_core::testutil::{scratch_dir, scratch_dir_canonical, touch};
-
-#[allow(unused_imports)]
-pub use quicksearch_core::testutil::{
-    scratch_db, seed_index, Lcg, SeedSpec, BODY_TERM, NEEDLE, WORDS,
-};
+pub use quicksearch_core::testutil::{touch, Lcg, BODY_TERM};
 
 const INDEX_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One full indexing run, awaited via the `last_full_index` marker, which is
-/// written only on a successful finish — polling for `Idle` would race: a
-/// small tree finishes between two polls, leaving `Idle` ambiguous between
-/// "not started yet" and "already done".
+/// written only on a successful finish. Polling for `Idle` would race: a small
+/// tree finishes between two polls, leaving `Idle` ambiguous between "not
+/// started yet" and "already done".
 pub struct IndexOnce<'a> {
     pub db: &'a Path,
     pub roots: Vec<String>,

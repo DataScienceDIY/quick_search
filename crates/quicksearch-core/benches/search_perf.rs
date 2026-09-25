@@ -1,32 +1,21 @@
-//! How big the search connection's page cache has to be, and what it is worth
-//! — the two claims `db::schema::PRAGMAS_SEARCH` and
-//! `search::IDLE_RELEASE` rest on.
+//! How big the search connection's page cache has to be, and what it is
+//! worth: the sweep behind `db::schema::recommended_search_cache_mib` and
+//! `search::IDLE_RELEASE`.
 //!
 //! Queries run as a keystroke sequence (`quar`, `quart`, `quartz`,
-//! `quartzi`), because that is what a real session is: the user types, and
-//! every keystroke re-runs the search. **The warm column is the one that
-//! decides the constant.** A cold query happens once, on the first keystroke
-//! after `IDLE_RELEASE` drops the connection; a warm one happens on every
-//! keystroke after it.
+//! `quartzi`), as in a real session, where every keystroke re-runs the
+//! search. The warm column decides the constant: a cold query happens once,
+//! on the first keystroke after `IDLE_RELEASE` drops the connection, and a
+//! warm one on every keystroke after it.
 //!
-//! What has to stay resident is the **`files` table**, not the FTS index.
+//! The `files` table has to stay resident, not the FTS index.
 //! `search/cascade/passes.rs` answers filename queries (ranks 1–4, 9–10) with
-//! `SELECT … FROM files f WHERE f.name LIKE '%…%'` — a full table scan, no FTS
-//! at all — and the fuzzy pass scans it again (`LIKE`-narrowed for terms of
-//! 9+ characters, unpredicated below that). So the working set scales with
-//! **file count**, not with document volume, and the corpus dimension below
-//! is what makes that visible.
+//! `SELECT … FROM files f WHERE f.name LIKE '%…%'`, a full table scan with no
+//! FTS, and the fuzzy pass scans it again (`LIKE`-narrowed for terms of 9+
+//! characters, unpredicated below that). So the working set scales with file
+//! count, not document volume, and the corpus dimension below shows it.
 //!
-//! The keyed rows are where an undersized cache hurts first: a page-cache miss
-//! costs an AES-CBC decrypt, not a `memcpy`.
-//!
-//! **Every keyed figure recorded below was taken while
-//! `db::schema::HMAC_MODE` was HMAC-SHA512**, so a miss then also cost a
-//! per-page verify. It no longer does, and `benches/cipher_hmac.rs` measured
-//! that as 1.78x on warm search — so the knees found here are deeper than the
-//! ones a re-sweep would find. `schema::SEARCH_CACHE_BYTES_PER_FILE` says the
-//! same thing from the other side: it is now conservative, and re-running this
-//! bench is what would tighten it.
+//! Keyed figures predate `HMAC_MODE = Off`; see `db::schema::HMAC_MODE`.
 //!
 //! Printed rather than asserted: shared-box timings are not stable enough for
 //! a pass/fail gate, and a flaky perf gate gets muted rather than fixed.
@@ -36,14 +25,14 @@
 //!   cargo bench -p quicksearch-core --bench search_perf
 //! ```
 //!
-//! `TMPDIR` wants real storage: the 1M-file arms are ~580 MB each and a tmpfs
-//! `/tmp` would turn every miss into a RAM copy. Budget ~20 minutes, nearly
-//! all of it seeding.
+//! Point `TMPDIR` at real storage (see `arms::warn_if_tmpdir_unset`); the
+//! 1M-file arms are ~580 MB each. Budget ~20 minutes, nearly all of it
+//! seeding.
 //!
 //! # What it found
 //!
 //! Warm search, best of the settled session, `schema::PAGE_SIZE` = 8192, rows
-//! at a realistic width (139 B — see [`spec`]):
+//! at a realistic width (139 B; see [`spec`]):
 //!
 //! | corpus | `files` table | keyed, under knee | keyed, at knee | knee | ratio |
 //! |---|---|---|---|---|---|
@@ -51,125 +40,101 @@
 //! | 600k | 79.5 MiB | 121.2 ms (≤64 MiB) | **33.7 ms** | 96 MiB | 1.21x |
 //! | 1M | 132.4 MiB | 199.6 ms (≤128 MiB) | **58.3 ms** | 256 MiB | ≤1.93x |
 //!
-//! 1. **The knee is 1.21x the `files` table, at every corpus.** Not
-//!    approximately: 26.5→32 and 79.5→96 both land on it, and 1M's true knee
-//!    is somewhere in (128, 256] where 1.21x predicts 160. It tracks *file
-//!    count*, not document volume, because what every keystroke rescans is
-//!    `files` (see the pass-A note above), never the FTS index. That product —
-//!    139 B/row × 1.21 — is `schema::SEARCH_CACHE_BYTES_PER_FILE`.
-//! 2. **Below the knee an encrypted index is 3.4–3.9x slower**, and the step
-//!    is a cliff, not a slope: 600k measured 121–130 ms at every ceiling from
-//!    1 to 64 MiB and 33.7 ms at 96.
-//! 3. **Plain has no knee.** Its widest spread was 1.35x and it is not even
-//!    monotonic — 32 and 48 MiB measured slower than 1 MiB at 600k — which is
-//!    run-to-run noise, not a curve. A miss it takes is a `memcpy` from the OS
-//!    cache; a miss the keyed arm takes is an AES-CBC decrypt (plus, when
-//!    these were measured, an HMAC-SHA512 verify). Hence
+//! 1. The knee is 1.21x the `files` table at every corpus: 26.5→32 and
+//!    79.5→96 both land on it, and 1M's true knee is somewhere in (128, 256]
+//!    where 1.21x predicts 160. Hence 139 B/row × 1.21x = 168 B,
+//!    `schema::SEARCH_CACHE_BYTES_PER_FILE`.
+//! 2. Below the knee an encrypted index is 3.4–3.9x slower, and the step is a
+//!    cliff, not a slope: 600k keyed ran 121–130 ms at every ceiling up to
+//!    64 MiB and 33.7 ms at 96.
+//! 3. Plain has no knee. Its widest spread was 1.35x and it is not monotonic
+//!    (32 and 48 MiB measured slower than 1 MiB at 600k): run-to-run noise,
+//!    not a curve. A miss on a plain index is a `memcpy` from the OS cache; on
+//!    a keyed one it is an AES-CBC decrypt. Hence
 //!    `schema::SEARCH_CACHE_PLAIN_MIB`, flat.
 //!
-//! **Row width is half the answer and was nearly missed.** The narrow rows the
-//! search harnesses used to seed — `hash` NULL, a 16-character parent — are
-//! 69.5 B, exactly half of a realistic 139 B. Calibrating against those would
-//! have under-sized every cache by two and put every user back under the knee.
+//! Row width is half the answer. The default seed's narrow rows (`hash` NULL,
+//! a 16-character `/seed/NNN/` parent) measure 69.5 B, half of a realistic
+//! 139 B; calibrating on them would under-size every cache by two and put
+//! every user back under the knee.
 //!
-//! **The 128 MiB automatic cap binds at ~800k files.** At 1M the derived value
-//! is capped at 128 while the index wants ~160: 205 ms per keystroke against
-//! the 58 ms available. That is the memory-versus-speed trade
-//! `schema::SEARCH_CACHE_MAX_MIB` documents, and
-//! `[search] cache_size_mib` is how a user takes the other side of it.
+//! The 128 MiB automatic cap (`schema::SEARCH_CACHE_MAX_MIB`) binds at ~800k
+//! files. At 1M the index wants ~160 MiB and gets 128: 205 ms per keystroke
+//! against the 58 ms available at 256. `[search] cache_size_mib` is how a
+//! user trades memory for that speed.
 
-use std::time::{Duration, Instant};
+mod arms;
 
-use quicksearch_core::query::split::split_for_cascade;
-use quicksearch_core::search::{cascade, SearchHit, SearchOptions};
-use quicksearch_core::testutil::{Arm, SeedSpec};
-use rusqlite::Connection;
+use std::time::Duration;
 
-/// Corpora chosen to bracket `PRAGMAS_SEARCH`: at 200k the `files` table is
-/// ~19 MiB and fits inside 32 MiB, at 1M it is ~98 MiB and cannot. If the
-/// working set really is `files`, the knee moves between these two.
+use quicksearch_core::db::schema::recommended_search_cache_mib;
+use quicksearch_core::search::SearchOptions;
+use quicksearch_core::testutil::{run_cascade, Arm, SeedSpec};
+
+/// Two corpora under the automatic cap and one past it
+/// (`schema::SEARCH_CACHE_MAX_MIB` binds at ~800k files). If the working set
+/// is `files`, the knee moves with the corpus.
 const CORPORA: [usize; 3] = [200_000, 600_000, 1_000_000];
 
-/// Cache ceilings in KiB (negative is KiB; positive would be a page count).
-/// 1 MiB is deliberately far too small — the curve needs a visible floor for
-/// any "enough" to be a measurement — and 256 MiB is past anything shippable,
-/// so a knee inside the range is a knee and not the edge of the sweep.
+/// Cache ceilings as `PRAGMA cache_size` values: negative is KiB (positive
+/// would be a page count). 1 MiB is far too small, because the curve needs a
+/// visible floor for any "enough" to be a measurement, and 256 MiB is past
+/// the automatic cap, so a knee inside the range is a knee and not the edge
+/// of the sweep.
 ///
-/// 24, 48 and 96 MiB break the powers of two. Without them the knee can only
-/// be located to the next power up, which pins the cache-over-`files` ratio no
-/// tighter than (1.0, 1.93] — too loose to derive a constant from.
+/// 24, 48 and 96 MiB break the powers of two. Without them the knee could
+/// only be located to the next power up, which pins the cache-over-`files`
+/// ratio no tighter than (1.0, 1.93], too loose to derive a constant from.
 const CACHE_SIZES: [i64; 12] = [
     -1024, -2048, -4096, -8192, -16384, -24576, -32768, -49152, -65536, -98304, -131072, -262144,
 ];
 
-/// What `PRAGMAS_SEARCH` ships with, marked in the output so the curve can be
-/// read against it without counting columns.
-const SHIPPED_CACHE: i64 = -32768;
+/// The ceiling `open_search_reader` derives for this arm, in [`CACHE_SIZES`]
+/// units. The output marks it, so the curve can be read against it without
+/// counting rows.
+fn shipped_cache(arm: &Arm, files: usize) -> i64 {
+    -recommended_search_cache_mib(files as i64, arm.keyed) * 1024
+}
 
 const SEQUENCE: [&str; 4] = ["quar", "quart", "quartz", "quartzi"];
 
 /// A cache is "enough" once warm is within this of the best warm on the same
-/// arm — used to *locate* a knee, once there is one to locate.
+/// arm. Locates a knee once [`KNEE_MIN_SPREAD`] says there is one.
 const KNEE_TOLERANCE: f64 = 1.10;
 
-/// How much worse the worst ceiling must be than the best before the curve is
-/// called a knee at all.
-///
-/// A real one is unmistakable: keyed at 200k ran 41.4 ms flat below 32 MiB and
-/// 10.7 ms at or above it, monotonically, a 4x step. A plain arm at the same
-/// corpus wanders over about 1.3x and is not even monotonic — 32 and 48 MiB
-/// measured *slower* than 1 MiB — which is run-to-run noise wearing the shape
-/// of a curve. At 1.10 the locator happily reports a knee in that noise, so
-/// the gate to being a knee is set well above it.
+/// How much worse the worst ceiling must be than the best before the curve
+/// counts as a knee. A real one is a 4x step (keyed at 200k: 41.4 ms below
+/// 32 MiB, 10.7 ms at or above). [`KNEE_TOLERANCE`] alone would find a knee
+/// in a plain arm's ~1.3x run-to-run noise, so this gate sits well above it.
 const KNEE_MIN_SPREAD: f64 = 1.5;
 
 fn enabled() -> bool {
     std::env::var("QSB_SEARCH_PERF").is_ok()
 }
 
-/// A **realistically wide** `files` row, which is the whole calibration.
-///
-/// The default seed stores `hash` NULL and a 16-character `/seed/NNN/` parent;
-/// a real row carries a 32-byte content hash and a parent nested several
-/// directories deep, and `parent` is stored per row. Since the working set
-/// *is* the `files` table, calibrating a cache constant against the narrow
-/// shape would under-size it by roughly the ratio between them — the bytes per
-/// row are printed per arm so that ratio stays visible rather than assumed.
+/// A realistically wide `files` row: a content hash and a parent several
+/// directories deep, where the default seed has `hash` NULL and a
+/// 16-character `/seed/NNN/` parent. The row width sets the calibration (see
+/// the module doc), so bytes per row are printed per arm.
 fn spec(files: usize) -> SeedSpec {
     SeedSpec {
         files,
-        // ~2 KB documents, the default: a corpus of tiny ones would make the
-        // full-text pass look free when it is the cascade's most expensive.
         commit_every: 5_000,
         // A hash on every row, as a real index has once hashing has run.
         dup_every: 2,
-        // `/seed/NNN/word/word/word/word/word/` — about 50 characters, which
-        // is an ordinary depth for a document tree.
+        // `/seed/NNN/word/word/word/word/word/`: about 50 characters, an
+        // ordinary depth for a document tree.
         dir_depth: 6,
+        // ~2 KB documents, the default: a corpus of tiny ones would make the
+        // full-text pass look free when it is the cascade's most expensive.
         ..SeedSpec::default()
     }
 }
 
-fn mib(bytes: u64) -> f64 {
-    bytes as f64 / (1024.0 * 1024.0)
-}
-
-/// Run one query; hits are counted, not kept — holding 200k `SearchHit`s
-/// would measure the allocator instead of the scan.
-fn time_query(conn: &Connection, query: &str, options: &SearchOptions) -> (Duration, usize) {
-    let split = split_for_cascade(query).unwrap();
-    let latest = std::sync::atomic::AtomicU64::new(1);
-    let mut count = 0usize;
-    let mut sink = |hits: Vec<SearchHit>| count += hits.len();
-    let start = Instant::now();
-    cascade::run(conn, &split, options, 1, &latest, &mut sink).unwrap();
-    (start.elapsed(), count)
-}
-
-/// The options every measurement here runs under: the sweep's, with `fuzzy`
-/// the variable. Both `SearchOptions::default()` and the GUI default
-/// (`[search] fuzzy_default`) have fuzzy **off** — the fuzzy rows below are
-/// what a user opts into, not what a default install pays per keystroke.
+/// The options every measurement here runs under, with `fuzzy` the variable.
+/// Fuzzy is off in both `SearchOptions::default()` and the GUI default
+/// (`[search] fuzzy_default`), so the fuzzy rows are what a user opts into,
+/// not what a default install pays per keystroke.
 fn options(fuzzy: bool) -> SearchOptions {
     SearchOptions {
         limit: 1000,
@@ -178,28 +143,30 @@ fn options(fuzzy: bool) -> SearchOptions {
     }
 }
 
-/// The fuzzy pairing's keystroke sequence, per-term rather than averaged:
-/// under the default `fuzzy_max_edits` of 2, `pigeonhole_chunks` needs
-/// `3 × (k + 1)` characters, so terms under 9 characters keep the full scan
-/// (`edit_budget` gives k=1 at 3–5 and k=2 from 6) and only the 9+ ones can
-/// be prefiltered. Both shapes are in the sequence on purpose: the short
-/// terms are the control a pass-C narrowing must not move, the long ones are
-/// what it narrows. `quartzite` is `testutil::NEEDLE`, present in seeded
-/// names, so the engaged rows return real hits.
+/// The fuzzy pairing's keystroke sequence, reported per term rather than
+/// averaged. Under the default `fuzzy_max_edits` of 2, `pigeonhole_chunks`
+/// needs `3 × (k + 1)` characters (`edit_budget` gives k=1 at 3–5 and k=2
+/// from 6), so only terms of 9+ characters are prefiltered. The short terms
+/// are the control a pass-C narrowing must not move; the long ones are what
+/// it narrows. `quartzite` is `testutil::NEEDLE`, present in seeded names, so
+/// the prefiltered rows return real hits.
 const FUZZY_SEQUENCE: [&str; 4] = ["quar", "quartz", "quartzite", "quartzites"];
 
-/// Warm per-term timings, fuzzy off against on, at the shipped cache — the
-/// gate for the fuzzy filename pass's shape (`passes::pass_fuzzy_filename`).
-/// The off column is the control: a pass-C change has no business moving it.
-fn run_fuzzy_pairing(arm: &Arm) {
+/// Warm per-term timings, fuzzy off against on, at the shipped cache: the
+/// gate for the fuzzy filename pass (`passes::pass_fuzzy_filename`). The off
+/// column is the control, which a pass-C change must not move.
+fn run_fuzzy_pairing(arm: &Arm, files: usize) {
     let conn = arm.open_search();
-    conn.execute_batch(&format!("PRAGMA cache_size = {};", SHIPPED_CACHE))
-        .unwrap();
+    conn.execute_batch(&format!(
+        "PRAGMA cache_size = {};",
+        shipped_cache(arm, files)
+    ))
+    .unwrap();
     // One settling pass per mode so every printed number is warm.
     for fuzzy in [false, true] {
         let opts = options(fuzzy);
         for query in FUZZY_SEQUENCE {
-            time_query(&conn, query, &opts);
+            run_cascade(&conn, query, &opts);
         }
     }
     println!(
@@ -207,50 +174,46 @@ fn run_fuzzy_pairing(arm: &Arm) {
         "term", "off", "on", "hits"
     );
     for query in FUZZY_SEQUENCE {
-        let (off, _) = time_query(&conn, query, &options(false));
-        let (on, hits) = time_query(&conn, query, &options(true));
+        let (off, _) = run_cascade(&conn, query, &options(false));
+        let (on, hits) = run_cascade(&conn, query, &options(true));
         println!("{:>12}  {:>9.1?}  {:>9.1?}  {:>8}", query, off, on, hits);
     }
 }
 
 /// One arm at one cache ceiling: the first keystroke on a fresh connection,
-/// then the steady state after a priming pass.
-///
-/// The connection comes from the production `open_search_reader` with only
-/// `cache_size` overridden, so the two key states differ by the key and
-/// nothing else — the old version opened the plain arm with a raw
-/// `Connection::open`, which skipped the key path entirely and made the two
-/// columns incomparable.
+/// then the steady state after a priming pass. The connection comes from the
+/// production `open_search_reader` with only `cache_size` overridden, so the
+/// two key states differ by the key alone.
 fn measure(arm: &Arm, cache_size: i64) -> (Duration, Duration, usize) {
     let conn = arm.open_search();
     conn.execute_batch(&format!("PRAGMA cache_size = {};", cache_size))
         .unwrap();
 
     let opts = options(false);
-    let (cold, hits) = time_query(&conn, SEQUENCE[0], &opts);
+    let (cold, hits) = run_cascade(&conn, SEQUENCE[0], &opts);
     // A priming pass, so "warm" is a settled session rather than the three
     // keystrokes after the first.
     for query in SEQUENCE {
-        time_query(&conn, query, &opts);
+        run_cascade(&conn, query, &opts);
     }
     let total: Duration = SEQUENCE
         .iter()
-        .map(|q| time_query(&conn, q, &opts).0)
+        .map(|q| run_cascade(&conn, q, &opts).0)
         .sum();
     (cold, total / SEQUENCE.len() as u32, hits)
 }
 
 fn run_matrix(arm: &Arm, files: usize) {
     let files_bytes = arm.table_bytes("files");
-    // Bytes per row is the constant `schema::recommended_search_cache_mib` is
-    // built on, so it is printed rather than left to be inferred from the
-    // table size and the corpus.
+    let shipped = shipped_cache(arm, files);
+    // `schema::SEARCH_CACHE_BYTES_PER_FILE` is built on bytes per row, so it
+    // is printed rather than left to be inferred.
     println!(
         "\n=== {} ===  {:.1} MiB on disk, files table {:.1} MiB ({:.0} B/row), \
          seeded in {:.1?}",
         arm.what,
-        mib(arm.size_bytes()),
-        mib(files_bytes),
+        arms::mib(arm.size_bytes()),
+        arms::mib(files_bytes),
         files_bytes as f64 / files as f64,
         arm.seeded_in
     );
@@ -277,11 +240,7 @@ fn run_matrix(arm: &Arm, files: usize) {
         println!(
             "{:>9} MiB{}  {:>9.1?}  {:>9.1?}  {:>9.2}x  {:>8}",
             -cache_size / 1024,
-            if *cache_size == SHIPPED_CACHE {
-                " *"
-            } else {
-                "  "
-            },
+            if *cache_size == shipped { " *" } else { "  " },
             cold,
             warm,
             ratio,
@@ -303,34 +262,32 @@ fn run_matrix(arm: &Arm, files: usize) {
              the {:.1}x a step has to clear; files table is {:.1} MiB",
             spread,
             KNEE_MIN_SPREAD,
-            mib(files_bytes)
+            arms::mib(files_bytes)
         );
         return;
     }
 
-    // Otherwise the knee is the smallest ceiling still within tolerance of the
-    // best. Reported against the `files` table because that is the quantity it
-    // should track — if the two move together across corpora, the constant
-    // should be written in terms of file count. `max` on a negative KiB
-    // ceiling is the *smallest* cache.
+    // Otherwise the knee is the smallest ceiling within tolerance of the best
+    // (`max` on a negative KiB ceiling is the smallest cache), reported
+    // against the `files` table, the quantity it should track across corpora.
     let knee = rows
         .iter()
         .filter(|(_, _, warm, _)| warm.as_secs_f64() <= best.as_secs_f64() * KNEE_TOLERANCE)
         .map(|(cache_size, _, _, _)| *cache_size)
         .max()
-        .unwrap_or(SHIPPED_CACHE);
-    // The ratio is the number the constant is derived from: how much cache one
-    // byte of `files` needs. Reported per arm so the derivation can be checked
-    // against every corpus rather than fitted to one.
+        .unwrap_or(shipped);
+    // The constant is derived from the ratio, cache per byte of `files`;
+    // printing it per arm checks the derivation against every corpus rather
+    // than fitting it to one.
     println!(
         "knee at {} MiB (within {:.0}% of best warm); files table is {:.1} MiB; \
          ratio {:.2}x; shipped ceiling is {} MiB{}",
         -knee / 1024,
         (KNEE_TOLERANCE - 1.0) * 100.0,
-        mib(files_bytes),
+        arms::mib(files_bytes),
         (-knee * 1024) as f64 / files_bytes as f64,
-        -SHIPPED_CACHE / 1024,
-        if knee < SHIPPED_CACHE {
+        -shipped / 1024,
+        if knee < shipped {
             " — TOO SMALL for this corpus"
         } else {
             ""
@@ -343,16 +300,10 @@ fn main() {
         eprintln!("skipping: set QSB_SEARCH_PERF=1 to run");
         return;
     }
-    if std::env::var_os("TMPDIR").is_none() {
-        eprintln!(
-            "warning: TMPDIR unset — scratch goes to {}. If that is tmpfs the \
-             large arms will not fit and every miss is a RAM copy.",
-            std::env::temp_dir().display()
-        );
-    }
-    // `QSB_SEARCH_PERF=fuzzy` runs only the fuzzy pairing — the cache sweep
-    // is minutes per arm and a pass-C gate does not need it. `QSB_CORPORA`
-    // trims the corpus list the same way (comma-separated file counts).
+    arms::warn_if_tmpdir_unset("the large arms will not fit and every miss is a RAM copy");
+    // `QSB_SEARCH_PERF=fuzzy` runs only the fuzzy pairing: the cache sweep
+    // takes minutes per arm and a pass-C gate does not need it. `QSB_CORPORA`
+    // trims the corpus list (comma-separated file counts).
     let fuzzy_only = std::env::var("QSB_SEARCH_PERF").as_deref() == Ok("fuzzy");
     let corpora: Vec<usize> = std::env::var("QSB_CORPORA")
         .ok()
@@ -385,17 +336,17 @@ fn main() {
             } else {
                 run_matrix(&arm, files);
             }
-            run_fuzzy_pairing(&arm);
+            run_fuzzy_pairing(&arm, files);
             arm.discard();
         }
     }
 }
 
 /// The fuzzy-only corpus: `files` rows and nothing else. Pass C never reads a
-/// document — its whole cost is the `files` scan plus the bitap — and 2 KB
+/// document (its whole cost is the `files` scan plus the bitap), and 2 KB
 /// bodies turn a minutes-long seed into hours on slow storage while adding
-/// only pass-D noise to the number under test. One row in `usize::MAX` still
-/// gets content, which keeps pass D exercised without costing anything.
+/// only pass-D noise. One row in `usize::MAX` still gets content, which keeps
+/// pass D exercised at no cost.
 fn light_spec(files: usize) -> SeedSpec {
     SeedSpec {
         content_every: usize::MAX,

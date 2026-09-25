@@ -1,84 +1,71 @@
 use super::*;
+use crate::testutil::Scratch;
 
-fn tmp_db_path() -> std::path::PathBuf {
-    crate::testutil::scratch_dir("open").join("index.sqlite")
+/// A database path that does not exist yet, in its own scratch directory.
+fn db() -> (Scratch, String) {
+    let (dir, p) = Scratch::db("open");
+    (dir, p.to_str().unwrap().to_string())
+}
+
+/// `schema_info.{key}`, which must be present.
+fn info(conn: &Connection, key: &str) -> String {
+    conn.query_row("SELECT value FROM schema_info WHERE key = ?1", [key], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+fn file_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// The `schema_info` of a version-1 index, on whatever `conn` is.
+fn write_v1_schema_info(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO schema_info(key,value) VALUES('version','1');",
+    )
+    .unwrap();
+}
+
+/// A plain version-1 index holding one `files` row named `name`.
+fn write_v1_index(p: &str, name: &str) {
+    let conn = Connection::open(p).unwrap();
+    write_v1_schema_info(&conn);
+    conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO files(name) VALUES(?1)", [name])
+        .unwrap();
 }
 
 #[test]
 fn fresh_db_gets_current_version() {
-    let p = tmp_db_path();
-    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-    let v: String = conn
-        .query_row(
-            "SELECT value FROM schema_info WHERE key='version'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(v, CURRENT_SCHEMA_VERSION.to_string());
-    drop(conn);
-    std::fs::remove_file(&p).ok();
+    let (_dir, p) = db();
+    let conn = open_or_recreate(&p, "trigram").unwrap();
+    assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
 }
 
 #[test]
 fn reopen_is_idempotent() {
-    let p = tmp_db_path();
-    {
-        let _ = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-    }
-    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-    let v: String = conn
-        .query_row(
-            "SELECT value FROM schema_info WHERE key='version'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(v, CURRENT_SCHEMA_VERSION.to_string());
-    drop(conn);
-    std::fs::remove_file(&p).ok();
+    let (_dir, p) = db();
+    drop(open_or_recreate(&p, "trigram").unwrap());
+    let conn = open_or_recreate(&p, "trigram").unwrap();
+    assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
 }
 
 #[test]
 fn older_versioned_db_is_wiped_and_recreated() {
-    let p = tmp_db_path();
-    {
-        let conn = Connection::open(&p).unwrap();
-        conn.execute(
-            "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO schema_info(key,value) VALUES('version','1')",
-            [],
-        )
-        .unwrap();
-        conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT)", [])
-            .unwrap();
-        conn.execute("INSERT INTO files(name) VALUES('a.txt')", [])
-            .unwrap();
-    }
-    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-    let v: String = conn
-        .query_row(
-            "SELECT value FROM schema_info WHERE key='version'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(v, CURRENT_SCHEMA_VERSION.to_string());
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 0, "old rows should be wiped");
-    drop(conn);
-    std::fs::remove_file(&p).ok();
+    let (_dir, p) = db();
+    write_v1_index(&p, "a.txt");
+    let conn = open_or_recreate(&p, "trigram").unwrap();
+    assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
+    assert_eq!(file_count(&conn), 0, "old rows should be wiped");
 }
 
 #[test]
 fn legacy_layout_db_is_wiped_and_recreated() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     {
         let conn = Connection::open(&p).unwrap();
         conn.execute(
@@ -92,72 +79,36 @@ fn legacy_layout_db_is_wiped_and_recreated() {
         )
         .unwrap();
     }
-    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+    let conn = open_or_recreate(&p, "trigram").unwrap();
+    assert_eq!(file_count(&conn), 0);
+    // An unknown column name fails to prepare.
+    conn.prepare("SELECT content_state, type, mime FROM files LIMIT 0")
         .unwrap();
-    assert_eq!(count, 0);
-    // An unknown column name would parse-error here.
-    conn.query_row(
-        "SELECT content_state, type, mime FROM files LIMIT 0",
-        [],
-        |_| Ok(()),
-    )
-    .or_else(|e| {
-        if matches!(e, rusqlite::Error::QueryReturnedNoRows) {
-            Ok(())
-        } else {
-            Err(e)
-        }
-    })
-    .unwrap();
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn tokenizer_drift_wipes_db() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     let first_effective = {
-        let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        let conn = open_or_recreate(&p, "trigram").unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) \
              VALUES ('x', '/', 0, 0)",
             [],
         )
         .unwrap();
-        let stored: String = conn
-            .query_row(
-                "SELECT value FROM schema_info WHERE key='tokenize'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        drop(conn);
-        stored
+        info(&conn, "tokenize")
     };
-    let conn = open_or_recreate(p.to_str().unwrap(), "unicode61").unwrap();
-    let files_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(files_count, 0, "tokenizer drift should wipe rows");
-    let new_stored: String = conn
-        .query_row(
-            "SELECT value FROM schema_info WHERE key='tokenize'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_ne!(first_effective, new_stored);
-    drop(conn);
-    std::fs::remove_file(&p).ok();
+    let conn = open_or_recreate(&p, "unicode61").unwrap();
+    assert_eq!(file_count(&conn), 0, "tokenizer drift should wipe rows");
+    assert_ne!(first_effective, info(&conn, "tokenize"));
 }
 
 #[test]
 fn open_existing_reads_nondefault_tokenizer_without_wiping() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     {
-        let conn = open_or_recreate(p.to_str().unwrap(), "unicode61").unwrap();
+        let conn = open_or_recreate(&p, "unicode61").unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) \
              VALUES ('note', '/', 0, 0)",
@@ -172,12 +123,10 @@ fn open_existing_reads_nondefault_tokenizer_without_wiping() {
         .unwrap();
     }
 
-    let conn = open_existing(p.to_str().unwrap(), false).unwrap();
-    let files: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap();
+    let conn = open_existing(&p, false).unwrap();
     assert_eq!(
-        files, 1,
+        file_count(&conn),
+        1,
         "open_existing must not wipe a non-default-tokenizer DB"
     );
     let hits: i64 = conn
@@ -189,70 +138,59 @@ fn open_existing_reads_nondefault_tokenizer_without_wiping() {
         .unwrap();
     assert_eq!(hits, 1);
     // Proof we neither rewrote the FTS table nor reset schema_info.
-    let tok: String = conn
-        .query_row(
-            "SELECT value FROM schema_info WHERE key='tokenize'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(tok, "unicode61");
-    drop(conn);
-    std::fs::remove_file(&p).ok();
+    assert_eq!(info(&conn, "tokenize"), "unicode61");
 }
 
 #[test]
 fn open_or_recreate_creates_missing_parent_dirs() {
-    let dir = crate::testutil::scratch_dir("mkdir");
+    let dir = Scratch::dir("mkdir");
     let db = dir.join("nested/deeper/index.sqlite");
-    let conn = open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
-    drop(conn);
+    drop(open_or_recreate(db.to_str().unwrap(), "trigram").unwrap());
     assert!(db.exists());
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn writable_opens_use_wal_and_it_persists() {
-    let p = tmp_db_path();
-    {
-        let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-        let mode: String = conn
-            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(mode.to_lowercase(), "wal");
-    }
-    // WAL is persistent in the file: a later read-only consumer sees it.
-    let conn = open_existing(p.to_str().unwrap(), false).unwrap();
-    let mode: String = conn
-        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(mode.to_lowercase(), "wal");
+    let (_dir, p) = db();
+    let mode = |conn: &Connection| -> String {
+        conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap()
+    };
+    let conn = open_or_recreate(&p, "trigram").unwrap();
+    assert_eq!(mode(&conn).to_lowercase(), "wal");
     drop(conn);
-    std::fs::remove_file(&p).ok();
+    // WAL is persistent in the file: a later read-only consumer sees it.
+    let conn = open_existing(&p, false).unwrap();
+    assert_eq!(mode(&conn).to_lowercase(), "wal");
 }
 
 /// Under `-DSQLITE_TEMP_STORE=2`, VACUUM builds the replacement index in
 /// memory unless `temp_store` is explicitly `FILE`.
 #[test]
 fn maintenance_opens_keep_temporaries_on_disk() {
-    let p = tmp_db_path();
-    {
-        let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-        let indexer: i64 = conn
-            .query_row("PRAGMA temp_store", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(indexer, 2, "the indexer's own profile is MEMORY");
-    }
+    let (_dir, p) = db();
+    let temp_store = |conn: &Connection| -> i64 {
+        conn.query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .unwrap()
+    };
+    let conn = open_or_recreate(&p, "trigram").unwrap();
+    assert_eq!(temp_store(&conn), 2, "the indexer's own profile is MEMORY");
+    drop(conn);
 
-    let conn = open_maintenance(p.to_str().unwrap()).unwrap();
-    let store: i64 = conn
-        .query_row("PRAGMA temp_store", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(store, 1, "maintenance must build its temporaries on disk");
+    let conn = open_maintenance(&p).unwrap();
+    assert_eq!(
+        temp_store(&conn),
+        1,
+        "maintenance must build its temporaries on disk"
+    );
 
-    // The directory those temporaries land in is steerable — what keeps
-    // them off a RAM-backed /tmp.
-    let dir = p.parent().unwrap().to_string_lossy().into_owned();
+    // The directory those temporaries land in is steerable, which keeps them
+    // off a RAM-backed /tmp.
+    let dir = Path::new(&p)
+        .parent()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
     conn.execute_batch(&format!("PRAGMA temp_store_directory = '{}';", dir))
         .unwrap();
     let set: String = conn
@@ -261,108 +199,97 @@ fn maintenance_opens_keep_temporaries_on_disk() {
     assert_eq!(set, dir);
     conn.execute_batch("PRAGMA temp_store_directory = '';")
         .unwrap();
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
+
+/// Builds the file at a path, or leaves it absent.
+type Fixture = fn(&str);
 
 /// Drives the GUI's "your index is being reset" modal: a false positive
 /// announces a wipe that is not happening.
 #[test]
 fn index_needs_rebuild_only_when_the_schema_really_differs() {
-    let p = tmp_db_path();
-    assert!(
-        !index_needs_rebuild(p.to_str().unwrap()),
-        "no file yet is a fresh install, not a reset"
-    );
-
-    {
-        let _ = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    let cases: [(Fixture, bool, &str); 5] = [
+        (|_| {}, false, "no file yet is a fresh install, not a reset"),
+        (
+            |p| drop(open_or_recreate(p, "trigram").unwrap()),
+            false,
+            "a current index is not going to be rebuilt",
+        ),
+        (
+            |p| {
+                drop(open_or_recreate(p, "trigram").unwrap());
+                open_existing(p, true)
+                    .unwrap()
+                    .execute(
+                        "UPDATE schema_info SET value = '1' WHERE key = 'version'",
+                        [],
+                    )
+                    .unwrap();
+            },
+            true,
+            "an older schema version is rebuilt",
+        ),
+        (
+            |p| {
+                Connection::open(p)
+                    .unwrap()
+                    .execute("CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT)", [])
+                    .unwrap();
+            },
+            true,
+            "a legacy layout is rebuilt",
+        ),
+        (
+            |p| std::fs::write(p, [0x5a; 4096]).unwrap(),
+            false,
+            "not a database at all: we cannot tell, so we say nothing",
+        ),
+    ];
+    for (build, expected, why) in cases {
+        let (_dir, p) = db();
+        build(&p);
+        assert_eq!(index_needs_rebuild(&p), expected, "{}", why);
     }
-    assert!(
-        !index_needs_rebuild(p.to_str().unwrap()),
-        "a current index is not going to be rebuilt"
-    );
-
-    {
-        let conn = open_existing(p.to_str().unwrap(), true).unwrap();
-        conn.execute(
-            "UPDATE schema_info SET value = '1' WHERE key = 'version'",
-            [],
-        )
-        .unwrap();
-    }
-    assert!(index_needs_rebuild(p.to_str().unwrap()));
-
-    std::fs::remove_file(&p).ok();
-    {
-        let conn = Connection::open(&p).unwrap();
-        conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT)", [])
-            .unwrap();
-    }
-    assert!(index_needs_rebuild(p.to_str().unwrap()));
-
-    // Not a database at all: we cannot tell, so we say nothing.
-    std::fs::write(&p, [0x5a; 4096]).unwrap();
-    assert!(!index_needs_rebuild(p.to_str().unwrap()));
-
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn open_existing_errors_on_missing_file() {
-    let p = tmp_db_path();
-    assert!(!p.exists());
-    let res = open_existing(p.to_str().unwrap(), false);
+    let (_dir, p) = db();
+    let res = open_existing(&p, false);
     assert!(res.is_err(), "missing file must error, not be created");
-    assert!(!p.exists(), "open_existing must not create the file");
+    assert!(
+        !Path::new(&p).exists(),
+        "open_existing must not create the file"
+    );
 }
 
 #[test]
 fn open_existing_errors_on_version_mismatch_without_wiping() {
-    let p = tmp_db_path();
-    {
-        let conn = Connection::open(&p).unwrap();
-        conn.execute(
-            "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO schema_info(key,value) VALUES('version','1')",
-            [],
-        )
-        .unwrap();
-        conn.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, name TEXT)", [])
-            .unwrap();
-        conn.execute("INSERT INTO files(name) VALUES('sentinel')", [])
-            .unwrap();
-    }
-    let res = open_existing(p.to_str().unwrap(), false);
+    let (_dir, p) = db();
+    write_v1_index(&p, "sentinel");
+    let res = open_existing(&p, false);
     assert!(res.is_err(), "stale schema version must error");
-    let conn = Connection::open(&p).unwrap();
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n, 1, "open_existing must never delete on version mismatch");
-    drop(conn);
-    std::fs::remove_file(&p).ok();
+    assert_eq!(
+        file_count(&Connection::open(&p).unwrap()),
+        1,
+        "open_existing must never delete on version mismatch"
+    );
 }
 
 fn test_key(seed: u8) -> IndexKey {
     IndexKey::from_hex(&format!("{:02x}", seed).repeat(32)).unwrap()
 }
 
-fn file_bytes(p: &Path) -> Vec<u8> {
+fn file_bytes(p: &str) -> Vec<u8> {
     std::fs::read(p).unwrap()
 }
 
 #[test]
 fn keyed_create_reopen_and_header_is_encrypted() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     let key = test_key(0xa1);
     {
-        let conn = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&key)).unwrap();
+        let conn = open_or_recreate_keyed(&p, "trigram", Some(&key)).unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) \
              VALUES ('secret', '/', 0, 0)",
@@ -373,28 +300,22 @@ fn keyed_create_reopen_and_header_is_encrypted() {
     let head = &file_bytes(&p)[..16];
     assert_ne!(head, b"SQLite format 3\0", "file must not be plaintext");
 
-    {
-        let conn = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&key)).unwrap();
-        let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 1, "keyed reopen must see existing rows, not wipe");
-    }
-    let conn = open_existing_keyed(p.to_str().unwrap(), false, Some(&key)).unwrap();
-    let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n, 1);
+    let conn = open_or_recreate_keyed(&p, "trigram", Some(&key)).unwrap();
+    assert_eq!(
+        file_count(&conn),
+        1,
+        "keyed reopen must see existing rows, not wipe"
+    );
     drop(conn);
-    std::fs::remove_file(&p).ok();
+    let conn = open_existing_keyed(&p, false, Some(&key)).unwrap();
+    assert_eq!(file_count(&conn), 1);
 }
 
 #[test]
 fn wrong_key_errors_without_wiping() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     {
-        let conn =
-            open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&test_key(0xa1))).unwrap();
+        let conn = open_or_recreate_keyed(&p, "trigram", Some(&test_key(0xa1))).unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) \
              VALUES ('x', '/', 0, 0)",
@@ -404,115 +325,83 @@ fn wrong_key_errors_without_wiping() {
     }
     let before = file_bytes(&p);
     for write in [false, true] {
-        let err =
-            open_existing_keyed(p.to_str().unwrap(), write, Some(&test_key(0xb2))).unwrap_err();
+        let err = open_existing_keyed(&p, write, Some(&test_key(0xb2))).unwrap_err();
         assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     }
     // A wrong key is never a "schema mismatch" to answer with a wipe.
-    let err =
-        open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&test_key(0xb2))).unwrap_err();
+    let err = open_or_recreate_keyed(&p, "trigram", Some(&test_key(0xb2))).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     assert_eq!(before, file_bytes(&p), "file must be byte-identical");
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn missing_key_on_encrypted_db_errors_without_wiping() {
-    let p = tmp_db_path();
-    {
-        let _ =
-            open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&test_key(0xa1))).unwrap();
-    }
+    let (_dir, p) = db();
+    drop(open_or_recreate_keyed(&p, "trigram", Some(&test_key(0xa1))).unwrap());
     let before = file_bytes(&p);
-    let err = open_existing_keyed(p.to_str().unwrap(), false, None).unwrap_err();
+    let err = open_existing_keyed(&p, false, None).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     assert!(err.contains("password-protected"), "got: {err}");
-    let err = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", None).unwrap_err();
+    let err = open_or_recreate_keyed(&p, "trigram", None).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     assert_eq!(before, file_bytes(&p));
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn key_on_plaintext_db_errors_without_wiping() {
-    let p = tmp_db_path();
-    {
-        let _ = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-    }
+    let (_dir, p) = db();
+    drop(open_or_recreate(&p, "trigram").unwrap());
     let before = file_bytes(&p);
-    let err = open_existing_keyed(p.to_str().unwrap(), false, Some(&test_key(0xa1))).unwrap_err();
+    let err = open_existing_keyed(&p, false, Some(&test_key(0xa1))).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     // The sniffed plaintext header yields the precise diagnosis.
     assert!(err.contains("not encrypted"), "got: {err}");
-    let err =
-        open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&test_key(0xa1))).unwrap_err();
+    let err = open_or_recreate_keyed(&p, "trigram", Some(&test_key(0xa1))).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     assert_eq!(before, file_bytes(&p));
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn schema_mismatch_under_key_wipes_and_recreates_encrypted() {
     // Right key, stale schema: the replacement must come back encrypted.
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     let key = test_key(0xa1);
     {
-        // Built through `key_and_probe` under an explicit previous profile,
-        // not with a bare `PRAGMA key`. SQLCipher's `cipher_default_*`
-        // settings are process globals that `key_and_probe` writes, so a bare
-        // key here would inherit whatever another test in this binary last
-        // installed and could land the fixture under a layout
-        // `PROFILES_PREVIOUS` does not list — which reads as a wrong password.
-        // Naming the layout is also what the fixture means: this is a file
-        // from an older build.
+        // Built through `key_and_probe` under a named previous profile, as a
+        // file from an older build is. A bare `PRAGMA key` would inherit the
+        // `cipher_default_*` globals another test last installed and could
+        // land under a layout `PROFILES_PREVIOUS` does not list, which reads
+        // as a wrong password.
         let previous = crate::db::schema::PROFILES_PREVIOUS[0];
         let conn = Connection::open(&p).unwrap();
-        key_and_probe(&conn, p.to_str().unwrap(), Some(&key), previous).unwrap();
-        conn.execute(
-            "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO schema_info(key,value) VALUES('version','1')",
-            [],
-        )
-        .unwrap();
+        key_and_probe(&conn, &p, Some(&key), previous).unwrap();
+        write_v1_schema_info(&conn);
     }
-    let conn = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&key)).unwrap();
-    let v: String = conn
-        .query_row(
-            "SELECT value FROM schema_info WHERE key='version'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(v, CURRENT_SCHEMA_VERSION.to_string());
+    let conn = open_or_recreate_keyed(&p, "trigram", Some(&key)).unwrap();
+    assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
     drop(conn);
     let head = &file_bytes(&p)[..16];
     assert_ne!(
         head, b"SQLite format 3\0",
         "rebuilt index must still be encrypted"
     );
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn garbage_file_with_key_reports_mismatch_not_corruption() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     std::fs::write(&p, [0x5a; 4096]).unwrap();
     let before = file_bytes(&p);
-    let err = open_existing_keyed(p.to_str().unwrap(), false, Some(&test_key(0xa1))).unwrap_err();
+    let err = open_existing_keyed(&p, false, Some(&test_key(0xa1))).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     assert_eq!(before, file_bytes(&p));
-    std::fs::remove_file(&p).ok();
 }
 
 #[test]
 fn open_existing_rw_allows_delete() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     {
-        let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        let conn = open_or_recreate(&p, "trigram").unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) \
              VALUES ('a', '/', 0, 0)",
@@ -520,13 +409,11 @@ fn open_existing_rw_allows_delete() {
         )
         .unwrap();
     }
-    let conn = open_existing(p.to_str().unwrap(), true).unwrap();
+    let conn = open_existing(&p, true).unwrap();
     let removed = conn
         .execute("DELETE FROM files WHERE parent = '/' AND name = 'a'", [])
         .unwrap();
     assert_eq!(removed, 1);
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 /// SQLite creates its database 0644 (copied to `-wal`/`-shm`); under umask
@@ -539,11 +426,8 @@ fn a_fresh_index_and_its_sidecars_are_owner_only() {
 
     // A directory that does not exist yet, so the creation path is under
     // test: an existing directory keeps whatever mode its owner chose.
-    let p = tmp_db_path()
-        .parent()
-        .unwrap()
-        .join("data")
-        .join("index.sqlite");
+    let dir = Scratch::dir("open");
+    let p = dir.join("data").join("index.sqlite");
     let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
     conn.execute(
         "INSERT INTO files (name, parent, size, mtime) \
@@ -568,31 +452,27 @@ fn a_fresh_index_and_its_sidecars_are_owner_only() {
     }
     // The created directory would otherwise take the umask.
     assert_eq!(mode_of(p.parent().unwrap()), 0o700);
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// `maintain` must work on a *keyed* index — the one case where SQLCipher
-/// answers `PRAGMA page_size` as TEXT. Every unencrypted test passed while
-/// every password-protected index silently skipped its VACUUM and optimize.
+/// `maintain` must work on a keyed index, the one case where SQLCipher answers
+/// `PRAGMA page_size` as TEXT; a failure there skips VACUUM and optimize on
+/// every password-protected index while every unencrypted test passes.
 #[test]
 fn maintain_reads_its_pragmas_on_a_keyed_index() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     let key = test_key(0xc3);
     {
-        let conn = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&key)).unwrap();
+        let conn = open_or_recreate_keyed(&p, "trigram", Some(&key)).unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) VALUES ('x', '/', 0, 0)",
             [],
         )
         .unwrap();
     }
-    let conn = open_keyed_with_pragmas(p.to_str().unwrap(), true, Some(&key), PRAGMAS_MAINTENANCE)
-        .unwrap();
+    let conn = open_keyed_with_pragmas(&p, true, Some(&key), PRAGMAS_MAINTENANCE).unwrap();
     // What matters is an answer, not an error; a tiny index has no slack.
     assert_eq!(
-        crate::db::repo::maintain(&conn, p.to_str().unwrap()),
+        crate::db::repo::maintain(&conn, &p),
         Ok(false),
         "maintain must not fail on a keyed index"
     );
@@ -602,9 +482,6 @@ fn maintain_reads_its_pragmas_on_a_keyed_index() {
         crate::db::repo::pragma_number(&conn, "page_size").unwrap() >= 512,
         "a real page size, not a silent zero"
     );
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
 /// Write enough text that FTS5 emits several *full* leaves. A corpus of tiny
@@ -626,20 +503,6 @@ fn seed_searchable_text(conn: &Connection) {
     conn.execute_batch("COMMIT").unwrap();
 }
 
-/// `(leaf, overflow)` page counts for the FTS5 data table.
-fn fts_page_types(conn: &Connection) -> (i64, i64) {
-    let count = |pagetype: &str| -> i64 {
-        conn.query_row(
-            "SELECT COUNT(*) FROM dbstat \
-             WHERE name = 'searchabletext_data' AND pagetype = ?1",
-            params![pagetype],
-            |r| r.get(0),
-        )
-        .unwrap()
-    };
-    (count("leaf"), count("overflow"))
-}
-
 fn fts_stored_pgsz(conn: &Connection) -> Option<i64> {
     conn.query_row(
         "SELECT v FROM searchabletext_config WHERE k = 'pgsz'",
@@ -657,11 +520,11 @@ fn max_inline(keyed: bool) -> i64 {
     PROFILE.page_size - PROFILE.reserve(keyed) - 35
 }
 
-/// Assert one index's FTS5 leaves are inline. An overflowed leaf is a second
-/// page fetch and decrypt on every read of it, and it is silent — nothing but
-/// the page counts shows it.
+/// Assert one index's FTS5 leaves are inline. An overflowed leaf costs a
+/// second page fetch and decrypt on every read, and only the page counts show
+/// it.
 fn assert_leaves_inline(conn: &Connection, keyed: bool) {
-    let (leaf, overflow) = fts_page_types(conn);
+    let (leaf, overflow) = crate::testutil::fts_page_counts(conn);
     assert!(
         leaf > 20,
         "the corpus must fill real leaves for this to test anything: {} leaves",
@@ -670,7 +533,7 @@ fn assert_leaves_inline(conn: &Connection, keyed: bool) {
     assert_eq!(
         overflow,
         0,
-        "{} of {} FTS5 leaves spilled to overflow pages — the derived pgsz is \
+        "{} of {} FTS5 leaves spilled to overflow pages; the derived pgsz is \
          back above the {}-byte inline limit",
         overflow,
         leaf,
@@ -692,16 +555,17 @@ fn assert_leaves_inline(conn: &Connection, keyed: bool) {
     );
 }
 
-/// SQLCipher reserves bytes of every page for its IV and any authenticator, so
-/// a keyed index's inline payload limit is that much lower than a plain one's
-/// at the same page size. FTS5's own default record size ignores that and,
-/// before `fts_pgsz_for`, sent **every** full keyed leaf to an overflow page —
-/// 12% more file, and a second decrypt per leaf read.
+/// SQLCipher reserves bytes of every page for its IV and any authenticator,
+/// so a keyed index's inline payload limit is lower than a plain one's at the
+/// same page size. FTS5's default record size ignores the reserve and would
+/// send every full keyed leaf to an overflow page (12% more file, and a
+/// second decrypt per leaf read); [`crate::db::schema::fts_pgsz_for`] keeps
+/// them inline.
 #[test]
 fn keyed_fts_leaves_stay_inline() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     let key = test_key(0xd4);
-    let conn = open_or_recreate_keyed(p.to_str().unwrap(), "trigram", Some(&key)).unwrap();
+    let conn = open_or_recreate_keyed(&p, "trigram", Some(&key)).unwrap();
     assert_eq!(
         fts_stored_pgsz(&conn),
         Some(crate::db::schema::fts_pgsz_for(
@@ -713,22 +577,18 @@ fn keyed_fts_leaves_stay_inline() {
 
     seed_searchable_text(&conn);
     assert_leaves_inline(&conn, true);
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// The derivation is only worth anything if it clears the limit it is derived
-/// from, at every size `benches/page_geometry.rs` sweeps. Arithmetic only —
-/// the round trip through a real file is the test below.
+/// The derivation must clear the limit it is derived from at every size
+/// `benches/page_geometry.rs` sweeps. Arithmetic only; the round trip through
+/// a real file is the test below.
 #[test]
 fn derived_fts_pgsz_fits_inline_at_every_swept_page_size() {
     use crate::db::schema::{fts_pgsz_for, HmacMode, Profile};
     for page_size in [1024i64, 2048, 4096, 8192, 16384, 32768, 65536] {
-        // Every HMAC mode, not just the shipped one: the reserve moves with it
-        // and the derivation has to clear the limit under all of them, or
-        // `benches/cipher_hmac.rs` would be measuring overflow rather than
-        // authentication.
+        // Every HMAC mode, not just the shipped one: the reserve moves with
+        // it, and `benches/cipher_hmac.rs` must measure authentication rather
+        // than overflow.
         for hmac in [HmacMode::Off, HmacMode::Sha256, HmacMode::Sha512] {
             let profile = Profile { page_size, hmac };
             for keyed in [false, true] {
@@ -759,8 +619,7 @@ fn derived_fts_pgsz_fits_inline_at_every_swept_page_size() {
         }
     }
     // Spelled out so a change to the formula has to be deliberate. The keyed
-    // value is quoted per mode, because that is the number the on-disk format
-    // depends on.
+    // value is quoted per mode: the on-disk format depends on it.
     let at = |page_size, hmac| Profile { page_size, hmac };
     assert_eq!(fts_pgsz_for(at(4096, HmacMode::Sha512), true), 3970);
     assert_eq!(fts_pgsz_for(at(4096, HmacMode::Sha256), true), 4002);
@@ -772,14 +631,14 @@ fn derived_fts_pgsz_fits_inline_at_every_swept_page_size() {
     );
 }
 
-/// The mirror. A plain index gets a *larger* record than a keyed one at the
-/// same page size, because it has no reserve to give up — the two differ by
-/// exactly that, and both have to land inline.
+/// The mirror. A plain index gets a larger record than a keyed one at the
+/// same page size, because it has no reserve to give up; the two differ by
+/// exactly that, and both land inline.
 #[test]
 fn a_plain_index_gets_the_derived_pgsz_for_its_page_size() {
     use crate::db::schema::{fts_pgsz_for, PROFILE};
-    let p = tmp_db_path();
-    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    let (_dir, p) = db();
+    let conn = open_or_recreate(&p, "trigram").unwrap();
     assert_eq!(
         fts_stored_pgsz(&conn),
         Some(fts_pgsz_for(PROFILE, false)),
@@ -793,17 +652,13 @@ fn a_plain_index_gets_the_derived_pgsz_for_its_page_size() {
 
     seed_searchable_text(&conn);
     assert_leaves_inline(&conn, false);
-
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// A typo naming another application's database used to delete it on the
-/// next indexing run, because "no `schema_info`" read as "an old index of
-/// ours".
+/// Another application's database at `database_path` is refused, not wiped:
+/// "no `schema_info`" must not read as "an old index of ours".
 #[test]
 fn a_foreign_database_is_refused_not_wiped() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     {
         let conn = Connection::open(&p).unwrap();
         conn.execute(
@@ -817,7 +672,7 @@ fn a_foreign_database_is_refused_not_wiped() {
         )
         .unwrap();
     }
-    let err = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap_err();
+    let err = open_or_recreate(&p, "trigram").unwrap_err();
     assert!(err.starts_with(FOREIGN_DB_PREFIX), "got: {err}");
     assert!(
         err.contains("moz_places"),
@@ -829,44 +684,30 @@ fn a_foreign_database_is_refused_not_wiped() {
         .query_row("SELECT url FROM moz_places", [], |r| r.get(0))
         .expect("the foreign database must survive intact");
     assert_eq!(url, "https://example.invalid/");
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }
 
-/// The refusal must not extend to a file that is genuinely ours to create.
+/// The refusal must not extend to a file that is ours to create.
 #[test]
 fn an_empty_database_file_is_still_ours_to_build() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     // An empty but real SQLite file, header and all.
     drop(Connection::open(&p).unwrap());
-    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
-    let v: String = conn
-        .query_row(
-            "SELECT value FROM schema_info WHERE key='version'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(v, CURRENT_SCHEMA_VERSION.to_string());
-    drop(conn);
-    std::fs::remove_file(&p).ok();
+    let conn = open_or_recreate(&p, "trigram").unwrap();
+    assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
 }
 
-/// Each pre-`schema_info` table name marks a file as ours — wiped, not
+/// Each pre-`schema_info` table name marks a file as ours: wiped, not
 /// refused.
 #[test]
 fn a_legacy_table_marks_a_file_as_ours() {
     for table in LEGACY_TABLES {
-        let p = tmp_db_path();
-        {
-            let conn = Connection::open(&p).unwrap();
-            conn.execute(&format!("CREATE TABLE {} (x INTEGER)", table), [])
-                .unwrap();
-        }
-        let conn = open_or_recreate(p.to_str().unwrap(), "trigram")
+        let (_dir, p) = db();
+        Connection::open(&p)
+            .unwrap()
+            .execute(&format!("CREATE TABLE {} (x INTEGER)", table), [])
+            .unwrap();
+        open_or_recreate(&p, "trigram")
             .unwrap_or_else(|e| panic!("{table} should read as ours, got: {e}"));
-        drop(conn);
-        std::fs::remove_file(&p).ok();
     }
 }
 
@@ -874,24 +715,21 @@ fn a_legacy_table_marks_a_file_as_ours() {
 /// creation: ours, and rebuilding it is right.
 #[test]
 fn a_schema_info_without_a_version_row_is_still_ours() {
-    let p = tmp_db_path();
-    {
-        let conn = Connection::open(&p).unwrap();
-        conn.execute(
+    let (_dir, p) = db();
+    Connection::open(&p)
+        .unwrap()
+        .execute(
             "CREATE TABLE schema_info (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
             [],
         )
         .unwrap();
-    }
-    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").expect("half-built index is ours");
-    drop(conn);
-    std::fs::remove_file(&p).ok();
+    open_or_recreate(&p, "trigram").expect("half-built index is ours");
 }
 
 /// A table that merely *shares the name* `schema_info` is not ours.
 #[test]
 fn a_foreign_schema_info_is_refused() {
-    let p = tmp_db_path();
+    let (_dir, p) = db();
     {
         let conn = Connection::open(&p).unwrap();
         conn.execute("CREATE TABLE schema_info (revision INTEGER)", [])
@@ -899,7 +737,7 @@ fn a_foreign_schema_info_is_refused() {
         conn.execute("INSERT INTO schema_info(revision) VALUES(3)", [])
             .unwrap();
     }
-    let err = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap_err();
+    let err = open_or_recreate(&p, "trigram").unwrap_err();
     assert!(err.starts_with(FOREIGN_DB_PREFIX), "got: {err}");
 
     let conn = Connection::open(&p).unwrap();
@@ -907,6 +745,4 @@ fn a_foreign_schema_info_is_refused() {
         .query_row("SELECT revision FROM schema_info", [], |r| r.get(0))
         .expect("the foreign database must survive intact");
     assert_eq!(revision, 3);
-    drop(conn);
-    std::fs::remove_file(&p).ok();
 }

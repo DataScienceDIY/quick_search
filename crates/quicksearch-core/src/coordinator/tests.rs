@@ -20,6 +20,7 @@ fn start_coord_watching(config: Config, watcher: WatcherConfig) -> IndexCoordina
 }
 
 struct Fixture {
+    _scratch: crate::testutil::Scratch,
     dir: PathBuf,
     db: PathBuf,
     config: Config,
@@ -27,7 +28,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(auto: bool) -> Fixture {
-        let scratch = crate::testutil::scratch_dir("coord");
+        let scratch = crate::testutil::Scratch::dir("coord");
         let dir = scratch.join("tree");
         std::fs::create_dir_all(&dir).unwrap();
         let db = scratch.join("index.sqlite");
@@ -35,7 +36,48 @@ impl Fixture {
         config.paths.indexing_paths = vec![dir.to_string_lossy().into_owned()];
         config.paths.database_path = db.to_string_lossy().into_owned();
         config.indexing.auto_index = auto;
-        Fixture { dir, db, config }
+        Fixture {
+            _scratch: scratch,
+            dir,
+            db,
+            config,
+        }
+    }
+
+    /// The fixture's config with `*.log` files ignored. Appended, not
+    /// replaced: replacing would also be a widening.
+    fn narrowed(&self) -> Config {
+        let mut narrowed = self.config.clone();
+        narrowed.indexing.ignore_patterns.push("*.log".into());
+        narrowed
+    }
+
+    /// A coordinator over `keep.txt` and `drop.log`, after its first run.
+    fn indexed_pair(&self) -> IndexCoordinator {
+        std::fs::write(self.dir.join("keep.txt"), "kept content").unwrap();
+        std::fs::write(self.dir.join("drop.log"), "dropped content").unwrap();
+        let coord = start_coord(self.config.clone());
+        coord.reindex_now();
+        wait_for("initial run", Duration::from_secs(20), || {
+            let s = coord.state();
+            s.last_full_index.is_some()
+                && s.mode == IndexMode::ManualStopped
+                && self.file_count() == 2
+        });
+        coord
+    }
+
+    /// A manual fixture with one file indexed, switched to auto mode, its
+    /// last-run stamp moved `offset` seconds from now. Returns the stamp.
+    fn stamped_auto(offset: i64, interval_minutes: u64) -> (Fixture, u64) {
+        let mut f = Fixture::new(false);
+        std::fs::write(f.dir.join("seed.txt"), "content").unwrap();
+        f.seed_index();
+        let stamp = now_unix().saturating_add_signed(offset);
+        f.stamp_last_index(stamp);
+        f.config.indexing.auto_index = true;
+        f.config.indexing.reindex_interval_minutes = interval_minutes;
+        (f, stamp)
     }
 
     fn file_count(&self) -> i64 {
@@ -78,13 +120,6 @@ impl Fixture {
     }
 }
 
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.dir).ok();
-        std::fs::remove_file(&self.db).ok();
-    }
-}
-
 #[test]
 fn manual_mode_starts_idle_and_reindex_now_round_trips() {
     let f = Fixture::new(false);
@@ -102,7 +137,7 @@ fn manual_mode_starts_idle_and_reindex_now_round_trips() {
         s.last_full_index.is_some() && s.mode == IndexMode::ManualStopped
     });
     assert_eq!(f.file_count(), 1);
-    // The cheap predicate and the full status must never disagree — a GUI
+    // The cheap predicate and the full status must never disagree: a GUI
     // polling `is_indexing` decides cache lifetime by its falling edge.
     assert!(!coord.is_indexing());
     assert!(matches!(coord.state().activity, IndexingStatus::Idle));
@@ -124,8 +159,7 @@ fn shutdown_during_a_prune_does_not_wait_for_it() {
         coord.state().last_full_index.is_some() && f.file_count() == 401
     });
 
-    let mut narrowed = f.config.clone();
-    narrowed.indexing.ignore_patterns.push("*.log".into());
+    let mut narrowed = f.narrowed();
     // One row per statement: a huge index's shape at a test's size.
     narrowed.processing.batch_size = 1;
     coord.apply_config(narrowed.clone());
@@ -147,21 +181,10 @@ fn shutdown_during_a_prune_does_not_wait_for_it() {
 #[test]
 fn manual_mode_prunes_a_narrowed_filter_without_running() {
     let f = Fixture::new(false);
-    std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
-    std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
-
-    let coord = start_coord(f.config.clone());
-    coord.reindex_now();
-    wait_for("initial run", Duration::from_secs(20), || {
-        let s = coord.state();
-        s.last_full_index.is_some() && s.mode == IndexMode::ManualStopped && f.file_count() == 2
-    });
+    let coord = f.indexed_pair();
     let stamped = coord.state().last_full_index;
 
-    // Appended, not replaced: replacing would also be a widening.
-    let mut narrowed = f.config.clone();
-    narrowed.indexing.ignore_patterns.push("*.log".into());
-    coord.apply_config(narrowed);
+    coord.apply_config(f.narrowed());
 
     wait_for(
         "the log entry to be pruned",
@@ -177,7 +200,7 @@ fn manual_mode_prunes_a_narrowed_filter_without_running() {
     assert_eq!(
         coord.state().last_full_index,
         stamped,
-        "no run happened — narrowing needs no walk"
+        "no run happened: narrowing needs no walk"
     );
     coord.shutdown();
 }
@@ -185,18 +208,9 @@ fn manual_mode_prunes_a_narrowed_filter_without_running() {
 #[test]
 fn a_completed_prune_records_what_it_reconciled() {
     let f = Fixture::new(false);
-    std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
-    std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
+    let coord = f.indexed_pair();
 
-    let coord = start_coord(f.config.clone());
-    coord.reindex_now();
-    wait_for("initial run", Duration::from_secs(20), || {
-        let s = coord.state();
-        s.last_full_index.is_some() && f.file_count() == 2
-    });
-
-    let mut narrowed = f.config.clone();
-    narrowed.indexing.ignore_patterns.push("*.log".into());
+    let narrowed = f.narrowed();
     assert!(
         f.outstanding_work(&narrowed).touches_index(),
         "the edit must be one the index does not yet reflect"
@@ -224,19 +238,9 @@ fn a_completed_prune_records_what_it_reconciled() {
 #[test]
 fn a_finished_prune_keeps_reporting_itself_for_a_while() {
     let f = Fixture::new(false);
-    std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
-    std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
+    let coord = f.indexed_pair();
 
-    let coord = start_coord(f.config.clone());
-    coord.reindex_now();
-    wait_for("initial run", Duration::from_secs(20), || {
-        let s = coord.state();
-        s.last_full_index.is_some() && f.file_count() == 2
-    });
-
-    let mut narrowed = f.config.clone();
-    narrowed.indexing.ignore_patterns.push("*.log".into());
-    coord.apply_config(narrowed);
+    coord.apply_config(f.narrowed());
     wait_for("the summary to appear", Duration::from_secs(20), || {
         matches!(coord.state().reconcile, Some(ReconcileState::Finished(_)))
     });
@@ -263,15 +267,7 @@ fn a_summary_stops_being_fresh_once_the_linger_is_up() {
 #[test]
 fn a_prune_never_records_settings_only_a_rebuild_can_satisfy() {
     let f = Fixture::new(false);
-    std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
-    std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
-
-    let coord = start_coord(f.config.clone());
-    coord.reindex_now();
-    wait_for("initial run", Duration::from_secs(20), || {
-        let s = coord.state();
-        s.last_full_index.is_some() && f.file_count() == 2
-    });
+    let coord = f.indexed_pair();
     let built_with = f.stored_value("hash_length").unwrap();
 
     let mut rebuilt = f.config.clone();
@@ -304,8 +300,7 @@ fn manual_mode_reindexes_a_widened_filter_and_returns_to_stopped() {
     std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
     std::fs::write(f.dir.join("later.log"), "arrives later").unwrap();
 
-    let mut narrowed = f.config.clone();
-    narrowed.indexing.ignore_patterns.push("*.log".into());
+    let narrowed = f.narrowed();
     let coord = start_coord(narrowed.clone());
     coord.reindex_now();
     wait_for("initial run", Duration::from_secs(20), || {
@@ -325,15 +320,7 @@ fn manual_mode_reindexes_a_widened_filter_and_returns_to_stopped() {
 #[test]
 fn stopping_cancels_a_queued_walk_but_not_a_queued_prune() {
     let f = Fixture::new(false);
-    std::fs::write(f.dir.join("keep.txt"), "kept content").unwrap();
-    std::fs::write(f.dir.join("drop.log"), "dropped content").unwrap();
-
-    let coord = start_coord(f.config.clone());
-    coord.reindex_now();
-    wait_for("initial run", Duration::from_secs(20), || {
-        let s = coord.state();
-        s.last_full_index.is_some() && s.mode == IndexMode::ManualStopped && f.file_count() == 2
-    });
+    let coord = f.indexed_pair();
     let stamped = coord.state().last_full_index;
 
     // Narrow and widen at once; turning auto off in the same edit is what
@@ -341,8 +328,7 @@ fn stopping_cancels_a_queued_walk_but_not_a_queued_prune() {
     let extra = f.dir.join("extra");
     std::fs::create_dir_all(&extra).unwrap();
     std::fs::write(extra.join("new.txt"), "in the new root").unwrap();
-    let mut edited = f.config.clone();
-    edited.indexing.ignore_patterns.push("*.log".into());
+    let mut edited = f.narrowed();
     edited
         .paths
         .indexing_paths
@@ -378,15 +364,7 @@ fn fast_watcher() -> WatcherConfig {
 
 #[test]
 fn a_lapsed_stamp_starts_a_run_at_startup() {
-    let mut f = Fixture::new(false);
-    std::fs::write(f.dir.join("seed.txt"), "content").unwrap();
-    f.seed_index();
-
-    let stamped = now_unix() - 7200;
-    f.stamp_last_index(stamped);
-    f.config.indexing.auto_index = true;
-    f.config.indexing.reindex_interval_minutes = 1;
-
+    let (f, stamped) = Fixture::stamped_auto(-7200, 1);
     let coord = start_coord_watching(f.config.clone(), fast_watcher());
     wait_for(
         "a run without waiting out the interval",
@@ -398,15 +376,7 @@ fn a_lapsed_stamp_starts_a_run_at_startup() {
 
 #[test]
 fn a_fresh_stamp_waits_out_the_interval() {
-    let mut f = Fixture::new(false);
-    std::fs::write(f.dir.join("seed.txt"), "content").unwrap();
-    f.seed_index();
-
-    let stamped = now_unix();
-    f.stamp_last_index(stamped);
-    f.config.indexing.auto_index = true;
-    f.config.indexing.reindex_interval_minutes = 600;
-
+    let (f, stamped) = Fixture::stamped_auto(0, 600);
     let coord = start_coord_watching(f.config.clone(), fast_watcher());
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(
@@ -420,15 +390,7 @@ fn a_fresh_stamp_waits_out_the_interval() {
 /// A stamp ahead of the clock happens: NTP correction, migrated index.
 #[test]
 fn a_stamp_from_the_future_is_treated_as_due() {
-    let mut f = Fixture::new(false);
-    std::fs::write(f.dir.join("seed.txt"), "content").unwrap();
-    f.seed_index();
-
-    let ahead = now_unix() + 86_400;
-    f.stamp_last_index(ahead);
-    f.config.indexing.auto_index = true;
-    f.config.indexing.reindex_interval_minutes = 600;
-
+    let (f, ahead) = Fixture::stamped_auto(86_400, 600);
     let coord = start_coord_watching(f.config.clone(), fast_watcher());
     // The run re-stamps from *this* machine's clock, ending the skew.
     wait_for(
@@ -440,18 +402,10 @@ fn a_stamp_from_the_future_is_treated_as_due() {
 }
 
 #[test]
-fn a_run_it_schedules_itself_wakes_the_frontend() {
+fn a_scheduled_run_wakes_the_frontend_once() {
     use std::sync::atomic::AtomicUsize;
 
-    let mut f = Fixture::new(false);
-    std::fs::write(f.dir.join("seed.txt"), "content").unwrap();
-    f.seed_index();
-
-    let stamped = now_unix() - 7200;
-    f.stamp_last_index(stamped);
-    f.config.indexing.auto_index = true;
-    f.config.indexing.reindex_interval_minutes = 1;
-
+    let (f, stamped) = Fixture::stamped_auto(-7200, 1);
     let wakes = Arc::new(AtomicUsize::new(0));
     let counter = wakes.clone();
     let coord = IndexCoordinator::start_with_watcher_config(
@@ -887,10 +841,10 @@ fn a_deletion_during_a_full_run_is_queued_then_applied() {
     coord.shutdown();
 }
 
-/// `is_file()` cannot tell "not a regular file" from "I could not look", so an
-/// unreadable file (dropped network share, unplugged drive) used to read as a
-/// deletion — one the next full run cannot undo, because an unreachable root
-/// is recorded unreadable, not re-walked.
+/// `is_file()` cannot tell "not a regular file" from "I could not look", and
+/// an unreadable file (dropped network share, unplugged drive) must not read
+/// as a deletion: the next full run cannot undo one, because an unreachable
+/// root is recorded unreadable, not re-walked.
 #[test]
 fn an_unreadable_path_is_not_treated_as_deleted() {
     let dir = crate::testutil::scratch_dir("verb");
@@ -915,7 +869,7 @@ fn an_unreadable_path_is_not_treated_as_deleted() {
     let hidden = locked.join("file.txt");
     std::fs::write(&hidden, b"x").unwrap();
     if crate::platform::deny_read(&locked).is_ok() {
-        // Skipped when the test runs with rights that ignore the mode — CI
+        // Skipped when the test runs with rights that ignore the mode; CI
         // drops CAP_DAC_OVERRIDE with capsh for exactly this reason.
         if std::fs::metadata(&hidden).is_err() {
             assert!(

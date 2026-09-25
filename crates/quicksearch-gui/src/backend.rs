@@ -1,6 +1,6 @@
 //! Wiring between the egui thread and the core services. All communication
 //! is non-blocking from the UI's point of view; every core thread wakes the
-//! UI through `ctx.request_repaint()`, which is what makes polling enough.
+//! UI through `ctx.request_repaint()`, so polling is enough.
 //!
 //! The duplicates scan and the verification run on throwaway threads fired
 //! by user actions. The verification can hold a large group's worth of file
@@ -39,7 +39,7 @@ const DUP_HIDDEN_ALLOWANCE: u32 = 4_500;
 
 /// The limit for a scan whose result `hidden` groups will be dropped from.
 /// Hidden groups are groups the scan returns and the tab discards, so a flat
-/// limit would quietly charge the user for every group they dismissed — the
+/// limit would quietly charge the user for every group they dismissed, the
 /// opposite of what hiding one is for. Bounded, so a config with a million
 /// hidden hashes cannot turn one scan into a full hydration of the index.
 fn dup_scan_limit(hidden: usize) -> u32 {
@@ -58,12 +58,10 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Rebuild, after letting go of everything holding the index open: the
-    /// search worker keeps its connection warm for half an hour
-    /// (`search::IDLE_RELEASE`), and without the release the delete fails on
-    /// Windows and the rebuild silently becomes an ordinary run against the
-    /// old index. The window is long enough that waiting one out is not a
-    /// fallback — this release is the only thing that makes the delete work.
+    /// Releases the search connection, then rebuilds. The search worker holds
+    /// the index open for up to `search::IDLE_RELEASE` (30 min); on Windows
+    /// that makes the delete fail, and the rebuild silently becomes an
+    /// ordinary run against the old index.
     pub fn rebuild_index(&self) {
         if let Some(search) = &self.search {
             search.release_connection();
@@ -149,7 +147,7 @@ impl Backend {
 
     /// Ignored while a scan is already running: a second one would re-read the
     /// whole hash index for an answer the first is about to produce. Returns
-    /// the limit it asked for, which is what tells the tab a full page from a
+    /// the limit it asked for, which tells the tab a full page from a
     /// complete one; 0 when nothing was started.
     pub fn start_duplicates(&mut self, config: &Config, ctx: egui::Context) -> u32 {
         if self.dup_job.is_some() {
@@ -182,7 +180,7 @@ impl Backend {
         std::thread::spawn(move || {
             verify_identical(&paths, &worker_cancel, &mut |update| {
                 // A closed receiver means the app moved on; the cancel flag
-                // is what stops the work.
+                // stops the work.
                 let _ = tx.send(update);
                 ctx.request_repaint();
             });

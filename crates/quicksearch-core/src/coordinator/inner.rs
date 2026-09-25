@@ -4,9 +4,119 @@
 use super::*;
 
 /// First wait after a full run is refused or fails to start.
-pub(super) const RUN_RETRY_BASE: Duration = Duration::from_secs(30);
+const RUN_RETRY_BASE: Duration = Duration::from_secs(30);
 
 const RUN_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// The watcher's event queue and the two timers that decide when to apply
+/// it: once no event has arrived for `pending_settle`, or once the oldest
+/// has waited `pending_max_defer`, so a trickle cannot defer it forever.
+#[derive(Default)]
+pub(super) struct Debounced {
+    pub(super) events: HashMap<PathBuf, FsEvent>,
+    /// Most recent arrival.
+    last_at: Option<Instant>,
+    /// Oldest un-applied arrival.
+    since: Option<Instant>,
+}
+
+impl Debounced {
+    /// Queue `events`, stamping the arrival if there were any; `true` if so.
+    fn push(&mut self, events: impl Iterator<Item = FsEvent>) -> bool {
+        let mut received = false;
+        for ev in events {
+            enqueue(&mut self.events, ev);
+            received = true;
+        }
+        if received {
+            let now = Instant::now();
+            self.last_at = Some(now);
+            self.since.get_or_insert(now);
+        }
+        received
+    }
+
+    fn settled(&self, config: &WatcherConfig) -> bool {
+        let quiet = self
+            .last_at
+            .is_none_or(|t| t.elapsed() >= config.pending_settle);
+        let overdue = self
+            .since
+            .is_some_and(|t| t.elapsed() >= config.pending_max_defer);
+        quiet || overdue
+    }
+
+    /// Drop the queue and its timers, so a stale `since` cannot force an
+    /// immediate apply of the next event.
+    fn clear(&mut self) {
+        self.events.clear();
+        // `clear` keeps capacity: up to 100k slots after a storm.
+        self.events.shrink_to_fit();
+        self.last_at = None;
+        self.since = None;
+    }
+
+    /// Keep only the removals, dropping the timers if nothing is left.
+    fn keep_removals(&mut self) {
+        self.events.retain(|_, ev| is_removal(ev));
+        if self.events.is_empty() {
+            self.last_at = None;
+            self.since = None;
+        }
+    }
+
+    /// After an apply that ran out of budget: the remainder goes to the next
+    /// tick at once, since the pause was ours, not the filesystem's, and must
+    /// not re-arm the settle window.
+    fn after_partial_apply(&mut self) {
+        self.last_at = None;
+        if self.events.is_empty() {
+            self.since = None;
+        }
+    }
+}
+
+/// When another full run may be attempted after one is refused or fails:
+/// the wait doubles from [`RUN_RETRY_BASE`] up to [`RUN_RETRY_MAX`].
+pub(super) struct Backoff {
+    until: Option<Instant>,
+    delay: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Backoff {
+            until: None,
+            delay: RUN_RETRY_BASE,
+        }
+    }
+}
+
+impl Backoff {
+    fn defer(&mut self) {
+        self.until = Some(Instant::now() + self.delay);
+        self.delay = (self.delay * 2).min(RUN_RETRY_MAX);
+    }
+
+    fn reset(&mut self) {
+        *self = Backoff::default();
+    }
+
+    fn active(&self) -> bool {
+        self.until.is_some_and(|at| Instant::now() < at)
+    }
+}
+
+/// Log a failed apply of `what` by the queue's policy: a targeted failure
+/// only logs, a pending one also schedules a full run. `true` for the latter.
+fn apply_failed(targeted: bool, what: &str, e: impl std::fmt::Display) -> bool {
+    if targeted {
+        crate::log_warn!("coordinator: targeted {}: {}", what, e);
+    } else {
+        crate::log_warn!("coordinator: {}: {}; scheduling full run", what, e);
+    }
+    !targeted
+}
 
 /// Refusal log throttles; reset the moment a run starts.
 static NO_ROOTS: crate::log::Throttle = crate::log::Throttle::new(3);
@@ -35,29 +145,24 @@ pub(super) struct Inner {
     pub(super) watcher_config: WatcherConfig,
     pub(super) watcher_rx: Option<mpsc::Receiver<(u64, Result<Watcher, WatchError>)>>,
     pub(super) watcher_gen: u64,
-    pub(super) pending: HashMap<PathBuf, FsEvent>,
+    pub(super) pending: Debounced,
     /// Paths a frontend asked for by name ([`IndexCoordinator::update_paths`]).
     /// Survives [`Inner::clear_pending`] and applies in manual mode: it keeps
     /// the rows a user is *reading* in step with the disk.
     pub(super) targeted: HashMap<PathBuf, FsEvent>,
     /// How far a directory event got before its turn's budget ran out.
     pub(super) resume_from: HashMap<PathBuf, usize>,
-    /// Most recent event arrival; the burst is over once `pending_settle` old.
-    pub(super) last_event_at: Option<Instant>,
-    /// Oldest un-applied event; a trickle cannot defer past `pending_max_defer`.
-    pub(super) pending_since: Option<Instant>,
     pub(super) needs_full_run: bool,
-    /// Earliest time another full run may be *attempted* after a refusal.
-    pub(super) run_retry_at: Option<Instant>,
-    pub(super) run_retry_delay: Duration,
+    pub(super) run_retry: Backoff,
     /// Reconciliation owed to a config change, part-applied across ticks;
     /// unlike `needs_full_run` it is acted on in manual mode too.
     pub(super) pending_work: Option<WorkCursor>,
     pub(super) reconcile_done: Option<(ReconcileProgress, Instant)>,
     /// A reconciliation was abandoned part-way; read by [`Inner::teardown`].
     pub(super) reconcile_cut_short: bool,
-    /// Cleared once the service reports running; detects idle-after-running.
-    pub(super) saw_running: bool,
+    /// Set while a full run holds the database; cleared by the tick that sees
+    /// it end.
+    pub(super) run_in_flight: bool,
     pub(super) files_at: Option<Instant>,
     /// Drives [`Inner::go_idle`] once per busy→idle transition.
     pub(super) was_busy: bool,
@@ -97,10 +202,7 @@ impl Inner {
             CoordCmd::SetMode(IndexMode::ManualStopped) => self.enter_manual_stopped(),
             // ManualRunning isn't directly settable; ReindexNow is the verb.
             CoordCmd::SetMode(IndexMode::ManualRunning) | CoordCmd::ReindexNow => {
-                self.start_full_run(RunTrigger::Requested);
-                if self.mode != IndexMode::Auto {
-                    self.mode = IndexMode::ManualRunning;
-                }
+                self.start_requested_run()
             }
             CoordCmd::ConfigChanged(new) => {
                 let want_auto = new.indexing.auto_index;
@@ -115,12 +217,12 @@ impl Inner {
                 if !actions.requires_rebuild && !actions.work.is_empty() {
                     self.start_work(actions.work);
                 }
-                if want_auto && self.mode != IndexMode::Auto {
-                    self.enter_auto();
-                } else if !want_auto && self.mode == IndexMode::Auto {
-                    self.enter_manual_stopped();
-                } else if self.mode == IndexMode::Auto {
-                    self.start_watcher();
+                match (want_auto, self.mode == IndexMode::Auto) {
+                    (true, false) => self.enter_auto(),
+                    (false, true) => self.enter_manual_stopped(),
+                    // Still automatic: the watcher follows the new config.
+                    (true, true) => self.start_watcher(),
+                    (false, false) => {}
                 }
                 self.refresh_last_full_index();
             }
@@ -139,10 +241,7 @@ impl Inner {
                     return;
                 }
                 self.clear_root_counts();
-                self.start_full_run(RunTrigger::Requested);
-                if self.mode != IndexMode::Auto {
-                    self.mode = IndexMode::ManualRunning;
-                }
+                self.start_requested_run();
             }
             CoordCmd::ClearIndex => {
                 // Manual first: in Auto the periodic scheduler would see a
@@ -170,18 +269,17 @@ impl Inner {
                     .config
                     .normalized_indexing_paths()
                     .iter()
-                    .map(|root| crate::file_handling::ExtractCursor::for_root(root).lo)
+                    .map(|root| crate::file_handling::RootRange::for_root(root).lo)
                     .collect();
-                for path in paths {
+                let under_root = |path: &PathBuf| {
                     let spelled = path.to_string_lossy();
-                    if !prefixes.iter().any(|lo| spelled.starts_with(lo.as_str())) {
-                        continue;
-                    }
-                    let Some(event) = verb_for(path) else {
-                        continue;
-                    };
-                    enqueue(&mut self.targeted, event);
-                }
+                    prefixes.iter().any(|lo| spelled.starts_with(lo.as_str()))
+                };
+                paths
+                    .into_iter()
+                    .filter(under_root)
+                    .filter_map(verb_for)
+                    .for_each(|event| enqueue(&mut self.targeted, event));
                 self.was_busy = true;
             }
             CoordCmd::Shutdown => unreachable!("handled in run()"),
@@ -200,14 +298,14 @@ impl Inner {
             | IndexingStatus::Optimizing => {
                 // Single-writer rule: never touch the DB while a full run is
                 // active; Optimizing holds a write transaction over the file.
-                self.saw_running = true;
+                self.run_in_flight = true;
                 return;
             }
             IndexingStatus::Idle | IndexingStatus::Error(_) => {}
         }
 
-        if self.saw_running {
-            self.saw_running = false;
+        if self.run_in_flight {
+            self.run_in_flight = false;
             self.was_busy = true;
             // An errored run never stamps `last_full_index`, so `periodic_due`
             // stays true; without the backoff a walk would start every second.
@@ -243,12 +341,15 @@ impl Inner {
         }
 
         let mut worked = false;
-        if !self.pending.is_empty() && !self.needs_full_run && self.pending_settled() {
+        if !self.pending.events.is_empty()
+            && !self.needs_full_run
+            && self.pending.settled(&self.watcher_config)
+        {
             self.apply_pending();
             worked = true;
         }
 
-        let deferred = self.run_retry_at.is_some_and(|at| Instant::now() < at);
+        let deferred = self.run_retry.active();
         if (self.needs_full_run || self.periodic_due()) && !deferred {
             self.start_full_run(RunTrigger::Scheduled);
             worked = true;
@@ -262,7 +363,7 @@ impl Inner {
     }
 
     /// Settle: drop [`Inner::write_conn`] (and its page cache), then return
-    /// freed heap to the kernel — in that order.
+    /// freed heap to the kernel, in that order.
     fn go_idle(&mut self) {
         if !self.was_busy {
             return;
@@ -273,21 +374,13 @@ impl Inner {
     }
 
     fn drain_events(&mut self) {
-        let mut received = false;
-        while let Ok(ev) = self.event_rx.try_recv() {
-            enqueue(&mut self.pending, ev);
-            received = true;
-        }
-        if received {
-            let now = Instant::now();
+        if self.pending.push(self.event_rx.try_iter()) {
             self.was_busy = true;
-            self.last_event_at = Some(now);
-            self.pending_since.get_or_insert(now);
             // Before the overflow test: collapsed, an `rm -rf` storm stays
             // under [`PENDING_OVERFLOW`] instead of forcing a full run.
-            collapse_pending_removals(&mut self.pending);
+            collapse_pending_removals(&mut self.pending.events);
         }
-        if self.pending.len() > PENDING_OVERFLOW {
+        if self.pending.events.len() > PENDING_OVERFLOW {
             self.clear_pending();
             self.needs_full_run = true;
         }
@@ -335,10 +428,11 @@ impl Inner {
                 &self.reconcile_stop.cancel,
             )
         };
+        // Restored before anything below: `start_full_run` takes it back.
         self.write_conn = Some(conn);
-        if let Err(e) = outcome {
+        match outcome {
             // A cancelled statement fails like any other; ask our own flag.
-            if self.reconcile_stop.cancelled() {
+            Err(_) if self.reconcile_stop.cancelled() => {
                 self.reconcile_cut_short = true;
                 crate::log_info!(
                     "configuration change interrupted after {} index entries; \
@@ -347,16 +441,19 @@ impl Inner {
                 );
                 return;
             }
-            // Not retried — a persistent error would spin this loop forever.
-            crate::log_warn!(
-                "coordinator: reconcile: {}; leaving it to the next indexing run",
-                e
-            );
-            return;
+            // Not retried: a persistent error would spin this loop forever.
+            Err(e) => {
+                crate::log_warn!(
+                    "coordinator: reconcile: {}; leaving it to the next indexing run",
+                    e
+                );
+                return;
+            }
+            Ok(_) => {}
         }
         if !cursor.done() {
             // Nothing is recorded for a pass that stopped early: the stale
-            // record is what makes the next run redo it.
+            // record makes the next run redo it.
             self.pending_work = Some(cursor);
             return;
         }
@@ -380,34 +477,16 @@ impl Inner {
             );
         }
         if cursor.reindex() {
-            self.start_full_run(RunTrigger::Requested);
-            if self.mode != IndexMode::Auto {
-                self.mode = IndexMode::ManualRunning;
-            }
+            self.start_requested_run();
         }
     }
 
-    /// Drop the queue and the timers that describe it, so a stale
-    /// `pending_since` cannot force an immediate apply of the next event.
+    /// Drop the event queue and its timers (see [`Debounced::clear`]).
     fn clear_pending(&mut self) {
         self.pending.clear();
-        // `clear` keeps capacity — up to 100k slots after a storm.
-        self.pending.shrink_to_fit();
         // Resume points for `targeted` survive: that queue outlives this call.
         self.resume_from
             .retain(|p, _| self.targeted.contains_key(p));
-        self.last_event_at = None;
-        self.pending_since = None;
-    }
-
-    fn pending_settled(&self) -> bool {
-        let quiet = self
-            .last_event_at
-            .is_none_or(|t| t.elapsed() >= self.watcher_config.pending_settle);
-        let overdue = self
-            .pending_since
-            .is_some_and(|t| t.elapsed() >= self.watcher_config.pending_max_defer);
-        quiet || overdue
     }
 
     /// Apply as much of the queue as fits in [`APPLY_BUDGET`], removals first:
@@ -428,12 +507,7 @@ impl Inner {
         };
         self.apply_queue(&mut conn, false);
         self.write_conn = Some(conn);
-        // The remainder goes to the next tick immediately: the pause was
-        // ours, not the filesystem's, so it must not re-arm the settle window.
-        self.last_event_at = None;
-        if self.pending.is_empty() {
-            self.pending_since = None;
-        }
+        self.pending.after_partial_apply();
     }
 
     /// Drain one queue's removals, then its upserts, within [`APPLY_BUDGET`].
@@ -443,9 +517,9 @@ impl Inner {
         let deadline = Instant::now() + APPLY_BUDGET;
         let chunk = self.config.processing.batch_size.max(1);
         let queue = if targeted {
-            &self.targeted
+            &mut self.targeted
         } else {
-            &self.pending
+            &mut self.pending.events
         };
 
         let removals: Vec<PathBuf> = queue
@@ -455,20 +529,10 @@ impl Inner {
             .collect();
         for batch in removals.chunks(chunk) {
             if let Err(e) = crate::incremental::remove_paths(conn, batch, chunk) {
-                // The batch leaves the queue either way — retrying a failed
-                // write every tick is worse; the full run recovers the rows.
-                if targeted {
-                    crate::log_warn!("coordinator: targeted remove: {}", e);
-                } else {
-                    crate::log_warn!("coordinator: remove: {}; scheduling full run", e);
-                    self.needs_full_run = true;
-                }
+                // The batch leaves the queue either way: retrying a failed
+                // write every tick is worse, and the full run recovers the rows.
+                self.needs_full_run |= apply_failed(targeted, "remove", e);
             }
-            let queue = if targeted {
-                &mut self.targeted
-            } else {
-                &mut self.pending
-            };
             for path in batch {
                 queue.remove(path);
             }
@@ -478,22 +542,12 @@ impl Inner {
         }
 
         if Instant::now() < deadline {
-            let queue = if targeted {
-                &self.targeted
-            } else {
-                &self.pending
-            };
             let upserts: Vec<PathBuf> = queue
                 .iter()
                 .filter(|(_, ev)| !is_removal(ev))
                 .map(|(p, _)| p.clone())
                 .collect();
             for path in upserts {
-                let queue = if targeted {
-                    &mut self.targeted
-                } else {
-                    &mut self.pending
-                };
                 let Some(ev) = queue.remove(&path) else {
                     continue;
                 };
@@ -511,24 +565,16 @@ impl Inner {
                 ) {
                     // A directory event can cover a whole moved-in tree. Put
                     // it back with how far it got, so one `mv` cannot hold
-                    // this loop — or the shutdown behind it — indefinitely.
+                    // this loop, or the shutdown behind it, indefinitely.
                     Ok(Applied::Unfinished { done }) => {
                         self.resume_from.insert(path.clone(), done);
-                        let queue = if targeted {
-                            &mut self.targeted
-                        } else {
-                            &mut self.pending
-                        };
                         queue.insert(path, ev);
                         break;
                     }
                     Ok(Applied::Done) => {}
-                    Err(e) if targeted => {
-                        crate::log_warn!("coordinator: targeted apply {:?}: {}", ev, e);
-                    }
                     Err(e) => {
-                        crate::log_warn!("coordinator: apply {:?}: {}; scheduling full run", ev, e);
-                        self.needs_full_run = true;
+                        let what = format!("apply {:?}", ev);
+                        self.needs_full_run |= apply_failed(targeted, &what, e);
                     }
                 }
                 if Instant::now() >= deadline {
@@ -550,7 +596,8 @@ impl Inner {
                 crate::log_warn!("coordinator: targeted update unavailable: {}", e);
                 self.targeted.clear();
                 // A stale resume point would misapply to the path's next event.
-                self.resume_from.retain(|p, _| self.pending.contains_key(p));
+                self.resume_from
+                    .retain(|p, _| self.pending.events.contains_key(p));
                 return;
             }
         };
@@ -577,14 +624,22 @@ impl Inner {
             .max(1)
             .saturating_mul(60);
         let last = crate::lock_ok(&self.shared).last_full_index;
-        match last {
-            None => true,
-            Some(last) => {
-                let now = now_unix();
-                // A stamp ahead of the clock (NTP correction, moved index)
-                // would suppress the reindex for the skew's life; treat as due.
-                now < last || now - last >= interval_secs
-            }
+        // A stamp ahead of the clock (NTP correction, moved index) would
+        // suppress the reindex for the skew's life; `checked_sub` reads it as
+        // due.
+        last.is_none_or(|last| {
+            now_unix()
+                .checked_sub(last)
+                .is_none_or(|age| age >= interval_secs)
+        })
+    }
+
+    /// A full run somebody asked for; in manual mode it reads as
+    /// `ManualRunning` until it ends.
+    fn start_requested_run(&mut self) {
+        self.start_full_run(RunTrigger::Requested);
+        if self.mode != IndexMode::Auto {
+            self.mode = IndexMode::ManualRunning;
         }
     }
 
@@ -592,10 +647,7 @@ impl Inner {
         // A run already in progress is not a refusal: refusing would back off
         // future runs and replace visible progress with an error. Also covers
         // `Optimizing`, which `start_indexing` does not reject.
-        if !matches!(
-            self.indexing.get_status(),
-            IndexingStatus::Idle | IndexingStatus::Error(_)
-        ) {
+        if self.indexing.is_active() {
             return;
         }
         let roots: Vec<String> = self
@@ -626,18 +678,14 @@ impl Inner {
         // The full run owns the DB (and may wipe/rebuild the file).
         self.write_conn = None;
         self.needs_full_run = false;
-        // Creates and modifies are dropped — the walk rediscovers them.
+        // Creates and modifies are dropped: the walk rediscovers them.
         // Removals are kept: the walk cannot see a deletion under an
         // unreadable directory (`unreadable.covers`) or of an aliased symlink
         // target (`aliased_paths`), and those rows would leak until a rebuild.
-        self.pending.retain(|_, ev| is_removal(ev));
+        self.pending.keep_removals();
         // A stale resume point would `skip` entries of an unrelated walk.
         self.resume_from
-            .retain(|p, _| self.pending.contains_key(p) || self.targeted.contains_key(p));
-        if self.pending.is_empty() {
-            self.last_event_at = None;
-            self.pending_since = None;
-        }
+            .retain(|p, _| self.pending.events.contains_key(p) || self.targeted.contains_key(p));
         if let Err(e) = self
             .indexing
             .start_indexing(roots, self.db_path(), self.config.clone())
@@ -649,14 +697,13 @@ impl Inner {
             );
             return;
         }
-        self.run_retry_at = None;
-        self.run_retry_delay = RUN_RETRY_BASE;
+        self.run_retry.reset();
         NO_ROOTS.reset();
         NESTED_ROOTS.reset();
         START_FAILURES.reset();
         // `start_indexing` claims Running before returning: no window in
         // which this thread writes to a database the run is about to reopen.
-        self.saw_running = true;
+        self.run_in_flight = true;
     }
 
     /// Refuse a full run: back off, and say so at a volume the trigger earns.
@@ -678,8 +725,7 @@ impl Inner {
     /// `needs_full_run` is cleared too, or `tick` would retry every second.
     fn defer_runs(&mut self) {
         self.needs_full_run = false;
-        self.run_retry_at = Some(Instant::now() + self.run_retry_delay);
-        self.run_retry_delay = (self.run_retry_delay * 2).min(RUN_RETRY_MAX);
+        self.run_retry.defer();
     }
 
     fn enter_auto(&mut self) {
@@ -701,14 +747,13 @@ impl Inner {
         if let Some(cursor) = self.pending_work.as_mut() {
             cursor.cancel_reindex();
         }
-        let status = self.indexing.get_status();
-        if !matches!(status, IndexingStatus::Idle | IndexingStatus::Error(_)) {
-            // Signal only — waiting here would stall every queued command.
+        if self.indexing.is_active() {
+            // Signal only: waiting here would stall every queued command.
             self.indexing.request_stop();
         }
     }
 
-    /// Begin watcher startup WITHOUT blocking the command loop — registering
+    /// Begin watcher startup without blocking the command loop: registering
     /// inotify watches walks every root, minutes on large or networked trees.
     /// A generation counter discards superseded registrations.
     fn start_watcher(&mut self) {
@@ -752,32 +797,33 @@ impl Inner {
         let Some(rx) = &self.watcher_rx else {
             return;
         };
-        match rx.try_recv() {
-            Ok((generation, result)) => {
-                self.watcher_rx = None;
-                if generation != self.watcher_gen {
-                    return; // superseded; the watcher drops and unregisters
-                }
-                match result {
-                    Ok(w) => {
-                        let status = WatcherStatus::Active {
-                            dirs: w.watched_dirs(),
-                        };
-                        self.watcher = Some(w);
-                        self.set_watcher_status(status);
-                    }
-                    Err(e) => {
-                        crate::log_warn!("coordinator: watcher: {}", e);
-                        self.set_watcher_status(WatcherStatus::Disabled { reason: e });
-                    }
-                }
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
+        let (generation, result) = match rx.try_recv() {
+            Ok(message) => message,
+            Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.watcher_rx = None;
                 self.set_watcher_status(WatcherStatus::Off);
+                return;
             }
+        };
+        self.watcher_rx = None;
+        if generation != self.watcher_gen {
+            return; // superseded; the watcher drops and unregisters
         }
+        let status = match result {
+            Ok(w) => {
+                let status = WatcherStatus::Active {
+                    dirs: w.watched_dirs(),
+                };
+                self.watcher = Some(w);
+                status
+            }
+            Err(e) => {
+                crate::log_warn!("coordinator: watcher: {}", e);
+                WatcherStatus::Disabled { reason: e }
+            }
+        };
+        self.set_watcher_status(status);
     }
 
     /// Tear the watcher down if it ran out of watch budget after starting, and
@@ -790,13 +836,8 @@ impl Inner {
         let Some(mut reason) = w.degraded_reason() else {
             return;
         };
-        // An overflow is not a capacity problem: `inotify` and
-        // `ReadDirectoryChangesW` both keep delivering after their queue
-        // overflows — the rescan flag means "you missed some", not "this
-        // watch is broken" — so schedule the run that finds out; do not tear
-        // down and re-register. Consuming the reason makes this a one-shot: a
-        // standing `Overflowed` would re-arm `needs_full_run` every tick and
-        // hide a later `KernelLimit`.
+        // Schedule the run that finds out what was missed, without tearing
+        // down, and consume the reason; see [`WatchError::Overflowed`].
         if matches!(reason, WatchError::Overflowed) {
             w.clear_degraded();
             crate::log_warn!("watcher: {}", reason);
@@ -844,13 +885,14 @@ impl Inner {
 
     /// Re-read the published row count, at most every [`FILE_COUNT_INTERVAL`].
     /// Called only from the idle half of [`Inner::tick`], so it cannot run
-    /// while a full run holds the database; `COUNT(*)` is still a key scan —
+    /// while a full run holds the database; `COUNT(*)` is still a key scan,
     /// hence the interval and the interrupt guard.
     fn refresh_file_count(&mut self) {
-        if let Some(at) = self.files_at {
-            if at.elapsed() < FILE_COUNT_INTERVAL {
-                return;
-            }
+        if self
+            .files_at
+            .is_some_and(|at| at.elapsed() < FILE_COUNT_INTERVAL)
+        {
+            return;
         }
         // Stamped before the read: a failing count must back off like a
         // successful one, or a missing index means an open attempt every tick.
@@ -888,12 +930,8 @@ impl Inner {
     /// re-spelling a root (`~/docs` vs `/home/me/docs`) keeps the figures.
     fn read_root_counts(&self, conn: &Connection) -> Vec<RootCount> {
         self.config
-            .paths
-            .indexing_paths
-            .iter()
-            .zip(self.config.resolved_indexing_paths())
-            .filter_map(|(raw, resolved)| {
-                let root = crate::file_handling::normalize_root_string(&resolved.to_string_lossy());
+            .indexing_roots()
+            .filter_map(|(raw, root)| {
                 let counts = db::repo::get_root_counts(conn, &root)?;
                 Some(RootCount {
                     root: raw.clone(),
@@ -911,7 +949,7 @@ impl Inner {
         let reconcile = match &self.pending_work {
             Some(cursor) => Some(ReconcileState::Running(cursor.progress())),
             None => {
-                // The tail ages out here, not in `tick` — tick returns early
+                // The tail ages out here, not in `tick`: tick returns early
                 // for the whole length of a run.
                 let now = Instant::now();
                 self.reconcile_done = self
@@ -921,14 +959,10 @@ impl Inner {
                     .map(|(progress, _)| ReconcileState::Finished(progress))
             }
         };
-        let busy = reconcile.is_some()
-            || !matches!(
-                self.indexing.get_status(),
-                IndexingStatus::Idle | IndexingStatus::Error(_)
-            );
+        let busy = reconcile.is_some() || self.indexing.is_active();
         let mut shared = crate::lock_ok(&self.shared);
         shared.mode = self.mode;
-        shared.queued_events = self.pending.len() + self.targeted.len();
+        shared.queued_events = self.pending.events.len() + self.targeted.len();
         shared.reconcile = reconcile;
         drop(shared);
 
@@ -941,12 +975,12 @@ impl Inner {
     }
 
     /// Must stay fast: it runs (transitively) on the GUI thread during window
-    /// close. Signal, don't wait — an abandoned run is safe under WAL, and an
+    /// close. Signal, don't wait: an abandoned run is safe under WAL, and an
     /// abandoned reconcile is redone by the next run.
     fn teardown(mut self) {
         self.stop_watcher();
-        let status = self.indexing.get_status();
-        let idle = matches!(status, IndexingStatus::Idle | IndexingStatus::Error(_));
+        // Read once: `idle` gates two decisions that must agree.
+        let idle = !self.indexing.is_active();
         if !idle {
             self.indexing.request_stop();
             // Dropping the service joins its worker, and a VACUUM answers
@@ -957,7 +991,7 @@ impl Inner {
         if let Some(conn) = self.write_conn.take() {
             // A cut-short reconcile must not checkpoint: it can have written
             // much WAL, and a TRUNCATE checkpoint is the wait the cancellation
-            // just spared. Dropping is safe — the next run lands the log.
+            // just spared. Dropping is safe: the next run lands the log.
             if idle && !cut_short {
                 db::repo::checkpoint_and_close(conn);
             }

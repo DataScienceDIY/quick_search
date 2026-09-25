@@ -26,8 +26,22 @@ fn fast_config() -> WatcherConfig {
     }
 }
 
-fn tmp_dir(tag: &str) -> PathBuf {
-    crate::testutil::scratch_dir(tag)
+/// [`fast_config`] with a directory budget of `n`.
+fn capped(n: usize) -> WatcherConfig {
+    WatcherConfig {
+        max_watched_dirs: n,
+        ..fast_config()
+    }
+}
+
+/// Start a watcher on `dir` alone, with the default filters.
+fn watch_with(dir: &Path, config: WatcherConfig, sink: EventSink) -> Result<Watcher, WatchError> {
+    Watcher::start(vec![dir.to_path_buf()], default_filters(), config, sink)
+}
+
+/// [`watch_with`] at the fast defaults, into a sink nobody reads.
+fn watch(dir: &Path) -> Watcher {
+    watch_with(dir, fast_config(), sink_to_vec().0).unwrap()
 }
 
 /// Seeds `dirs` directly so set logic is tested without real kernel watches.
@@ -144,16 +158,10 @@ fn prune_stale_keeps_active_entries() {
 
 #[test]
 fn e2e_create_modify_remove_surfaces() {
-    let dir = tmp_dir("e2e");
+    let dir = crate::testutil::scratch_dir("e2e");
     let (sink, got) = sink_to_vec();
 
-    let mut w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        fast_config(),
-        sink,
-    )
-    .unwrap();
+    let mut w = watch_with(&dir, fast_config(), sink).unwrap();
 
     let f = dir.join("hello.txt");
     std::fs::write(&f, "hi").unwrap();
@@ -177,12 +185,12 @@ fn e2e_create_modify_remove_surfaces() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The incremental side keys on lossy `path_to_db_string`, so an event that
-/// got through would be applied to whichever *different* file owns the lossy
-/// spelling. The control file rules out a watcher that simply saw nothing.
+/// An event that got through would be applied to whichever different file
+/// owns the lossy spelling (see `path_to_db_string`). The control file rules
+/// out a watcher that simply saw nothing.
 #[test]
 fn events_for_an_unrepresentable_name_never_surface() {
-    let dir = tmp_dir("e2e-unrepresentable");
+    let dir = crate::testutil::scratch_dir("e2e-unrepresentable");
     let bad = dir.join(crate::testutil::unrepresentable_name("report", ".txt"));
     if std::fs::write(&bad, "hi").is_err() {
         eprintln!("skipped: this filesystem will not store an unrepresentable name");
@@ -192,13 +200,7 @@ fn events_for_an_unrepresentable_name_never_surface() {
     std::fs::remove_file(&bad).unwrap();
 
     let (sink, got) = sink_to_vec();
-    let mut w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        fast_config(),
-        sink,
-    )
-    .unwrap();
+    let mut w = watch_with(&dir, fast_config(), sink).unwrap();
 
     std::fs::write(&bad, "hi").unwrap();
     std::thread::sleep(Duration::from_millis(150));
@@ -239,7 +241,7 @@ fn events_for_an_unrepresentable_name_never_surface() {
 
 #[test]
 fn ignored_and_hidden_dirs_are_not_registered() {
-    let dir = tmp_dir("filter");
+    let dir = crate::testutil::scratch_dir("filter");
     for sub in [
         "keep",
         "keep/nested",
@@ -252,13 +254,7 @@ fn ignored_and_hidden_dirs_are_not_registered() {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
 
-    let w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        fast_config(),
-        sink_to_vec().0,
-    )
-    .unwrap();
+    let w = watch(&dir);
 
     assert_eq!(w.watched_dirs(), 3, "expected root, keep, keep/nested only");
     drop(w);
@@ -267,20 +263,14 @@ fn ignored_and_hidden_dirs_are_not_registered() {
 
 #[test]
 fn include_hidden_registers_dotted_dirs() {
-    let dir = tmp_dir("hidden");
+    let dir = crate::testutil::scratch_dir("hidden");
     std::fs::create_dir_all(dir.join(".hidden")).unwrap();
 
     let filters = WatchFilters {
         include_hidden: true,
         ..default_filters()
     };
-    let w = Watcher::start(
-        std::iter::once(&dir),
-        filters,
-        fast_config(),
-        sink_to_vec().0,
-    )
-    .unwrap();
+    let w = Watcher::start(vec![dir.clone()], filters, fast_config(), sink_to_vec().0).unwrap();
 
     assert_eq!(w.watched_dirs(), 2, "root + .hidden");
     drop(w);
@@ -289,22 +279,12 @@ fn include_hidden_registers_dotted_dirs() {
 
 #[test]
 fn exceeding_the_cap_fails_all_or_nothing() {
-    let dir = tmp_dir("cap");
+    let dir = crate::testutil::scratch_dir("cap");
     for sub in ["a", "b", "c", "d"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
 
-    let config = WatcherConfig {
-        max_watched_dirs: 2,
-        ..fast_config()
-    };
-    let err = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        config,
-        sink_to_vec().0,
-    )
-    .unwrap_err();
+    let err = watch_with(&dir, capped(2), sink_to_vec().0).unwrap_err();
 
     assert_eq!(
         err,
@@ -317,18 +297,13 @@ fn exceeding_the_cap_fails_all_or_nothing() {
 #[test]
 #[cfg(unix)]
 fn an_unreadable_directory_is_skipped_not_fatal() {
-    let dir = tmp_dir("denied");
+    let dir = crate::testutil::scratch_dir("denied");
     std::fs::create_dir_all(dir.join("open")).unwrap();
     let locked = dir.join("locked");
     std::fs::create_dir_all(&locked).unwrap();
     crate::platform::deny_read(&locked).unwrap();
 
-    let started = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        fast_config(),
-        sink_to_vec().0,
-    );
+    let started = watch_with(&dir, fast_config(), sink_to_vec().0);
     crate::platform::restore_read(&locked).ok();
     let w = started.expect("an unreadable directory must not fail the watcher");
 
@@ -341,7 +316,7 @@ fn an_unreadable_directory_is_skipped_not_fatal() {
 #[test]
 #[cfg(unix)]
 fn the_cap_outranks_an_unreadable_directory() {
-    let dir = tmp_dir("denied-cap");
+    let dir = crate::testutil::scratch_dir("denied-cap");
     for sub in ["a", "b", "c", "d"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
     }
@@ -349,16 +324,7 @@ fn the_cap_outranks_an_unreadable_directory() {
     std::fs::create_dir_all(&locked).unwrap();
     crate::platform::deny_read(&locked).unwrap();
 
-    let config = WatcherConfig {
-        max_watched_dirs: 2,
-        ..fast_config()
-    };
-    let started = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        config,
-        sink_to_vec().0,
-    );
+    let started = watch_with(&dir, capped(2), sink_to_vec().0);
     crate::platform::restore_read(&locked).ok();
 
     assert_eq!(
@@ -371,20 +337,10 @@ fn the_cap_outranks_an_unreadable_directory() {
 
 #[test]
 fn a_tree_inside_the_cap_registers() {
-    let dir = tmp_dir("undercap");
+    let dir = crate::testutil::scratch_dir("undercap");
     std::fs::create_dir_all(dir.join("a")).unwrap();
 
-    let config = WatcherConfig {
-        max_watched_dirs: 2,
-        ..fast_config()
-    };
-    let w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        config,
-        sink_to_vec().0,
-    )
-    .unwrap();
+    let w = watch_with(&dir, capped(2), sink_to_vec().0).unwrap();
     assert_eq!(w.watched_dirs(), 2);
     assert!(!w.is_degraded());
     drop(w);
@@ -393,15 +349,9 @@ fn a_tree_inside_the_cap_registers() {
 
 #[test]
 fn a_directory_created_after_start_is_watched() {
-    let dir = tmp_dir("newdir");
+    let dir = crate::testutil::scratch_dir("newdir");
     let (sink, got) = sink_to_vec();
-    let mut w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        fast_config(),
-        sink,
-    )
-    .unwrap();
+    let mut w = watch_with(&dir, fast_config(), sink).unwrap();
     assert_eq!(w.watched_dirs(), 1, "only the root to begin with");
 
     let sub = dir.join("later");
@@ -428,17 +378,11 @@ fn a_directory_created_after_start_is_watched() {
 
 #[test]
 fn a_moved_in_tree_registers_every_directory() {
-    let staging = tmp_dir("staging");
-    let dir = tmp_dir("movein");
+    let staging = crate::testutil::scratch_dir("staging");
+    let dir = crate::testutil::scratch_dir("movein");
     std::fs::create_dir_all(staging.join("tree/one/two")).unwrap();
 
-    let mut w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        fast_config(),
-        sink_to_vec().0,
-    )
-    .unwrap();
+    let mut w = watch(&dir);
     assert_eq!(w.watched_dirs(), 1);
 
     std::fs::rename(staging.join("tree"), dir.join("tree")).unwrap();
@@ -452,16 +396,10 @@ fn a_moved_in_tree_registers_every_directory() {
 
 #[test]
 fn a_removed_directory_releases_its_watches() {
-    let dir = tmp_dir("rmdir");
+    let dir = crate::testutil::scratch_dir("rmdir");
     std::fs::create_dir_all(dir.join("gone/deep")).unwrap();
 
-    let mut w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        fast_config(),
-        sink_to_vec().0,
-    )
-    .unwrap();
+    let mut w = watch(&dir);
     assert_eq!(w.watched_dirs(), 3, "root + gone + gone/deep");
 
     std::fs::remove_dir_all(dir.join("gone")).unwrap();
@@ -475,17 +413,11 @@ fn a_removed_directory_releases_its_watches() {
 /// `Path::starts_with` compares components, not byte prefixes.
 #[test]
 fn remove_tree_does_not_match_name_prefixes() {
-    let dir = tmp_dir("prefix");
+    let dir = crate::testutil::scratch_dir("prefix");
     std::fs::create_dir_all(dir.join("b")).unwrap();
     std::fs::create_dir_all(dir.join("bc")).unwrap();
 
-    let mut w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        fast_config(),
-        sink_to_vec().0,
-    )
-    .unwrap();
+    let mut w = watch(&dir);
     assert_eq!(w.watched_dirs(), 3);
 
     std::fs::remove_dir_all(dir.join("b")).unwrap();
@@ -498,18 +430,8 @@ fn remove_tree_does_not_match_name_prefixes() {
 
 #[test]
 fn running_out_of_budget_later_records_the_reason() {
-    let dir = tmp_dir("degrade");
-    let config = WatcherConfig {
-        max_watched_dirs: 2,
-        ..fast_config()
-    };
-    let mut w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        config,
-        sink_to_vec().0,
-    )
-    .unwrap();
+    let dir = crate::testutil::scratch_dir("degrade");
+    let mut w = watch_with(&dir, capped(2), sink_to_vec().0).unwrap();
     assert!(!w.is_degraded(), "one directory is under the cap of 2");
 
     std::fs::create_dir(dir.join("fits")).unwrap();
@@ -529,14 +451,8 @@ fn running_out_of_budget_later_records_the_reason() {
 
 #[test]
 fn a_created_ignored_directory_is_not_watched() {
-    let dir = tmp_dir("newignored");
-    let mut w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        fast_config(),
-        sink_to_vec().0,
-    )
-    .unwrap();
+    let dir = crate::testutil::scratch_dir("newignored");
+    let mut w = watch(&dir);
 
     std::fs::create_dir(dir.join("node_modules")).unwrap();
     std::fs::create_dir(dir.join(".cache")).unwrap();
@@ -552,19 +468,13 @@ fn a_created_ignored_directory_is_not_watched() {
 #[test]
 #[cfg(unix)]
 fn a_symlinked_directory_is_not_registered_when_following_is_off() {
-    let dir = tmp_dir("symlink-reg");
+    let dir = crate::testutil::scratch_dir("symlink-reg");
     std::fs::create_dir_all(dir.join("real/nested")).unwrap();
-    let outside = tmp_dir("symlink-reg-target");
+    let outside = crate::testutil::scratch_dir("symlink-reg-target");
     std::fs::create_dir_all(outside.join("deep")).unwrap();
     std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
 
-    let w = Watcher::start(
-        std::iter::once(&dir),
-        default_filters(),
-        fast_config(),
-        sink_to_vec().0,
-    )
-    .unwrap();
+    let w = watch(&dir);
 
     assert_eq!(
         w.watched_dirs(),

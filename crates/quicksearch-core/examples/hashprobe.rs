@@ -1,9 +1,10 @@
+//! How `hash_length` trades bytes read per file against false duplicates.
+//!
 //! The index identifies a file as `sha256(size ‖ first hash_length bytes)`,
-//! so one number decides bytes read per file and how often two different
-//! files are declared duplicates. Collisions are measured over `1..32 KiB`
-//! against the 32 KiB baseline — right **by definition**; `--verify` is the
-//! footnote that reads baseline groups byte for byte and reports how many
-//! of *those* were wrong too.
+//! so one number decides both. Collisions are measured over `1..32 KiB`
+//! against the 32 KiB baseline, which is right by definition; `--verify`
+//! reads the baseline's groups byte for byte and reports how many of those
+//! were wrong too.
 //!
 //! ```text
 //! cargo build -p quicksearch-core --example hashprobe --release
@@ -12,8 +13,8 @@
 //!     --ignore target --ignore build --ignore __pycache__
 //! ```
 //!
-//! Read cost per sample belongs to [`indexprobe`](indexprobe.rs); the
-//! traversal walks the shipped default [`IgnoreSet`], and `--ignore` adds.
+//! [`indexprobe`](indexprobe.rs) prices the read cost of a sample size. The
+//! traversal walks the default [`IgnoreSet`]; `--ignore` adds to it.
 
 mod common;
 
@@ -37,15 +38,15 @@ use quicksearch_core::verify::{verify_identical, VerifyUpdate};
 use common::{mib, Io};
 
 /// Sample sizes, smallest first; the last is the baseline. Widening the
-/// window can only *split* a group, so the six partitions are successive
-/// refinements — one traversal answers all of them, and the per-sample
-/// false-positive counts are monotonic ([`Sweep::check_invariants`]).
+/// window can only split a group, so the six partitions are successive
+/// refinements: one traversal answers all of them, and the false-positive
+/// counts fall monotonically ([`Sweep::check_invariants`]).
 const SWEEP: [usize; 6] = [1 << 10, 2 << 10, 4 << 10, 8 << 10, 16 << 10, 32 << 10];
 
 const BASE: usize = SWEEP.len() - 1;
 
-/// Eight rather than the core count: round-trip bound, not CPU bound — on
-/// virtiofs the thread is parked in `read` almost the whole time.
+/// Eight rather than the core count: the scan is round-trip bound, and on
+/// virtiofs a thread spends almost all its time parked in `read`.
 const DEFAULT_WORKERS: usize = 8;
 
 /// Ceiling on bytes `--verify` reads; whatever it stops short of is
@@ -63,7 +64,7 @@ struct Scan {
     /// `sha256(size ‖ head[..n])` for each `n` in [`SWEEP`].
     digests: [Sha; SWEEP.len()],
     /// Bit `i`: the MIME guessed from `SWEEP[i]` bytes differs from the
-    /// baseline's — a short sample also classifies on less evidence.
+    /// baseline's, since a short sample also classifies on less evidence.
     mime_differs: u8,
     /// Bit `i`: [`looks_like_text`] disagrees with the baseline's answer.
     text_differs: u8,
@@ -76,14 +77,14 @@ struct Scan {
 #[derive(Default, Debug)]
 struct ScanErrors {
     unreadable: u64,
-    /// Zero-length, excluded exactly as `duplicates.rs` excludes them.
+    /// Zero-length files, excluded as `search::duplicates` excludes them.
     empty: u64,
     irregular: u64,
 }
 
-/// Read one file's head once (`min(size, 32 KiB)`) and derive every sample
-/// size's answer from the same bytes — one traversal measures all six,
-/// guaranteed mutually consistent as six separate runs never could be.
+/// Read one file's head (`min(size, 32 KiB)`) once and derive every sample
+/// size's answer from it, so the six answers are consistent with each other
+/// as six separate runs could not be.
 fn scan_one(path: &Path, size: u64, config: &Config, registry: &Registry) -> Option<Scan> {
     let mut head = vec![0u8; size.min(SWEEP[BASE] as u64) as usize];
     let mut file = File::open(path).ok()?;
@@ -124,9 +125,9 @@ fn scan_one(path: &Path, size: u64, config: &Config, registry: &Registry) -> Opt
     })
 }
 
-/// Traverse `roots` with the shipped defaults, `workers` at a time: a
-/// bounded channel, so a million files never materialise as a vector, and
-/// per-worker accumulation merged once at the end.
+/// Scan `roots` with the default config, `workers` at a time. A bounded
+/// channel keeps a million pending paths from materialising at once, and each
+/// worker's results merge once at the end.
 fn scan(
     roots: &[String],
     workers: usize,
@@ -229,8 +230,8 @@ struct GroupStat {
     /// Of those, the pairs the baseline says are different files.
     fp_pairs: u64,
     /// The Duplicates tab's reclaimable-bytes figure minus what the baseline
-    /// subgroups really hold — the number that could talk someone into
-    /// deleting something.
+    /// subgroups hold: the number that could talk someone into deleting
+    /// something.
     overstated_bytes: u64,
 }
 
@@ -282,8 +283,8 @@ struct Collisions {
     overstated_bytes: u64,
 }
 
-/// Sum over a partition; groups of one are skipped, exactly as the
-/// `HAVING cnt > 1` in `search::duplicates` skips them.
+/// Sum over a partition, skipping groups of one as the `HAVING cnt > 1` in
+/// `search::duplicates` does.
 fn tally(partition: &[Vec<u32>], base: &[u32], size: &[u64]) -> Collisions {
     let mut total = Collisions::default();
     for members in partition {
@@ -330,10 +331,10 @@ struct Sweep {
 }
 
 impl Sweep {
-    /// Invariants that hold by construction, checked because a probe that
-    /// silently reports a plausible wrong number is worse than no probe:
-    /// the baseline's false-positive columns are exactly zero, and every
-    /// "wrong" column is non-increasing as the sample refines.
+    /// Assert the invariants that hold by construction: the baseline's
+    /// false-positive columns are zero, and every "wrong" column is
+    /// non-increasing as the sample widens. A probe that reports a plausible
+    /// wrong number is worse than none.
     fn check_invariants(&self) {
         let base = &self.rows[BASE];
         assert_eq!(base.fp_groups, 0, "the baseline defines truth");
@@ -388,9 +389,9 @@ fn sample_name(n: usize) -> String {
 
 fn collide(roots: &[String], workers: usize, ignore: &[String], verify_budget: Option<u64>) {
     let mut config = Config::default();
-    // `--ignore` is not a convenience: build output is where a disk keeps
-    // its near-identical files, and a corpus including it answers a
-    // different question. Both answers are wanted.
+    // Build output is where a disk keeps its near-identical files, so a
+    // corpus with and without it answers different questions; `--ignore`
+    // asks the second.
     config
         .indexing
         .ignore_patterns
@@ -518,7 +519,8 @@ fn collide(roots: &[String], workers: usize, ignore: &[String], verify_budget: O
     }
 }
 
-/// The five worst groups at the default 8 KiB: *what* collides.
+/// Print the five worst false-positive groups at the default `hash_length`:
+/// what collides.
 fn top_offenders(scans: &[Scan], paths: &[PathBuf], base: &[u32], sizes: &[u64]) {
     let default_index = SWEEP
         .iter()
@@ -549,8 +551,8 @@ fn top_offenders(scans: &[Scan], paths: &[PathBuf], base: &[u32], sizes: &[u64])
             mib(sizes[members[0] as usize]),
             mib(stat.overstated_bytes),
         );
-        // Two members from *different* baseline groups — the pair actually
-        // claimed wrongly, what a reader would run `cmp` on.
+        // Two members from different baseline groups: a pair claimed wrongly,
+        // for a reader to `cmp`.
         let first = members[0];
         if let Some(other) = members
             .iter()
@@ -562,9 +564,10 @@ fn top_offenders(scans: &[Scan], paths: &[PathBuf], base: &[u32], sizes: &[u64])
     }
 }
 
-/// Read the baseline's own duplicate groups byte for byte and report how
-/// many were wrong — only groups holding a file larger than the sample can
-/// be. Opt-in and budgeted: the one part of this probe that reads whole files.
+/// Read the baseline's duplicate groups byte for byte and report how many
+/// were wrong; only groups holding a file larger than the sample can be.
+/// Opt-in and budgeted, because this is the only part of the probe that reads
+/// whole files.
 fn verify_baseline(scans: &[Scan], paths: &[PathBuf], sizes: &[u64], budget: u64) {
     let baseline = partition(scans, BASE);
     let baseline_dup_groups = baseline.iter().filter(|m| m.len() >= 2).count();
@@ -585,9 +588,9 @@ fn verify_baseline(scans: &[Scan], paths: &[PathBuf], sizes: &[u64], budget: u64
     let mut exhausted = false;
     for members in &groups {
         let cost: u64 = members.iter().map(|m| sizes[*m as usize]).sum();
-        // Stop dead at the budget: carrying on admits whatever still fits —
-        // *small* groups — and the sample quietly becomes weighted toward
-        // files the baseline is least likely to get wrong.
+        // Stop at the budget: carrying on would admit whatever still fits, the
+        // small groups, and weight the sample toward files the baseline is
+        // least likely to get wrong.
         exhausted |= bytes + cost > budget;
         if exhausted {
             skipped += 1;
@@ -824,8 +827,8 @@ mod tests {
         assert_eq!(total.overstated_bytes, 20);
     }
 
-    /// The hardlink-farm case: the pair count is quadratic, so it has to be
-    /// arithmetic — no brute force here; that is the point.
+    /// The hardlink-farm case: the pair count is quadratic, so it must be
+    /// computed, not enumerated.
     #[test]
     fn a_group_of_thousands_does_not_need_enumerating() {
         let members: Vec<u32> = (0..10_000).collect();

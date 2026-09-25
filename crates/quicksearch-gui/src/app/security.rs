@@ -111,25 +111,19 @@ impl QuickSearchApp {
             }
             SecurityAction::SetKeychain(remember) => {
                 let db_path = self.cfg.resolved_database_path();
-                if remember {
-                    match db::process_key_hex() {
-                        Some(hex) => {
-                            if let Err(e) = keychain::store_key(&db_path.to_string_lossy(), &hex) {
-                                self.config_error = Some(e);
-                                return; // preference not saved either
-                            }
-                        }
-                        None => {
-                            // Unreachable while protected: the gate installs
-                            // a key before the app starts.
-                            self.config_error =
-                                Some("no key to remember; restart and unlock first".to_string());
-                            return;
-                        }
-                    }
-                } else if let Err(e) = keychain::delete_key(&db_path.to_string_lossy()) {
-                    // The preference must not claim the key is gone while it
-                    // is still on the keychain.
+                let db_path = db_path.to_string_lossy();
+                let result = if remember {
+                    // Always there while protected: the gate installs a key
+                    // before the app starts.
+                    db::process_key_hex()
+                        .ok_or_else(|| "no key to remember; restart and unlock first".to_string())
+                        .and_then(|hex| keychain::sync(&db_path, Some(&hex)))
+                } else {
+                    keychain::sync(&db_path, None)
+                };
+                // The preference is not saved either: it must never claim
+                // what the keychain does not hold.
+                if let Err(e) = result {
                     self.config_error = Some(e);
                     return;
                 }
@@ -282,26 +276,23 @@ impl QuickSearchApp {
                 }
             }
             KeyPrompt::Deriving { rx } => match rx.try_recv() {
-                Ok(key) => match db::process_key_hex() {
-                    // Shown is the *installed* key — the one that opens the index.
-                    Some(installed) => match reveal_display(&installed, &key.to_hex()) {
-                        Some(display) => {
-                            self.key_prompt = Some(KeyPrompt::Reveal { display });
-                        }
-                        None => {
-                            self.key_prompt = Some(KeyPrompt::Confirm {
-                                pw: String::new(),
-                                wrong: true,
-                            });
-                        }
-                    },
-                    None => {
-                        // Unreachable while protected (see above).
+                Ok(key) => {
+                    // Unreachable while protected (see above).
+                    let Some(installed) = db::process_key_hex() else {
                         self.config_error =
                             Some("no key installed; restart and unlock first".to_string());
                         self.key_prompt = None;
-                    }
-                },
+                        return;
+                    };
+                    // Shown is the *installed* key, the one that opens the index.
+                    self.key_prompt = Some(match reveal_display(&installed, &key.to_hex()) {
+                        Some(display) => KeyPrompt::Reveal { display },
+                        None => KeyPrompt::Confirm {
+                            pw: String::new(),
+                            wrong: true,
+                        },
+                    });
+                }
                 Err(mpsc::TryRecvError::Empty) => deriving_window(ctx),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.config_error = Some("key derivation thread died".to_string());
@@ -320,7 +311,7 @@ impl QuickSearchApp {
         }
     }
 
-    /// Config, keychain, process key — in that order, before the rebuild,
+    /// Config, keychain, process key, in that order and before the rebuild,
     /// so the fresh index is created under the new key (or none).
     fn apply_security_change(&mut self, new_security: SecurityConfig, new_key: Option<IndexKey>) {
         let db_path = self
@@ -333,23 +324,18 @@ impl QuickSearchApp {
         if let Err(e) = self.cfg.save() {
             // Fail closed: the salt lives only in that file, and carrying on
             // would rebuild an index encrypted with a salt that reached no
-            // disk — which no password can open afterwards.
+            // disk, which no password can open afterwards.
             self.cfg.security = previous_security;
             self.config_error = Some(e);
             return;
         }
-        match (&new_key, self.cfg.security.use_keychain) {
-            (Some(key), true) => {
-                if let Err(e) = keychain::store_key(&db_path, &key.to_hex()) {
-                    self.config_error = Some(e);
-                }
-            }
-            // No stored key may survive pointing at the previous state.
-            _ => {
-                if let Err(e) = keychain::delete_key(&db_path) {
-                    self.config_error = Some(e);
-                }
-            }
+        // No stored key may survive pointing at the previous state.
+        let remembered = new_key
+            .as_ref()
+            .filter(|_| self.cfg.security.use_keychain)
+            .map(|key| key.to_hex());
+        if let Err(e) = keychain::sync(&db_path, remembered.as_deref()) {
+            self.config_error = Some(e);
         }
         db::set_process_key(new_key);
         self.backend.rebuild_index();
@@ -359,7 +345,7 @@ impl QuickSearchApp {
 
 const SHOW_KEY_FIELD: &str = "show-key-pw";
 
-/// Drop egui's retained state (buffer + undo history) for the password fields.
+/// Drops egui's retained state (buffer + undo history) for the password fields.
 fn purge_security_field_state(ctx: &egui::Context) {
     ctx.data_mut(|d| {
         d.remove::<egui::text_edit::TextEditState>(egui::Id::new("security-pw1"));
@@ -439,19 +425,18 @@ fn reveal_key_modal(ctx: &egui::Context, display: &str) -> (bool, bool) {
             ui.label(egui::RichText::new(display).monospace());
         });
         ui.add_space(6.0);
-        // The key on its own is not enough: under any other page size or
-        // page authenticator the file decrypts to noise, and every tool
-        // reports that as a wrong key. Both are shown as their own lines, not
-        // in the small print, because both have to be entered alongside the
-        // key.
+        // The key on its own is not enough: under any other page size or page
+        // authenticator the file decrypts to noise, which every tool reports
+        // as a wrong key. Both have to be entered with the key, so each gets
+        // its own line rather than the small print.
         ui.label(egui::RichText::new(format!("Page size: {}", PAGE_SIZE)).monospace());
         ui.label(egui::RichText::new(format!("Page HMAC: {}", HMAC_MODE.label())).monospace());
         ui.add_space(6.0);
         ui.label(hint(format!(
-            "Other SQLCipher tools take the key in this form, but default to \
-             {}-byte pages and HMAC_SHA512 — set both of the above as well or \
-             the index will not open ({} {}). Copy puts the key alone on the \
-             clipboard, where it stays until something else replaces it.",
+            "Other SQLCipher tools take the key in this form but default to \
+             {}-byte pages and HMAC_SHA512, so set both of the above as well \
+             or the index will not open ({} {}). Copy puts only the key on the \
+             clipboard, where it stays until something replaces it.",
             SQLCIPHER_DEFAULT_PAGE_SIZE,
             format_args!("PRAGMA cipher_page_size = {};", PAGE_SIZE),
             hmac_pragma_hint(),

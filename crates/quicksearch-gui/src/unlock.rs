@@ -151,12 +151,13 @@ pub struct UnlockScreen {
     password: String,
     remember: bool,
     error: Option<String>,
-    /// Set once at startup and after a failed attempt — *not* every frame:
+    /// Set at startup and after a failed attempt, not every frame: an
     /// unconditional re-focus traps the caret.
     focus_password: bool,
     /// In-flight Argon2 derivation (+ verification) on a worker thread.
     job: Option<mpsc::Receiver<Result<IndexKey, String>>>,
-    forgot_confirm: bool,
+    /// The "Forgot password…" reset is asking for confirmation.
+    confirming_reset: bool,
 }
 
 impl UnlockScreen {
@@ -186,7 +187,7 @@ impl UnlockScreen {
             error: None,
             focus_password: true,
             job: None,
-            forgot_confirm: false,
+            confirming_reset: false,
         }
     }
 
@@ -297,7 +298,7 @@ impl UnlockScreen {
                 if !matches!(self.mode, Mode::Create)
                     && ui.small_button("Forgot password…").clicked()
                 {
-                    self.forgot_confirm = true;
+                    self.confirming_reset = true;
                 }
             });
         });
@@ -305,8 +306,8 @@ impl UnlockScreen {
         if submitted && self.job.is_none() {
             self.submit(ctx);
         }
-        if self.forgot_confirm {
-            if let Some(app) = self.forgot_confirm_ui(ctx) {
+        if self.confirming_reset {
+            if let Some(app) = self.confirm_reset_ui(ctx) {
                 return Some(app);
             }
         }
@@ -362,13 +363,10 @@ impl UnlockScreen {
 
     fn unlocked(&mut self, ctx: &egui::Context, key: IndexKey) -> Option<QuickSearchApp> {
         let db_path = self.cfg.resolved_database_path();
-        if self.remember {
-            if let Err(e) = keychain::store_key(&db_path.to_string_lossy(), &key.to_hex()) {
-                // Non-fatal: unlock proceeds, the preference just can't stick.
-                self.config_error = Some(e);
-            }
-        } else if let Err(e) = keychain::delete_key(&db_path.to_string_lossy()) {
-            // Non-fatal, but the old key is still on the keychain — say so.
+        // Non-fatal: unlock proceeds, but say that the keychain does not
+        // match the preference (or still holds the old key).
+        let remembered = self.remember.then(|| key.to_hex());
+        if let Err(e) = keychain::sync(&db_path.to_string_lossy(), remembered.as_deref()) {
             self.config_error = Some(e);
         }
         if self.cfg.security.use_keychain != self.remember {
@@ -405,7 +403,7 @@ impl UnlockScreen {
 
     /// The index is derived data: deleting it and disabling protection
     /// loses nothing but time. `Some(app)` when the reset happened.
-    fn forgot_confirm_ui(&mut self, ctx: &egui::Context) -> Option<QuickSearchApp> {
+    fn confirm_reset_ui(&mut self, ctx: &egui::Context) -> Option<QuickSearchApp> {
         let result = crate::ui_util::centered_modal(ctx, "Reset the index?", |ui| {
             ui.set_max_width(420.0);
             ui.label(
@@ -419,8 +417,10 @@ impl UnlockScreen {
                     .color(ui.visuals().error_fg_color);
                 if ui.button(delete).clicked() {
                     let db_path = self.cfg.resolved_database_path();
-                    if let Err(e) = delete_index_files(&db_path) {
-                        self.error = Some(e);
+                    // No coordinator exists while the gate is locked, so a
+                    // plain delete is safe.
+                    if let Err(e) = db::remove_index_files(&db_path) {
+                        self.error = Some(format!("Failed to delete {}: {}", db_path.display(), e));
                     } else {
                         // A surviving keychain entry would point at nothing.
                         if let Err(e) = keychain::delete_key(&db_path.to_string_lossy()) {
@@ -441,7 +441,7 @@ impl UnlockScreen {
         });
         let (launched, close) = result.unwrap_or((None, false));
         if close {
-            self.forgot_confirm = false;
+            self.confirming_reset = false;
         }
         launched
     }
@@ -457,28 +457,10 @@ fn pw_field_id() -> egui::Id {
     egui::Id::new("unlock-password")
 }
 
-/// Drop egui's retained state — text buffer and undo history — so the
+/// Drops egui's retained state (text buffer and undo history), so the
 /// plaintext doesn't outlive the submit.
 fn purge_text_state(ctx: &egui::Context, id: egui::Id) {
     ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(id));
-}
-
-/// No coordinator exists while the gate is locked, so plain deletes are safe.
-fn delete_index_files(db_path: &std::path::Path) -> Result<(), String> {
-    match quicksearch_core::platform::remove_file_retrying(db_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("Failed to delete {}: {}", db_path.display(), e)),
-    }
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let name = format!(
-            "{}{}",
-            db_path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
-            suffix
-        );
-        let _ = quicksearch_core::platform::remove_file_retrying(&db_path.with_file_name(name));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -507,7 +489,7 @@ mod tests {
         });
     }
 
-    /// The regression: the caret starts in the password field, then can leave.
+    /// The caret starts in the password field, then can leave.
     #[test]
     fn the_password_field_takes_focus_once_and_then_releases_it() {
         let ctx = crate::test_ui::ctx();
@@ -546,7 +528,7 @@ mod tests {
         assert!(ctx.memory(|m| m.has_focus(pw_field_id())));
     }
 
-    /// The build id is painted, not merely laid out — a panel declared after
+    /// The build id is painted, not merely laid out: a panel declared after
     /// the central one would compile and show nothing.
     #[test]
     fn the_lock_screen_shows_the_build_id() {
@@ -558,12 +540,10 @@ mod tests {
             assert!(screen.update(ctx).is_none());
         });
 
-        let painted = out.shapes.iter().any(|clipped| match &clipped.shape {
-            egui::epaint::Shape::Text(text) => text.galley.text() == crate::version::BUILD_ID,
-            _ => false,
-        });
         assert!(
-            painted,
+            crate::test_ui::painted_text(&out)
+                .iter()
+                .any(|t| t == crate::version::BUILD_ID),
             "{} is not painted on the lock screen",
             crate::version::BUILD_ID
         );

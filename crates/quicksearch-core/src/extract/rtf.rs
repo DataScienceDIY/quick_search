@@ -1,4 +1,4 @@
-//! RTF text extraction via `rtf-parser` (patched — `vendor/rtf-parser`, see
+//! RTF text extraction via `rtf-parser`, patched in `vendor/rtf-parser` (see
 //! the workspace `[patch.crates-io]` note). Registers before the plaintext
 //! extractor, which claims every `text/*` and would index `text/rtf` raw.
 
@@ -10,34 +10,23 @@ use rtf_parser::document::RtfDocument;
 
 use super::{ExtractError, Extractor, Scratch};
 
-/// RTF is 7-bit ASCII by design — non-ASCII travels as `\'hh` and `\uN`
-/// escapes — so the lossy UTF-8 view loses nothing from a well-formed file.
-///
-/// Borrowed: `from_utf8_lossy` borrows an already-valid buffer, so an owned
-/// argument bought nothing and cost the head path a full copy.
+/// Parse `bytes` and append the document's text to `out`. RTF is 7-bit ASCII
+/// by design (non-ASCII travels as `\'hh` and `\uN` escapes), so the lossy
+/// UTF-8 view loses nothing from a well-formed file, and it borrows valid
+/// input, so the head path parses the walk worker's buffer without a copy.
 fn parse(bytes: &[u8], path: &Path, out: &mut String) -> Result<(), ExtractError> {
     let source = String::from_utf8_lossy(bytes);
-    match RtfDocument::try_from(source.as_ref()) {
-        Ok(doc) => {
-            // `get_text` builds its own string; taking it whole is one move
-            // when `out` is empty, which it is for every caller today.
-            let text = doc.get_text();
-            if out.is_empty() {
-                *out = text;
-            } else {
-                out.push_str(&text);
-            }
-            Ok(())
-        }
-        Err(e) => Err(format!("rtf parse {}: {}", path.display(), e)),
-    }
+    let doc = RtfDocument::try_from(source.as_ref())
+        .map_err(|e| format!("rtf parse {}: {}", path.display(), e))?;
+    super::append(out, doc.get_text());
+    Ok(())
 }
 
 pub struct RtfExtractor;
 
-/// Read at most `cap` bytes of `path` into `buf`; `rtf-parser` amplifies its
-/// input several-fold in heap, so the read stays bounded whatever the walk
-/// recorded. `buf` is the worker's, reused file after file.
+/// Read at most `cap` bytes of `path` into `buf`, the worker's, reused file
+/// after file. `rtf-parser` amplifies its input several-fold in heap, so the
+/// read stays bounded whatever the walk recorded.
 fn read_capped(path: &Path, cap: u64, buf: &mut Vec<u8>) -> Result<(), ExtractError> {
     let file = File::open(path).map_err(|e| format!("rtf read {}: {}", path.display(), e))?;
     buf.clear();
@@ -82,7 +71,7 @@ mod tests {
         Scratch::new(&crate::config::Config::default())
     }
 
-    /// The default `maximum_text_file_size`, which is what bounds a read now.
+    /// The default `maximum_text_file_size`, which bounds a read.
     fn max_read() -> u64 {
         scratch().limits().read as u64
     }
@@ -93,17 +82,13 @@ mod tests {
     }
 
     fn extract(path: &Path) -> Result<String, ExtractError> {
-        let mut out = String::new();
-        RtfExtractor.extract(path, &mut out, &mut scratch()).map(|()| out)
+        crate::extract::extract_text(&RtfExtractor, path)
     }
 
     fn extract_from_head(path: &Path, head: &[u8]) -> Option<Result<String, ExtractError>> {
         let mut out = String::new();
-        match RtfExtractor.extract_from_head(path, head, &mut out) {
-            Some(Ok(())) => Some(Ok(out)),
-            Some(Err(e)) => Some(Err(e)),
-            None => None,
-        }
+        let outcome = RtfExtractor.extract_from_head(path, head, &mut out);
+        outcome.map(|r| r.map(|()| out))
     }
 
     fn tmp(tag: &str, body: &[u8]) -> std::path::PathBuf {
@@ -134,11 +119,11 @@ mod tests {
     }
 
     /// A `\\uN` escape naming a lone UTF-16 surrogate costs one character, not
-    /// the document: upstream reached `String::from_utf16(..).unwrap()` with it
-    /// unscreened and panicked. `vendor/rtf-parser` (LOCAL PATCH,
-    /// `Parser::flush_unicode`) decodes lossily — one `U+FFFD`, rest indexed.
-    /// Both entry points stay exercised; the containment above them must keep
-    /// working for every other way a parser can panic.
+    /// the document: upstream passes it unscreened to
+    /// `String::from_utf16(..).unwrap()` and panics, and `vendor/rtf-parser`
+    /// (LOCAL PATCH, `Parser::flush_unicode`) decodes lossily instead, to one
+    /// `U+FFFD`. Both entry points stay exercised; the containment above them
+    /// must keep working for every other way a parser can panic.
     #[test]
     fn a_lone_surrogate_escape_costs_one_character() {
         // `\u55296` is a lone high surrogate; the `?` is its ANSI fallback,
@@ -182,9 +167,8 @@ mod tests {
         std::fs::remove_file(&p).ok();
     }
 
-    /// `\\par` ends a paragraph and must reach the text as a line break; it
-    /// used to emit nothing and paragraph boundaries closed up. Fixed in
-    /// `vendor/rtf-parser` (LOCAL PATCH), alongside `\\line`.
+    /// `\\par` ends a paragraph and must reach the text as a line break
+    /// (`vendor/rtf-parser` LOCAL PATCH, alongside `\\line`).
     #[test]
     fn paragraph_breaks_reach_the_text() {
         let body = br"{\rtf1\ansi First paragraph.\par Second paragraph.\par}";

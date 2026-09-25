@@ -4,19 +4,26 @@ fn new_tab() -> SearchTab {
     SearchTab::new(false, ColumnsConfig::default(), true)
 }
 
-/// Rows all carry a content snippet — the expensive cell, which measures
+/// A settled tab showing `results` for `query`, in arrival order.
+fn tab_showing(query: &str, results: Vec<SearchHit>) -> SearchTab {
+    let mut tab = new_tab();
+    tab.query = query.into();
+    tab.focus_query = false;
+    tab.order = (0..results.len() as u32).collect();
+    tab.results = results;
+    tab
+}
+
+/// Rows all carry a content snippet: the expensive cell, which measures
 /// glyph advances across the window to centre the match.
 fn tab_with_content_snippets(n: usize) -> SearchTab {
-    let mut tab = new_tab();
-    tab.query = "quartzite".into();
-    tab.focus_query = false;
     // A full-width window with the match in the middle, as the cascade cuts them.
     let filler = "lorem ipsum dolor sit amet consectetur ";
     let head = filler.repeat(8);
     let tail = filler.repeat(8);
     let window = format!("{head}quartzite{tail}");
     let at = head.len();
-    tab.results = (0..n)
+    let results = (0..n)
         .map(|i| SearchHit {
             file_id: i as i64,
             name: format!("alpha_widget_{i}.txt"),
@@ -33,24 +40,20 @@ fn tab_with_content_snippets(n: usize) -> SearchTab {
             }),
         })
         .collect();
-    tab.order = (0..n as u32).collect();
-    tab
+    tab_showing("quartzite", results)
 }
 
 /// One frame with no assertions; `run_frame`'s glyph check is wrong for timing.
 fn timed_frame(ctx: &egui::Context, tab: &mut SearchTab) {
-    let input = crate::test_ui::raw_input(egui::vec2(1400.0, 900.0), Vec::new());
-    let _ = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            tab.ui(ui);
-        });
+    run_panel(ctx, egui::vec2(1400.0, 900.0), Vec::new(), |ui| {
+        tab.ui(ui);
     });
 }
 
 /// Per-visible-row frame cost, printed rather than asserted. Measured: 1000
-/// rows with content snippets cost 615 µs/frame (<4% of a 60 fps budget),
-/// which argued *against* memoizing the Content Match cut — re-measure here
-/// before optimizing the row renderer.
+/// rows with content snippets cost 615 µs/frame (<4% of a 60 fps budget), so
+/// the Content Match cut is not memoized; re-measure here before optimizing
+/// the row renderer.
 ///
 /// ```text
 /// QSB_RENDER_PERF=1 cargo test --release -p quicksearch-gui -- render_perf --nocapture
@@ -98,10 +101,7 @@ fn render_perf() {
 }
 
 fn tab_with_results(n: usize) -> SearchTab {
-    let mut tab = new_tab();
-    tab.query = "alpha".into();
-    tab.focus_query = false;
-    tab.results = (0..n)
+    let results = (0..n)
         .map(|i| SearchHit {
             file_id: i as i64,
             name: format!("alpha_widget_{i}.txt"),
@@ -113,8 +113,7 @@ fn tab_with_results(n: usize) -> SearchTab {
             snippet: None,
         })
         .collect();
-    tab.order = (0..n as u32).collect();
-    tab
+    tab_showing("alpha", results)
 }
 
 /// One frame at the given width; the no-tofu glyph check rides along on
@@ -125,12 +124,9 @@ fn frame_at(
     width: f32,
     events: Vec<egui::Event>,
 ) -> (egui::FullOutput, SearchActions) {
-    let input = crate::test_ui::raw_input(egui::vec2(width, 700.0), events);
     let mut actions = SearchActions::default();
-    let out = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            actions = tab.ui(ui);
-        });
+    let out = run_panel(ctx, egui::vec2(width, 700.0), events, |ui| {
+        actions = tab.ui(ui);
     });
     crate::test_ui::assert_no_tofu(ctx, &out);
     (out, actions)
@@ -158,7 +154,9 @@ fn hover_row_text(ctx: &egui::Context, tab: &mut SearchTab, row: usize) -> egui:
     panic!("never landed on row {row}'s label text");
 }
 
-use crate::test_ui::painted_text;
+use crate::test_ui::{
+    click_with, hover_shows, instant_tooltips, painted_rect, painted_text, run_panel,
+};
 
 /// Far too long for the Path column at the test's 1000pt screen width.
 fn deep_path() -> String {
@@ -197,11 +195,7 @@ fn long_paths_elide_from_the_middle_of_the_path_column() {
 #[test]
 fn an_elided_path_still_shows_the_whole_thing_on_hover() {
     let ctx = crate::test_ui::ctx();
-    // Testing that the tooltip is wired up, not egui's hover timing.
-    ctx.style_mut(|s| {
-        s.interaction.tooltip_delay = 0.0;
-        s.interaction.show_tooltips_only_when_still = false;
-    });
+    instant_tooltips(&ctx);
     let mut tab = tab_with_results(1);
     let path = deep_path();
     tab.results[0].path = path.clone();
@@ -210,31 +204,15 @@ fn an_elided_path_still_shows_the_whole_thing_on_hover() {
     for y in 40..250 {
         // x lands in the Path column, past the 220pt Name column.
         let pos = egui::pos2(300.0, y as f32);
-        let mut out = run_frame(&ctx, &mut tab, vec![egui::Event::PointerMoved(pos)]);
+        run_frame(&ctx, &mut tab, vec![egui::Event::PointerMoved(pos)]);
         if tab.hovered_row != Some(0) {
             continue;
         }
-        // The tooltip is its own area, so it may land a frame behind.
-        for _ in 0..3 {
-            if painted_text(&out).contains(&path) {
-                return;
-            }
-            out = run_frame(&ctx, &mut tab, vec![]);
+        if hover_shows(|events| run_frame(&ctx, &mut tab, events), pos, &path) {
+            return;
         }
     }
     panic!("the full path never appeared on hover");
-}
-
-fn click(pos: egui::Pos2, button: egui::PointerButton) -> Vec<egui::Event> {
-    [true, false]
-        .into_iter()
-        .map(|pressed| egui::Event::PointerButton {
-            pos,
-            button,
-            pressed,
-            modifiers: egui::Modifiers::default(),
-        })
-        .collect()
 }
 
 fn hit(id: i64, name: &str, rank: f64, size: u64) -> SearchHit {
@@ -250,17 +228,34 @@ fn hit(id: i64, name: &str, rank: f64, size: u64) -> SearchHit {
     }
 }
 
-fn batch(tab: &mut SearchTab, hits: Vec<SearchHit>) {
-    tab.apply_update(
-        SearchUpdate::Hits {
-            generation: tab.generation,
-            hits,
-        },
-        1000,
-    );
+/// Hands `hits` to the tab as one batch of its current search, under a
+/// display limit of `limit`, and re-sorts as the next frame would.
+fn batch_capped(tab: &mut SearchTab, hits: Vec<SearchHit>, limit: usize) {
+    send_hits(tab, tab.generation, hits, limit);
     if tab.sort_dirty {
         tab.resort();
     }
+}
+
+fn batch(tab: &mut SearchTab, hits: Vec<SearchHit>) {
+    batch_capped(tab, hits, 1000);
+}
+
+/// A batch of `hits` for search `generation`, under a display limit of `limit`.
+fn send_hits(tab: &mut SearchTab, generation: u64, hits: Vec<SearchHit>, limit: usize) {
+    tab.apply_update(SearchUpdate::Hits { generation, hits }, limit);
+}
+
+/// Search `generation` finished, having found `total`.
+fn complete(tab: &mut SearchTab, generation: u64, total: usize) {
+    tab.apply_update(
+        SearchUpdate::Completed {
+            generation,
+            total,
+            limited: false,
+        },
+        1000,
+    );
 }
 
 /// A tab already past the fade, so batches land straight in `results`.
@@ -387,32 +382,20 @@ fn a_late_better_hit_displaces_the_worst_at_the_cap() {
     tab.sort = (SortKey::Name, true);
     let limit = 3;
 
-    let send = |tab: &mut SearchTab, hits: Vec<SearchHit>| {
-        tab.apply_update(
-            SearchUpdate::Hits {
-                generation: tab.generation,
-                hits,
-            },
-            limit,
-        );
-        if tab.sort_dirty {
-            tab.resort();
-        }
-    };
-
-    send(
+    batch_capped(
         &mut tab,
         vec![
             hit(1, "aaa.txt", 9.0, 10),
             hit(2, "bbb.txt", 8.0, 20),
             hit(3, "ccc.txt", 7.0, 30),
         ],
+        limit,
     );
     assert_eq!(displayed(&tab), vec!["aaa.txt", "bbb.txt", "ccc.txt"]);
     assert!(!tab.limited);
 
     // Full. A rank-1 arrival must still get in, evicting rank 9.
-    send(&mut tab, vec![hit(4, "zzz.txt", 1.0, 40)]);
+    batch_capped(&mut tab, vec![hit(4, "zzz.txt", 1.0, 40)], limit);
     assert!(tab.limited, "the cap was hit");
     assert_eq!(tab.results.len(), limit);
     assert_eq!(
@@ -431,13 +414,7 @@ fn staged_batches_are_ordered_once_the_fade_swaps() {
     assert!(tab.swap_pending);
 
     for h in [hit(1, "worst.txt", 9.0, 10), hit(2, "best.txt", 1.0, 20)] {
-        tab.apply_update(
-            SearchUpdate::Hits {
-                generation: 1,
-                hits: vec![h],
-            },
-            1000,
-        );
+        batch(&mut tab, vec![h]);
     }
     assert!(tab.results.is_empty(), "still staged behind the fade");
 
@@ -465,8 +442,8 @@ fn run_fade(tab: &mut SearchTab, done: impl Fn(&SearchTab) -> bool) -> f32 {
 fn each_half_of_the_transition_takes_its_own_duration() {
     let mut tab = new_tab();
     tab.swap_pending = true;
-    let out = run_fade(&mut tab, |t| t.fade <= 0.0);
-    assert_eq!(tab.fade, 0.0, "settles exactly on invisible");
+    let out = run_fade(&mut tab, |t| t.opacity <= 0.0);
+    assert_eq!(tab.opacity, 0.0, "settles exactly on invisible");
     assert!(
         (out - FADE_OUT_SECS).abs() <= 1.0 / 60.0,
         "clearing runs for FADE_OUT_SECS, took {out}"
@@ -474,9 +451,9 @@ fn each_half_of_the_transition_takes_its_own_duration() {
 
     // What `ui` does at the swap.
     tab.swap_pending = false;
-    tab.wipe = 1.0;
-    let into = run_fade(&mut tab, |t| t.wipe <= 0.0);
-    assert_eq!(tab.fade, 1.0, "and the reveal settles on fully opaque");
+    tab.cover = 1.0;
+    let into = run_fade(&mut tab, |t| t.cover <= 0.0);
+    assert_eq!(tab.opacity, 1.0, "and the reveal settles on fully opaque");
     assert!(
         (into - FADE_IN_SECS).abs() <= 1.0 / 60.0,
         "the reveal runs for FADE_IN_SECS, took {into}"
@@ -488,33 +465,33 @@ fn a_stalled_frame_does_not_overshoot() {
     let mut tab = new_tab();
     tab.swap_pending = true;
     tab.advance_fade(10.0);
-    assert_eq!(tab.fade, 0.0, "a whole ten seconds lands, not passes");
+    assert_eq!(tab.opacity, 0.0, "a whole ten seconds lands, not passes");
 
     tab.swap_pending = false;
-    tab.wipe = 1.0;
+    tab.cover = 1.0;
     tab.advance_fade(10.0);
-    assert_eq!(tab.wipe, 0.0);
-    assert_eq!(tab.fade, 1.0);
+    assert_eq!(tab.cover, 0.0);
+    assert_eq!(tab.opacity, 1.0);
 }
 
 /// Run backwards, it would flash just-covered rows back on screen.
 #[test]
 fn clearing_results_holds_the_reveal_where_it_stands() {
     let mut tab = new_tab();
-    tab.wipe = 1.0;
+    tab.cover = 1.0;
     tab.advance_fade(FADE_IN_SECS / 5.0);
-    let standing = tab.wipe;
+    let standing = tab.cover;
     assert!((standing - 0.8).abs() < 1e-4, "one fifth in: {standing}");
-    let carried = tab.fade;
+    let carried = tab.opacity;
 
     tab.swap_pending = true;
     tab.advance_fade(0.0);
-    assert_eq!(tab.wipe, standing, "the reveal is frozen, not rewound");
-    assert_eq!(tab.fade, carried, "and the opacity carries on from here");
+    assert_eq!(tab.cover, standing, "the reveal is frozen, not rewound");
+    assert_eq!(tab.opacity, carried, "and the opacity carries on from here");
 
     // The scrim holds its position for the whole of the fade-out.
-    let out = run_fade(&mut tab, |t| t.fade <= 0.0);
-    assert_eq!(tab.wipe, standing, "still frozen at the end of it");
+    let out = run_fade(&mut tab, |t| t.opacity <= 0.0);
+    assert_eq!(tab.cover, standing, "still frozen at the end of it");
     let expected = carried * FADE_OUT_SECS;
     assert!(
         (out - expected).abs() <= 1.0 / 60.0,
@@ -535,7 +512,7 @@ fn a_settled_section_stops_asking_for_frames() {
     assert!(!tab.fade_settled());
     tab.advance_fade(FADE_OUT_SECS);
     tab.swap_pending = false;
-    tab.wipe = 1.0;
+    tab.cover = 1.0;
     assert!(!tab.fade_settled());
 }
 
@@ -544,7 +521,7 @@ fn a_settled_section_stops_asking_for_frames() {
 fn reveal_to(ctx: &egui::Context, tab: &mut SearchTab, to: f32) -> egui::FullOutput {
     for _ in 0..200 {
         let out = run_frame(ctx, tab, vec![]);
-        if tab.wipe <= to {
+        if tab.cover <= to {
             return out;
         }
     }
@@ -626,9 +603,9 @@ fn clearing_results_paints_no_scrim() {
         assert!(
             crate::test_ui::painted_meshes(&out).is_empty(),
             "no scrim while the old results clear, at fade {}",
-            tab.fade
+            tab.opacity
         );
-        dimmest = dimmest.min(tab.fade);
+        dimmest = dimmest.min(tab.opacity);
     }
     assert!(
         dimmest < 0.35,
@@ -636,7 +613,7 @@ fn clearing_results_paints_no_scrim() {
     );
 }
 
-/// The scrim carries its own alpha — painted through the `Ui` it would be
+/// The scrim carries its own alpha: painted through the `Ui` it would be
 /// scaled by the section opacity, which is exactly zero on this frame.
 #[test]
 fn new_results_start_completely_covered() {
@@ -647,7 +624,7 @@ fn new_results_start_completely_covered() {
     tab.on_search_started(1);
     stage_results(&mut tab);
     let swapped = swap_in(&ctx, &mut tab);
-    assert_eq!(tab.wipe, 1.0, "the reveal starts from the top");
+    assert_eq!(tab.cover, 1.0, "the reveal starts from the top");
 
     let ramp = scrim(&swapped);
     assert!(
@@ -750,12 +727,16 @@ fn rows_respond_over_selectable_label_text() {
     let pos = hover_row_text(&ctx, &mut tab, 0);
 
     // Left click on glyphs selects the row.
-    run_frame(&ctx, &mut tab, click(pos, egui::PointerButton::Primary));
+    run_frame(&ctx, &mut tab, click_at(pos));
     assert_eq!(tab.selected, Some(0));
 
     // Right click on glyphs selects the row and opens the context menu.
     let pos = hover_row_text(&ctx, &mut tab, 1);
-    run_frame(&ctx, &mut tab, click(pos, egui::PointerButton::Secondary));
+    run_frame(
+        &ctx,
+        &mut tab,
+        click_with(pos, egui::PointerButton::Secondary),
+    );
     assert_eq!(tab.selected, Some(1));
     assert!(egui::Popup::is_any_open(&ctx));
 }
@@ -763,6 +744,7 @@ fn rows_respond_over_selectable_label_text() {
 /// A drive root must not become the never-matching `C:\/*`.
 #[test]
 fn dir_ignore_patterns_use_the_platform_separator() {
+    use crate::ui_util::dir_ignore_pattern;
     use std::path::Path;
     #[cfg(unix)]
     {
@@ -794,7 +776,7 @@ fn the_recency_fade_ends_at_the_theme_color() {
 
 use crate::test_ui::{painted_rows, with_ui};
 
-/// The rows `job` actually lays out — `Galley::text` includes every row
+/// The rows `job` actually lays out: `Galley::text` includes every row
 /// epaint dropped at `wrap.max_rows`, so it cannot see a truncation.
 fn laid_out_rows(ui: &egui::Ui, job: LayoutJob) -> Vec<String> {
     ui.fonts(|f| f.layout_job(job))
@@ -828,7 +810,7 @@ fn the_hover_snippet_keeps_the_match_when_the_lead_in_is_all_newlines() {
             "the match never made it on screen: {rows:#?}"
         );
         // Trimmed at a line boundary and said so: a start landing mid
-        // character would read "…afé" — or panic off a char boundary.
+        // character would read "…afé", or panic off a char boundary.
         assert_eq!(rows[0], "… café", "{rows:#?}");
     });
 }
@@ -898,11 +880,7 @@ fn the_content_match_cell_stays_inside_its_column() {
 #[test]
 fn hovering_the_content_match_cell_shows_the_match_in_the_tooltip() {
     let ctx = crate::test_ui::ctx();
-    // Testing that the tooltip carries the match, not egui's hover timing.
-    ctx.style_mut(|s| {
-        s.interaction.tooltip_delay = 0.0;
-        s.interaction.show_tooltips_only_when_still = false;
-    });
+    instant_tooltips(&ctx);
     let mut tab = tab_with_results(1);
     tab.results[0].stage = 6; // a full-text stage
     tab.results[0].snippet = Some(ragged_snippet(40));
@@ -1099,7 +1077,7 @@ fn fixed_columns_shrink_only_once_the_flex_ones_have_bottomed_out() {
     );
 }
 
-/// Including the space freed by narrowing, the case that used to leave a
+/// Including the space freed by narrowing, which must not be left as a
 /// blank strip down the right of the table.
 #[test]
 fn a_dragged_column_is_taken_as_given_and_the_rest_absorb() {
@@ -1188,30 +1166,17 @@ fn refitting_without_a_measurement_splits_the_budget_evenly() {
     assert!(fit_widths(&[], &[], 400.0).is_empty());
 }
 
-/// The bug this exists for: `egui_extras` reloads a resizable column as
-/// `Size::exact(stored_width)`, so nothing re-fits on its own.
+/// `egui_extras` reloads a resizable column as `Size::exact(stored_width)`,
+/// so nothing re-fits on its own.
 #[test]
 fn the_columns_follow_the_window_when_it_is_resized() {
     let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(3);
-    tab.columns = ColumnsConfig {
-        name: true,
-        content_match: true,
-        size: false,
-        modified: false,
-        rank: true,
-    };
 
     let width_of = |ctx: &egui::Context, tab: &mut SearchTab, w: f32| -> Vec<f32> {
         // The first frame lays out at the new width, the second measures it.
-        for _ in 0..2 {
-            let input = crate::test_ui::raw_input(egui::vec2(w, 700.0), Vec::new());
-            let _ = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    tab.ui(ui);
-                });
-            });
-        }
+        frame_at(ctx, tab, w, vec![]);
+        frame_at(ctx, tab, w, vec![]);
         tab.col_widths.clone()
     };
 
@@ -1238,103 +1203,77 @@ fn the_columns_follow_the_window_when_it_is_resized() {
     );
 }
 
-/// Once the table fills its window, a column can only be widened by
-/// narrowing another first.
-#[test]
-fn a_column_cannot_be_dragged_wider_than_the_slack_that_is_left() {
-    let p = flex(&[(80.0, 220.0), (120.0, 260.0)]);
-    let budget = 400.0;
-    let current = fit_widths(&[200.0, 200.0], &p, budget);
-    let slack = budget - current.iter().sum::<f32>();
-    assert!(slack.abs() < 0.01, "the fixture must start full: {slack}");
-
-    // This is the bound the table hands egui_extras as `at_most`.
-    for (&w, plan) in current.iter().zip(&p) {
-        let at_most = (w + slack).max(plan.floor);
-        assert!(
-            at_most <= w + 0.01,
-            "a full table still offered {at_most} of room for a {w} column"
-        );
+/// Holds the primary button down on the divider at `from`, then moves it by
+/// each of `steps` in turn, running `settle` empty frames after each move.
+/// Returns the column widths after the press and after every step; the
+/// button stays down.
+fn drag_divider(
+    ctx: &egui::Context,
+    tab: &mut SearchTab,
+    width: f32,
+    from: egui::Pos2,
+    steps: &[f32],
+    settle: usize,
+) -> Vec<Vec<f32>> {
+    let press = crate::test_ui::button(from, egui::PointerButton::Primary, true);
+    frame_at(
+        ctx,
+        tab,
+        width,
+        vec![egui::Event::PointerMoved(from), press],
+    );
+    let mut widths = vec![tab.col_widths.clone()];
+    let mut x = from.x;
+    for dx in steps {
+        x += dx;
+        let moved = egui::Event::PointerMoved(egui::pos2(x, from.y));
+        frame_at(ctx, tab, width, vec![moved]);
+        for _ in 0..settle {
+            frame_at(ctx, tab, width, vec![]);
+        }
+        widths.push(tab.col_widths.clone());
     }
+    widths
 }
 
 /// End to end through egui_extras' own drag handling: haul the first
 /// column's handle far past the window's edge. The contract is where the
-/// table *settles*, not every frame between — egui_extras lays out from
+/// table *settles*, not every frame between: egui_extras lays out from
 /// widths stored a frame earlier, so each 400pt step is settled before
-/// measuring.
+/// measuring. Settling is a fixed count of frames, not "until two agree":
+/// the total sits unchanged while the measurement and reflow are in the
+/// pipeline, so the first repeat is premature.
 #[test]
 fn dragging_a_column_cannot_push_the_table_off_the_edge() {
     const W: f32 = 900.0;
     const STEP: f32 = 400.0;
+    const SETTLE: usize = 8;
     let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(3);
-    tab.columns = ColumnsConfig {
-        name: true,
-        content_match: true,
-        size: false,
-        modified: false,
-        rank: true,
-    };
 
-    fn frame(ctx: &egui::Context, tab: &mut SearchTab, events: Vec<egui::Event>) {
-        frame_at(ctx, tab, W, events);
+    for _ in 0..SETTLE {
+        frame_at(&ctx, &mut tab, W, vec![]);
     }
-    fn total(tab: &SearchTab) -> f32 {
-        tab.col_widths.iter().sum()
-    }
-    /// A fixed count, not "stop when two frames agree": the total sits
-    /// unchanged for the frames the measurement and reflow spend in the
-    /// pipeline, so stopping on the first repeat is premature.
-    fn settle(ctx: &egui::Context, tab: &mut SearchTab) -> f32 {
-        for _ in 0..8 {
-            frame(ctx, tab, Vec::new());
-        }
-        total(tab)
-    }
-    let settled = settle(&ctx, &mut tab);
+    let settled: f32 = tab.col_widths.iter().sum();
     assert!(settled <= W, "the fixture starts overflowing: {settled}");
 
     // The Name column's right edge, then a drag far beyond the window.
-    let handle_x = tab.col_widths[0] + 10.0;
-    let y = 60.0;
-    frame(
-        &ctx,
-        &mut tab,
-        vec![
-            egui::Event::PointerMoved(egui::pos2(handle_x, y)),
-            egui::Event::PointerButton {
-                pos: egui::pos2(handle_x, y),
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: Default::default(),
-            },
-        ],
-    );
-    for step in 1..=8 {
-        let x = handle_x + step as f32 * STEP;
-        frame(
-            &ctx,
-            &mut tab,
-            vec![egui::Event::PointerMoved(egui::pos2(x, y))],
-        );
-        let total = settle(&ctx, &mut tab);
+    let handle = egui::pos2(tab.col_widths[0] + 10.0, 60.0);
+    let widths = drag_divider(&ctx, &mut tab, W, handle, &[STEP; 8], SETTLE);
+    for step in &widths[1..] {
+        let total: f32 = step.iter().sum();
         assert!(
             total <= W + 1.0,
             "the drag settled at {total} inside a {W} window"
         );
     }
-    frame(
-        &ctx,
-        &mut tab,
-        vec![egui::Event::PointerButton {
-            pos: egui::pos2(handle_x + 8.0 * STEP, y),
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: Default::default(),
-        }],
-    );
-    let total = settle(&ctx, &mut tab);
+    let release_at = egui::pos2(handle.x + 8.0 * STEP, handle.y);
+    let release = crate::test_ui::button(release_at, egui::PointerButton::Primary, false);
+    frame_at(&ctx, &mut tab, W, vec![release]);
+    for _ in 0..SETTLE {
+        frame_at(&ctx, &mut tab, W, vec![]);
+    }
+    let total: f32 = tab.col_widths.iter().sum();
     assert!(total <= W + 1.0, "released at {total} inside a {W} window");
     assert!(
         total >= settled - 1.0,
@@ -1355,7 +1294,7 @@ fn dragging_a_column_cannot_push_the_table_off_the_edge() {
 
 /// The property the whole drag rests on: a divider drag must not move any
 /// column to its left, or the divider walks away from the cursor (see
-/// `fit_around`) — which is what made dragging uncontrollable.
+/// `fit_around`) and dragging becomes uncontrollable.
 #[test]
 fn a_drag_leaves_every_column_to_its_left_alone() {
     let plans = text_and_rank();
@@ -1437,71 +1376,35 @@ fn the_ceiling_is_what_the_columns_to_the_right_can_give() {
     assert_eq!(&after[1..], &[120.0, 120.0, 40.0]);
 }
 
-/// The two symptoms as reported: widening did nothing at all, and the split
-/// would not stay under the cursor.
+/// Widening a column works, and the split stays under the cursor.
 #[test]
 fn a_dragged_divider_widens_its_column_and_stays_under_the_cursor() {
     const W: f32 = 1000.0;
     let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(3);
-    tab.columns = ColumnsConfig {
-        name: true,
-        content_match: true,
-        size: false,
-        modified: false,
-        rank: true,
-    };
-
-    fn frame(ctx: &egui::Context, tab: &mut SearchTab, events: Vec<egui::Event>) {
-        frame_at(ctx, tab, W, events);
-    }
     for _ in 0..4 {
-        frame(&ctx, &mut tab, Vec::new());
+        frame_at(&ctx, &mut tab, W, vec![]);
     }
     let started_at = tab.col_widths[0];
 
     // The Name|Path divider; egui's grab radius covers the panel margin.
-    let y = 60.0;
-    let grab = tab.col_widths[0] + 10.0;
-    frame(
-        &ctx,
-        &mut tab,
-        vec![
-            egui::Event::PointerMoved(egui::pos2(grab, y)),
-            egui::Event::PointerButton {
-                pos: egui::pos2(grab, y),
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: Default::default(),
-            },
-        ],
-    );
+    let grab = egui::pos2(tab.col_widths[0] + 10.0, 60.0);
+    let widths = drag_divider(&ctx, &mut tab, W, grab, &[20.0; 10], 1);
 
     // Comparing *deltas* is independent of the panel margin, and is the
-    // exact statement of "the split stays under the cursor".
-    let mut x = grab;
-    for step in 1..=10 {
-        let before = tab.col_widths[0];
-        x += 20.0;
-        frame(
-            &ctx,
-            &mut tab,
-            vec![egui::Event::PointerMoved(egui::pos2(x, y))],
+    // exact statement of "the split stays under the cursor". The first step
+    // also takes up the grab-radius slack; every step after that is pure
+    // tracking.
+    for (step, pair) in widths.windows(2).enumerate().skip(1) {
+        let moved = pair[1][0] - pair[0][0];
+        assert!(
+            (moved - 20.0).abs() < 0.5,
+            "step {}: the pointer moved 20 and the divider moved {moved}",
+            step + 1
         );
-        frame(&ctx, &mut tab, Vec::new());
-        let moved = tab.col_widths[0] - before;
-        // The first step also takes up the grab-radius slack; every step
-        // after that is pure tracking.
-        if step > 1 {
-            assert!(
-                (moved - 20.0).abs() < 0.5,
-                "step {step}: the pointer moved 20 and the divider moved {moved}"
-            );
-        }
     }
 
-    // Before the fix the ceiling was the column's own width, so widening
-    // was clamped away on every frame.
+    // A ceiling at the column's own width would clamp every widening away.
     assert!(
         tab.col_widths[0] > started_at + 150.0,
         "the drag barely widened the column: {started_at} to {}",
@@ -1542,8 +1445,7 @@ fn the_path_column_survives_every_column_combination() {
     }
 }
 
-/// A checked box that paints nothing is indistinguishable from a bug, which
-/// is what the last one was taken for.
+/// A checked box that paints nothing is indistinguishable from a bug.
 #[test]
 fn the_content_match_column_follows_only_its_checkbox() {
     let ctx = crate::test_ui::ctx();
@@ -1587,7 +1489,11 @@ fn right_clicking_any_header_opens_the_column_picker() {
         let out = run_frame(&ctx, &mut tab, vec![]);
         let pos = painted_text_center(&out, header)
             .unwrap_or_else(|| panic!("no {header} header painted"));
-        run_frame(&ctx, &mut tab, click(pos, egui::PointerButton::Secondary));
+        run_frame(
+            &ctx,
+            &mut tab,
+            click_with(pos, egui::PointerButton::Secondary),
+        );
         assert!(
             egui::Popup::is_any_open(&ctx),
             "right-clicking {header} opened no menu"
@@ -1635,7 +1541,7 @@ fn a_name_snippet_that_is_not_the_name_paints_no_highlight() {
     let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     let mut hit = name_hit("a_very_long_quarterly_budget_report.txt", (0, 6));
-    // What `window_around` used to hand back: a suffix, with rebased ranges.
+    // A suffix of the name, with rebased ranges.
     hit.snippet = Some(Snippet {
         window: "budget_report.txt".to_string(),
         ranges: vec![(0, 6)],
@@ -1761,14 +1667,7 @@ fn the_repeat_button_tracks_the_search_it_would_repeat() {
         "while running"
     );
 
-    tab.apply_update(
-        SearchUpdate::Completed {
-            generation: 1,
-            total: 1,
-            limited: false,
-        },
-        1000,
-    );
+    complete(&mut tab, 1, 1);
     assert!(
         has_button(&run_frame(&ctx, &mut tab, vec![])),
         "after completion"
@@ -1784,14 +1683,7 @@ fn the_repeat_button_tracks_the_search_it_would_repeat() {
 fn completed_tab(ctx: &egui::Context) -> SearchTab {
     let mut tab = tab_with_results(1);
     tab.on_search_started(1);
-    tab.apply_update(
-        SearchUpdate::Completed {
-            generation: 1,
-            total: 1,
-            limited: false,
-        },
-        1000,
-    );
+    complete(&mut tab, 1, 1);
     run_frame(ctx, &mut tab, vec![]);
     tab
 }
@@ -1807,8 +1699,8 @@ fn clicking_the_repeat_button_asks_for_a_rerun() {
 }
 
 /// egui derives widget ids from how many widgets precede them; a renamed
-/// `TextEdit` silently loses focus. Typing is the assertion that matters —
-/// an id comparison would pass even if focus was dropped and handed back.
+/// `TextEdit` silently loses focus. Typing is the assertion that matters: an
+/// id comparison would pass even if focus was dropped and handed back.
 #[test]
 fn the_repeat_button_does_not_steal_the_query_box() {
     let ctx = crate::test_ui::ctx();
@@ -1819,14 +1711,7 @@ fn the_repeat_button_does_not_steal_the_query_box() {
 
     // Finish a search, so the button appears between two frames of typing.
     tab.on_search_started(1);
-    tab.apply_update(
-        SearchUpdate::Completed {
-            generation: 1,
-            total: 1,
-            limited: false,
-        },
-        1000,
-    );
+    complete(&mut tab, 1, 1);
     let out = run_frame(&ctx, &mut tab, vec![]);
     assert!(painted_text(&out).contains(&"↻".to_string()));
 
@@ -1845,27 +1730,13 @@ fn the_query_text_does_not_shift_when_the_repeat_button_appears() {
     let mut tab = tab_with_results(1);
     tab.query = "alpha".into();
 
-    let rect_of = |out: &egui::FullOutput| {
-        painted(out)
-            .into_iter()
-            .find(|(text, _)| text == "alpha")
-            .map(|(_, rect)| rect)
-            .expect("the query text was not painted")
-    };
-    let without = rect_of(&run_frame(&ctx, &mut tab, vec![]));
+    let without = painted_rect(&run_frame(&ctx, &mut tab, vec![]), "alpha");
 
     tab.on_search_started(1);
-    tab.apply_update(
-        SearchUpdate::Completed {
-            generation: 1,
-            total: 1,
-            limited: false,
-        },
-        1000,
-    );
+    complete(&mut tab, 1, 1);
     let out = run_frame(&ctx, &mut tab, vec![]);
     assert!(painted_text(&out).contains(&"↻".to_string()));
-    assert_eq!(without, rect_of(&out), "the query text moved");
+    assert_eq!(without, painted_rect(&out, "alpha"), "the query text moved");
 }
 
 /// Left to right: syntax help, the box, how long the search took, then Fuzzy.
@@ -1893,7 +1764,7 @@ fn the_query_strip_reads_help_box_duration_fuzzy() {
 }
 
 /// The query strip's timing readout, found by its units. No other cell ends
-/// this way — `human_size` writes " B"/" KB", and the count reads "3 results".
+/// this way: `human_size` writes " B"/" KB", and the count reads "3 results".
 fn duration_readout(out: &egui::FullOutput) -> String {
     let painted = painted_text(out);
     painted
@@ -1910,22 +1781,14 @@ fn the_readout_reports_the_first_result_and_the_last_pass() {
     let ctx = crate::test_ui::ctx();
     let mut tab = tab_with_results(1);
     tab.on_search_started(1);
-    tab.apply_update(
-        SearchUpdate::Hits {
-            generation: 1,
-            hits: vec![hit(1, "alpha_widget_0.txt", 3.0, 116)],
-        },
+    send_hits(
+        &mut tab,
+        1,
+        vec![hit(1, "alpha_widget_0.txt", 3.0, 116)],
         1000,
     );
     let first = tab.first_hit.expect("no first-result time recorded");
-    tab.apply_update(
-        SearchUpdate::Completed {
-            generation: 1,
-            total: 1,
-            limited: false,
-        },
-        1000,
-    );
+    complete(&mut tab, 1, 1);
     assert!(
         tab.elapsed.expect("no completion time") >= first,
         "completion came before the first result"
@@ -1945,24 +1808,12 @@ fn timed_tab(ctx: &egui::Context, hits: usize) -> SearchTab {
     let mut tab = tab_with_results(hits);
     tab.on_search_started(1);
     if hits > 0 {
-        tab.apply_update(
-            SearchUpdate::Hits {
-                generation: 1,
-                hits: (0..hits)
-                    .map(|i| hit(i as i64, &format!("alpha_widget_{i}.txt"), 3.0, 116))
-                    .collect(),
-            },
-            1000,
-        );
+        let batch = (0..hits)
+            .map(|i| hit(i as i64, &format!("alpha_widget_{i}.txt"), 3.0, 116))
+            .collect();
+        send_hits(&mut tab, 1, batch, 1000);
     }
-    tab.apply_update(
-        SearchUpdate::Completed {
-            generation: 1,
-            total: hits,
-            limited: false,
-        },
-        1000,
-    );
+    complete(&mut tab, 1, hits);
     run_frame(ctx, &mut tab, vec![]);
     tab
 }
@@ -1973,41 +1824,20 @@ fn timed_tab(ctx: &egui::Context, hits: usize) -> SearchTab {
 fn readout_and_pointer(ctx: &egui::Context, tab: &mut SearchTab) -> (String, egui::Pos2) {
     let out = run_frame(ctx, tab, vec![]);
     let readout = duration_readout(&out);
-    let rect = crate::test_ui::painted(&out)
-        .into_iter()
-        .find(|(t, _)| *t == readout)
-        .map(|(_, r)| r)
-        .expect("the readout was not painted");
+    let rect = painted_rect(&out, &readout);
     (readout, egui::pos2(rect.left() + 2.0, rect.center().y))
-}
-
-/// Whether hovering `pos` brings up `tip`. The tooltip is its own area, so it
-/// may land a frame or two behind the pointer.
-fn hover_shows(ctx: &egui::Context, tab: &mut SearchTab, pos: egui::Pos2, tip: &str) -> bool {
-    let mut out = run_frame(ctx, tab, vec![egui::Event::PointerMoved(pos)]);
-    for _ in 0..3 {
-        if painted_text(&out).iter().any(|t| t == tip) {
-            return true;
-        }
-        out = run_frame(ctx, tab, vec![]);
-    }
-    false
 }
 
 /// Two bare numbers separated by a slash explain nothing on their own.
 #[test]
 fn hovering_the_readout_says_what_the_times_are() {
     let ctx = crate::test_ui::ctx();
-    // Testing that the tooltip is wired up, not egui's hover timing.
-    ctx.style_mut(|s| {
-        s.interaction.tooltip_delay = 0.0;
-        s.interaction.show_tooltips_only_when_still = false;
-    });
+    instant_tooltips(&ctx);
 
     let mut tab = timed_tab(&ctx, 1);
     let (readout, pos) = readout_and_pointer(&ctx, &mut tab);
     assert!(
-        hover_shows(&ctx, &mut tab, pos, TIMES_TIP),
+        hover_shows(|events| run_frame(&ctx, &mut tab, events), pos, TIMES_TIP),
         "hovering {readout:?} explained nothing"
     );
 
@@ -2015,7 +1845,11 @@ fn hovering_the_readout_says_what_the_times_are() {
     let mut tab = timed_tab(&ctx, 0);
     let (readout, pos) = readout_and_pointer(&ctx, &mut tab);
     assert!(
-        hover_shows(&ctx, &mut tab, pos, TOTAL_ONLY_TIP),
+        hover_shows(
+            |events| run_frame(&ctx, &mut tab, events),
+            pos,
+            TOTAL_ONLY_TIP
+        ),
         "hovering {readout:?} still promised a first result"
     );
 }
@@ -2028,41 +1862,17 @@ fn the_first_result_time_is_the_first_one() {
     tab.on_search_started(2);
 
     // From the search before this one.
-    tab.apply_update(
-        SearchUpdate::Hits {
-            generation: 1,
-            hits: vec![hit(1, "stale.txt", 3.0, 10)],
-        },
-        1000,
-    );
+    send_hits(&mut tab, 1, vec![hit(1, "stale.txt", 3.0, 10)], 1000);
     assert_eq!(tab.first_hit, None, "a stale batch started the clock");
 
     // An empty batch is not a result.
-    tab.apply_update(
-        SearchUpdate::Hits {
-            generation: 2,
-            hits: vec![],
-        },
-        1000,
-    );
+    send_hits(&mut tab, 2, vec![], 1000);
     assert_eq!(tab.first_hit, None, "an empty batch counted as a result");
 
-    tab.apply_update(
-        SearchUpdate::Hits {
-            generation: 2,
-            hits: vec![hit(2, "first.txt", 3.0, 10)],
-        },
-        1000,
-    );
+    send_hits(&mut tab, 2, vec![hit(2, "first.txt", 3.0, 10)], 1000);
     let first = tab.first_hit.expect("no first-result time recorded");
     std::thread::sleep(std::time::Duration::from_millis(2));
-    tab.apply_update(
-        SearchUpdate::Hits {
-            generation: 2,
-            hits: vec![hit(3, "second.txt", 3.0, 10)],
-        },
-        1000,
-    );
+    send_hits(&mut tab, 2, vec![hit(3, "second.txt", 3.0, 10)], 1000);
     assert_eq!(tab.first_hit, Some(first), "a later batch moved the clock");
 
     // And the next search starts over.
@@ -2083,7 +1893,7 @@ fn a_search_that_found_nothing_shows_one_time() {
     );
 }
 
-/// The fixed slot is what keeps the query box from resizing when a search
+/// The fixed slot keeps the query box from resizing when a search
 /// finishes; a readout wider than it would shove the box sideways.
 #[test]
 fn the_duration_readout_fits_its_slot() {
@@ -2126,11 +1936,7 @@ fn the_fuzzy_label_is_left_of_its_box_and_still_toggles() {
     let ctx = crate::test_ui::ctx();
     let mut tab = completed_tab(&ctx);
     let out = run_frame(&ctx, &mut tab, vec![]);
-    let label = painted(&out)
-        .into_iter()
-        .find(|(t, _)| t == "Fuzzy")
-        .map(|(_, r)| r)
-        .expect("no Fuzzy label");
+    let label = painted_rect(&out, "Fuzzy");
 
     // Sweep for the box rather than assume how wide egui draws it.
     let before = tab.fuzzy;
@@ -2167,9 +1973,7 @@ fn a_capped_count_says_so_without_the_word_truncated() {
     assert_eq!(tab.result_count_label().as_deref(), Some("3 results"));
 
     tab.limited = true;
-    let label = tab.result_count_label().expect("a label");
-    assert_eq!(label, "3+ results");
-    assert!(!label.contains("truncated"), "{label}");
+    assert_eq!(tab.result_count_label().as_deref(), Some("3+ results"));
 }
 
 /// The in-tab notice is the one with room to explain the cap.
@@ -2187,8 +1991,8 @@ fn the_in_tab_notice_still_explains_the_cap() {
 
 // --- Live results ---------------------------------------------------------
 
-/// Only the rows actually rendered are watched — the request is explicit that
-/// it is the visible set, not everything the search returned.
+/// Only the rows actually rendered are watched: the visible set, not
+/// everything the search returned.
 #[test]
 fn only_the_rendered_rows_are_offered_for_watching() {
     let ctx = crate::test_ui::ctx();
@@ -2204,7 +2008,7 @@ fn only_the_rendered_rows_are_offered_for_watching() {
     assert!(!targets.is_empty());
     assert!(
         targets.len() < 100,
-        "{} of 500 rows were watched — that is not the visible set",
+        "{} of 500 rows were watched, which is not the visible set",
         targets.len()
     );
 }
@@ -2296,9 +2100,9 @@ fn the_watch_set_is_the_paths_and_the_tier_and_not_the_baseline() {
     );
 }
 
-/// The bug a rename used to hit: the row's path changes but its position does
-/// not, so anything keyed on row indices would decide nothing had moved and
-/// leave the watcher pointed at a file that is no longer there.
+/// A rename changes the row's path but not its position, so anything keyed
+/// on row indices would decide nothing had moved and leave the watcher
+/// pointed at a file that is no longer there.
 #[test]
 fn a_renamed_row_is_re_armed_at_its_new_path() {
     let ctx = crate::test_ui::ctx();
@@ -2325,9 +2129,9 @@ fn a_renamed_row_is_re_armed_at_its_new_path() {
     );
 }
 
-/// The baseline the watcher sweeps against is what the row is *displaying* —
-/// which on a fresh result is what the index said. That is what turns arming
-/// into a check of the index against the disk.
+/// The baseline the watcher sweeps against is what the row is *displaying*,
+/// which on a fresh result is what the index said; that turns arming into a
+/// check of the index against the disk.
 #[test]
 fn a_target_carries_what_the_row_is_displaying() {
     let ctx = crate::test_ui::ctx();
@@ -2347,7 +2151,7 @@ fn a_target_carries_what_the_row_is_displaying() {
 }
 
 /// A rename lands from the filesystem event itself. The row keeps its place,
-/// its identity and its rank — only what it says about the file changes.
+/// its identity and its rank; only what it says about the file changes.
 #[test]
 fn a_rename_updates_the_row_in_place() {
     let mut tab = tab_with_results(2);
@@ -2384,7 +2188,7 @@ fn a_vanished_file_is_struck_through_and_comes_back() {
     let mut tab = tab_with_results(1);
     let path = tab.results[0].path.clone();
 
-    // The *name* run, exactly — the path column paints the filename as well,
+    // The *name* run, exactly: the path column paints the filename as well,
     // as part of a longer run and never weak.
     let name_is_weak = |out: &egui::FullOutput| {
         let weak = ctx.style().visuals.weak_text_color();
@@ -2441,9 +2245,9 @@ fn a_content_change_repaints_the_highlight() {
     );
 }
 
-/// The watcher re-cuts a content row's window from the file, so `None` is not
-/// "nothing to say" — it is "the body stopped matching", and the cell has to
-/// fall back to its dash rather than keep showing text that is no longer a hit.
+/// The watcher re-cuts a content row's window from the file, so `NoMatch`
+/// means "the body stopped matching", and the cell has to fall back to its
+/// dash rather than keep showing text that is no longer a hit.
 #[test]
 fn an_edit_that_removes_the_match_clears_the_content_cell() {
     let ctx = crate::test_ui::ctx();
@@ -2473,7 +2277,7 @@ fn an_edit_that_removes_the_match_clears_the_content_cell() {
 }
 
 /// A name-tier row's snippet *is* its filename, not its body, so a write must
-/// not take it away — only the content tiers hand over an authoritative window.
+/// not take it away; only the content tiers hand over an authoritative window.
 #[test]
 fn a_content_change_leaves_a_name_hit_s_snippet_alone() {
     let mut tab = tab_with_results(1);
@@ -2493,7 +2297,7 @@ fn a_content_change_leaves_a_name_hit_s_snippet_alone() {
 }
 
 /// The Name column is optional, so it cannot be the only place a vanished file
-/// says so. With it hidden, the path — which is always shown — carries it.
+/// says so. With it hidden, the path, which is always shown, carries it.
 #[test]
 fn a_vanished_file_is_legible_with_the_name_column_hidden() {
     let ctx = crate::test_ui::ctx();
@@ -2521,8 +2325,8 @@ fn a_vanished_file_is_legible_with_the_name_column_hidden() {
 }
 
 /// One frame with the tour on screen, and where each of `wanted` ended up.
-/// Read inside the pass, which is the only place a mark is live — and the
-/// only place the tour itself ever reads one.
+/// Read inside the pass, the only place a mark is live and the only place
+/// the tour itself ever reads one.
 fn frame_spotlit(
     ctx: &egui::Context,
     tab: &mut SearchTab,
@@ -2541,16 +2345,6 @@ fn frame_spotlit(
             .collect();
     });
     (out, found)
-}
-
-/// Where a string was painted; the tour's glow has to land on the widget the
-/// user is being told to look at, not near it.
-fn painted_rect(out: &egui::FullOutput, needle: &str) -> egui::Rect {
-    crate::test_ui::painted(out)
-        .into_iter()
-        .find(|(text, _)| text == needle)
-        .map(|(_, rect)| rect)
-        .unwrap_or_else(|| panic!("nothing painted for {needle:?}"))
 }
 
 #[test]

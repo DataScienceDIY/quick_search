@@ -90,7 +90,7 @@ impl Throttle {
         self.seen.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// How many went unlogged — what a summary line should report.
+    /// How many went unlogged: what a summary line should report.
     pub fn suppressed(&self) -> u64 {
         self.seen().saturating_sub(self.limit)
     }
@@ -106,7 +106,7 @@ pub fn snapshot() -> Vec<LogLine> {
 }
 
 /// Lines recorded since the process started, including ones since dropped.
-/// Only ever grows — the cheap "anything new?" poll.
+/// Only ever grows: the cheap "anything new?" poll.
 pub fn recorded() -> u64 {
     lock().recorded
 }

@@ -1,46 +1,35 @@
 //! The Help tab: what QuickSearch is, how to start, how results are ranked
-//! and what ends up in the index. Anything belonging to one control lives on
-//! that control's hover tip (`tips.rs`); the query language lives in the
-//! Search tab's syntax window; the complete technical reference stays in
-//! README.md.
+//! and what ends up in the index. A control's own help lives on its hover tip
+//! (`tips.rs`), and the query language in the Search tab's syntax window;
+//! README.md covers building, installing and configuring.
 
 use crate::ui_util::hint;
 
 /// Returns true when the "Show the introduction again" button was clicked.
 pub fn ui(ui: &mut egui::Ui) -> bool {
     let mut replay = false;
-    // Cap the column like a document page: a maximized window would
-    // otherwise stretch every paragraph into one long line. Only ever a cap,
-    // never a floor: `set_max_width` widens a `Ui` as readily as it narrows
-    // one, and text laid out wider than the panel is *clipped* by the scroll
-    // area rather than wrapped, so the ends of the lines simply vanish.
-    //
-    // Measured out here, on the panel: inside a vertical `ScrollArea` the
-    // content `Ui` is free to be wider than the viewport, so its own
-    // `available_width` is no guide to what will be visible. The bar's
-    // allocation comes off the top, or the last few characters of every line
-    // would sit under it (zero while the bars float, as they do by default).
+    // A page-like column, so a maximized window does not stretch paragraphs
+    // into single lines. Only ever a cap: `set_max_width` widens as readily
+    // as it narrows, and text wider than the panel is clipped, not wrapped.
+    // Measured here because a `ScrollArea`'s content may be wider than its
+    // viewport; the scroll bar's width comes off the top.
     let column = (ui.available_width() - ui.spacing().scroll.allocated_width()).min(620.0);
     let scroll = egui::ScrollArea::vertical()
         .auto_shrink([false; 2])
         .show(ui, |ui| {
             ui.set_max_width(column);
 
-            ui.heading(egui::RichText::new("Welcome to QuickSearch").strong());
-            ui.add_space(4.0);
+            section_heading(ui, "Welcome to QuickSearch");
             ui.label(
-                "QuickSearch is a search engine for the files on this computer \
-                 and for the text inside them. It reads through your folders \
-                 once, remembers what it found, and then answers from what it \
-                 remembers rather than by going back to the disk. That is why \
-                 results appear as fast as you can type, across hundreds of \
-                 thousands of files.",
+                "QuickSearch searches the files on this computer and the text \
+                 inside them. It reads your folders once and answers from that \
+                 index instead of the disk, so results appear as you type, even \
+                 across hundreds of thousands of files.",
             );
             ui.add_space(4.0);
             ui.label(
-                "It never connects to the internet and nothing ever leaves this \
-                 computer. What it remembers can be encrypted with a password, \
-                 from the Settings tab.",
+                "It never connects to the internet. The index can be encrypted \
+                 with a password from the Settings tab.",
             );
 
             ui.add_space(6.0);
@@ -49,10 +38,7 @@ pub fn ui(ui: &mut egui::Ui) -> bool {
             link(ui, "https://quicksearch.karsttech.com");
             link(ui, "https://code.karsttech.com/jeremy/quick_search");
             ui.add_space(6.0);
-            ui.label(
-                "The code is also mirrored to GitHub for easier bug reporting \
-                 and issue tracking:",
-            );
+            ui.label("The code is also mirrored to GitHub for bug reports and issues:");
             link(ui, "https://github.com/DataScienceDIY/quick_search");
 
             ui.add_space(6.0);
@@ -62,62 +48,52 @@ pub fn ui(ui: &mut egui::Ui) -> bool {
 
             ui.add_space(6.0);
             ui.label(hint(
-                "Where to look for what: hover any control for what that one \
-                 control does and what to set it to. This tab covers the ideas \
-                 behind them. The ? button beside the search box covers the \
-                 query language. README.md is the complete reference.",
+                "Hover any control to see what it does and what to set it to. \
+                 This tab covers the ideas behind them; the ? button beside the \
+                 search box covers the query language.",
             ));
 
             ui.add_space(12.0);
-            ui.heading(egui::RichText::new("Getting started").strong());
-            ui.add_space(4.0);
+            section_heading(ui, "Getting started");
             ui.label(
-                "1.  The first time QuickSearch runs it starts indexing your home \
-                 folder on its own. The status bar along the bottom shows the \
-                 progress, and searching already works while it runs, though a \
-                 file it has not reached yet cannot appear until it does.",
+                "1.  On first run QuickSearch indexes your home folder. The status \
+                 bar shows progress; you can search meanwhile, but files not yet \
+                 reached won't appear.",
             );
             ui.label(
-                "2.  To search other places, open the Manage Index tab and add them \
-                 to the folder list. Indexed folders are watched, so the index \
-                 follows your files as they change, and adding one leaves \
-                 everything already indexed alone.",
+                "2.  To search other places, add them on the Manage Index tab. \
+                 Indexed folders are watched, so the index keeps up as files \
+                 change.",
             );
             ui.label(
                 "3.  Type in the search box on the Search tab. Results appear as \
                  you type, best matches first.",
             );
             ui.label(
-                "4.  If the index grows larger than you would like, narrow it with \
-                 the two filters under Content filters on the Manage Index tab. \
-                 They are explained under What gets indexed, below.",
+                "4.  To shrink the index, use the Content filters on the Manage \
+                 Index tab (see What gets indexed, below).",
             );
 
             ui.add_space(12.0);
-            ui.heading(egui::RichText::new("Searching").strong());
-            ui.add_space(4.0);
-            ui.label("Plain words match file names, file contents, and paths:");
+            section_heading(ui, "Searching");
+            ui.label("Plain words match names, contents and paths:");
             ui.monospace("quarterly budget");
-            ui.label(
-                "Filters narrow the results and combine freely with the search \
-                 words:",
-            );
+            ui.label("Filters narrow the results and combine with the words:");
             ui.monospace("type:Document modified:>=2024-01-01 report");
             ui.label("The ? button left of the search box shows the full query syntax.");
             ui.add_space(6.0);
             ui.label(
-                "•  A match in a file's name or path is highlighted in that \
-                 column; a match in its contents shows a snippet of the \
-                 surrounding text in the Content Match column, with the rest on \
-                 hover.",
+                "•  A match in a name or path is highlighted in that column; a \
+                 match in the contents shows the surrounding text in the Content \
+                 Match column, with more on hover.",
             );
             ui.label(
-                "•  Right-click a result to open it, open its containing folder, \
+                "•  Right-click a result to open it or its folder, copy its path, \
                  or hide files like it from the results.",
             );
             ui.label(
                 "•  Click a column header to sort by it; right-click any header to \
-                 choose which columns are shown.",
+                 choose the columns shown.",
             );
 
             ui.add_space(12.0);
@@ -130,68 +106,41 @@ pub fn ui(ui: &mut egui::Ui) -> bool {
             duplicates_section(ui);
 
             ui.add_space(12.0);
-            ui.heading(egui::RichText::new("Updates").strong());
-            ui.add_space(4.0);
+            section_heading(ui, "Updates");
             ui.label(
-                "QuickSearch never sends anything off of your computer, so it \
-                 never updates itself automatically.",
+                "QuickSearch never sends anything off your computer, so it does \
+                 not update itself.",
             );
             ui.label("To update, install the latest version yourself from:");
             link(ui, "https://quicksearch.karsttech.com");
 
             ui.add_space(12.0);
-            ui.heading(egui::RichText::new("The other tabs").strong());
-            ui.add_space(4.0);
+            section_heading(ui, "The other tabs");
             let prose = prose_width(ui.available_width());
             egui::Grid::new("help-tabs")
                 .num_columns(2)
                 .spacing([CELL_SPACING, 5.0])
                 .show(ui, |ui| {
-                    let row = |ui: &mut egui::Ui, name: &str, what: &str| {
+                    for (name, what) in OTHER_TABS {
                         ui.strong(name);
                         cell(ui, prose, what);
                         ui.end_row();
-                    };
-                    row(
-                        ui,
-                        "Manage Index",
-                        "indexing status and controls, the indexed folder list, \
-                         and the filters that decide what is skipped",
-                    );
-                    row(
-                        ui,
-                        "Duplicates",
-                        "files that are probably identical copies of each other, \
-                         grouped; verify before deleting anything",
-                    );
-                    row(ui, "Logs", "warnings from issues during indexing");
-                    row(
-                        ui,
-                        "Settings",
-                        "everything QuickSearch can be told to do, in one \
-                         place; hover any control for what it means",
-                    );
+                    }
                 });
 
             ui.add_space(12.0);
-            ui.heading(egui::RichText::new("Terminal").strong());
-            ui.add_space(4.0);
-            ui.label("QuickSearch also searches straight from a terminal:");
+            section_heading(ui, "Terminal");
+            ui.label("QuickSearch also searches from a terminal:");
             ui.monospace("quicksearch \"quarterly budget\"");
-            ui.label(
-                "On Windows use quicksearch-cli. Either way, --help lists all \
-                 the flags.",
-            );
+            ui.label("On Windows use quicksearch-cli. Either way, --help lists the flags.");
 
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
-                // The sentence is assembled from several widgets, so the
-                // spacing between them has to come from the text itself.
+                // Several widgets make one sentence, so the spacing between
+                // them comes from the text.
                 ui.spacing_mut().item_spacing.x = 0.0;
-                let quiet = |text: &str| crate::ui_util::hint(text);
-                ui.label(quiet(
-                    "Building from source, configuration, query structuring and more \
-                     are covered in ",
+                ui.label(hint(
+                    "Building from source, installing and configuring are covered in ",
                 ));
                 if let Some(path) = readme_path() {
                     let path = path.display().to_string();
@@ -203,27 +152,78 @@ pub fn ui(ui: &mut egui::Ui) -> bool {
                         crate::platform::open_file(&path);
                     }
                 } else {
-                    ui.label(quiet("README.md"));
+                    ui.label(hint("README.md"));
                 }
-                ui.label(quiet("."));
+                ui.label(hint("."));
             });
         });
     crate::ui_util::more_below_hint(ui, &scroll);
     replay
 }
 
+/// A section's heading and the gap under it.
+fn section_heading(ui: &mut egui::Ui, text: &str) {
+    ui.heading(egui::RichText::new(text).strong());
+    ui.add_space(4.0);
+}
+
+/// The other tabs, each with what it is for.
+const OTHER_TABS: [(&str, &str); 4] = [
+    (
+        "Manage Index",
+        "indexing status and controls, the indexed folders, and the filters \
+         that decide what is skipped",
+    ),
+    (
+        "Duplicates",
+        "groups of files that are probably copies; verify before deleting",
+    ),
+    ("Logs", "warnings from indexing"),
+    (
+        "Settings",
+        "every setting in one place; hover any control for what it does",
+    ),
+];
+
+/// `(stage, tier, what)`. Each chip wears the Rank column's colour for the
+/// *first* cascade stage its tier covers (see the rank table in
+/// `search::cascade`): exact name 1–2, name contains 3–4, text inside 5–6,
+/// fuzzy 7–8, path 9–11.
+const RANKING: [(u8, &str, &str); 5] = [
+    (1, "Exact name", "the file is called exactly what you typed"),
+    (
+        3,
+        "Name contains",
+        "what you typed is somewhere in the file's name",
+    ),
+    (
+        5,
+        "Text inside",
+        "the words are in the file's contents, most mentions first",
+    ),
+    (
+        7,
+        "Close spelling",
+        "a name or some text within a typo or two of what you typed, \
+         only while Fuzzy is ticked",
+    ),
+    (
+        9,
+        "Path only",
+        "no match in the name or text, but a folder along the way matched",
+    ),
+];
+
 /// The tiers of `search::cascade`, collapsed to the ones a reader can act on:
 /// its eleven ranks pair up (exact case, then any case) everywhere but the
-/// fuzzy stages, and the pairing is an implementation detail here.
+/// fuzzy stages.
 fn ranking_section(ui: &mut egui::Ui) {
-    ui.heading(egui::RichText::new("How results are ranked").strong());
-    ui.add_space(4.0);
+    section_heading(ui, "How results are ranked");
     ui.label(
-        "Every result is placed in a tier by where it matched, and the tiers \
-         come out in this order. Within a tier, a match with the case you \
-         typed comes before one that only matches ignoring case, and a file \
-         mentioning your words more often comes before one mentioning them \
-         once.",
+        "Each result falls in a tier by where it matched, and tiers come out in \
+         this order. Within a tier, a match in the case you typed beats one \
+         that ignores case, and a file that mentions your words more often \
+         comes first.",
     );
     ui.add_space(6.0);
     let prose = prose_width(ui.available_width());
@@ -232,11 +232,7 @@ fn ranking_section(ui: &mut egui::Ui) {
         .spacing([CELL_SPACING, 5.0])
         .striped(true)
         .show(ui, |ui| {
-            // Each tier's chip wears the colour its results wear in the Rank
-            // column, keyed by the *first* cascade stage the collapsed tier
-            // covers (see the rank table in `search::cascade`): exact name
-            // 1–2, name contains 3–4, text inside 5–6, fuzzy 7–8, path 9–11.
-            let row = |ui: &mut egui::Ui, stage: u8, tier: &str, what: &str| {
+            for (stage, tier, what) in RANKING {
                 ui.label(
                     egui::RichText::new(format!(" {} ", tier))
                         .strong()
@@ -247,49 +243,17 @@ fn ranking_section(ui: &mut egui::Ui) {
                 );
                 cell(ui, prose, what);
                 ui.end_row();
-            };
-            row(
-                ui,
-                1,
-                "Exact name",
-                "the file is called exactly what you typed",
-            );
-            row(
-                ui,
-                3,
-                "Name contains",
-                "what you typed appears somewhere in the file's name",
-            );
-            row(
-                ui,
-                5,
-                "Text inside",
-                "the words are in the file's contents, most mentions first",
-            );
-            row(
-                ui,
-                7,
-                "Close spelling",
-                "a name or some text within a typo or two of what you typed, \
-                 only while Fuzzy is ticked",
-            );
-            row(
-                ui,
-                9,
-                "Path only",
-                "nothing in the name or the text matched, but a folder along \
-                 the way did",
-            );
+            }
         });
     ui.add_space(6.0);
     ui.label(
-        "The Rank column carries the tier a result came from, coloured from \
-         blue for a close match to red for a distant one. Sorting by any other \
-         column sets that ordering aside until you sort by Rank again.",
+        "The Rank column shows each result's tier, coloured from blue for a \
+         close match to red for a distant one. Sorting by another column sets \
+         this order aside until you sort by Rank again.",
     );
     ui.label(hint(
-        "Results stream in while a search runs and are only ever added to the \
-         end, so the list never reshuffles under you as you read it.",
+        "Results stream in while a search runs and are only added at the end, \
+         so the list never reshuffles as you read.",
     ));
 }
 
@@ -297,138 +261,118 @@ fn ranking_section(ui: &mut egui::Ui) {
 /// cause is about which one keeps a file out of the index (ignore patterns)
 /// and which one only stops its text being read (the whitelist).
 fn what_gets_indexed_section(ui: &mut egui::Ui) {
-    ui.heading(egui::RichText::new("What gets indexed").strong());
-    ui.add_space(4.0);
+    section_heading(ui, "What gets indexed");
     ui.label(
-        "Everything inside your indexed folders, minus whatever the two \
-         filters on the Manage Index tab take out. The filters do different \
-         jobs: one decides which files exist in the index at all, the other \
-         decides which of them have their text read.",
+        "Everything in your indexed folders, minus what the two filters on the \
+         Manage Index tab take out. One decides which files are in the index at \
+         all; the other decides which of those have their text read.",
     );
 
     ui.add_space(8.0);
     ui.strong("Ignore patterns: files and folders never indexed");
     ui.add_space(4.0);
     ui.label(
-        "A pattern is compared against file and folder names, and against \
-         whole paths. It is never compared against what is inside a file, so \
-         nothing is excluded for the words it contains. A file kept out this \
-         way is gone from the index completely, contents included.",
+        "Patterns match file and folder names and whole paths, never file \
+         contents. A file they match is gone from the index entirely, text \
+         included.",
     );
     ui.add_space(4.0);
     ui.label(
-        "•  A pattern with no slash in it is a name: it matches any file or \
-         folder called that, anywhere under your indexed folders, and it has \
-         to match the whole name. Excluding an extension therefore needs a \
-         wildcard.",
+        "•  No slash: a name. It must match a whole file or folder name, \
+         anywhere in your indexed folders, so excluding an extension needs a \
+         wildcard (*.jpg).",
     );
     ui.label(
-        "•  A pattern with a slash in it is a path: it is matched against the \
-         whole path of a file or folder, and takes out everything underneath \
-         it.",
+        "•  With a slash: a path. It must match a whole path, and takes out \
+         everything under it.",
     );
-    ui.label("•  * stands for any run of characters, including none; ? for exactly one.");
+    ui.label("•  * matches any run of characters, including none; ? exactly one.");
     ui.add_space(6.0);
     ignore_examples(ui);
     ui.add_space(6.0);
     ui.label(hint(
-        "A path pattern has to match from the start, so Vacation/Diary on its \
-         own matches nothing: the leading */ is what lets it find that folder \
-         wherever it sits. Whether case matters follows the filesystem, so \
-         *diary* also catches Diary on Windows and macOS, but not on Linux.",
+        "Path patterns match from the start, so Vacation/Diary alone matches \
+         nothing; */Vacation/Diary finds that folder anywhere. Case matters on \
+         Linux but not on Windows or macOS, so *diary* catches Diary only there.",
     ));
     ui.label(hint(
-        "Adding a pattern takes out the entries it matches. Deleting a pattern \
-         from the list is what brings those files back, at the next indexing \
-         run; deleting the files it matched is never something QuickSearch does.",
+        "Removing a pattern brings its files back at the next indexing run. \
+         QuickSearch never deletes the files themselves.",
     ));
 
     ui.add_space(8.0);
     ui.strong("Full-text extensions whitelist: which files have their text read");
     ui.add_space(4.0);
     ui.label(
-        "This one limits contents only. Files it leaves out are still indexed \
-         and still turn up in results by their name and their path; what you \
-         lose is finding them by the words inside them.",
+        "This limits contents only. Files it leaves out are still indexed and \
+         found by name and path, just not by the words inside them.",
     );
     ui.add_space(4.0);
     ui.label(
-        "•  Empty, which is how it starts, means QuickSearch reads the text of \
-         every file type it understands.",
+        "•  Empty, the default, means QuickSearch reads the text of every file \
+         type it understands.",
     );
     ui.label(
-        "•  To narrow it, enter one extension per line, the leading dot \
-         optional. Listing only txt, md and pdf keeps the stored text small \
-         and focused on documents, while every other file stays findable by \
-         name.",
+        "•  To narrow it, enter one extension per line, leading dot optional. \
+         Listing only txt, md and pdf keeps the stored text small and focused \
+         on documents; every other file stays findable by name.",
     );
     ui.label(
-        "•  A list that has anything in it also leaves out files with no \
-         extension, such as Makefile or README. Add the line (none) to include \
-         them.",
+        "•  A non-empty list also leaves out files with no extension, such as \
+         Makefile or README. Add the line (none) to include them.",
     );
     ui.label("•  Anything after a # is a comment, so a line can be switched off in place.");
 }
 
-/// What a duplicate group is and is not. Written out here because the tab
-/// itself has room for the caution and not for the reasoning, and because the
-/// question it answers — "it says these differ, but they look the same" — is
-/// the one the feature reliably provokes.
+/// What a duplicate group is and is not. The tab has room for the caution
+/// but not the reasoning, and "they differ but look the same" is the
+/// question the feature reliably provokes.
 fn duplicates_section(ui: &mut egui::Ui) {
-    ui.heading(egui::RichText::new("Duplicates").strong());
-    ui.add_space(4.0);
+    section_heading(ui, "Duplicates");
     ui.label(
-        "The Duplicates tab groups files that look like copies of each other, \
-         biggest waste first, so the space worth reclaiming is at the top. \
-         Nothing there is ever deleted or moved for you; the tab only shows \
-         you the groups.",
+        "The Duplicates tab groups files that look like copies, biggest waste \
+         first. It only lists them; it never deletes or moves anything.",
     );
     ui.add_space(4.0);
     ui.label(
-        "A group is a strong suspicion, not a verdict. Indexing reads each \
-         file's size and its first few kilobytes and hashes those, and that \
-         hash is what puts two files in a group — the rest of the file was \
-         never read. Right-click a group and choose Verify copies are \
-         identical to read all of it and compare every byte, which is the \
-         answer to have before deleting anything.",
+        "A group is a strong suspicion, not a verdict: files are grouped by \
+         their size and a hash of their first few kilobytes, and the rest is \
+         never read. Before deleting anything, right-click the group and choose \
+         Verify copies are identical to compare every byte.",
     );
 
     ui.add_space(8.0);
-    ui.strong("When the verification says two files differ and they look the same");
+    ui.strong("Verified as different, but they look the same?");
     ui.add_space(4.0);
     ui.label(
-        "They do differ, in bytes you never see. PDFs and Office documents \
-         carry the date they were created and last modified, a document ID, \
-         and a revision number, all stored inside the file itself. Two \
-         invoices printed from one template, or one document saved twice, \
-         are different files on disk however identical they look on screen.",
+        "They differ in bytes you never see. PDFs and Office documents store \
+         their creation and modification dates, a document ID and a revision \
+         number inside the file, so two invoices from one template, or one \
+         document saved twice, are different files on disk.",
     );
     ui.label(hint(
-        "The report says which byte disagreed and how big the file was. A \
-         difference in the first few hundred bytes of a document is almost \
-         always that bookkeeping; one in the middle of a large file is not.",
+        "The report names the byte that differs and the file's size. A \
+         difference in the first few hundred bytes is almost always that \
+         bookkeeping; one deep inside a large file is not.",
     ));
 
     ui.add_space(8.0);
-    ui.strong("Groups you do not want to be shown again");
+    ui.strong("Groups you never want to see again");
     ui.add_space(4.0);
     ui.label(
-        "•  Hide this group, from the right-click menu, drops one group for \
-         good — the group that is not really a duplicate at all. It is \
-         remembered by content, so it stays hidden when those files are \
-         renamed or moved, and comes back if they are edited. Show hidden \
-         lists them again and Clear forgets the lot.",
+        "•  Hide this group (right-click) drops one group for good. It is \
+         remembered by content, so it stays hidden when the files are renamed \
+         or moved and returns if they are edited. Show hidden lists hidden \
+         groups; Clear forgets them all.",
     );
     ui.label(
-        "•  Exclude leaves out whole sets of files: the box above the list \
-         takes the same patterns as the ignore filters, and the right-click \
-         menu offers this file's type and this file's folder. That is the one \
-         for a backup folder that is meant to hold copies.",
+        "•  Exclude drops whole sets of files, such as a backup folder meant to \
+         hold copies. The box above the list takes ignore-filter patterns, and \
+         the right-click menu offers the file's type or folder.",
     );
     ui.label(hint(
-        "Neither hides anything from search. An excluded file is still \
-         indexed, still found by name and still found by its contents; it is \
-         only left out of this one listing.",
+        "Neither affects search: excluded files stay indexed and findable by \
+         name and content.",
     ));
 }
 
@@ -474,9 +418,8 @@ const IGNORE_EXAMPLES: &[Example] = &[
 const EXAMPLE_TABLE_MIN_WIDTH: f32 = 560.0;
 
 /// The examples as a table where there is room for one, stacked where there
-/// is not. Inside a [`crate::ui_util::stable_section`] because the two
-/// layouts allocate different numbers of widgets, and a resize across the
-/// threshold would otherwise rename everything below them.
+/// is not. The two layouts differ in widget count, hence
+/// [`crate::ui_util::stable_section`].
 fn ignore_examples(ui: &mut egui::Ui) {
     crate::ui_util::stable_section(ui, |ui| {
         let available = ui.available_width();
@@ -517,26 +460,12 @@ const KEY_COL_WIDTH: f32 = 140.0;
 /// Both tables' horizontal cell spacing.
 const CELL_SPACING: f32 = 14.0;
 
-/// A prose cell in one of this tab's tables, laid out in a child `Ui` of
-/// exactly `width` and exactly as tall as the wrapped text came out.
-///
-/// Two things force the explicit width. Grid cells default to
-/// `TextWrapMode::Extend`, which lays a long cell out past the panel and, far
-/// worse, *widens the `Ui`* it was drawn in, so every paragraph below the
-/// table wraps to that width and is then clipped by the scroll area. Wrapping
-/// the cell instead fixes that but breaks the other way: a wrapped `Label`
-/// reports its narrowest possible width as what it wants, and `Grid` sizes
-/// the column to that, squeezing prose into a two-word ribbon. A child `Ui`
-/// of a width we chose settles both. Pinned by
-/// `tests::a_window_narrower_than_the_column_reflows_rather_than_clipping`.
-///
-/// The height has to be measured rather than left at zero, which is why the
-/// galley is laid out here instead of by the `Label`. `Grid` aligns a cell
-/// `LEFT_CENTER` within its row, and centring a *zero-height* box lands it on
-/// the row's midpoint; the text then runs downward from there, half a row
-/// below the striped background painted behind it. Handing the measured
-/// height in makes that centring a no-op. Pinned by
-/// `tests::table_rows_line_up_with_their_stripes`.
+/// A prose cell in a child `Ui` of exactly `width` and exactly the wrapped
+/// text's height. The fixed width keeps `Grid`'s default `Extend` wrap from
+/// widening the whole tab, and a wrapped `Label` from shrinking its column to
+/// a ribbon. The measured height keeps `Grid` from centring a zero-height box
+/// on the row's midpoint, which would put the text half a row below its
+/// stripe.
 fn cell(ui: &mut egui::Ui, width: f32, text: impl Into<egui::WidgetText>) {
     let galley = text.into().into_galley(
         ui,
@@ -573,19 +502,22 @@ fn readme_path() -> Option<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// One pass of the whole tab in a `w` by `h` viewport.
+    fn render(w: f32, h: f32) -> (egui::Context, egui::FullOutput) {
+        let ctx = crate::test_ui::ctx();
+        let out = crate::test_ui::run_panel(&ctx, egui::vec2(w, h), vec![], |ui| {
+            super::ui(ui);
+        });
+        (ctx, out)
+    }
+
     /// The Help tab is the largest block of prose in the app and the only tab
     /// with no other test, which makes it the widest net for the one thing
     /// dropping egui's emoji faces could break: a character with no glyph,
     /// painted as `◻`.
     #[test]
     fn the_help_tab_paints_no_missing_glyphs() {
-        let ctx = crate::test_ui::ctx();
-        let input = crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), vec![]);
-        let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                super::ui(ui);
-            });
-        });
+        let (ctx, out) = render(1000.0, 900.0);
         assert!(
             !crate::test_ui::painted_text(&out).is_empty(),
             "the tab painted nothing, so the glyph check proves nothing"
@@ -599,13 +531,7 @@ mod tests {
     /// scroll area paints the whole document.
     #[test]
     fn the_tab_carries_the_sections_that_live_nowhere_else() {
-        let ctx = crate::test_ui::ctx();
-        let input = crate::test_ui::raw_input(egui::vec2(1000.0, 4000.0), vec![]);
-        let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                super::ui(ui);
-            });
-        });
+        let (_, out) = render(1000.0, 4000.0);
         let painted = crate::test_ui::painted_text(&out).join("\n");
         for expected in [
             "How results are ranked",
@@ -627,20 +553,15 @@ mod tests {
     /// stretch a paragraph into one long line. A cap that is also a floor
     /// lays the text out past the scroll area, which clips it rather than
     /// wrapping it: the ends of the lines simply vanish. Galley rects are
-    /// pre-clip, so this measures the layout rather than the paint.
+    /// pre-clip, so this measures the layout rather than the paint. Also
+    /// what `cell`'s fixed width is for.
     #[test]
     fn a_window_narrower_than_the_column_reflows_rather_than_clipping() {
         // 640 is the smallest window the app allows, and the UI scale
         // divides it: 400 is roughly that window at 1.6x, and 250 is it at
-        // the 2.5x ceiling — the narrowest layout the app can produce.
+        // the 2.5x ceiling, the narrowest layout the app can produce.
         for width in [250.0_f32, 320.0, 400.0, 480.0, 560.0, 620.0] {
-            let ctx = crate::test_ui::ctx();
-            let input = crate::test_ui::raw_input(egui::vec2(width, 6000.0), vec![]);
-            let out = ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    super::ui(ui);
-                });
-            });
+            let (_, out) = render(width, 6000.0);
             let overflowing: Vec<_> = crate::test_ui::painted(&out)
                 .into_iter()
                 .filter(|(_, rect)| rect.max.x > width)
@@ -656,28 +577,18 @@ mod tests {
     }
 
     /// Every tier chip wears the Rank column's own colour for its first
-    /// cascade stage — the chips exist to demonstrate the blue→red ramp the
+    /// cascade stage: the chips exist to demonstrate the blue-to-red ramp the
     /// paragraph under the table describes.
     #[test]
     fn the_ranking_tiers_wear_the_rank_colors() {
-        let ctx = crate::test_ui::ctx();
-        let input = crate::test_ui::raw_input(egui::vec2(1000.0, 4000.0), vec![]);
-        let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                super::ui(ui);
-            });
-        });
+        let (_, out) = render(1000.0, 4000.0);
         // A RichText background is a section format in the galley, not a
         // separate rect shape.
-        let mut backgrounds = Vec::new();
-        for clipped in &out.shapes {
-            if let egui::epaint::Shape::Text(text) = &clipped.shape {
-                for section in &text.galley.job.sections {
-                    backgrounds.push(section.format.background);
-                }
-            }
-        }
-        for stage in [1u8, 3, 5, 7, 9] {
+        let backgrounds: Vec<egui::Color32> = crate::test_ui::painted_backgrounds(&out)
+            .into_iter()
+            .map(|(_, color)| color)
+            .collect();
+        for (stage, _, _) in super::RANKING {
             let color = crate::color::rank_tier_color(stage);
             assert!(
                 backgrounds.contains(&color),
@@ -690,44 +601,26 @@ mod tests {
 
     /// A table cell allocated with no height of its own is centred on its
     /// row's midpoint by `Grid` and then laid out downward from there, which
-    /// leaves every prose column half a row below the striped background
-    /// painted behind it. Both halves of a row have to share a centre line,
-    /// and the text has to sit inside its own stripe.
+    /// leaves every prose column half a row below its key. Also what `cell`'s
+    /// measured height is for.
     #[test]
-    fn table_rows_line_up_with_their_stripes() {
-        let ctx = crate::test_ui::ctx();
-        let input = crate::test_ui::raw_input(egui::vec2(1000.0, 4000.0), vec![]);
-        let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                super::ui(ui);
-            });
-        });
-        let painted = crate::test_ui::painted(&out);
-        let find = |needle: &str| {
-            painted
-                .iter()
-                .find(|(text, _)| text == needle)
-                .unwrap_or_else(|| panic!("nothing painted for {:?}", needle))
-                .1
-        };
-
+    fn both_halves_of_a_table_row_share_a_centre_line() {
+        let (_, out) = render(1000.0, 4000.0);
         // One single-line and one wrapping row from each striped table: the
         // offset is half the row's height, so a wrapping row misses by twice
         // as much as a single-line one.
+        let [exact, _, _, fuzzy, _] = super::RANKING;
+        let [node_modules, jpg, ..] = super::IGNORE_EXAMPLES else {
+            panic!("fewer ignore examples than the test reads");
+        };
         for (key, prose) in [
-            (" Exact name ", "the file is called exactly what you typed"),
-            (
-                " Close spelling ",
-                "a name or some text within a typo or two of what you typed, \
-                 only while Fuzzy is ticked",
-            ),
-            ("*.jpg", "holiday.jpg, 1.jpg"),
-            (
-                "node_modules",
-                "a file or folder named exactly that, and all it holds",
-            ),
+            (format!(" {} ", exact.1), exact.2),
+            (format!(" {} ", fuzzy.1), fuzzy.2),
+            (jpg.pattern.to_string(), jpg.excluded),
+            (node_modules.pattern.to_string(), node_modules.excluded),
         ] {
-            let (key_rect, prose_rect) = (find(key), find(prose));
+            let key_rect = crate::test_ui::painted_rect(&out, &key);
+            let prose_rect = crate::test_ui::painted_rect(&out, prose);
             assert!(
                 (key_rect.center().y - prose_rect.center().y).abs() < 1.0,
                 "{:?} is centred at {} but {:?} at {}",
@@ -737,34 +630,25 @@ mod tests {
                 prose_rect.center().y
             );
         }
+    }
 
-        // The stripes themselves, so the rows are checked against what the
-        // user actually sees behind them rather than only against each other.
-        // Only every other row carries one, so both of these are rows egui
-        // paints: the ranking table's fourth, the examples' second.
+    /// The stripes themselves, so the rows are checked against what the user
+    /// sees behind them rather than only against each other.
+    #[test]
+    fn table_text_sits_inside_its_stripe() {
+        let (ctx, out) = render(1000.0, 4000.0);
         let faint = ctx.style().visuals.faint_bg_color;
-        fn walk(shape: &egui::epaint::Shape, faint: egui::Color32, into: &mut Vec<egui::Rect>) {
-            match shape {
-                egui::epaint::Shape::Rect(r) if r.fill == faint => into.push(r.rect),
-                egui::epaint::Shape::Vec(shapes) => {
-                    for s in shapes {
-                        walk(s, faint, into);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut stripes = Vec::new();
-        for clipped in &out.shapes {
-            walk(&clipped.shape, faint, &mut stripes);
-        }
+        let stripes: Vec<egui::Rect> = crate::test_ui::painted_rects(&out)
+            .into_iter()
+            .filter(|r| r.fill == faint)
+            .map(|r| r.rect)
+            .collect();
         assert!(!stripes.is_empty(), "no striped rows painted");
-        for prose in [
-            "a name or some text within a typo or two of what you typed, \
-             only while Fuzzy is ticked",
-            "a file or folder named exactly that, and all it holds",
-        ] {
-            let rect = find(prose);
+        // Only every other row carries a stripe, so both of these are rows
+        // egui paints one behind: the ranking table's fourth, the examples'
+        // second.
+        for prose in [super::RANKING[3].2, super::IGNORE_EXAMPLES[0].excluded] {
+            let rect = crate::test_ui::painted_rect(&out, prose);
             let stripe = stripes
                 .iter()
                 .find(|s| s.contains(rect.center()))
@@ -783,13 +667,7 @@ mod tests {
     /// narrow layout has to keep it rather than dropping to pattern-only.
     #[test]
     fn the_stacked_examples_keep_both_halves_of_each_row() {
-        let ctx = crate::test_ui::ctx();
-        let input = crate::test_ui::raw_input(egui::vec2(400.0, 6000.0), vec![]);
-        let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                super::ui(ui);
-            });
-        });
+        let (_, out) = render(400.0, 6000.0);
         let painted = crate::test_ui::painted_text(&out).join("\n");
         for example in super::IGNORE_EXAMPLES {
             for expected in [example.pattern, example.excluded, example.kept] {

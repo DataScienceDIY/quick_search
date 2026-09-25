@@ -24,15 +24,14 @@
 
   <description>
     <p>
-      QuickSearch keeps a SQLite/FTS5 index of the directories you choose and
-      searches them by both filename and file content. It extracts text from
-      documents, PDFs, archives and office files, watches the indexed paths for
-      changes and reindexes in the background while the application is open.
+      QuickSearch indexes the folders you choose and searches them by file name
+      and content. It reads the text of plain-text files, PDFs, RTF and office
+      documents, and the tags of audio files, and keeps the index current while
+      the app is open.
     </p>
     <p>
-      The same binary doubles as a terminal search tool: "quicksearch" followed
-      by search terms prints ranked results and exits without starting the
-      indexer, the file watcher or any background thread.
+      It also searches from a terminal: "quicksearch" followed by search terms
+      prints ranked results without starting the indexer.
     </p>
   </description>
 

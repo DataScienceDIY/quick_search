@@ -4,19 +4,10 @@ use crate::config::Config;
 use crate::extract::{Registry, Scratch};
 use crate::mime::guess_mime_from_head;
 
+#[cfg(windows)]
+use super::counting::{count_tree_entries_walkdir, count_tree_entries_win32};
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-/// The removed `extract_scope_prepare`: the oversize sweep, then the count.
-fn extract_scope_prepare(
-    conn_mutex: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
-    cursor: &ExtractCursor,
-    config: &Config,
-) -> Result<ExtractScope, String> {
-    let conn = crate::lock_ok(conn_mutex);
-    super::mark_oversize_pending_na(&conn, cursor, config)?;
-    super::count_extract_scope(&conn, cursor, config)
-}
 
 fn tmp(tag: &str) -> std::path::PathBuf {
     crate::testutil::scratch_dir(tag).join("tree")
@@ -95,14 +86,14 @@ fn count_cancelled_returns_promptly() {
         "cancellation took {:?}",
         elapsed
     );
-    // The token is observational only — nothing resets it.
+    // The token is observational only: nothing resets it.
     assert!(cancel.load(Ordering::Relaxed));
 }
 
 /// If these two ever disagree, a file the walk wrote off as NA would
 /// silently never be full-text indexed.
 #[test]
-fn content_extractable_is_decide_contents_not_applicable() {
+fn content_extractable_agrees_with_decide_content() {
     let root = tmp("extractable");
     std::fs::create_dir_all(&root).unwrap();
     let mut cfg = Config::default();
@@ -203,8 +194,8 @@ fn prepare_file_record_marks_only_claimable_files() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The number the manage-index tab shows as the extraction denominator,
-/// measured where `indexing.rs` measures it.
+/// The number the manage-index tab shows as the extraction denominator, as a
+/// run measures it: the writer's oversize sweep, then the pass's count.
 #[test]
 fn extract_scope_counts_only_files_an_extractor_claims() {
     let root = tmp("denominator");
@@ -213,7 +204,7 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
     db.set_extension("sqlite");
 
     // 4 files an extractor claims (README via the text sniff), 5 it never
-    // will — the unclaimed set gets NUL bodies.
+    // will: the unclaimed set gets NUL bodies.
     let claimed = ["a.txt", "b.json", "c.mp3", "README"];
     let unclaimed = ["d.mp4", "e.zip", "f.bin", "g.exe", "h"];
     for name in claimed.iter() {
@@ -242,8 +233,8 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
     let stop = Arc::new(AtomicBool::new(false));
     process_batch_inserts(&conn_mutex, &records, &stop, &config).unwrap();
 
-    let cursor = ExtractCursor::for_root(root.to_str().unwrap());
-    let scope = extract_scope_prepare(&conn_mutex, &cursor, &config).unwrap();
+    let range = RootRange::for_root(root.to_str().unwrap());
+    let scope = extract_scope_prepare(&conn_mutex, &range, &config).unwrap();
 
     // The three small text files were finished inline by the walk; the mp3
     // needs the disk pass. Either way the denominator is the claimed set.
@@ -266,8 +257,8 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
 }
 
 /// A `find` that fails writes nothing, and `wc -l` prints `0` and exits
-/// *successfully* — checking only the terminal process reported a tree of
-/// zero entries and kept the non-GNU `-printf` fallback from ever running.
+/// successfully: checking only the terminal process would report a tree of
+/// zero entries and keep the non-GNU `-printf` fallback from ever running.
 #[test]
 #[cfg(unix)]
 fn a_failing_find_is_an_error_not_a_count_of_zero() {
@@ -281,7 +272,7 @@ fn a_failing_find_is_an_error_not_a_count_of_zero() {
     );
 }
 
-/// An empty directory really does count zero — the error above must not be
+/// An empty directory really does count zero: the error above must not be
 /// bought by calling every small answer a failure.
 #[test]
 fn an_empty_tree_still_counts() {

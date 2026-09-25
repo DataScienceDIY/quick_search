@@ -10,8 +10,7 @@
 //! cargo bench -p quicksearch-core --bench search
 //! ```
 //!
-//! Sizes come from `corpus::SIZES` — 1 KiB, 16 KiB and 256 KiB, the last
-//! being `maximum_text_size`, the worst case a full-text row can present.
+//! Sizes come from `corpus::SIZES`.
 
 mod corpus;
 
@@ -32,9 +31,9 @@ fn literal(term: &str) -> TermPattern {
     .expect("literal patterns always compile")
 }
 
-/// Decompressing the stored body — the first thing every full-text row does.
-/// Reusing one context and pre-sizing the output is ~4x at 1 KiB, the size
-/// most documents are; why `DocDecoder` exists.
+/// Decompressing the stored body, the first thing every full-text row does.
+/// Reusing one context and pre-sizing the output is ~4x faster at 1 KiB, the
+/// size most documents are; `DocDecoder` exists for that.
 mod zstd_decode {
     use super::*;
 
@@ -75,7 +74,7 @@ mod utf8 {
     }
 
     /// The decompressed `Vec` is unshared, so `from_utf8` can move it;
-    /// the lossy fallback keeps corrupt-row behaviour exactly.
+    /// the lossy fallback keeps corrupt-row behaviour unchanged.
     #[divan::bench(args = corpus::SIZES)]
     fn from_utf8_move(bencher: Bencher, size: usize) {
         let raw = corpus::text(size, 4).as_bytes();
@@ -88,9 +87,9 @@ mod utf8 {
     }
 }
 
-/// ASCII-folding the document. Folding into a reused buffer is *not* faster:
-/// `fold_into` is chosen for what it does to the allocator, not the clock —
-/// do not "optimize" the other direction.
+/// ASCII-folding the document. Folding into a reused buffer is not faster;
+/// `fold_into` is chosen for what it does to the allocator, not the clock, so
+/// do not "optimize" it back.
 mod fold {
     use super::*;
 
@@ -107,8 +106,8 @@ mod fold {
         bencher.bench_local(move || {
             buf.clear();
             buf.push_str(divan::black_box(text));
-            // `make_ascii_lowercase` is byte-length preserving — the same
-            // invariant the cascade relies on for folded offsets.
+            // `make_ascii_lowercase` preserves byte length, the invariant
+            // the cascade's folded offsets rely on.
             buf.make_ascii_lowercase();
             buf.len()
         });
@@ -117,8 +116,8 @@ mod fold {
 
 /// Substring search: std's Two-Way against `memmem`'s SIMD prefilter. The
 /// miss case matters most (a pass verifies far more rows than it accepts):
-/// 111 µs against 2.4 µs at 256 KiB. `match_indices` stays as the guard —
-/// convergence means the SIMD path stopped being selected.
+/// 111 µs against 2.4 µs at 256 KiB. `match_indices` stays as the guard: if
+/// the two converge, the SIMD path has stopped being selected.
 mod substring {
     use super::*;
 
@@ -135,8 +134,8 @@ mod substring {
         bencher.bench(|| finder.find_iter(divan::black_box(text)).count());
     }
 
-    /// Hoisted `memmem::Finder`: measured, indistinguishable — the
-    /// precompute is O(needle) and a term is a handful of bytes.
+    /// A `Finder` built per call: measured indistinguishable from a hoisted
+    /// one, since the precompute is O(needle) and a term is a few bytes.
     #[divan::bench(args = corpus::SIZES)]
     fn memmem_per_call_miss(bencher: Bencher, size: usize) {
         let text = corpus::text(size, 0).as_bytes();
@@ -173,7 +172,7 @@ mod substring {
         let pattern = literal(corpus::NEEDLE);
         let text = corpus::text_mixed(size, 4);
         let folded = corpus::text_folded(size, 4);
-        let opts = snippet::Options { approx_chars: 600 };
+        let opts = snippet::Options { approx_bytes: 600 };
         bencher.bench(|| {
             let (s, b) = snippet::extract_folded(
                 divan::black_box(text),
@@ -186,14 +185,14 @@ mod substring {
         });
     }
 
-    /// The shape it replaced: a separate folded count sweeps the document a
-    /// third time for a number the extraction already knew.
+    /// The rejected shape: a separate folded count sweeps the document a
+    /// third time for a number the extraction already has.
     #[divan::bench(args = corpus::SIZES)]
     fn cascade_row_sweeps_separate_count(bencher: Bencher, size: usize) {
         let pattern = literal(corpus::NEEDLE);
         let text = corpus::text_mixed(size, 4);
         let folded = corpus::text_folded(size, 4);
-        let opts = snippet::Options { approx_chars: 600 };
+        let opts = snippet::Options { approx_bytes: 600 };
         bencher.bench(|| {
             let a = pattern.count(divan::black_box(text), false);
             let b = pattern.count_folded(divan::black_box(folded));
@@ -203,8 +202,8 @@ mod substring {
     }
 }
 
-/// Snippet extraction against a pre-folded haystack — now the only folded
-/// sweep of a row, and the source of its count.
+/// Snippet extraction against a pre-folded haystack: the only folded sweep
+/// of a row, and the source of its count.
 mod snippet_extract {
     use super::*;
 
@@ -212,7 +211,7 @@ mod snippet_extract {
     fn extract_folded(bencher: Bencher, size: usize) {
         let text = corpus::text_mixed(size, 64);
         let folded = corpus::text_folded(size, 64);
-        let opts = snippet::Options { approx_chars: 600 };
+        let opts = snippet::Options { approx_bytes: 600 };
         bencher.bench(|| {
             snippet::extract_folded(
                 divan::black_box(text),
@@ -226,7 +225,7 @@ mod snippet_extract {
 
 /// The filename pass's per-row ladder over 2000 realistic rows. The two
 /// obvious fixes each measure *worse* alone (reused fold buffer, prebuilt
-/// `Finder`); only together do they win, and only by ~1.2x — short strings
+/// `Finder`); only together do they win, and only by ~1.2x: short strings
 /// do not behave like document bodies.
 mod filename_ladder {
     use super::*;
@@ -358,9 +357,9 @@ mod filename_ladder {
     }
 }
 
-/// Bitap, the fuzzy passes' inner loop — whole-table scans, so it runs over
-/// every row when fuzzy is on. `step` takes `&mut [u64]`, so indices are
-/// bounds-checked and the trip count is opaque to the optimizer.
+/// Bitap, the fuzzy passes' inner loop, run over every candidate row when
+/// fuzzy is on. `step` takes `&mut [u64]`, so indices are bounds-checked and
+/// the trip count is opaque to the optimizer.
 mod bitap {
     use super::*;
 

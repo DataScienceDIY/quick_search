@@ -5,7 +5,7 @@
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-/// The user's home directory. On Windows `%USERPROFILE%` is checked **first**:
+/// The user's home directory. On Windows `%USERPROFILE%` is checked first:
 /// Git Bash and MSYS2 export `HOME` as a POSIX path (`/c/Users/me`) that no
 /// Win32 API can open.
 pub fn home_dir() -> Option<OsString> {
@@ -26,12 +26,10 @@ const _: () = assert!(
     FILE_ATTRIBUTE_HIDDEN == windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN
 );
 
-/// `FILE_ATTRIBUTE_HIDDEN` and nothing else. `FILE_ATTRIBUTE_SYSTEM` must not
-/// be part of this test: Windows honours a folder's `desktop.ini` only if it
-/// carries Read-only or System, so cloud-sync clients set System on their
-/// plainly visible sync roots purely for a branded icon — including it pruned
-/// whole cloud folders from the index. Everything System was meant to catch
-/// (`$RECYCLE.BIN`, `pagefile.sys`, …) is Hidden **and** System anyway.
+/// Only `FILE_ATTRIBUTE_HIDDEN` counts, never System: cloud-sync clients set
+/// System on visible sync roots (Windows honours `desktop.ini` icons only
+/// then), and the system files worth skipping (`$RECYCLE.BIN`,
+/// `pagefile.sys`) are Hidden too.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn attributes_are_hidden(attributes: u32) -> bool {
     attributes & FILE_ATTRIBUTE_HIDDEN != 0
@@ -46,10 +44,10 @@ pub enum HiddenReason {
 }
 
 /// Whether a directory entry counts as hidden, and why. Unix: a leading dot.
-/// Windows: a leading dot **or** `FILE_ATTRIBUTE_HIDDEN` (never System; see
-/// [`attributes_are_hidden`]). `meta` must report the entry **itself**, never
-/// a link target — call sites disagreeing churns the index every cycle — and
-/// is a closure because on Unix it is never called (an extra `lstat` per entry).
+/// Windows: a leading dot or `FILE_ATTRIBUTE_HIDDEN` (never System; see
+/// [`attributes_are_hidden`]). `meta` must report the entry itself, never a
+/// link target (call sites disagreeing churns the index every cycle), and is
+/// a closure because on Unix it is never called (an extra `lstat` per entry).
 pub fn entry_hidden_reason<F>(name: &str, meta: F) -> Option<HiddenReason>
 where
     F: FnOnce() -> Option<std::fs::Metadata>,
@@ -158,7 +156,7 @@ const _: () = assert!(std::mem::size_of::<Option<CachedMetadata>>() == 0);
 /// (`IO_REPARSE_TAG_APPEXECLINK`, OneDrive's `IO_REPARSE_TAG_CLOUD_*`) reach
 /// the walk's ordinary file arm where the two answers differ. Hence the raw
 /// `FILE_ATTRIBUTE_REPARSE_POINT` test, not `is_symlink`, which also wants
-/// the name-surrogate bit `0x20000000` — the test that lets those tags through.
+/// the name-surrogate bit `0x20000000`: the test that lets those tags through.
 pub(crate) fn entry_cached_metadata<F>(meta: F) -> Option<CachedMetadata>
 where
     F: FnOnce() -> Option<std::fs::Metadata>,
@@ -198,37 +196,30 @@ pub(crate) fn metadata_or_stat(
 
 /// Whether `path` has a hidden component *below* the root that contains it.
 /// Components at or above a root are exempt because the walkers exempt their
-/// root too; the two must agree or the index churns — a certainty on Windows,
+/// root too; the two must agree or the index churns, a certainty on Windows,
 /// where `AppData` is Hidden and roots under it are routine. `roots` match by
 /// whole components; a path under no known root is checked in full.
 pub fn path_has_hidden_component_under(path: &Path, roots: &[PathBuf]) -> bool {
     // Innermost containing root wins: with both `/data` and `/data/.cache`
     // configured, a file under the latter is only judged below `.cache`.
-    let base = roots
+    let (mut current, tail) = roots
         .iter()
         .filter(|r| path.starts_with(r))
-        .max_by_key(|r| r.components().count());
+        .max_by_key(|r| r.components().count())
+        .and_then(|root| Some((root.clone(), path.strip_prefix(root).ok()?)))
+        .unwrap_or((PathBuf::new(), path));
 
-    let (mut current, tail) = match base {
-        Some(root) => match path.strip_prefix(root) {
-            Ok(tail) => (root.clone(), tail),
-            Err(_) => (PathBuf::new(), path),
-        },
-        None => (PathBuf::new(), path),
-    };
-
-    for component in tail.components() {
+    tail.components().any(|component| {
         current.push(component);
-        if let Component::Normal(name) = component {
-            let name = name.to_string_lossy();
-            // `symlink_metadata`, not `metadata`: each component is judged as
-            // itself, which is what the walkers do.
-            if entry_is_hidden(&name, || std::fs::symlink_metadata(&current).ok()) {
-                return true;
-            }
-        }
-    }
-    false
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        // `symlink_metadata`, not `metadata`: each component is judged as
+        // itself, as the walkers do.
+        entry_is_hidden(&name.to_string_lossy(), || {
+            std::fs::symlink_metadata(&current).ok()
+        })
+    })
 }
 
 /// Whether `s` names a UNC path, in either spelling. Only *called* on Windows.
@@ -281,7 +272,8 @@ pub(crate) fn is_network_path(path: &Path) -> bool {
 }
 
 /// UNC needs no syscall; a *mapped drive letter* is indistinguishable from a
-/// local disk by string inspection — `GetDriveTypeW` is the only way to tell.
+/// local disk by string inspection, and `GetDriveTypeW` is the only way to
+/// tell.
 #[cfg(windows)]
 pub(crate) fn is_network_path(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
@@ -313,7 +305,7 @@ pub(crate) fn is_network_path(_path: &Path) -> bool {
 
 /// Whether the notification backend covers a whole tree from one watch on its
 /// root. `false` (inotify): one descriptor covers one directory, so the
-/// caller registers every directory itself — which lets it skip ignored and
+/// caller registers every directory itself, which lets it skip ignored and
 /// hidden subtrees. `true` (`ReadDirectoryChangesW`): one handle covers the
 /// subtree, and notify allocates a 16 KiB buffer *inline per watch*, so
 /// per-directory registration would ask for gigabytes; pruning moves to the
@@ -324,11 +316,11 @@ pub const WATCH_ROOTS_RECURSIVELY: bool = cfg!(windows);
 /// has to exclude `Node_Modules`, and on Linux it must not.
 pub const PATHS_ARE_CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
 
-/// Drop the **calling thread** to background scheduling priority (the GUI
-/// shares this process). Best-effort and idempotent. **CPU only, on every
-/// platform**: Windows' `THREAD_MODE_BACKGROUND_BEGIN` drops I/O to a tier
-/// the kernel actively rate-limits, and Linux's `nice` has no I/O half —
-/// don't reintroduce it.
+/// Drop the calling thread to background scheduling priority (the GUI shares
+/// this process). Best-effort and idempotent. CPU only, on every platform:
+/// Windows' `THREAD_MODE_BACKGROUND_BEGIN` drops I/O to a tier the kernel
+/// actively rate-limits, and Linux's `nice` has no I/O half; don't
+/// reintroduce it.
 pub fn set_background_priority() {
     #[cfg(target_os = "linux")]
     {
@@ -342,13 +334,31 @@ pub fn set_background_priority() {
         };
         unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
     }
-    // Elsewhere (macOS, BSD): `nice` applies to the whole process — skip.
+    // Elsewhere (macOS, BSD): `nice` applies to the whole process, so skip.
 }
 
-/// glibc **caches freed thread stacks** (`stack_cache_maxsize`, 40 MiB
-/// default) and a cached stack keeps its dirty pages for the life of the
-/// process; 512 KiB is ample. Document parsing recurses on untrusted input —
-/// if a malformed document ever overflows this, raise it and add a depth limit.
+/// Run `f`, then give SIGHUP back the disposition it had before, whatever `f`
+/// installed: exit by default, nothing under `nohup`.
+pub fn preserving_sighup<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(unix)]
+    {
+        let mut before: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut before) };
+        let out = f();
+        unsafe { libc::sigaction(libc::SIGHUP, &before, std::ptr::null_mut()) };
+        out
+    }
+    #[cfg(not(unix))]
+    {
+        f()
+    }
+}
+
+/// Stack size for [`spawn_worker`] threads. 512 KiB is ample, and glibc
+/// caches freed thread stacks (`stack_cache_maxsize`, 40 MiB default) with
+/// their dirty pages for the life of the process. Document parsing recurses
+/// on untrusted input; if a malformed document ever overflows this, raise it
+/// and add a depth limit.
 const WORKER_STACK_SIZE: usize = 512 * 1024;
 
 /// Spawn a named worker thread with [`WORKER_STACK_SIZE`]; panics like
@@ -368,7 +378,7 @@ where
 /// The allocator every binary in this workspace installs.
 ///
 /// Re-exported because `#[global_allocator]` only takes effect in the crate
-/// that *declares* it — a library cannot choose one for its dependents. So
+/// that *declares* it: a library cannot choose one for its dependents. So
 /// each binary names this type, and they must all name the same one: a
 /// measurement harness left on the system allocator would report numbers for
 /// a build nobody ships.
@@ -381,24 +391,21 @@ where
 ///
 /// Why not glibc: it gives each thread a 64 MiB arena and never shrinks one
 /// below its high-water mark. A multi-million-file run settled at 985 MB RSS,
-/// 871 MB of it anonymous slack that `malloc_trim` could not coalesce —
-/// it only returns pages that are *wholly* free, and one live chunk pins
-/// 4 KiB. Capping arenas at 2 cut the floor to 146 MB but made indexing
-/// dramatically slower, because two arenas serialise every worker. mimalloc
-/// has per-thread heaps with no lock on the fast path and decommits freed
+/// 871 MB of it anonymous slack that `malloc_trim` could not coalesce (it
+/// returns only pages that are wholly free, and one live chunk pins 4 KiB).
+/// Capping arenas at 2 cut the floor to 146 MB but made indexing dramatically
+/// slower, because two arenas serialise every worker. mimalloc has
+/// per-thread heaps with no lock on the fast path and decommits freed
 /// segments, so it gives both.
 pub use mimalloc::MiMalloc as Allocator;
 
-/// Return free memory to the kernel; idempotent, and costs milliseconds, so
-/// it must not go anywhere hot.
-///
-/// A run's peak is not its steady state — extraction buffers, path strings
-/// and compression scratch are all freed by the end — but freed is not
-/// returned. This is the point where a finished run gives it back.
+/// Return freed heap to the OS. Costs milliseconds, so call it only at idle
+/// points such as the end of a run, whose freed peak would otherwise stay
+/// resident.
 pub fn release_free_heap() {
     // `libmimalloc-sys` binds only the allocation entry points, so this one
     // is declared here. The symbol is in the static library that crate
-    // already links; depending on it is what puts it there.
+    // already links; depending on it puts it there.
     extern "C" {
         /// `void mi_collect(bool force)`. C `_Bool` and Rust `bool` are the
         /// same one byte.
@@ -406,14 +413,14 @@ pub fn release_free_heap() {
     }
     // SAFETY: no arguments of ours, no state of ours, callable from any
     // thread. `true` asks it to return memory to the OS rather than merely to
-    // mimalloc's own free lists — the whole point of the call.
+    // mimalloc's own free lists, the whole point of the call.
     unsafe { mi_collect(true) };
 }
 
 /// Create `dir` and its parents, readable only by their owner:
 /// `create_dir_all` leaves the mode to the umask (022 ⇒ world `+rx`) and
 /// these directories hold the index and config. Only directories *created
-/// here* are narrowed — a user who chose `~/Documents` as their data
+/// here* are narrowed: a user who chose `~/Documents` as their data
 /// directory did not ask for it to be locked down.
 pub fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -450,10 +457,10 @@ pub fn restrict_to_owner(path: &Path) {
 
 /// Open `path` for reading, refusing anything that is not a regular file. A
 /// rename since the caller's `stat` can put a FIFO or device there, and
-/// `open` on one blocks in the kernel until a writer appears —
-/// uninterruptibly, past any stop flag — stranding a walk worker and the
-/// pool behind it. `O_NONBLOCK` makes the open return; `fstat` on the
-/// descriptor then answers un-swappably. Both are free on a regular file.
+/// `open` on one blocks in the kernel until a writer appears, uninterruptibly
+/// and past any stop flag, stranding a walk worker and the pool behind it.
+/// `O_NONBLOCK` makes the open return; `fstat` on the descriptor then answers
+/// un-swappably. Both are free on a regular file.
 pub fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -475,7 +482,7 @@ pub fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// Why [`IndexLock::acquire`] did not hand back a lock.
 #[derive(Debug)]
 pub enum LockError {
-    /// Another process holds it. `pid` is for the message only — never decides.
+    /// Another process holds it. `pid` is for the message only; it never decides.
     Held { pid: Option<u32> },
     /// The filesystem does not do locks. The caller must carry on regardless.
     Unsupported(String),
@@ -510,28 +517,23 @@ impl IndexLock {
     ///
     /// **The guard is the kernel's lock, never the file's existence**: the
     /// kernel drops it however the process dies, so a leftover `.lock` file is
-    /// inert and nothing here may ever branch on its presence — a stale-PID
+    /// inert and nothing here may ever branch on its presence; a stale-PID
     /// scheme would strand the user behind a crash. [`LockError::Unsupported`]
     /// means the filesystem could not answer, not that the lock is taken;
-    /// callers **must** start anyway.
+    /// callers must start anyway.
     pub fn acquire(db_path: &Path) -> Result<IndexLock, LockError> {
         let path = IndexLock::path_for(db_path);
-        if let Some(dir) = path.parent() {
-            if !dir.as_os_str().is_empty() {
-                let _ = create_dir_private(dir);
-            }
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = create_dir_private(dir);
         }
-        let file = match std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
-        {
-            Ok(f) => f,
             // An unwritable index directory is not a second instance: carry on.
-            Err(e) => return Err(LockError::Unsupported(format!("{}: {}", path.display(), e))),
-        };
+            .map_err(|e| LockError::Unsupported(format!("{}: {}", path.display(), e)))?;
         lock_exclusive_nonblocking(&file).map_err(|e| match e {
             LockAttempt::Held => LockError::Held {
                 pid: read_recorded_pid(&path),
@@ -553,10 +555,10 @@ impl IndexLock {
         Ok(())
     }
 
-    /// Move the held lock onto the index at `db_path`. **The new lock is
-    /// taken before the old one is let go**, so a refusal leaves this process
-    /// holding what it held. [`LockError::Unsupported`] means the move
-    /// *happened* and the new path simply cannot be locked; carry on.
+    /// Move the held lock onto the index at `db_path`. The new lock is taken
+    /// before the old one is let go, so a refusal leaves this process holding
+    /// what it held. [`LockError::Unsupported`] means the move *happened* and
+    /// the new path simply cannot be locked; carry on.
     pub fn move_to(db_path: &Path) -> Result<(), LockError> {
         let mut slot = crate::lock_ok(&HELD_LOCK);
         // Short-circuit before acquiring: `flock` conflicts with itself across
@@ -573,9 +575,9 @@ impl IndexLock {
                 *slot = Some(lock);
                 Ok(())
             }
-            Err(LockError::Unsupported(why)) => {
+            Err(e @ LockError::Unsupported(_)) => {
                 *slot = None;
-                Err(LockError::Unsupported(why))
+                Err(e)
             }
             Err(e) => Err(e),
         }
@@ -585,8 +587,8 @@ impl IndexLock {
         use std::io::Write;
         // A fresh handle: writing through `_file` would move the shared file
         // offset. That a *second* handle can write here at all is why the
-        // Windows lock byte sits at [`LOCK_BYTE_OFFSET`] rather than offset 0
-        // — its byte-range locks are mandatory and per-handle, so a lock over
+        // Windows lock byte sits at [`LOCK_BYTE_OFFSET`] rather than offset 0:
+        // its byte-range locks are mandatory and per-handle, so a lock over
         // this byte would block our own write.
         let written = std::fs::OpenOptions::new()
             .write(true)
@@ -603,7 +605,7 @@ impl IndexLock {
     }
 }
 
-/// `None` whenever the file is absent, empty or unparseable — all ordinary.
+/// `None` whenever the file is absent, empty or unparseable, all ordinary.
 fn read_recorded_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
@@ -623,8 +625,8 @@ fn lock_exclusive_nonblocking(file: &std::fs::File) -> Result<(), LockAttempt> {
     use std::os::unix::io::AsRawFd;
 
     // `flock`, not `fcntl`: a POSIX record lock would be cancelled by any
-    // `close` this process makes on the same inode — the hazard documented in
-    // `file_handling::index_file_set`. A `flock` belongs to the open file
+    // `close` this process makes on the same inode (see
+    // `file_handling::index_file_set`). A `flock` belongs to the open file
     // description and is immune to it.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
@@ -646,8 +648,8 @@ fn lock_exclusive_nonblocking(file: &std::fs::File) -> Result<(), LockAttempt> {
     };
     use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
 
-    // The locked byte sits at [`LOCK_BYTE_OFFSET`] — **not** at offset 0,
-    // where the PID is written. Windows byte-range locks are *mandatory* and
+    // The locked byte sits at [`LOCK_BYTE_OFFSET`], not at offset 0, where
+    // the PID is written. Windows byte-range locks are *mandatory* and
     // belong to the file object: a lock covering offset 0 would make our own
     // `record_holder` (a second handle) and `read_recorded_pid` fail with
     // `ERROR_LOCK_VIOLATION`. Locking beyond end-of-file is explicitly legal
@@ -680,13 +682,10 @@ fn lock_exclusive_nonblocking(file: &std::fs::File) -> Result<(), LockAttempt> {
 }
 
 /// Bytes free to this user on the filesystem holding `path`. `None` is
-/// "unknown", never "zero". The nearest existing ancestor is what gets asked.
+/// "unknown", never "zero". The nearest existing ancestor is asked.
 pub fn available_space(path: &Path) -> Option<u64> {
     let mut probe = path;
-    loop {
-        if probe.exists() {
-            break;
-        }
+    while !probe.exists() {
         probe = probe.parent()?;
     }
     available_space_of_existing(probe)
@@ -703,8 +702,8 @@ fn available_space_of_existing(path: &Path) -> Option<u64> {
         return None;
     }
     // `f_bavail`, not `f_bfree`: the difference is root's reserve. `f_frsize`
-    // is the fragment size the block counts are in — `f_bsize` is the
-    // preferred I/O size and is the wrong multiplier.
+    // is the fragment size the block counts are in; `f_bsize` is the
+    // preferred I/O size and the wrong multiplier.
     let frsize = if stat.f_frsize > 0 {
         stat.f_frsize
     } else {
@@ -739,8 +738,9 @@ fn available_space_of_existing(path: &Path) -> Option<u64> {
 const REMOVE_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// `fs::remove_file`, retried briefly on Windows, which returns a sharing
-/// violation while *any* handle is open — most often an antivirus scanner
-/// reading the file microseconds after we closed it. Unix `unlink` needs no retry.
+/// violation while *any* handle is open, most often an antivirus scanner
+/// reading the file microseconds after we closed it. Unix `unlink` needs no
+/// retry.
 pub fn remove_file_retrying(path: &Path) -> std::io::Result<()> {
     #[cfg(not(windows))]
     {

@@ -3,12 +3,13 @@
 //! byte, zero allocations. Patterns are capped at 64 bytes by the machine word.
 //!
 //! Case-insensitivity lives in the mask table (both cases of every pattern
-//! byte are set), so neither side is folded — don't reintroduce haystack
-//! folding; measured, it cost a copy per scanned field and per stored document.
+//! byte are set), so neither side is folded. Measured: folding the haystack
+//! cost a copy per scanned field and per stored document.
+
+use crate::query::split::CascadeQuery;
 
 /// Registers: one per error count `0..=k`. [`edit_budget`]'s ladder against a
-/// 64-byte pattern caps `k` at 21 (pinned by
-/// `edit_budget_stays_within_the_bitap_word_size`); [`Bitap::new`] rejects more.
+/// 64-byte pattern caps `k` at 21; [`Bitap::new`] rejects more.
 const MAX_REGISTERS: usize = 22;
 
 pub struct Bitap {
@@ -51,7 +52,7 @@ impl Bitap {
     /// bytes can be deleted before any text is read, hence the pre-set low bits.
     fn reset(&self, r: &mut [u64; MAX_REGISTERS]) {
         for (d, reg) in r.iter_mut().enumerate().take(self.k + 1) {
-            *reg = if d == 0 { 0 } else { (1u64 << d) - 1 };
+            *reg = (1u64 << d) - 1;
         }
     }
 
@@ -83,10 +84,10 @@ impl Bitap {
     }
 
     /// Where the match that ended at `end` with `errors` edits began: the same
-    /// automaton runs over the *reversed* pattern, backwards from `end`; the
-    /// first position accepted **within `errors` edits** is the start. The
-    /// bound is load-bearing — unbounded, the reverse scan spends its budget
-    /// on deletions and marks one letter of an exact match.
+    /// automaton runs over the reversed pattern, backwards from `end`, and the
+    /// first position accepted within `errors` edits is the start. Without
+    /// that bound the reverse scan spends its budget on deletions and marks
+    /// one letter of an exact match.
     fn match_start(&self, hay: &[u8], end: usize, errors: usize) -> usize {
         // A ≤k-edit alignment of a len-byte pattern is at most len+k long,
         // so nothing before this can be the start.
@@ -106,10 +107,10 @@ impl Bitap {
         floor
     }
 
-    /// Improve on the *earliest* accepting end, which is systematically short
+    /// Improve on the earliest accepting end, which is systematically short
     /// (the automaton pays for the pattern's tail with trailing deletions). A
-    /// better alignment ends at most `errors` bytes later, never more; a copy
-    /// of the registers is stepped so the caller's scan is undisturbed.
+    /// better alignment ends at most `errors` bytes later; a copy of the
+    /// registers is stepped so the caller's scan is undisturbed.
     fn refine_end(
         &self,
         hay: &[u8],
@@ -130,7 +131,7 @@ impl Bitap {
     }
 
     /// The smallest edit distance (≤ k) at which the pattern occurs in `hay`,
-    /// and that occurrence's byte range — the span a frontend marks.
+    /// and that occurrence's byte range: the span a frontend marks.
     pub fn best_distance_and_first(&self, hay: &[u8]) -> Option<(usize, (usize, usize))> {
         let mut r = [0u64; MAX_REGISTERS];
         self.reset(&mut r);
@@ -180,12 +181,11 @@ pub use super::prefilter::TRIGRAM_FLOOR;
 /// characters each, for the fuzzy full-text pass's candidate prefilter.
 /// `None` when the term is too short to divide that way.
 ///
-/// Sound because the chunks **partition** the term: `k` edits touch at most
-/// `k` of the `k + 1` chunks, so one survives verbatim and "any chunk present"
-/// is a superset of what the pass accepts. It must stay a partition — overlap
-/// or gaps collapse the argument silently. The floor exists because a
-/// sub-trigram chunk matches no token; the split is by characters, not bytes,
-/// so no chunk breaks a UTF-8 sequence.
+/// Sound because the chunks partition the term: `k` edits touch at most `k`
+/// of the `k + 1` chunks, so one survives verbatim and "any chunk present" is
+/// a superset of what the pass accepts. Overlap or gaps would break that
+/// silently. The floor exists because a sub-trigram chunk matches no token;
+/// the split is by characters, not bytes, so no chunk breaks a UTF-8 sequence.
 pub fn pigeonhole_chunks(term: &str, k: usize) -> Option<Vec<&str>> {
     let chunks = k + 1;
     let total = term.chars().count();
@@ -216,6 +216,19 @@ pub fn edit_budget(term_len: usize, max_edits: usize) -> Option<usize> {
         return None;
     }
     Some((term_len / 3).min(max_edits))
+}
+
+/// The fuzzy stages' edit budget and matcher for `query`, built from the term
+/// as typed (the mask table folds case). `None` when the term is a wildcard,
+/// earns no budget under `max_edits`, or does not fit the matcher. Shared by
+/// the fuzzy passes and [`crate::live`], so a live re-cut uses the matcher
+/// that found the row.
+pub fn matcher_for(query: &CascadeQuery, max_edits: usize) -> Option<(usize, Bitap)> {
+    if query.pattern.is_wildcard() {
+        return None;
+    }
+    let k = edit_budget(query.term.len(), max_edits)?;
+    Bitap::new(query.term.as_bytes(), k).map(|bitap| (k, bitap))
 }
 
 #[cfg(test)]
@@ -336,8 +349,9 @@ mod tests {
         assert_eq!(&hay[4..8], b"helo");
     }
 
-    /// The reported bug, exactly: `repot` marked `1Repo` in `1Reporter` — a
-    /// range assumed to be term-length reached one byte too far left.
+    /// A match shorter than the term is marked exactly: `repot` in
+    /// `1Reporter` marks `Repo`, not `1Repo`, which a range assumed to be
+    /// term-length would reach.
     #[test]
     fn a_match_shorter_than_the_term_is_still_marked_exactly() {
         assert_eq!(marked("repot", "1reporter", 1), "repo");
@@ -353,9 +367,10 @@ mod tests {
         assert_eq!(marked_best("abc", "zzabxczz", 1), "ab");
     }
 
-    /// The trap in resolving the start backwards: unbounded, the reverse pass
-    /// spends a generous budget on deletions and accepts one letter of an
-    /// exact match (`c` alone in `xabc` at k=2).
+    /// Resolving the start backwards must stay within the forward match's
+    /// edits: unbounded, the reverse pass spends a generous budget on
+    /// deletions and accepts one letter of an exact match (`c` alone in
+    /// `xabc` at k=2).
     #[test]
     fn a_generous_budget_does_not_shrink_an_exact_match() {
         assert_eq!(marked_best("abc", "xabc", 2), "abc");
@@ -363,8 +378,8 @@ mod tests {
         assert_eq!(marked("hello", "say hello world", 2), "hello");
     }
 
-    /// The earliest accepting end is short (trailing deletions), and marking
-    /// it highlighted `abcd` for a search for `abcdef` with the whole word
+    /// The earliest accepting end is short (trailing deletions); marking it
+    /// would highlight `abcd` for a search for `abcdef` with the whole word
     /// right there.
     #[test]
     fn the_mark_is_not_truncated_to_a_leading_part_of_the_term() {
@@ -472,7 +487,7 @@ mod tests {
     /// automaton.
     fn oracle(pattern: &[u8], hay: &[u8], k: usize) -> Option<usize> {
         // Without this, k >= pattern-length "matches" empty text by deleting
-        // every pattern byte — a non-occurrence the automaton never reports.
+        // every pattern byte, a non-occurrence the automaton never reports.
         if hay.is_empty() {
             return None;
         }
@@ -517,8 +532,12 @@ mod tests {
         for _ in 0..500 {
             let plen = 3 + rng() % 6;
             let hlen = rng() % 20;
-            let pattern: Vec<u8> = (0..plen).map(|_| alphabet[rng() % 4]).collect();
-            let hay: Vec<u8> = (0..hlen).map(|_| alphabet[rng() % 4]).collect();
+            let pattern: Vec<u8> = (0..plen)
+                .map(|_| alphabet[rng() % alphabet.len()])
+                .collect();
+            let hay: Vec<u8> = (0..hlen)
+                .map(|_| alphabet[rng() % alphabet.len()])
+                .collect();
             for k in 0..=4 {
                 let got = Bitap::new(&pattern, k)
                     .unwrap()

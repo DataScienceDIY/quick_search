@@ -1,24 +1,16 @@
 //! The in-application half of the search shortcut: the key QuickSearch
-//! claims for itself while it is running. Windows and X11 grant that via
-//! `global-hotkey` (`RegisterHotKey`/`XGrabKey`). Wayland refuses grabs by
-//! design and gets no in-app half at all ([`Status::DesktopOnly`]): the XDG
-//! GlobalShortcuts portal was tried and removed — it prompted a dialog on
-//! every launch, bound an action that only worked while the app ran, and
-//! its persisted claim on the key blocked the desktop's own launch binding.
-//! On Wayland the desktop's binding (`crate::shortcut_setup`, `--toggle`)
-//! is the whole story.
+//! claims for itself while it is running, through `global-hotkey`
+//! (`RegisterHotKey` on Windows, `XGrabKey` on X11). It needs no setup, so the
+//! Settings tab can offer any combination, but it cannot fire while
+//! QuickSearch is closed; [`crate::activate`] and `--toggle` cover that, and
+//! both paths set the same pending flag.
 //!
-//! This is the path that needs no setup at all, and it is why the Settings
-//! tab can offer an arbitrary combination on every platform. It cannot fire
-//! while QuickSearch is not running — nothing an application registers for
-//! itself can — which is what [`crate::activate`] and `--toggle` are for.
-//! Both funnel into the same pending flag, so the window comes forward the
-//! same way whichever one fired.
-//!
-//! When a [`crate::shortcut_setup`] system binding is installed, this half
-//! stands down entirely ([`Status::SystemOwned`]): the desktop delivers the
-//! key whether QuickSearch is running or not, and holding our own claim as
-//! well would fight it for the key.
+//! Wayland refuses grabs and gets no in-app half ([`Status::DesktopOnly`]).
+//! The XDG GlobalShortcuts portal is not used: it prompts on every launch,
+//! binds an action that only works while the app runs, and its persisted
+//! claim blocks the desktop's own launch binding. An installed
+//! [`crate::shortcut_setup`] binding stands this half down too
+//! ([`Status::SystemOwned`]).
 //!
 //! Held in a thread-local global rather than a field: the registration is
 //! process-wide, the event handler is set-once, and on Windows
@@ -70,41 +62,45 @@ enum Backend {
     },
 }
 
-/// Start the shortcut and register `setting`. Must be called on the
+/// Starts the shortcut and registers `setting`. Must be called on the
 /// event-loop thread: on Windows `GlobalHotKeyManager` creates a hidden
 /// window whose messages that loop dispatches.
 pub fn init(ctx: &egui::Context, setting: &str) {
-    // Press only: the crate reports the release as a second event.
+    // Press only: the crate reports the release as a second event. The press
+    // goes to `activate`, which consumes it however it arrived.
     let repaint = ctx.clone();
     GlobalHotKeyEvent::set_event_handler(Some(move |event: GlobalHotKeyEvent| {
         if event.state == HotKeyState::Pressed {
-            fire(&repaint);
+            crate::activate::fire(&repaint);
         }
     }));
 
-    let backend = match choose_backend() {
-        Ok(backend) => backend,
+    let (registry, started) = match choose_backend() {
+        Ok(backend) => (
+            Registry {
+                backend,
+                status: Status::Disabled,
+            },
+            true,
+        ),
         Err(message) => {
             quicksearch_core::log_warn!("global shortcut: {}", message);
-            REGISTRY.with_borrow_mut(|slot| {
-                *slot = Some(Registry {
+            (
+                Registry {
                     backend: Backend::Idle,
                     status: Status::Error(message),
-                });
-            });
-            return;
+                },
+                false,
+            )
         }
     };
-    REGISTRY.with_borrow_mut(|slot| {
-        *slot = Some(Registry {
-            backend,
-            status: Status::Disabled,
-        })
-    });
-    apply(setting);
+    REGISTRY.with_borrow_mut(|slot| *slot = Some(registry));
+    if started {
+        apply(setting);
+    }
 }
 
-/// Register `setting`, releasing whatever was registered before. An
+/// Registers `setting`, releasing whatever was registered before. An
 /// unparseable or refused shortcut is reported through [`status`], never by
 /// failing: not worth blocking a config the user has already applied.
 pub fn apply(setting: &str) {
@@ -112,18 +108,17 @@ pub fn apply(setting: &str) {
         let Some(registry) = slot.as_mut() else {
             return;
         };
-        // The desktop's own binding outranks ours: release whatever is held
-        // and stand down (see `Status::SystemOwned`). Checked here rather
-        // than by the callers so init and every save agree; the probe is a
-        // file check on KDE and a one-off subprocess on GNOME, and `apply`
-        // only runs on saves.
+        // The desktop's own binding outranks ours (see
+        // `Status::SystemOwned`). Checked here so init and every save agree;
+        // the probe is a file check on KDE and one subprocess on GNOME, and
+        // `apply` only runs on saves.
         if crate::shortcut_setup::installed() {
             let _ = registry.backend.register(None);
             registry.status = Status::SystemOwned;
             return;
         }
-        // Wayland with nothing installed: there is nothing to register —
-        // the compositor refuses grabs — so say where the key has to live.
+        // Wayland with nothing installed: the compositor refuses grabs, so
+        // say where the key has to live.
         if crate::activate::raise::is_wayland() {
             registry.status = Status::DesktopOnly;
             return;
@@ -158,13 +153,6 @@ pub fn status() -> Status {
         None => Status::Disabled,
         Some(registry) => registry.status.clone(),
     })
-}
-
-/// Hand the press to [`crate::activate`], which owns the pending flag and
-/// the repaint. One place to consume, whether the press came from our own
-/// registration or from a `--toggle` the desktop launched.
-fn fire(ctx: &egui::Context) {
-    crate::activate::fire(ctx);
 }
 
 impl Backend {
@@ -202,18 +190,13 @@ impl Backend {
     }
 }
 
-/// A Wayland session gets no backend at all — the desktop's binding is the
-/// Wayland path; see the module docs. No X11 grab as a fallback either: it
-/// succeeds inside a Wayland session and then only fires while an XWayland
-/// window has focus — a broken-looking shortcut.
+/// A Wayland session gets no backend (see the module docs). No X11 grab as a
+/// fallback either: it succeeds inside a Wayland session and then only fires
+/// while an XWayland window has focus, which looks broken.
 fn choose_backend() -> Result<Backend, String> {
     if crate::activate::raise::is_wayland() {
         return Ok(Backend::Idle);
     }
-    grab_backend()
-}
-
-fn grab_backend() -> Result<Backend, String> {
     GlobalHotKeyManager::new()
         .map(|manager| Backend::Grab {
             manager,

@@ -11,6 +11,26 @@ pub struct IgnoreDialog {
     pub persist: bool,
 }
 
+impl IgnoreDialog {
+    /// The dialog's starting patterns for one hit: its extension, its name
+    /// and its folder.
+    pub(super) fn for_hit(hit: &SearchHit) -> IgnoreDialog {
+        IgnoreDialog {
+            source_path: hit.path.clone(),
+            ext_pattern: std::path::Path::new(&hit.name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| format!("*.{}", e)),
+            name_pattern: hit.name.clone(),
+            dir_pattern: std::path::Path::new(&hit.path)
+                .parent()
+                .map(crate::ui_util::dir_ignore_pattern)
+                .unwrap_or_default(),
+            persist: false,
+        }
+    }
+}
+
 impl SearchTab {
     pub(super) fn ignore_dialog_ui(&mut self, ctx: &egui::Context, actions: &mut SearchActions) {
         use crate::ui_util::{bordered_button, pattern_edit};
@@ -18,80 +38,81 @@ impl SearchTab {
         let Some(dialog) = &mut self.ignore_dialog else {
             return;
         };
+        // A pattern box with its button right-aligned; the pattern when clicked.
+        let pattern_row = |ui: &mut egui::Ui, pattern: &mut String, hint: &str, label: &str| {
+            ui.horizontal(|ui| {
+                let (_, valid) = pattern_edit(ui, pattern, 240.0, hint);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled(valid, bordered_button(label, p.orange))
+                        .clicked()
+                        .then(|| pattern.trim().to_string())
+                })
+                .inner
+            })
+            .inner
+        };
         let buttons = crate::ui_util::centered_modal(ctx, "Ignore filter", |ui| {
             let mut chosen: Option<String> = None;
-            {
-                ui.set_min_width(430.0);
-                ui.label(format!("From: {}", dialog.source_path));
-                ui.separator();
+            ui.set_min_width(430.0);
+            ui.label(format!("From: {}", dialog.source_path));
+            ui.separator();
 
-                // --- Extension ---------------------------------------------
-                ui.horizontal(|ui| match &dialog.ext_pattern {
-                    Some(ext) => {
-                        ui.monospace(ext);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .add(bordered_button("Ignore this extension", p.orange))
-                                .clicked()
-                            {
-                                chosen = Some(ext.clone());
-                            }
-                        });
-                    }
-                    None => {
-                        ui.label(egui::RichText::new("(no file extension)").weak());
-                    }
-                });
-                ui.separator();
-
-                // --- Filename ----------------------------------------------
-                ui.horizontal(|ui| {
-                    let (_, valid) =
-                        pattern_edit(ui, &mut dialog.name_pattern, 240.0, "filename or glob");
+            // --- Extension ---------------------------------------------
+            ui.horizontal(|ui| match &dialog.ext_pattern {
+                Some(ext) => {
+                    ui.monospace(ext);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_enabled(valid, bordered_button("Ignore this filename", p.orange))
+                            .add(bordered_button("Ignore this extension", p.orange))
                             .clicked()
                         {
-                            chosen = Some(dialog.name_pattern.trim().to_string());
+                            chosen = Some(ext.clone());
                         }
                     });
-                });
-                // Inside a stable section, or the hint's appearance would
-                // rename the directory editor below and drop its focus.
-                crate::ui_util::pattern_hint_label(ui, &dialog.name_pattern);
-                ui.separator();
+                }
+                None => {
+                    ui.label(egui::RichText::new("(no file extension)").weak());
+                }
+            });
+            ui.separator();
 
-                // --- Directory ---------------------------------------------
-                ui.horizontal(|ui| {
-                    let (_, valid) =
-                        pattern_edit(ui, &mut dialog.dir_pattern, 240.0, "directory glob");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled(valid, bordered_button("Ignore this directory", p.orange))
-                            .clicked()
-                        {
-                            chosen = Some(dialog.dir_pattern.trim().to_string());
-                        }
-                    });
-                });
-                ui.separator();
+            // --- Filename ----------------------------------------------
+            chosen = pattern_row(
+                ui,
+                &mut dialog.name_pattern,
+                "filename or glob",
+                "Ignore this filename",
+            )
+            .or(chosen);
+            // In a stable section, so the hint coming and going keeps the
+            // directory editor's id (see `ui_util::stable_section`).
+            crate::ui_util::pattern_hint_label(ui, &dialog.name_pattern);
+            ui.separator();
 
-                // --- Persist + close ---------------------------------------
-                egui::Frame::new()
-                    .stroke(egui::Stroke::new(1.0, p.blue))
-                    .corner_radius(4)
-                    .inner_margin(egui::Margin::symmetric(6, 3))
-                    .show(ui, |ui| {
-                        ui.checkbox(&mut dialog.persist, "Persist to config");
-                    });
-                ui.label(hint(
-                    "Session filters hide results immediately. Persisted filters also \
-                         exclude files from the index at the next reindex.",
-                ));
-                let cancel = ui.button("Cancel").clicked();
-                (chosen, cancel)
-            }
+            // --- Directory ---------------------------------------------
+            chosen = pattern_row(
+                ui,
+                &mut dialog.dir_pattern,
+                "directory glob",
+                "Ignore this directory",
+            )
+            .or(chosen);
+            ui.separator();
+
+            // --- Persist + close ---------------------------------------
+            egui::Frame::new()
+                .stroke(egui::Stroke::new(1.0, p.blue))
+                .corner_radius(4)
+                .inner_margin(egui::Margin::symmetric(6, 3))
+                .show(ui, |ui| {
+                    ui.checkbox(&mut dialog.persist, "Persist to config");
+                });
+            ui.label(hint(
+                "Session filters hide results immediately. Persisted filters also \
+                 exclude files from the index at the next reindex.",
+            ));
+            let cancel = ui.button("Cancel").clicked();
+            (chosen, cancel)
         });
         let (chosen, cancel) = buttons.unwrap_or((None, false));
         if let Some(pattern) = chosen {

@@ -5,9 +5,9 @@
 //! output is committed (see `tests/fixtures/legacy/regen.sh`).
 //!
 //! Their text is fixed, not seeded, and the expectations are read out of
-//! the committed sources — a regenerated fixture that lost a line fails
+//! the committed sources, so a regenerated fixture that lost a line fails
 //! instead of redefining what it contains. LibreOffice's `.ppt` drags
-//! master-slide prompts into the text, which is exactly why
+//! master-slide prompts into the text, which is why
 //! [`super::match_in_order`] asserts containment rather than equality.
 
 use std::path::{Path, PathBuf};

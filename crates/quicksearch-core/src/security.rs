@@ -9,10 +9,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const SALT_LEN: usize = 16;
 pub const KEY_LEN: usize = 32;
 
-/// Argon2id cost parameters. Changing any of these changes every derived
-/// key, which makes every protected index unreadable — treat them like a
-/// schema version. ~0.5 s on desktop hardware; paid once per unlock, never
-/// per connection (the keychain path skips it entirely).
+/// Argon2id cost parameters. Changing any of them changes every derived key
+/// and makes every protected index unreadable, so treat them like a schema
+/// version. ~0.5 s on desktop hardware, paid once per unlock and never per
+/// connection (the keychain path skips it entirely).
 const ARGON2_MEM_KIB: u32 = 64 * 1024;
 const ARGON2_ITERS: u32 = 3;
 const ARGON2_LANES: u32 = 1;
@@ -44,8 +44,8 @@ impl IndexKey {
     }
 }
 
-/// Fresh random salt. Called only when a password is being set — a salt is
-/// never invented anywhere else (no default exists).
+/// Fresh random salt, made only when a password is being set; no default
+/// exists.
 pub fn generate_salt() -> [u8; SALT_LEN] {
     let mut salt = [0u8; SALT_LEN];
     getrandom::getrandom(&mut salt).expect("OS randomness unavailable");
@@ -77,7 +77,7 @@ pub fn derive_key(password: &str, salt: &[u8; SALT_LEN]) -> IndexKey {
     IndexKey(out)
 }
 
-/// The crate's only hex encoder — also how a duplicate group spells its hash
+/// The crate's only hex encoder, also how a duplicate group spells its hash
 /// ([`crate::search::DuplicateGroup::hash_hex`]).
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -105,9 +105,9 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
-    /// Golden vector: pins password + salt → key. If this test breaks, the
-    /// derivation changed and every existing protected index just became
-    /// unreadable — that must never happen by accident.
+    /// Golden vector: pins password + salt → key. If this breaks, the
+    /// derivation changed and every existing protected index became
+    /// unreadable, which must never happen by accident.
     #[test]
     fn derive_key_is_pinned() {
         let salt = salt_from_hex("000102030405060708090a0b0c0d0e0f").unwrap();

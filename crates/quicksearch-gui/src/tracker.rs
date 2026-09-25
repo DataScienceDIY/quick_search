@@ -1,28 +1,22 @@
-//! Indexing-rate estimation: a rolling [`WINDOW`] average, not a run
-//! average. Two rules that look like bugs and are not — never prune below
-//! two points (a rate slower than one file per window must stay
-//! computable), and measure against `now` (so a stall decays the estimate
-//! instead of freezing it at the last burst).
+//! Indexing-rate estimation: a rolling [`RATE_WINDOW`] average, not a run
+//! average. Two rules look like bugs and are not: never prune below two
+//! points (a rate slower than one file per window must stay computable), and
+//! measure against `now` (so a stall decays the estimate instead of freezing
+//! it at the last burst).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-/// Public so the display can name it.
-pub const WINDOW: Duration = Duration::from_secs(30);
+pub const RATE_WINDOW: Duration = Duration::from_secs(30);
 
+#[derive(Default)]
 pub struct SpeedTracker {
     /// (when, counter value), appended only on a change.
     points: VecDeque<(Instant, usize)>,
 }
 
 impl SpeedTracker {
-    pub fn new() -> SpeedTracker {
-        SpeedTracker {
-            points: VecDeque::new(),
-        }
-    }
-
-    /// Between phases — each restarts its counter.
+    /// Forgets the history between phases, since each restarts its counter.
     pub fn reset(&mut self) {
         self.points.clear();
     }
@@ -34,14 +28,14 @@ impl SpeedTracker {
     fn record_at(&mut self, now: Instant, files_processed: usize) {
         match self.points.back() {
             Some(&(_, last)) if last == files_processed => return,
-            // Counter went backwards — a new phase started without an
+            // Counter went backwards: a new phase started without an
             // explicit reset.
             Some(&(_, last)) if files_processed < last => self.points.clear(),
             _ => {}
         }
         self.points.push_back((now, files_processed));
         // Never below two: see the module header.
-        while self.points.len() > 2 && now.duration_since(self.points[0].0) > WINDOW {
+        while self.points.len() > 2 && now.duration_since(self.points[0].0) > RATE_WINDOW {
             self.points.pop_front();
         }
     }
@@ -72,7 +66,7 @@ mod tests {
 
     #[test]
     fn needs_two_points() {
-        let mut t = SpeedTracker::new();
+        let mut t = SpeedTracker::default();
         let base = Instant::now();
         assert!(t.files_per_sec_at(base).is_none());
         t.record_at(base, 10);
@@ -82,7 +76,7 @@ mod tests {
     #[test]
     fn slow_rate_is_measurable_not_zero() {
         // One file every 2.5 s.
-        let mut t = SpeedTracker::new();
+        let mut t = SpeedTracker::default();
         let base = Instant::now();
         for i in 0..4 {
             t.record_at(base + Duration::from_millis(2500 * i), 10 + i as usize);
@@ -95,7 +89,7 @@ mod tests {
 
     #[test]
     fn unchanged_counter_adds_no_points() {
-        let mut t = SpeedTracker::new();
+        let mut t = SpeedTracker::default();
         let base = Instant::now();
         for i in 0..100 {
             t.record_at(base + Duration::from_millis(50 * i), 42);
@@ -105,7 +99,7 @@ mod tests {
 
     #[test]
     fn stall_decays_toward_zero() {
-        let mut t = SpeedTracker::new();
+        let mut t = SpeedTracker::default();
         let base = Instant::now();
         t.record_at(base, 0);
         t.record_at(base + Duration::from_secs(1), 100); // 100/s burst
@@ -121,7 +115,7 @@ mod tests {
 
     #[test]
     fn pruning_keeps_at_least_two_points() {
-        let mut t = SpeedTracker::new();
+        let mut t = SpeedTracker::default();
         let base = Instant::now();
         t.record_at(base, 1);
         t.record_at(base + Duration::from_secs(30), 2);
@@ -136,7 +130,7 @@ mod tests {
     fn window_forgets_an_older_burst() {
         // 10,000 files in the first second, then a steady 10/s: a run
         // average would still read in the hundreds.
-        let mut t = SpeedTracker::new();
+        let mut t = SpeedTracker::default();
         let base = Instant::now();
         t.record_at(base, 0);
         t.record_at(base + Duration::from_secs(1), 10_000);
@@ -149,14 +143,14 @@ mod tests {
         assert!(
             t.points
                 .iter()
-                .all(|&(at, _)| now.duration_since(at) <= WINDOW),
+                .all(|&(at, _)| now.duration_since(at) <= RATE_WINDOW),
             "no point older than the window survives while others remain"
         );
     }
 
     #[test]
     fn counter_regression_resets() {
-        let mut t = SpeedTracker::new();
+        let mut t = SpeedTracker::default();
         let base = Instant::now();
         t.record_at(base, 500);
         t.record_at(base + Duration::from_secs(1), 600);

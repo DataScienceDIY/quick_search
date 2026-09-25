@@ -1,7 +1,7 @@
 //! End-to-end timing and syscall accounting for a full indexing run.
 //!
 //! [`walkprobe`](walkprobe.rs) covers phase 1 alone; this covers the whole
-//! pipeline — parallel walk, `files` writes, and content extraction.
+//! pipeline: parallel walk, `files` writes and content extraction.
 //!
 //! ```text
 //! cargo build -p quicksearch-core --example indexprobe --release
@@ -10,8 +10,8 @@
 //! ./target/release/examples/indexprobe warm /tmp/qs-bench /tmp/qs-bench.db
 //! ```
 //!
-//! `cold` deletes the database first; `warm` re-runs untouched — the case
-//! that must stay at one `stat` per file. The run modes inspect nothing
+//! `cold` deletes the database first; `warm` re-runs untouched, the case that
+//! must stay at one `stat` per file. The run modes inspect nothing
 //! themselves, so every syscall a trace attributes to the tree is the indexer's:
 //!
 //! ```text
@@ -21,20 +21,18 @@
 //! grep -oP '^\d+ \K[a-z0-9_]+' <(grep '/tmp/qs-bench/' /tmp/t.log) | sort | uniq -c
 //! ```
 //!
-//! `QSB_HASH_LENGTH` overrides `[processing] hash_length` for a run — how
-//! [`hashprobe`](hashprobe.rs) gets its end-to-end column.
+//! `QSB_HASH_LENGTH` overrides `[processing] hash_length` for a run, pricing
+//! the read cost [`hashprobe`](hashprobe.rs) leaves out.
 //!
-//! `QSB_KEY=<64 hex digits>` measures an encrypted index. It is not optional
-//! dressing: without a key installed this probe polls the completion marker
-//! through a plain open, which an encrypted index cannot answer, so the run
-//! reports a three-hour hang instead of its actual time.
+//! `QSB_KEY=<64 hex digits>` measures an encrypted index; a `warm` run over
+//! one needs the same key (see `probe_open`).
 
 mod common;
 
 use std::alloc::{GlobalAlloc, Layout};
 
-// What `Counting` wraps: the allocator the shipped binaries install, or the
-// throughput figures describe a build nobody runs.
+// `Counting` wraps the allocator the shipped binaries install, so the
+// throughput figures describe a real build.
 use quicksearch_core::platform::Allocator as Inner;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,11 +43,11 @@ use common::{evict, mib, Io};
 // Allocation accounting
 // ---------------------------------------------------------------------------
 
-/// [`Inner`], counting — per binary, so the shipped `quicksearch` is
-/// untouched. Global atomics, not `search_alloc`'s per-thread `Cell`s: the
-/// work spreads over several pools and nothing else runs here, so a global
-/// count is exactly the run. The contended RMW is fine when both sides of a
-/// comparison carry it; never quote against an uninstrumented build.
+/// [`Inner`] with allocation accounting, installed in this binary only.
+/// Global atomics, not `benches/alloc`'s per-thread `Cell`s: the work spreads
+/// over several pools and nothing else runs here, so a global count is the
+/// run. The contended atomics cost throughput, so compare only against
+/// another instrumented build.
 struct Counting;
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -108,16 +106,16 @@ use std::time::{Duration, Instant};
 use quicksearch_core::config::Config;
 use quicksearch_core::indexing::{IndexingService, IndexingStatus};
 
-/// Files whose head the walk reads in full — never reopened.
+/// Text files the walk's head read covers whole, so never reopened.
 const SMALL_TEXT: usize = 800;
 /// Text files past `hash_length`, which extraction must still read.
 const LARGE_TEXT: usize = 100;
-/// Unclaimed by any extractor — a control group whose cost must not move.
+/// Files no extractor claims: a control group whose cost must not move.
 const BINARY: usize = 100;
 
-/// Scale the generated tree (`QSB_SCALE`), keeping the mix fixed: the
-/// default thousand files is dominated by fixed start-up, and the difference
-/// between two scales is the only way to separate it from per-file cost.
+/// The generated tree's scale (`QSB_SCALE`), with the mix fixed. The default
+/// thousand files is dominated by fixed start-up; the difference between two
+/// scales separates it from per-file cost.
 fn scale() -> usize {
     std::env::var("QSB_SCALE")
         .ok()
@@ -291,16 +289,16 @@ fn prose(rng: &mut Rng, target: usize) -> String {
     s
 }
 
-/// What the WAL did during a run, sampled from outside the process: growth
-/// between samples is frames appended, a drop is a checkpoint, and the size
-/// it dropped *from* bounds the copy-back. The split matters: more frames
-/// means the load rewrites pages, more copy-back means checkpointing too
-/// often — checkpointing less can be strictly cheaper.
+/// What the WAL did during a run, sampled from its file size: growth between
+/// samples is frames appended, a drop is a checkpoint, and the size it
+/// dropped from bounds the copy-back. More frames means the load rewrites
+/// pages; more copy-back means checkpointing too often, where checkpointing
+/// less can be strictly cheaper.
 #[derive(Default, Clone, Copy)]
 struct WalStats {
     peak: u64,
     appended: u64,
-    /// Sum of sizes before each truncation — bounds checkpoint copy-back.
+    /// Sum of the sizes before each truncation; bounds the copy-back.
     copied_back: u64,
     checkpoints: u64,
 }
@@ -340,19 +338,18 @@ fn db_sizes(db: &Path) -> (u64, u64) {
     )
 }
 
-/// `[processing] hash_length` for this run, from `QSB_HASH_LENGTH`: charged
-/// to the walk, credited back by the content pass, so the knob has to be
-/// swept end-to-end. Out-of-range values are clamped, with a warning.
+/// `[processing] hash_length` for this run, from `QSB_HASH_LENGTH`. The walk
+/// pays for it and the content pass gets it back, so the knob has to be swept
+/// end-to-end. Out-of-range values are clamped, with a warning.
 fn hash_length_override() -> Option<usize> {
     std::env::var("QSB_HASH_LENGTH")
         .ok()
         .and_then(|v| v.parse().ok())
 }
 
-/// `QSB_KEY=<64 hex digits>` measures an *encrypted* index: the key is
-/// installed process-wide before any connection exists, exactly as the GUI
-/// does after an unlock. Raw hex rather than a password, so no Argon2id
-/// derivation lands inside a timed run.
+/// Install `QSB_KEY` (64 hex digits) process-wide before any connection
+/// exists, as the GUI does after an unlock; returns whether it did. Raw hex
+/// rather than a password keeps Argon2id derivation out of the timed run.
 fn install_key() -> bool {
     match std::env::var("QSB_KEY") {
         Ok(hex) => {
@@ -367,13 +364,11 @@ fn install_key() -> bool {
 
 /// Open the index the way this run's key demands.
 ///
-/// **A plain open cannot read an encrypted index**, and
+/// A plain open cannot read an encrypted index, and
 /// [`get_last_full_index`](quicksearch_core::db::repo::get_last_full_index)
-/// reports that failure as `None` — indistinguishable from "not finished
-/// yet". Polling an encrypted run through a plain open therefore never
-/// observes its own completion and sits here until the deadline, which reads
-/// as an indexing slowdown of several orders of magnitude rather than as the
-/// probe defect it is.
+/// reports that failure as `None`, the same as "not finished yet". Polling
+/// through a plain open would wait out the deadline and read as a slowdown of
+/// several orders of magnitude.
 fn probe_open(db: &Path, keyed: bool) -> Option<rusqlite::Connection> {
     if keyed {
         quicksearch_core::db::open_existing(&db.to_string_lossy(), false).ok()
@@ -417,9 +412,9 @@ fn run(mode: &str, tree: &Path, db: &Path) {
         )
         .expect("start indexing");
 
-    // Generous, like `memprobe`'s: the scale sweep this probe exists for runs
-    // hundreds of thousands of files, and a run that times out reports
-    // nothing. Past this is a hang, not a slow disk.
+    // Three hours, as in `memprobe`: a scale sweep runs hundreds of thousands
+    // of files, and a run that times out reports nothing. Past this is a
+    // hang, not a slow disk.
     let deadline = Instant::now() + Duration::from_secs(3 * 3600);
     let mut done = false;
     while Instant::now() < deadline {
@@ -447,8 +442,8 @@ fn run(mode: &str, tree: &Path, db: &Path) {
     wal_stop.store(true, Ordering::Relaxed);
     let wal = wal_sampler.join().unwrap_or_default();
 
-    // Count what was actually indexed rather than assuming `gen`'s tree —
-    // pointing the probe elsewhere made the rate a fiction.
+    // Count what was indexed rather than assuming `gen`'s tree, so the rate
+    // holds for any tree.
     let total = probe_open(db, keyed)
         .and_then(|c| quicksearch_core::db::repo::row_count(&c).ok())
         .unwrap_or(0);

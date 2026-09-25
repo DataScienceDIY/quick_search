@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::config::IgnoreSet;
+use crate::testutil::touch;
 
 use super::records::get_file_hash;
 use super::*;
@@ -10,21 +11,68 @@ fn tmp_tree() -> std::path::PathBuf {
     crate::testutil::scratch_dir("walk")
 }
 
-fn touch(p: &Path) {
-    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::write(p, b"x").unwrap();
+/// The entries' file names, sorted.
+fn names(entries: impl Iterator<Item = walkdir::DirEntry>) -> Vec<String> {
+    let mut names: Vec<String> = entries
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The sorted names of the files [`filtered_walk`] yields under `root`.
+fn walked_names(root: &Path, follow: bool, hidden: bool, ignore: &IgnoreSet) -> Vec<String> {
+    let failures = UnreadableDirs::default();
+    names(filtered_walk(
+        root.to_str().unwrap(),
+        follow,
+        hidden,
+        ignore,
+        &failures,
+    ))
+}
+
+/// The sorted names of the directories [`filtered_dirs`] yields under `root`.
+fn walked_dir_names(root: &Path, follow: bool, hidden: bool, ignore: &IgnoreSet) -> Vec<String> {
+    let failures = UnreadableDirs::default();
+    names(filtered_dirs(
+        root.to_str().unwrap(),
+        follow,
+        hidden,
+        ignore,
+        &failures,
+    ))
+}
+
+/// The stored `deletemerge` threshold, if FTS5 has one recorded.
+fn deletemerge(conn: &rusqlite::Connection) -> Option<i64> {
+    conn.query_row(
+        "SELECT v FROM searchabletext_config WHERE k = 'deletemerge'",
+        [],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+#[cfg(unix)]
+fn into_conn(m: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>) -> rusqlite::Connection {
+    std::sync::Arc::try_unwrap(m)
+        .map_err(|_| ())
+        .expect("sole owner")
+        .into_inner()
+        .unwrap()
 }
 
 #[test]
 fn filtered_walk_prunes_hidden_and_ignored() {
     let root = tmp_tree();
-    touch(&root.join("keep.txt"));
-    touch(&root.join("sub/keep2.txt"));
-    touch(&root.join("sub/skip.tmp"));
-    touch(&root.join(".hidden/inside.txt"));
-    touch(&root.join(".dotfile"));
-    touch(&root.join("node_modules/dep/index.js"));
-    touch(&root.join("secret/deep/file.txt"));
+    touch(&root.join("keep.txt"), b"x");
+    touch(&root.join("sub/keep2.txt"), b"x");
+    touch(&root.join("sub/skip.tmp"), b"x");
+    touch(&root.join(".hidden/inside.txt"), b"x");
+    touch(&root.join(".dotfile"), b"x");
+    touch(&root.join("node_modules/dep/index.js"), b"x");
+    touch(&root.join("secret/deep/file.txt"), b"x");
 
     let ignore = IgnoreSet::compile(&[
         "*.tmp".to_string(),
@@ -33,30 +81,12 @@ fn filtered_walk_prunes_hidden_and_ignored() {
     ])
     .unwrap();
 
-    let mut names: Vec<String> = filtered_walk(
-        root.to_str().unwrap(),
-        false,
-        false,
-        &ignore,
-        &UnreadableDirs::default(),
-    )
-    .map(|e| e.file_name().to_string_lossy().into_owned())
-    .collect();
-    names.sort();
-    assert_eq!(names, vec!["keep.txt", "keep2.txt"]);
-
-    let mut names: Vec<String> = filtered_walk(
-        root.to_str().unwrap(),
-        false,
-        true,
-        &ignore,
-        &UnreadableDirs::default(),
-    )
-    .map(|e| e.file_name().to_string_lossy().into_owned())
-    .collect();
-    names.sort();
     assert_eq!(
-        names,
+        walked_names(&root, false, false, &ignore),
+        vec!["keep.txt", "keep2.txt"]
+    );
+    assert_eq!(
+        walked_names(&root, false, true, &ignore),
         vec![".dotfile", "inside.txt", "keep.txt", "keep2.txt"]
     );
 
@@ -68,38 +98,20 @@ fn filtered_walk_prunes_hidden_and_ignored() {
 #[test]
 fn filtered_dirs_yields_only_kept_directories() {
     let root = tmp_tree();
-    touch(&root.join("keep.txt"));
-    touch(&root.join("sub/nested/keep2.txt"));
-    touch(&root.join(".hidden/inside.txt"));
-    touch(&root.join("node_modules/dep/index.js"));
+    touch(&root.join("keep.txt"), b"x");
+    touch(&root.join("sub/nested/keep2.txt"), b"x");
+    touch(&root.join(".hidden/inside.txt"), b"x");
+    touch(&root.join("node_modules/dep/index.js"), b"x");
 
     let ignore = IgnoreSet::compile(&["node_modules".to_string()]).unwrap();
 
-    let mut names: Vec<String> = filtered_dirs(
-        root.to_str().unwrap(),
-        false,
-        false,
-        &ignore,
-        &UnreadableDirs::default(),
-    )
-    .map(|e| e.file_name().to_string_lossy().into_owned())
-    .collect();
-    names.sort();
     // The root itself is included (depth 0 is always kept).
     let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
-    let mut want = vec![root_name.clone(), "nested".to_string(), "sub".to_string()];
+    let mut want = vec![root_name, "nested".to_string(), "sub".to_string()];
     want.sort();
-    assert_eq!(names, want);
+    assert_eq!(walked_dir_names(&root, false, false, &ignore), want);
 
-    let names: Vec<String> = filtered_dirs(
-        root.to_str().unwrap(),
-        false,
-        true,
-        &ignore,
-        &UnreadableDirs::default(),
-    )
-    .map(|e| e.file_name().to_string_lossy().into_owned())
-    .collect();
+    let names = walked_dir_names(&root, false, true, &ignore);
     assert!(names.contains(&".hidden".to_string()));
     assert!(
         !names.contains(&"node_modules".to_string()),
@@ -113,8 +125,8 @@ fn filtered_dirs_yields_only_kept_directories() {
 #[test]
 fn filtered_dirs_and_filtered_walk_do_not_overlap() {
     let root = tmp_tree();
-    touch(&root.join("a.txt"));
-    touch(&root.join("sub/b.txt"));
+    touch(&root.join("a.txt"), b"x");
+    touch(&root.join("sub/b.txt"), b"x");
     let ignore = IgnoreSet::compile(&[]).unwrap();
 
     let files: Vec<_> = filtered_walk(
@@ -151,18 +163,9 @@ fn filtered_walk_hidden_root_still_walked() {
     // A hidden root dir must not silence the whole walk.
     let base = tmp_tree();
     let root = base.join(".config");
-    touch(&root.join("app.conf"));
+    touch(&root.join("app.conf"), b"x");
     let ignore = IgnoreSet::compile(&[]).unwrap();
-    let names: Vec<String> = filtered_walk(
-        root.to_str().unwrap(),
-        false,
-        false,
-        &ignore,
-        &UnreadableDirs::default(),
-    )
-    .map(|e| e.file_name().to_string_lossy().into_owned())
-    .collect();
-    assert_eq!(names, vec!["app.conf"]);
+    assert_eq!(walked_names(&root, false, false, &ignore), vec!["app.conf"]);
     std::fs::remove_dir_all(&base).ok();
 }
 
@@ -222,11 +225,11 @@ fn db_path_strips_windows_prefixes() {
 /// The range must bracket paths spelled with the *platform's* separator: a
 /// hard-coded `'/' + 1` `hi` sorts below every `C:\…` path.
 #[test]
-fn extract_cursor_brackets_paths_under_its_root() {
+fn root_range_brackets_paths_under_its_root() {
     use std::path::MAIN_SEPARATOR as SEP;
 
     let root = format!("{}Users{}me", root_prefix(), SEP);
-    let c = ExtractCursor::for_root(&root);
+    let c = RootRange::for_root(&root);
     let inside = format!("{}{}docs{}a.txt", root, SEP, SEP);
     assert!(
         inside.as_str() >= c.lo.as_str() && inside.as_str() < c.hi.as_str(),
@@ -248,7 +251,7 @@ fn extract_cursor_brackets_paths_under_its_root() {
     );
 
     for spelled in [format!("{}/", root), format!("{}\\", root)] {
-        let c2 = ExtractCursor::for_root(&spelled);
+        let c2 = RootRange::for_root(&spelled);
         assert_eq!((&c2.lo, &c2.hi), (&c.lo, &c.hi), "spelled {:?}", spelled);
     }
 }
@@ -333,41 +336,41 @@ fn unreadable_dirs_match_by_component_not_string_prefix() {
     assert!(!u.covers("/a/other.txt"));
 }
 
+/// "Could not look" must stay distinguishable from "the files are gone": the
+/// latter deletes index rows.
 #[test]
+#[cfg(unix)]
 fn unreadable_directory_is_reported_rather_than_yielded_as_empty() {
-    // "Could not look" must stay distinguishable from "the files are
-    // gone" — the latter deletes index rows.
+    use std::os::unix::fs::PermissionsExt;
+
     let root = tmp_tree();
-    touch(&root.join("readable/a.txt"));
+    touch(&root.join("readable/a.txt"), b"x");
     let locked = root.join("locked");
-    std::fs::create_dir_all(&locked).unwrap();
-    touch(&locked.join("hidden-from-us.txt"));
+    touch(&locked.join("hidden-from-us.txt"), b"x");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let ignore = IgnoreSet::compile(&[]).unwrap();
+    let failures = UnreadableDirs::default();
+    let names = names(filtered_walk(
+        root.to_str().unwrap(),
+        false,
+        false,
+        &ignore,
+        &failures,
+    ));
 
-        let ignore = IgnoreSet::compile(&[]).unwrap();
-        let failures = UnreadableDirs::default();
-        let names: Vec<String> =
-            filtered_walk(root.to_str().unwrap(), false, false, &ignore, &failures)
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
 
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
-
-        assert_eq!(
-            names,
-            vec!["a.txt"],
-            "the unreadable subtree yields nothing"
-        );
-        assert!(!failures.is_empty(), "and that failure must be recorded");
-        assert!(
-            failures.covers(locked.join("hidden-from-us.txt").to_str().unwrap()),
-            "rows beneath it are protected from stale cleanup"
-        );
-    }
+    assert_eq!(
+        names,
+        vec!["a.txt"],
+        "the unreadable subtree yields nothing"
+    );
+    assert!(!failures.is_empty(), "and that failure must be recorded");
+    assert!(
+        failures.covers(locked.join("hidden-from-us.txt").to_str().unwrap()),
+        "rows beneath it are protected from stale cleanup"
+    );
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -491,43 +494,28 @@ fn a_backslash_is_just_a_character_on_unix() {
     );
 }
 
-/// walkdir defaults `follow_root_links` to **true**, independently of
-/// `follow_links` — a symlinked root was descended even with following off,
-/// landing rows where no sweep range reaches.
+/// walkdir defaults `follow_root_links` to true, independently of
+/// `follow_links`, which would descend a symlinked root even with following
+/// off and land rows where no sweep range reaches.
 #[test]
 #[cfg(unix)]
 fn a_symlinked_root_is_not_descended_when_following_is_off() {
     let base = tmp_tree();
     let real = base.join("real");
-    touch(&real.join("inside.txt"));
+    touch(&real.join("inside.txt"), b"x");
     let link = base.join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
     let ignore = IgnoreSet::compile(&[]).unwrap();
-    let names: Vec<String> = filtered_walk(
-        link.to_str().unwrap(),
-        false,
-        false,
-        &ignore,
-        &UnreadableDirs::default(),
-    )
-    .map(|e| e.file_name().to_string_lossy().into_owned())
-    .collect();
+    let names = walked_names(&link, false, false, &ignore);
     assert!(
         names.is_empty(),
         "a symlinked root must not be descended: {names:?}"
     );
-
-    let names: Vec<String> = filtered_walk(
-        link.to_str().unwrap(),
-        true,
-        false,
-        &ignore,
-        &UnreadableDirs::default(),
-    )
-    .map(|e| e.file_name().to_string_lossy().into_owned())
-    .collect();
-    assert_eq!(names, vec!["inside.txt"]);
+    assert_eq!(
+        walked_names(&link, true, false, &ignore),
+        vec!["inside.txt"]
+    );
 
     std::fs::remove_dir_all(&base).ok();
 }
@@ -538,36 +526,22 @@ fn a_symlinked_root_is_not_descended_when_following_is_off() {
 fn a_symlink_inside_a_root_is_skipped_when_following_is_off() {
     let base = tmp_tree();
     let root = base.join("root");
-    touch(&root.join("real.txt"));
+    touch(&root.join("real.txt"), b"x");
     let outside = base.join("outside");
-    touch(&outside.join("target.txt"));
+    touch(&outside.join("target.txt"), b"x");
     std::os::unix::fs::symlink(outside.join("target.txt"), root.join("link.txt")).unwrap();
     std::os::unix::fs::symlink(&outside, root.join("linkdir")).unwrap();
 
     let ignore = IgnoreSet::compile(&[]).unwrap();
-    let mut names: Vec<String> = filtered_walk(
-        root.to_str().unwrap(),
-        false,
-        false,
-        &ignore,
-        &UnreadableDirs::default(),
-    )
-    .map(|e| e.file_name().to_string_lossy().into_owned())
-    .collect();
-    names.sort();
-    assert_eq!(names, vec!["real.txt"], "only the real file may be walked");
-
-    let mut names: Vec<String> = filtered_walk(
-        root.to_str().unwrap(),
-        true,
-        false,
-        &ignore,
-        &UnreadableDirs::default(),
-    )
-    .map(|e| e.file_name().to_string_lossy().into_owned())
-    .collect();
-    names.sort();
-    assert_eq!(names, vec!["link.txt", "real.txt", "target.txt"]);
+    assert_eq!(
+        walked_names(&root, false, false, &ignore),
+        vec!["real.txt"],
+        "only the real file may be walked"
+    );
+    assert_eq!(
+        walked_names(&root, true, false, &ignore),
+        vec!["link.txt", "real.txt", "target.txt"]
+    );
 
     std::fs::remove_dir_all(&base).ok();
 }
@@ -579,20 +553,12 @@ fn a_symlink_inside_a_root_is_skipped_when_following_is_off() {
 fn a_symlinked_root_yields_no_directories_when_following_is_off() {
     let base = tmp_tree();
     let real = base.join("real");
-    touch(&real.join("sub/inside.txt"));
+    touch(&real.join("sub/inside.txt"), b"x");
     let link = base.join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
     let ignore = IgnoreSet::compile(&[]).unwrap();
-    let dirs: Vec<String> = filtered_dirs(
-        link.to_str().unwrap(),
-        false,
-        false,
-        &ignore,
-        &UnreadableDirs::default(),
-    )
-    .map(|e| e.path().display().to_string())
-    .collect();
+    let dirs = walked_dir_names(&link, false, false, &ignore);
     assert!(
         dirs.is_empty(),
         "a symlinked root must yield no directories: {dirs:?}"
@@ -602,33 +568,23 @@ fn a_symlinked_root_yields_no_directories_when_following_is_off() {
 }
 
 /// A reconcile killed mid-burst leaves `deletemerge` at 0, where no later
-/// `'merge'` would reclaim a tombstone again. The next indexing run repairs it.
-///
-/// This is the whole reason [`fts_begin_bulk_write`] writes a value it never
+/// `'merge'` would reclaim a tombstone again, and the next indexing run
+/// repairs it. This is why [`fts_begin_bulk_write`] writes a value it never
 /// lowers: the pairing in `scope::advance` covers the orderly cases, and this
-/// covers the process simply not coming back.
+/// covers the process not coming back.
 #[test]
 fn a_bulk_write_repairs_a_delete_merge_threshold_left_off() {
     let dir = crate::testutil::scratch_dir("deletemerge-repair");
     let db = dir.join("index.sqlite");
     let conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
 
-    let threshold = || -> Option<i64> {
-        conn.query_row(
-            "SELECT v FROM searchabletext_config WHERE k = 'deletemerge'",
-            [],
-            |r| r.get(0),
-        )
-        .ok()
-    };
-
     // What a killed burst leaves behind.
     fts_begin_tombstone_burst(&conn);
-    assert_eq!(threshold(), Some(0), "the burst is in effect");
+    assert_eq!(deletemerge(&conn), Some(0), "the burst is in effect");
 
     fts_begin_bulk_write(&conn);
     assert_eq!(
-        threshold(),
+        deletemerge(&conn),
         Some(i64::from(FTS_DELETEMERGE)),
         "the next run puts tombstone reclamation back"
     );
@@ -637,8 +593,8 @@ fn a_bulk_write_repairs_a_delete_merge_threshold_left_off() {
 }
 
 /// Seed one row per content state under `/t/`, plus a survivor. Returns
-/// `name -> id`. States: the two `done-*` rows hold postings, the others do
-/// not — the distinction stale cleanup's `with_postings` narrowing draws.
+/// `name -> id`. The two `done-*` rows hold postings and the others do not,
+/// the distinction stale cleanup's `with_postings` narrowing draws.
 #[cfg(unix)]
 fn seed_stale_corpus(
     conn: &mut rusqlite::Connection,
@@ -681,7 +637,7 @@ fn seed_stale_corpus(
 /// go, a posting survives exactly for the surviving DONE row, and the
 /// delete-merge threshold the pass held off is back afterwards. An orphan
 /// posting would surface as a hit for a file no longer indexed, with no error
-/// anywhere — the failure mode this pins.
+/// anywhere.
 #[test]
 #[cfg(unix)]
 fn stale_cleanup_deletes_exactly_the_stale_rows_and_their_postings() {
@@ -713,11 +669,7 @@ fn stale_cleanup_deletes_exactly_the_stale_rows_and_their_postings() {
             .unwrap();
     assert_eq!(deleted, 4);
 
-    let conn = Arc::try_unwrap(conn_mutex)
-        .map_err(|_| ())
-        .expect("sole owner")
-        .into_inner()
-        .unwrap();
+    let conn = into_conn(conn_mutex);
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     assert_eq!(count("SELECT COUNT(*) FROM files"), 1);
     assert_eq!(count("SELECT COUNT(*) FROM searchabletext"), 1);
@@ -732,23 +684,18 @@ fn stale_cleanup_deletes_exactly_the_stale_rows_and_their_postings() {
         .unwrap();
     assert_eq!(hit, ids["done-kept.txt"], "the survivor is still findable");
     assert_eq!(
-        conn.query_row(
-            "SELECT v FROM searchabletext_config WHERE k = 'deletemerge'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap(),
-        i64::from(FTS_DELETEMERGE),
+        deletemerge(&conn),
+        Some(i64::from(FTS_DELETEMERGE)),
         "the pass restored the threshold it held off"
     );
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A stop mid-pass returns without restoring `deletemerge` — the abandonment
-/// semantics `a_bulk_write_repairs_a_delete_merge_threshold_left_off` exists
-/// for. If this ever starts restoring it eagerly, that test loses its
-/// subject; if it starts deleting under a stop, a stopped run reconciles.
+/// A stop mid-pass returns without restoring `deletemerge`: the abandonment
+/// `a_bulk_write_repairs_a_delete_merge_threshold_left_off` exists for. If
+/// this starts restoring it eagerly, that test loses its subject; if it
+/// starts deleting under a stop, a stopped run reconciles.
 #[test]
 #[cfg(unix)]
 fn a_stopped_stale_cleanup_deletes_nothing_and_leaves_the_burst() {
@@ -771,21 +718,12 @@ fn a_stopped_stale_cleanup_deletes_nothing_and_leaves_the_burst() {
     .unwrap();
     assert_eq!(deleted, 0);
 
-    let conn = Arc::try_unwrap(conn_mutex)
-        .map_err(|_| ())
-        .expect("sole owner")
-        .into_inner()
-        .unwrap();
+    let conn = into_conn(conn_mutex);
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     assert_eq!(count("SELECT COUNT(*) FROM files"), 5, "a stop deletes nothing");
     assert_eq!(
-        conn.query_row(
-            "SELECT v FROM searchabletext_config WHERE k = 'deletemerge'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap(),
-        0,
+        deletemerge(&conn),
+        Some(0),
         "the burst is left for the next run's bulk write to repair"
     );
 

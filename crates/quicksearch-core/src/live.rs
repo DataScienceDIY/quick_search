@@ -1,9 +1,9 @@
 //! Watching the search results a frontend is actually showing.
 //!
-//! Rows refresh from the *file*, never the index — writes go through
+//! Rows refresh from the file, never the index; writes go through
 //! [`crate::coordinator::IndexCoordinator::update_paths`]. Watches go on
-//! parent *directories*, not files: editors save by renaming over the
-//! target, orphaning the inode a file watch would hold.
+//! parent directories, not files: editors save by renaming over the target,
+//! orphaning the inode a file watch would hold.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -21,7 +21,7 @@ use notify::{
 use crate::config::Config;
 use crate::extract::Registry;
 use crate::query::split::split_for_cascade;
-use crate::search::fuzzy::{edit_budget, Bitap};
+use crate::search::fuzzy::{matcher_for, Bitap};
 use crate::search::ContentTier;
 use crate::snippet::Snippet;
 
@@ -68,7 +68,7 @@ pub enum WindowUpdate {
 /// A ready-to-apply change to one row on screen.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiveUpdate {
-    /// The file moved. `path` is the row's old path — the frontend's key.
+    /// The file moved. `path` is the row's old path, the frontend's key.
     Renamed {
         path: String,
         to: String,
@@ -86,7 +86,7 @@ pub enum LiveUpdate {
 }
 
 impl LiveUpdate {
-    /// The row this update is keyed by — the path the frontend knows it as.
+    /// The row this update is keyed by: the path the frontend knows it as.
     pub fn path(&self) -> &str {
         match self {
             LiveUpdate::Renamed { path, .. }
@@ -141,7 +141,7 @@ impl LiveWatcher {
                     targets: HashMap::new(),
                     pending: HashMap::new(),
                     last_emit: HashMap::new(),
-                    orphan_to: Vec::new(),
+                    unclaimed_destinations: Vec::new(),
                     settle_at: None,
                     query: None,
                     fuzzy: None,
@@ -201,9 +201,9 @@ struct Loop {
     targets: HashMap<String, Target>,
     pending: HashMap<String, Op>,
     last_emit: HashMap<String, Instant>,
-    /// Rename destinations seen in this window whose source is not a target —
+    /// Rename destinations seen in this window whose source is not a target:
     /// the other half of a Windows rename, which carries no pairing cookie.
-    orphan_to: Vec<PathBuf>,
+    unclaimed_destinations: Vec<PathBuf>,
     settle_at: Option<Instant>,
     query: Option<crate::query::split::CascadeQuery>,
     /// Fuzzy matcher built at arm time for re-cutting [`ContentTier::Fuzzy`]
@@ -216,46 +216,43 @@ struct Loop {
 impl Loop {
     fn run(mut self) {
         loop {
+            // With nothing to settle, park until a message arrives.
             let msg = match self.settle_at {
-                None => match self.rx.recv() {
-                    Ok(msg) => Some(msg),
-                    Err(_) => return,
-                },
+                None => self
+                    .rx
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
                 Some(deadline) => {
                     let wait = deadline.saturating_duration_since(Instant::now());
-                    match self.rx.recv_timeout(wait.min(TICK)) {
-                        Ok(msg) => Some(msg),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
+                    self.rx.recv_timeout(wait.min(TICK))
                 }
             };
             match msg {
-                Some(Msg::Stop) => return,
-                Some(Msg::Clear) => self.reset(),
-                Some(Msg::Watch {
+                Ok(Msg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Ok(Msg::Clear) => self.reset(),
+                Ok(Msg::Watch {
                     query,
                     targets,
                     config,
                 }) => self.rearm(&query, targets, config),
-                Some(Msg::Event(event)) => {
+                Ok(Msg::Event(event)) => {
                     classify(
                         &event,
                         &self.targets,
                         &mut self.pending,
-                        &mut self.orphan_to,
+                        &mut self.unclaimed_destinations,
                     );
-                    // Arm on either queue: `orphan_to` drains only in
-                    // `flush_settled`, and on Windows the pairing needs
-                    // `orphans.len() == 1` — one leaked stale entry turns
-                    // every later rename into "gone".
-                    if (!self.pending.is_empty() || !self.orphan_to.is_empty())
+                    // Arm on either queue: unclaimed destinations drain only
+                    // in `flush_settled`, and the Windows pairing needs
+                    // exactly one, so a leaked stale entry would turn every
+                    // later rename into "gone".
+                    if (!self.pending.is_empty() || !self.unclaimed_destinations.is_empty())
                         && self.settle_at.is_none()
                     {
                         self.settle_at = Some(Instant::now() + SETTLE);
                     }
                 }
-                None => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             self.flush_settled();
         }
@@ -266,7 +263,7 @@ impl Loop {
         self.targets.clear();
         self.pending.clear();
         self.last_emit.clear();
-        self.orphan_to.clear();
+        self.unclaimed_destinations.clear();
         self.settle_at = None;
         self.query = None;
         self.fuzzy = None;
@@ -282,15 +279,13 @@ impl Loop {
             return;
         }
         self.query = split_for_cascade(query).ok();
-        // The same construction the fuzzy pass makes, so a fuzzy row is
-        // re-cut against exactly what matched it; case folds in the mask table.
-        self.fuzzy = self.query.as_ref().and_then(|q| {
-            if q.pattern.is_wildcard() {
-                return None;
-            }
-            let k = edit_budget(q.term.len(), config.search.fuzzy_max_edits)?;
-            Bitap::new(q.term.as_bytes(), k)
-        });
+        // The fuzzy pass's own matcher, so a fuzzy row is re-cut against
+        // exactly what matched it.
+        self.fuzzy = self
+            .query
+            .as_ref()
+            .and_then(|q| matcher_for(q, config.search.fuzzy_max_edits))
+            .map(|(_, bitap)| bitap);
         self.config = Some(config);
 
         let mut watcher = {
@@ -322,9 +317,10 @@ impl Loop {
                     continue;
                 }
                 if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-                    // Deliberately not the indexer's all-or-nothing: rows
-                    // under this directory are dropped, not swept — better
-                    // left alone than corrected once and silently frozen.
+                    // Unlike the indexer, not all-or-nothing: rows under this
+                    // directory are dropped rather than swept, because a row
+                    // corrected once and then frozen misleads more than one
+                    // left alone.
                     crate::log_warn!("live results: not watching {}: {}", dir.display(), e);
                     continue;
                 }
@@ -339,9 +335,9 @@ impl Loop {
         self.sweep();
     }
 
-    /// Compare every target against the disk once and emit what disagrees: a
-    /// row whose file changed off screen — or whose index row was out of date
-    /// when the search returned it — is corrected the moment it is watched.
+    /// Compare every target against the disk once and emit what disagrees, so
+    /// a row whose file changed off screen (or whose index row was stale when
+    /// the search returned it) is corrected the moment it is watched.
     fn sweep(&mut self) {
         let mut updates: Vec<LiveUpdate> = Vec::new();
         for target in self.targets.values() {
@@ -360,8 +356,8 @@ impl Loop {
         }
         let now = Instant::now();
         for update in updates {
-            // So an event arriving right behind the sweep — a save still in
-            // flight — does not repeat the same answer a moment later.
+            // So an event arriving right behind the sweep (a save still in
+            // flight) does not repeat the same answer a moment later.
             self.last_emit.insert(update.path().to_string(), now);
             self.note_emitted(&update);
             self.send(update);
@@ -375,21 +371,8 @@ impl Loop {
             return;
         }
         self.settle_at = None;
-
-        // Windows reports rename halves separately with no pairing cookie.
-        // Exactly one target gone plus one unclaimed destination is the same
-        // file; anything more ambiguous resolves to the truthful "gone".
-        let orphans = std::mem::take(&mut self.orphan_to);
-        let gone: Vec<String> = self
-            .pending
-            .iter()
-            .filter(|(_, op)| **op == Op::Gone)
-            .map(|(path, _)| path.clone())
-            .collect();
-        if gone.len() == 1 && orphans.len() == 1 {
-            self.pending
-                .insert(gone[0].clone(), Op::Renamed(orphans[0].clone()));
-        }
+        let unclaimed = std::mem::take(&mut self.unclaimed_destinations);
+        pair_lone_rename(&mut self.pending, &unclaimed);
 
         let now = Instant::now();
         let ready: Vec<(String, Op)> = self
@@ -492,8 +475,8 @@ impl Loop {
         };
         let cut = match tier {
             ContentTier::Exact => {
-                // Unlike in the passes, the body here may genuinely have
-                // stopped matching; an unmarked window is how that reads.
+                // Unlike in the passes, the body may have stopped matching
+                // here; an unmarked window says so.
                 let folded = text.to_ascii_lowercase();
                 crate::search::cascade::text_snippet(&query.pattern, text, &folded)
                     .filter(|snip| !snip.ranges.is_empty())
@@ -535,9 +518,9 @@ impl Loop {
 /// The first `limit` bytes of a file, for MIME sniffing. A short read is the
 /// whole file and is not an error; an unreadable file simply has no MIME.
 fn read_head(path: &Path, limit: usize) -> Option<Vec<u8>> {
-    // The earlier `stat` said file; by now it may be a FIFO, and a blocking
-    // open here costs every live row for the rest of the session — and hangs
-    // exit, since `LiveWatcher::stop` joins this thread.
+    // The earlier `stat` said file, but by now it may be a FIFO: a blocking
+    // open here would stall every live row for the rest of the session and
+    // hang exit, since `LiveWatcher::stop` joins this thread.
     let file = crate::platform::open_regular_file(path).ok()?;
     let mut head = Vec::new();
     file.take(limit as u64).read_to_end(&mut head).ok()?;
@@ -552,23 +535,44 @@ fn mtime_of(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// Pair the halves of a Windows rename, which arrive separately with no
+/// cookie: exactly one target gone plus one unclaimed destination is the same
+/// file. Anything more ambiguous stays the truthful `Gone`.
+fn pair_lone_rename(pending: &mut HashMap<String, Op>, unclaimed: &[PathBuf]) {
+    let [to] = unclaimed else {
+        return;
+    };
+    let mut gone = pending.iter().filter(|(_, op)| **op == Op::Gone);
+    let (Some((path, _)), None) = (gone.next(), gone.next()) else {
+        return;
+    };
+    let path = path.clone();
+    pending.insert(path, Op::Renamed(to.clone()));
+}
+
 /// Fold one notify event into the pending decisions for this window; every
 /// shape below is a real emission from `notify` 6.1 on some platform.
 fn classify(
     event: &NotifyEvent,
     targets: &HashMap<String, Target>,
     pending: &mut HashMap<String, Op>,
-    orphan_to: &mut Vec<PathBuf>,
+    unclaimed: &mut Vec<PathBuf>,
 ) {
     use notify::event::{ModifyKind, RenameMode};
 
-    // `to_str`, not `to_string_lossy`: an unrepresentable path still has a
-    // lossy spelling that is a valid path for some *other* file, so keying
-    // lossily would fire a Gone or a Changed at a row we are displaying.
+    // `to_str`, not `to_string_lossy`: a lossy key names another file (see
+    // [`crate::file_handling::path_to_db_string`]) and would fire a Gone or a
+    // Changed at a row we are displaying.
     let target_key = |p: &PathBuf| {
         p.to_str()
             .filter(|k| targets.contains_key(*k))
             .map(str::to_owned)
+    };
+    // Every displayed row the event names takes `op`.
+    let mark = |pending: &mut HashMap<String, Op>, op: Op| {
+        for key in event.paths.iter().filter_map(target_key) {
+            pending.insert(key, op.clone());
+        }
     };
 
     match event.kind {
@@ -597,9 +601,9 @@ fn classify(
                 if let Some(key) = target_key(path) {
                     pending.insert(key, Op::Changed);
                 } else if path.to_str().is_some() {
-                    // Screened too: an unrepresentable orphan would pair with
-                    // a lone `Gone` into the same bad `Renamed`.
-                    orphan_to.push(path.clone());
+                    // Screened too: an unrepresentable destination would pair
+                    // with a lone `Gone` into the same bad `Renamed`.
+                    unclaimed.push(path.clone());
                 }
             }
         }
@@ -610,23 +614,11 @@ fn classify(
                 }
             }
         }
-        EventKind::Remove(_) => {
-            for path in &event.paths {
-                if let Some(key) = target_key(path) {
-                    pending.insert(key, Op::Gone);
-                }
-            }
-        }
-        EventKind::Create(_) | EventKind::Modify(_) => {
-            for path in &event.paths {
-                if let Some(key) = target_key(path) {
-                    // A Create at a watched path un-deletes the row.
-                    pending.insert(key, Op::Changed);
-                }
-            }
-        }
-        // Access events, and paths we are not showing. Live results never
-        // *add* rows: nothing here can know a new file matches the query.
+        EventKind::Remove(_) => mark(pending, Op::Gone),
+        // A Create at a watched path un-deletes the row.
+        EventKind::Create(_) | EventKind::Modify(_) => mark(pending, Op::Changed),
+        // Access events, and paths we are not showing. Live results never add
+        // rows: nothing here can know a new file matches the query.
         _ => {}
     }
 }

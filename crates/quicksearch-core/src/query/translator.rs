@@ -1,7 +1,7 @@
 //! `key op value` filters → composable SQL fragments.
 //!
 //! One filter becomes one [`FilterFragment`] over table alias `f` with
-//! anonymous `?` placeholders — the cascade ANDs fragments onto every stage,
+//! anonymous `?` placeholders: the cascade ANDs fragments onto every stage,
 //! so they must compose by plain appending, which numbered ones would not.
 
 use super::Op;
@@ -71,7 +71,7 @@ pub fn is_filter_key(key: &str) -> bool {
     )
 }
 
-/// Translate one `key op value` filter — the single source of filter
+/// Translate one `key op value` filter; the single source of filter
 /// semantics. `glob` marks a value whose unquoted `*` acts as a wildcard;
 /// only `name:`/`filename:` honor it.
 pub fn build_filter(
@@ -85,19 +85,20 @@ pub fn build_filter(
         sql: sql.to_string(),
         params,
     };
-    let eq_like_only = |op: Op| -> Result<(), TranslateError> {
-        if op != Op::Contains && op != Op::Eq {
-            return Err(TranslateError::UnsupportedOp {
+    let allow = |ok: &[Op]| -> Result<(), TranslateError> {
+        if ok.contains(&op) {
+            Ok(())
+        } else {
+            Err(TranslateError::UnsupportedOp {
                 key: key.into(),
                 op,
-            });
+            })
         }
-        Ok(())
     };
 
     match key.to_ascii_lowercase().as_str() {
         "type" => {
-            eq_like_only(op)?;
+            allow(&[Op::Contains, Op::Eq])?;
             let bits = FileType::from_name(value).bits() as i64;
             if bits == 0 {
                 return Err(TranslateError::UnknownProperty(format!(
@@ -110,27 +111,20 @@ pub fn build_filter(
         "modified" | "mtime" => {
             let unix =
                 parse_date_to_unix(value).ok_or_else(|| TranslateError::BadDate(value.into()))?;
-            // `modified:=2024-01-01` matches the whole day, not the second.
-            if op == Op::Eq || op == Op::Contains {
-                return Ok(frag(
+            Ok(match op {
+                // `modified:=2024-01-01` matches the whole day, not the second.
+                Op::Eq | Op::Contains => frag(
                     "(f.mtime >= ? AND f.mtime < ?)",
                     vec![Value::Integer(unix), Value::Integer(unix + 86_400)],
-                ));
-            }
-            let sql_op = match op {
-                Op::Lt => "<",
-                Op::Le => "<=",
-                Op::Gt => ">",
-                Op::Ge => ">=",
-                Op::Contains | Op::Eq => unreachable!(),
-            };
-            Ok(frag(
-                &format!("f.mtime {} ?", sql_op),
-                vec![Value::Integer(unix)],
-            ))
+                ),
+                _ => frag(
+                    &format!("f.mtime {} ?", op.as_str()),
+                    vec![Value::Integer(unix)],
+                ),
+            })
         }
         "path" | "folder" | "includefolder" => {
-            eq_like_only(op)?;
+            allow(&[Op::Contains, Op::Eq])?;
             let base = normalize_folder_value(value);
             if base.is_empty() {
                 // "everything": Windows has no single root, so say it directly.
@@ -145,12 +139,7 @@ pub fn build_filter(
             ))
         }
         "name" | "filename" => {
-            if op != Op::Contains {
-                return Err(TranslateError::UnsupportedOp {
-                    key: key.into(),
-                    op,
-                });
-            }
+            allow(&[Op::Contains])?;
             // Each `*` becomes an unescaped `%`; the pieces around it still
             // get escaped so user metacharacters stay literal.
             let pattern = if glob && value.contains('*') {
@@ -168,7 +157,7 @@ pub fn build_filter(
             ))
         }
         "mime" => {
-            eq_like_only(op)?;
+            allow(&[Op::Contains, Op::Eq])?;
             Ok(frag("f.mime = ?", vec![Value::Text(value.into())]))
         }
         _ => Err(TranslateError::UnknownProperty(key.to_string())),
@@ -195,10 +184,9 @@ fn normalize_folder_value(value: &str) -> String {
 
 /// A `LIKE ... ESCAPE '\'` pattern matching `dir`'s own files and everything
 /// beneath it. The separator is escaped along with the base, because on
-/// Windows the separator *is* the escape character. SQLite takes the
-/// character after an escape literally whatever it is, so a doubled `\` is
-/// well defined; the folklore that an escape must be followed by `%`, `_` or
-/// itself does not apply.
+/// Windows the separator is the escape character. SQLite takes the character
+/// after an escape literally whatever it is, so a doubled `\` is well
+/// defined.
 pub fn like_subtree_pattern(dir: &str) -> String {
     format!(
         "{}{}%",
@@ -209,19 +197,16 @@ pub fn like_subtree_pattern(dir: &str) -> String {
 
 /// Parse a date string. Accepts `YYYY-MM-DD`. Returns unix seconds at 00:00 UTC.
 fn parse_date_to_unix(s: &str) -> Option<i64> {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 3 {
+    let &[y, m, d] = &s.split('-').collect::<Vec<_>>()[..] else {
         return None;
-    }
-    let y: i64 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
-    let d: u32 = parts[2].parse().ok()?;
-    if !(1..=12).contains(&m) || !(1970..=9999).contains(&y) {
-        return None;
-    }
-    // Real month lengths: `civil_to_unix` rolls 2024-02-31 into March, and a
-    // typo would silently filter on a date the user never typed.
-    if d < 1 || d > days_in_month(y, m) {
+    };
+    let y: i64 = y.parse().ok()?;
+    let m: u32 = m.parse().ok()?;
+    let d: u32 = d.parse().ok()?;
+    // Real month lengths, and none for a month that does not exist:
+    // `civil_to_unix` rolls 2024-02-31 into March, and a typo would silently
+    // filter on a date the user never typed.
+    if !(1970..=9999).contains(&y) || !(1..=days_in_month(y, m)).contains(&d) {
         return None;
     }
     Some(civil_to_unix(y, m as i64, d as i64))

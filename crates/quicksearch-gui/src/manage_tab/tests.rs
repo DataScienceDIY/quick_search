@@ -39,7 +39,7 @@ fn idle_state() -> IndexerState {
     }
 }
 
-/// Idle, carrying figures for `/data` — the root `cfg_with_root` configures.
+/// Idle, carrying figures for `/data`, the root `cfg_with_root` configures.
 fn counted_state(files: i64, fts: i64) -> IndexerState {
     IndexerState {
         root_counts: Arc::new(vec![RootCount {
@@ -96,12 +96,26 @@ fn preparing_state(step: PrepStep) -> IndexerState {
     }
 }
 
-use crate::test_ui::{click_at, painted_text};
+use crate::test_ui::{click_at, painted_text, run_panel};
 
-fn raw_input(events: Vec<egui::Event>) -> egui::RawInput {
-    crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), events)
+/// One frame of the tab: what it painted and what it asked for. The widget
+/// log starts empty.
+fn render(
+    ctx: &egui::Context,
+    tab: &mut ManageTab,
+    cfg: &Config,
+    state: &IndexerState,
+    events: Vec<egui::Event>,
+) -> (egui::FullOutput, ManageActions) {
+    WIDGETS.with(|w| w.borrow_mut().clear());
+    let mut actions = ManageActions::default();
+    let out = run_panel(ctx, egui::vec2(1000.0, 900.0), events, |ui| {
+        actions = tab.ui(ui, state, cfg);
+    });
+    (out, actions)
 }
 
+/// [`render`], with the no-tofu glyph check.
 fn frame(
     ctx: &egui::Context,
     tab: &mut ManageTab,
@@ -109,13 +123,7 @@ fn frame(
     state: &IndexerState,
     events: Vec<egui::Event>,
 ) -> ManageActions {
-    WIDGETS.with(|w| w.borrow_mut().clear());
-    let mut actions = ManageActions::default();
-    let out = ctx.run(raw_input(events), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            actions = tab.ui(ui, state, cfg);
-        });
-    });
+    let (out, actions) = render(ctx, tab, cfg, state, events);
     crate::test_ui::assert_no_tofu(ctx, &out);
     actions
 }
@@ -130,22 +138,33 @@ fn frame_text_with(
     cfg: &Config,
     state: &IndexerState,
 ) -> Vec<String> {
-    WIDGETS.with(|w| w.borrow_mut().clear());
-    let out = ctx.run(raw_input(vec![]), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            tab.ui(ui, state, cfg);
-        });
-    });
-    painted_text(&out)
+    painted_text(&render(ctx, tab, cfg, state, vec![]).0)
 }
 
-fn pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
-    egui::Event::PointerButton {
-        pos,
-        button: egui::PointerButton::Primary,
-        pressed,
-        modifiers: egui::Modifiers::NONE,
-    }
+/// One frame with the tour on screen, and where each of `spots` ended up.
+/// Read inside the pass: a mark is only live for the pass that wrote it.
+fn frame_spotlit(
+    ctx: &egui::Context,
+    tab: &mut ManageTab,
+    spots: &[crate::spotlight::Spot],
+) -> (egui::FullOutput, Vec<Option<egui::Rect>>) {
+    WIDGETS.with(|w| w.borrow_mut().clear());
+    let (cfg, state) = (cfg_with_root(), idle_state());
+    let mut found = Vec::new();
+    let out = ctx.run(
+        crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), vec![]),
+        |ctx| {
+            crate::spotlight::set_active(ctx, true);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                tab.ui(ui, &state, &cfg);
+            });
+            found = spots
+                .iter()
+                .map(|spot| crate::spotlight::rect(ctx, *spot))
+                .collect();
+        },
+    );
+    (out, found)
 }
 
 fn cfg_with_root() -> Config {
@@ -154,14 +173,16 @@ fn cfg_with_root() -> Config {
     cfg
 }
 
-fn staged_workers(tab: &ManageTab) -> Option<usize> {
-    tab.draft
-        .as_ref()
-        .unwrap()
-        .indexing
-        .root_workers
-        .get("/data")
-        .copied()
+fn draft(tab: &ManageTab) -> &Config {
+    tab.draft.as_ref().expect("synced")
+}
+
+fn draft_mut(tab: &mut ManageTab) -> &mut Config {
+    tab.draft.as_mut().expect("synced")
+}
+
+fn staged_workers(tab: &ManageTab, root: &str) -> Option<usize> {
+    draft(tab).indexing.root_workers.get(root).copied()
 }
 
 /// egui hangs focus and in-progress text off the widget id, so a field
@@ -169,7 +190,7 @@ fn staged_workers(tab: &ManageTab) -> Option<usize> {
 #[test]
 fn the_worker_field_keeps_its_identity_as_the_status_changes() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let cfg = cfg_with_root();
 
     frame(
@@ -185,8 +206,8 @@ fn the_worker_field_keeps_its_identity_as_the_status_changes() {
         running_state(&["/data"], Some("/data/file")),
         running_state(&["/data", "/other"], None),
         idle_state(),
-        // The per-root figures share the field's row — the case a
-        // conditionally-drawn label would break.
+        // The per-root figures share the field's row: the case a
+        // conditionally drawn label would break.
         counted_state(1_234_567, 456_789),
         IndexerState {
             watcher: WatcherStatus::Off,
@@ -206,11 +227,11 @@ fn the_worker_field_keeps_its_identity_as_the_status_changes() {
     }
 }
 
-/// Type a count and apply it — while a run reports progress the whole time.
+/// Type a count and apply it, while a run reports progress the whole time.
 #[test]
 fn a_typed_worker_count_reaches_the_applied_config() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let cfg = cfg_with_root();
 
     frame(
@@ -238,7 +259,11 @@ fn a_typed_worker_count_reaches_the_applied_config() {
         &busy,
         vec![egui::Event::Text("8".into())],
     );
-    assert_eq!(staged_workers(&tab), Some(8), "typed count was not staged");
+    assert_eq!(
+        staged_workers(&tab, "/data"),
+        Some(8),
+        "typed count was not staged"
+    );
 
     let apply = widget("apply").1.center();
     let mut actions = frame(&ctx, &mut tab, &cfg, &busy, click_at(apply));
@@ -255,7 +280,7 @@ fn a_typed_worker_count_reaches_the_applied_config() {
 #[test]
 fn a_dragged_worker_count_is_staged() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let cfg = cfg_with_root();
     let busy = running_state(&["/data"], None);
 
@@ -266,7 +291,10 @@ fn a_dragged_worker_count_is_staged() {
         &mut tab,
         &cfg,
         &busy,
-        vec![egui::Event::PointerMoved(field), pointer(field, true)],
+        vec![
+            egui::Event::PointerMoved(field),
+            crate::test_ui::button(field, egui::PointerButton::Primary, true),
+        ],
     );
     // Drag right across frames, with the status changing underneath.
     let mut pos = field;
@@ -284,11 +312,12 @@ fn a_dragged_worker_count_is_staged() {
             vec![egui::Event::PointerMoved(pos)],
         );
     }
-    frame(&ctx, &mut tab, &cfg, &busy, vec![pointer(pos, false)]);
+    let release = crate::test_ui::button(pos, egui::PointerButton::Primary, false);
+    frame(&ctx, &mut tab, &cfg, &busy, vec![release]);
+    let staged = staged_workers(&tab, "/data");
     assert!(
-        staged_workers(&tab).is_some_and(|w| w > 0),
-        "dragging staged nothing: {:?}",
-        staged_workers(&tab)
+        staged.is_some_and(|w| w > 0),
+        "dragging staged nothing: {staged:?}"
     );
 }
 
@@ -311,7 +340,7 @@ fn root_progress(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> 
 #[test]
 fn a_finished_root_reports_its_exact_count_not_the_estimate() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let mut done = root_progress(RootPhase::Done, 261_088, Some(6_677_062));
     done.extracted = 238_929;
     done.active_workers = 0;
@@ -333,7 +362,7 @@ fn a_finished_root_reports_its_exact_count_not_the_estimate() {
 #[test]
 fn a_configured_root_shows_what_the_last_run_counted() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
 
     let text = frame_text(&ctx, &mut tab, &counted_state(1_234_567, 456_789)).join(" | ");
     assert!(
@@ -347,7 +376,7 @@ fn a_configured_root_shows_what_the_last_run_counted() {
 #[test]
 fn a_root_the_index_has_never_counted_says_so() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
 
     let text = frame_text(&ctx, &mut tab, &idle_state()).join(" | ");
     assert!(text.contains("not yet indexed"), "folder row: {}", text);
@@ -361,7 +390,7 @@ fn a_root_the_index_has_never_counted_says_so() {
 #[test]
 fn figures_belong_to_the_root_they_were_counted_for() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let state = IndexerState {
         root_counts: Arc::new(vec![RootCount {
             root: "/somewhere-else".into(),
@@ -383,7 +412,7 @@ fn figures_belong_to_the_root_they_were_counted_for() {
 #[test]
 fn a_walking_root_shows_the_estimate_raised_to_what_it_has_walked() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
 
     let honest = frame_text(
         &ctx,
@@ -406,19 +435,22 @@ fn a_walking_root_shows_the_estimate_raised_to_what_it_has_walked() {
     );
 }
 
+/// The color each word of the frame was painted in, for `state`.
 fn frame_spans(
     ctx: &egui::Context,
     tab: &mut ManageTab,
     state: &IndexerState,
 ) -> Vec<(String, egui::Color32)> {
-    WIDGETS.with(|w| w.borrow_mut().clear());
-    let cfg = cfg_with_root();
-    let out = ctx.run(raw_input(vec![]), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            tab.ui(ui, state, &cfg);
-        });
-    });
-    crate::test_ui::painted_spans(&out)
+    crate::test_ui::painted_spans(&render(ctx, tab, &cfg_with_root(), state, vec![]).0)
+}
+
+/// Each root phase's word, with the color it has to come out in.
+fn phase_words(colors: &crate::color::Palette) -> [(RootPhase, &'static str, egui::Color32); 3] {
+    [
+        (RootPhase::Walking, "indexing", colors.yellow),
+        (RootPhase::Extracting, "extracting text", colors.green),
+        (RootPhase::Done, "done", colors.blue),
+    ]
 }
 
 #[test]
@@ -426,21 +458,29 @@ fn every_phase_word_is_painted_in_its_hint_color() {
     for theme in [egui::Theme::Dark, egui::Theme::Light] {
         let ctx = crate::test_ui::ctx();
         ctx.set_theme(theme);
-        let mut tab = ManageTab::new();
+        let mut tab = ManageTab::default();
         let colors = crate::color::palette(theme == egui::Theme::Dark);
 
-        for (phase, word, want) in [
-            (RootPhase::Walking, "indexing", colors.yellow),
-            (RootPhase::Extracting, "extracting text", colors.green),
-            (RootPhase::Done, "done", colors.blue),
-        ] {
+        for (phase, word, want) in phase_words(&colors) {
             let state = state_with(vec![root_progress(phase, 100, Some(1000))]);
             let spans = frame_spans(&ctx, &mut tab, &state);
             let hint = spans.iter().find(|(text, _)| text == word).map(|(_, c)| *c);
             assert_eq!(hint, Some(want), "{:?}: {:?} in {:?}", theme, word, spans);
+        }
+    }
+}
 
-            // Upkeep blocks the writer whatever the root was doing, so it
-            // replaces the phase word rather than sitting beside it.
+/// Upkeep blocks the writer whatever the root was doing, so it replaces the
+/// phase word rather than sitting beside it.
+#[test]
+fn an_upkeep_step_replaces_the_phase_word() {
+    for theme in [egui::Theme::Dark, egui::Theme::Light] {
+        let ctx = crate::test_ui::ctx();
+        ctx.set_theme(theme);
+        let mut tab = ManageTab::default();
+        let colors = crate::color::palette(theme == egui::Theme::Dark);
+
+        for (phase, word, _) in phase_words(&colors) {
             let state = maintaining_state(
                 vec![root_progress(phase, 100, Some(1000))],
                 Some(MaintenanceStep::Checkpoint),
@@ -466,18 +506,15 @@ fn every_phase_word_is_painted_in_its_hint_color() {
     }
 }
 
-/// Run-wide state: said once, however many roots are on screen. And said
-/// *alongside* the per-root file hints rather than instead of them.
-///
-/// The hint count is the assertion that matters. A checkpoint fires every few
-/// seconds on a large index, so a line that disappears per root and comes back
-/// reflowed the whole block on a loop. Keeping it costs a moment of staleness
-/// (it names the last file written, not one in flight) and buys a row that
-/// holds its height.
+/// Run-wide state: said once, however many roots are on screen, and
+/// *alongside* the per-root file hints rather than instead of them. The hint
+/// count is the assertion that matters: a checkpoint fires every few seconds
+/// on a large index, and a line that vanished and came back per root would
+/// reflow the whole block on a loop.
 #[test]
 fn an_upkeep_step_names_itself_once_and_keeps_the_file_hints() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
 
     let with_file = |root: &str| RootProgress {
         root: root.to_string(),
@@ -528,7 +565,7 @@ fn an_upkeep_step_names_itself_once_and_keeps_the_file_hints() {
 #[test]
 fn an_overlong_file_hint_loses_its_middle_rather_than_wrapping() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     const FILE: &str = "deeply-buried-report.pdf";
 
     let mut hint_shape = |file: &str| {
@@ -536,12 +573,7 @@ fn an_overlong_file_hint_loses_its_middle_rather_than_wrapping() {
             current_file: Some(file.to_string()),
             ..root_progress(RootPhase::Extracting, 100, Some(1000))
         }]);
-        WIDGETS.with(|w| w.borrow_mut().clear());
-        let out = ctx.run(raw_input(vec![]), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                tab.ui(ui, &state, &cfg_with_root());
-            });
-        });
+        let (out, _) = render(&ctx, &mut tab, &cfg_with_root(), &state, vec![]);
         crate::test_ui::painted(&out)
             .into_iter()
             .find(|(t, _)| t.ends_with(FILE))
@@ -585,7 +617,7 @@ fn an_overlong_file_hint_loses_its_middle_rather_than_wrapping() {
 #[test]
 fn a_walking_root_without_a_count_shows_no_denominator() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let text = frame_text(
         &ctx,
         &mut tab,
@@ -599,7 +631,7 @@ fn a_walking_root_without_a_count_shows_no_denominator() {
 #[test]
 fn each_prologue_step_says_what_it_is_waiting_on() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
 
     for (step, expected) in [
         (PrepStep::PreviousRun, "Finishing the previous run…"),
@@ -615,7 +647,7 @@ fn each_prologue_step_says_what_it_is_waiting_on() {
 #[test]
 fn a_reconcile_reports_how_far_through_the_index_it_is() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let text = frame_text(
         &ctx,
         &mut tab,
@@ -642,41 +674,27 @@ fn a_reconcile_reports_how_far_through_the_index_it_is() {
 #[test]
 fn the_reconcile_status_explains_the_wait_on_hover() {
     let ctx = crate::test_ui::ctx();
-    ctx.style_mut(|s| {
-        s.interaction.tooltip_delay = 0.0;
-        s.interaction.show_tooltips_only_when_still = false;
-    });
-    let mut tab = ManageTab::new();
+    crate::test_ui::instant_tooltips(&ctx);
+    let mut tab = ManageTab::default();
     let cfg = cfg_with_root();
     let state = preparing_state(PrepStep::Reconciling(ReconcileProgress::default()));
-    let mut run = |events: Vec<egui::Event>| {
-        ctx.run(raw_input(events), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                tab.ui(ui, &state, &cfg);
-            });
-        })
-    };
+    let mut run = |events| render(&ctx, &mut tab, &cfg, &state, events).0;
 
     run(vec![]);
-    let settled = run(vec![]);
-    let pos = crate::test_ui::painted_text_center(&settled, "Rebuilding FTS cache")
+    let pos = crate::test_ui::painted_text_center(&run(vec![]), "Rebuilding FTS cache")
         .expect("status line painted");
     let opening: String = crate::tips::REBUILDING_FTS.body.chars().take(40).collect();
-    let mut out = run(vec![egui::Event::PointerMoved(pos)]);
-    for _ in 0..3 {
-        if painted_text(&out).join("\n").contains(&opening) {
-            return;
-        }
-        out = run(vec![]);
-    }
-    panic!("no tooltip on the status line: {:?}", painted_text(&out));
+    assert!(
+        crate::test_ui::hover_shows(&mut run, pos, &opening),
+        "no tooltip on the status line"
+    );
 }
 
 /// Whole-range deletions read no rows; the display must not invent a denominator.
 #[test]
 fn a_reconcile_without_a_row_count_shows_no_denominator() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let text = frame_text(
         &ctx,
         &mut tab,
@@ -691,7 +709,7 @@ fn a_reconcile_without_a_row_count_shows_no_denominator() {
 #[test]
 fn a_prune_between_runs_is_reported_instead_of_idle() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let state = IndexerState {
         reconcile: Some(ReconcileState::Running(ReconcileProgress {
             examined: 40_000,
@@ -720,7 +738,7 @@ fn a_prune_between_runs_is_reported_instead_of_idle() {
 #[test]
 fn a_finished_prune_reports_what_it_did() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let state = IndexerState {
         reconcile: Some(ReconcileState::Finished(ReconcileProgress {
             examined: 80_000,
@@ -749,7 +767,7 @@ fn a_finished_prune_reports_what_it_did() {
 #[test]
 fn the_starting_placeholder_is_gone() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     for state in [
         preparing_state(PrepStep::PreviousRun),
         preparing_state(PrepStep::OpeningIndex),
@@ -855,7 +873,7 @@ fn the_status_row_shows_the_total_index_size() {
     write_bytes(&dir.join("index.sqlite-shm"), 32_768);
 
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let text = frame_text_with(&ctx, &mut tab, &cfg_with_db(&db), &idle_state()).join(" | ");
     assert!(
         text.contains("Index size: 3.2 MB"),
@@ -873,8 +891,8 @@ fn hovering_the_size_explains_how_to_shrink_the_index() {
     write_bytes(&db, 2048);
 
     let ctx = crate::test_ui::ctx();
-    ctx.style_mut(|s| s.interaction.tooltip_delay = 0.0);
-    let mut tab = ManageTab::new();
+    crate::test_ui::instant_tooltips(&ctx);
+    let mut tab = ManageTab::default();
     let cfg = cfg_with_db(&db);
 
     frame_text_with(&ctx, &mut tab, &cfg, &idle_state());
@@ -907,7 +925,7 @@ fn hovering_the_size_explains_how_to_shrink_the_index() {
 }
 
 fn synced_tab(config: &Config) -> ManageTab {
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     tab.sync_editors(config);
     tab
 }
@@ -916,17 +934,12 @@ fn synced_tab(config: &Config) -> ManageTab {
 fn identical_config_leaves_draft_untouched() {
     let cfg = Config::default();
     let mut tab = synced_tab(&cfg);
-    tab.draft
-        .as_mut()
-        .unwrap()
+    draft_mut(&mut tab)
         .indexing
         .ignore_patterns
         .push("*.log".into());
     tab.sync_editors(&cfg);
-    assert!(tab
-        .draft
-        .as_ref()
-        .unwrap()
+    assert!(draft(&tab)
         .indexing
         .ignore_patterns
         .contains(&"*.log".to_string()));
@@ -940,7 +953,7 @@ fn clean_draft_adopts_external_changes_wholesale() {
     external.indexing.ignore_patterns.push("*.log".into());
     external.search.fuzzy_default = !external.search.fuzzy_default;
     tab.sync_editors(&external);
-    assert_eq!(tab.draft.as_ref().unwrap(), &external);
+    assert_eq!(draft(&tab), &external);
     assert_eq!(tab.baseline.as_ref().unwrap(), &external);
 }
 
@@ -949,20 +962,14 @@ fn staged_edits_survive_an_external_persist() {
     let cfg = Config::default();
     let mut tab = synced_tab(&cfg);
     // Stage a removal of the first default pattern.
-    let removed = tab
-        .draft
-        .as_mut()
-        .unwrap()
-        .indexing
-        .ignore_patterns
-        .remove(0);
+    let removed = draft_mut(&mut tab).indexing.ignore_patterns.remove(0);
     // Meanwhile the Search tab persists a new filter.
     let mut external = cfg.clone();
     external.indexing.ignore_patterns.push("*.log".into());
     tab.sync_editors(&external);
-    let draft = tab.draft.as_ref().unwrap();
-    assert!(!draft.indexing.ignore_patterns.contains(&removed));
-    assert!(draft
+    let staged = draft(&tab);
+    assert!(!staged.indexing.ignore_patterns.contains(&removed));
+    assert!(staged
         .indexing
         .ignore_patterns
         .contains(&"*.log".to_string()));
@@ -973,9 +980,7 @@ fn staged_edits_survive_an_external_persist() {
 fn dirty_draft_adopts_sections_owned_elsewhere() {
     let cfg = Config::default();
     let mut tab = synced_tab(&cfg);
-    tab.draft
-        .as_mut()
-        .unwrap()
+    draft_mut(&mut tab)
         .indexing
         .ignore_patterns
         .push("*.bak".into());
@@ -983,9 +988,9 @@ fn dirty_draft_adopts_sections_owned_elsewhere() {
     let mut external = cfg.clone();
     external.search.fuzzy_default = !cfg.search.fuzzy_default;
     tab.sync_editors(&external);
-    let draft = tab.draft.as_ref().unwrap();
-    assert_eq!(draft.search.fuzzy_default, external.search.fuzzy_default);
-    assert!(draft
+    let staged = draft(&tab);
+    assert_eq!(staged.search.fuzzy_default, external.search.fuzzy_default);
+    assert!(staged
         .indexing
         .ignore_patterns
         .contains(&"*.bak".to_string()));
@@ -995,19 +1000,14 @@ fn dirty_draft_adopts_sections_owned_elsewhere() {
 fn external_pattern_is_not_duplicated_into_a_draft_that_has_it() {
     let cfg = Config::default();
     let mut tab = synced_tab(&cfg);
-    tab.draft
-        .as_mut()
-        .unwrap()
+    draft_mut(&mut tab)
         .indexing
         .ignore_patterns
         .push("*.log".into());
     let mut external = cfg.clone();
     external.indexing.ignore_patterns.push("*.log".into());
     tab.sync_editors(&external);
-    let count = tab
-        .draft
-        .as_ref()
-        .unwrap()
+    let count = draft(&tab)
         .indexing
         .ignore_patterns
         .iter()
@@ -1018,7 +1018,7 @@ fn external_pattern_is_not_duplicated_into_a_draft_that_has_it() {
 
 #[test]
 fn a_fresh_tab_is_not_dirty_before_or_after_its_first_sync() {
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     assert!(!tab.is_dirty(), "no draft yet");
     tab.sync_editors(&cfg_with_root());
     assert!(!tab.is_dirty(), "a fresh sync stages nothing");
@@ -1028,9 +1028,7 @@ fn a_fresh_tab_is_not_dirty_before_or_after_its_first_sync() {
 fn a_staged_edit_reads_dirty_and_discard_reverts_it() {
     let cfg = cfg_with_root();
     let mut tab = synced_tab(&cfg);
-    tab.draft
-        .as_mut()
-        .unwrap()
+    draft_mut(&mut tab)
         .indexing
         .ignore_patterns
         .push("*.jpg".into());
@@ -1073,9 +1071,7 @@ fn a_live_mode_flip_does_not_read_as_dirty() {
     assert!(!tab.is_dirty());
 
     // Staged edit, then Return to Automatic: dirty from the edit only.
-    tab.draft
-        .as_mut()
-        .unwrap()
+    draft_mut(&mut tab)
         .indexing
         .ignore_patterns
         .push("*.jpg".into());
@@ -1089,7 +1085,7 @@ fn a_live_mode_flip_does_not_read_as_dirty() {
         "applying must not revert the live mode"
     );
 
-    tab.draft.as_mut().unwrap().indexing.ignore_patterns.pop();
+    draft_mut(&mut tab).indexing.ignore_patterns.pop();
     assert!(!tab.is_dirty());
 }
 
@@ -1097,9 +1093,7 @@ fn a_live_mode_flip_does_not_read_as_dirty() {
 fn a_rejected_apply_keeps_the_draft() {
     let cfg = cfg_with_root();
     let mut tab = synced_tab(&cfg);
-    tab.draft
-        .as_mut()
-        .unwrap()
+    draft_mut(&mut tab)
         .paths
         .indexing_paths
         .push("/data/nested".into());
@@ -1121,7 +1115,7 @@ fn a_rejected_apply_keeps_the_draft() {
 #[test]
 fn the_unsaved_label_appears_without_renaming_the_apply_button() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let cfg = cfg_with_root();
 
     let clean = frame_text_with(&ctx, &mut tab, &cfg, &idle_state());
@@ -1131,9 +1125,7 @@ fn the_unsaved_label_appears_without_renaming_the_apply_button() {
     );
     let (clean_id, _) = widget("apply");
 
-    tab.draft
-        .as_mut()
-        .unwrap()
+    draft_mut(&mut tab)
         .indexing
         .ignore_patterns
         .push("*.jpg".into());
@@ -1151,7 +1143,7 @@ fn the_unsaved_label_appears_without_renaming_the_apply_button() {
 #[test]
 fn the_prune_rows_come_and_go_without_renaming_anything_below() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
+    let mut tab = ManageTab::default();
     let cfg = cfg_with_root();
     let progress = ReconcileProgress {
         examined: 40_000,
@@ -1180,8 +1172,9 @@ fn the_prune_rows_come_and_go_without_renaming_anything_below() {
 }
 
 /// The cross-row adoption hazard: egui names widgets positionally, so after
-/// a Remove the surviving rows inherit earlier rows' ids — an in-progress
-/// DragValue edit must not carry over onto a different root.
+/// a Remove the surviving rows inherit earlier rows' ids, and an in-progress
+/// DragValue edit must not carry over onto a different root. Safe because
+/// the Remove click takes focus first.
 #[test]
 fn removing_a_root_does_not_leak_an_edit_onto_another_row() {
     fn rects(tag: &str) -> Vec<egui::Rect> {
@@ -1199,15 +1192,7 @@ fn removing_a_root_does_not_leak_an_edit_onto_another_row() {
     cfg.paths.indexing_paths = vec!["/aaa".into(), "/bbb".into(), "/ccc".into()];
     let mut tab = synced_tab(&cfg);
     let state = idle_state();
-    let staged = |tab: &ManageTab, root: &str| -> Option<usize> {
-        tab.draft
-            .as_ref()
-            .unwrap()
-            .indexing
-            .root_workers
-            .get(root)
-            .copied()
-    };
+    let staged = staged_workers;
 
     // Start editing row B's worker count.
     frame(&ctx, &mut tab, &cfg, &state, vec![]);
@@ -1235,7 +1220,7 @@ fn removing_a_root_does_not_leak_an_edit_onto_another_row() {
         vec![egui::Event::Text("9".into())],
     );
 
-    let paths = &tab.draft.as_ref().unwrap().paths.indexing_paths;
+    let paths = &draft(&tab).paths.indexing_paths;
     assert_eq!(paths, &["/bbb".to_string(), "/ccc".to_string()]);
     assert_eq!(
         staged(&tab, "/bbb"),
@@ -1254,28 +1239,13 @@ fn removing_a_root_does_not_leak_an_edit_onto_another_row() {
 #[test]
 fn the_tour_can_find_every_way_to_add_a_folder() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
-    let cfg = cfg_with_root();
-    let state = idle_state();
+    let mut tab = ManageTab::default();
 
-    let mut marked = None;
-    let out = ctx.run(raw_input(vec![]), |ctx| {
-        crate::spotlight::set_active(ctx, true);
-        egui::CentralPanel::default().show(ctx, |ui| {
-            tab.ui(ui, &state, &cfg);
-        });
-        // Inside the pass: a mark is only live for the pass that wrote it.
-        marked = crate::spotlight::rect(ctx, crate::spotlight::Spot::IndexedFolderAdd);
-    });
-    let marked = marked.expect("the add-a-folder row was never marked");
+    let (out, found) = frame_spotlit(&ctx, &mut tab, &[crate::spotlight::Spot::IndexedFolderAdd]);
+    let marked = found[0].expect("the add-a-folder row was never marked");
 
-    let painted = crate::test_ui::painted(&out);
     for needle in ["Add folder…", "or type a path", "Add"] {
-        let rect = painted
-            .iter()
-            .find(|(text, _)| text == needle)
-            .map(|(_, rect)| *rect)
-            .unwrap_or_else(|| panic!("nothing painted for {needle:?}"));
+        let rect = crate::test_ui::painted_rect(&out, needle);
         assert!(
             marked.contains_rect(rect),
             "{needle:?} at {rect:?} is outside the glow at {marked:?}"
@@ -1289,38 +1259,25 @@ fn the_tour_can_find_every_way_to_add_a_folder() {
 }
 
 /// The tour's indexing page names both content filters and glows them. Each
-/// glow has to land on the box itself — not its label, not the list of
+/// glow has to land on the box itself: not its label, not the list of
 /// patterns above it, and not nothing at all.
 #[test]
 fn the_tour_glows_both_content_filter_boxes() {
+    use crate::spotlight::Spot;
     let ctx = crate::test_ui::ctx();
-    let mut tab = ManageTab::new();
-    let cfg = cfg_with_root();
-    let state = idle_state();
+    let mut tab = ManageTab::default();
 
-    WIDGETS.with(|w| w.borrow_mut().clear());
-    let mut marks = (None, None);
-    let _ = ctx.run(raw_input(vec![]), |ctx| {
-        crate::spotlight::set_active(ctx, true);
-        egui::CentralPanel::default().show(ctx, |ui| {
-            tab.ui(ui, &state, &cfg);
-        });
-        // Inside the pass: a mark is only live for the pass that wrote it.
-        marks = (
-            crate::spotlight::rect(ctx, crate::spotlight::Spot::IgnorePatterns),
-            crate::spotlight::rect(ctx, crate::spotlight::Spot::ExtWhitelist),
-        );
-    });
+    let (_, marks) = frame_spotlit(&ctx, &mut tab, &[Spot::IgnorePatterns, Spot::ExtWhitelist]);
 
     let ignore = widget("ignore-entry").1;
     let whitelist = widget("ext-filter").1;
     assert_eq!(
-        marks.0,
+        marks[0],
         Some(ignore),
         "the ignore-pattern box was not the thing glowed"
     );
     assert_eq!(
-        marks.1,
+        marks[1],
         Some(whitelist),
         "the extensions box was not the thing glowed"
     );

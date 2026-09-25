@@ -1,6 +1,9 @@
 use super::*;
 
-use crate::test_ui::{click_at, painted, painted_rects, painted_spans, painted_text, raw_input_at};
+use crate::test_ui::{
+    button, click_at, key_press, painted_rect, painted_rects, painted_spans, painted_text,
+    raw_input_at, run_panel,
+};
 
 const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
 /// Deliberately not the real home directory: the folders page's fallback
@@ -13,16 +16,13 @@ fn roots() -> Vec<String> {
     vec![ROOT.to_string()]
 }
 
-/// A tour parked on `page` with that page's arrival already dealt with —
+/// A tour parked on `page` with that page's arrival already dealt with:
 /// what every test about the *rendering* of a page wants.
 fn at(page: usize) -> Tutorial {
     Tutorial {
         page,
-        shown: Some(page),
-        typing: None,
-        moved: false,
-        capturing_hotkey: false,
-        staged_scale: None,
+        entered_page: Some(page),
+        ..Default::default()
     }
 }
 
@@ -31,12 +31,20 @@ fn at(page: usize) -> Tutorial {
 fn entering(page: usize) -> Tutorial {
     Tutorial {
         page,
-        shown: None,
-        typing: None,
-        moved: false,
-        capturing_hotkey: false,
-        staged_scale: None,
+        ..Default::default()
     }
+}
+
+fn page_titled(title: &str) -> usize {
+    PAGES
+        .iter()
+        .position(|p| p.title == title)
+        .unwrap_or_else(|| panic!("no page titled {title:?}"))
+}
+
+fn window_rect(ctx: &egui::Context) -> egui::Rect {
+    ctx.memory(|m| m.area_rect(egui::Id::new(WINDOW_ID)))
+        .expect("the tour's window")
 }
 
 /// One pass, and what the tour asked for during it.
@@ -116,16 +124,12 @@ fn every_page_paints_its_own_title_and_body() {
 #[test]
 fn every_keyword_has_a_spot_to_point_at() {
     for (page, spec) in PAGES.iter().enumerate() {
-        let keywords: Vec<&str> = paragraphs(spec, &roots())
+        let prose = paragraphs(spec, &roots());
+        let keywords: Vec<&str> = prose
             .iter()
-            .flat_map(|p| {
-                runs(p)
-                    .into_iter()
-                    .filter(|(_, keyword)| *keyword)
-                    .map(|(run, _)| run.to_string())
-                    .collect::<Vec<_>>()
-            })
-            .map(|s| Box::leak(s.into_boxed_str()) as &str)
+            .flat_map(|p| runs(p))
+            .filter(|(_, keyword)| *keyword)
+            .map(|(run, _)| run)
             .collect();
         assert_eq!(
             keywords.len(),
@@ -163,12 +167,8 @@ fn brackets_mark_keywords_and_survive_being_unbalanced() {
 /// same colour, and different words are different colours.
 #[test]
 fn each_keyword_is_painted_in_the_colour_of_the_spot_it_names() {
-    let input = PAGES
-        .iter()
-        .position(|p| p.title == "Search: Input")
-        .expect("the input page");
     let ctx = crate::test_ui::ctx();
-    let mut tour = at(input);
+    let mut tour = at(page_titled("Search: Input"));
     let (out, _) = frame(&ctx, &mut tour, Vec::new());
     let dark_mode = ctx.style().visuals.dark_mode;
     let spans = painted_spans(&out);
@@ -190,10 +190,7 @@ fn each_keyword_is_painted_in_the_colour_of_the_spot_it_names() {
 /// Both halves of the effect move together, and they move at all.
 #[test]
 fn the_keyword_and_its_ring_pulse_in_step() {
-    let status = PAGES
-        .iter()
-        .position(|p| p.title == "The status bar")
-        .expect("the status bar page");
+    let status = page_titled("The status bar");
     let target = egui::Rect::from_min_size(egui::pos2(0.0, 660.0), egui::vec2(1000.0, 24.0));
 
     // The tint behind a keyword and the rings around its widget, at one time.
@@ -248,16 +245,12 @@ fn the_keyword_and_its_ring_pulse_in_step() {
     }
 }
 
-/// A spot nothing marked this pass — a hidden column, another tab — is not
+/// A spot nothing marked this pass (a hidden column, another tab) is not
 /// worth painting a ring in the middle of nowhere for.
 #[test]
 fn an_unmarked_spot_is_not_ringed() {
-    let status = PAGES
-        .iter()
-        .position(|p| p.title == "The status bar")
-        .expect("the status bar page");
     let ctx = crate::test_ui::ctx();
-    let mut tour = at(status);
+    let mut tour = at(page_titled("The status bar"));
     let (out, _) = frame(&ctx, &mut tour, Vec::new());
     let dark_mode = ctx.style().visuals.dark_mode;
     let ring = accent(0, dark_mode);
@@ -277,7 +270,7 @@ fn page_with(extra: Extra) -> usize {
         .unwrap_or_else(|| panic!("no page carries {extra:?}"))
 }
 
-/// A press, a move and a release, one frame each — a slider only follows a
+/// A press, a move and a release, one frame each: a slider only follows a
 /// pointer that is already down, so a drag cannot be squeezed into one pass.
 fn drag(
     ctx: &egui::Context,
@@ -285,20 +278,11 @@ fn drag(
     from: egui::Pos2,
     to: egui::Pos2,
 ) -> [TourActions; 3] {
-    let button = |pos, pressed| egui::Event::PointerButton {
-        pos,
-        button: egui::PointerButton::Primary,
-        pressed,
-        modifiers: egui::Modifiers::NONE,
-    };
-    let (_, press) = pass(
-        ctx,
-        tour,
-        vec![egui::Event::PointerMoved(from), button(from, true)],
-        1.0,
-    );
+    let primary = egui::PointerButton::Primary;
+    let press = vec![egui::Event::PointerMoved(from), button(from, primary, true)];
+    let (_, press) = pass(ctx, tour, press, 1.0);
     let (_, moved) = pass(ctx, tour, vec![egui::Event::PointerMoved(to)], 1.1);
-    let (_, release) = pass(ctx, tour, vec![button(to, false)], 1.2);
+    let (_, release) = pass(ctx, tour, vec![button(to, primary, false)], 1.2);
     [press, moved, release]
 }
 
@@ -312,11 +296,7 @@ fn the_welcome_page_slider_applies_only_on_its_button() {
     let scale_page = page_with(Extra::Scale);
     let mut tour = at(scale_page);
     let (out, _) = frame(&ctx, &mut tour, Vec::new());
-    let label = painted(&out)
-        .into_iter()
-        .find(|(text, _)| text == "UI scale")
-        .expect("the slider is labelled")
-        .1;
+    let label = painted_rect(&out, "UI scale");
     // The rail runs to the right of its label, on the same row.
     let from = egui::pos2(label.right() + 30.0, label.center().y);
     let [press, moved, release] = drag(&ctx, &mut tour, from, from + egui::vec2(120.0, 0.0));
@@ -337,11 +317,7 @@ fn the_welcome_page_slider_applies_only_on_its_button() {
     let (out, quiet) = pass(&ctx, &mut tour, Vec::new(), 2.0);
     assert_eq!(quiet.set_scale, None);
     assert_eq!(tour.staged_scale, Some(staged));
-    let apply = painted(&out)
-        .into_iter()
-        .find(|(text, _)| text == "Apply")
-        .expect("no Apply button beside the slider")
-        .1;
+    let apply = painted_rect(&out, "Apply");
     let (_, applied) = pass(&ctx, &mut tour, click_at(apply.center()), 2.1);
     assert_eq!(
         applied.set_scale,
@@ -386,7 +362,7 @@ fn only_the_welcome_page_offers_the_slider() {
     }
 }
 
-/// The command has to be the one that would actually work — a wrong one is
+/// The command has to be the one that would actually work: a wrong one is
 /// worse than none, because the key it is bound to fails silently.
 #[test]
 fn the_shortcut_page_offers_the_command_to_bind() {
@@ -403,13 +379,10 @@ fn the_shortcut_page_offers_the_command_to_bind() {
         actions.set_hotkey.is_none(),
         "nothing was pressed, but the tour asked to rebind the shortcut"
     );
-    // The command is a full path when the app is not installed — this test
-    // binary's own, which is as long as it gets. It has to wrap inside the
-    // window rather than be what decides how wide the window is.
-    let width = ctx
-        .memory(|m| m.area_rect(egui::Id::new(WINDOW_ID)))
-        .expect("the tour's window")
-        .width();
+    // The command is a full path when the app is not installed (this test
+    // binary's own, which is as long as it gets). It has to wrap inside the
+    // window rather than decide how wide the window is.
+    let width = window_rect(&ctx).width();
     assert!(
         width <= 560.0,
         "the command ({} points long) stretched the window to {width}",
@@ -432,8 +405,8 @@ fn the_shortcut_page_offers_the_command_to_bind() {
 }
 
 /// The other half of the page: the same button the Settings tab uses to
-/// claim a key while QuickSearch is running, acting the moment it is pressed
-/// — the tour has no Apply to wait for.
+/// claim a key while QuickSearch is running, acting the moment it is pressed,
+/// since the tour has no Apply to wait for.
 #[test]
 fn the_shortcut_page_rebinds_the_shortcut_it_shows() {
     let ctx = crate::test_ui::ctx();
@@ -462,13 +435,7 @@ fn the_shortcut_page_rebinds_the_shortcut_it_shows() {
     );
 
     // And the combination pressed next is the one handed back.
-    let press = vec![egui::Event::Key {
-        key: egui::Key::J,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::CTRL | egui::Modifiers::ALT,
-    }];
+    let press = key_press(egui::Key::J, egui::Modifiers::CTRL | egui::Modifiers::ALT);
     let (_, actions) = pass(&ctx, &mut tour, press, 1.1);
     assert_eq!(actions.set_hotkey.as_deref(), Some("Ctrl+Alt+J"));
     assert!(
@@ -513,32 +480,39 @@ fn the_notes_read_larger_than_the_page_counter() {
     let body = size_of(PAGES[page].body[0]);
     assert!(
         note < body,
-        "the note is {note}, no smaller than the body's {body} — it stops \
+        "the note is {note}, no smaller than the body's {body}, so it stops \
          reading as an aside"
     );
 }
 
+/// The machine's real home, which is what a default install indexes.
 #[test]
-fn the_folders_page_says_which_folders_those_are() {
-    // The machine's real home, which is what a default install indexes.
-    if let Some(home) = quicksearch_core::platform::home_dir() {
-        let home = home.to_string_lossy().into_owned();
-        let line = folders_line(std::slice::from_ref(&home));
-        assert!(
-            line.contains(&home),
-            "{line:?} does not name the home folder"
-        );
-        assert!(line.contains("[here]"), "{line:?} points nowhere");
-        // A trailing separator in the config is the same folder.
-        assert_eq!(folders_line(&[format!("{home}/")]), line);
-    }
+fn the_folders_page_names_the_home_folder() {
+    let home = quicksearch_core::platform::home_dir()
+        .expect("a home directory")
+        .to_string_lossy()
+        .into_owned();
+    let line = folders_line(std::slice::from_ref(&home));
+    assert!(
+        line.contains(&home),
+        "{line:?} does not name the home folder"
+    );
+    assert!(line.contains("[here]"), "{line:?} points nowhere");
+    // A trailing separator in the config is the same folder.
+    assert_eq!(folders_line(&[format!("{home}/")]), line);
+}
 
-    // Anything else: say what is actually indexed rather than claim home is.
+/// Anything else: say what is actually indexed rather than claim home is.
+#[test]
+fn the_folders_page_names_other_folders_as_they_are() {
     let line = folders_line(&[ROOT.to_string()]);
     assert!(line.contains(ROOT), "{line:?} does not name the root");
     assert!(line.contains("[here]"), "{line:?} points nowhere");
+}
 
-    // And with nothing indexed at all, which a reopened tour can find.
+/// Nothing indexed at all, which a reopened tour can find.
+#[test]
+fn the_folders_page_with_nothing_indexed_still_points_at_the_list() {
     let line = folders_line(&[]);
     assert!(line.contains("[here]"), "{line:?} points nowhere");
 }
@@ -564,10 +538,8 @@ fn the_folders_page_paints_the_configured_folder() {
 #[test]
 fn the_last_page_names_the_help_tab_button() {
     let ctx = crate::test_ui::ctx();
-    let out = ctx.run(raw_input_at(SCREEN, Vec::new(), 0.0), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            crate::help_tab::ui(ui);
-        });
+    let out = run_panel(&ctx, SCREEN, Vec::new(), |ui| {
+        crate::help_tab::ui(ui);
     });
     let buttons = painted_text(&out);
     let last = PAGES.last().expect("pages");
@@ -581,14 +553,14 @@ fn the_last_page_names_the_help_tab_button() {
     );
 }
 
-/// Entering a page moves to the tab it is about — once. Repeating it every
+/// Entering a page moves to the tab it is about, once. Repeating it every
 /// frame would drag back a user who clicked somewhere else mid-page.
 #[test]
 fn a_page_asks_for_its_tab_once_on_arrival() {
     let ctx = crate::test_ui::ctx();
     let duplicates = PAGES
         .iter()
-        .position(|p| p.tab == Some(Tab::Duplicates))
+        .position(|p| p.tab == Tab::Duplicates)
         .expect("the duplicates page");
     let mut tour = entering(duplicates);
 
@@ -606,7 +578,7 @@ fn a_page_asks_for_its_tab_once_on_arrival() {
     assert_eq!(tour.page, duplicates + 1);
     assert_eq!(actions.goto_tab, None, "the click frame is still this page");
     let (out, actions) = pass(&ctx, &mut tour, Vec::new(), 0.3);
-    assert_eq!(actions.goto_tab, PAGES[duplicates + 1].tab);
+    assert_eq!(actions.goto_tab, Some(PAGES[duplicates + 1].tab));
 
     let back = crate::test_ui::painted_text_center(&out, "Back").expect("a Back button");
     pass(&ctx, &mut tour, click_at(back), 0.4);
@@ -617,19 +589,6 @@ fn a_page_asks_for_its_tab_once_on_arrival() {
         Some(Tab::Duplicates),
         "going back re-asks"
     );
-}
-
-/// Every page is explicit about the tab it wants, so no page can inherit
-/// whatever the last one happened to leave on screen.
-#[test]
-fn every_page_names_the_tab_it_belongs_on() {
-    for (page, spec) in PAGES.iter().enumerate() {
-        assert!(
-            spec.tab.is_some(),
-            "page {page} ({}) does not say where it should be read",
-            spec.title
-        );
-    }
 }
 
 #[test]
@@ -724,38 +683,14 @@ fn the_window_can_be_dragged_out_of_the_way() {
     let title = PAGES[0].title;
 
     let (out, _) = frame(&ctx, &mut tour, Vec::new());
-    let where_is = |out: &egui::FullOutput| {
-        painted(out)
-            .into_iter()
-            .find(|(text, _)| text == title)
-            .map(|(_, rect)| rect.min)
-            .expect("the title is painted")
-    };
-    let before = where_is(&out);
+    let before = painted_rect(&out, title).min;
 
     let grab = crate::test_ui::painted_text_center(&out, title).expect("the title bar");
     let delta = egui::vec2(-180.0, -120.0);
-    let button = |pos, pressed| egui::Event::PointerButton {
-        pos,
-        button: egui::PointerButton::Primary,
-        pressed,
-        modifiers: egui::Modifiers::NONE,
-    };
-    pass(
-        &ctx,
-        &mut tour,
-        vec![egui::Event::PointerMoved(grab), button(grab, true)],
-        0.0,
-    );
-    pass(
-        &ctx,
-        &mut tour,
-        vec![egui::Event::PointerMoved(grab + delta)],
-        0.1,
-    );
-    let (out, _) = pass(&ctx, &mut tour, vec![button(grab + delta, false)], 0.2);
+    drag(&ctx, &mut tour, grab, grab + delta);
+    let (out, _) = pass(&ctx, &mut tour, Vec::new(), 1.3);
 
-    let after = where_is(&out);
+    let after = painted_rect(&out, title).min;
     assert!(
         (after - before - delta).length() < 2.0,
         "dragged by {delta:?} but the window went from {before:?} to {after:?}"
@@ -764,19 +699,14 @@ fn the_window_can_be_dragged_out_of_the_way() {
     // And it stays there when the page changes, rather than snapping back.
     // Measured on the window itself: the next page is a different width, so
     // where its title starts says nothing about where the window is.
-    let centre = |ctx: &egui::Context| {
-        ctx.memory(|m| m.area_rect(egui::Id::new(WINDOW_ID)))
-            .expect("the tour's window")
-            .center()
-    };
-    let dragged_to = centre(&ctx);
+    let dragged_to = window_rect(&ctx).center();
     let next = crate::test_ui::painted_text_center(&out, "Next").expect("a Next button");
-    pass(&ctx, &mut tour, click_at(next), 0.3);
-    pass(&ctx, &mut tour, Vec::new(), 0.4);
+    pass(&ctx, &mut tour, click_at(next), 1.4);
+    pass(&ctx, &mut tour, Vec::new(), 1.5);
+    let now = window_rect(&ctx).center();
     assert!(
-        (centre(&ctx) - dragged_to).length() < 2.0,
-        "the next page put the window back at {:?}, not {dragged_to:?}",
-        centre(&ctx)
+        (now - dragged_to).length() < 2.0,
+        "the next page put the window back at {now:?}, not {dragged_to:?}"
     );
 }
 
@@ -846,8 +776,7 @@ fn footer_spans(ctx: &egui::Context, page: usize) -> [Option<Span>; 3] {
 }
 
 /// `Ui::columns` lays a column out justified, so a button dropped
-/// straight into one comes out as wide as the whole third — which is
-/// what Back was until it was given a layout of its own.
+/// straight into one comes out as wide as the whole third.
 #[test]
 fn the_footer_runs_back_then_skip_then_next_at_the_same_size() {
     let ctx = crate::test_ui::ctx();
@@ -893,50 +822,24 @@ fn the_first_page_cannot_go_back() {
     }
 }
 
-fn sweep(ctx: &egui::Context, page: usize) -> Vec<usize> {
-    let mut seen = Vec::new();
-    for y in (150..560).step_by(4) {
-        for x in (240..760).step_by(8) {
-            let mut t = at(page);
-            let (_, actions) = frame(ctx, &mut t, click_at(egui::pos2(x as f32, y as f32)));
-            if actions.dismissed {
-                seen.push(t.page);
-            }
-        }
-    }
-    seen
-}
-
+/// Skip is on every page; Finish only on the last, where it replaces Next.
 #[test]
 fn skip_and_finish_both_dismiss() {
-    let ctx = crate::test_ui::ctx();
-
-    // Skip is on every page.
-    assert!(
-        !sweep(&ctx, 0).is_empty(),
-        "Skip never fired on the first page"
-    );
-
-    // Finish only on the last, where it replaces Next.
-    let last = PAGES.len() - 1;
-    assert!(
-        !sweep(&ctx, last).is_empty(),
-        "Finish never fired on the last page"
-    );
-    let ctx = crate::test_ui::ctx();
-    let mut tour = at(last);
-    let (out, _) = frame(&ctx, &mut tour, Vec::new());
-    assert!(
-        painted_text(&out).contains(&"Finish".to_string()),
-        "the last page still offers Next"
-    );
+    for (page, button) in [(0, "Skip"), (PAGES.len() - 1, "Finish")] {
+        let ctx = crate::test_ui::ctx();
+        let mut tour = at(page);
+        let (out, _) = frame(&ctx, &mut tour, Vec::new());
+        let pos = crate::test_ui::painted_text_center(&out, button)
+            .unwrap_or_else(|| panic!("page {page} offers no {button}"));
+        let (_, actions) = pass(&ctx, &mut tour, click_at(pos), 1.0);
+        assert!(actions.dismissed, "{button} did not dismiss page {page}");
+    }
 }
 
-/// The window is measured on its first frame, and on that frame the viewport
-/// is not necessarily the size it settles at — the real app opened the tour
-/// pinned to the bottom-right corner because a position picked once was
-/// picked against the wrong screen. Until the user drags it, it belongs in
-/// the middle of whatever the window currently is.
+/// The window is measured on its first frame, when the viewport may not have
+/// its final size, so a position picked once can be picked against the wrong
+/// screen. Until the user drags it, it belongs in the middle of whatever the
+/// window currently is.
 #[test]
 fn the_window_centres_itself_on_the_window_it_is_in() {
     let ctx = crate::test_ui::ctx();
@@ -946,11 +849,8 @@ fn the_window_centres_itself_on_the_window_it_is_in() {
         let _ = ctx.run(raw_input_at(size, Vec::new(), 0.0), |ctx| {
             tour.ui(ctx, &roots, HOTKEY);
         });
-        let rect = ctx
-            .memory(|m| m.area_rect(egui::Id::new(WINDOW_ID)))
-            .expect("the tour's window");
         (
-            rect.center(),
+            window_rect(&ctx).center(),
             egui::Rect::from_min_size(egui::Pos2::ZERO, size).center(),
         )
     };

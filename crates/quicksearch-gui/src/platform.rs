@@ -3,7 +3,7 @@
 
 use std::process::Command;
 
-/// Give the process somewhere to write when it has no stdio.
+/// Gives the process somewhere to write when it has no stdio.
 ///
 /// A window-subsystem binary launched from Explorer has NULL standard
 /// handles, and `println!`/`eprintln!` *panic* on a failed write. Pointing
@@ -29,14 +29,14 @@ pub fn redirect_null_stdio() {
     }
 }
 
-/// Open a file with the desktop's default application, detached.
+/// Opens a file with the desktop's default application, detached.
 pub fn open_file(path: &str) {
     if let Err(e) = open::that_detached(path) {
         quicksearch_core::log_warn!("open {}: {}", path, e);
     }
 }
 
-/// Reveal a file in the system file manager with the file selected.
+/// Reveals a file in the system file manager with the file selected.
 ///
 /// Linux goes through `dbus-send` (no D-Bus library for one call), falling
 /// back to opening the parent directory.
@@ -49,9 +49,9 @@ pub fn reveal_in_folder(path: &str) {
 
         // explorer.exe parses its own command line: `/select,` must be glued
         // to the path in one token with quotes around the path only, which
-        // only `raw_arg` can express — as two arguments it silently ignores
-        // the selection. Forward slashes are invalid here alone, and the exit
-        // code is meaningless (explorer returns 1 on success).
+        // only `raw_arg` can express (as two arguments the selection is
+        // silently ignored). Forward slashes are invalid here alone, and the
+        // exit code is meaningless (explorer returns 1 on success).
         let native = path.replace('/', "\\");
         let _ = Command::new("explorer.exe")
             .raw_arg(format!("/select,\"{}\"", native))
@@ -103,61 +103,21 @@ fn uri_escape_path(path: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod keyboard_settings_tests {
-    /// The first entry that is recognised wins, so a desktop that lists
-    /// itself ahead of a generic fallback gets its own settings application.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn the_most_specific_desktop_wins() {
-        let (program, args, _) = super::keyboard_settings_for("KDE").expect("KDE is known");
-        assert_eq!(program, "systemsettings");
-        assert_eq!(args, ["kcm_keys"]);
-
-        let (program, _, _) =
-            super::keyboard_settings_for("ubuntu:GNOME").expect("GNOME after a vendor prefix");
-        assert_eq!(program, "gnome-control-center");
-    }
-
-    /// The spec does not pin the case and desktops disagree.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn the_match_ignores_case() {
-        assert!(super::keyboard_settings_for("kde").is_some());
-        assert!(super::keyboard_settings_for("Kde").is_some());
-    }
-
-    /// An unknown or absent desktop offers no button rather than a broken one.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn an_unknown_desktop_offers_nothing() {
-        assert!(super::keyboard_settings_for("").is_none());
-        assert!(super::keyboard_settings_for("i3:sway").is_none());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn uri_escaping() {
-        use super::uri_escape_path;
-        assert_eq!(uri_escape_path("/plain/path.txt"), "/plain/path.txt");
-        assert_eq!(
-            uri_escape_path("/with space/ünïcode&.txt"),
-            "/with%20space/%C3%BCn%C3%AFcode%26.txt"
-        );
-    }
+/// A desktop's keyboard-shortcut settings application.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct KeyboardSettings {
+    program: &'static str,
+    args: &'static [&'static str],
+    /// The label of the button that opens it.
+    label: &'static str,
 }
 
 /// The desktop's keyboard-shortcut settings, when this is a desktop whose
-/// settings application we know how to name.
-///
-/// A pair with [`open_keyboard_settings`]: the Settings tab only offers the
-/// button when there is something to open, rather than showing one that may
-/// do nothing.
+/// settings application we know how to name. A pair with
+/// [`open_keyboard_settings`]: the Settings tab only offers the button when
+/// there is something to open.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn keyboard_settings_command() -> Option<(&'static str, &'static [&'static str], &'static str)> {
+fn keyboard_settings_command() -> Option<KeyboardSettings> {
     keyboard_settings_for(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
 }
 
@@ -166,34 +126,26 @@ fn keyboard_settings_command() -> Option<(&'static str, &'static [&'static str],
 /// most specific first, and matched case-insensitively because the spec does
 /// not pin the case and desktops disagree in practice.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn keyboard_settings_for(
-    desktops: &str,
-) -> Option<(&'static str, &'static [&'static str], &'static str)> {
-    for desktop in desktops.split(':') {
-        let found = match desktop.to_ascii_uppercase().as_str() {
-            "KDE" => Some((
-                "systemsettings",
-                &["kcm_keys"][..],
-                "Open Shortcuts settings",
-            )),
-            "GNOME" | "UNITY" => Some((
-                "gnome-control-center",
-                &["keyboard"][..],
-                "Open Keyboard settings",
-            )),
-            "XFCE" => Some(("xfce4-keyboard-settings", &[][..], "Open Keyboard settings")),
-            "CINNAMON" => Some((
-                "cinnamon-settings",
-                &["keyboard"][..],
-                "Open Keyboard settings",
-            )),
-            _ => None,
-        };
-        if found.is_some() {
-            return found;
-        }
-    }
-    None
+fn keyboard_settings_for(desktops: &str) -> Option<KeyboardSettings> {
+    desktops.split(':').find_map(|desktop| {
+        let (program, args, label): (_, &'static [&'static str], _) =
+            match desktop.to_ascii_uppercase().as_str() {
+                "KDE" => ("systemsettings", &["kcm_keys"], "Open Shortcuts settings"),
+                "GNOME" | "UNITY" => (
+                    "gnome-control-center",
+                    &["keyboard"],
+                    "Open Keyboard settings",
+                ),
+                "XFCE" => ("xfce4-keyboard-settings", &[], "Open Keyboard settings"),
+                "CINNAMON" => ("cinnamon-settings", &["keyboard"], "Open Keyboard settings"),
+                _ => return None,
+            };
+        Some(KeyboardSettings {
+            program,
+            args,
+            label,
+        })
+    })
 }
 
 /// The button label for [`open_keyboard_settings`], or `None` when this
@@ -203,8 +155,8 @@ pub fn keyboard_settings_label() -> Option<&'static str> {
     {
         // Naming it is not enough; it also has to be installed, or the button
         // would promise something that silently fails.
-        let (program, _, label) = keyboard_settings_command()?;
-        which(program).then_some(label)
+        let settings = keyboard_settings_command()?;
+        which(settings.program).then_some(settings.label)
     }
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     {
@@ -226,9 +178,53 @@ fn which(program: &str) -> bool {
 /// `quicksearch --toggle` without hunting for the page.
 pub fn open_keyboard_settings() {
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some((program, args, _)) = keyboard_settings_command() {
-        if let Err(e) = Command::new(program).args(args).spawn() {
-            quicksearch_core::log_warn!("opening {}: {}", program, e);
+    if let Some(settings) = keyboard_settings_command() {
+        if let Err(e) = Command::new(settings.program).args(settings.args).spawn() {
+            quicksearch_core::log_warn!("opening {}: {}", settings.program, e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn uri_escaping() {
+        use super::uri_escape_path;
+        assert_eq!(uri_escape_path("/plain/path.txt"), "/plain/path.txt");
+        assert_eq!(
+            uri_escape_path("/with space/ünïcode&.txt"),
+            "/with%20space/%C3%BCn%C3%AFcode%26.txt"
+        );
+    }
+
+    /// The first entry that is recognised wins, so a desktop that lists
+    /// itself ahead of a generic fallback gets its own settings application.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_most_specific_desktop_wins() {
+        let kde = super::keyboard_settings_for("KDE").expect("KDE is known");
+        assert_eq!(kde.program, "systemsettings");
+        assert_eq!(kde.args, ["kcm_keys"]);
+
+        let gnome =
+            super::keyboard_settings_for("ubuntu:GNOME").expect("GNOME after a vendor prefix");
+        assert_eq!(gnome.program, "gnome-control-center");
+    }
+
+    /// The spec does not pin the case and desktops disagree.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_match_ignores_case() {
+        assert!(super::keyboard_settings_for("kde").is_some());
+        assert!(super::keyboard_settings_for("Kde").is_some());
+    }
+
+    /// An unknown or absent desktop offers no button rather than a broken one.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn an_unknown_desktop_offers_nothing() {
+        assert!(super::keyboard_settings_for("").is_none());
+        assert!(super::keyboard_settings_for("i3:sway").is_none());
     }
 }

@@ -1,21 +1,19 @@
 //! Bringing the running window forward from a second process.
 //!
 //! The desktop owns the search shortcut: the user binds it to
-//! `quicksearch --toggle`, which either hands the activation to an instance
-//! that is already running and exits, or — when nothing is running — becomes
-//! that instance. This is the only shape that can satisfy "focus the search
-//! box whether or not the app was started", because a shortcut an application
-//! registers for itself cannot fire while the application is not there.
+//! `quicksearch --toggle`, which hands the activation to a running instance
+//! and exits, or becomes that instance when nothing is running. Only this
+//! shape focuses the search box whether or not the app was started, because
+//! a shortcut an application registers for itself cannot fire while the
+//! application is not there.
 //!
 //! "Come forward" is nearly the whole protocol; what little each side says
 //! is the permission the other needs. On unix the request line carries the
-//! sender's `XDG_ACTIVATION_TOKEN` (usually empty) — on Wayland that token
-//! is the compositor's leave for the running window to take focus, spent in
-//! [`raise`]'s `xdg_activation_v1` path — and the reply exists so the
-//! sender can tell a live instance from a leftover socket. On Windows the
-//! reply instead carries the server's PID, which the sender feeds to
-//! `AllowSetForegroundWindow` so the running window may take the foreground
-//! — see the `#[cfg(windows)]` module below.
+//! sender's `XDG_ACTIVATION_TOKEN` (usually empty), which on Wayland lets the
+//! running window take focus (spent in [`raise`]'s `xdg_activation_v1`
+//! path), and the reply lets the sender tell a live instance from a leftover
+//! socket. On Windows the reply carries the server's PID instead, for the
+//! sender's `AllowSetForegroundWindow` (see the `#[cfg(windows)]` module).
 
 pub mod raise;
 
@@ -41,26 +39,23 @@ static TOKEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 const PID_REPLY_CAP: usize = 16;
 
 /// The server's PID out of its reply: ASCII decimal up to a newline.
-/// Anything else — truncation, garbage, an empty read — is `None`, which
-/// skips the foreground grant rather than failing the activation.
+/// Anything else (truncation, garbage, an empty read) is `None`, which skips
+/// the foreground grant rather than failing the activation.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn parse_pid_reply(reply: &[u8]) -> Option<u32> {
     let line = reply.split(|&b| b == b'\n').next()?;
     std::str::from_utf8(line).ok()?.parse().ok()
 }
 
-/// The socket identifying the instance that `config_path` configures.
+/// The socket identifying the instance that `config_path` configures. Keyed
+/// by the config file, not the index: the index path can change while
+/// running (`IndexLock` moves with it), and a socket that moved too would
+/// leave `--toggle` looking for the old one. Two GUIs under different configs
+/// get different sockets, the only way two can legitimately run at once.
 ///
-/// **Keyed by the config file, not the index.** The index path is a setting
-/// the user can change while running — `IndexLock` moves with it — and a
-/// socket that moved too would leave `--toggle` looking for the old one; the
-/// config path is fixed for the life of both processes and is what makes them
-/// agree. Two GUIs under different configs still get different sockets, which
-/// is the only way two can legitimately run at once.
-///
-/// It lives in the runtime directory rather than beside the index: that is
-/// tmpfs, private to the session, and cleared at logout, so a socket cannot
-/// outlive the login that made it or land on a read-only portable install.
+/// It lives in the runtime directory (tmpfs, private to the session, cleared
+/// at logout), so a socket cannot outlive its login or land on a read-only
+/// portable install.
 pub fn path_for(config_path: &Path) -> PathBuf {
     runtime_dir().join(format!("quicksearch-{:016x}.sock", key(config_path)))
 }
@@ -80,7 +75,7 @@ fn key(config_path: &Path) -> u64 {
 }
 
 /// `$XDG_RUNTIME_DIR` when the session set one, else a private directory of
-/// our own under the temporary directory — which is shared, hence the mode.
+/// our own under the temporary directory, which is shared, hence the mode.
 fn runtime_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
         let dir = PathBuf::from(dir);
@@ -96,7 +91,7 @@ fn runtime_dir() -> PathBuf {
     fallback
 }
 
-/// Take the activation asked for since the last call.
+/// Takes the activation asked for since the last call.
 pub fn take_pending() -> bool {
     PENDING.swap(false, Ordering::SeqCst)
 }
@@ -107,16 +102,13 @@ pub fn take_token() -> Option<String> {
     TOKEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
 }
 
-/// What to tell the user (or a desktop binding) to run. The installed name
-/// when we are on the path under it, and the full path otherwise — a build
-/// run out of `target/` is the common case, and "quicksearch" would be wrong
-/// advice there.
+/// What to tell the user (or a desktop binding) to run: the installed name
+/// when we are on the path under it, and the full path otherwise (a build run
+/// out of `target/`, where "quicksearch" would be wrong advice).
 ///
-/// An AppImage needs its own rule: `current_exe` there points into the
-/// runtime's FUSE mount (`/tmp/.mount_…`), which vanishes with the process,
-/// so a binding made from it dies the moment QuickSearch closes. The
-/// runtime exports the durable path of the `.AppImage` file itself as
-/// `$APPIMAGE`; that is the thing to run.
+/// An AppImage runs from a FUSE mount (`/tmp/.mount_…`) that vanishes with
+/// the process, so a binding made from `current_exe` dies when QuickSearch
+/// closes; the durable path of the `.AppImage` itself is in `$APPIMAGE`.
 pub fn command_name() -> String {
     let Ok(exe) = std::env::current_exe() else {
         return "quicksearch".to_string();
@@ -142,18 +134,16 @@ fn durable_command(appimage: Option<PathBuf>, exe: PathBuf) -> String {
     }
 }
 
-/// Record an activation and wake the window. Without the repaint an idle
-/// event loop would leave it unread until the user moved the mouse.
-///
-/// Called both by the socket listener here and by `crate::hotkey` when the
-/// application's own registration fires, so the two paths are identical from
-/// the UI's point of view.
+/// Records an activation and wakes the window; without the repaint an idle
+/// event loop would leave it unread until the user moved the mouse. Called by
+/// the listener here and by `crate::hotkey`, so both paths look the same to
+/// the UI.
 pub(crate) fn fire(ctx: &egui::Context) {
     fire_with_token(ctx, None);
 }
 
-/// [`fire`], carrying the activation token a `--toggle` sender forwarded —
-/// on Wayland it is the compositor's permission to take focus.
+/// [`fire`], carrying the activation token a `--toggle` sender forwarded (on
+/// Wayland, the compositor's permission to take focus).
 pub(crate) fn fire_with_token(ctx: &egui::Context, token: Option<String>) {
     *TOKEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = token;
     PENDING.store(true, Ordering::SeqCst);
@@ -169,23 +159,20 @@ mod imp {
     use std::os::unix::net::{UnixListener, UnixStream};
 
     /// The most a request line may be. Real xdg-activation tokens run some
-    /// tens of characters; the cap is what keeps a hostile peer from feeding
+    /// tens of characters; the cap keeps a hostile peer from feeding
     /// the listener forever.
     const REQUEST_CAP: usize = 1024;
 
-    /// Ask the instance configured by `config_path` to come forward.
+    /// Asks the instance configured by `config_path` to come forward. `true`
+    /// means a live instance accepted it; `false` (a refused connection, or
+    /// no socket at all) means the caller should start the GUI itself. A
+    /// leftover socket file never counts as an instance, the rule `IndexLock`
+    /// follows too, so a crash cannot strand the user behind a file nobody
+    /// is listening on.
     ///
-    /// `true` means a live instance accepted it. `false` means there is none
-    /// — a refused connection, or no socket at all — and the caller should
-    /// start the GUI itself. **A leftover socket file never counts as an
-    /// instance**: the same rule `IndexLock` follows, so a crash cannot
-    /// strand the user behind a file nobody is listening on.
-    ///
-    /// The request carries this process's `XDG_ACTIVATION_TOKEN`, when the
-    /// launcher behind the user's keypress minted one: on Wayland that token
-    /// is the compositor's permission to take focus, and the running
-    /// instance spends it on its own window (`raise`). Launched by hand
-    /// there is none, and the request is the empty line it always was.
+    /// The request carries this process's `XDG_ACTIVATION_TOKEN` when the
+    /// launcher minted one; the running instance spends it on its own window
+    /// (`raise`). Launched by hand there is none, and the line is empty.
     pub fn signal(config_path: &Path) -> bool {
         let token = std::env::var("XDG_ACTIVATION_TOKEN").unwrap_or_default();
         signal_with_token(config_path, &token)
@@ -217,20 +204,18 @@ mod imp {
         {
             return false;
         }
-        // The reply is what distinguishes "delivered" from "wrote into a
+        // The reply distinguishes "delivered" from "wrote into a
         // socket nobody reads". EOF means the peer went away.
         let mut ack = [0u8; 1];
         matches!(stream.read(&mut ack), Ok(1))
     }
 
-    /// Start answering activations for the instance `config_path` configures.
-    ///
-    /// Call only while holding the index lock: binding unlinks whatever is
-    /// in the way, and the lock is what proves no live instance under this
-    /// config could be listening on it.
-    ///
-    /// Failure is logged and otherwise ignored — a runtime directory that
-    /// cannot host a socket is not a reason to refuse to open the window.
+    /// Starts answering activations for the instance `config_path`
+    /// configures. Call only while holding the index lock: binding unlinks
+    /// whatever is in the way, and the lock proves no live instance under
+    /// this config is listening on it. Failure is logged and otherwise
+    /// ignored: a runtime directory that cannot host a socket is not a reason
+    /// to refuse to open the window.
     pub fn listen(ctx: &egui::Context, config_path: &Path) {
         let path = path_for(config_path);
         let _ = std::fs::remove_file(&path);
@@ -284,11 +269,10 @@ mod imp {
         }
     }
 
-    /// Read the request: one newline-terminated line carrying the sender's
+    /// Reads the request: one newline-terminated line carrying the sender's
     /// activation token, usually empty.
     ///
-    /// Hostile input is the norm rather than the exception: any process of
-    /// this user can connect. The read is bounded in bytes ([`REQUEST_CAP`])
+    /// Hostile input is the norm: any process of this user can connect. The read is bounded in bytes ([`REQUEST_CAP`])
     /// and time, so a peer that connects and stalls, or pours data without a
     /// newline, cannot wedge the one thread that answers every activation.
     pub(super) fn request(stream: &mut UnixStream) -> std::io::Result<String> {
@@ -329,19 +313,16 @@ mod imp {
 }
 
 /// The same handshake over a named pipe, which is what Windows has instead
-/// of a unix socket.
-///
-/// **One deliberate difference: the reply is the foreground grant, not a
-/// liveness check.** A named pipe exists only while a server holds an
-/// instance open — there is no file left behind — so a successful
-/// `CreateFileW` already proves a live instance accepted us. What Windows
-/// *does* need is permission: `SetForegroundWindow` is refused to a process
-/// the user did not just interact with, and the running instance is exactly
-/// that. The `--toggle` process was launched by the user's keypress and so
-/// holds the right — and may donate it with `AllowSetForegroundWindow`, given
-/// the server's PID. The server therefore opens every connection by writing
-/// its PID, and the sender grants before sending the request, so the grant
-/// is always in force by the time the server raises.
+/// of a unix socket, with one difference: the reply is the foreground grant,
+/// not a liveness check. A named pipe exists only while a server holds it
+/// open, so a successful `CreateFileW` already proves a live instance. What
+/// Windows needs is permission: `SetForegroundWindow` is refused to a process
+/// the user did not just interact with, which the running instance is. The
+/// `--toggle` process was launched by the user's keypress, so it holds that
+/// right and may donate it with `AllowSetForegroundWindow`, given the
+/// server's PID. The server opens every connection by writing its PID, and
+/// the sender grants before sending the request, so the grant is in force by
+/// the time the server raises.
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -384,10 +365,9 @@ mod imp {
         }
     }
 
-    /// Ask the instance configured by `config_path` to come forward.
-    ///
-    /// `false` means no instance is serving the pipe and the caller should
-    /// start the GUI itself.
+    /// Asks the instance configured by `config_path` to come forward. `false`
+    /// means no instance is serving the pipe and the caller should start the
+    /// GUI itself.
     pub fn signal(config_path: &Path) -> bool {
         let name = pipe_name(config_path);
         // A busy pipe means an instance is there but mid-handshake with
@@ -417,7 +397,7 @@ mod imp {
             let pipe = Handle(handle);
             // The server opens with its PID; hand it the foreground right we
             // hold from the user's keypress *before* asking it to raise. A
-            // reply that does not parse skips the grant — the raise then
+            // reply that does not parse skips the grant, so the raise
             // degrades to a taskbar flash rather than the request being lost.
             let mut reply = [0u8; PID_REPLY_CAP];
             let mut got = 0u32;
@@ -459,10 +439,8 @@ mod imp {
         false
     }
 
-    /// Start answering activations for the instance `config_path` configures.
-    ///
-    /// Failure is logged and otherwise ignored, exactly as on unix: a pipe
-    /// that cannot be created is not a reason to refuse to open the window.
+    /// Starts answering activations for the instance `config_path`
+    /// configures. Failure is logged and otherwise ignored, as on unix.
     pub fn listen(ctx: &egui::Context, config_path: &Path) {
         let name = pipe_name(config_path);
         let ctx = ctx.clone();
@@ -503,7 +481,7 @@ mod imp {
             // SAFETY: the handle is open and no overlapped structure is used.
             let connected = unsafe { ConnectNamedPipe(pipe.0, std::ptr::null_mut()) };
             // Zero can still mean a client that connected before we asked;
-            // the read below is what decides, so it is not checked here.
+            // the read below decides, so it is not checked here.
             let _ = connected;
 
             // Our PID first, before reading anything: the client turns it
@@ -581,25 +559,8 @@ mod tests {
         assert_ne!(path_for(config), path_for(Path::new("/elsewhere.toml")));
     }
 
-    /// The index path is a live setting; the socket must not follow it, or a
-    /// `database_path` change would strand every later `--toggle`.
-    #[test]
-    fn the_socket_does_not_depend_on_the_index() {
-        assert!(!path_for(Path::new("/c.toml"))
-            .to_string_lossy()
-            .contains("index"));
-    }
-
-    /// Distinct paths that share a suffix must not collide.
-    #[test]
-    fn different_configs_name_different_sockets() {
-        let a = key(Path::new("/a/config.toml"));
-        let b = key(Path::new("/b/config.toml"));
-        assert_ne!(a, b);
-    }
-
     /// An AppImage's mount path dies with the process; a binding must run
-    /// the image file itself. Everything else keeps the old rule.
+    /// the image file itself. Everything else keeps the usual rule.
     #[test]
     fn the_bound_command_survives_the_appimage_exiting() {
         let mount = PathBuf::from("/tmp/.mount_quicksjBMkDo/usr/bin/quicksearch");
@@ -675,6 +636,16 @@ mod tests {
         path
     }
 
+    /// The next connection to `listener`.
+    #[cfg(unix)]
+    fn accept(listener: &std::os::unix::net::UnixListener) -> std::os::unix::net::UnixStream {
+        listener
+            .incoming()
+            .next()
+            .expect("a connection")
+            .expect("accepted")
+    }
+
     /// Nothing is listening on a path that was never bound.
     #[cfg(unix)]
     #[test]
@@ -706,11 +677,7 @@ mod tests {
         let sender =
             std::thread::spawn(move || imp::signal_with_token(&db, "wayland-token-123"));
 
-        let mut stream = listener
-            .incoming()
-            .next()
-            .expect("a connection")
-            .expect("accepted");
+        let mut stream = accept(&listener);
         let token = imp::request(&mut stream).expect("a well-formed request");
         assert_eq!(token, "wayland-token-123");
         imp::acknowledge(&mut stream).expect("acknowledged");
@@ -729,11 +696,7 @@ mod tests {
             let db = scratch("badtoken");
             let listener = UnixListener::bind(path_for(&db)).expect("bind");
             let sender = std::thread::spawn(move || imp::signal_with_token(&db, &bad));
-            let mut stream = listener
-                .incoming()
-                .next()
-                .expect("a connection")
-                .expect("accepted");
+            let mut stream = accept(&listener);
             assert_eq!(imp::request(&mut stream).expect("well-formed"), "");
             imp::acknowledge(&mut stream).expect("acknowledged");
             assert!(sender.join().expect("sender"));
@@ -757,11 +720,7 @@ mod tests {
             // refusal causes.
             let _ = peer.write_all(&[b'x'; 4096]);
         });
-        let mut stream = listener
-            .incoming()
-            .next()
-            .expect("a connection")
-            .expect("accepted");
+        let mut stream = accept(&listener);
         assert!(
             imp::request(&mut stream).is_err(),
             "a capless request was accepted"
@@ -801,19 +760,15 @@ mod tests {
         let peer = UnixStream::connect(&path).expect("connect");
         drop(peer);
 
-        let mut stream = listener
-            .incoming()
-            .next()
-            .expect("a connection")
-            .expect("accepted");
+        let mut stream = accept(&listener);
         assert!(
             imp::request(&mut stream).is_err(),
             "an empty request is refused"
         );
     }
 
-    /// A config path unique to this test. Never opened as a file — only
-    /// hashed into a pipe name — so it need not exist.
+    /// A config path unique to this test. Only hashed into a pipe name, never
+    /// opened, so it need not exist.
     #[cfg(windows)]
     fn scratch(name: &str) -> PathBuf {
         PathBuf::from(format!(

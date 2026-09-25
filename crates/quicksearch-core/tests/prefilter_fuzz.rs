@@ -1,9 +1,9 @@
 //! Fuzzing the cascade's prefilters.
 //!
-//! The generator manufactures queries whose correct answer is known **by
-//! construction**: cut a substring from a document, corrupt it at most `k`
-//! times (counted in **bytes**, the metric `Bitap` uses), and the document
-//! it came from must still be found.
+//! The generator manufactures queries whose correct answer is known by
+//! construction: cut a substring from a document, corrupt it at most `k`
+//! times (counted in bytes, the metric `Bitap` uses), and the document it
+//! came from must still be found.
 //!
 //! The reference is a true oracle, not a differential against the
 //! pre-prefilter code path: a bug in `Bitap` would be present in both paths
@@ -47,11 +47,11 @@ const BOUNDED_CAPS: usize = 3;
 
 const DOCS: usize = 60;
 
-/// Bodies the generator draws substrings from. Deliberately hostile, since
-/// whatever is in the corpus goes straight into the term and the FTS chunks:
-/// FTS5 metacharacters (must be quoted into inertness by
+/// Bodies the generator draws substrings from, hostile because whatever is in
+/// the corpus goes straight into the term and the FTS chunks: FTS5
+/// metacharacters (must be quoted into inertness by
 /// `translator::quote_phrase`), multi-byte characters at 2, 3 and 4 bytes,
-/// diacritics (folded by the trigram index but not by bitap — the prefilter
+/// diacritics (folded by the trigram index but not by bitap, so the prefilter
 /// must stay a superset across that), mixed case, and a degenerate
 /// repeated-character shape.
 fn bodies() -> Vec<String> {
@@ -101,9 +101,9 @@ fn bodies() -> Vec<String> {
 // Oracles
 // ---------------------------------------------------------------------------
 
-/// Minimum Levenshtein distance between `pattern` and any substring of
-/// `hay`, over **bytes**, ASCII-case-insensitively — the metric the matcher
-/// uses. The shared brute-force reference.
+/// Minimum Levenshtein distance between `pattern` and any substring of `hay`,
+/// over bytes, ASCII-case-insensitively: the metric the matcher uses. The
+/// shared brute-force reference.
 fn oracle_distance(pattern: &[u8], hay: &[u8]) -> usize {
     if hay.is_empty() || pattern.is_empty() {
         return usize::MAX;
@@ -164,7 +164,7 @@ fn substring_of<'a>(body: &'a str, len: usize, lcg: &mut Lcg) -> Option<&'a str>
 
 /// The pigeonhole argument the prefilter rests on, isolated from FTS, SQLite
 /// and bitap: if the term occurs within `k` edits, some chunk of the
-/// `k + 1`-way split occurs **verbatim**. Driven by the corrupt-a-substring
+/// `k + 1`-way split occurs verbatim. Driven by the corrupt-a-substring
 /// generator; a randomly drawn pair almost never aligns and would be vacuous.
 #[test]
 fn a_surviving_chunk_always_remains_after_k_edits() {
@@ -189,7 +189,7 @@ fn a_surviving_chunk_always_remains_after_k_edits() {
                 }
                 let term: String = chars.into_iter().collect();
 
-                // Only assert within the byte budget — see the module note.
+                // Only assert within the byte budget; see the module note.
                 let distance = oracle_distance(term.as_bytes(), body.as_bytes());
                 let Some(chunks) = pigeonhole_chunks(&term, k) else {
                     continue;
@@ -366,9 +366,9 @@ fn a_corrupted_substring_still_finds_the_document_it_came_from() {
                 // The cascade does not search the string typed at it: the
                 // lexer strips and re-joins whitespace, makes `*` a wildcard
                 // and `key:value` a filter. A term like `" Qi"` loses its
-                // leading space and falls below the fuzzy floor — correct
-                // behaviour that read as a lost hit when asserted against the
-                // raw string. Every decision below uses the *parsed* term.
+                // leading space and falls below the fuzzy floor, which is
+                // correct but reads as a lost hit against the raw string.
+                // Every decision below uses the parsed term.
                 let Ok(split) = split_for_cascade(&term) else {
                     // A term that parses to an error is not a fuzzy search.
                     continue;
@@ -427,14 +427,14 @@ fn a_corrupted_substring_still_finds_the_document_it_came_from() {
     );
 }
 
-/// The two-sided property, against a brute-force oracle over the **whole**
+/// The two-sided property, against a brute-force oracle over the whole
 /// corpus:
 ///
-/// * **No lost hits** — every document within `k` edits appears; the
-///   direction the prefilter can break, with no visible symptom.
-/// * **No invented hits** — every stage-8 hit is within `k` edits; stage 8
-///   exactly, since a filename or path pass may legitimately surface a
-///   document whose *body* is outside the budget.
+/// * No lost hits: every document within `k` edits appears. The prefilter can
+///   break this direction with no visible symptom.
+/// * No invented hits: every stage-8 hit is within `k` edits. Stage 8 only,
+///   since a filename or path pass may legitimately surface a document whose
+///   body is outside the budget.
 #[test]
 fn every_document_within_the_budget_is_found_and_nothing_outside_it_is() {
     const ITERS: usize = 5;
@@ -616,8 +616,8 @@ fn seed_files(path: &std::path::Path, rows: &[(String, String)]) -> Vec<i64> {
 
 /// The filename analog of [`a_corrupted_substring_still_finds_the_document_it_came_from`]:
 /// cut a substring from a stored name or full path, corrupt it within the
-/// byte budget, and the row must still be found — the recall direction pass
-/// C's pigeonhole `LIKE` prefilter can break with no symptom. Terms cut from
+/// byte budget, and the row must still be found: pass C's pigeonhole `LIKE`
+/// prefilter can break recall with no symptom. Terms cut from
 /// a path can carry a separator, which disqualifies the chunk set and
 /// exercises the full-scan fallback in the same sweep.
 #[test]
@@ -638,7 +638,11 @@ fn a_corrupted_path_substring_still_finds_the_file_it_came_from() {
                 let at = lcg.next_u64() as usize % rows.len();
                 let (parent, name) = &rows[at];
                 let full = format!("{}{}", parent, name);
-                let source: &str = if lcg.next_u64() % 2 == 0 { name } else { &full };
+                let source: &str = if lcg.next_u64().is_multiple_of(2) {
+                    name
+                } else {
+                    &full
+                };
                 let Some(original) = substring_of(source, len, &mut lcg) else {
                     continue;
                 };
@@ -673,8 +677,8 @@ fn a_corrupted_path_substring_still_finds_the_file_it_came_from() {
                 }
 
                 // The pass verifies the name always, the path only at three
-                // *characters* of pattern (`cascade::path_tiers_enabled`) —
-                // a three-byte term can be one CJK character, under the tier
+                // characters of pattern (`cascade::path_tiers_enabled`); a
+                // three-byte term can be one CJK character, under the tier
                 // floor while over the fuzzy one.
                 let name_hit = oracle_distance(effective.as_bytes(), name.as_bytes()) <= k;
                 let path_hit = effective.chars().count() >= 3
@@ -846,7 +850,7 @@ fn seed(path: &std::path::Path, bodies: &[String]) -> Vec<i64> {
         let id = insert_file(
             &tx,
             &NewFile {
-                // Names deliberately share nothing with the bodies, so a hit
+                // Names share nothing with the bodies, so a hit
                 // can only come from the full-text pass.
                 name: &format!("row{:04}.bin", i),
                 parent: "/fuzz/",

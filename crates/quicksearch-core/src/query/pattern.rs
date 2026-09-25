@@ -3,14 +3,15 @@
 //! A term with an unquoted `*` compiles to a small regex; star-free terms
 //! stay on the [`Literal`](TermPattern::Literal) path.
 //!
-//! `.` never matches `\n`, so a star cannot span lines of extracted text —
-//! a `*` bridging a whole document would produce page-sized snippets.
+//! `.` never matches `\n`, so a star cannot span lines of extracted text; a
+//! `*` bridging a whole document would produce page-sized snippets.
 
 use std::ops::Range;
 
 use regex::{Regex, RegexBuilder};
 
 use super::translator::TranslateError;
+use crate::search::prefilter::Required;
 use crate::snippet;
 
 /// Keeps a hostile pattern (`a{1000000}{1000}`) from ballooning the program.
@@ -22,8 +23,8 @@ const COUNT_CAP: usize = 1000;
 /// The cascade term, compiled once at split time.
 #[derive(Debug, Clone, Default)]
 pub enum TermPattern {
-    /// Empty or stars-only. Matches nothing — a bare `*` must not become a
-    /// scan of everything.
+    /// Empty or stars-only. Matches nothing: a bare `*` must not become a scan
+    /// of everything.
     #[default]
     Empty,
     Literal(LiteralPattern),
@@ -41,7 +42,7 @@ pub struct WildcardPattern {
     /// Literal chunks between stars, in order. Never empty and no chunk is
     /// empty: edge stars fold into the regexes, doubled stars collapse.
     segments: Vec<String>,
-    /// Unanchored, non-greedy joins — leftmost-shortest, what a snippet wants.
+    /// Unanchored, non-greedy joins: leftmost-shortest, what a snippet wants.
     search_cs: Regex,
     search_ci: Regex,
     /// Anchored (`^…$`) regexes for whole-field matching (rank tiers 1/2).
@@ -50,7 +51,7 @@ pub struct WildcardPattern {
 }
 
 /// One piece of the search phrase. `glob` is true only for plain unquoted
-/// words — quoted phrases and `key:value` text keep their stars literal.
+/// words; quoted phrases and `key:value` text keep their stars literal.
 #[derive(Debug, Clone)]
 pub struct TermPart {
     pub text: String,
@@ -60,6 +61,24 @@ pub struct TermPart {
 enum Chunk {
     Lit(String),
     Star,
+}
+
+impl WildcardPattern {
+    fn search(&self, case_insensitive: bool) -> &Regex {
+        if case_insensitive {
+            &self.search_ci
+        } else {
+            &self.search_cs
+        }
+    }
+
+    fn anchored(&self, case_insensitive: bool) -> &Regex {
+        if case_insensitive {
+            &self.anchored_ci
+        } else {
+            &self.anchored_cs
+        }
+    }
 }
 
 impl TermPattern {
@@ -110,9 +129,8 @@ impl TermPattern {
             return Ok(TermPattern::Empty);
         }
         if !has_star {
-            let Some(text) = segments.into_iter().next() else {
-                return Ok(TermPattern::Empty);
-            };
+            // Star-free chunks merge into one segment.
+            let text = segments.into_iter().next().expect("segments is non-empty");
             let folded = text.to_ascii_lowercase();
             return Ok(TermPattern::Literal(LiteralPattern { text, folded }));
         }
@@ -159,7 +177,7 @@ impl TermPattern {
         }
     }
 
-    /// [`literal`](Self::literal), ASCII-folded — the form every
+    /// [`literal`](Self::literal), ASCII-folded: the form every
     /// case-insensitive scan searches with.
     pub fn literal_folded(&self) -> Option<&str> {
         match self {
@@ -192,14 +210,7 @@ impl TermPattern {
                     text == l.text
                 }
             }
-            TermPattern::Wildcard(w) => {
-                let re = if case_insensitive {
-                    &w.anchored_ci
-                } else {
-                    &w.anchored_cs
-                };
-                re.is_match(text)
-            }
+            TermPattern::Wildcard(w) => w.anchored(case_insensitive).is_match(text),
         }
     }
 
@@ -232,14 +243,7 @@ impl TermPattern {
                 };
                 Some(pos..pos + l.text.len())
             }
-            TermPattern::Wildcard(w) => {
-                let re = if case_insensitive {
-                    &w.search_ci
-                } else {
-                    &w.search_cs
-                };
-                re.find(text).map(|m| m.range())
-            }
+            TermPattern::Wildcard(w) => w.search(case_insensitive).find(text).map(|m| m.range()),
         }
     }
 
@@ -264,20 +268,17 @@ impl TermPattern {
         }
     }
 
-    /// Non-overlapping occurrence count. Wildcards stop at 1000 — the
-    /// cascade's `count_frac` saturates there anyway.
+    /// Non-overlapping occurrence count. Wildcards stop at 1000, where the
+    /// cascade's `count_frac` saturates anyway.
     pub fn count(&self, text: &str, case_insensitive: bool) -> usize {
         match self {
             TermPattern::Empty => 0,
             TermPattern::Literal(l) => snippet::count_occurrences(text, &l.text, !case_insensitive),
-            TermPattern::Wildcard(w) => {
-                let re = if case_insensitive {
-                    &w.search_ci
-                } else {
-                    &w.search_cs
-                };
-                re.find_iter(text).take(COUNT_CAP).count()
-            }
+            TermPattern::Wildcard(w) => w
+                .search(case_insensitive)
+                .find_iter(text)
+                .take(COUNT_CAP)
+                .count(),
         }
     }
 }
@@ -288,16 +289,16 @@ impl TermPattern {
 pub struct RegexQuery {
     pub source: String,
     re: Regex,
-    required: Option<crate::search::prefilter::Required>,
+    required: Option<Required>,
 }
 
 /// Extract a set of literals at least one of which occurs in every match.
 /// Sound because every match begins (prefix set) or ends (suffix set) with
 /// one of the literals; an unbounded set yields `None`. Parsed
-/// case-sensitively on purpose: case-insensitive extraction explodes
+/// case-sensitively because case-insensitive extraction explodes
 /// combinatorially, and both consumers fold anyway, so a case-sensitive set
-/// stays sound — `(?i)` yields `None`, a lost optimisation, never a lost row.
-fn required_literals(source: &str) -> Option<crate::search::prefilter::Required> {
+/// stays sound: `(?i)` yields `None`, a lost optimisation, never a lost row.
+fn required_literals(source: &str) -> Option<Required> {
     use regex_syntax::hir::literal::{ExtractKind, Extractor};
 
     let hir = regex_syntax::ParserBuilder::new()
@@ -305,36 +306,32 @@ fn required_literals(source: &str) -> Option<crate::search::prefilter::Required>
         .build()
         .parse(source)
         .ok()?;
-
-    let mut best: Option<(usize, crate::search::prefilter::Required)> = None;
-    for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
-        let seq = Extractor::new().kind(kind).extract(&hir);
-        let Some(literals) = seq.literals() else {
-            continue; // unbounded: no constraint to be had from this direction
-        };
-        // The extractor can split a multi-byte character; invalid UTF-8 cannot
-        // be handed to FTS5 or bound as SQL text, so the whole direction is
-        // abandoned — dropping one literal from an OR would drop rows.
-        let strings: Option<Vec<String>> = literals
-            .iter()
-            .map(|l| std::str::from_utf8(l.as_bytes()).ok().map(str::to_owned))
-            .collect();
-        let Some(strings) = strings else { continue };
-        let Some(required) = crate::search::prefilter::Required::new(strings) else {
-            continue;
-        };
-        // The OR is only as selective as its shortest arm.
-        let weakest = required
-            .literals()
-            .iter()
-            .map(|l| l.chars().count())
-            .min()
-            .unwrap_or(0);
-        if best.as_ref().is_none_or(|(w, _)| weakest > *w) {
-            best = Some((weakest, required));
-        }
-    }
-    best.map(|(_, required)| required)
+    // The OR is only as selective as its shortest arm.
+    let weakest = |r: &Required| r.literals().iter().map(|l| l.chars().count()).min();
+    [ExtractKind::Prefix, ExtractKind::Suffix]
+        .into_iter()
+        .filter_map(|kind| {
+            // `None` when unbounded: no constraint from this direction.
+            let seq = Extractor::new().kind(kind).extract(&hir);
+            // The extractor can split a multi-byte character, and invalid
+            // UTF-8 cannot be handed to FTS5 or bound as SQL text; dropping
+            // one literal from an OR would drop rows, so the whole direction
+            // goes.
+            let strings = seq
+                .literals()?
+                .iter()
+                .map(|l| std::str::from_utf8(l.as_bytes()).ok().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?;
+            Required::new(strings)
+        })
+        // On a tie the earlier direction, the prefix set, wins.
+        .reduce(|best, next| {
+            if weakest(&next) > weakest(&best) {
+                next
+            } else {
+                best
+            }
+        })
 }
 
 impl RegexQuery {
@@ -363,7 +360,7 @@ impl RegexQuery {
     /// Literals of which at least one occurs in anything this matches; `None`
     /// means nothing usable (`\d+`) and the pass scans everything. See
     /// [`crate::search::prefilter`] for the rule to obey.
-    pub fn required(&self) -> Option<&crate::search::prefilter::Required> {
+    pub fn required(&self) -> Option<&Required> {
         self.required.as_ref()
     }
 
@@ -381,13 +378,16 @@ impl RegexQuery {
     }
 }
 
-/// Cap a match range at `max_len` bytes, aligned back to a char boundary: a
-/// greedy regex can match megabytes; the snippet window wants the start.
+/// Cap a match range at `max_len` bytes, aligned back to a char boundary but
+/// never below its start: a greedy regex can match megabytes, and the snippet
+/// window wants the start.
 pub fn clamp_match_range(text: &str, range: Range<usize>, max_len: usize) -> Range<usize> {
-    let mut end = range.end.min(range.start + max_len);
-    while end > range.start && !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = range.end.min(range.start + max_len);
+    let end = if end > range.start {
+        text.floor_char_boundary(end).max(range.start)
+    } else {
+        end
+    };
     range.start..end
 }
 

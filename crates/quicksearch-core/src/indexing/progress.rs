@@ -35,14 +35,14 @@ pub struct RootProgress {
     /// Files the walk has seen so far; final and exact once the walk ends.
     pub walked: usize,
     /// What to divide `walked` by; `None` until one lands. A first-time root's
-    /// count reads high — read it through [`RootProgress::walk_denominator`].
+    /// count reads high; read it through [`RootProgress::walk_denominator`].
     pub walk_total: Option<usize>,
     /// Rows with searchable text, including earlier runs' once `extract_total` is known.
     pub extracted: usize,
-    /// The count of files that have or will have text — not of files under the
+    /// The count of files that have or will have text, not of files under the
     /// root. `None` until the content pass has counted its range.
     pub extract_total: Option<usize>,
-    /// A file the root has recently reached, as a whole path in every phase —
+    /// A file the root has recently reached, as a whole path in every phase:
     /// sampled, not every file, and during extraction the last one *written*.
     pub current_file: Option<String>,
     /// Threads busy / pool size for the current phase's pool; both zero once done.
@@ -62,6 +62,13 @@ impl RootProgress {
     }
 }
 
+/// `done / total`, clamped to 1; `None` when there is nothing to divide by.
+fn ratio(done: usize, total: Option<usize>) -> Option<f64> {
+    total
+        .filter(|&total| total > 0)
+        .map(|total| (done as f64 / total as f64).min(1.0))
+}
+
 /// Files processed and the run's total, across every root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OverallProgress {
@@ -74,10 +81,7 @@ pub struct OverallProgress {
 impl OverallProgress {
     /// Completed share, clamped to 1; `None` when there is nothing to divide by.
     pub fn fraction(&self) -> Option<f64> {
-        match self.total {
-            Some(total) if total > 0 => Some((self.processed as f64 / total as f64).min(1.0)),
-            _ => None,
-        }
+        ratio(self.processed, self.total)
     }
 }
 
@@ -88,18 +92,10 @@ pub fn overall_progress(roots: &[RootProgress]) -> OverallProgress {
         .iter()
         .map(|r| r.walked + r.extract_total.map_or(0, |_| r.extracted))
         .sum();
-    let mut total = Some(0usize);
-    for r in roots {
-        match (total, r.walk_denominator()) {
-            (Some(acc), Some(walk)) => {
-                total = Some(acc + walk + r.extract_total.unwrap_or(0));
-            }
-            _ => {
-                total = None;
-                break;
-            }
-        }
-    }
+    let total = roots
+        .iter()
+        .map(|r| Some(r.walk_denominator()? + r.extract_total.unwrap_or(0)))
+        .sum::<Option<usize>>();
     OverallProgress { processed, total }
 }
 
@@ -118,9 +114,6 @@ pub struct ReconcileProgress {
 impl ReconcileProgress {
     /// Completed share, clamped to 1, matching [`OverallProgress::fraction`].
     pub fn fraction(&self) -> Option<f64> {
-        match self.total {
-            Some(total) if total > 0 => Some((self.examined as f64 / total as f64).min(1.0)),
-            _ => None,
-        }
+        ratio(self.examined, self.total)
     }
 }

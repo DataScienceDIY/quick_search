@@ -84,7 +84,7 @@ fn nothing_is_served_from_a_directory_read_off_windows() {
 }
 
 /// `fs::metadata` follows a reparse point and the cached buffer does not, so
-/// the fast path must decline them all — including the tags std does not call
+/// the fast path must decline them all, including the tags std does not call
 /// symlinks, which are the ones that reach the walk's ordinary file arm.
 #[test]
 #[cfg(windows)]
@@ -153,8 +153,8 @@ fn only_the_hidden_bit_hides_an_entry() {
     assert!(!attributes_are_hidden(READONLY | DIRECTORY));
 }
 
-/// A cloud sync root carries System and *not* Hidden — Windows will not
-/// honour the `desktop.ini` supplying its branded icon otherwise.
+/// A cloud sync root carries System and *not* Hidden: Windows will not honour
+/// the `desktop.ini` supplying its branded icon otherwise.
 #[test]
 fn a_sync_root_marked_system_but_not_hidden_is_not_hidden() {
     assert!(!attributes_are_hidden(SYSTEM | DIRECTORY));
@@ -232,7 +232,7 @@ fn the_index_lock_is_exclusive_while_held() {
     // descriptor table: between another thread's `fork` and its `exec` a child
     // shares the description just released (`O_CLOEXEC` closes it only at
     // `exec`). Other tests here spawn processes, so under `cargo test` the
-    // window is hit — hence the retry. It cannot reach the product, which
+    // window is hit, hence the retry. It cannot reach the product, which
     // never drops and immediately retakes the lock.
     acquire_within(&db, Duration::from_secs(5));
 }

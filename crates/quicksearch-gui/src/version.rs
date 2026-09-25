@@ -3,7 +3,7 @@
 
 /// The one string the user sees: `v0.9.1 (a46cbc2)`.
 ///
-/// The version half is `[workspace.package] version` — the same value the
+/// The version half is `[workspace.package] version`, the same value the
 /// `.deb`, the Windows installer and the release tag carry. The commit half
 /// is the short hash `build.rs` resolved, or `unknown` for a build made
 /// outside a git checkout.

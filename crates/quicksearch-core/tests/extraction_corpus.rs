@@ -19,11 +19,12 @@ use quicksearch_core::mime;
 use quicksearch_core::query::split_for_cascade;
 use quicksearch_core::search::cascade;
 use quicksearch_core::search::SearchOptions;
+use quicksearch_core::testutil::Scratch;
 
 use corpus::Sample;
 
-/// How much the MIME sniff is shown — the indexer's default, so dispatch
-/// here matches a real run.
+/// How much the MIME sniff is shown: the indexer's default, so dispatch here
+/// matches a real run.
 const HEAD: usize = 8 * 1024;
 
 fn head_of(path: &Path) -> Vec<u8> {
@@ -96,7 +97,7 @@ fn head_extraction_agrees_with_reading_the_file() {
 
         if !sample.head_path {
             // A format that seeks or reads a trailer must never be handed a
-            // buffer — `None` routes it back to the on-disk extractor.
+            // buffer; `None` routes it back to the on-disk extractor.
             assert!(
                 from_head.is_none(),
                 "{} took the head path but cannot support it",
@@ -143,7 +144,7 @@ fn the_whole_corpus_indexes_and_is_searchable() {
     let (dir, samples) = corpus::build("corpus-index");
     // The database goes in its own directory: inside the root, its `-wal` and
     // `-shm` sidecars would survive only via a default ignore pattern.
-    let db = common::scratch_db("corpus-index-db");
+    let (_db_dir, db) = Scratch::db("corpus-index-db");
     let config = Config::default();
 
     common::IndexOnce {
@@ -198,22 +199,22 @@ fn search(conn: &rusqlite::Connection, term: &str) -> Vec<String> {
     paths
 }
 
-/// Two RTF lexer bugs this corpus found, fixed in `vendor/rtf-parser` (see
-/// the `[patch.crates-io]` note in the workspace manifest). Both came from
-/// terminating a control word at whitespace and trimming leading spaces off
-/// what followed:
+/// RTF `\uN` escapes survive extraction, through the fixes in
+/// `vendor/rtf-parser` (see the `[patch.crates-io]` note in the workspace
+/// manifest). The unpatched lexer ends a control word at whitespace and trims
+/// leading spaces off what follows, which:
 ///
-/// * A `\uN` escape with a literal fallback took the rest of the word with
-///   it: `before \u233?after end` lexed `\u233?after` as one control word
-///   and yielded "before end".
-/// * A space between two escaped words was dropped, collapsing every script
-///   outside cp1252 (`Καλημέρα κόσμε` → `Καλημέρακόσμε`).
+/// * takes the rest of the word with a `\uN` escape's literal fallback:
+///   `before \u233?after end` lexes `\u233?after` as one control word and
+///   yields "before end";
+/// * drops a space between two escaped words, collapsing every script outside
+///   cp1252 (`Καλημέρα κόσμε` → `Καλημέρακόσμε`).
 ///
-/// Fallback characters are now counted off against `\ucN` in the parser
-/// rather than guessed at.
+/// The parser counts fallback characters off against `\ucN` rather than
+/// guessing at them.
 #[test]
 fn rtf_unicode_escapes_survive_extraction() {
-    let dir = quicksearch_core::testutil::scratch_dir("rtf-escapes");
+    let dir = Scratch::dir("rtf-escapes");
     let registry = Registry::default_set();
     let extract = |name: &str, body: &str| {
         let path = dir.join(name);
@@ -231,7 +232,7 @@ fn rtf_unicode_escapes_survive_extraction() {
     // every word containing a non-cp1252 character.
     assert!(!text.contains('?'), "fallback character indexed: {text:?}");
 
-    // The two spellings that always worked must keep working.
+    // The spellings LibreOffice and Word write.
     for (label, body) in [
         ("libreoffice", r"{\rtf1\ansi before \u233\'3fafter end}"),
         ("word", r"{\rtf1\ansi before \u233\'e9after end}"),
@@ -267,7 +268,7 @@ fn rtf_unicode_escapes_survive_extraction() {
     );
 
     // A `\'hh` that is nobody's fallback is still text, and a space after it
-    // is still a space — the case the second fix must not overshoot.
+    // is still a space, which the space fix must not overshoot.
     let text = extract("standalone-hex.rtf", r"{\rtf1\ansi caf\'e9 \'e0 noon}");
     assert!(text.contains("café à noon"), "{text:?}");
 
@@ -280,10 +281,9 @@ fn rtf_unicode_escapes_survive_extraction() {
     );
 }
 
-/// The corpus's needles and `common::BODY_TERM` are deliberately the same
-/// body-only word, so the end-to-end search is attributable to extraction;
-/// `corpus` does not depend on the harness, so this is what stops the two
-/// drifting apart silently.
+/// The corpus's needles and `common::BODY_TERM` are the same body-only word,
+/// so the end-to-end search is attributable to extraction. `corpus` does not
+/// depend on the harness, so this test keeps the two from drifting apart.
 #[test]
 fn corpus_needles_use_the_shared_body_term() {
     assert_eq!(corpus::NEEDLE_PREFIX, common::BODY_TERM);

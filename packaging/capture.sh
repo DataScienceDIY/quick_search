@@ -11,10 +11,10 @@
 # masters stay here.
 #
 # The app is built with the `capture` feature and drives itself through
-# packaging/capture-scenario.txt (see crates/quicksearch-gui/src/capture.rs
-# for the command grammar). It runs against a throwaway index of this
-# repository plus ~/.cargo/registry/src, under scratch XDG dirs — the real
-# ~/.config/quicksearch and index are never touched.
+# packaging/capture-scenario.txt, whose command grammar is in
+# crates/quicksearch-gui/src/capture/script.rs. It runs against a throwaway
+# index of this repository plus ~/.cargo/registry/src, under scratch XDG dirs —
+# the real ~/.config/quicksearch and index are never touched.
 #
 # The scratch dirs live OUTSIDE both index roots on purpose: the demo config
 # has an empty ignore list, so a scratch index database inside an indexed

@@ -40,7 +40,7 @@ struct Recorder {
     path: PathBuf,
     interval: Duration,
     next_request: Instant,
-    /// Spawned when the first frame arrives — only then are the pixel
+    /// Spawned when the first frame arrives: only then are the pixel
     /// dimensions known, and ffmpeg needs them up front for raw video.
     encoder: Option<Encoder>,
 }
@@ -60,7 +60,8 @@ struct FrameTag;
 
 pub(crate) struct CaptureDriver {
     cmds: Vec<Cmd>,
-    pc: usize,
+    /// The command running, or next to run.
+    next_cmd: usize,
     cmd_started: Option<Instant>,
     typing: Option<Typing>,
     shot: Option<PathBuf>,
@@ -69,9 +70,9 @@ pub(crate) struct CaptureDriver {
     /// resolved to on the last rendered frame.
     hover: Option<usize>,
     hover_pos: Option<egui::Pos2>,
-    /// The position last injected — separate from `hover_pos` because
-    /// injection must be edge-triggered: egui resets its pointer-stillness
-    /// clock on *every* `PointerMoved` event, moved or not.
+    /// The position last injected, apart from `hover_pos` because injection
+    /// must be edge-triggered: egui resets its pointer-stillness clock on
+    /// *every* `PointerMoved` event, moved or not.
     hover_injected: Option<egui::Pos2>,
     pointer_gone_pending: bool,
     out_dir: PathBuf,
@@ -114,7 +115,7 @@ impl CaptureDriver {
         }
         Some(Box::new(CaptureDriver {
             cmds,
-            pc: 0,
+            next_cmd: 0,
             cmd_started: None,
             typing: None,
             shot: None,
@@ -152,7 +153,7 @@ impl CaptureDriver {
             self.hover_pos = app.capture_match_cell(n).map(|r| r.center());
         }
 
-        let Some(cmd) = self.cmds.get(self.pc).cloned() else {
+        let Some(cmd) = self.cmds.get(self.next_cmd).cloned() else {
             self.quit(app, ctx);
             return;
         };
@@ -171,12 +172,12 @@ impl CaptureDriver {
 
         let elapsed = started.elapsed();
         if self.done(&cmd, app, elapsed) {
-            self.pc += 1;
+            self.next_cmd += 1;
             self.cmd_started = None;
         } else if elapsed >= Duration::from_millis(hard_timeout_ms(&cmd)) {
             eprintln!(
                 "capture: command #{} ({:?}) timed out after {:.1?}",
-                self.pc + 1,
+                self.next_cmd + 1,
                 cmd,
                 elapsed
             );
@@ -191,8 +192,7 @@ impl CaptureDriver {
             | Cmd::WaitIndexRunning { .. }
             | Cmd::WaitIndexIdle { .. }
             | Cmd::WaitSearchDone { .. }
-            | Cmd::WaitDupsDone { .. }
-            | Cmd::RecordStop => {}
+            | Cmd::WaitDupsDone { .. } => {}
             Cmd::Type { text, cps } => {
                 let interval_s = 1.0 / cps;
                 self.typing = Some(Typing {
@@ -216,7 +216,7 @@ impl CaptureDriver {
             }
             Cmd::Window { w, h } => {
                 // ViewportCommand sizes are in egui points, which fold in the
-                // UI zoom — divide it back out. The 640x400 floor must be
+                // UI zoom, so divide it back out. The 640x400 floor must be
                 // lowered first; the resize lands asynchronously.
                 let size = egui::vec2(*w, *h) / ctx.zoom_factor();
                 ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(size));
@@ -237,10 +237,8 @@ impl CaptureDriver {
                     ShotTag,
                 )));
             }
+            Cmd::RecordStop => self.stop_recorder(),
             Cmd::Quit => self.quit(app, ctx),
-        }
-        if matches!(cmd, Cmd::RecordStop) {
-            self.stop_recorder();
         }
     }
 
@@ -321,7 +319,7 @@ impl CaptureDriver {
         if let Some(pos) = self.hover_pos {
             // Edge-triggered (see `hover_injected`): inject when the pin
             // moves, or after a real OS pointer event, which would otherwise
-            // unpin us — appending after it means the pin wins the frame.
+            // unpin us; appended after it, the pin wins the frame.
             let foreign_pointer = raw.events.iter().any(|e| {
                 matches!(
                     e,
@@ -364,7 +362,7 @@ impl CaptureDriver {
 
     // -- recording ----------------------------------------------------------
 
-    /// Append one readback, spawning the encoder on the first frame. The
+    /// Appends one readback, spawning the encoder on the first frame. The
     /// frame is written as many times as whole intervals have elapsed, so
     /// the video's length tracks wall time.
     fn feed_frame(&mut self, image: &egui::ColorImage) -> Result<(), String> {
@@ -402,7 +400,8 @@ impl CaptureDriver {
         Ok(())
     }
 
-    /// Close stdin (ffmpeg encodes the tail and exits), wait, kill as backstop.
+    /// Closes stdin (ffmpeg encodes the tail and exits), waits, kills as a
+    /// backstop.
     fn stop_recorder(&mut self) {
         let Some(rec) = self.rec.take() else {
             return;

@@ -1,4 +1,4 @@
-//! An RTF corpus file, written as control words by hand — the only Rust RTF
+//! An RTF corpus file, written as control words by hand: the only Rust RTF
 //! library in the tree is `rtf-parser`, the reader under test.
 //!
 //! Both non-ASCII escape forms are exercised, as separate parser code paths
@@ -14,9 +14,9 @@ use super::{BodyFn, Charset, Lcg, Sample};
 ///
 /// The fallback is `\'3f` rather than a literal `?` because that is what
 /// LibreOffice writes, and checking a real producer's form is the point of
-/// this corpus. The literal form is equally legal and used to lose the rest
-/// of the word — pinned by `rtf_unicode_escapes_survive_extraction` in
-/// `tests/extraction_corpus.rs`, which covers all three spellings.
+/// this corpus. The literal form is equally legal;
+/// `rtf_unicode_escapes_survive_extraction` in `tests/extraction_corpus.rs`
+/// covers all three spellings.
 fn escape(c: char, out: &mut String) {
     let code = c as u32;
     match c {

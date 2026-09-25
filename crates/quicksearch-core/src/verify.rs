@@ -1,7 +1,7 @@
-//! Byte-for-byte verification that a set of files really is identical — the
+//! Byte-for-byte verification that a set of files is identical: the definite
 //! answer behind the index's advisory head-hash duplicate grouping, for the
-//! moment before someone deletes something. No hashing here, by policy: the
-//! whole point of asking a second time is that the bytes are compared.
+//! moment before someone deletes something. No hashing, by policy: asking a
+//! second time is worth it only because the bytes are compared.
 
 use std::fs::File;
 use std::io::Read;
@@ -26,7 +26,7 @@ pub enum MemberVerdict {
     /// Offset of the first byte that disagreed.
     DiffersAt(u64),
     /// Lengths disagree, so nothing was read. Within a duplicate group this
-    /// can only mean a stale index — the hash covers the size.
+    /// can only mean a stale index, since the hash covers the size.
     LengthDiffers {
         len: u64,
         reference_len: u64,
@@ -85,27 +85,23 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
     }
     let mut verdicts = vec![MemberVerdict::Identical; paths.len()];
 
-    // The reference is the first path that both opens *and* stats: one
+    // The reference is the first path that both opens and stats: one
     // unreadable member must not cost the answer about all the others.
     let mut reference: Option<(usize, File, u64)> = None;
     let mut rest: Vec<(usize, File)> = Vec::new();
     for (i, path) in paths.iter().enumerate() {
-        // A member replaced by a FIFO since the walk would strand this
-        // worker on a blocking open before it reported a single verdict.
-        let file = match crate::platform::open_regular_file(path) {
-            Ok(f) => f,
-            Err(e) => {
-                verdicts[i] = MemberVerdict::Unreadable(describe(path, &e));
-                continue;
-            }
-        };
-        if reference.is_some() {
-            rest.push((i, file));
-            continue;
-        }
-        match file.metadata() {
-            Ok(m) => reference = Some((i, file, m.len())),
-            Err(e) => verdicts[i] = MemberVerdict::Unreadable(describe(path, &e)),
+        // `open_regular_file`: a member replaced by a FIFO since the walk
+        // would strand this worker on a blocking open.
+        match (
+            crate::platform::open_regular_file(path),
+            reference.is_some(),
+        ) {
+            (Err(e), _) => verdicts[i] = MemberVerdict::Unreadable(describe(path, &e)),
+            (Ok(file), true) => rest.push((i, file)),
+            (Ok(file), false) => match file.metadata() {
+                Ok(m) => reference = Some((i, file, m.len())),
+                Err(e) => verdicts[i] = MemberVerdict::Unreadable(describe(path, &e)),
+            },
         }
     }
 
@@ -182,47 +178,37 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
         };
         bytes_read += n as u64;
 
-        let mut i = 0;
-        while i < live.len() {
-            let (got, verdict) = {
-                let l = &mut live[i];
-                match read_chunk(&mut l.file, &mut l.buf[..n]) {
-                    Ok(m) => {
-                        let common = n.min(m);
-                        if let Some(k) =
-                            first_difference(&reference_buf[..common], &l.buf[..common])
-                        {
-                            (m, Some(MemberVerdict::DiffersAt(offset + k as u64)))
-                        } else if m < n {
-                            // Same length a moment ago, shorter now.
-                            (
-                                m,
-                                Some(MemberVerdict::Unreadable(format!(
-                                    "{}: ended at byte {} while the file it was compared \
-                                     against had more",
-                                    paths[l.index].display(),
-                                    offset + m as u64
-                                ))),
-                            )
-                        } else {
-                            (m, None)
-                        }
+        // A member that reaches a verdict stops being read; the verdict goes
+        // in by index, so the order `live` keeps does not matter.
+        live.retain_mut(|l| {
+            let verdict = match read_chunk(&mut l.file, &mut l.buf[..n]) {
+                Ok(m) => {
+                    bytes_read += m as u64;
+                    let common = n.min(m);
+                    if let Some(k) = first_difference(&reference_buf[..common], &l.buf[..common]) {
+                        Some(MemberVerdict::DiffersAt(offset + k as u64))
+                    } else if m < n {
+                        // Same length a moment ago, shorter now.
+                        Some(MemberVerdict::Unreadable(format!(
+                            "{}: ended at byte {} while the file it was compared \
+                             against had more",
+                            paths[l.index].display(),
+                            offset + m as u64
+                        )))
+                    } else {
+                        None
                     }
-                    Err(e) => (
-                        0,
-                        Some(MemberVerdict::Unreadable(describe(&paths[l.index], &e))),
-                    ),
                 }
+                Err(e) => Some(MemberVerdict::Unreadable(describe(&paths[l.index], &e))),
             };
-            bytes_read += got as u64;
             match verdict {
                 Some(v) => {
-                    verdicts[live[i].index] = v;
-                    live.swap_remove(i);
+                    verdicts[l.index] = v;
+                    false
                 }
-                None => i += 1,
+                None => true,
             }
-        }
+        });
         offset += n as u64;
 
         if last_progress.elapsed() >= PROGRESS_INTERVAL {

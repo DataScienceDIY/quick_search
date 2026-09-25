@@ -3,10 +3,10 @@
 //! Everything that isn't a recognized `key:value` filter joins the *term*;
 //! recognized filters become SQL fragments ANDed onto every cascade stage.
 //!
-//! Search-as-you-type robustness: a lex error degrades to "whole input is
-//! the term" — incremental typing must never surface an error; an
+//! Search-as-you-type robustness: a lex error degrades to "whole input is the
+//! term", because incremental typing must never surface an error; an
 //! unrecognized `key:value` (`12:30`) reassembles verbatim; `AND`/`OR` pass
-//! through as words, parens are dropped.
+//! through as words, and parens are dropped.
 
 use super::lexer::{tokenize, Token};
 use super::pattern::{RegexQuery, TermPart, TermPattern};
@@ -19,7 +19,7 @@ pub struct CascadeQuery {
     /// The ranked search phrase; empty for filter-only or regex-only input.
     pub term: String,
     pub pattern: TermPattern,
-    /// A `regex:` filter, matched in Rust — never part of the SQL.
+    /// A `regex:` filter, matched in Rust and never part of the SQL.
     pub regex: Option<RegexQuery>,
     /// ` AND (...)` fragments appended verbatim to every stage's WHERE clause.
     pub filter_sql: String,
@@ -27,14 +27,14 @@ pub struct CascadeQuery {
 }
 
 impl CascadeQuery {
-    /// Nothing to rank on — filters alone don't drive a search.
+    /// Nothing to rank on: filters alone don't drive a search.
     pub fn is_empty(&self) -> bool {
         self.pattern.is_empty() && self.regex.is_none()
     }
 
     fn term_only(term: &str) -> CascadeQuery {
         let term = term.trim().to_string();
-        // Un-lexable input is searched verbatim — stars are not wildcards here.
+        // Un-lexable input is searched verbatim; stars are not wildcards here.
         let pattern = TermPattern::build(&[TermPart {
             text: term.clone(),
             glob: false,
@@ -48,25 +48,34 @@ impl CascadeQuery {
     }
 }
 
-fn op_str(op: Op) -> &'static str {
-    match op {
-        Op::Contains => ":",
-        Op::Eq => "=",
-        Op::Lt => "<",
-        Op::Le => "<=",
-        Op::Gt => ">",
-        Op::Ge => ">=",
+/// The filter starting at `tokens[i]`, if one is there:
+/// `Word(key) Op [Op] (Word|Quoted)`, since the lexer emits `modified:>=x` as
+/// `Word Op(:) Op(>=) Word`. Returns the effective operator, the value,
+/// whether the value is an unquoted word (quoted values keep `*` literal), and
+/// the index after the value.
+fn filter_at(tokens: &[Token], i: usize) -> Option<(Op, &str, bool, usize)> {
+    let Some(Token::Op(op1)) = tokens.get(i + 1) else {
+        return None;
+    };
+    let (op, value_idx) = match tokens.get(i + 2) {
+        Some(Token::Op(op2)) => (*op2, i + 3),
+        _ => (*op1, i + 2),
+    };
+    match tokens.get(value_idx)? {
+        Token::Word(value) => Some((op, value, true, value_idx + 1)),
+        Token::Quoted(value) => Some((op, value, false, value_idx + 1)),
+        _ => None,
     }
 }
 
 pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
-    // NULs break SQLite text binding and the FTS5 query parser — strip them.
+    // NULs break SQLite text binding and the FTS5 query parser, so strip them.
     let input = input.replace('\0', "");
     let input = input.as_str();
     let tokens = match tokenize(input) {
         Ok(t) => t,
-        // Half-typed input: the whole raw string is the term. Never an
-        // error mid-keystroke.
+        // Half-typed input: the whole raw string is the term, never an error
+        // mid-keystroke.
         Err(_) => return Ok(CascadeQuery::term_only(input)),
     };
 
@@ -82,63 +91,47 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
     while i < tokens.len() {
         match &tokens[i] {
             Token::Word(word) => {
-                // Candidate filter: Word(key) Op [Op] (Word|Quoted), since
-                // the lexer emits `modified:>=x` as Word Op(:) Op(>=) Word.
-                if let Some(Token::Op(op1)) = tokens.get(i + 1) {
-                    let (op, value_idx) = match tokens.get(i + 2) {
-                        Some(Token::Op(op2)) => (*op2, i + 3),
-                        _ => (*op1, i + 2),
-                    };
-                    let value = match tokens.get(value_idx) {
-                        Some(Token::Word(v)) | Some(Token::Quoted(v)) => Some(v.clone()),
-                        _ => None,
-                    };
-                    if let Some(value) = value {
-                        // Quoted values keep `*` literal.
-                        let value_is_word = matches!(tokens.get(value_idx), Some(Token::Word(_)));
-                        if word.eq_ignore_ascii_case("regex") {
-                            // Not a SQL filter: matched in Rust.
-                            if op != Op::Contains {
-                                return Err(TranslateError::UnsupportedOp {
-                                    key: word.clone(),
-                                    op,
-                                });
-                            }
-                            if out.regex.is_some() {
-                                return Err(TranslateError::BadRegex(
-                                    "only one regex: per query".into(),
-                                ));
-                            }
-                            out.regex = Some(RegexQuery::new(&value)?);
-                            i = value_idx + 1;
-                            continue;
+                if let Some((op, value, value_is_word, next)) = filter_at(&tokens, i) {
+                    i = next;
+                    if word.eq_ignore_ascii_case("regex") {
+                        // Not a SQL filter: matched in Rust.
+                        if op != Op::Contains {
+                            return Err(TranslateError::UnsupportedOp {
+                                key: word.clone(),
+                                op,
+                            });
                         }
-                        if is_filter_key(word) {
-                            let frag = build_filter(word, op, &value, value_is_word)?;
-                            out.filter_sql.push_str(" AND (");
-                            out.filter_sql.push_str(&frag.sql);
-                            out.filter_sql.push(')');
-                            out.filter_params.extend(frag.params);
-                            i = value_idx + 1;
-                            continue;
+                        if out.regex.is_some() {
+                            return Err(TranslateError::BadRegex(
+                                "only one regex: per query".into(),
+                            ));
                         }
+                        out.regex = Some(RegexQuery::new(value)?);
+                    } else if is_filter_key(word) {
+                        let frag = build_filter(word, op, value, value_is_word)?;
+                        out.filter_sql.push_str(" AND (");
+                        out.filter_sql.push_str(&frag.sql);
+                        out.filter_sql.push(')');
+                        out.filter_params.extend(frag.params);
+                    } else {
                         // Unrecognized key: reassemble verbatim, gluing any
                         // further `:value` chains (`foo:bar:baz`).
-                        let mut glued = format!("{}{}{}", word, op_str(op), value);
-                        i = value_idx + 1;
+                        let mut glued = format!("{}{}{}", word, op.as_str(), value);
                         while let Some(Token::Op(next_op)) = tokens.get(i) {
-                            glued.push_str(op_str(*next_op));
+                            glued.push_str(next_op.as_str());
                             i += 1;
-                            if let Some(Token::Word(v)) | Some(Token::Quoted(v)) = tokens.get(i) {
+                            if let Some(Token::Word(v) | Token::Quoted(v)) = tokens.get(i) {
                                 glued.push_str(v);
                                 i += 1;
                             }
                         }
                         term_parts.push(literal(&glued));
-                        continue;
                     }
-                    // Key + op with no value yet (mid-typing "type:").
-                    term_parts.push(literal(&format!("{}{}", word, op_str(*op1))));
+                    continue;
+                }
+                if let Some(Token::Op(op)) = tokens.get(i + 1) {
+                    // Key and operator with no value yet (mid-typing "type:").
+                    term_parts.push(literal(&format!("{}{}", word, op.as_str())));
                     i += 2;
                     continue;
                 }
@@ -151,7 +144,7 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
             Token::And => term_parts.push(literal("AND")),
             Token::Or => term_parts.push(literal("OR")),
             Token::LParen | Token::RParen => {}
-            Token::Op(op) => term_parts.push(literal(op_str(*op))),
+            Token::Op(op) => term_parts.push(literal(op.as_str())),
         }
         i += 1;
     }
@@ -413,7 +406,7 @@ mod tests {
         let q = split_for_cascade("name:%*_").unwrap();
         assert!(matches!(&q.filter_params[0], Value::Text(t) if t == "%\\%%\\_%"));
 
-        // path: values never glob — the star reaches the pattern as a literal.
+        // path: values never glob; the star reaches the pattern as a literal.
         let q = split_for_cascade("path:/da*ta").unwrap();
         assert_eq!(
             q.filter_params[0],

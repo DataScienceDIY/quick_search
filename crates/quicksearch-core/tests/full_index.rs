@@ -1,13 +1,10 @@
 //! End-to-end phase-1 tests over a real tree and a real database.
-//!
 
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 use quicksearch_core::config::Config;
-use quicksearch_core::file_handling::{
-    count_extract_scope, mark_oversize_pending_na, ExtractCursor,
-};
+use quicksearch_core::file_handling::{count_extract_scope, mark_oversize_pending_na, RootRange};
 use quicksearch_core::indexing::{IndexingService, IndexingStatus, RootPhase};
 use quicksearch_core::testutil::Scratch;
 
@@ -32,6 +29,63 @@ fn index_once(root: &Path, db: &Path, config: &Config) {
     index_roots_once(&[root], db, config)
 }
 
+/// Start a run indexing `root` into `db`.
+fn start(root: &Path, db: &Path, config: &Config) -> IndexingService {
+    let service = IndexingService::new();
+    service
+        .start_indexing(
+            vec![root.to_string_lossy().into_owned()],
+            db.to_string_lossy().into_owned(),
+            config.clone(),
+        )
+        .unwrap();
+    service
+}
+
+/// Poll `service` until `Idle`, calling `each_poll` first every time. `Idle`
+/// is the end of the post-run maintenance pass and a resting state, so waiting
+/// for it cannot miss it however fast the pass was.
+fn run_to_idle(service: &IndexingService, mut each_poll: impl FnMut()) {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        each_poll();
+        match service.get_status() {
+            IndexingStatus::Idle => return,
+            IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "the run never reached Idle");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The single integer `sql` returns.
+fn count(db: &Path, sql: &str) -> i64 {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(sql, [], |r| r.get(0))
+        .unwrap()
+}
+
+/// FTS rows matching the phrase `word`.
+fn hits(db: &Path, word: &str) -> i64 {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH ?1",
+            [format!("\"{}\"", word)],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// Bytes in `db`'s write-ahead log; 0 when there is none.
+fn wal_bytes(db: &Path) -> u64 {
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    std::fs::metadata(wal).map(|m| m.len()).unwrap_or(0)
+}
+
 fn rows(db: &Path) -> Vec<(String, i64, i64)> {
     let conn = rusqlite::Connection::open(db).unwrap();
     let mut stmt = conn
@@ -43,6 +97,20 @@ fn rows(db: &Path) -> Vec<(String, i64, i64)> {
         .map(|r| r.unwrap())
         .collect();
     out
+}
+
+/// The file names of [`rows`], in the same order.
+fn names(db: &Path) -> Vec<String> {
+    rows(db)
+        .into_iter()
+        .map(|(p, _, _)| {
+            Path::new(&p)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
 }
 
 #[test]
@@ -84,18 +152,8 @@ fn deleted_files_are_removed_and_new_ones_added() {
     touch(&root.join("added.txt"), b"added");
     index_once(&root, &db, &config);
 
-    let names: Vec<String> = rows(&db)
-        .into_iter()
-        .map(|(p, _, _)| {
-            Path::new(&p)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
     assert_eq!(
-        names,
+        names(&db),
         vec!["added.txt", "keep.txt"],
         "stale cleanup still works"
     );
@@ -176,16 +234,9 @@ fn stopping_mid_run_deletes_nothing() {
     let full = rows(&db);
     assert_eq!(full.len(), 1500);
 
-    // Stop only once a snapshot shows a root still in flight — that is the
-    // proof the stop landed mid-run.
-    let service = IndexingService::new();
-    service
-        .start_indexing(
-            vec![root.to_string_lossy().into_owned()],
-            db.to_string_lossy().into_owned(),
-            config.clone(),
-        )
-        .unwrap();
+    // Stop only once a snapshot shows a root still in flight, which proves the
+    // stop landed mid-run.
+    let service = start(&root, &db, &config);
     let deadline = Instant::now() + Duration::from_secs(120);
     let stopped_in_flight = loop {
         assert!(Instant::now() < deadline, "the run never became observable");
@@ -217,11 +268,20 @@ fn stopping_mid_run_deletes_nothing() {
     );
 }
 
+/// Let a started run go for `delay`, stop it, and give its tail time to land:
+/// the stamp lands past the point a stop can still cut the run short.
+fn run_then_stop(service: IndexingService, delay: Duration) {
+    std::thread::sleep(delay);
+    service.stop_indexing().unwrap();
+    drop(service);
+    std::thread::sleep(Duration::from_millis(300));
+}
+
 #[test]
 fn a_stamped_run_has_finished_its_stale_cleanup() {
-    // A stamp must always mean stale cleanup finished. The assertion is
-    // one-sided on purpose, so timing can never make it fail spuriously:
-    // whether the stop landed inside the window or never landed at all.
+    // A stamp always means stale cleanup finished. The assertion is one-sided,
+    // so timing cannot fail it spuriously, whether the stop landed inside the
+    // window or not at all.
     let root = Scratch::dir("stop-stamp");
     let (_db_dir, db) = Scratch::db("stop-stamp-db");
     let mut config = Config::default();
@@ -229,95 +289,57 @@ fn a_stamped_run_has_finished_its_stale_cleanup() {
     config.processing.maximum_text_file_size = 0;
 
     const FILES: usize = 8000;
+    let file = |i: usize| root.join(format!("d{}/f{:05}.txt", i % 25, i));
     for i in 0..FILES {
-        touch(&root.join(format!("d{}/f{:05}.txt", i % 25, i)), b"body");
+        touch(&file(i), b"body");
     }
     index_once(&root, &db, &config);
     assert_eq!(rows(&db).len(), FILES);
-
     for i in 0..FILES {
-        std::fs::remove_file(root.join(format!("d{}/f{:05}.txt", i % 25, i))).unwrap();
+        std::fs::remove_file(file(i)).unwrap();
     }
 
-    let marker = |db: &Path| -> Option<u64> {
-        let conn = rusqlite::Connection::open(db).ok()?;
-        quicksearch_core::db::repo::get_last_full_index(&conn)
+    let stamped = |db: &Path| -> bool {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        quicksearch_core::db::repo::get_last_full_index(&conn).is_some()
     };
 
-    // The ladder samples the race; the trailing `None` is "let it finish", and
-    // it is what makes the guard below hold. With every entry a deadline the
-    // guard was a wall-clock assumption, and this suite runs in parallel:
-    // under enough load no run reaches its stamp inside 200 ms, and the test
-    // then failed for having proved nothing rather than for a defect.
-    let mut stamped = false;
-    for delay_ms in [
-        Some(2u64),
-        Some(5),
-        Some(10),
-        Some(20),
-        Some(35),
-        Some(60),
-        Some(100),
-        Some(200),
-        None,
-    ] {
-        {
-            let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
-                .unwrap();
-        }
-        assert_eq!(marker(&db), None, "stamp cleared before the run");
-
-        let service = IndexingService::new();
-        service
-            .start_indexing(
-                vec![root.to_string_lossy().into_owned()],
-                db.to_string_lossy().into_owned(),
-                config.clone(),
-            )
+    // The ladder samples the race. The trailing `None` lets the run finish, so
+    // the loop ends stamped however loaded the host: the suite runs in
+    // parallel, and under load no stopped run may stamp within 200 ms.
+    for delay_ms in [2, 5, 10, 20, 35, 60, 100, 200]
+        .map(Some)
+        .into_iter()
+        .chain([None])
+    {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
             .unwrap();
+        assert!(!stamped(&db), "stamp cleared before the run");
+
+        let service = start(&root, &db, &config);
         match delay_ms {
-            Some(ms) => {
-                std::thread::sleep(Duration::from_millis(ms));
-                service.stop_indexing().unwrap();
-                drop(service);
-                // The stamp lands in the run's tail, past the point a stop can
-                // still cut it short; give that tail room to land.
-                std::thread::sleep(Duration::from_millis(300));
-            }
-            // Idle is the *end* of the post-run maintenance pass, and a
-            // resting state, so waiting for it cannot miss the stamp however
-            // fast or slow the machine is.
+            Some(ms) => run_then_stop(service, Duration::from_millis(ms)),
             None => {
-                let by = Instant::now() + Duration::from_secs(120);
-                loop {
-                    match service.get_status() {
-                        IndexingStatus::Idle => break,
-                        IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
-                        _ => {}
-                    }
-                    assert!(Instant::now() < by, "the unstopped run never reached Idle");
-                    std::thread::sleep(Duration::from_millis(1));
-                }
+                run_to_idle(&service, || {});
                 drop(service);
             }
         }
 
-        if marker(&db).is_some() {
-            stamped = true;
+        if stamped(&db) {
             assert_eq!(
                 rows(&db).len(),
                 0,
                 "delay {:?}: the run stamped itself complete but left stale rows behind",
                 delay_ms
             );
-            break;
+            return;
         }
     }
-    // A real guard now rather than a timing hope: the `None` pass is never
-    // stopped, so arriving here unstamped is a defect in the stamp itself.
-    assert!(
-        stamped,
+    // The `None` pass is never stopped, so arriving here unstamped is a defect
+    // in the stamp itself.
+    panic!(
         "a run allowed to finish did not stamp itself; the fixture never \
          exercised the stamp-means-clean invariant"
     );
@@ -330,14 +352,7 @@ fn starting_a_run_claims_the_status_before_it_returns() {
     let config = Config::default();
     touch(&root.join("a.txt"), b"body");
 
-    let service = IndexingService::new();
-    service
-        .start_indexing(
-            vec![root.to_string_lossy().into_owned()],
-            db.to_string_lossy().into_owned(),
-            config.clone(),
-        )
-        .unwrap();
+    let service = start(&root, &db, &config);
 
     // No sleep, no poll. `Preparing` is a claim: it holds the index exactly
     // as `Running` does.
@@ -401,42 +416,31 @@ fn two_roots_walk_extract_and_clean_independently() {
 
     index_roots_once(&[&root_a, &root_b], &db, &config);
 
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(total, 65, "both roots fully walked");
-    let pending: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM files WHERE content_state = 0",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(pending, 0, "per-root extraction drained both roots");
-    for term in ["\"xylophone\"", "\"quagmire\""] {
-        let hits: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH ?1",
-                [term],
-                |r| r.get(0),
-            )
-            .unwrap();
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM files"),
+        65,
+        "both roots fully walked"
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM files WHERE content_state = 0"),
+        0,
+        "per-root extraction drained both roots"
+    );
+    for word in ["xylophone", "quagmire"] {
         assert!(
-            hits > 0,
+            hits(&db, word) > 0,
             "content from both roots must be indexed ({})",
-            term
+            word
         );
     }
-    drop(conn);
 
     std::fs::remove_file(root_b.join("b000.txt")).unwrap();
     index_roots_once(&[&root_a, &root_b], &db, &config);
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let total: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(total, 64, "stale row swept across roots");
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM files"),
+        64,
+        "stale row swept across roots"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -462,17 +466,7 @@ fn a_deleted_directory_takes_its_whole_subtree_out_of_the_index() {
     std::fs::remove_dir_all(root.join("doomed")).unwrap();
     index_once(&root, &db, &config);
 
-    let names: Vec<String> = rows(&db)
-        .into_iter()
-        .map(|(p, _, _)| {
-            Path::new(&p)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect();
-    assert_eq!(names, vec!["keep.txt"], "the whole subtree is swept");
+    assert_eq!(names(&db), vec!["keep.txt"], "the whole subtree is swept");
 }
 
 /// Only the target under the pruned directory exercises the alias exemption:
@@ -483,8 +477,7 @@ fn a_deleted_directory_takes_its_whole_subtree_out_of_the_index() {
 fn a_symlink_target_in_an_unwalked_directory_survives_reindexing() {
     let root = Scratch::dir("alias-root");
     let outside = Scratch::dir("alias-outside");
-    let db_dir = Scratch::dir("alias-db");
-    let db = db_dir.join("index.sqlite");
+    let (db_dir, db) = Scratch::db("alias-db");
     let mut config = Config::default();
     config.indexing.follow_symlinks = true;
 
@@ -521,18 +514,16 @@ fn a_symlink_target_in_an_unwalked_directory_survives_reindexing() {
     assert!(off[0].ends_with("normal.txt"));
 }
 
-/// A target *inside* the root, so the walk reaches it twice — once by reading
-/// its own directory, once by resolving the link. The other two symlink tests
-/// use targets the walk never reaches directly, so this is the only one where
-/// a duplicate visit actually happens.
+/// A target inside the root, so the walk reaches it twice: once by reading its
+/// own directory, once by resolving the link. The other symlink tests use
+/// targets the walk never reaches directly, so only this one makes a duplicate
+/// visit.
 ///
-/// **This is what replaced the writer's duplicate-visit set.** That set held a
-/// path digest for every walked file — the largest thing a run kept — to stop
-/// a second visit reaching the writer. It was removed once measured: a repeat
-/// visit is already collapsed by `insert_file` being `INSERT OR IGNORE` and
-/// returning `None` for a row that exists, so it can produce neither a second
-/// row nor a second FTS entry. This test is the guard on that claim; it is
-/// expected to fail if `insert_file` ever stops ignoring conflicts.
+/// The writer keeps no duplicate-visit set, which would hold a digest per
+/// walked file and be the largest thing a run keeps: `insert_file` is
+/// `INSERT OR IGNORE` and returns `None` for a row that exists, so a repeat
+/// visit produces neither a second row nor a second FTS entry. This test fails
+/// if `insert_file` ever stops ignoring conflicts.
 #[test]
 #[cfg(unix)]
 fn a_file_reachable_both_directly_and_through_a_link_gets_one_row() {
@@ -562,18 +553,10 @@ fn a_file_reachable_both_directly_and_through_a_link_gets_one_row() {
     // The link is not a second document: a duplicated visit that reached the
     // writer twice would tokenize the body twice into a contentless FTS
     // table, where nothing would later collapse the two.
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let hits: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH '\"reachable\"'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(hits, 1, "the body is indexed once");
+    assert_eq!(hits(&db, "reachable"), 1, "the body is indexed once");
 
-    // Links off: the link is never followed, so the same tree still yields
-    // exactly the one row — the run that skips the set entirely.
+    // Links off: the link is never followed, so the same tree yields the one
+    // row.
     let db2 = db_dir.join("links-off.sqlite");
     index_once(&root, &db2, &Config::default());
     let off = rows(&db2);
@@ -766,7 +749,7 @@ fn inline_extraction_produces_an_identical_index_to_the_two_pass_path() {
 #[test]
 fn the_head_boundary_decides_inlining_without_changing_the_result() {
     let root = Scratch::dir("inline-boundary");
-    let db_dir = Scratch::dir("inline-boundary-db");
+    let (_db_dir, db) = Scratch::db("inline-boundary-db");
 
     let mut config = Config::default();
     config.processing.hash_length = 64;
@@ -774,23 +757,30 @@ fn the_head_boundary_decides_inlining_without_changing_the_result() {
     let past = "y".repeat(65);
     touch(&root.join("at.txt"), at.as_bytes());
     touch(&root.join("past.txt"), past.as_bytes());
-
-    let db = db_dir.join("index.sqlite");
     index_once(&root, &db, &config);
 
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let pending: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM files WHERE content_state != 1",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(pending, 0, "both sides of the boundary end up extracted");
-    drop(conn);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM files WHERE content_state != 1"),
+        0,
+        "both sides of the boundary end up extracted"
+    );
 
     assert_eq!(stored_text(&db, "at.txt").as_deref(), Some(at.as_str()));
     assert_eq!(stored_text(&db, "past.txt").as_deref(), Some(past.as_str()));
+}
+
+/// The content state and failure reason of the one file ending in `suffix`.
+fn failure(db: &Path, suffix: &str) -> (i64, Option<String>) {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .query_row(
+            "SELECT f.content_state, ff.reason FROM files f \
+               LEFT JOIN failed_files ff ON ff.file_id = f.id \
+              WHERE f.parent || f.name LIKE '%' || ?1",
+            [suffix],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
 }
 
 #[test]
@@ -798,21 +788,12 @@ fn undecodable_small_files_are_reported_as_failures_not_silently_skipped() {
     let root = Scratch::dir("inline-badutf8");
     let (_db_dir, db) = Scratch::db("inline-badutf8-db");
 
-    // The NUL keeps this undecodable: without it these bytes would now
-    // decode as windows-1252 and the test would assert nothing.
+    // The NUL keeps this undecodable: without it these bytes decode as
+    // windows-1252 and the test asserts nothing.
     touch(&root.join("bad.txt"), &[0x68, 0x00, 0x69, 0xff]);
     index_once(&root, &db, &Config::default());
 
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let (state, msg): (i64, Option<String>) = conn
-        .query_row(
-            "SELECT f.content_state, ff.reason FROM files f \
-               LEFT JOIN failed_files ff ON ff.file_id = f.id \
-              WHERE f.parent || f.name LIKE '%bad.txt'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
+    let (state, msg) = failure(&db, "bad.txt");
     assert_eq!(state, 2, "undecodable content is FAILED, not DONE or NA");
     assert!(
         msg.unwrap_or_default().contains("bad.txt"),
@@ -831,16 +812,7 @@ fn an_unreadable_legacy_office_file_fails_with_a_reason() {
     );
     index_once(&root, &db, &Config::default());
 
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let (state, msg): (i64, Option<String>) = conn
-        .query_row(
-            "SELECT f.content_state, ff.reason FROM files f \
-               LEFT JOIN failed_files ff ON ff.file_id = f.id \
-              WHERE f.parent || f.name LIKE '%broken.doc'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
+    let (state, msg) = failure(&db, "broken.doc");
     assert_eq!(
         state, 2,
         "an unreadable .doc is FAILED, not DONE-with-no-text"
@@ -850,8 +822,8 @@ fn an_unreadable_legacy_office_file_fails_with_a_reason() {
     assert!(msg.contains("compound file"), "says what went wrong: {msg}");
 }
 
-/// The fix keeps size *and* mtime identical, so the walk sees an unchanged
-/// file — only the run-start retry of failed files can rescue it.
+/// The fix keeps size and mtime identical, so the walk sees an unchanged file
+/// and only the run-start retry of failed files can rescue it.
 #[test]
 fn a_failed_file_is_retried_on_the_next_run() {
     let root = Scratch::dir("retry-failed");
@@ -1016,28 +988,28 @@ fn the_extraction_denominator_counts_only_files_that_need_text() {
     let config = Config::default();
     index_once(&root, &db, &config);
 
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let count = |state: i64| -> i64 {
-        conn.query_row(
-            "SELECT COUNT(*) FROM files WHERE content_state = ?1",
-            [state],
-            |r| r.get(0),
+    let in_state = |state: i64| {
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM files WHERE content_state = {}", state),
         )
-        .unwrap()
     };
-    assert_eq!(count(0), 0, "a finished run leaves nothing pending");
-    assert_eq!(count(1), 3, "the claimed files have text");
-    assert_eq!(count(3), 7, "the rest are NA, and were NA from the walk on");
-    drop(conn);
+    assert_eq!(in_state(0), 0, "a finished run leaves nothing pending");
+    assert_eq!(in_state(1), 3, "the claimed files have text");
+    assert_eq!(
+        in_state(3),
+        7,
+        "the rest are NA, and were NA from the walk on"
+    );
 
-    // The exact calls the production path makes to fill
+    // The calls the production path makes to fill
     // `RootProgress::extract_total`, in production order, against the finished
-    // index — the live status cannot be sampled reliably: a ten-file tree
-    // finishes between two polls.
+    // index: a ten-file tree finishes between two polls, so the live status
+    // cannot be sampled.
     let conn = quicksearch_core::db::open_existing(db.to_str().unwrap(), true).unwrap();
-    let cursor = ExtractCursor::for_root(root.to_str().unwrap());
-    mark_oversize_pending_na(&conn, &cursor, &config).unwrap();
-    let scope = count_extract_scope(&conn, &cursor, &config).unwrap();
+    let range = RootRange::for_root(root.to_str().unwrap());
+    mark_oversize_pending_na(&conn, &range, &config).unwrap();
+    let scope = count_extract_scope(&conn, &range, &config).unwrap();
     assert_eq!(
         (scope.pending, scope.already_done),
         (0, 3),
@@ -1079,22 +1051,13 @@ fn the_content_extension_filter_still_excludes_small_text_files() {
     touch(&root.join("skipped.txt"), b"skipped xylophone body");
     index_once(&root, &db, &config);
 
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let states: Vec<(String, i64)> = conn
-        .prepare("SELECT parent || name, content_state FROM files ORDER BY parent, name")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
-    for (path, state) in &states {
+    for (path, _, state) in rows(&db) {
         if path.ends_with("kept.md") {
-            assert_eq!(*state, 1, "an allowed extension is extracted");
+            assert_eq!(state, 1, "an allowed extension is extracted");
         } else {
-            assert_eq!(*state, 3, "a filtered extension is NA, never inlined");
+            assert_eq!(state, 3, "a filtered extension is NA, never inlined");
         }
     }
-    drop(conn);
     assert_eq!(
         stored_text(&db, "skipped.txt"),
         None,
@@ -1112,59 +1075,46 @@ fn contentless_mode_still_indexes_inlined_files_without_storing_bodies() {
     touch(&root.join("small.txt"), b"searchable xylophone body");
     index_once(&root, &db, &config);
 
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let sidecars: i64 = conn
-        .query_row("SELECT COUNT(*) FROM documents_text", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(sidecars, 0, "contentless mode stores no bodies");
-    let hits: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH '\"xylophone\"'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
     assert_eq!(
-        hits, 1,
+        count(&db, "SELECT COUNT(*) FROM documents_text"),
+        0,
+        "contentless mode stores no bodies"
+    );
+    assert_eq!(
+        hits(&db, "xylophone"),
+        1,
         "an inlined file is still searchable in contentless mode"
     );
 }
 
 // ---------------------------------------------------------------------------
-// How the stall tests measure interleaving.
+// How the stall tests measure interleaving; `observe_overlap` collects the
+// counters.
 //
-// Shared by `a_heavy_root_does_not_stall_a_light_one` and its `_at_the_writer`
-// sibling; `observe_overlap` collects the counters.
-//
-// A stall is counted in *work*, not milliseconds: while the heavy root's
+// A stall is counted in work, not milliseconds: while the heavy root's
 // content pass runs, how many files the light root's walk was drained of,
-// against how many heavy rows landed. Both counters are advanced by the same
-// writer loop (`service_walking` / `service_extracting` in
+// against how many heavy rows landed. The same writer loop advances both
+// counters (`service_walking` / `service_extracting` in
 // `indexing/pipeline.rs`), each root's turn bounded by one slice, so their
-// ratio *is* the interleaving — and every way a host can be slow freezes both
-// counters together and cancels out, which the wall-clock budget this
-// replaced did not.
+// ratio is the interleaving, and a slow host freezes both together.
 //
 // `writer_turn_slice_ms = 0` makes the verdict arithmetic rather than a
-// measurement of the host: with no time in a turn, a writer round is exactly
-// one bounded piece of work per root — `service_walking` runs one
-// `batch_size` quantum, `store_extracted` consumes exactly one row. The
-// round, not the second, is the unit, the interleave floor is `QUANTUM : 1`
-// by construction on any host, and load can only raise it. It also makes the
-// ratio uniform across the pass, which is what lets the observed window be a
+// measurement of the host: with no time in a turn, a writer round is one
+// bounded piece of work per root (`service_walking` runs one `batch_size`
+// batch, `store_extracted` consumes one row). The round is the unit, the
+// interleave floor is `BATCH : 1` on any host, and load can only raise it.
+// The ratio is also uniform across the pass, so the observed window may be a
 // partial sample of it.
 //
-// The bound: the serialised design — the regression, where the writer read
-// the heavy batch itself and drained nobody meanwhile — manages one quantum
-// of each per round, so it obeys `light < heavy + quantum`. Each test demands
-// `light_drained ≥ MIN_INTERLEAVE × (heavy_stored + QUANTUM)` with
-// `MIN_INTERLEAVE = 3`: three times a bound the broken design provably cannot
-// reach, while the built one floors at `QUANTUM : 1` — 16:1 here.
+// The bound: a serialised writer, which reads the heavy batch itself and
+// drains nobody meanwhile, manages one batch of each per round, so it obeys
+// `light < heavy + BATCH`. Each test demands
+// `light_drained ≥ MIN_INTERLEAVE × (heavy_stored + BATCH)`: three times a
+// bound the serialised design cannot reach, against a floor of 16:1.
 //
-// MIN_ROWS_SAMPLED: a partial window must not be degenerate. A window of `n`
-// rows drains `QUANTUM × n` light files at the floor and must beat
-// `MIN_INTERLEAVE × (n + QUANTUM)`, so under four rows the constant
-// `+ QUANTUM` term decides the comparison instead of the design.
+// `MIN_ROWS_SAMPLED`: a window of `n` rows drains `BATCH × n` light files at
+// the floor and must beat `MIN_INTERLEAVE × (n + BATCH)`, so under four rows
+// the constant `+ BATCH` term decides the comparison instead of the design.
 // ---------------------------------------------------------------------------
 
 /// What one watch of a heavy/light overlap saw; see [`observe_overlap`].
@@ -1176,9 +1126,9 @@ struct Overlap {
     /// The heavy root's `extract_total` and pool size, for the fixture guards.
     heavy_pending: usize,
     heavy_pool: usize,
-    /// Publications in which the heavy root's row count moved. Reported,
-    /// never asserted on: it is really `min(writer rounds, watcher polls)`,
-    /// and is here only to make a surprising run legible.
+    /// Publications in which the heavy root's row count moved. Reported, never
+    /// asserted: it is `min(writer rounds, watcher polls)`, there to make a
+    /// surprising run legible.
     heavy_steps: usize,
     /// Longest this watcher went between polls: distinguishes a writer that
     /// gulped the pass in one turn from a watcher descheduled past it.
@@ -1190,10 +1140,10 @@ struct Overlap {
 /// Removing the fixture is the caller's job.
 ///
 /// The window opens on the first snapshot holding both roots in flight and
-/// closes when the heavy root leaves `Extracting` — not when the light root
-/// finishes walking, which CI showed to be a race between two rates with no
-/// fixed ratio across hosts. A light walk that ends early just stops
-/// contributing, understating the interleaving, never overstating it.
+/// closes when the heavy root leaves `Extracting`, not when the light root
+/// finishes walking, which is a race between two rates with no fixed ratio
+/// across hosts. A light walk that ends early just stops contributing,
+/// understating the interleaving, never overstating it.
 /// Panics if the window never opened.
 fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) -> Overlap {
     let mut opened: Option<(usize, usize)> = None; // (light.walked, heavy.extracted)
@@ -1279,232 +1229,187 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
     }
 }
 
-/// A slow root must not stall the others: one root's heavy extraction used to
-/// occupy the single writer thread for a whole batch at a time, during which
-/// no other root's walk was drained.
+/// The writer's batch in the stall tests: the bound is arithmetic in it, and a
+/// default 500-file round is a coarse enough publish interval to look like a
+/// stall on its own.
+const BATCH: usize = 16;
+/// A wide tree of tiny files, inlined by their walk workers, so the light root
+/// has no extraction phase of its own to confuse the window with, and wide
+/// enough that it is still walking when the heavy pass starts.
+const LIGHT_FILES: usize = 16_000;
+/// Light files drained per (heavy row + batch); derived above `Overlap`.
+const MIN_INTERLEAVE: usize = 3;
+/// Fewest heavy rows a window needs; derived above `Overlap`.
+const MIN_ROWS_SAMPLED: usize = 4;
+
+/// Index `heavy_files` copies of `body`, spread over `heavy_dirs` directories
+/// and extracted on `workers` threads, beside [`LIGHT_FILES`] one-byte files,
+/// and watch the overlap under `config` plus the writer settings derived above
+/// `Overlap`. Asserts the fixture guards, each of which silently costs a
+/// factor of the margin if it stops holding.
 ///
-/// The assertion is about *stalls*, not throughput: writing is serial by
+/// Removes the fixture before asserting, unlike the rest of this file: it is
+/// generated and identical every run, and leaving tens of MB in a RAM-backed
+/// /tmp behind a failure is itself a reason to fail.
+fn watch_heavy_beside_light(
+    tag: &str,
+    heavy_files: usize,
+    heavy_dirs: usize,
+    body: &[u8],
+    workers: usize,
+    mut config: Config,
+) -> Overlap {
+    let (heavy_tag, light_tag) = (format!("{}-heavy", tag), format!("{}-light", tag));
+    let heavy = Scratch::dir(&heavy_tag);
+    for i in 0..heavy_files {
+        touch(
+            &heavy.join(format!("d{}/big{:04}.txt", i % heavy_dirs, i)),
+            body,
+        );
+    }
+    let light = Scratch::dir(&light_tag);
+    for i in 0..LIGHT_FILES {
+        touch(&light.join(format!("d{}/f{:05}.txt", i % 60, i)), b"x");
+    }
+    let (db_dir, db) = Scratch::db(&format!("{}-db", tag));
+    let roots = vec![
+        heavy.to_string_lossy().into_owned(),
+        light.to_string_lossy().into_owned(),
+    ];
+
+    config.processing.batch_size = BATCH;
+    config.processing.writer_turn_slice_ms = 0;
+    // `root_workers` is keyed by the `indexing_paths` spelling; both sides
+    // canonicalize before matching.
+    config.paths.indexing_paths = roots.clone();
+    config
+        .indexing
+        .root_workers
+        .insert(roots[0].clone(), workers);
+    // The default WAL cap is far above anything these runs write; that stops
+    // being true if a fixture grows by an order of magnitude.
+
+    let service = IndexingService::new();
+    service
+        .start_indexing(roots, db.to_string_lossy().into_owned(), config)
+        .unwrap();
+    let seen = observe_overlap(&service, &heavy_tag, &light_tag);
+    drop(service);
+    drop((heavy, light, db_dir));
+
+    assert_eq!(
+        seen.heavy_pool, workers,
+        "the heavy root must extract on the {} workers root_workers asked for",
+        workers
+    );
+    assert_eq!(
+        seen.heavy_pending, heavy_files,
+        "every heavy file must reach the content pass; one inlined by its walk \
+         worker never produces an extraction phase to overlap with"
+    );
+    assert!(
+        seen.heavy_stored >= MIN_ROWS_SAMPLED,
+        "only {} of {} heavy rows landed inside the observed window, fewer than \
+         the {} a verdict needs (worst watcher gap {:?}, rows seen over {} \
+         rounds) — a gap near the pass's own length means this watcher was \
+         descheduled past it, not that the writer gulped it",
+        seen.heavy_stored,
+        heavy_files,
+        MIN_ROWS_SAMPLED,
+        seen.worst_gap,
+        seen.heavy_steps
+    );
+    seen
+}
+
+/// A slow root does not stall the others: the single writer thread keeps
+/// draining the light root's walk while the heavy root extracts.
+///
+/// The assertion is about stalls, not throughput: writing is serial by
 /// construction (one SQLite connection), so a wall-clock comparison would
 /// mostly measure the machine. The measurement and bound are derived above
 /// [`Overlap`].
 #[test]
 fn a_heavy_root_does_not_stall_a_light_one() {
-    // The writer's round-robin quantum: the bound below is arithmetic in it,
-    // and a default 500-file round is a coarse enough publish interval to
-    // look like a stall on its own.
-    const QUANTUM: usize = 16;
     // Few files, each big enough that reading one is real work, with a small
     // `maximum_text_size` so the cost lands in extraction: the bound grows
     // with the row count, while what the light root drains does not. Sized
-    // for the guards — enough that the rows arrive over separate writer
+    // for the guards: enough that the rows arrive over separate writer
     // rounds, cheap enough that a loaded runner still finishes in seconds.
     const HEAVY_FILES: usize = 12;
-    // A wide tree of tiny files, inlined by their walk workers, so this root
-    // has no extraction phase of its own to confuse the window with. It must
-    // still be walking when the heavy pass starts.
-    const LIGHT_FILES: usize = 16_000;
-    // Light files drained per (heavy row + quantum); derived above `Overlap`.
-    const MIN_INTERLEAVE: usize = 3;
-    // Fewest heavy rows a window needs; derived above `Overlap`.
-    const MIN_ROWS_SAMPLED: usize = 4;
-
-    let heavy = Scratch::dir("stall-heavy");
     // ~2 MiB each, 24 MB total.
-    let body: Vec<u8> = "sphinx of black quartz judge my vow "
-        .repeat(58_000)
-        .into_bytes();
-    for i in 0..HEAVY_FILES {
-        touch(&heavy.join(format!("d{}/big{:04}.txt", i % 4, i)), &body);
-    }
-    let light = Scratch::dir("stall-light");
-    for i in 0..LIGHT_FILES {
-        touch(&light.join(format!("d{}/f{:05}.txt", i % 60, i)), b"x");
-    }
-
-    let db_dir = Scratch::dir("stall-db");
-    let db = db_dir.join("index.sqlite");
-    let roots = vec![
-        heavy.to_string_lossy().into_owned(),
-        light.to_string_lossy().into_owned(),
-    ];
+    let body = "sphinx of black quartz judge my vow ".repeat(58_000);
 
     let mut config = Config::default();
     config.processing.maximum_text_size = 1024;
     // Above the heavy files, or `mark_oversize_pending_na` writes them off as
     // N/A before the pass starts and there is no extraction phase at all.
     config.processing.maximum_text_file_size = 4 * 1024 * 1024;
-    config.processing.batch_size = QUANTUM;
-    // Zero: the round becomes the unit and the interleave floor is
-    // `quantum : 1` on any host — the derivation above `Overlap`.
-    config.processing.writer_turn_slice_ms = 0;
-    // One extraction thread for the heavy root. `root_workers` is keyed by
-    // the `indexing_paths` spelling; both sides canonicalize before matching.
-    config.paths.indexing_paths = roots.clone();
-    config.indexing.root_workers.insert(roots[0].clone(), 1);
-    // The default WAL cap is far above anything this run writes; that stops
-    // being true if the fixture grows by an order of magnitude.
-
-    let service = IndexingService::new();
-    service
-        .start_indexing(roots, db.to_string_lossy().into_owned(), config.clone())
-        .unwrap();
-    let seen = observe_overlap(&service, "stall-heavy", "stall-light");
-    drop(service);
-
-    // Removed explicitly before the assertions, unlike the rest of this file:
-    // the fixture is generated and identical every run, and leaving tens of
-    // MB in a RAM-backed /tmp behind a failure is itself a reason to fail.
-    std::fs::remove_dir_all(&heavy).ok();
-    std::fs::remove_dir_all(&light).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
-
-    // Fixture guards: each silently costs a factor of the margin below if it
-    // stops holding.
-    assert_eq!(
-        seen.heavy_pool, 1,
-        "the heavy root must extract on the single worker root_workers asked for; \
-         with the default four its pass is four times shorter and so is the margin"
-    );
-    assert_eq!(
-        seen.heavy_pending, HEAVY_FILES,
-        "every heavy file must reach the content pass; one inlined by its walk \
-         worker never produces an extraction phase to overlap with"
-    );
-    // The window may be a sub-sample of the pass — every round contributes
-    // the same ratio — but below four rows the bound's `+ QUANTUM` term
-    // dominates and a passing ratio would be arithmetic, not evidence.
-    assert!(
-        seen.heavy_stored >= MIN_ROWS_SAMPLED,
-        "only {} of {} heavy rows landed inside the observed window, fewer than \
-         the {} a verdict needs (worst watcher gap {:?}, rows seen over {} \
-         rounds) — a gap near the pass's own length means this watcher was \
-         descheduled past it, not that the writer gulped it",
-        seen.heavy_stored,
-        HEAVY_FILES,
-        MIN_ROWS_SAMPLED,
-        seen.worst_gap,
-        seen.heavy_steps
-    );
+    // One extraction thread: with the default four the pass is four times
+    // shorter, and so is the margin.
+    let seen = watch_heavy_beside_light("stall", HEAVY_FILES, 4, body.as_bytes(), 1, config);
 
     eprintln!(
         "light files drained while the heavy root extracted: {} against {} heavy \
-         rows (quantum {}) landing over {} rounds, worst watcher gap {:?} — \
+         rows (batch {}) landing over {} rounds, worst watcher gap {:?} — \
          {}x the {}x required; the \
          serialised design cannot exceed 1x",
         seen.light_drained,
         seen.heavy_stored,
-        QUANTUM,
+        BATCH,
         seen.heavy_steps,
         seen.worst_gap,
-        seen.light_drained / (seen.heavy_stored + QUANTUM),
+        seen.light_drained / (seen.heavy_stored + BATCH),
         MIN_INTERLEAVE
     );
     assert!(
-        seen.light_drained >= MIN_INTERLEAVE * (seen.heavy_stored + QUANTUM),
+        seen.light_drained >= MIN_INTERLEAVE * (seen.heavy_stored + BATCH),
         "the light root was drained of only {} files while the heavy root landed \
-         {} rows; one quantum of each per round is all a writer that extracts \
+         {} rows; one batch of each per round is all a writer that extracts \
          inline can manage, so anything near {} means the extraction is back on \
          the writer thread",
         seen.light_drained,
         seen.heavy_stored,
-        seen.heavy_stored + QUANTUM
+        seen.heavy_stored + BATCH
     );
 }
 
-/// The sibling of [`a_heavy_root_does_not_stall_a_light_one`] for the cost
-/// that test keeps small: the writer's own tokenising. Here each heavy row
-/// carries the default 256 KiB of text and its FTS5 trigram insert runs on
-/// the writer thread, inside the transaction, where nothing can take it off.
-/// Before turns had a slice, an extraction turn wrote everything it found and
-/// the ratio below came in under one.
+/// [`a_heavy_root_does_not_stall_a_light_one`] for the cost that test keeps
+/// small: the writer's own tokenising. Each heavy row carries the default
+/// 256 KiB of text, and its FTS5 trigram insert runs on the writer thread
+/// inside the transaction, so only the turn's slice bounds it. An extraction
+/// turn that writes everything it finds brings the ratio below one.
 #[test]
 fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
-    const QUANTUM: usize = 16;
-    // Over the walk's inline threshold, with the full 256 KiB of stored
-    // text: the tokenising is what is measured.
+    // Over the walk's inline threshold, with the full 256 KiB of stored text,
+    // so the tokenising is what is measured.
     const HEAVY_FILES: usize = 32;
-    // Wide enough that the light walk outlasts enough of the heavy pass.
-    const LIGHT_FILES: usize = 16_000;
-    // Three times a bound the unsliced writer cannot reach.
-    const MIN_INTERLEAVE: usize = 3;
-    // Derived above `Overlap`.
-    const MIN_ROWS_SAMPLED: usize = 4;
+    let body = "sphinx of black quartz judge my vow ".repeat(9_000);
 
-    let heavy = Scratch::dir("stall-writer-heavy");
-    let body: Vec<u8> = "sphinx of black quartz judge my vow "
-        .repeat(9_000)
-        .into_bytes();
-    for i in 0..HEAVY_FILES {
-        touch(&heavy.join(format!("d{}/big{:04}.txt", i % 8, i)), &body);
-    }
-    let light = Scratch::dir("stall-writer-light");
-    for i in 0..LIGHT_FILES {
-        touch(&light.join(format!("d{}/f{:05}.txt", i % 60, i)), b"x");
-    }
-
-    let db_dir = Scratch::dir("stall-writer-db");
-    let db = db_dir.join("index.sqlite");
-    let roots = vec![
-        heavy.to_string_lossy().into_owned(),
-        light.to_string_lossy().into_owned(),
-    ];
-
-    let mut config = Config::default();
-    config.processing.batch_size = QUANTUM;
-    // As in the sibling: at zero the round is the unit and the floor is
-    // `quantum : 1` whatever the host does.
-    config.processing.writer_turn_slice_ms = 0;
-    config.paths.indexing_paths = roots.clone();
     // Four readers, so the ready channel is full when the writer's turn comes.
-    config.indexing.root_workers.insert(roots[0].clone(), 4);
-
-    let service = IndexingService::new();
-    service
-        .start_indexing(roots, db.to_string_lossy().into_owned(), config.clone())
-        .unwrap();
-    let seen = observe_overlap(&service, "stall-writer-heavy", "stall-writer-light");
-    drop(service);
-
-    std::fs::remove_dir_all(&heavy).ok();
-    std::fs::remove_dir_all(&light).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
-
-    assert_eq!(
-        seen.heavy_pool, 4,
-        "the heavy root must extract on four workers"
-    );
-    assert_eq!(
-        seen.heavy_pending, HEAVY_FILES,
-        "every heavy file must reach the content pass"
-    );
-    // As in the sibling: the window may be partial, but not degenerate.
-    assert!(
-        seen.heavy_stored >= MIN_ROWS_SAMPLED,
-        "only {} of {} heavy rows landed inside the observed window, fewer than \
-         the {} a verdict needs (worst watcher gap {:?}, rows seen over {} \
-         rounds) — a gap near the pass's own length means this watcher was \
-         descheduled past it, not that the writer gulped it",
-        seen.heavy_stored,
+    let seen = watch_heavy_beside_light(
+        "stall-writer",
         HEAVY_FILES,
-        MIN_ROWS_SAMPLED,
-        seen.worst_gap,
-        seen.heavy_steps
+        8,
+        body.as_bytes(),
+        4,
+        Config::default(),
     );
 
     eprintln!(
         "light files drained while the heavy root tokenised: {} against {} heavy \
-         rows (quantum {}) landing over {} rounds, worst watcher gap {:?} — \
+         rows (batch {}) landing over {} rounds, worst watcher gap {:?} — \
          {}x the {}x required",
         seen.light_drained,
         seen.heavy_stored,
-        QUANTUM,
+        BATCH,
         seen.heavy_steps,
         seen.worst_gap,
-        seen.light_drained / (seen.heavy_stored + QUANTUM),
+        seen.light_drained / (seen.heavy_stored + BATCH),
         MIN_INTERLEAVE
     );
     assert!(
-        seen.light_drained >= MIN_INTERLEAVE * (seen.heavy_stored + QUANTUM),
+        seen.light_drained >= MIN_INTERLEAVE * (seen.heavy_stored + BATCH),
         "the light root was drained of only {} files while the heavy root landed \
          {} rows; an extraction turn is writing to the end of its batch again \
          instead of yielding at its slice",
@@ -1513,48 +1418,44 @@ fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
     );
 }
 
-/// The write-ahead log must not grow for the length of a run: autocheckpoint
-/// can only reset the log at an instant no reader holds a read mark, and a
-/// run keeps a reader per root querying continuously (the prompting case: a
-/// 12.5 GiB index carrying a 21.6 GiB log).
-///
-/// The assertion is about the peak *while running* — `stop_indexing` and the
-/// post-run maintenance both truncate the log on the way out, so a reading
-/// taken afterwards proves nothing.
-#[test]
-fn the_wal_stays_bounded_during_a_run() {
-    let root = Scratch::dir("wal-bound");
-    // Text-heavy: the FTS index is what fills the log.
+/// A text-heavy tree: the FTS index fills the log and dominates the database,
+/// so a log measured against the database size means something.
+fn seed_text_tree(tag: &str) -> Scratch {
+    let root = Scratch::dir(tag);
     let body: Vec<u8> = "sphinx of black quartz judge my vow "
         .repeat(200)
         .into_bytes();
     for i in 0..4000 {
         touch(&root.join(format!("d{}/f{:05}.txt", i % 40, i)), &body);
     }
+    root
+}
 
-    let db_dir = Scratch::dir("wal-bound-db");
-    let db = db_dir.join("index.sqlite");
-    let wal = db_dir.join("index.sqlite-wal");
+/// The write-ahead log does not grow for the length of a run. Autocheckpoint
+/// can reset the log only at an instant no reader holds a read mark, and a run
+/// keeps a reader per root querying continuously (the prompting case: a
+/// 12.5 GiB index carrying a 21.6 GiB log).
+///
+/// The assertion is about the peak while running: `stop_indexing` and the
+/// post-run maintenance both truncate the log on the way out, so a reading
+/// taken afterwards proves nothing.
+#[test]
+fn the_wal_stays_bounded_during_a_run() {
+    let root = seed_text_tree("wal-bound");
+    let (_db_dir, db) = Scratch::db("wal-bound-db");
     let mut config = Config::default();
     // The floor `MINIMUM_WAL_SIZE` clamps to, so the cap is exercised many
     // times rather than once at the end.
     config.processing.maximum_wal_size = 16 * 1024 * 1024;
 
-    let service = IndexingService::new();
-    service
-        .start_indexing(
-            vec![root.to_string_lossy().into_owned()],
-            db.to_string_lossy().into_owned(),
-            config.clone(),
-        )
-        .unwrap();
+    let service = start(&root, &db, &config);
 
     let mut peak = 0u64;
     let mut checkpointed = false;
     let mut last = 0u64;
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
-        let len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        let len = wal_bytes(&db);
         peak = peak.max(len);
         // Vacuity guard: without a mid-run checkpoint the bound could be met
         // by the fixture being too small.
@@ -1573,7 +1474,7 @@ fn the_wal_stays_bounded_during_a_run() {
     while Instant::now() < idle_by && !matches!(service.get_status(), IndexingStatus::Idle) {
         std::thread::sleep(Duration::from_millis(10));
     }
-    let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let after = wal_bytes(&db);
     drop(service);
 
     eprintln!("peak WAL during the run: {} bytes", peak);
@@ -1592,43 +1493,25 @@ fn the_wal_stays_bounded_during_a_run() {
     assert_eq!(after, 0, "the optimize pass leaves an empty log behind");
 }
 
-/// Stopping a run does not skip the optimize pass: a run cut short is exactly
-/// when the log is largest and nothing else will land it.
+/// A stopped run still runs the optimize pass: a run cut short is when the log
+/// is largest, and nothing else lands it.
 ///
-/// Asserted through [`repo::optimize_count`] — a latch, not a sample: polling
-/// for the transient `Optimizing` status missed it more often the faster the
-/// indexer got.
+/// Asserted through `repo::optimize_count`, a latch, because the transient
+/// `Optimizing` status is gone too fast to poll for.
 #[test]
 fn a_stopped_run_is_still_optimized() {
-    let root = Scratch::dir("stop-optimize");
-    let body: Vec<u8> = "sphinx of black quartz judge my vow "
-        .repeat(200)
-        .into_bytes();
-    for i in 0..4000 {
-        touch(&root.join(format!("d{}/f{:05}.txt", i % 40, i)), &body);
-    }
-
-    let db_dir = Scratch::dir("stop-optimize-db");
-    let db = db_dir.join("index.sqlite");
-    let wal = db_dir.join("index.sqlite-wal");
+    let root = seed_text_tree("stop-optimize");
+    let (db_dir, db) = Scratch::db("stop-optimize-db");
     let dir_key = db_dir.to_string_lossy().into_owned();
 
     // Per-directory, so a sibling test optimizing its own scratch index on
     // another thread cannot satisfy this.
     let before = quicksearch_core::db::repo::optimize_count(&dir_key);
 
-    let service = IndexingService::new();
-    service
-        .start_indexing(
-            vec![root.to_string_lossy().into_owned()],
-            db.to_string_lossy().into_owned(),
-            Config::default(),
-        )
-        .unwrap();
-
+    let service = start(&root, &db, &Config::default());
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
-        if std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 512 * 1024 {
+        if wal_bytes(&db) > 512 * 1024 {
             break;
         }
         if let IndexingStatus::Error(e) = service.get_status() {
@@ -1637,22 +1520,7 @@ fn a_stopped_run_is_still_optimized() {
         std::thread::sleep(Duration::from_millis(2));
     }
     service.request_stop();
-
-    // Idle is the *end* of the pass, and unlike Optimizing it is a resting
-    // state — waiting for it cannot miss it however fast the pass was.
-    let idle_by = Instant::now() + Duration::from_secs(120);
-    loop {
-        match service.get_status() {
-            IndexingStatus::Idle => break,
-            IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
-            _ => {}
-        }
-        assert!(
-            Instant::now() < idle_by,
-            "the stopped run never reached Idle"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    run_to_idle(&service, || {});
 
     assert_eq!(
         quicksearch_core::db::repo::optimize_count(&dir_key),
@@ -1660,7 +1528,7 @@ fn a_stopped_run_is_still_optimized() {
         "a stopped run must still run PRAGMA optimize against its index"
     );
     assert_eq!(
-        std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0),
+        wal_bytes(&db),
         0,
         "the optimize pass must land the stopped run's log"
     );
@@ -1722,89 +1590,46 @@ fn high_byte_binaries_are_listed_but_not_text_extracted() {
     assert_eq!(probe("notes.md"), (1, 1, 0), "ordinary UTF-8 is unaffected");
 }
 
-/// A helper for the two tail tests below: run to completion and to `Idle`,
-/// which is the *end* of the post-run maintenance pass, sampling the log
-/// throughout. Returns its peak.
-///
-/// `Idle` and not the completion marker: the marker lands inside
-/// `run_indexing`, before the FTS merge, the tail checkpoints and the whole of
-/// `repo::maintain` — which is precisely the window under test.
+/// Index `root` into `db` and run to `Idle`, sampling the log throughout;
+/// returns its peak. Waits for `Idle` rather than the completion marker, which
+/// lands inside `run_indexing` before the FTS merge, the tail checkpoints and
+/// `repo::maintain`: the window the tail tests measure.
 fn reindex_sampling_the_log(root: &Path, db: &Path, config: &Config) -> u64 {
-    let wal = db.with_file_name(format!(
-        "{}-wal",
-        db.file_name().and_then(|s| s.to_str()).unwrap()
-    ));
-    let service = IndexingService::new();
-    service
-        .start_indexing(
-            vec![root.to_string_lossy().into_owned()],
-            db.to_string_lossy().into_owned(),
-            config.clone(),
-        )
-        .unwrap();
-
+    let service = start(root, db, config);
     let mut peak = 0u64;
-    let deadline = Instant::now() + Duration::from_secs(180);
-    loop {
-        peak = peak.max(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0));
-        match service.get_status() {
-            IndexingStatus::Idle => break,
-            IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
-            _ => {}
-        }
-        assert!(Instant::now() < deadline, "the run never reached Idle");
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    run_to_idle(&service, || peak = peak.max(wal_bytes(db)));
     drop(service);
     peak
 }
 
-/// A text-heavy tree, for the two tail tests. Big enough that the FTS index
-/// dominates the database, which is what makes a log measured against the
-/// database size mean anything.
-fn seed_text_tree(tag: &str) -> Scratch {
-    let root = Scratch::dir(tag);
-    let body: Vec<u8> = "sphinx of black quartz judge my vow "
-        .repeat(200)
-        .into_bytes();
-    for i in 0..4000 {
-        touch(&root.join(format!("d{}/f{:05}.txt", i % 40, i)), &body);
-    }
-    root
-}
-
-/// The window [`the_wal_stays_bounded_during_a_run`] explicitly declines to
-/// cover — "a reading taken afterwards proves nothing" — and the one a
-/// released bug lived in.
+/// The log stays bounded after the writer loop, the window
+/// [`the_wal_stays_bounded_during_a_run`] does not cover.
 ///
 /// Everything after the writer loop is database work with no checkpoint of its
 /// own: the FTS merge, the completion stamp, the per-root counts, then
 /// `repo::maintain`'s VACUUM, whose copy-back pushes the whole database
 /// through the log. With autocheckpoint off for the run and every per-root
-/// reader still holding a read mark, that all piled onto one log — a warm
-/// reindex, which writes almost nothing during the loop and so never trips the
-/// in-loop checkpoint, left a `-wal` several times the size of the index.
+/// reader holding a read mark, all of it lands on one log unless the tail
+/// checkpoints. A warm reindex writes almost nothing during the loop, so the
+/// in-loop checkpoint never fires; without the tail's, one left a `-wal`
+/// several times the size of the index.
 ///
-/// **A reader is held across both runs, and the test is vacuous without it.**
-/// The application always has one — the search worker keeps its connection for
-/// `IDLE_RELEASE`, half an hour. A test that does not leaves the indexer's
-/// connection as the last handle on the file, and SQLite checkpoints and
-/// *deletes* the log when the last one closes, papering over anything the run
-/// failed to land.
+/// A reader is held across both runs, and the test is vacuous without it. The
+/// application always has one: the search worker keeps its connection for
+/// `IDLE_RELEASE`. Without it the indexer's connection is the last handle on
+/// the file, and SQLite checkpoints and deletes the log when the last one
+/// closes, hiding anything the run failed to land.
 ///
-/// Two assertions, doing different jobs. The **mechanism** is that the tail's
-/// checkpoints hand `repo::maintain` an empty log — read back through
-/// [`repo::log_on_entry_to_maintain`], a latch, because the value is gone by
-/// the time a test could sample it. That is what fails without the fix. The
-/// **peak** is the guard on the reported symptom, and it is honest about its
-/// limits: a fixture this size cannot build a tail large enough to breach the
-/// ceiling on its own, so it protects the released behaviour rather than
-/// reproducing the bug.
+/// Two assertions. The mechanism: the tail's checkpoints hand `repo::maintain`
+/// an empty log, read back through `repo::log_on_entry_to_maintain`, a latch,
+/// because the value is gone before a test could sample it; this fails without
+/// the tail checkpoints. The peak guards the reported symptom, but a fixture
+/// this size cannot build a tail large enough to breach the ceiling on its own,
+/// so it pins the current behaviour rather than reproducing the bug.
 #[test]
 fn the_wal_stays_bounded_through_the_tail_of_a_warm_reindex() {
     let root = seed_text_tree("wal-tail");
-    let db_dir = Scratch::dir("wal-tail-db");
-    let db = db_dir.join("index.sqlite");
+    let (db_dir, db) = Scratch::db("wal-tail-db");
     let dir_key = db_dir.to_string_lossy().into_owned();
     let config = Config::default();
 
@@ -1855,43 +1680,27 @@ fn the_wal_stays_bounded_through_the_tail_of_a_warm_reindex() {
         peak,
         indexed
     );
-    assert_eq!(
-        wal_path(&db).metadata().map(|m| m.len()).unwrap_or(0),
-        0,
-        "and the tail leaves no log behind"
-    );
+    assert_eq!(wal_bytes(&db), 0, "and the tail leaves no log behind");
 }
 
-fn wal_path(db: &Path) -> std::path::PathBuf {
-    db.with_file_name(format!(
-        "{}-wal",
-        db.file_name().and_then(|s| s.to_str()).unwrap()
-    ))
-}
-
-/// A reindex that finds nothing to do must not grow the FTS index.
+/// A reindex that finds nothing to do does not grow the FTS index.
 ///
-/// The end-of-run merge takes a **positive** page budget for a reason. With a
-/// negative one SQLite routes through `fts5IndexOptimizeStruct` — that is
-/// `optimize`, merely rate-limited — hoisting every segment into a single
-/// level and leaving the structure mid-merge in `%_data`. Called once per run
-/// rather than looped to completion, as it was, each run restarted that and
-/// churned pages for a corpus that had not changed.
+/// The end-of-run merge takes a positive page budget. A negative one routes
+/// through `fts5IndexOptimizeStruct`, a rate-limited `optimize` that hoists
+/// every segment into one level and leaves the structure mid-merge in
+/// `%_data`; called once per run, each run would restart it and churn pages
+/// for an unchanged corpus.
 #[test]
 fn repeated_warm_reindexes_do_not_grow_the_fts_index() {
     let root = seed_text_tree("fts-churn");
-    let db_dir = Scratch::dir("fts-churn-db");
-    let db = db_dir.join("index.sqlite");
+    let (_db_dir, db) = Scratch::db("fts-churn-db");
     let config = Config::default();
 
-    let fts_pages = |db: &Path| -> i64 {
-        let conn = rusqlite::Connection::open(db).unwrap();
-        conn.query_row(
+    let fts_pages = |db: &Path| {
+        count(
+            db,
             "SELECT COUNT(*) FROM dbstat WHERE name = 'searchabletext_data'",
-            [],
-            |r| r.get(0),
         )
-        .unwrap()
     };
 
     reindex_sampling_the_log(&root, &db, &config);
@@ -1944,17 +1753,15 @@ fn media_heavy_deck(path: &Path, media_bytes: usize) {
     zip.finish().unwrap();
 }
 
-/// The content pass gates on a file's *size*, which for a container is its
-/// media and not its text: a 5 MiB deck holds about 10 KiB of words, and
-/// reading them costs a seek through the central directory plus the one
-/// member named. A cap tuned to prose skipped every deck in the tree —
-/// indexed by name, with nothing inside findable and no failure to show for
-/// it. This pins the default cap against the shape that exposed it.
+/// The content pass gates on a file's size, which for a container is its media,
+/// not its text: a 5 MiB deck holds about 10 KiB of words, and reading them
+/// costs a seek through the central directory plus the one member named. A cap
+/// tuned to prose indexes every deck by name only, with nothing inside
+/// findable and no failure to show for it.
 #[test]
 fn a_media_heavy_presentation_is_indexed_under_the_default_cap() {
     let root = Scratch::dir("deck-media");
-    let db_dir = Scratch::dir("deck-media-db");
-    let db = db_dir.join("index.sqlite");
+    let (_db_dir, db) = Scratch::db("deck-media-db");
     let deck = root.join("quarterly.pptx");
     media_heavy_deck(&deck, 5 * 1024 * 1024);
 
@@ -1981,15 +1788,11 @@ fn a_media_heavy_presentation_is_indexed_under_the_default_cap() {
         text
     );
 
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let hits: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH ?1",
-            ["\"chalcedony\""],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(hits, 1, "a word inside the deck is not searchable");
+    assert_eq!(
+        hits(&db, "chalcedony"),
+        1,
+        "a word inside the deck is not searchable"
+    );
 }
 
 /// Raising the cap has to reach an index that already wrote a file off. The
@@ -2001,8 +1804,7 @@ fn raising_the_size_cap_reaches_files_already_written_off() {
     use std::sync::atomic::AtomicBool;
 
     let root = Scratch::dir("cap-raise");
-    let db_dir = Scratch::dir("cap-raise-db");
-    let db = db_dir.join("index.sqlite");
+    let (_db_dir, db) = Scratch::db("cap-raise-db");
     media_heavy_deck(&root.join("quarterly.pptx"), 5 * 1024 * 1024);
 
     // A cap under the deck's size: its text is never read. The root goes in

@@ -1,6 +1,6 @@
 //! Byte-for-byte verification of one duplicate group, and the modal that
 //! reports it. Grouping only hashes each file's size and head, so this is the
-//! second opinion — asked for before what usually follows it, deletion.
+//! second opinion, asked for before what usually follows it: deletion.
 
 use super::*;
 
@@ -43,7 +43,7 @@ impl VerifyModal {
 
 /// One line of the report, in the words the modal paints. `reference_len` is
 /// how long the file everything was compared against was: an offset means
-/// little on its own, and "byte 91 of 2.1 MB" is what says the difference is
+/// little on its own; "byte 91 of 2.1 MB" says the difference is
 /// in the header rather than in anything anyone typed.
 pub(crate) fn verdict_line(verdict: &MemberVerdict, reference: bool, reference_len: u64) -> String {
     match verdict {
@@ -90,49 +90,35 @@ impl QuickSearchApp {
         let Some(job) = &self.backend.verify_job else {
             return;
         };
-        let mut finished = false;
-        loop {
+        // The state the job ended in, and whether it only replaces a run
+        // still in progress.
+        let (end, only_if_running) = loop {
             match job.rx.try_recv() {
                 Ok(VerifyUpdate::Progress {
-                    bytes_read: read,
-                    bytes_total: total,
+                    bytes_read,
+                    bytes_total,
                 }) => {
                     if let Some(modal) = &mut self.verify {
                         modal.state = VerifyState::Running {
-                            bytes_read: read,
-                            bytes_total: total,
+                            bytes_read,
+                            bytes_total,
                         };
                     }
                 }
                 Ok(VerifyUpdate::Done(report)) => {
-                    if let Some(modal) = &mut self.verify {
-                        modal.state = VerifyState::Done(Box::new(report));
-                    }
-                    finished = true;
-                    break;
+                    break (VerifyState::Done(Box::new(report)), false)
                 }
-                Ok(VerifyUpdate::Cancelled) => {
-                    if let Some(modal) = &mut self.verify {
-                        modal.state = VerifyState::Cancelled;
-                    }
-                    finished = true;
-                    break;
-                }
-                Err(TryRecvError::Empty) => break,
+                Ok(VerifyUpdate::Cancelled) => break (VerifyState::Cancelled, false),
                 // The worker died without a terminal update.
-                Err(TryRecvError::Disconnected) => {
-                    if let Some(modal) = &mut self.verify {
-                        if matches!(modal.state, VerifyState::Running { .. }) {
-                            modal.state = VerifyState::Cancelled;
-                        }
-                    }
-                    finished = true;
-                    break;
-                }
+                Err(TryRecvError::Disconnected) => break (VerifyState::Cancelled, true),
+                Err(TryRecvError::Empty) => return,
             }
-        }
-        if finished {
-            self.backend.verify_job = None;
+        };
+        self.backend.verify_job = None;
+        if let Some(modal) = &mut self.verify {
+            if !only_if_running || matches!(modal.state, VerifyState::Running { .. }) {
+                modal.state = end;
+            }
         }
     }
 
@@ -147,7 +133,7 @@ impl QuickSearchApp {
     }
 }
 
-/// Paint the modal; `true` when its dismiss button was clicked. Takes a bare
+/// Paints the modal; `true` when its dismiss button was clicked. Takes a bare
 /// context, so a test can render it without an app or an index.
 pub(crate) fn verify_modal(ctx: &egui::Context, modal: &VerifyModal) -> bool {
     centered_modal(ctx, "Verify duplicates", |ui| {
@@ -190,10 +176,9 @@ pub(crate) fn verify_modal(ctx: &egui::Context, modal: &VerifyModal) -> bool {
                         "Grouping only reads each file's size and how it begins; \
                          this read every byte.",
                     );
-                    // The question this answers is the one everybody asks next:
-                    // the files look the same when opened, so how can they
-                    // differ? Named formats, because those are the ones people
-                    // hit — a run of invoices or a folder of .docx.
+                    // Answers the next question: the files look the same when
+                    // opened, so how can they differ? Named formats, because
+                    // those are the ones people hit (invoices, .docx folders).
                     ui.label(hint(
                         "A difference near the start of a file is usually metadata you \
                          never see. PDFs and Office documents store creation and \

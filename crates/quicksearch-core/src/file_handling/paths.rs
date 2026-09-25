@@ -9,18 +9,15 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::config::IgnoreSet;
 
-/// Render a path in the spelling the index stores it in.
+/// Render a path in the spelling the index stores. Strips Windows'
+/// extended-length prefix only where the result still opens:
+/// `\\?\UNC\server\share` → `\\server\share`, `\\?\C:\…` → `C:\…`; anything
+/// else (e.g. a folder-mounted `\\?\Volume{GUID}\…`) keeps it.
 ///
-/// `Path::canonicalize` on Windows hands back extended-length paths; the
-/// index stores plain ones. A UNC share canonicalizes to
-/// `\\?\UNC\server\share`, so the two prefixes have to be stripped
-/// differently — taking four characters off both leaves `UNC\server\share`,
-/// which is not a path that exists.
-///
-/// A volume mounted at a folder has no DOS name and canonicalizes to
-/// `\\?\Volume{GUID}\…`; stripping the prefix there yields a path that cannot
-/// be opened — every file under such a mount would fail to hash. Only a
-/// genuine drive letter is safe to un-prefix.
+/// Lossy: a non-UTF-8 name comes out with U+FFFD, an ordinary filename
+/// character, so that spelling is another file's real name. A lossy path must
+/// never become a DB key or be opened by its stored spelling; callers screen
+/// with [`warn_if_unrepresentable`] or, in the walk, on the directory entry.
 pub(crate) fn path_to_db_string(path: &Path) -> String {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
@@ -39,22 +36,16 @@ pub(crate) fn path_to_db_string(path: &Path) -> String {
 /// [`crate::platform::IndexLock`]'s.
 pub(crate) const INDEX_SIDECAR_SUFFIXES: [&str; 4] = ["-wal", "-shm", "-journal", ".lock"];
 
-/// Every file belonging to the index at `db_path`, spelled the way the walk
-/// spells the files it visits.
+/// Every file of the index at `db_path` (database, SQLite sidecars, lock), in
+/// walk spelling.
 ///
-/// **Nothing may ever open one of these.** On POSIX, closing *any* descriptor
-/// on an inode cancels every advisory lock the whole process holds on it, so a
-/// walk worker that opens `index.sqlite-shm` to hash it destroys the DMS lock
-/// SQLite took on that file — after which the next connection to attach, from
-/// any process, truncates the wal-index to 3 bytes under our live mapping and
-/// the next commit dies with SIGBUS. The same close cancels the main
-/// database's own locks, which is SQLite's documented corruption hazard
-/// (howtocorrupt.html §2.2). See [`crate::walk`], which prunes these before an
-/// entry can become a candidate.
-///
-/// The *directory* is canonicalized rather than the files: the sidecars come
-/// and go across a run, and `canonicalize` fails on a path that is not there
-/// at the instant it is called.
+/// **Nothing may ever open one**: on POSIX, closing any descriptor on an inode
+/// drops every advisory lock the process holds on it. Hashing
+/// `index.sqlite-shm` destroys SQLite's DMS lock, the next connection
+/// truncates the wal-index under our mapping, and the next commit dies with
+/// SIGBUS; the same close drops the main database's locks too
+/// (howtocorrupt.html §2.2). The directory, not the files, is canonicalized:
+/// sidecars come and go.
 pub(crate) fn index_file_set(db_path: &Path) -> HashSet<PathBuf> {
     let mut set = HashSet::new();
     // An empty filename means `database_path` names a directory; joining ""
@@ -73,9 +64,9 @@ pub(crate) fn index_file_set(db_path: &Path) -> HashSet<PathBuf> {
     set
 }
 
-/// Canonicalize a root string for storage/comparison — the spelling stored
-/// parents are prefixed with, and so the form roots must be compared in:
-/// `~/docs` and `/home/me/docs` name one root and must not read as a change.
+/// Canonicalize a root string for storage and comparison: the spelling stored
+/// parents are prefixed with, so `~/docs` and `/home/me/docs` name one root
+/// and do not read as a change.
 pub(crate) fn normalize_root_string(indexing_path: &str) -> String {
     let path = Path::new(indexing_path)
         .canonicalize()
@@ -83,13 +74,10 @@ pub(crate) fn normalize_root_string(indexing_path: &str) -> String {
     path_to_db_string(&path)
 }
 
-/// Warn and report `true` for a path that cannot round-trip through the
-/// index. [`path_to_db_string`] is lossy, and a lossy path must never become
-/// a DB key: U+FFFD is an ordinary filename character, so the lossy spelling
-/// is somebody's real name. Such a file is skipped whole.
-///
-/// The check for callers that arrive with a single path; the full walk
-/// screens earlier, on the directory entry itself (`crate::walk`).
+/// Warn and report `true` for a path that cannot round-trip through the index
+/// (see [`path_to_db_string`]); such a file is skipped whole. For callers
+/// holding a single path; the full walk screens earlier, on the directory
+/// entry itself (`crate::walk`).
 pub(crate) fn warn_if_unrepresentable(path: &Path) -> bool {
     if path.to_str().is_some() {
         return false;
@@ -102,11 +90,10 @@ pub(crate) fn warn_if_unrepresentable(path: &Path) -> bool {
     true
 }
 
-/// Whether `s` begins `X:` for some ASCII letter — the only `\\?\` payload
+/// Whether `s` begins `X:` for some ASCII letter: the only `\\?\` payload
 /// that is still a usable path once the prefix is gone.
 fn starts_with_drive_letter(s: &str) -> bool {
-    let mut it = s.chars();
-    matches!((it.next(), it.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic())
+    matches!(s.as_bytes(), [c, b':', ..] if c.is_ascii_alphabetic())
 }
 
 /// The stored spelling of a path that may no longer exist: canonicalizes the
@@ -114,10 +101,9 @@ fn starts_with_drive_letter(s: &str) -> bool {
 /// Linux a root reached through a symlinked parent (`/home` → `/mnt/home`)
 /// makes every removal a no-op without this.
 ///
-/// **The caller must have screened `path` for representability.** This ends
-/// in lossy [`path_to_db_string`] and the answer is used to *delete*: for a
-/// non-UTF-8 path the key names some other, real file, and deleting by it
-/// takes that file's row and everything under it.
+/// **The caller must have screened `path` for representability.** The key is
+/// used to delete, and a lossy one (see [`path_to_db_string`]) names another,
+/// real file: deleting by it takes that file's row and everything under it.
 pub fn db_key_for_missing_path(path: &Path) -> String {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = path;
@@ -135,7 +121,7 @@ pub fn db_key_for_missing_path(path: &Path) -> String {
                 tail.push(name.to_os_string());
                 cursor = parent;
             }
-            // Nothing above resolves — the raw spelling is the best key left.
+            // Nothing above resolves: the raw spelling is the best key left.
             _ => return path_to_db_string(path),
         }
     }
@@ -143,12 +129,12 @@ pub fn db_key_for_missing_path(path: &Path) -> String {
 
 /// Render a directory as the string stored in `files.parent`.
 ///
-/// **`files.parent` always ends in the platform separator**, and that is the
-/// invariant the whole schema rests on:
+/// `files.parent` always ends in the platform separator, the invariant the
+/// whole schema rests on:
 ///
-/// * A file's path is `parent` concatenated with `name` — no separator logic
-///   at the join, and so no special case for `/` or `C:\`, whose children
-///   would otherwise be spelled `//x` and `C:\\x`.
+/// * A file's path is `parent` concatenated with `name`, with no separator
+///   logic at the join, and so no special case for `/` or `C:\`, whose
+///   children would otherwise be spelled `//x` and `C:\\x`.
 /// * A root's subtree is the single range `[root + SEP, root + succ(SEP))`,
 ///   because the root's *own* parent is `root + SEP` rather than `root`. With
 ///   a bare `root` there is no such range: strings between `root` and
@@ -156,8 +142,8 @@ pub fn db_key_for_missing_path(path: &Path) -> String {
 pub(crate) fn dir_to_db_parent(dir: &Path) -> String {
     let mut s = path_to_db_string(dir);
     // The platform's own separator only. On Unix `\` is an ordinary filename
-    // character, so a directory genuinely named `weird\` must still get its
-    // `/` — testing both separators would leave that row unjoinable.
+    // character, so a directory named `weird\` must still get its `/`;
+    // testing both separators would leave that row unjoinable.
     if !s.ends_with(std::path::MAIN_SEPARATOR) {
         s.push(std::path::MAIN_SEPARATOR);
     }
@@ -174,8 +160,8 @@ pub fn split_db_path(path: &str) -> Option<(&str, &str)> {
 }
 
 /// Paths a walk could not read. A full run deletes rows for everything it did
-/// not see, so "could not read" and "gone" must not look alike — an unplugged
-/// drive would otherwise silently delete its whole subtree from the index.
+/// not see, so "could not read" and "gone" must not look alike, or an
+/// unplugged drive would silently delete its whole subtree from the index.
 #[derive(Debug, Default)]
 pub struct UnreadableDirs {
     dirs: Mutex<Vec<std::path::PathBuf>>,
@@ -198,12 +184,10 @@ impl UnreadableDirs {
     /// Containment is by path component, never by string prefix: a
     /// `str::starts_with` would match a sibling (`/a/bc` under `/a/b`).
     pub fn covers(&self, path: &str) -> bool {
-        let dirs = crate::lock_ok(&self.dirs);
-        if dirs.is_empty() {
-            return false;
-        }
         let path = Path::new(path);
-        dirs.iter().any(|d| path.starts_with(d))
+        crate::lock_ok(&self.dirs)
+            .iter()
+            .any(|d| path.starts_with(d))
     }
 }
 
@@ -253,7 +237,7 @@ fn walk_entries<'a>(
         .follow_links(follow_symlinks)
         // walkdir defaults this to *true*, independently of `follow_links`:
         // without it a root that is itself a symlink gets descended even when
-        // following is off, and rows land under the target's real path —
+        // following is off, and rows land under the target's real path,
         // possibly outside every sweep range, orphans until a rebuild.
         .follow_root_links(follow_symlinks)
         .into_iter()
@@ -275,8 +259,8 @@ fn walk_entries<'a>(
         // A symlink is an entry in its own right when following is off, and
         // `walk_filter` cannot drop it (it passes depth 0 unconditionally).
         // Yielding it would index the link as a file under the target's real
-        // path — outside every root, a row no sweep range covers. No cost
-        // when following is on: walkdir resolves links then.
+        // path, outside every root, a row no sweep range covers. No cost when
+        // following is on: walkdir resolves links then.
         .filter(move |e| follow_symlinks || !e.file_type().is_symlink())
 }
 

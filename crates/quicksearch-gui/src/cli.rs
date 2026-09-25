@@ -30,28 +30,26 @@ USAGE:
 
 FLAGS:
     --toggle        bring the running GUI forward with the search box
-                    focused, starting it if none is running. Bind a key to
-                    this in your desktop's keyboard settings for a
-                    system-wide search shortcut.
-    --fuzzy         also run the fuzzy filename/full-text passes
+                    focused, or start it. Bind a key to this in your
+                    desktop's keyboard settings for a system-wide shortcut.
+    --fuzzy         also run the fuzzy filename and full-text passes
     --limit <N>     maximum results (default: [search].display_limit)
-    --long          rank, size, mtime, and snippets instead of bare paths
+    --long          rank, size, mtime and snippets instead of bare paths
     -h, --help      this help
     -V, --version   version and the commit it was built from
 
-Query syntax matches the GUI: plain words form one phrase; filters like
-type:Document, modified:>=2024-01-01, path:/dir, mime:application/pdf,
+Query syntax matches the GUI: plain words form one phrase, and filters such
+as type:Document, modified:>=2024-01-01, path:/dir, mime:application/pdf and
 name:frag combine with it.
 
 A password-protected index unlocks from, in order: the OS keychain (when
-'remember on this device' is enabled in the GUI), the QUICKSEARCH_PASSWORD
-environment variable, or an interactive prompt. Note that environment
-variables are visible to other processes of the same user.";
+'Remember on this device' is on in the GUI), the QUICKSEARCH_PASSWORD
+environment variable, or a prompt. Other processes of the same user can
+read environment variables.";
 
-/// Parse argv; `Some(exit_code)` for CLI-mode, `None` to open the GUI.
-///
-/// Invariant: terminal mode never builds an `IndexCoordinator` — a one-shot
-/// query must not compete for the per-user inotify budget with a running GUI.
+/// Parses argv; `Some(exit_code)` for CLI mode, `None` to open the GUI.
+/// Terminal mode never builds an `IndexCoordinator`: a one-shot query must
+/// not compete for the per-user inotify budget with a running GUI.
 pub fn maybe_run_cli() -> Option<i32> {
     run_cli(std::env::args().skip(1).collect())
 }
@@ -75,20 +73,17 @@ fn run_cli(args: Vec<String>) -> Option<i32> {
             }
             "--fuzzy" => fuzzy = true,
             "--long" => long = true,
-            "--limit" => match it.next().and_then(|v| v.parse().ok()) {
-                Some(n) => limit = Some(n),
-                None => {
+            other if other == "--limit" || other.starts_with("--limit=") => {
+                let value = match other.strip_prefix("--limit=") {
+                    Some(v) => Some(v.to_string()),
+                    None => it.next(),
+                };
+                let Some(n) = value.and_then(|v| v.parse().ok()) else {
                     eprintln!("--limit requires a number\n\n{}", USAGE);
                     return Some(2);
-                }
-            },
-            other if other.starts_with("--limit=") => match other["--limit=".len()..].parse() {
-                Ok(n) => limit = Some(n),
-                Err(_) => {
-                    eprintln!("--limit requires a number\n\n{}", USAGE);
-                    return Some(2);
-                }
-            },
+                };
+                limit = Some(n);
+            }
             other if other.starts_with('-') && terms.is_empty() => {
                 // Unknown flags may be eframe/winit flags: fall through to the GUI.
                 return None;
@@ -103,7 +98,7 @@ fn run_cli(args: Vec<String>) -> Option<i32> {
     Some(run_query(&terms.join(" "), fuzzy, limit, long))
 }
 
-/// Unlock a protected index: keychain → `QUICKSEARCH_PASSWORD` →
+/// Unlocks a protected index: keychain → `QUICKSEARCH_PASSWORD` →
 /// interactive prompt (three attempts) → an instructive error. Password
 /// buffers are zeroized on drop and consumed immediately by the KDF;
 /// nothing here retains or logs them.
@@ -121,40 +116,31 @@ pub(crate) fn resolve_key(
     let salt = security.salt_bytes()?;
 
     if let Some(hex) = keychain_hex {
-        match IndexKey::from_hex(&hex).map_err(|e| format!("keychain entry: {}", e)) {
-            Ok(key) => match try_key(key) {
+        match IndexKey::from_hex(&hex) {
+            Ok(key) => match attempt(&mut try_key, key) {
                 Ok(()) => return Ok(()),
-                Err(e) => match mismatch_cause(&e) {
-                    Some((db::KeyMismatch::WrongPassword, _)) => {
-                        eprintln!(
-                            "warning: the key remembered in the OS keychain no longer \
-                             opens this index"
-                        );
-                    }
-                    // Not a stale entry: say which, then fall through.
-                    Some((_, detail)) => eprintln!("warning: {}", detail),
-                    None => return Err(e),
-                },
+                Err(Rejection::WrongPassword) => eprintln!(
+                    "warning: the key remembered in the OS keychain no longer opens this index"
+                ),
+                // Not a stale entry: say which, then fall through.
+                Err(Rejection::Mismatch(detail)) => eprintln!("warning: {}", detail),
+                Err(Rejection::Fatal(e)) => return Err(e),
             },
-            Err(e) => eprintln!("warning: {}", e),
+            Err(e) => eprintln!("warning: keychain entry: {}", e),
         }
     }
 
     if let Some(password) = env_password {
         let key = derive_key(&password, &salt);
         drop(password);
-        return match try_key(key) {
-            Ok(()) => Ok(()),
-            Err(e) => match mismatch_cause(&e) {
-                Some((db::KeyMismatch::WrongPassword, _)) => Err(format!(
-                    "{} does not match this index's password",
-                    PASSWORD_ENV
-                )),
-                // Don't blame the env var for a cause that is not about it.
-                Some((_, detail)) => Err(detail),
-                None => Err(e),
-            },
-        };
+        return attempt(&mut try_key, key).map_err(|rejection| match rejection {
+            Rejection::WrongPassword => {
+                format!("{} does not match this index's password", PASSWORD_ENV)
+            }
+            // Don't blame the env var for a cause that is not about it.
+            Rejection::Mismatch(detail) => detail,
+            Rejection::Fatal(e) => e,
+        });
     }
 
     if !is_tty {
@@ -170,25 +156,38 @@ pub(crate) fn resolve_key(
         };
         let key = derive_key(&password, &salt);
         drop(password);
-        match try_key(key) {
+        match attempt(&mut try_key, key) {
             Ok(()) => return Ok(()),
-            Err(e) => match mismatch_cause(&e) {
-                // Only a wrong password is worth another attempt; the other
-                // causes are facts about the index, and retrying makes the
-                // user type a *correct* password twice more.
-                Some((db::KeyMismatch::WrongPassword, _)) => eprintln!("Wrong password."),
-                Some((_, detail)) => return Err(detail),
-                None => return Err(e),
-            },
+            // Only a wrong password is worth another attempt; the other
+            // causes are facts about the index, and retrying makes the user
+            // type a *correct* password twice more.
+            Err(Rejection::WrongPassword) => eprintln!("Wrong password."),
+            Err(Rejection::Mismatch(e) | Rejection::Fatal(e)) => return Err(e),
         }
     }
     Err("wrong password (3 attempts)".to_string())
 }
 
-/// [`db::key_mismatch_parts`] with the detail copied out, so a caller can
-/// hand the original error back on the `None` arm without a borrow conflict.
-fn mismatch_cause(error: &str) -> Option<(db::KeyMismatch, String)> {
-    db::key_mismatch_parts(error).map(|(cause, detail)| (cause, detail.to_string()))
+/// Why [`attempt`] turned a key down.
+enum Rejection {
+    /// Wrong for this index: another password may be worth a try.
+    WrongPassword,
+    /// A key mismatch not about the password; says which.
+    Mismatch(String),
+    /// Not a key mismatch at all (the database vanished, say).
+    Fatal(String),
+}
+
+/// Tries one key, sorting a failure by what it means for the next source.
+fn attempt(
+    try_key: &mut impl FnMut(IndexKey) -> Result<(), String>,
+    key: IndexKey,
+) -> Result<(), Rejection> {
+    try_key(key).map_err(|e| match db::key_mismatch_parts(&e) {
+        Some((db::KeyMismatch::WrongPassword, _)) => Rejection::WrongPassword,
+        Some((_, detail)) => Rejection::Mismatch(detail.to_string()),
+        None => Rejection::Fatal(e),
+    })
 }
 
 /// [`resolve_key`] wired to the real terminal, environment and keychain.
@@ -323,9 +322,9 @@ fn run_query(query: &str, fuzzy: bool, limit: Option<usize>, long: bool) -> i32 
     }
 }
 
-/// Whether ANSI escapes will actually render. On Windows the console only
-/// interprets escapes once `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set;
-/// anything that refuses gets plain text rather than a screen of `\x1b[1m`.
+/// Whether ANSI escapes will render. On Windows the console only interprets
+/// them once `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is set; anything that
+/// refuses gets plain text rather than a screen of `\x1b[1m`.
 #[cfg(not(windows))]
 fn enable_vt() -> bool {
     true
@@ -376,10 +375,10 @@ fn render_snippet(snip: &quicksearch_core::snippet::Snippet, color: bool, tty: b
         push(&mut out, &snip.window[cursor..start]);
         if color {
             out.push_str("\x1b[1m");
-            push(&mut out, &snip.window[start..end]);
+        }
+        push(&mut out, &snip.window[start..end]);
+        if color {
             out.push_str("\x1b[0m");
-        } else {
-            push(&mut out, &snip.window[start..end]);
         }
         cursor = end;
     }

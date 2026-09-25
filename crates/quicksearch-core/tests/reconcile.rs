@@ -2,8 +2,8 @@
 //! configuration.
 //!
 //! Every test also pins `schema_info.created_at`, which only a wipe can
-//! change: losing the index file is silent — the next run rebuilds and
-//! everything looks fine, hours later.
+//! change: losing the index file is otherwise silent, because the next run
+//! rebuilds it.
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -13,9 +13,10 @@ use quicksearch_core::config::{diff_actions, Config};
 use quicksearch_core::db;
 use quicksearch_core::extract::Registry;
 use quicksearch_core::scope::{advance, WorkCursor, SLICE};
+use quicksearch_core::testutil::Scratch;
 
 mod common;
-use common::{scratch_dir_canonical as tmp_dir, touch};
+use common::touch;
 
 fn index_once(db: &Path, config: &Config) {
     common::IndexOnce {
@@ -58,7 +59,7 @@ fn conn(db: &Path) -> rusqlite::Connection {
     rusqlite::Connection::open(db).unwrap()
 }
 
-/// Every indexed path, in **path** order — not the index's own
+/// Every indexed path, sorted by path rather than by the index's own
 /// `(parent, name)` order, which groups by directory.
 fn paths(db: &Path) -> Vec<String> {
     let c = conn(db);
@@ -70,6 +71,20 @@ fn paths(db: &Path) -> Vec<String> {
         .collect();
     out.sort();
     out
+}
+
+/// The file names of [`paths`], in the same order.
+fn names(db: &Path) -> Vec<String> {
+    paths(db)
+        .iter()
+        .map(|p| {
+            Path::new(p)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
 }
 
 fn count(db: &Path, sql: &str) -> i64 {
@@ -138,8 +153,8 @@ fn base_config(root: &Path, db: &Path) -> Config {
 
 #[test]
 fn adding_an_ignore_pattern_prunes_instead_of_rebuilding() {
-    let root = tmp_dir("ignore-add");
-    let db_dir = tmp_dir("ignore-add-db");
+    let root = Scratch::canonical("ignore-add");
+    let db_dir = Scratch::canonical("ignore-add-db");
     let db = db_dir.join("index.sqlite");
     tree(&root);
 
@@ -154,17 +169,7 @@ fn adding_an_ignore_pattern_prunes_instead_of_rebuilding() {
     let (deleted, _) = reconcile(&db, &old, &new);
 
     assert_eq!(deleted, 2, "the log and the dependency");
-    assert_eq!(
-        paths(&db)
-            .iter()
-            .map(|p| Path::new(p)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned())
-            .collect::<Vec<_>>(),
-        vec!["keep2.txt", "keep.txt", "notes.md"]
-    );
+    assert_eq!(names(&db), vec!["keep2.txt", "keep.txt", "notes.md"]);
     assert_eq!(
         residue(&db),
         (3, 3),
@@ -180,15 +185,12 @@ fn adding_an_ignore_pattern_prunes_instead_of_rebuilding() {
         "the ignored file's content is no longer findable"
     );
     assert_eq!(created_at(&db), born, "the index was not rebuilt");
-
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }
 
 #[test]
 fn removing_an_ignore_pattern_reindexes_and_deletes_nothing() {
-    let root = tmp_dir("ignore-remove");
-    let db_dir = tmp_dir("ignore-remove-db");
+    let root = Scratch::canonical("ignore-remove");
+    let db_dir = Scratch::canonical("ignore-remove-db");
     let db = db_dir.join("index.sqlite");
     tree(&root);
 
@@ -210,17 +212,14 @@ fn removing_an_ignore_pattern_reindexes_and_deletes_nothing() {
     index_once(&db, &new);
     assert_eq!(paths(&db).len(), 5, "the walk found the log");
     assert_eq!(created_at(&db), born, "the index was not rebuilt");
-
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }
 
 #[test]
 fn removing_a_root_takes_only_its_own_entries() {
-    let base = tmp_dir("roots");
+    let base = Scratch::canonical("roots");
     let kept = base.join("kept");
     let dropped = base.join("dropped");
-    let db_dir = tmp_dir("roots-db");
+    let db_dir = Scratch::canonical("roots-db");
     let db = db_dir.join("index.sqlite");
     touch(&kept.join("a.txt"), b"alpha");
     touch(&kept.join("sub/b.txt"), b"bravo");
@@ -253,17 +252,14 @@ fn removing_a_root_takes_only_its_own_entries() {
     assert_eq!(residue(&db), (2, 2), "the kept root keeps its text");
     assert_eq!(orphans(&db), 0, "nothing left behind");
     assert_eq!(created_at(&db), born, "the index was not rebuilt");
-
-    std::fs::remove_dir_all(&base).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }
 
 #[test]
 fn adding_a_root_keeps_everything_already_indexed() {
-    let base = tmp_dir("root-add");
+    let base = Scratch::canonical("root-add");
     let first = base.join("first");
     let second = base.join("second");
-    let db_dir = tmp_dir("root-add-db");
+    let db_dir = Scratch::canonical("root-add-db");
     let db = db_dir.join("index.sqlite");
     touch(&first.join("a.txt"), b"alpha");
     touch(&second.join("b.txt"), b"bravo");
@@ -286,15 +282,12 @@ fn adding_a_root_keeps_everything_already_indexed() {
     index_once(&db, &new);
     assert_eq!(paths(&db).len(), 2);
     assert_eq!(created_at(&db), born, "the index was not rebuilt");
-
-    std::fs::remove_dir_all(&base).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }
 
 #[test]
 fn narrowing_content_extensions_keeps_the_file_findable_by_name() {
-    let root = tmp_dir("content");
-    let db_dir = tmp_dir("content-db");
+    let root = Scratch::canonical("content");
+    let db_dir = Scratch::canonical("content-db");
     let db = db_dir.join("index.sqlite");
     touch(&root.join("notes.md"), b"markdown body");
     touch(&root.join("readme.txt"), b"plain body");
@@ -335,16 +328,13 @@ fn narrowing_content_extensions_keeps_the_file_findable_by_name() {
     index_once(&db, &old);
     assert_eq!(residue(&db).0, 2, "its text came back");
     assert_eq!(created_at(&db), born, "the index was never rebuilt");
-
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }
 
 /// On again re-extracts: the text of files already indexed was never kept.
 #[test]
 fn store_text_toggles_without_losing_full_text_search() {
-    let root = tmp_dir("store-text");
-    let db_dir = tmp_dir("store-text-db");
+    let root = Scratch::canonical("store-text");
+    let db_dir = Scratch::canonical("store-text-db");
     let db = db_dir.join("index.sqlite");
     touch(&root.join("a.txt"), b"alpha unique-token");
 
@@ -370,15 +360,12 @@ fn store_text_toggles_without_losing_full_text_search() {
     index_once(&db, &on);
     assert_eq!(residue(&db).1, 1, "text re-extracted");
     assert_eq!(created_at(&db), born, "the index was never rebuilt");
-
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }
 
 #[test]
 fn turning_hidden_files_off_prunes_whole_hidden_subtrees() {
-    let root = tmp_dir("hidden");
-    let db_dir = tmp_dir("hidden-db");
+    let root = Scratch::canonical("hidden");
+    let db_dir = Scratch::canonical("hidden-db");
     let db = db_dir.join("index.sqlite");
     touch(&root.join("visible.txt"), b"alpha");
     touch(&root.join(".config/app/settings.txt"), b"bravo");
@@ -394,23 +381,10 @@ fn turning_hidden_files_off_prunes_whole_hidden_subtrees() {
     off.indexing.include_hidden = false;
     let (deleted, _) = reconcile(&db, &on, &off);
     assert_eq!(deleted, 2);
-    assert_eq!(
-        paths(&db)
-            .iter()
-            .map(|p| Path::new(p)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned())
-            .collect::<Vec<_>>(),
-        vec!["visible.txt"]
-    );
+    assert_eq!(names(&db), vec!["visible.txt"]);
     assert_eq!(residue(&db), (1, 1));
     assert_eq!(orphans(&db), 0);
     assert_eq!(created_at(&db), born, "the index was not rebuilt");
-
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }
 
 /// A followed symlink's target is stored under its own canonical path, which
@@ -420,10 +394,10 @@ fn turning_hidden_files_off_prunes_whole_hidden_subtrees() {
 #[cfg(unix)]
 #[test]
 fn a_symlink_target_outside_every_root_survives_a_prune() {
-    let base = tmp_dir("alias");
+    let base = Scratch::canonical("alias");
     let indexed = base.join("indexed");
     let neighbour = base.join("neighbour");
-    let db_dir = tmp_dir("alias-db");
+    let db_dir = Scratch::canonical("alias-db");
     let db = db_dir.join("index.sqlite");
     touch(&indexed.join("a.txt"), b"alpha");
     touch(&indexed.join("sub/b.log"), b"bravo");
@@ -451,24 +425,21 @@ fn a_symlink_target_outside_every_root_survives_a_prune() {
     reconcile(&db, &old, &new);
 
     // `**` matches every component, so everything under the configured root
-    // goes — and only that. The target, which lives outside it, stays.
+    // goes, and only that. The target, which lives outside it, stays.
     assert_eq!(paths(&db), vec![target]);
     assert_eq!(orphans(&db), 0, "nothing left behind");
     assert_eq!(created_at(&db), born, "the index was not rebuilt");
-
-    std::fs::remove_dir_all(&base).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }
 
-/// Rows for out-of-root targets are reached by no walk and no stale sweep —
-/// the reason this setting used to force a wipe.
+/// Rows for out-of-root targets are reached by no walk and no stale sweep, so
+/// only the reconcile can remove them.
 #[cfg(unix)]
 #[test]
 fn turning_symlinks_off_reaches_targets_outside_the_roots() {
-    let base = tmp_dir("links-off");
+    let base = Scratch::canonical("links-off");
     let indexed = base.join("indexed");
     let neighbour = base.join("neighbour");
-    let db_dir = tmp_dir("links-off-db");
+    let db_dir = Scratch::canonical("links-off-db");
     let db = db_dir.join("index.sqlite");
     touch(&indexed.join("a.txt"), b"alpha");
     touch(&neighbour.join("target.txt"), b"bravo outside");
@@ -488,19 +459,16 @@ fn turning_symlinks_off_reaches_targets_outside_the_roots() {
     assert_eq!(paths(&db), vec![indexed.join("a.txt").to_string_lossy()]);
     assert_eq!(orphans(&db), 0);
     assert_eq!(created_at(&db), born, "the index was not rebuilt");
-
-    std::fs::remove_dir_all(&base).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }
 
 /// A config changed while the app was not running is reconciled by the next
 /// run, from the `config_validation` record of what the index was built with.
 #[test]
 fn a_run_reconciles_a_config_edited_while_it_was_closed() {
-    let base = tmp_dir("offline");
+    let base = Scratch::canonical("offline");
     let kept = base.join("kept");
     let dropped = base.join("dropped");
-    let db_dir = tmp_dir("offline-db");
+    let db_dir = Scratch::canonical("offline-db");
     let db = db_dir.join("index.sqlite");
     touch(&kept.join("a.txt"), b"alpha");
     touch(&dropped.join("b.txt"), b"bravo");
@@ -525,17 +493,14 @@ fn a_run_reconciles_a_config_edited_while_it_was_closed() {
     assert_eq!(residue(&db), (1, 1));
     assert_eq!(orphans(&db), 0);
     assert_eq!(created_at(&db), born, "the index was not rebuilt");
-
-    std::fs::remove_dir_all(&base).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }
 
 /// The run-start pass and the coordinator's pass can both fire for one edit;
 /// a plan that is not idempotent would delete rows the walk just re-added.
 #[test]
 fn reconciling_is_idempotent() {
-    let root = tmp_dir("idempotent");
-    let db_dir = tmp_dir("idempotent-db");
+    let root = Scratch::canonical("idempotent");
+    let db_dir = Scratch::canonical("idempotent-db");
     let db = db_dir.join("index.sqlite");
     tree(&root);
 
@@ -552,7 +517,4 @@ fn reconciling_is_idempotent() {
     let second = reconcile(&db, &old, &new);
     assert_eq!(second, (0, 0), "the second pass found nothing left to do");
     assert_eq!(paths(&db), after_first);
-
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&db_dir).ok();
 }

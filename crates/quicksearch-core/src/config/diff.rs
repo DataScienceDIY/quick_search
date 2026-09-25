@@ -9,9 +9,9 @@ use super::*;
 /// configuration, short of deleting and rebuilding it.
 ///
 /// Every field is independently satisfiable and applying the whole is
-/// idempotent — which is what lets the same plan come from a live edit and
-/// from the `config_validation` fingerprint of a config hand-edited while
-/// the app was closed. [`crate::scope`] applies it.
+/// idempotent, so the same plan can come from a live edit or from the
+/// `config_validation` fingerprint of a config hand-edited while the app was
+/// closed. [`crate::scope`] applies it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IndexWork {
     /// Deconfigured roots, in stored spelling. Purely a row delete: a root
@@ -20,16 +20,15 @@ pub struct IndexWork {
     /// Ignore/hidden rules narrowed; surviving rows are re-tested.
     pub prune_scope: bool,
     /// Symlink following turned off. A followed target is stored under its
-    /// own canonical path, which can be outside every root — with links off
-    /// no walk and no root range would ever reach it again, so every row
-    /// outside the roots goes.
+    /// own canonical path, which can be outside every root; with links off no
+    /// walk and no root range would ever reach it again, so every row outside
+    /// the roots goes.
     pub drop_aliases: bool,
-    /// `content_extensions` or `maximum_text_file_size` changed. Re-tested
-    /// both ways: newly-included files go back to pending, newly-excluded
-    /// ones give up text and FTS but keep the name/path row filename search
-    /// needs. Both settings decide the same thing — whether a file's text is
-    /// read — and [`crate::scope::advance`] re-runs the whole predicate,
-    /// size included, so one flag covers them.
+    /// `content_extensions` or `maximum_text_file_size` changed. Both decide
+    /// whether a file's text is read, and [`crate::scope::advance`] re-runs
+    /// the whole predicate, so one flag covers them. Newly included rows go
+    /// back to pending; newly excluded ones lose text and FTS but keep their
+    /// row.
     pub reconcile_content: bool,
     /// `store_text_for_snippets` turned on; rows extracted under the old
     /// setting kept no text, so they must run again.
@@ -45,9 +44,9 @@ impl IndexWork {
         *self == IndexWork::default()
     }
 
-    /// Fold `other` in so one pass satisfies both — for an edit arriving
-    /// while the previous one is still being applied. The union is the only
-    /// thing certainly enough, and every part is idempotent.
+    /// Fold `other` in so one pass satisfies both, for an edit arriving while
+    /// the previous one is still being applied. The union is the only thing
+    /// certainly enough, and every part is idempotent.
     pub fn merge_from(&mut self, other: &IndexWork) {
         for root in &other.drop_roots {
             if !self.drop_roots.contains(root) {
@@ -80,32 +79,23 @@ impl IndexWork {
 
     /// The plan in one line for the log, naming what changed.
     pub fn summary(&self) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if !self.drop_roots.is_empty() {
-            parts.push(format!(
-                "{} root(s) no longer indexed",
-                self.drop_roots.len()
-            ));
-        }
-        if self.prune_scope {
-            parts.push("narrowed ignore or hidden-file rules".into());
-        }
-        if self.drop_aliases {
-            parts.push("symlinks no longer followed".into());
-        }
-        if self.reconcile_content {
-            // Either setting that decides it; the flag does not say which,
-            // and the effect on the index is the same line of work.
-            parts.push("changed which files have their text read".into());
-        }
-        if self.restore_text {
-            parts.push("snippet text turned on".into());
-        }
-        if self.drop_text {
-            parts.push("snippet text turned off".into());
-        }
+        let roots = format!("{} root(s) no longer indexed", self.drop_roots.len());
+        let parts: Vec<&str> = [
+            (!self.drop_roots.is_empty(), roots.as_str()),
+            (self.prune_scope, "narrowed ignore or hidden-file rules"),
+            (self.drop_aliases, "symlinks no longer followed"),
+            (
+                self.reconcile_content,
+                "changed which files have their text read",
+            ),
+            (self.restore_text, "snippet text turned on"),
+            (self.drop_text, "snippet text turned off"),
+        ]
+        .into_iter()
+        .filter_map(|(changed, part)| changed.then_some(part))
+        .collect();
         if parts.is_empty() {
-            // `touches_index` is false here, so no caller logs it today.
+            // `touches_index` is false here, so no caller logs it.
             return "no stored rows affected".into();
         }
         parts.join("; ")
@@ -127,7 +117,7 @@ pub struct ConfigActions {
 /// Roots inside other roots, as `(child, parent)` pairs (exact duplicates
 /// reported once). Disallowed because one walker per root would race for the
 /// same files and split progress. Compared on best-effort canonicalized
-/// paths — an unresolvable root is compared as spelled.
+/// paths; an unresolvable root is compared as spelled.
 pub fn nested_roots(roots: &[String]) -> Vec<(String, String)> {
     let resolved: Vec<PathBuf> = roots
         .iter()
@@ -158,27 +148,31 @@ fn content_filter_set(list: &[String]) -> BTreeSet<String> {
         .collect()
 }
 
-/// Whether `new` accepts everything `old` did and more.
+/// Whether `new` accepts something `old` did not.
 ///
-/// Trap: an empty list means "no filter, everything allowed" — a superset of
+/// Trap: an empty list means "no filter, everything allowed", a superset of
 /// every other list, which plain set arithmetic gets backwards.
 fn filter_widened(old: &BTreeSet<String>, new: &BTreeSet<String>) -> bool {
-    match (old.is_empty(), new.is_empty()) {
-        (_, true) => !old.is_empty(),
-        (true, false) => false,
-        (false, false) => new.difference(old).next().is_some(),
-    }
+    !old.is_empty() && (new.is_empty() || !new.is_subset(old))
+}
+
+/// The ignore patterns as a set, whitespace-trimmed as they compile.
+fn ignore_set(c: &Config) -> BTreeSet<&str> {
+    c.indexing
+        .ignore_patterns
+        .iter()
+        .map(|s| s.trim())
+        .collect()
 }
 
 /// What an edit means for the running services and the stored index.
 ///
 /// The rule: a wipe is only for data that can no longer be read or compared;
 /// everything else is a difference, and differences reconcile. Roots, ignore
-/// patterns and content extensions compare as **sets** after normalization,
+/// patterns and content extensions compare as sets after normalization,
 /// so reordering or re-spelling is not a change.
 pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
-    let old_roots = old.normalized_indexing_paths();
-    let new_roots = new.normalized_indexing_paths();
+    let search_db_changed = old.paths.database_path != new.paths.database_path;
 
     // The only three: a different key makes the file unreadable, the
     // tokenizer is baked into the FTS table definition, and `hash_length`
@@ -188,69 +182,57 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
         || old.processing.tokenize != new.processing.tokenize
         || old.security.password_protected != new.security.password_protected
         || old.security.salt != new.security.salt;
+    if requires_rebuild {
+        return ConfigActions {
+            requires_rebuild,
+            work: IndexWork::default(),
+            search_db_changed,
+        };
+    }
 
-    let mut work = IndexWork::default();
-    if !requires_rebuild {
-        work.drop_roots = old_roots.difference(&new_roots).cloned().collect();
+    let (old_roots, new_roots) = (
+        old.normalized_indexing_paths(),
+        new.normalized_indexing_paths(),
+    );
+    let (old_ignores, new_ignores) = (ignore_set(old), ignore_set(new));
+    let (old_idx, new_idx) = (&old.indexing, &new.indexing);
+    let old_content = content_filter_set(&old_idx.content_extensions);
+    let new_content = content_filter_set(&new_idx.content_extensions);
+    let old_cap = old.processing.maximum_text_file_size;
+    let new_cap = new.processing.maximum_text_file_size;
+    let old_store = old.processing.store_text_for_snippets;
+    let new_store = new.processing.store_text_for_snippets;
+    let restore_text = !old_store && new_store;
 
-        let old_ignores: BTreeSet<&str> = old
-            .indexing
-            .ignore_patterns
-            .iter()
-            .map(|s| s.trim())
-            .collect();
-        let new_ignores: BTreeSet<&str> = new
-            .indexing
-            .ignore_patterns
-            .iter()
-            .map(|s| s.trim())
-            .collect();
-
+    let work = IndexWork {
+        drop_roots: old_roots.difference(&new_roots).cloned().collect(),
         // Hidden files narrow the walk exactly as an added ignore pattern does.
-        work.prune_scope = new_ignores.difference(&old_ignores).next().is_some()
-            || (old.indexing.include_hidden && !new.indexing.include_hidden);
-
+        prune_scope: !new_ignores.is_subset(&old_ignores)
+            || (old_idx.include_hidden && !new_idx.include_hidden),
         // Symlinks do not: a followed target inside a root is a row a direct
         // walk produces anyway, but one outside every root is stranded where
         // no walk and no per-root scan will look again.
-        work.drop_aliases = old.indexing.follow_symlinks && !new.indexing.follow_symlinks;
-
-        let old_content = content_filter_set(&old.indexing.content_extensions);
-        let new_content = content_filter_set(&new.indexing.content_extensions);
-        let content_widened = filter_widened(&old_content, &new_content);
-
-        // The size cap decides the same thing the extension filter does —
-        // whether a file's text is read — so changing it has to be applied
-        // the same way. Without this a raised cap did nothing to an existing
-        // index: every file already written off as too large stays `NA`,
-        // because nothing re-asks until that file itself changes.
-        let old_cap = old.processing.maximum_text_file_size;
-        let new_cap = new.processing.maximum_text_file_size;
-        work.reconcile_content = old_content != new_content || old_cap != new_cap;
-
-        let old_store = old.processing.store_text_for_snippets;
-        let new_store = new.processing.store_text_for_snippets;
-        work.restore_text = !old_store && new_store;
-        work.drop_text = old_store && !new_store;
-
+        drop_aliases: old_idx.follow_symlinks && !new_idx.follow_symlinks,
+        // See the field: the size cap decides what the extension filter does.
+        reconcile_content: old_content != new_content || old_cap != new_cap,
+        restore_text,
+        drop_text: old_store && !new_store,
         // Widening only adds files, and a file absent from the index is not
-        // findable from it — only a walk produces those rows. Re-extraction
-        // needs a run too: the content pass runs as part of one.
-        work.reindex = new_roots.difference(&old_roots).next().is_some()
-            || old_ignores.difference(&new_ignores).next().is_some()
-            || (!old.indexing.include_hidden && new.indexing.include_hidden)
-            || (!old.indexing.follow_symlinks && new.indexing.follow_symlinks)
-            || content_widened
-            // A raised cap widens the same way an added extension does: the
-            // reconcile puts those rows back to pending, and the content
-            // pass that reads them runs as part of an indexing run.
+        // findable from it: only a walk produces those rows. Re-extraction
+        // needs a run too, since the content pass runs as part of one; a
+        // raised cap widens like an added extension.
+        reindex: !new_roots.is_subset(&old_roots)
+            || !old_ignores.is_subset(&new_ignores)
+            || (!old_idx.include_hidden && new_idx.include_hidden)
+            || (!old_idx.follow_symlinks && new_idx.follow_symlinks)
+            || filter_widened(&old_content, &new_content)
             || new_cap > old_cap
-            || work.restore_text;
-    }
+            || restore_text,
+    };
 
     ConfigActions {
         requires_rebuild,
         work,
-        search_db_changed: old.paths.database_path != new.paths.database_path,
+        search_db_changed,
     }
 }

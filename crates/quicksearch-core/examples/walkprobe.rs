@@ -1,4 +1,5 @@
-//! Times and syscall-counts the phase-1 walk, without touching a database.
+//! Times and syscall-counts the phase-1 walk against an empty scratch index.
+//!
 //! ```text
 //! cargo build -p quicksearch-core --example walkprobe --release
 //! ./target/release/examples/walkprobe <root> parallel   # the threaded walker
@@ -12,10 +13,11 @@
 //!     ./target/release/examples/walkprobe <root> parallel
 //! ```
 //!
-//! Expect ~one `statx` per unchanged file, open/read/close for new or
-//! modified ones, and `readlink` only for the roots — a per-file `readlink`
-//! means a `canonicalize` crept back. Inline extraction is CPU, visible in
+//! Expect about one `statx` per unchanged file, open/read/close for new or
+//! modified ones, and `readlink` only for the roots; a per-file `readlink`
+//! means something calls `canonicalize`. Inline extraction is CPU, visible in
 //! files/sec, not the trace. Compare each mode's second pass.
+
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};

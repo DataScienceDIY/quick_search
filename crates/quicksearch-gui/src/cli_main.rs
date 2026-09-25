@@ -1,4 +1,4 @@
-//! `quicksearch-cli <query>` — terminal search, and nothing else.
+//! `quicksearch-cli <query>`: terminal search, and nothing else.
 //!
 //! A console-subsystem binary, so redirection, pipes, exit codes, and the
 //! shell waiting for the process all behave normally. `src/cli.rs` and

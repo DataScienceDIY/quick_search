@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::test_ui::{click_at, painted_text, painted_text_center, raw_input};
+use crate::test_ui::{click_at, painted_text, painted_text_center, two_pass};
 
 const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
 
@@ -9,36 +9,28 @@ const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
 const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const OTHER: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
 
-/// Two passes: an `egui::Window` is measured on its first frame and placed on
-/// the next, so a single pass paints nothing to read back. Same shape as the
-/// verify modal's test frame.
+/// The reveal modal and the buttons clicked on the frame that painted it.
 fn frame(
     ctx: &egui::Context,
     display: &str,
     events: Vec<egui::Event>,
 ) -> (egui::FullOutput, (bool, bool)) {
-    let _ = ctx.run(raw_input(SCREEN, Vec::new()), |ctx| {
-        reveal_key_modal(ctx, display);
-    });
     let mut buttons = (false, false);
-    let out = ctx.run(raw_input(SCREEN, events), |ctx| {
+    let out = two_pass(ctx, SCREEN, events, |ctx| {
         buttons = reveal_key_modal(ctx, display);
     });
     (out, buttons)
 }
 
-/// The confirmation half, in the same two passes.
+/// The confirmation half, the same way.
 fn confirm_frame(
     ctx: &egui::Context,
     pw: &mut String,
     wrong: bool,
     events: Vec<egui::Event>,
 ) -> (egui::FullOutput, (bool, bool)) {
-    let _ = ctx.run(raw_input(SCREEN, Vec::new()), |ctx| {
-        confirm_key_modal(ctx, pw, wrong);
-    });
     let mut buttons = (false, false);
-    let out = ctx.run(raw_input(SCREEN, events), |ctx| {
+    let out = two_pass(ctx, SCREEN, events, |ctx| {
         buttons = confirm_key_modal(ctx, pw, wrong);
     });
     (out, buttons)
@@ -170,7 +162,7 @@ fn the_reveal_shows_the_layout_the_index_was_built_under() {
     );
 }
 
-/// A tool cannot be told "HMAC off" in prose — it needs the pragma. The hint
+/// A tool cannot be told "HMAC off" in prose; it needs the pragma. The hint
 /// carries it whenever the index is off SQLCipher's default authenticator, and
 /// omits it when there is nothing to say.
 #[test]

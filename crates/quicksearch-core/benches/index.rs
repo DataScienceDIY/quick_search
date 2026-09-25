@@ -16,9 +16,9 @@ fn main() {
     divan::main();
 }
 
-/// Compressing an extracted document — pure CPU that used to sit inside the
-/// `conn_mutex` hold; `batch_*` measures a whole chunk, which is what
-/// `compress_bodies` now does before taking the lock.
+/// Compressing an extracted document: pure CPU, done before the writer takes
+/// the connection. `batch_*` measures a whole chunk, as `Bodies::fill`
+/// compresses one.
 mod zstd_encode {
     use super::*;
 
@@ -70,10 +70,10 @@ mod zstd_encode {
 }
 
 /// What a small text file costs between the MIME sniff and the decode:
-/// `classify` runs twice on identical bytes. Left alone deliberately — the
-/// calls pass different `truncated` flags and genuinely disagree at a
-/// mid-sequence EOF, and the redundancy is under 1% of a cold run;
-/// re-measure here before coupling the layers to share a verdict.
+/// `classify` runs twice on identical bytes, and stays that way. The calls
+/// pass different `truncated` flags and disagree at a mid-sequence EOF, and
+/// the redundancy is under 1% of a cold run; re-measure here before coupling
+/// the layers to share a verdict.
 mod text_pipeline {
     use super::*;
     use std::path::Path;
@@ -106,8 +106,8 @@ mod text_pipeline {
 }
 
 /// The MIME sniff, once per new or changed file: ~180 ns on a text head
-/// against ~2.2 µs for the `classify` next to it — its allocations are not
-/// worth removing, and this group keeps that ratio visible.
+/// against ~2.2 µs for the `classify` next to it, so its allocations are not
+/// worth removing. This group keeps that ratio visible.
 mod mime_sniff {
     use super::*;
     use std::path::Path;
@@ -136,15 +136,12 @@ mod mime_sniff {
     }
 }
 
-
-/// `repo::update_file_basic`'s state narrowing: an NA→NA update — the whole
-/// of a re-run over a text-free tree — pays one statement instead of four.
-/// The pair: `clear_always` reimplements the pre-narrowing shape (the control
-/// that must not move between builds); `narrowed` is the shipped function.
-/// NA→NA is idempotent, so iterations are stable without re-seeding.
-/// DONE→PENDING is deliberately not benched: its statement count is identical
-/// in both shapes (clearing that must happen either way), so there is nothing
-/// to regress.
+/// `repo::update_file_basic`'s state narrowing: an NA→NA update, the whole
+/// of a re-run over a text-free tree, pays one statement instead of four.
+/// `clear_always` clears unconditionally, the control that must not move
+/// between builds; `narrowed` is the shipped function. NA→NA is idempotent,
+/// so iterations are stable without re-seeding. DONE→PENDING is not benched:
+/// it clears in both shapes, so there is nothing to regress.
 mod update_narrowing {
     use super::*;
     use quicksearch_core::db::repo::{self, NewFile};

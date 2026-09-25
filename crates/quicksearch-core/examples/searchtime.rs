@@ -1,6 +1,6 @@
-//! The counterweight to `indexprobe`: every FTS write-side knob buys
-//! indexing time by leaving more segments behind, and a segment is a
-//! b-tree a query has to visit.
+//! Query latency on an existing index, the counterweight to `indexprobe`:
+//! every FTS write-side knob buys indexing time by leaving more segments
+//! behind, and each segment is a b-tree a query visits.
 //!
 //! ```text
 //! cargo build -p quicksearch-core --example searchtime --release
@@ -13,11 +13,10 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use quicksearch_core::query::split::split_for_cascade;
-use quicksearch_core::search::{cascade, SearchHit, SearchOptions};
+use quicksearch_core::search::SearchOptions;
+use quicksearch_core::testutil;
 
 const RUNS: u32 = 5;
 
@@ -39,18 +38,15 @@ fn main() {
     );
     let conn = quicksearch_core::db::open::open_search_reader(&db.to_string_lossy())
         .expect("open the index");
-    // Override the cache ceiling: working set too big, or index too big?
+    // `QSB_CACHE_KIB` overrides the cache ceiling, to tell a working set too
+    // big for the cache from an index too big.
     if let Ok(kib) = std::env::var("QSB_CACHE_KIB") {
         conn.execute_batch(&format!("PRAGMA cache_size = -{};", kib.trim()))
             .expect("set cache_size");
     }
 
-    let segments: i64 = conn
-        .query_row("SELECT COUNT(*) FROM searchabletext_idx", [], |r| r.get(0))
-        .unwrap_or(-1);
-    let rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap_or(-1);
+    let segments = common::count(&conn, "SELECT COUNT(*) FROM searchabletext_idx");
+    let rows = common::count(&conn, "SELECT COUNT(*) FROM files");
     println!(
         "{}  ({} rows, {} segment-index entries)",
         db.display(),
@@ -61,11 +57,10 @@ fn main() {
 
     let mut total = Duration::ZERO;
     for (label, fuzzy, query) in QUERIES {
-        let split = split_for_cascade(query).expect("query parses");
         // The display limit makes this unfair: `scan_pass` stops when the
         // limit fills, and candidates stream in insertion order, so which
-        // documents drew low ids changes bytes read 13x. A limit past the
-        // corpus makes every index do equal work.
+        // documents drew low ids changes bytes read 13x. A `QSB_LIMIT` past
+        // the corpus makes every index do equal work.
         let limit = std::env::var("QSB_LIMIT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -80,12 +75,8 @@ fn main() {
         // Time varying while `rchar` does not means waiting on the disk.
         let io_before = common::Io::read();
         for _ in 0..RUNS {
-            let latest = AtomicU64::new(1);
-            let mut count = 0usize;
-            let mut sink = |h: Vec<SearchHit>| count += h.len();
-            let start = Instant::now();
-            cascade::run(&conn, &split, &options, 1, &latest, &mut sink).expect("cascade runs");
-            best = best.min(start.elapsed());
+            let (took, count) = testutil::run_cascade(&conn, query, &options);
+            best = best.min(took);
             hits = count;
         }
         total += best;

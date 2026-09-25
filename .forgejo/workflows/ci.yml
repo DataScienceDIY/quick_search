@@ -62,8 +62,8 @@ jobs:
       # creates the job container. The capabilities are dropped inside the Test
       # step instead, where nothing can ignore them.
     env:
-      # crates/quicksearch-core/src/config.rs has a test that expects a home
-      # directory and panics without one.
+      # Tests in crates/quicksearch-core/src/config/tests.rs and the GUI tour
+      # expect a home directory and panic without one.
       HOME: /root
       # The highest libc6 version the .deb is allowed to require.
       MAX_GLIBC: '2.35'
@@ -75,8 +75,12 @@ jobs:
         # tagging v0.9.0 against version 0.8.8 would publish a release called
         # v0.9.0 full of 0.8.8 files. Fails in seconds, before anything is built.
         if: startsWith(github.ref, 'refs/tags/v')
+        # Every step that reads the version sources packaging/common.sh, the
+        # same reader the packaging scripts use. bash, because common.sh finds
+        # itself through BASH_SOURCE; -e without pipefail, like the default.
+        shell: bash -e {0}
         run: |
-          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
+          . packaging/common.sh
           tag="${GITHUB_REF#refs/tags/}"
           if [ "v$version" != "$tag" ]; then
               echo "ERROR: tag $tag does not match the workspace version $version." >&2
@@ -133,9 +137,9 @@ jobs:
           || startsWith(github.ref, 'refs/heads/release')
         env:
           RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash -e {0}
         run: |
-          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
-          [ -n "$version" ] || { echo "could not read the version from Cargo.toml" >&2; exit 1; }
+          . packaging/common.sh
           tag="v$version"
           api="${GITHUB_API_URL:-$GITHUB_SERVER_URL/api/v1}"
           at=$(curl -sS -H "Authorization: token $RELEASE_TOKEN" \
@@ -191,7 +195,7 @@ jobs:
       - name: Test
         # Release mode is not a nicety: tests/encrypted.rs derives an Argon2id key
         # at m=64 MiB, t=3, which takes about half a second in release and minutes
-        # in debug. tests/snippet_perf.rs self-skips without QSB_SNIPPET_PERF=1.
+        # in debug.
         #
         # capsh drops CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH from the bounding
         # set before exec. Without that, uid 0 reads a mode-000 file or directory
@@ -280,9 +284,9 @@ jobs:
           || startsWith(github.ref, 'refs/heads/release')
         # A tarball for anyone not installing the .deb, stripped to match what
         # build-deb.sh ships.
+        shell: bash -e {0}
         run: |
-          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
-          [ -n "$version" ] || { echo "could not read the version from Cargo.toml" >&2; exit 1; }
+          . packaging/common.sh
           stage="quicksearch-$version-linux-x86_64"
           mkdir -p "dist/$stage"
           for bin in quicksearch quicksearch-cli; do
@@ -423,9 +427,9 @@ jobs:
           startsWith(github.ref, 'refs/tags/v')
           || startsWith(github.ref, 'refs/heads/Release')
           || startsWith(github.ref, 'refs/heads/release')
+        shell: bash -e {0}
         run: |
-          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
-          [ -n "$version" ] || { echo "could not read the version from Cargo.toml" >&2; exit 1; }
+          . packaging/common.sh
           stage="quicksearch-$version-windows-x86_64"
           mkdir -p "dist/$stage"
           for exe in quicksearch.exe quicksearch-cli.exe; do
@@ -437,13 +441,7 @@ jobs:
           rm -rf "dist/$stage"
           ls -l dist/
 
-      # Not v4, and not plain v3 either. @actions/artifact v2+ (which backs
-      # upload/download-artifact v4) inspects the API host, decides anything that
-      # is not github.com is GitHub Enterprise Server, and refuses outright with
-      # GHESNotSupportedError - it never reaches the server, so whether Forgejo
-      # implements the v4 artifact API is beside the point. Plain v3 runs on
-      # node16, which current Forgejo runner images no longer ship; the
-      # -node20 tags are Forgejo's builds for precisely this combination.
+      # v3-node20, not v4: see the linux job's upload step.
       - uses: actions/upload-artifact@v3-node20
         # Same gate as the packaging steps, for the same `if-no-files-found`
         # reason as the linux job.
@@ -496,6 +494,7 @@ jobs:
         # keeps the release step off any third-party action's release cadence.
         env:
           RELEASE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash -e {0}
         run: |
           api="${GITHUB_API_URL:-$GITHUB_SERVER_URL/api/v1}"
           auth="Authorization: token $RELEASE_TOKEN"
@@ -508,8 +507,7 @@ jobs:
               refs/tags/*)
                   tag="${GITHUB_REF#refs/tags/}" ;;
               *)
-                  version=$(sed -n '/^\[workspace\.package\]/,/^\[/{ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p }' Cargo.toml)
-                  [ -n "$version" ] || { echo "could not read the version from Cargo.toml" >&2; exit 1; }
+                  . packaging/common.sh
                   tag="v$version" ;;
           esac
           echo "release tag: $tag   commit: $GITHUB_SHA"

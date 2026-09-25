@@ -2,15 +2,15 @@
 //!
 //! # Pragma profiles
 //!
-//! **A negative `cache_size` is KiB; a positive one would be a page count.**
-//! A filled cache is glibc arena memory that outlives the connection — see
+//! A negative `cache_size` is KiB; a positive one would be a page count. A
+//! filled cache is glibc arena memory that outlives the connection; see
 //! [`crate::platform::release_free_heap`].
 //!
 //! | Profile | Connection | Lifetime | Cache |
 //! |---|---|---|---|
 //! | [`PRAGMAS_FAST`] | bulk indexer writer | one run | 8 MiB |
 //! | [`PRAGMAS_INCREMENTAL`] | coordinator's writer | released when idle | 4 MiB |
-//! | [`PRAGMAS_SEARCH`] | search worker | held across a typing session | 32 MiB |
+//! | [`pragmas_search`] | search worker | held across a typing session | [`recommended_search_cache_mib`] |
 //! | [`PRAGMAS_READONLY`] | one-shot readers | a single query | 4 MiB |
 //! | [`PRAGMAS_MAINTENANCE`] | VACUUM | one bulk copy | 8 MiB |
 //! | [`PRAGMAS_WALK_READER`] | per-root walk prefetch and content feeder | the run | 1 MiB |
@@ -18,26 +18,19 @@
 //! `PRAGMA mmap_size` is absent from all of them: it would make memory
 //! behaviour differ between protected and unprotected installs.
 //!
-//! `PRAGMA journal_size_limit` is on the three *writing* profiles and on none
-//! of the readers, which cannot set it. Without it the `-wal` keeps its
-//! high-water mark on disk after every checkpoint that is not a successful
-//! TRUNCATE — and a TRUNCATE silently downgrades whenever it cannot take the
-//! reset lock (see [`crate::db::repo::checkpoint_truncate`]), which is most
-//! likely in exactly the case that grew the log. One bad run then leaves a
-//! multi-gigabyte file for every later reader to page around.
-//!
-//! The limit is a backstop, not a second checkpoint: SQLite applies it at the
-//! first commit *after* the log restarts, so the space comes back from
-//! whichever writer touches the index next, with no successful TRUNCATE
-//! anywhere in the story. `repo::journal_size_limit_gives_the_space_back_after_a_blocked_truncate`
-//! is the demonstration. It is spelled out in each profile rather than shared,
-//! because a pragma string cannot interpolate a constant;
-//! `every_writing_profile_bounds_the_log` is what keeps the three in step with
+//! The three *writing* profiles set `PRAGMA journal_size_limit`; readers
+//! cannot. Without it the `-wal` keeps its high-water size after any
+//! checkpoint that is not a successful TRUNCATE, and TRUNCATE silently
+//! downgrades when it cannot take the reset lock
+//! ([`crate::db::repo::checkpoint_truncate`]). SQLite applies the limit at the
+//! first commit after the log restarts, so the next writer reclaims the space.
+//! Each profile spells the value out because pragma strings cannot
+//! interpolate; the tests keep them equal to
 //! [`crate::config::MINIMUM_WAL_SIZE`].
 
 /// The bulk indexer's write connection: one per run, dies with it.
-/// `synchronous = NORMAL` under WAL risks only the last commit on power loss
-/// — acceptable for an index re-derivable from disk.
+/// `synchronous = NORMAL` under WAL risks only the last commit on power loss,
+/// which an index re-derivable from disk can afford.
 pub const PRAGMAS_FAST: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -48,10 +41,11 @@ pub const PRAGMAS_FAST: &str = "
     PRAGMA journal_size_limit = 16777216;
 ";
 
-/// [`PRAGMAS_FAST`] but with `temp_store = FILE`: SQLCipher is compiled
+/// [`PRAGMAS_FAST`] but with `temp_store = FILE`. SQLCipher is compiled
 /// `-DSQLITE_TEMP_STORE=2`, under which anything but an explicit `FILE` puts
-/// temporary databases in memory — and VACUUM builds the replacement database
-/// there, so the indexer's profile would hold a multi-gigabyte index in RAM.
+/// temporary databases in memory, and VACUUM builds its replacement database
+/// there: under the indexer's profile it would hold a multi-gigabyte index in
+/// RAM.
 pub const PRAGMAS_MAINTENANCE: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -62,8 +56,8 @@ pub const PRAGMAS_MAINTENANCE: &str = "
     PRAGMA journal_size_limit = 16777216;
 ";
 
-/// The coordinator's long-lived write connection — whatever its cache
-/// reaches it holds until the coordinator settles, so this bounds it.
+/// The coordinator's long-lived write connection. It holds whatever its cache
+/// reaches until the coordinator settles, so this bounds it.
 pub const PRAGMAS_INCREMENTAL: &str = "
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -74,78 +68,45 @@ pub const PRAGMAS_INCREMENTAL: &str = "
     PRAGMA journal_size_limit = 16777216;
 ";
 
-/// Cache ceiling for an **unencrypted** index, whatever its size.
+/// Cache ceiling for an unencrypted index, whatever its size.
 ///
-/// `benches/search_perf.rs` swept 1 MiB → 256 MiB against corpora from 200k to
-/// 1M files and found no knee at all on a plain index: warm search was flat
-/// within 10% across the whole range, because a page-cache miss there is a
-/// `memcpy` from the OS cache. Only SQLCipher makes a miss expensive — it
-/// caches pages *decrypted*, so a miss re-pays the AES-CBC.
-/// Spending more than this on a plain index buys nothing measurable.
+/// `benches/search_perf.rs` swept 1–256 MiB on 200k–1M files and found no
+/// knee on a plain index, where a page-cache miss is a `memcpy` from the OS
+/// cache. Only SQLCipher makes a miss expensive: it caches pages decrypted,
+/// so a miss pays the AES-CBC again.
 pub const SEARCH_CACHE_PLAIN_MIB: i64 = 16;
 
-/// Floor and ceiling for the **derived** value. The floor is the smallest the
-/// sweep ever found sufficient.
+/// Floor and ceiling for the derived value. The floor is the smallest the
+/// sweep found sufficient.
 ///
-/// The cap is a deliberate limit on resident memory, and it does bind: it is
-/// reached at about 800k files, and beyond that an encrypted index sits under
-/// its knee. Measured at 1M files, whose `files` table is 132 MiB: 205 ms per
-/// keystroke at 128 MiB against 58 ms at 256. That is the trade — a third of a
-/// gigabyte held for the life of a search session, or a 3.5x slower one — and
-/// it is the user's to make, which is what [`SEARCH_CACHE_OVERRIDE_MAX_MIB`]
-/// is for.
+/// The cap limits resident memory and binds at about 800k files, beyond which
+/// an encrypted index sits under its knee: at 1M files (a 132 MiB `files`
+/// table) a keystroke costs 205 ms at 128 MiB against 58 ms at 256. Trading a
+/// third of a gigabyte for a 3.5x faster session is the user's call, through
+/// [`SEARCH_CACHE_OVERRIDE_MAX_MIB`].
 pub const SEARCH_CACHE_MIN_MIB: i64 = 16;
 pub const SEARCH_CACHE_MAX_MIB: i64 = 128;
 
-/// Ceiling on an **explicit** `[search] cache_size_mib`, well above the
-/// automatic cap: capping a manual override at the automatic limit would deny
-/// it in exactly the case that needs it, a large encrypted index whose knee is
-/// past 128 MiB.
+/// Ceiling on an explicit `[search] cache_size_mib`, well above the automatic
+/// cap: the override exists for a large encrypted index whose knee is past
+/// [`SEARCH_CACHE_MAX_MIB`].
 pub const SEARCH_CACHE_OVERRIDE_MAX_MIB: i64 = 1024;
 
-/// Lowering the override ceiling to the automatic one would quietly re-cap the
-/// escape hatch; this refuses to compile instead.
+/// Refuses to compile if the override ceiling drops to the automatic one,
+/// which would re-cap the escape hatch.
 const _: () = assert!(SEARCH_CACHE_OVERRIDE_MAX_MIB > SEARCH_CACHE_MAX_MIB);
 const _: () = assert!(SEARCH_CACHE_MIN_MIB <= SEARCH_CACHE_MAX_MIB);
 
-/// Cache bytes to allow per indexed file, from `benches/search_perf.rs`.
+/// Cache bytes to allow per indexed file: 139 bytes per `files` row times the
+/// 1.21x headroom the sweep found sufficient.
 ///
-/// What every keystroke rescans is the `files` table — `search/cascade/passes`
-/// answers filename queries with `WHERE f.name LIKE '%…%'`, a full table scan
-/// with no FTS in it, and the fuzzy pass rescans with `WHERE 1=1`. So the
-/// working set is that table, its size is linear in row count, and the knee in
-/// the warm curve sits at the first ceiling that holds it. Below the knee an
-/// encrypted index re-decrypts the table on every keystroke and runs 2.4–2.7x
-/// slower; at it, keyed and plain are within 2% of each other.
-///
-/// 139 bytes per row, times the 1.21x the sweep found sufficient. Both halves
-/// were measured, and the product lands on the observed knee exactly:
-///
-/// | corpus | `files` table | knee | ratio | this formula |
-/// |---|---|---|---|---|
-/// | 200k | 26.5 MiB | 32 MiB | 1.21x | 32 MiB |
-/// | 600k | 79.5 MiB | 96 MiB | 1.21x | 96 MiB |
-///
-/// The step is not subtle — keyed at 600k ran 121–130 ms at every ceiling up
-/// to 64 MiB and 33.7 ms at 96.
-///
-/// **Calibrated while [`HMAC_MODE`] was still HMAC-SHA512, and not re-swept
-/// since.** A cache miss is now materially cheaper — `benches/cipher_hmac.rs`
-/// measured warm search 1.78x faster with the authenticator gone — so the
-/// knee this reaches for is shallower than it was, and the recommendation is
-/// therefore *conservative*: it asks for at least as much cache as it needs,
-/// never less. Erring that way is safe for latency and costs only resident
-/// memory. Re-running `benches/search_perf.rs` would likely let both the
-/// bytes-per-file figure and [`SEARCH_CACHE_MAX_MIB`] come down; until someone
-/// does, do not quote the 2.4–2.7x above as current.
-///
-/// **139 B/row assumes ordinary path lengths.** `parent` is stored per row, so
-/// a tree far deeper than the measured one (`/seed/NNN/` plus five segments)
-/// has wider rows and wants more; the narrow shape the older harnesses seeded
-/// measured 69.5 B/row, half of this, and calibrating against it would have
-/// under-sized every index by two. That is what `[search] cache_size_mib`
-/// overrides, and why the GUI shows the recommendation beside it rather than
-/// hiding the arithmetic.
+/// Every keystroke rescans the `files` table (filename queries are a `LIKE`
+/// scan with no FTS), so the working set is that table and the warm curve's
+/// knee sits at the first ceiling that holds it. The sweep, the knee per
+/// corpus and the row-width caveat are in `benches/search_perf.rs`. The
+/// figures predate `HMAC_MODE = Off` (see [`HMAC_MODE`]), which makes this
+/// conservative. 139 B/row assumes ordinary path lengths; a much deeper tree
+/// wants more, which `[search] cache_size_mib` covers.
 pub const SEARCH_CACHE_BYTES_PER_FILE: i64 = 168;
 
 /// The cache ceiling this index wants, in MiB.
@@ -158,22 +119,21 @@ pub fn recommended_search_cache_mib(files: i64, keyed: bool) -> i64 {
 }
 
 /// The search worker's connection, held across a typing session, at an
-/// explicit ceiling — see [`recommended_search_cache_mib`] for why it is not a
-/// constant. The one deliberately large profile.
+/// explicit ceiling: [`recommended_search_cache_mib`], or the user's override.
 pub fn pragmas_search(cache_mib: i64) -> String {
     format!(
         "PRAGMA busy_timeout = 5000;
          PRAGMA cache_size = -{};
          PRAGMA temp_store = MEMORY;
          PRAGMA foreign_keys = ON;",
-        // The *override* ceiling: a caller may legitimately ask for more than
-        // the automatic cap, and only nonsense is refused here.
+        // The override ceiling: a caller may ask for more than the automatic
+        // cap, and only nonsense is refused here.
         cache_mib.clamp(SEARCH_CACHE_MIN_MIB, SEARCH_CACHE_OVERRIDE_MAX_MIB) * 1024
     )
 }
 
-/// The *one-shot* readers. Pragmas safe on a read-only connection, where
-/// `journal_mode` and `synchronous` can't be changed on the file.
+/// The one-shot readers. Pragmas safe on a read-only connection, which cannot
+/// change `journal_mode` or `synchronous` on the file.
 pub const PRAGMAS_READONLY: &str = "
     PRAGMA busy_timeout = 5000;
     PRAGMA cache_size = -4096;
@@ -183,9 +143,9 @@ pub const PRAGMAS_READONLY: &str = "
 
 /// A root's own reader: the walk's row prefetch, then the content pass's
 /// feeder. Two can exist per root, so the cache multiplies by root count;
-/// **this is the number to raise** if the prefetcher ever falls behind. The
-/// feeder's cold scan is deliberately paid here, not on the writer — the
-/// writer holding still for it stopped every other root's walk.
+/// raise it if the prefetcher falls behind. The feeder's cold scan is paid
+/// here rather than on the writer, which would stall every other root's walk
+/// while it ran.
 pub const PRAGMAS_WALK_READER: &str = "
     PRAGMA busy_timeout = 5000;
     PRAGMA cache_size = -1024;
@@ -194,8 +154,27 @@ pub const PRAGMAS_WALK_READER: &str = "
 ";
 
 /// The full current schema, applied to a fresh or just-wiped DB. FTS5 is
-/// *contentless* (see [`fts_create_sql`]); canonical extracted text lives in
+/// contentless (see [`fts_create_sql`]); canonical extracted text lives in
 /// `documents_text`, zstd-compressed.
+///
+/// `idx_files_parent` is row identity and the only index `parent` needs. It
+/// does not cover `mtime`: the walk prefetcher's `SELECT name, mtime … WHERE
+/// parent = ?` then fetches each row, which it can afford because it runs
+/// ahead of the walk workers and a directory's rows are rowid-adjacent.
+/// `mtime` cannot join the key, because `UNIQUE(parent, name, mtime)` would
+/// admit the same file twice. If the prefetcher falls behind, raise
+/// [`PRAGMAS_WALK_READER`] rather than adding a covering index.
+///
+/// `type` has no index: the kind filter's `(f.type & ?) != 0`
+/// (`crate::query::translator`) is not sargable, so nothing could seek one.
+/// Measured: an index cost ~10% on inserts and 805 pages at 300k rows, pages
+/// that compete with the ones search wants resident.
+///
+/// `documents_text` holds a row only when the extractor produced text (an
+/// audio file with empty tags is done but has none), so `files.content_state`
+/// is the authority on "content indexed". The uncompressed length is not
+/// stored: zstd records it in the frame header, where
+/// [`crate::db::repo::raw_text_len`] reads it.
 pub const SCHEMA_CURRENT: &str = r#"
 CREATE TABLE schema_info (
     key   TEXT PRIMARY KEY,
@@ -216,32 +195,8 @@ CREATE TABLE files (
     hash          BLOB
 );
 
--- The identity of a row, and the only index `parent` needs.
---
--- It replaces both of what came before — a `UNIQUE(path)` and a covering
--- `(parent, name, mtime)` — and dropping the second is the deliberate half.
--- The walk's row prefetcher issues `SELECT name, mtime FROM files WHERE
--- parent = ?` once per directory, the hottest read in a full run, and without
--- `mtime` in the index that is a table-row fetch per entry. It is affordable
--- because the prefetcher is one thread ahead of four walk workers that each
--- spend a `stat` *and* a SHA-256 of the path per file (`crate::walk`), so it
--- has budget to spend; because a directory's rows are written in one batch and
--- so are rowid-adjacent; and because the row is now narrow enough that a
--- 1 MiB cache holds ~7,200 of them. `mtime` cannot simply be appended here —
--- `UNIQUE(parent, name, mtime)` would let the same file be inserted twice
--- under two mtimes.
---
--- If the prefetcher is ever measured falling behind, raise
--- `PRAGMAS_WALK_READER` — paid for out of the space this index no longer
--- occupies — rather than restoring the covering one.
 CREATE UNIQUE INDEX idx_files_parent ON files(parent, name);
 CREATE INDEX idx_files_mtime  ON files(mtime);
--- No index on `type`. The only query that touches it is the kind filter's
--- `(f.type & ?) != 0` (`crate::query::translator`), and a bitmask test on the
--- left of the operator is not sargable, so SQLite scans regardless — nothing
--- can seek such an index and nothing orders or groups by the column. Carrying
--- one measured ~10% on inserts and 805 pages at 300k rows, and those pages
--- compete with the ones search wants resident.
 CREATE INDEX idx_files_mime   ON files(mime);
 CREATE INDEX idx_files_hash   ON files(hash);
 CREATE INDEX idx_files_content_pending ON files(id) WHERE content_state = 0;
@@ -252,16 +207,6 @@ CREATE TABLE failed_files (
     ts      INTEGER NOT NULL
 );
 
--- Canonical extracted text for every successfully content-indexed file.
--- Compressed with zstd (see `crate::db::repo::set_content_done`). Only
--- written when the extractor produced text; absent rows mean "no body
--- text" (e.g. an audio file whose tags are all empty). "Has a row here" is
--- therefore *not* the same as "content indexed" — `files.content_state` is
--- the authority on that.
---
--- The uncompressed length is not stored: zstd records it in the frame
--- header, so `crate::db::repo::raw_text_len` reads it back for the one
--- caller (the size report) that wants it.
 CREATE TABLE documents_text (
     file_id    INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
     text_zstd  BLOB    NOT NULL
@@ -275,9 +220,9 @@ CREATE TABLE config_validation (
 
 /// The database page size, applied at creation and fixed for the file's life.
 ///
-/// 8192, not SQLite's and SQLCipher's default of 4096, because
-/// `benches/page_geometry.rs` swept 1024→65536 on a keyed 200k-file index and
-/// this is where the two opposing costs balance:
+/// 8192 rather than the SQLite and SQLCipher default of 4096:
+/// `benches/page_geometry.rs` swept 1024→65536 on a keyed 200k-file index, and
+/// this balances two opposing costs:
 ///
 /// | page | size | index rows/s | `files` scan | scattered rows | cold name |
 /// |---|---|---|---|---|---|
@@ -287,38 +232,33 @@ CREATE TABLE config_validation (
 /// | 16384 | 151.4 MiB | 5592 | 37 ms | 58 ms | 34.2 ms |
 /// | 65536 | 158.4 MiB | 7712 | 23 ms | 61 ms | 38.1 ms |
 ///
-/// The table above was swept while [`HMAC_MODE`] was still SQLCipher's
-/// HMAC-SHA512, so the keyed columns overstate today's per-page cost. The
-/// *shape* of the trade is unchanged — both arms of it are per-page work, so
-/// removing the authenticator scales them together rather than moving the
-/// balance — and the plain arm, which never had an HMAC, picked 8192 too.
+/// A scattered row fetch decrypts a whole page to read one ~130-byte row, so
+/// it wants a small page and degrades past 8192 (43 ms → 73 ms by 32768). The
+/// sequential `files` scan behind every filename query wants a large one: the
+/// bytes decrypted stay ~9 MiB either way while per-page codec and pager work
+/// falls. 8192 keeps scattered reads within 3% of their optimum, halves the
+/// scan, ties for the smallest file, and indexes 1.5x faster than 4096.
 ///
-/// A scattered row fetch decrypts a whole page to read one ~130-byte row out
-/// of it, so it wants a *small* page and degrades past 8192 (43 ms → 73 ms by
-/// 32768). The `files` scan behind every filename query is sequential and
-/// wants a *large* one, improving all the way — because the bytes decrypted
-/// stay the same (~9 MiB either way) while the number of per-page codec and
-/// pager operations falls. 8192 keeps scattered reads within
-/// 3% of their optimum, halves the scan, is tied for the smallest file, and
-/// indexes 1.5x faster than 4096.
+/// The keyed columns predate `HMAC_MODE = Off` (see [`HMAC_MODE`]). Both costs
+/// are per-page work, so dropping the authenticator scales them together, and
+/// the plain arm picked 8192 too.
 ///
-/// **Changing this is not a free edit** — see [`PROFILES_PREVIOUS`].
+/// **Changing this is not a free edit**; see [`PROFILES_PREVIOUS`].
 pub const PAGE_SIZE: i64 = 8192;
 
-/// Which authenticator SQLCipher applies to every page — and so how much of
-/// every page it spends on one.
+/// Which authenticator SQLCipher applies to every page, and so how much of
+/// each page it spends on one.
 ///
-/// **This is a deliberately weakened setting; see [`HMAC_MODE`].** The
-/// encryption itself is not a choice: SQLCipher 4 dropped `PRAGMA cipher` and
-/// the provider hard-codes AES-256-CBC, so the HMAC is the only lever the
-/// build has.
+/// **The shipped mode is a weakened setting; see [`HMAC_MODE`].** The cipher
+/// is fixed (SQLCipher 4 dropped `PRAGMA cipher` and the provider hard-codes
+/// AES-256-CBC), so this is the only lever the build has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HmacMode {
     /// No per-page authenticator. The reserve is the IV alone.
-    Off,
-    Sha256,
+    Off = 0,
+    Sha256 = 1,
     /// SQLCipher's own default.
-    Sha512,
+    Sha512 = 2,
 }
 
 impl HmacMode {
@@ -333,16 +273,13 @@ impl HmacMode {
         }
     }
 
-    /// The pragmas selecting it, to be run **before** `PRAGMA key`.
+    /// The pragmas selecting it, to run before `PRAGMA key`.
     ///
-    /// These are SQLCipher's process-*default* settings, not the
-    /// per-connection `cipher_use_hmac` / `cipher_hmac_algorithm`, and the
-    /// difference is not stylistic: the per-connection forms cannot lower a
-    /// reserve that `PRAGMA key` has already installed. See
-    /// `db::open::key_and_probe`, which owns the lock they need.
-    ///
-    /// Both statements are emitted for every mode, so the globals are fully
-    /// specified whatever the previous open left behind.
+    /// They set SQLCipher's process defaults rather than the per-connection
+    /// `cipher_use_hmac`/`cipher_hmac_algorithm`, which cannot lower a reserve
+    /// `PRAGMA key` has already installed; see `db::open::key_and_probe`, which
+    /// holds the lock they need. Both statements are emitted for every mode,
+    /// so the globals never keep what a previous open left.
     pub const fn default_pragmas(self) -> &'static str {
         match self {
             HmacMode::Off => {
@@ -360,8 +297,8 @@ impl HmacMode {
         }
     }
 
-    /// For logs, and for the "Show database key" dialog, which has to tell
-    /// another SQLCipher tool what to expect.
+    /// For logs, and for the "Show database key" dialog, which tells another
+    /// SQLCipher tool what to expect.
     pub const fn label(self) -> &'static str {
         match self {
             HmacMode::Off => "off",
@@ -371,29 +308,23 @@ impl HmacMode {
     }
 }
 
-/// The per-page authenticator this build writes: **none**.
+/// The per-page authenticator this build writes: none.
 ///
 /// # Why it is safe to drop
 ///
-/// A threat-model argument, not a benchmark alone. The index holds text read
-/// out of files the same user can already read, so anything positioned to
-/// *tamper* with the index could read the originals instead — what the HMAC
-/// defends is nearly empty, and it is paid on every page read and every page
-/// write. Nor does dropping it cost integrity relative to the product's own
-/// baseline: an unprotected index has no per-page authentication either, and
-/// never has, so this makes the two behave alike rather than putting the
-/// protected one behind. Structural damage is still caught by SQLite's own
-/// page-header and cell checks, in both key states, and the index is
-/// re-derivable from disk regardless.
-///
-/// The encryption is untouched. SQLCipher 4 removed `PRAGMA cipher` and the
-/// provider hard-codes AES-256-CBC, so pages are as confidential as before;
-/// only the authenticator is gone.
+/// The index holds text read from files the same user can already read, so
+/// anything positioned to tamper with the index could read the originals
+/// instead; the HMAC defends almost nothing, yet costs every page read and
+/// write. An unprotected index has never had per-page authentication, so this
+/// makes the two alike rather than putting the protected one behind. SQLite's
+/// page-header and cell checks still catch structural damage in both key
+/// states, and the index is re-derivable from disk. The encryption is
+/// unchanged: pages stay AES-256-CBC.
 ///
 /// # What it buys
 ///
 /// `benches/cipher_hmac.rs`, 200k files, all four arms in one process. Warm
-/// total is six cascade shapes summed — the steady state of a typing session:
+/// total is six cascade shapes summed, the steady state of a typing session:
 ///
 /// | arm | seed | warm total | duplicates | size |
 /// |---|---|---|---|---|
@@ -402,23 +333,28 @@ impl HmacMode {
 /// | keyed, HMAC_SHA256 | 40.0 s | 209.0 ms | 250 ms | 150.6 MiB |
 /// | keyed, HMAC_SHA512 | 41.3 s | 259.5 ms | 262 ms | 151.4 MiB |
 ///
-/// Against SQLCipher's default that is **1.78x on warm search**, and it takes
-/// encrypted-over-plain from 2.07x to 1.16x — 84% of the penalty for having a
-/// password at all. Per shape it is widest where it matters most: a filename
-/// query went 32.6 ms → 13.8 ms and a rare body term 39.8 → 18.6.
+/// Against SQLCipher's default that is 1.78x on warm search, and it takes
+/// encrypted-over-plain from 2.07x to 1.16x, 84% of the cost of having a
+/// password. A filename query went 32.6 ms → 13.8 ms and a rare body term
+/// 39.8 → 18.6.
 ///
-/// **SHA-256 is the arm to understand, because it is the one that
-/// disappoints.** It halves the digest and gives back 32 bytes of every page,
-/// yet recovers only 1.24x of the 2.07x. The reason is that the digest is not
-/// where the money goes: `sqlcipher_openssl_hmac` calls
+/// SHA-256 recovers only 1.24x of the 2.07x despite halving the digest,
+/// because the digest is not the cost: `sqlcipher_openssl_hmac` calls
 /// `EVP_MAC_fetch(NULL, "HMAC", NULL)`, `EVP_MAC_CTX_new` and an
-/// `EVP_MAC_init` that fetches the digest *by name* — two OpenSSL 3 provider
-/// lookups per page, paid whichever digest is chosen. Only `Off` removes them,
-/// which is why the middle ground is worth so much less than it looks.
+/// `EVP_MAC_init` that fetches the digest by name, two OpenSSL 3 provider
+/// lookups per page whichever digest is chosen. Only `Off` removes them.
 ///
-/// Size is unmoved either way (151.5 against 151.4 MiB): `fts_pgsz_for`
-/// re-derives the record size from the new reserve, so the 64 bytes handed
-/// back per page go into leaves rather than into the file.
+/// Size is unmoved (151.5 against 151.4 MiB): [`fts_pgsz_for`] re-derives the
+/// record size from the new reserve, so the 64 bytes handed back per page go
+/// into leaves.
+///
+/// # Figures taken under HMAC-SHA512
+///
+/// [`PAGE_SIZE`]'s sweep, [`SEARCH_CACHE_BYTES_PER_FILE`], and the keyed
+/// figures in `benches/search_perf.rs`, `benches/page_geometry.rs`,
+/// `tests/encrypted_perf.rs` and `search::IDLE_RELEASE` were measured under
+/// HMAC-SHA512 and not re-swept. A keyed page miss is now cheaper, so those
+/// keyed costs are overstated and the cache sizing errs large.
 ///
 /// # Changing it is not a free edit
 ///
@@ -427,7 +363,7 @@ impl HmacMode {
 pub const HMAC_MODE: HmacMode = HmacMode::Off;
 
 /// A page size and an HMAC mode: everything about a keyed file's layout that
-/// has to be known *before* it can be read, because its header is ciphertext
+/// must be known before it can be read, because its header is ciphertext
 /// until SQLCipher has been told both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
@@ -466,27 +402,17 @@ pub const PROFILE: Profile = Profile {
 
 /// Layouts earlier versions created files at, newest first.
 ///
-/// A keyed file under another profile does not decrypt *at all*: the header
-/// comes back as noise, and without this list `open::key_and_probe` would
-/// report it as `KEY_MISMATCH: wrong-password`. No schema-version bump can
-/// rescue that, because the version cannot be read either. So `db::open`
-/// reopens under each of these before declaring a mismatch, and a file that
-/// answers to one is treated as ordinary schema drift: wiped and rebuilt at
-/// [`PROFILE`].
-///
-/// Unencrypted files never needed it — `PRAGMA page_size` against an existing
-/// file is silently ignored and they have no reserve to get wrong, so they
-/// open at whatever they were built with and the version check does the rest —
-/// but they take the same path for free.
-///
-/// Anything appended here is a layout some user's index is still sitting at.
-/// Entries can only be dropped when it is acceptable for those indexes to read
-/// as a wrong password.
+/// A keyed file under another profile does not decrypt at all, so its version
+/// cannot be read and `open::key_and_probe` would report
+/// `KEY_MISMATCH: wrong-password`. `db::open` retries each entry first; a file
+/// that opens under one is wiped and rebuilt at [`PROFILE`]. Unencrypted
+/// files open under any profile and take the same path. Drop an entry only
+/// when indexes still at that layout may be reported as a wrong password.
 pub const PROFILES_PREVIOUS: &[Profile] = &[
-    // Every protected index in the field is here: the shipped page size, under
-    // SQLCipher's own authenticator, before [`HMAC_MODE`] became `Off`. It is
-    // listed first because it is overwhelmingly the common case, and the probe
-    // stops at the first profile that answers.
+    // Every protected index built before [`HMAC_MODE`] became `Off`: the
+    // shipped page size under SQLCipher's own authenticator. First because it
+    // is by far the common case, and the probe stops at the first profile that
+    // answers.
     Profile {
         page_size: PAGE_SIZE,
         hmac: HmacMode::Sha512,
@@ -497,9 +423,8 @@ pub const PROFILES_PREVIOUS: &[Profile] = &[
     },
 ];
 
-/// A profile may not be listed as previous *and* current — the probe would
-/// then retry the layout it just failed on, and `ProfileMatch::Previous` would
-/// mean nothing.
+/// A profile may not be both previous and current: the probe would retry the
+/// layout it just failed on, and `ProfileMatch::Previous` would mean nothing.
 const _: () = {
     let mut i = 0;
     while i < PROFILES_PREVIOUS.len() {
@@ -512,37 +437,25 @@ const _: () = {
     }
 };
 
-/// FTS5's `pgsz` for one profile, applied once at creation and then persisted
-/// in `searchabletext_config`.
+/// FTS5's `pgsz` for `profile`, set once at creation and persisted in
+/// `searchabletext_config`.
 ///
-/// The arithmetic, in one line: a table leaf holds
-/// `page − reserve − 35` bytes inline, and an FTS5 record runs to `pgsz + 2`,
-/// so `pgsz ≤ page − reserve − 37`. `MARGIN` keeps a record that overruns by a
-/// byte or two from falling off the cliff.
-///
-/// The cliff is worth stating because it is expensive and silent. FTS5's own
-/// default is 4050 — a number SQLite chose so a full leaf fits inline in a
-/// *plain* 4096-byte page. Keyed under SQLCipher's own HMAC-SHA512 the reserve
-/// drops the limit to 3981 and that default misses it by 71 bytes, sending
-/// **every** full leaf to an overflow page: a second fetch and decrypt on
-/// every read of it. On the 60k-file corpus in `tests/encrypted_perf.rs` that
-/// was 10954 of 12354 leaves and 70.7 MiB against the plain index's 65.2;
-/// fitting them inline brought it to 65.5.
-///
-/// It cuts the other way too: at a page size of 8192 a 4050-byte record leaves
-/// half of every page empty, because a second one will not fit. So this is
-/// derived from the profile rather than pinned — and it has to follow
-/// [`HmacMode`] as well as the page size, because the reserve moves with both.
+/// A table leaf holds `page − reserve − 35` bytes inline and an FTS5 record
+/// takes `pgsz + 2`, so `pgsz ≤ page − reserve − 37`; `MARGIN` adds slack.
+/// Missing the limit is silent and expensive: every full leaf spills to an
+/// overflow page, a second fetch and decrypt per read. FTS5's default of 4050
+/// fits only a plain 4096-byte page (keyed under HMAC-SHA512 it overflowed
+/// 10954 of 12354 leaves) and wastes half of an 8192-byte page, so the value
+/// follows both page size and [`HmacMode`].
 pub fn fts_pgsz_for(profile: Profile, keyed: bool) -> i64 {
     /// Slack under the inline limit, in bytes.
     const MARGIN: i64 = 9;
     profile.page_size - profile.reserve(keyed) - 37 - MARGIN
 }
 
-/// Set [`fts_pgsz_for`] on a freshly created `searchabletext`. Written
-/// unconditionally, including when it lands on FTS5's own default: the value
-/// is the same either way, and one code path is worth more than a `pgsz` row
-/// saved.
+/// Set [`fts_pgsz_for`] on a freshly created `searchabletext`, even when it
+/// equals FTS5's default: the row is then redundant but harmless, and one
+/// code path is simpler.
 pub fn fts_set_pgsz(
     conn: &rusqlite::Connection,
     profile: Profile,
@@ -560,14 +473,14 @@ pub const FTS5_DEFAULT_PGSZ: i64 = 4050;
 
 /// FTS5 virtual table DDL. Separate because the tokenizer is config-driven.
 ///
-/// *Contentless* FTS5 (`content=''`): column values are not stored.
-/// `contentless_delete=1` (SQLite 3.43+) lets us `DELETE FROM … WHERE
-/// rowid=?` without replaying the original row text, at the cost of a modest
-/// tombstone bitmap. Built-in `snippet()` is unavailable in contentless
-/// mode — snippets are rendered in Rust from `documents_text` instead.
+/// Contentless FTS5 (`content=''`): column values are not stored.
+/// `contentless_delete=1` (SQLite 3.43+) allows `DELETE FROM … WHERE rowid=?`
+/// without replaying the original row text, at the cost of a modest tombstone
+/// bitmap. Built-in `snippet()` is unavailable in contentless mode, so
+/// snippets are cut in Rust from `documents_text`.
 ///
-/// **One column, deliberately.** Document bodies are the only thing anything
-/// ever MATCHes; a `name` column would cost (len − 2) postings per file.
+/// One column: only document bodies are ever MATCHed, and a `name` column
+/// would cost (len − 2) postings per file.
 pub fn fts_create_sql(tokenizer: &str) -> String {
     let effective = effective_tokenizer(tokenizer);
     format!(
@@ -597,11 +510,12 @@ pub fn effective_tokenizer(tokenizer: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Every profile that can write has to bound the log, and all three have to
-    /// bound it at the same figure — which is [`crate::config::MINIMUM_WAL_SIZE`],
-    /// spelled as a literal in each because a pragma string cannot interpolate.
-    /// The read-only profiles must *not* carry it: `journal_size_limit` is a
-    /// write to the file, and a read-only connection cannot make one.
+    /// Every writing profile bounds the log at
+    /// [`crate::config::MINIMUM_WAL_SIZE`], spelled as a literal in each. The
+    /// read-only profiles must not carry it: `journal_size_limit` is a write
+    /// to the file, which a read-only connection cannot make.
+    /// `repo::tests::journal_size_limit_gives_the_space_back_after_a_blocked_truncate`
+    /// shows the limit working.
     #[test]
     fn every_writing_profile_bounds_the_log() {
         let want = format!(
@@ -629,7 +543,7 @@ mod tests {
     }
 
     /// The sweep found no knee on a plain index at any corpus size, so this
-    /// must not grow with one — the whole reason it is a separate constant.
+    /// must not grow with one.
     #[test]
     fn a_plain_index_gets_the_same_ceiling_at_every_size() {
         for files in [0, 1_000, 200_000, 1_000_000, 50_000_000] {
@@ -657,8 +571,8 @@ mod tests {
         );
     }
 
-    /// Between the clamps it has to actually track the corpus; a constant
-    /// would satisfy every other test here.
+    /// Between the clamps it must track the corpus; a constant would satisfy
+    /// every other test here.
     #[test]
     fn a_keyed_index_grows_with_the_corpus_between_the_clamps() {
         let small = recommended_search_cache_mib(300_000, true);
@@ -673,8 +587,8 @@ mod tests {
     }
 
     /// The three corpora `benches/search_perf.rs` measured, against the knee
-    /// it found for each. Under the knee is the 2.4-4x regime this exists to
-    /// avoid, so the recommendation has to reach it.
+    /// it found for each. Below the knee a keyed search runs 3.4–3.9x slower,
+    /// so the recommendation must reach it.
     #[test]
     fn the_recommendation_clears_every_measured_knee() {
         for (files, knee_mib) in [(200_000, 32), (600_000, 96), (1_000_000, 128)] {
@@ -702,9 +616,9 @@ mod tests {
         );
     }
 
-    /// An explicit setting has to be able to exceed the automatic cap: past
-    /// ~800k files the derived value is capped *below* the measured knee, and
-    /// the override is the only way to reach it.
+    /// An explicit setting must be able to exceed the automatic cap: past ~800k
+    /// files the derived value is capped below the measured knee, and the
+    /// override is the only way to reach it.
     #[test]
     fn an_explicit_ceiling_may_exceed_the_automatic_cap() {
         let asked = SEARCH_CACHE_MAX_MIB * 2;

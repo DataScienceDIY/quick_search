@@ -1,21 +1,18 @@
 //! Where the time goes when an added ignore pattern scrubs the index.
 //!
 //! Adding one pattern sets `IndexWork { prune_scope: true, reindex: false }`
-//! (`config::diff_actions`), and `scope::advance` then reads **every** stored
-//! row under every root, decides each one, and deletes the losers by id. On a
-//! large index that has been measured slower than building the index was. This
-//! attributes that time to a phase.
+//! (`config::diff_actions`). `scope::advance` then reads every stored row
+//! under every root, decides each one, and deletes the losers by id. This
+//! probe attributes that time to a phase.
 //!
 //! ```text
 //! cargo build -p quicksearch-core --example pruneprobe --release
 //! ./target/release/examples/pruneprobe
 //! ```
 //!
-//! `QSB_FILES` / `QSB_DIRS` / `QSB_CONTENT_EVERY` size the corpus;
-//! `QSB_ARMS=plain|keyed|both` picks the key states. A keyed arm is not
-//! optional dressing — every page the delete touches is decrypted and
-//! re-encrypted, and the two arms have disagreed before (see
-//! `db::schema::PAGE_SIZE`).
+//! `QSB_FILES`, `QSB_DIRS`, `QSB_DIR_DEPTH` and `QSB_CONTENT_EVERY` size the
+//! corpus; `QSB_ARMS=plain|keyed|both` picks the key states (see
+//! `common::arms`).
 //!
 //! The stages are cumulative, so consecutive rows subtract to a phase cost:
 //!
@@ -28,36 +25,28 @@
 //! +subtree             ...range-deleting a doomed directory instead of paging it
 //! ```
 //!
-//! **No stage is what ships any more.** `scope::advance` tombstones only the
-//! ids that can hold a posting (`+fts(done)`), commits per slice rather than
-//! per page, and turns FTS5's delete-merging off for the pass
-//! (`file_handling::fts_begin_tombstone_burst`), so the `live` row below lands
-//! under every stage rather than on one of them. The stages remain the
-//! decomposition — they say where the time is — and `live` says what the sum
-//! of the shipped decisions costs.
+//! The stages decompose the cost; none is the shipped shape. `scope::advance`
+//! tombstones only the ids that can hold a posting (`+fts(done)`), commits per
+//! slice, and turns FTS5's delete-merging off for the pass
+//! (`file_handling::fts_begin_tombstone_burst`), so the `live` row lands under
+//! every stage.
 //!
-//! Two of them were measured and **not** adopted, which is why they are still
-//! here: `+subtree` bought nothing over `+fts(done)` (247 ms against 243 on the
-//! 40k corpus, with all 8,080 doomed rows genuinely skipping the page loop), and
-//! raising the page cache moved misses twelvefold while barely moving the clock.
+//! Measured and not adopted: `+subtree` bought nothing over `+fts(done)`
+//! (247 ms against 243 on the 40k corpus, with all 8,080 doomed rows skipping
+//! the page loop), and raising the page cache cut misses twelvefold while
+//! barely moving the clock.
 //!
-//! **Read the `commit` column, not `fts`.** FTS5 buffers a contentless delete
-//! in memory and writes the tombstone pages when the transaction is flushed, so
-//! the `DELETE` statement itself times as nearly free and the cost lands in the
-//! commit. That is also why `-tx` sweeps the number of pages per transaction:
-//! if the flush is priced per commit rather than per tombstone, transaction
-//! size is the variable that matters and the row count is not.
+//! Read the `commit` column, not `fts`. FTS5 buffers a contentless delete in
+//! memory and writes the tombstone pages when the transaction flushes, so the
+//! `DELETE` times as nearly free and the cost lands in the commit. The
+//! transaction-size table sweeps pages per transaction for the same reason:
+//! if the flush costs per commit rather than per tombstone, transaction size
+//! matters and row count does not.
 //!
-//! Every stage runs against a byte-identical copy of one seeded index rather
-//! than a fresh seed: FTS5 segment layout is most of what decides delete cost,
-//! and reseeding would let it drift between the rows of the table.
-//!
-//! The final table prices the *other* bulk withdrawal, a completed run's stale
+//! The final table prices the other bulk withdrawal, a completed run's stale
 //! cleanup (`file_handling::cleanup_stale_index_entries`): the same doomed
-//! rows, deleted by path the way that pass does. Its stages are spelled out in
-//! probe code for the same reason as above — they are the fixed decomposition
-//! — and its `live` row is the shipped function, which is the row that moves
-//! when `file_handling::batch` is reshaped.
+//! rows, deleted by path. Its stages are probe code, fixed like the stages
+//! above; its `live` row is the shipped function.
 
 mod common;
 
@@ -71,41 +60,33 @@ use quicksearch_core::db::{self, repo};
 use quicksearch_core::extract::Registry;
 use quicksearch_core::file_handling::{
     cleanup_stale_index_entries, fts_begin_tombstone_burst, fts_end_tombstone_burst,
-    fts_finalize_after_text_indexing, split_db_path, ExtractCursor,
+    fts_finalize_after_text_indexing, split_db_path, RootRange,
 };
 use quicksearch_core::scope::{self, Scope, WorkCursor};
 use quicksearch_core::testutil::{self, Arm, SeedSpec};
 
-use common::Io;
+use common::{
+    chunked, clone_arm, count, env_usize, merge_to_quiescence, open, print_merge, set_cache,
+    Commit, Io, MERGE_PAGES, PAGE, SHIPPED_MIB,
+};
 
-/// The root every `seed_index` row hangs under; it need not exist on disk,
-/// because nothing in the prune path stats a stored path on Unix (see
-/// `platform::entry_hidden_reason`, which short-circuits on the dot prefix).
+/// The root every `seed_index` row hangs under. It need not exist on disk:
+/// nothing in the prune path stats a stored path on Unix
+/// (`platform::entry_hidden_reason` short-circuits on the dot prefix).
 const ROOT: &str = "/seed";
 
 /// The ignore patterns the probe can add, each excluding a fifth of the index.
 ///
 /// `seed_index` names its second path segment `WORDS[(d * 7 + 13) % 35]`, and
-/// because 7 and 35 share a factor only these five of the thirty-five words are
-/// ever reachable — one per residue of `d mod 5`. So each excludes a fifth of
-/// the directories, spread across the keyspace rather than gathered at one end,
-/// which is the shape a real `node_modules` or `.git` pattern has. Taking a
-/// prefix of this list is how the probe sweeps the excluded fraction. `main`
-/// asserts the fractions rather than trusting this comment.
+/// because 7 and 35 share a factor only these five of the thirty-five words
+/// are reachable, one per residue of `d mod 5`. So each excludes a fifth of
+/// the directories, spread across the keyspace rather than gathered at one
+/// end, which is the shape a real `node_modules` or `.git` pattern has. The
+/// probe sweeps the excluded fraction by taking a prefix of this list.
 const PRUNE_PATTERNS: [&str; 5] = ["jumps", "content", "revenue", "figure", "eta"];
 
 /// The single-pattern case, and the one the stage table runs.
 const PRUNE_PATTERN: &str = PRUNE_PATTERNS[0];
-
-/// Rows per page, matching `processing.batch_size`'s default — the figure
-/// `scope::advance` runs at.
-const PAGE: i64 = 500;
-
-/// Ids per `IN (...)` list, matching `repo::DELETE_IDS_CHUNK`.
-const CHUNK: usize = 512;
-
-/// Output leaf pages per `'merge'` call, matching `FINALIZE_MERGE_PAGES`.
-const MERGE_PAGES: i64 = 1000;
 
 // ---------------------------------------------------------------------------
 // Stages
@@ -191,61 +172,27 @@ struct Timing {
 // The measured loop
 // ---------------------------------------------------------------------------
 
-fn placeholders(n: usize) -> String {
-    let mut s = String::with_capacity(n * 2);
-    for i in 0..n {
-        if i > 0 {
-            s.push(',');
-        }
-        s.push('?');
-    }
-    s
-}
-
 /// Whether the walker would still descend into the stored parent `parent`.
 ///
-/// `Scope::covers` judges a path component by component, which for a directory
-/// is exactly "would the walk enter it" — the same question the walker asks
-/// before recursing. The trailing separator every stored parent carries has to
-/// go first, or the leaf component is empty.
+/// `Scope::covers` judges a path component by component, which for a
+/// directory asks what the walker asks before recursing. The trailing
+/// separator every stored parent carries goes first, or the leaf component
+/// would be empty.
 fn dir_covered(scope: &Scope, root: &Path, parent: &str) -> bool {
     let trimmed = parent.trim_end_matches(['/', '\\']);
     scope.covers(root, Path::new(trimmed))
 }
 
-/// When the pass commits.
-#[derive(Clone, Copy)]
-enum Commit {
-    /// One transaction per page — what ships.
-    PerPage,
-    /// One per `n` pages; the sweep's variable.
-    Pages(usize),
-    /// One per elapsed slice, which is what `scope::advance` already uses as
-    /// its unit of interruptible work.
-    Slice(Duration),
-}
-
-impl Commit {
-    fn due(self, pages_open: usize, since: Instant) -> bool {
-        match self {
-            Commit::PerPage => true,
-            Commit::Pages(n) => pages_open >= n,
-            Commit::Slice(d) => since.elapsed() >= d,
-        }
-    }
-}
-
-/// Page the index the way `scope::advance` does, doing `stage`'s share of the
-/// work and timing each phase separately.
+/// Page the index as `scope::advance` does, doing `stage`'s share of the work
+/// and timing each phase apart.
 ///
-/// The deletes are spelled out here rather than routed through `repo` so that
-/// the filtered and unfiltered FTS variants can be compared in one run — and
-/// so this keeps measuring the same thing after `repo` is reshaped around
-/// whichever variant wins.
+/// The deletes are spelled out here rather than routed through `repo`, so the
+/// filtered and unfiltered FTS variants compare in one run and the stages stay
+/// fixed when `repo` changes.
 fn run_stage(conn: &Connection, config: &Config, stage: Stage, commit: Commit) -> Timing {
     let scope = Scope::from_config(config).expect("compile the scope");
     let root = PathBuf::from(ROOT);
-    let range = ExtractCursor::for_root(ROOT);
+    let range = RootRange::for_root(ROOT);
 
     let mut t = Timing::default();
     let io_before = Io::read();
@@ -254,9 +201,8 @@ fn run_stage(conn: &Connection, config: &Config, stage: Stage, commit: Commit) -
 
     let mut after = (range.lo.clone(), String::new());
     let mut covered = scope::CoverCache::default();
-    // `unchecked_transaction` borrows shared, which is what lets one end and
-    // the next begin inside the loop — the same trick `testutil::seed_index`
-    // uses for `commit_every`.
+    // `unchecked_transaction` borrows shared, so one transaction can end and
+    // the next begin inside the loop, as in `testutil::seed_index`.
     let mut tx = conn.unchecked_transaction().expect("begin");
     let mut pages_open = 0usize;
     let mut tx_since = Instant::now();
@@ -274,11 +220,10 @@ fn run_stage(conn: &Connection, config: &Config, stage: Stage, commit: Commit) -
             continue;
         }
 
-        // The subtree short-circuit. A page spans several directories, so the
-        // verdict is taken per distinct parent *as it appears* — stopping at
-        // the first doomed one, range-deleting it, and re-seeking past it.
-        // Testing only `rows[0]` would fire only on the pages that happen to
-        // begin inside an excluded directory.
+        // The subtree short-circuit. A page spans several directories, so each
+        // distinct parent is tested as it appears; the first doomed one is
+        // range-deleted and the scan re-seeks past it. Testing only `rows[0]`
+        // would fire only on pages that begin inside an excluded directory.
         let mut rows: &[repo::ScopeRow] = &rows;
         if stage == Stage::Subtree {
             let at = Instant::now();
@@ -301,16 +246,16 @@ fn run_stage(conn: &Connection, config: &Config, stage: Stage, commit: Commit) -
             t.cover += at.elapsed();
             if let Some(i) = doomed_at {
                 let dir = rows[i].parent.trim_end_matches(['/', '\\']).to_string();
-                let sub = ExtractCursor::for_root(&dir);
+                let sub = RootRange::for_root(&dir);
                 let (removed, fts, files) = delete_range(&tx, &sub.lo, &sub.hi);
                 t.fts += fts;
                 t.files += files;
                 t.deleted += removed;
                 t.skipped += removed;
                 // The rows before the doomed directory still need deciding;
-                // everything from it on is gone or will be re-read after the
-                // seek. Both happen inside the open transaction, so the seek
-                // sees the range delete without needing a commit first.
+                // everything from it on is gone or re-read after the seek.
+                // Both happen inside the open transaction, so the seek sees
+                // the range delete without a commit.
                 after = (sub.hi.clone(), String::new());
                 rows = &rows[..i];
             }
@@ -338,32 +283,18 @@ fn run_stage(conn: &Connection, config: &Config, stage: Stage, commit: Commit) -
                 &doomed
             };
             if stage.deletes_fts() {
-                for chunk in fts_ids.chunks(CHUNK) {
-                    let at = Instant::now();
-                    tx.execute(
-                        &format!(
-                            "DELETE FROM searchabletext WHERE rowid IN ({})",
-                            placeholders(chunk.len())
-                        ),
-                        rusqlite::params_from_iter(chunk.iter()),
-                    )
-                    .expect("tombstone");
-                    t.fts += at.elapsed();
-                }
-            }
-            for chunk in doomed.chunks(CHUNK) {
                 let at = Instant::now();
-                t.deleted += tx
-                    .execute(
-                        &format!(
-                            "DELETE FROM files WHERE id IN ({})",
-                            placeholders(chunk.len())
-                        ),
-                        rusqlite::params_from_iter(chunk.iter()),
-                    )
-                    .expect("delete rows");
-                t.files += at.elapsed();
+                chunked(
+                    &tx,
+                    "DELETE FROM searchabletext WHERE rowid IN",
+                    fts_ids,
+                    false,
+                );
+                t.fts += at.elapsed();
             }
+            let at = Instant::now();
+            t.deleted += chunked(&tx, "DELETE FROM files WHERE id IN", &doomed, false);
+            t.files += at.elapsed();
         }
 
         if commit.due(pages_open, tx_since) {
@@ -415,10 +346,9 @@ fn delete_range(tx: &Connection, lo: &str, hi: &str) -> (usize, Duration, Durati
 /// *path* rather than deciding rows from a page it already read.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum StaleShape {
-    /// Per-path deletes, three statements each, FTS handed every id — the
-    /// pass as originally shipped. This is the control row: it reproduces
-    /// that shape in probe code, so it must not move when
-    /// `cleanup_stale_index_entries` is reshaped.
+    /// Per-path deletes, three statements each, with FTS handed every id. The
+    /// control row: probe code, so it must not move when
+    /// `cleanup_stale_index_entries` changes.
     PerRow,
     /// ...resolve `(id, content_state)` per path instead, then chunked
     /// `IN (...)` deletes with FTS narrowed to ids that can hold a posting.
@@ -521,31 +451,17 @@ fn run_stale(conn: &Connection, paths: &[String], shape: StaleShape) -> Timing {
                 }
             }
             t.cover += at.elapsed();
-            for chunk in with_postings.chunks(CHUNK) {
-                let at = Instant::now();
-                tx.execute(
-                    &format!(
-                        "DELETE FROM searchabletext WHERE rowid IN ({})",
-                        placeholders(chunk.len())
-                    ),
-                    rusqlite::params_from_iter(chunk.iter()),
-                )
-                .expect("tombstone");
-                t.fts += at.elapsed();
-            }
-            for chunk in ids.chunks(CHUNK) {
-                let at = Instant::now();
-                t.deleted += tx
-                    .execute(
-                        &format!(
-                            "DELETE FROM files WHERE id IN ({})",
-                            placeholders(chunk.len())
-                        ),
-                        rusqlite::params_from_iter(chunk.iter()),
-                    )
-                    .expect("delete rows");
-                t.files += at.elapsed();
-            }
+            let at = Instant::now();
+            chunked(
+                &tx,
+                "DELETE FROM searchabletext WHERE rowid IN",
+                &with_postings,
+                false,
+            );
+            t.fts += at.elapsed();
+            let at = Instant::now();
+            t.deleted += chunked(&tx, "DELETE FROM files WHERE id IN", &ids, false);
+            t.files += at.elapsed();
         }
         let at = Instant::now();
         tx.commit().expect("commit");
@@ -566,75 +482,28 @@ fn run_stale(conn: &Connection, paths: &[String], shape: StaleShape) -> Timing {
     t
 }
 
-/// How much data FTS5 is holding — the only quiescence signal that works.
-///
-/// `sqlite3_changes()` after a `'merge'` does **not** report whether the merge
-/// did any work: measured here, it reports non-zero forever, so a
-/// `while changes() != 0` loop never terminates. Watching `%_data` shrink and
-/// stop is what actually detects a consolidated index.
-fn fts_data_rows(conn: &Connection) -> i64 {
-    conn.query_row("SELECT COUNT(*) FROM searchabletext_data", [], |r| r.get(0))
-        .unwrap_or(-1)
-}
-
-/// Merge until `%_data` stops moving, and report what that took.
-///
-/// The **positive** argument is deliberate: negative picks
-/// `fts5IndexOptimizeStruct` instead, which is a different algorithm and a
-/// documented trap (`file_handling::records::fts_finalize_after_text_indexing`).
-fn merge_to_quiescence(conn: &Connection) -> (Duration, u32, i64, i64) {
-    let before = fts_data_rows(conn);
-    let started = Instant::now();
-    let mut rounds = 0;
-    let mut last = before;
-    loop {
-        conn.execute(
-            "INSERT INTO searchabletext(searchabletext, rank) VALUES('merge', ?1)",
-            [MERGE_PAGES],
-        )
-        .expect("merge");
-        rounds += 1;
-        let now = fts_data_rows(conn);
-        if now == last || rounds > 500 {
-            break;
-        }
-        last = now;
-    }
-    (started.elapsed(), rounds, before, last)
-}
-
 // ---------------------------------------------------------------------------
 // Corpus and arms
 // ---------------------------------------------------------------------------
-
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
 
 fn spec() -> SeedSpec {
     SeedSpec {
         files: env_usize("QSB_FILES", 200_000),
         dirs: env_usize("QSB_DIRS", 2_000),
-        // **Coprime with 5, and that is the whole point.** `seed_index` places
-        // content every `content_every` files and directories every `dirs`,
-        // and [`PRUNE_PATTERN`] excludes the directories where `d mod 5 == 0`.
-        // The shipped default of 10 shares the factor 5 with that, so *every*
-        // extracted document lands in an excluded directory: the prune deletes
-        // 100% of the postings, the FTS index goes empty, and every question
-        // about tombstone cost is answered by a degenerate corpus. 7 puts a
-        // fifth of the documents in the doomed set, which is the real shape.
-        // `main` asserts the fraction.
+        // Coprime with 5. `seed_index` places content every `content_every`
+        // files and directories every `dirs`, and [`PRUNE_PATTERN`] excludes
+        // the directories where `d mod 5 == 0`. The default of 10 shares the
+        // factor 5, so every extracted document would land in an excluded
+        // directory and the prune would delete all the postings. 7 puts a
+        // fifth of the documents in the doomed set. `main` asserts the
+        // fraction.
         content_every: env_usize("QSB_CONTENT_EVERY", 7),
-        // At least two segments, so the second can carry the excluded name.
-        // Depth is most of what decides stored row width, and therefore how
-        // many pages the scan reads — see `SeedSpec::dir_depth`.
+        // At least two segments, so the second can carry the excluded name;
+        // see `SeedSpec::dir_depth` for how depth sets row width.
         dir_depth: env_usize("QSB_DIR_DEPTH", 6).max(2),
-        // A real run commits in slices, and each commit flushes FTS5's hash to
-        // its own segment. Seeding in one transaction would leave a single
-        // segment and understate every tombstone cost below.
+        // A real run commits in slices, each flushing FTS5's hash to its own
+        // segment; one transaction would leave a single segment and
+        // understate every tombstone cost.
         commit_every: 500,
         ..SeedSpec::default()
     }
@@ -648,88 +517,25 @@ fn config_with(patterns: &[&str]) -> Config {
     config
 }
 
-/// A byte-identical copy of `master`, under its own scratch directory.
-///
-/// `seed_index` ends with a TRUNCATE checkpoint, so the one file holds the
-/// whole index and there is no `-wal` to carry across.
-fn clone_arm(master: &Arm, tag: &str) -> Arm {
-    let path = testutil::scratch_db(tag);
-    std::fs::copy(&master.path, &path).expect("copy the seeded index");
-    Arm {
-        what: master.what.clone(),
-        keyed: master.keyed,
-        pgsz: master.pgsz,
-        page_size: master.page_size,
-        hmac: master.hmac,
-        path,
-        seeded_in: Duration::ZERO,
-    }
-}
-
-/// The coordinator's own writer profile, which is what the reconcile actually
-/// runs on — `PRAGMAS_INCREMENTAL`, a 4 MiB page cache. Opening this
-/// `open_existing(.., true)` instead would measure `PRAGMAS_FAST`'s 8 MiB and
-/// quietly flatter every figure below.
-fn open(arm: &Arm) -> Connection {
+/// Open `arm` on a run's own writer profile, `PRAGMAS_FAST`, which stale
+/// cleanup runs on.
+fn open_run_writer(arm: &Arm) -> Connection {
     arm.with_key(|| {
-        db::open::open_incremental_writer(&arm.path.to_string_lossy()).expect("open the copy")
+        db::open::open_existing(&arm.path.to_string_lossy(), true).expect("open the copy")
     })
-}
-
-/// A writer knob worth sweeping, applied over [`open`]'s profile.
-#[derive(Clone, Copy)]
-struct Knobs {
-    label: &'static str,
-    /// `None` leaves SQLite's 1000-page default: the committing thread
-    /// checkpoints — copying WAL pages back into the main file, re-encrypting
-    /// every one on a keyed index — every 8 MiB of log.
-    autocheckpoint: Option<i64>,
-    /// MiB of page cache; `None` keeps `PRAGMAS_INCREMENTAL`'s 4.
-    cache_mib: Option<i64>,
-}
-
-const SHIPPED: Knobs = Knobs {
-    label: "as shipped",
-    autocheckpoint: None,
-    cache_mib: None,
-};
-
-/// What `PRAGMAS_INCREMENTAL` gives the reconcile today, in MiB. Named so the
-/// sweep's first row is labelled with the figure it is arguing against rather
-/// than repeating it as a literal.
-const SHIPPED_MIB: i64 = 4;
-
-fn apply(conn: &Connection, knobs: Knobs) {
-    if let Some(n) = knobs.autocheckpoint {
-        conn.execute_batch(&format!("PRAGMA wal_autocheckpoint = {};", n))
-            .expect("autocheckpoint");
-    }
-    if let Some(mib) = knobs.cache_mib {
-        conn.execute_batch(&format!("PRAGMA cache_size = -{};", mib * 1024))
-            .expect("cache_size");
-    }
-}
-
-fn count(conn: &Connection, sql: &str) -> i64 {
-    conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1)
 }
 
 // ---------------------------------------------------------------------------
 
 fn main() {
     let spec = spec();
-    let arms: Vec<bool> = match std::env::var("QSB_ARMS").as_deref() {
-        Ok("plain") => vec![false],
-        Ok("keyed") => vec![true],
-        _ => vec![false, true],
-    };
 
     println!(
         "corpus: {} files across {} dirs, 1 in {} with content, pattern {:?}",
         spec.files, spec.dirs, spec.content_every, PRUNE_PATTERN
     );
 
-    for keyed in arms {
+    for keyed in common::arms() {
         let label = if keyed { "keyed" } else { "plain" };
         let master = Arm::seed(label, &format!("prune-{}", label), keyed, &spec);
         println!(
@@ -739,7 +545,7 @@ fn main() {
             common::mib(master.size_bytes())
         );
 
-        // What the pattern is worth, read off the index rather than assumed.
+        // Census: what the pattern takes, read off the index.
         {
             let conn = open(&master);
             let total = count(&conn, "SELECT COUNT(*) FROM files");
@@ -773,7 +579,7 @@ fn main() {
             );
             println!(
                 "  {} rows, {} doomed ({:.0}%), of which {} hold a posting ({:.0}%) — \
-                 the rest are tombstoned today for nothing",
+                 the rest hold nothing to tombstone",
                 total,
                 doomed,
                 100.0 * doomed as f64 / total as f64,
@@ -789,23 +595,7 @@ fn main() {
                 )
                 .unwrap_or_else(|e| format!("unavailable: {}", e))
             );
-            // What the tombstone actually has to find its way into. `%_data`
-            // holds the segment leaves, `%_idx` one row per segment b-tree
-            // node, `%_docsize` the origin a contentless delete looks up.
-            println!(
-                "  fts: {} %_data rows ({}), {} %_idx, {} %_docsize",
-                count(&conn, "SELECT COUNT(*) FROM searchabletext_data"),
-                common::mib(
-                    count(
-                        &conn,
-                        "SELECT COALESCE(SUM(pgsize), 0) FROM dbstat \
-                         WHERE name LIKE 'searchabletext%'"
-                    )
-                    .max(0) as u64
-                ),
-                count(&conn, "SELECT COUNT(*) FROM searchabletext_idx"),
-                count(&conn, "SELECT COUNT(*) FROM searchabletext_docsize"),
-            );
+            common::print_fts_census(&conn);
         }
 
         let config = config_with(&[PRUNE_PATTERN]);
@@ -843,27 +633,18 @@ fn main() {
                     "", t.skipped
                 );
             }
-            // Consolidation, priced apart: today one 1000-page `'merge'` runs
-            // and the scrub stops, whatever it left behind.
+            // Consolidation, priced apart: merge until `%_data` stops changing,
+            // as `fts_end_tombstone_burst` ends a burst.
             if stage.deletes_fts() {
-                let (took, rounds, before, after) = merge_to_quiescence(&conn);
-                println!(
-                    "  {:<11} merge: {:.0} ms over {} rounds, %_data {} -> {} rows",
-                    "",
-                    took.as_secs_f64() * 1000.0,
-                    rounds,
-                    before,
-                    after
-                );
+                print_merge(&conn, 11, "");
             }
             drop(conn);
             arm.discard();
         }
 
-        // Is the cost priced per commit or per row? Today's
-        // one-transaction-per-page is the first line; if it collapses as pages
-        // are folded together, commit cadence is the lever and none of the
-        // stages above are.
+        // Is the cost per commit or per row? The first line commits per page;
+        // if the cost collapses as pages fold together, commit cadence is the
+        // lever and none of the stages are.
         println!("\n  transaction size, at +fts(all):");
         header();
         for pages in [1usize, 8, 64, 512] {
@@ -875,10 +656,10 @@ fn main() {
             arm.discard();
         }
 
-        // The projected end state: commit on the slice `advance` already runs
-        // to, skip doomed directories wholesale, tombstone only what can hold
-        // a posting. Nothing here needs a longer uninterruptible window than
-        // ships today — the slice boundary is already the cancellation point.
+        // Every lever at once: commit per `advance` slice, skip doomed
+        // directories wholesale, tombstone only what can hold a posting. The
+        // slice is already `advance`'s cancellation point, so this needs no
+        // longer uninterruptible window.
         println!("\n  combined, committing once per {:?} slice:", scope::SLICE);
         header();
         {
@@ -886,29 +667,19 @@ fn main() {
             let conn = open(&arm);
             let t = run_stage(&conn, &config, Stage::Subtree, Commit::Slice(scope::SLICE));
             row("combined", &t);
-            let (took, rounds, before, after) = merge_to_quiescence(&conn);
-            println!(
-                "  {:<11} merge: {:.0} ms over {} rounds, %_data {} -> {} rows",
-                "",
-                took.as_secs_f64() * 1000.0,
-                rounds,
-                before,
-                after
-            );
+            print_merge(&conn, 11, "");
             drop(conn);
             arm.discard();
         }
 
         // The page cache. `PRAGMAS_INCREMENTAL` gives the reconcile a flat
-        // 4 MiB while it scans and deletes across the *whole* index — and a
-        // delete does not only touch the index the scan reads in order. It
-        // maintains `idx_files_mtime`, `idx_files_mime` and `idx_files_hash`
-        // too, three b-trees in orders uncorrelated with `(parent, name)`, so
-        // every doomed row scatters ~3 page touches that a 512-page cache
-        // cannot hold. `misses` is the column to read.
-        //
-        // Both commit policies are swept, because a cache that holds the
-        // working set may make the commit cadence stop mattering.
+        // 4 MiB for a pass across the whole index. A delete also maintains
+        // `idx_files_mtime`, `idx_files_mime` and `idx_files_hash`, three
+        // b-trees in orders uncorrelated with `(parent, name)`, so every
+        // doomed row scatters ~3 page touches that a 512-page cache cannot
+        // hold. Read the `misses` column. Both commit policies are swept,
+        // because a cache that holds the working set may make commit cadence
+        // stop mattering.
         println!("\n  page cache, at +fts(all)  [{} = shipped]:", SHIPPED_MIB);
         header();
         for mib in [SHIPPED_MIB, 16, 32, 64, 128, 256] {
@@ -918,13 +689,7 @@ fn main() {
             ] {
                 let arm = clone_arm(&master, &format!("prune-{}-c{}-{}", label, mib, name.len()));
                 let conn = open(&arm);
-                apply(
-                    &conn,
-                    Knobs {
-                        cache_mib: Some(mib),
-                        ..SHIPPED
-                    },
-                );
+                set_cache(&conn, mib);
                 let t = run_stage(&conn, &config, Stage::FtsAll, commit);
                 row(&format!("{} MiB, {}", mib, name), &t);
                 drop(conn);
@@ -932,21 +697,16 @@ fn main() {
             }
         }
 
-        // Measured and rejected, so the table records it: with autocheckpoint
-        // at its 1000-page default the committing thread copies the log back
-        // into the main file every 8 MiB and re-encrypts every page it moves,
-        // which looked like an obvious suspect. Deferring it to one checkpoint
-        // at the end is a wash — the pages have to move either way.
+        // Measured and rejected: at its 1000-page default, autocheckpoint has
+        // the committing thread copy the log back into the main file every
+        // 8 MiB, re-encrypting every page on a keyed index. Deferring it to
+        // one checkpoint at the end is a wash, because the pages move either
+        // way.
         {
             let arm = clone_arm(&master, &format!("prune-{}-nockpt", label));
             let conn = open(&arm);
-            apply(
-                &conn,
-                Knobs {
-                    autocheckpoint: Some(0),
-                    ..SHIPPED
-                },
-            );
+            conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
+                .expect("autocheckpoint");
             let t = run_stage(&conn, &config, Stage::FtsAll, Commit::Slice(scope::SLICE));
             let at = Instant::now();
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
@@ -963,29 +723,28 @@ fn main() {
             arm.discard();
         }
 
-        // How much of the index the pattern takes, swept. A prune that removes
-        // most of the postings is a different problem from one that removes a
-        // few: past some fraction FTS5 stops tombstoning and starts rewriting
-        // segments, and rewriting the full-text index is what building it was.
-        // `today` is what ships; `fixed` is the projection above.
-        println!("\n  excluded fraction (today -> fixed, both + merge to quiescence):");
+        // The excluded fraction, swept. Past some fraction FTS5 stops
+        // tombstoning and starts rewriting segments, which costs what building
+        // the index did. `baseline` is `+fts(all)` committing per page;
+        // `fixed` is the combined row above.
+        println!("\n  excluded fraction (baseline -> fixed, both + merge to quiescence):");
         println!(
             "  {:<11} {:>8} {:>9} {:>9} {:>9} {:>11} {:>11}",
-            "patterns", "deleted", "today", "fixed", "merge", "%_data", "postings"
+            "patterns", "deleted", "baseline", "fixed", "merge", "%_data", "postings"
         );
         for n in 1..=PRUNE_PATTERNS.len() {
             let patterns = &PRUNE_PATTERNS[..n];
             let config = config_with(patterns);
             let mut timings = Vec::new();
             for (tag, stage, commit) in [
-                ("today", Stage::FtsAll, Commit::PerPage),
+                ("baseline", Stage::FtsAll, Commit::PerPage),
                 ("fixed", Stage::Subtree, Commit::Slice(scope::SLICE)),
             ] {
                 let arm = clone_arm(&master, &format!("prune-{}-f{}-{}", label, n, tag));
                 let conn = open(&arm);
-                let before = fts_data_rows(&conn);
+                let before = common::fts_data_rows(&conn);
                 let t = run_stage(&conn, &config, stage, commit);
-                let (merge, _, _, after) = merge_to_quiescence(&conn);
+                let (merge, _, _, after) = merge_to_quiescence(&conn, MERGE_PAGES);
                 let left = count(&conn, "SELECT COUNT(*) FROM searchabletext");
                 timings.push((t, merge, before, after, left));
                 drop(conn);
@@ -1004,10 +763,8 @@ fn main() {
             );
         }
 
-        // The reference number every stage above is decomposing: the real
-        // `scope::advance`, driven to completion the way the coordinator drives
-        // it. It lands *under* every stage — see the header for which decisions
-        // put it there.
+        // The real `scope::advance`, driven to completion as the coordinator
+        // drives it. It lands under every stage; see the module doc.
         {
             let arm = clone_arm(&master, &format!("prune-{}-live", label));
             let mut conn = open(&arm);
@@ -1044,12 +801,11 @@ fn main() {
             arm.discard();
         }
 
-        // Stale cleanup, the pass a completed run ends with. Same doomed rows
-        // as the tables above, but deleted by *path* — the walk hands
-        // `cleanup_stale_index_entries` a list of paths it did not see, in
-        // directory order. Runs on `PRAGMAS_FAST` via `open_existing(_, true)`
-        // because that is the run's own writer connection, the one the real
-        // pass executes on — `open` here would measure the reconcile's 4 MiB
+        // Stale cleanup, the pass a completed run ends with: the same doomed
+        // rows, deleted by path, because the walk hands
+        // `cleanup_stale_index_entries` the paths it did not see, in directory
+        // order. It runs on the run's own writer connection
+        // (`open_run_writer`); `open` would measure the reconcile's 4 MiB
         // cache instead.
         {
             let stale: Vec<String> = {
@@ -1069,31 +825,18 @@ fn main() {
             header();
             for shape in StaleShape::ALL {
                 let arm = clone_arm(&master, &format!("prune-{}-stale-{}", label, shape.tag()));
-                let conn = arm.with_key(|| {
-                    db::open::open_existing(&arm.path.to_string_lossy(), true)
-                        .expect("open the copy")
-                });
+                let conn = open_run_writer(&arm);
                 let t = run_stale(&conn, &stale, shape);
                 row(shape.label(), &t);
-                let (took, rounds, before, after) = merge_to_quiescence(&conn);
-                println!(
-                    "  {:<11} merge: {:.0} ms over {} rounds, %_data {} -> {} rows",
-                    "",
-                    took.as_secs_f64() * 1000.0,
-                    rounds,
-                    before,
-                    after
-                );
+                print_merge(&conn, 11, "");
                 drop(conn);
                 arm.discard();
             }
 
-            // The shipped function, whole. The row that moves when
-            // `file_handling::batch` is reshaped; the stages above must not.
+            // The shipped function, whole: the row that moves when
+            // `file_handling::batch` changes.
             let arm = clone_arm(&master, &format!("prune-{}-stale-live", label));
-            let conn = arm.with_key(|| {
-                db::open::open_existing(&arm.path.to_string_lossy(), true).expect("open the copy")
-            });
+            let conn = open_run_writer(&arm);
             let (_, misses_before) = testutil::cache_stats(&conn);
             let conn_mutex = std::sync::Arc::new(std::sync::Mutex::new(conn));
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1116,15 +859,7 @@ fn main() {
                     ..Timing::default()
                 },
             );
-            let (took, rounds, before, after) = merge_to_quiescence(&conn);
-            println!(
-                "  {:<11} merge: {:.0} ms over {} rounds, %_data {} -> {} rows   <- cleanup_stale_index_entries",
-                "",
-                took.as_secs_f64() * 1000.0,
-                rounds,
-                before,
-                after
-            );
+            print_merge(&conn, 11, "   <- cleanup_stale_index_entries");
             drop(conn);
             arm.discard();
         }

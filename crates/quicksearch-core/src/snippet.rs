@@ -1,18 +1,18 @@
-//! Snippet extraction for search results — contentless FTS5 has no
-//! `snippet()`. Output is *structural* (window text plus byte ranges), never
-//! markup. Matching folds ASCII only: `cafe` finds `café` via the tokenizer
-//! but the snippet won't mark the accented occurrence.
+//! Snippet extraction for search results; contentless FTS5 has no
+//! `snippet()`. Output is structural (window text plus byte ranges), never
+//! markup. Matching folds ASCII only: `cafe` finds `café` via the tokenizer,
+//! but the snippet does not mark the accented occurrence.
 
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Approximate byte budget for the returned window — a soft target;
+    /// Approximate byte budget for the returned window: a soft target, since
     /// matches expand the window so a hit is never cut off.
-    pub approx_chars: usize,
+    pub approx_bytes: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { approx_chars: 200 }
+        Options { approx_bytes: 200 }
     }
 }
 
@@ -41,11 +41,11 @@ impl Snippet {
 }
 
 /// Extract against a haystack the caller has already ASCII-folded. `folded`
-/// must be `text.to_ascii_lowercase()` — the fold is byte-length preserving,
-/// which is what lets offsets found in it slice the original.
+/// must be `text.to_ascii_lowercase()`: the fold preserves byte length, so
+/// offsets found in it slice the original.
 ///
-/// Returns the window plus **how many occurrences it found**, before touching
-/// ranges are coalesced — the full-text pass ranks on that count. Blank terms
+/// Returns the window and how many occurrences it found before touching
+/// ranges were coalesced, the count the full-text pass ranks on. Blank terms
 /// are dropped, but a padded term is searched as given, never trimmed.
 pub fn extract_folded(
     text: &str,
@@ -63,25 +63,24 @@ pub fn extract_folded(
         .filter(|t| !t.trim().is_empty())
         .collect();
     if effective_terms.is_empty() {
-        return (head_window(text, opts.approx_chars), 0);
+        return (head_window(text, opts.approx_bytes), 0);
     }
 
-    // `memmem`, not `str::match_indices` — measured faster on whole-body
-    // scans. The walk runs to the end (the count must see every occurrence)
-    // but matches past the window's right edge are not stored. Bounded only
-    // for a single term: with several, two terms can coalesce across the
-    // edge and no single-pass bound sees it.
-    let pre_pad = opts.approx_chars / 3;
+    // `memmem`, not `str::match_indices`: measured faster on whole-body
+    // scans. The walk runs to the end (the count must see every occurrence),
+    // but matches past the window's right edge are not stored. Only a single
+    // term is bounded: with several, two terms can coalesce across the edge,
+    // which no single-pass bound sees.
     let bounded = effective_terms.len() == 1;
     let mut matches: Vec<(usize, usize)> = Vec::new();
     let mut found = 0usize;
-    // The right edge, once the first match has fixed it. Computed exactly as
-    // the window is computed below, so "kept" and "rendered" cannot disagree.
+    // The window's right edge once the first match fixes it, from the same
+    // [`window_bounds`] the window itself uses.
     let mut keep_below: Option<usize> = None;
 
     for term in &effective_terms {
-        // Borrow when the term is already folded — every cascade call — to
-        // avoid an allocation per candidate row.
+        // Borrow when the term is already folded, as every cascade call's is,
+        // to avoid an allocation per candidate row.
         let pattern: std::borrow::Cow<'_, str> = if term.bytes().any(|b| b.is_ascii_uppercase()) {
             std::borrow::Cow::Owned(term.to_ascii_lowercase())
         } else {
@@ -96,13 +95,8 @@ pub fn extract_folded(
             // ranking even though they paint as one highlight.
             found += 1;
             if bounded {
-                let bound = *keep_below.get_or_insert_with(|| {
-                    let mut end = (at.saturating_sub(pre_pad) + opts.approx_chars).min(text.len());
-                    while end < text.len() && !text.is_char_boundary(end) {
-                        end += 1;
-                    }
-                    end
-                });
+                let bound =
+                    *keep_below.get_or_insert_with(|| window_bounds(text, at, opts.approx_bytes).1);
                 if at >= bound && at > chain_end {
                     // Past the edge and not chained to anything kept: keep
                     // counting, stop storing.
@@ -115,30 +109,17 @@ pub fn extract_folded(
     }
 
     if matches.is_empty() {
-        return (head_window(text, opts.approx_chars), 0);
+        return (head_window(text, opts.approx_bytes), 0);
     }
 
     matches.sort_by_key(|(a, _)| *a);
     let matches = coalesce_overlapping(matches);
 
-    // Start a third of the budget before the first match so the hit isn't
-    // pinned to the left edge.
-    let mut win_start = matches[0].0.saturating_sub(pre_pad);
-    let mut win_end = (win_start + opts.approx_chars).min(text.len());
-    while win_start > 0 && !text.is_char_boundary(win_start) {
-        win_start -= 1;
-    }
-    while win_end < text.len() && !text.is_char_boundary(win_end) {
-        win_end += 1;
-    }
-
+    let (win_start, mut win_end) = window_bounds(text, matches[0].0, opts.approx_bytes);
     // A match straddling the right edge is fully included, not cut mid-hit.
     if let Some((_, end)) = matches.iter().rfind(|(s, _)| *s < win_end) {
         if *end > win_end {
-            win_end = *end;
-            while win_end < text.len() && !text.is_char_boundary(win_end) {
-                win_end += 1;
-            }
+            win_end = text.ceil_char_boundary(*end);
         }
     }
 
@@ -164,25 +145,33 @@ pub fn extract_folded(
     )
 }
 
-/// Clamp `range` into `text` and widen it to the nearest char boundaries:
-/// callers take ranges from byte-level matchers, so an endpoint can land
-/// inside a multi-byte character — slicing there panics.
-fn aligned_range(text: &str, range: (usize, usize)) -> (usize, usize) {
-    let (mut start, mut end) = range;
-    start = start.min(text.len());
-    end = end.clamp(start, text.len());
-    while start > 0 && !text.is_char_boundary(start) {
-        start -= 1;
-    }
-    while end < text.len() && !text.is_char_boundary(end) {
-        end += 1;
-    }
-    (start, end)
+/// The window cut around a match that starts at `first`: from a third of
+/// `budget` before it, rounded down to a char boundary, to `budget` past that
+/// unrounded start, rounded up. The third keeps the hit off the left edge.
+fn window_bounds(text: &str, first: usize, budget: usize) -> (usize, usize) {
+    let start = first.saturating_sub(budget / 3);
+    let end = (start + budget).min(text.len());
+    (
+        text.floor_char_boundary(start),
+        text.ceil_char_boundary(end),
+    )
 }
 
-/// The whole of `text` as the window, with `range` marked — the shape the
-/// name and path tiers use: `window` is the field verbatim, so the ranges
-/// index the field the column is already painting.
+/// Clamp `range` into `text` and widen it to the nearest char boundaries.
+/// Callers take ranges from byte-level matchers, so an endpoint can land
+/// inside a multi-byte character, where slicing panics.
+fn aligned_range(text: &str, range: (usize, usize)) -> (usize, usize) {
+    let start = range.0.min(text.len());
+    let end = range.1.clamp(start, text.len());
+    (
+        text.floor_char_boundary(start),
+        text.ceil_char_boundary(end),
+    )
+}
+
+/// The whole of `text` as the window, with `range` marked: the shape the name
+/// and path tiers use. `window` is the field verbatim, so the ranges index the
+/// field the column is already painting.
 pub fn whole_field(text: &str, range: (usize, usize)) -> Snippet {
     if text.is_empty() {
         return Snippet::empty();
@@ -200,23 +189,16 @@ pub fn whole_field(text: &str, range: (usize, usize)) -> Snippet {
     }
 }
 
-/// Build a snippet window around one known match range in `text`. Used by
-/// fuzzy full-text search; the range is clamped and aligned defensively.
+/// Build a snippet window around one known match range in `text`. The range
+/// is clamped into `text` and widened to char boundaries.
 pub fn window_around(text: &str, range: (usize, usize), opts: &Options) -> Snippet {
     if text.is_empty() {
         return Snippet::empty();
     }
     let (ms, me) = aligned_range(text, range);
-
-    let pre_pad = opts.approx_chars / 3;
-    let mut win_start = ms.saturating_sub(pre_pad);
-    let mut win_end = (win_start + opts.approx_chars).max(me).min(text.len());
-    while win_start > 0 && !text.is_char_boundary(win_start) {
-        win_start -= 1;
-    }
-    while win_end < text.len() && !text.is_char_boundary(win_end) {
-        win_end += 1;
-    }
+    let (win_start, win_end) = window_bounds(text, ms, opts.approx_bytes);
+    // The whole match stays inside the window.
+    let win_end = win_end.max(me);
 
     let ranges = if me > ms {
         vec![(ms - win_start, me - win_start)]
@@ -250,23 +232,12 @@ pub fn count_occurrences(text: &str, term: &str, case_sensitive: bool) -> usize 
 
 /// The first `n` bytes of `text` (char-aligned) as a match-less window.
 fn head_window(text: &str, n: usize) -> Snippet {
-    if text.len() <= n {
-        return Snippet {
-            window: text.to_string(),
-            ranges: Vec::new(),
-            truncated_start: false,
-            truncated_end: false,
-        };
-    }
-    let mut cut = n;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    let cut = text.floor_char_boundary(n);
     Snippet {
         window: text[..cut].to_string(),
         ranges: Vec::new(),
         truncated_start: false,
-        truncated_end: true,
+        truncated_end: cut < text.len(),
     }
 }
 
@@ -302,10 +273,10 @@ mod tests {
     }
 
     fn opts_small() -> Options {
-        Options { approx_chars: 40 }
+        Options { approx_bytes: 40 }
     }
 
-    /// The count must be occurrences — not the highlights they coalesce into.
+    /// The count is occurrences, not the highlights they coalesce into.
     #[test]
     fn extract_folded_counts_occurrences_not_ranges() {
         let text = "abab and ab";
@@ -314,12 +285,12 @@ mod tests {
         assert_eq!(
             n,
             count_occurrences(text, "ab", true),
-            "must agree with the counter the pass used to call"
+            "must agree with count_occurrences"
         );
         assert_eq!(s.ranges.len(), 2, "the abutting pair paints as one range");
     }
 
-    /// A disagreement here would silently change which rows survive the pass.
+    /// A disagreement here would change which rows survive the pass.
     #[test]
     fn extract_folded_count_agrees_with_count_occurrences() {
         let cases: &[(&str, &str)] = &[
@@ -396,9 +367,9 @@ mod tests {
         s.ranges.iter().map(|&(a, b)| &s.window[a..b]).collect()
     }
 
-    /// Occurrences past the window's right edge are counted but not kept —
-    /// a bound leaking into either side would be a ranking change or a
-    /// missing highlight.
+    /// Occurrences past the window's right edge are counted but not kept; a
+    /// bound leaking into either side would be a ranking change or a missing
+    /// highlight.
     #[test]
     fn occurrences_past_the_window_are_counted_but_not_kept() {
         let unit = "needle filler filler ";
@@ -438,9 +409,9 @@ mod tests {
         assert_ranges_valid(&snip);
         assert_eq!(snip.ranges.len(), 1, "one chain, one highlight");
 
-        // Load-bearing: an unbroken chain legitimately grows the window to
-        // the whole text; dropping the chain rule yields a 40-byte window,
-        // which "range == whole window" alone cannot tell apart.
+        // An unbroken chain grows the window to the whole text; without the
+        // chain rule the window is 40 bytes, which "range == whole window"
+        // alone cannot tell apart.
         assert_eq!(
             snip.window.len(),
             text.len(),

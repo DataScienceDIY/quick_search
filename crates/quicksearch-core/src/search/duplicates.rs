@@ -1,22 +1,20 @@
-//! Duplicate-file listing, grouped by content hash. Synchronous — callers
-//! run it on their own worker thread.
+//! Duplicate-file listing, grouped by content hash. Synchronous: callers run
+//! it on their own worker thread.
 //!
-//! # Why this is three queries and not one aggregate
+//! # Why three queries and not one aggregate
 //!
-//! The obvious form — `SELECT hash, COUNT(*), SUM(size) - MAX(size) … GROUP BY
-//! hash` — reads `size`, which lives only in the table row. `idx_files_hash`
-//! covers `hash` alone, so SQLite walks the index in hash order and fetches the
-//! wide `files` row behind *every* entry: one random page per indexed file, each
-//! of which SQLCipher must decrypt and verify. At 3M files that is the entire
-//! cost of the scan.
+//! `SELECT hash, COUNT(*), SUM(size) - MAX(size) … GROUP BY hash` reads
+//! `size`, which lives only in the table row. `idx_files_hash` covers `hash`
+//! alone, so SQLite walks the index in hash order and fetches the wide `files`
+//! row behind every entry: one random page per indexed file, each of which
+//! SQLCipher must decrypt. At 3M files that is the entire cost of the scan.
 //!
-//! Naming nothing but `hash` keeps the scan inside the index, and `size` is then
-//! needed once per *candidate group* rather than once per row — measured 3M row
-//! fetches down to 60k on a 3M-file index, and 2.75s down to 0.56s with the
-//! whole database already in RAM (the gap widens on cold or encrypted storage).
-//! That property is load-bearing and easy to lose to an innocent-looking edit,
-//! so `tests::candidate_scan_stays_inside_the_index` reads the query plan back
-//! and fails on anything but a covering scan.
+//! Naming nothing but `hash` keeps the scan inside the index, and `size` is
+//! then read once per candidate group rather than once per row: 3M row fetches
+//! down to 60k on a 3M-file index, and 2.75 s down to 0.56 s with the whole
+//! database in RAM (the gap widens on cold or encrypted storage). An innocent
+//! edit can lose this, so a test reads the query plan back and fails on
+//! anything but a covering scan.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -45,9 +43,9 @@ impl DuplicateGroup {
     }
 }
 
-/// A ranked group, ordered so that **greater is better**: more reclaimable
-/// bytes first, and the lower rowid on a tie so repeated scans of an unchanged
-/// index list the same groups in the same order.
+/// A ranked group, ordered so that greater is better: more reclaimable bytes
+/// first, and the lower rowid on a tie so repeated scans of an unchanged index
+/// list the same groups in the same order.
 #[derive(Debug, PartialEq, Eq)]
 struct Ranked {
     redundant: i64,
@@ -86,20 +84,15 @@ pub fn find_duplicate_groups(db_path: &str, limit: u32) -> Result<Vec<DuplicateG
 }
 
 /// Every hash shared by more than one row, as `(lowest rowid, member count)`.
-///
-/// The index-only half: selecting neither `hash` nor `size` is what keeps this
-/// a covering scan. Holding the result costs 16 bytes per duplicate group —
-/// bounded by the number of *groups*, not by the size of the index.
+/// Selecting neither `hash` nor `size` keeps this a covering scan. The result
+/// costs 16 bytes per duplicate group, not per indexed file.
 fn scan_candidates(conn: &Connection) -> Result<Vec<(i64, i64)>, String> {
     let mut stmt = conn.prepare(CANDIDATE_SQL).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, i64>(1)?, r.get::<_, i64>(0)?)))
         .map_err(|e| e.to_string())?;
-    let mut candidates = Vec::new();
-    for row in rows {
-        candidates.push(row.map_err(|e| e.to_string())?);
-    }
-    Ok(candidates)
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }
 
 /// `WHERE hash IS NOT NULL` is not optional: without it every unhashed row
@@ -111,8 +104,8 @@ const CANDIDATE_SQL: &str = "SELECT COUNT(*), MIN(id) FROM files \
 /// Price each candidate and keep the best `limit`, best first.
 ///
 /// One row read per group, for `size`. Every member of a hash group has the
-/// same size — the hash is `sha256(size ‖ head)` (see
-/// [`crate::file_handling::get_file_hash`]) — so the lowest rowid speaks for
+/// same size, because the hash is `sha256(size ‖ head)` (see
+/// [`crate::file_handling::get_file_hash`]), so the lowest rowid speaks for
 /// all of them.
 fn rank_candidates(
     conn: &Connection,
@@ -122,8 +115,8 @@ fn rank_candidates(
     let mut stmt = conn
         .prepare("SELECT size FROM files WHERE id = ?1")
         .map_err(|e| e.to_string())?;
-    // Peeking at the *worst* kept group is what bounds this to `limit` entries
-    // however many duplicate groups the index holds.
+    // Peeking at the worst kept group bounds this to `limit` entries however
+    // many duplicate groups the index holds.
     let mut best: BinaryHeap<std::cmp::Reverse<Ranked>> = BinaryHeap::new();
     for &(rowid, count) in candidates {
         let size: Option<i64> = stmt
@@ -195,10 +188,9 @@ fn hydrate(conn: &Connection, winners: Vec<Ranked>) -> Result<Vec<DuplicateGroup
                 ))
             })
             .map_err(|e| e.to_string())?;
-        let mut members = Vec::new();
-        for m in rows {
-            members.push(m.map_err(|e| e.to_string())?);
-        }
+        let members = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
         if members.is_empty() {
             continue;
         }
@@ -219,14 +211,15 @@ mod tests {
     use crate::db::open_or_recreate;
     use crate::db::repo::{insert_file, NewFile};
     use crate::mime::FileType;
+    use crate::testutil::Scratch;
 
     /// Members of a hash group always share a size, because the hash is
-    /// `sha256(size ‖ head)`. Seeds that break that are testing a state the
-    /// indexer cannot produce — `malformed_group_does_not_panic` does so on
-    /// purpose, and is the only one that may.
-    fn seed(dir: &str, rows: &[(&str, u64, Option<&[u8]>)]) -> std::path::PathBuf {
-        let p = crate::testutil::scratch_dir(dir).join("index.sqlite");
-        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    /// `sha256(size ‖ head)`. Only `malformed_group_does_not_panic` seeds a
+    /// group that breaks that, on purpose.
+    fn seed(dir: &str, rows: &[(&str, u64, Option<&[u8]>)]) -> (Scratch, String) {
+        let (scratch, p) = Scratch::db(dir);
+        let p = p.to_str().unwrap().to_string();
+        let mut conn = open_or_recreate(&p, "trigram").unwrap();
         let tx = conn.transaction().unwrap();
         for &(name, size, hash) in rows {
             insert_file(
@@ -246,11 +239,10 @@ mod tests {
             .expect("unique path");
         }
         tx.commit().unwrap();
-        drop(conn);
-        p
+        (scratch, p)
     }
 
-    fn seed_db() -> std::path::PathBuf {
+    fn seed_db() -> (Scratch, String) {
         seed(
             "dups",
             &[
@@ -258,7 +250,7 @@ mod tests {
                 ("a1.txt", 10, Some(b"AAA")),
                 ("a2.txt", 10, Some(b"AAA")),
                 ("a3.txt", 10, Some(b"AAA")),
-                // redundant = 100 × 1 = 100 — sorts first despite fewer members.
+                // redundant = 100 × 1 = 100: sorts first despite fewer members.
                 ("b1.txt", 100, Some(b"BBB")),
                 ("b2.txt", 100, Some(b"BBB")),
                 ("c.txt", 30, Some(b"CCC")),
@@ -273,8 +265,8 @@ mod tests {
 
     #[test]
     fn groups_ordered_by_redundant_size_zero_size_excluded() {
-        let p = seed_db();
-        let groups = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
+        let (_dir, p) = seed_db();
+        let groups = find_duplicate_groups(&p, 10).unwrap();
         assert_eq!(
             groups.len(),
             2,
@@ -288,40 +280,37 @@ mod tests {
         assert_eq!(groups[1].redundant_size, 20);
         assert_eq!(groups[1].members.len(), 3);
         assert_eq!(groups[1].members[0].1, "a1.txt", "members path-ordered");
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn limit_keeps_the_largest_groups() {
-        let p = seed_db();
-        let all = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
-        let one = find_duplicate_groups(p.to_str().unwrap(), 1).unwrap();
+        let (_dir, p) = seed_db();
+        let all = find_duplicate_groups(&p, 10).unwrap();
+        let one = find_duplicate_groups(&p, 1).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[0], all[0], "the truncated page is the *largest* group");
-        let over = find_duplicate_groups(p.to_str().unwrap(), 500).unwrap();
+        let over = find_duplicate_groups(&p, 500).unwrap();
         assert_eq!(
             over, all,
             "a limit above the group count returns everything"
         );
-        std::fs::remove_file(&p).ok();
     }
 
-    /// The identity a UI remembers a dismissed group by: it must be the hash
-    /// itself, spelled the one way, or a group hidden today comes back
-    /// tomorrow under a different spelling.
+    /// The identity a UI remembers a dismissed group by must be the hash
+    /// itself, spelled one way, or a hidden group comes back under a
+    /// different spelling.
     #[test]
     fn a_group_spells_its_hash_the_one_way() {
-        let p = seed_db();
-        let groups = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
+        let (_dir, p) = seed_db();
+        let groups = find_duplicate_groups(&p, 10).unwrap();
         for group in &groups {
             let hex = group.hash_hex();
             assert_eq!(hex.len(), group.hash.len() * 2);
             assert!(hex
                 .chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
-            assert_eq!(hex, group.hash_hex(), "not stable across calls");
         }
-        let again = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
+        let again = find_duplicate_groups(&p, 10).unwrap();
         let spelled = |gs: &[DuplicateGroup]| gs.iter().map(|g| g.hash_hex()).collect::<Vec<_>>();
         assert_eq!(
             spelled(&groups),
@@ -333,7 +322,6 @@ mod tests {
             groups[1].hash_hex(),
             "two groups must not answer to one name"
         );
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
@@ -355,20 +343,19 @@ mod tests {
             .iter()
             .map(|(n, s, h)| (n.as_str(), *s, Some(*h)))
             .collect();
-        let p = seed("dups_many", &rows);
-        let groups = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
+        let (_dir, p) = seed("dups_many", &rows);
+        let groups = find_duplicate_groups(&p, 10).unwrap();
         assert_eq!(groups[0].count, 20);
         assert_eq!(
             groups[0].redundant_size, 1900,
             "ranked on reclaimable bytes, not on file size"
         );
         assert_eq!(groups[1].redundant_size, 1000);
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn ties_are_broken_deterministically() {
-        let p = seed(
+        let (_dir, p) = seed(
             "dups_ties",
             &[
                 ("t1.txt", 50, Some(b"TA")),
@@ -379,31 +366,30 @@ mod tests {
                 ("v2.txt", 50, Some(b"TC")),
             ],
         );
-        let first = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
+        let first = find_duplicate_groups(&p, 10).unwrap();
         assert_eq!(first.len(), 3);
         assert!(first.iter().all(|g| g.redundant_size == 50), "all tied");
-        let again = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
+        let again = find_duplicate_groups(&p, 10).unwrap();
         assert_eq!(first, again, "an unchanged index lists the same order");
         // And the tie-break must survive truncation: the top 2 of a tied set are
         // the first 2 of the full listing.
-        let top2 = find_duplicate_groups(p.to_str().unwrap(), 2).unwrap();
+        let top2 = find_duplicate_groups(&p, 2).unwrap();
         assert_eq!(
             top2.as_slice(),
             &first[..2],
             "truncation agrees with the full listing"
         );
-        std::fs::remove_file(&p).ok();
     }
 
-    /// The indexer cannot produce this — the hash covers the size — but a row
+    /// The indexer cannot produce this (the hash covers the size), but a row
     /// hand-edited into the index must not take the scan down with it.
     #[test]
     fn malformed_group_does_not_panic() {
-        let p = seed(
+        let (_dir, p) = seed(
             "dups_malformed",
             &[("m1.txt", 10, Some(b"MMM")), ("m2.txt", 999, Some(b"MMM"))],
         );
-        let groups = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
+        let groups = find_duplicate_groups(&p, 10).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].count, 2);
         assert_eq!(
@@ -411,33 +397,30 @@ mod tests {
             "totals come from the lowest rowid's size"
         );
         assert_eq!(groups[0].members.len(), 2);
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn absurd_sizes_saturate_instead_of_overflowing() {
         let huge = i64::MAX as u64;
-        let p = seed(
+        let (_dir, p) = seed(
             "dups_overflow",
             &[
                 ("h1.bin", huge, Some(b"HHH")),
                 ("h2.bin", huge, Some(b"HHH")),
             ],
         );
-        let groups = find_duplicate_groups(p.to_str().unwrap(), 10).unwrap();
+        let groups = find_duplicate_groups(&p, 10).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].redundant_size, i64::MAX);
         assert_eq!(groups[0].total_size, i64::MAX, "saturated, not wrapped");
-        std::fs::remove_file(&p).ok();
     }
 
-    /// The guard on the whole point of this module. If a later edit makes the
-    /// candidate scan read a table row per indexed file again, this fails
-    /// rather than merely getting slow.
+    /// Guards the module's reason to exist: a candidate scan that reads a table
+    /// row per indexed file fails here rather than merely getting slow.
     #[test]
     fn candidate_scan_stays_inside_the_index() {
-        let p = seed_db();
-        let conn = db::open_existing(p.to_str().unwrap(), false).unwrap();
+        let (_dir, p) = seed_db();
+        let conn = db::open_existing(&p, false).unwrap();
         let plan: Vec<String> = conn
             .prepare(&format!("EXPLAIN QUERY PLAN {}", CANDIDATE_SQL))
             .unwrap()
@@ -450,7 +433,5 @@ mod tests {
                 .any(|s| s.contains("COVERING INDEX idx_files_hash")),
             "the candidate scan must not touch table rows; plan was {plan:?}"
         );
-        drop(conn);
-        std::fs::remove_file(&p).ok();
     }
 }

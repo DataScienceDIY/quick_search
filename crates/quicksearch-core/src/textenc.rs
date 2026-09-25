@@ -1,13 +1,13 @@
 //! Text detection and charset decoding, shared by the MIME sniff and the
-//! plaintext extractor — one classifier, so they cannot drift.
+//! plaintext extractor through one classifier, so they cannot drift.
 //! [`decode_text`] decodes every class but `Binary`; [`looks_like_text`]
 //! accepts only `Utf8` and `Bom`, the classes with positive proof.
 //!
-//! Classification order is load-bearing: **BOM** first (UTF-16 is full of
-//! NULs the binary guard would reject), then the binary guard, then strict
-//! UTF-8, then `Legacy`. The sniff rejects `Legacy` on purpose: chardetng's
-//! windows-1252 floor never fails, so accepting it makes the sniff
-//! unfalsifiable and stores NUL-free binary formats as mojibake.
+//! Classification order matters: BOM first (UTF-16 is full of NULs the binary
+//! guard would reject), then the binary guard, then strict UTF-8, then
+//! `Legacy`. The sniff rejects `Legacy` because chardetng's windows-1252
+//! floor never fails: accepting it would make the sniff unfalsifiable and
+//! store NUL-free binary formats as mojibake.
 
 /// How much of a file the charset detector is shown; chardetng's answer
 /// stops moving well inside this.
@@ -53,15 +53,15 @@ fn classify(bytes: &[u8], truncated: bool) -> TextClass {
     match std::str::from_utf8(bytes) {
         Ok(_) => TextClass::Utf8,
         // `error_len() == None` means the only defect is a multibyte
-        // sequence running off the end of the buffer — for a truncated head
-        // that is the file boundary's fault, not the file's.
+        // sequence running off the end of the buffer; for a truncated head
+        // that is the buffer boundary's fault, not the file's.
         Err(e) if truncated && e.error_len().is_none() => TextClass::Utf8,
         Err(_) => TextClass::Legacy,
     }
 }
 
-/// Whether `head` — a possibly-truncated prefix of a file — is *provably*
-/// text: valid UTF-8, or BOM-marked.
+/// Whether `head`, a possibly truncated prefix of a file, is provably text:
+/// valid UTF-8, or BOM-marked.
 ///
 /// An empty head proves nothing and answers `false`; without that guard
 /// every zero-size procfs file would become `text/plain`.
@@ -70,13 +70,12 @@ pub fn looks_like_text(head: &[u8]) -> bool {
 }
 
 /// Decode a complete file's bytes to UTF-8 for storage. Accepts `Legacy`
-/// besides what [`looks_like_text`] does: by the time this runs, something —
-/// usually the extension — has already decided the file is text, so a
+/// besides what [`looks_like_text`] does: by the time this runs, something
+/// (usually the extension) has already decided the file is text, so a
 /// windows-1252 `.txt` or Shift-JIS `.csv` still decodes.
 ///
-/// Takes the buffer **by value** so a UTF-8 file — the overwhelming majority
-/// — becomes its `String` with no copy at all. Callers that only have a
-/// borrow, and would otherwise clone one just to hand it over, want
+/// Takes the buffer by value so a UTF-8 file, the overwhelming majority,
+/// becomes its `String` with no copy. Callers holding only a borrow want
 /// [`decode_borrowed_text`].
 pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
     if bytes.is_empty() {
@@ -89,12 +88,9 @@ pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
     }
 }
 
-/// [`decode_text`] for bytes the caller does not own — the walk's head
-/// buffer, which is reused for the next file and so cannot be given away.
-///
-/// The one difference is the UTF-8 case, which must copy here; every other
-/// class allocates its output either way. `head.to_vec()` at the call site
-/// was that same copy plus a second one for the bytes.
+/// [`decode_text`] for bytes the caller does not own, such as the walk's head
+/// buffer, which is reused for the next file. Only the UTF-8 case differs: it
+/// copies here, where every other class allocates its output either way.
 pub fn decode_borrowed_text(bytes: &[u8], path: &Path) -> Result<String, String> {
     if bytes.is_empty() {
         return Ok(String::new());
@@ -132,7 +128,7 @@ pub fn decode_borrowed_text(bytes: &[u8], path: &Path) -> Result<String, String>
 /// Filenames and extracted text can carry terminal escape sequences; printed
 /// raw they rewrite the line, retitle the window, or via OSC 52 put text of
 /// the writer's choosing on the user's clipboard. Tab survives, as does
-/// everything above C1 — this is not a general sanitiser.
+/// everything above C1: this is not a general sanitiser.
 pub fn scrub_controls(s: &str) -> std::borrow::Cow<'_, str> {
     fn dangerous(c: char) -> bool {
         (c.is_control() && c != '\t') || ('\u{80}'..='\u{9f}').contains(&c)
@@ -282,8 +278,8 @@ mod tests {
         let mut head = "ends mid-char: caf".as_bytes().to_vec();
         head.push(0xC3); // first byte of a two-byte sequence, cut off
         assert!(looks_like_text(&head));
-        // The same bytes as a *complete* file are not valid UTF-8, so the
-        // decoder treats them as legacy-encoded — still Ok, never a panic.
+        // The same bytes as a complete file are not valid UTF-8, so the
+        // decoder treats them as legacy-encoded: still Ok, never a panic.
         assert!(decode_text(head, &p()).is_ok());
     }
 
@@ -305,9 +301,9 @@ mod tests {
         assert!(decode_text(body, &p()).is_err());
     }
 
-    /// Every head the sniff accepts must decode — the invariant that makes
-    /// "sniffed as text/plain" safe to act on. The `expect_sniff` column pins
-    /// each head's side of the line so a change can't quietly weaken this.
+    /// Every head the sniff accepts must decode, which makes "sniffed as
+    /// text/plain" safe to act on. The `expect_sniff` column pins each head's
+    /// side of the line so a change cannot weaken this unnoticed.
     #[test]
     fn sniffed_text_is_guaranteed_decodable() {
         let heads: Vec<(bool, Vec<u8>)> = vec![
@@ -339,10 +335,9 @@ mod tests {
         }
     }
 
-    /// The regression this guard exists for: protobuf wire bytes clear the
-    /// binary guard, and chardetng's windows-1252 floor then "decodes" them
-    /// into mojibake. On a real 99k-file tree this single hole was 93% of
-    /// all extracted text.
+    /// Protobuf wire bytes clear the binary guard, and chardetng's
+    /// windows-1252 floor would "decode" them into mojibake. On a real
+    /// 99k-file tree that hole was 93% of all extracted text.
     #[test]
     fn protobuf_head_is_not_text() {
         let mut body = b"\x10\n\x02v1\x10\x01\x18\xe2\xe3\xfc\xd3\x9d\xca\x97\xe4\x189\x08\
@@ -362,7 +357,7 @@ mod tests {
         );
         assert!(
             !body.contains(&0u8),
-            "test fixture must have no NUL, or the old guard would have caught it"
+            "test fixture must have no NUL, or the binary guard alone would catch it"
         );
     }
 }

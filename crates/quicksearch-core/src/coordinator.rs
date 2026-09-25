@@ -2,16 +2,16 @@
 //! [`IndexingService`], the filesystem [`Watcher`], a periodic-reindex
 //! scheduler, and the mode state machine:
 //!
-//! - **Auto** — watcher running; events apply incrementally between full
-//!   runs; a full reindex triggers whenever `last_full_index` is older
-//!   than the configured interval (or has never happened).
-//! - **ManualStopped** — watcher off, pending events dropped, nothing runs
+//! - `Auto`: watcher running; events apply incrementally between full runs;
+//!   a full reindex triggers whenever `last_full_index` is older than the
+//!   configured interval (or has never happened).
+//! - `ManualStopped`: watcher off, pending events dropped, nothing runs
 //!   until the user acts.
-//! - **ManualRunning** — one user-forced full run; returns to
-//!   `ManualStopped` when it finishes. (A forced run in Auto stays Auto.)
+//! - `ManualRunning`: one user-forced full run; returns to `ManualStopped`
+//!   when it finishes. (A forced run in Auto stays Auto.)
 //!
 //! `indexing.auto_index` persists the mode; writing the file back is the
-//! caller's job — the coordinator's config is a copy, not the source of
+//! caller's job, since the coordinator's config is a copy, not the source of
 //! truth. Single-writer guarantee: incremental writes are deferred while a
 //! full run is active, then the queue drains; overflow collapses into one
 //! full run.
@@ -30,6 +30,7 @@ use crate::db;
 use crate::extract::Registry;
 use crate::incremental::{apply_fs_event, Applied, Budget};
 use crate::indexing::{ConfigChange, IndexingService, IndexingStatus, PrepStep, ReconcileProgress};
+use crate::log::now_unix;
 use crate::scope::WorkCursor;
 use crate::watcher::{FsEvent, WatchError, WatchFilters, Watcher, WatcherConfig};
 
@@ -56,8 +57,8 @@ pub enum IndexMode {
 pub enum WatcherStatus {
     /// Not running: manual mode, or no roots configured.
     Off,
-    /// Registration in flight — it walks every root, so this can last
-    /// minutes on large or networked trees.
+    /// Registration in flight; it walks every root, so this can last minutes
+    /// on large or networked trees.
     Starting,
     Active {
         dirs: usize,
@@ -91,7 +92,7 @@ pub struct IndexerState {
     pub queued_events: usize,
     pub watcher: WatcherStatus,
     /// The between-runs reconciliation, while it runs and briefly after. A
-    /// run's *own* reconciliation is not here — it reads as
+    /// run's *own* reconciliation is not here: it reads as
     /// [`IndexingStatus::Preparing`] with a [`PrepStep::Reconciling`].
     pub reconcile: Option<ReconcileState>,
     /// What each configured root held when indexing last completed. Roots
@@ -130,7 +131,7 @@ pub struct IndexCoordinator {
     reconcile_stop: Arc<ReconcileStop>,
 }
 
-/// The two halves of cutting the coordinator's reconciliation short — the pair
+/// The two halves of cutting the coordinator's reconciliation short: the pair
 /// [`db::InterruptSlot`] describes. A command cannot do it: the thread that
 /// would read the command is the thread inside the scan.
 #[derive(Default)]
@@ -209,18 +210,15 @@ impl IndexCoordinator {
             watcher_config,
             watcher_rx: None,
             watcher_gen: 0,
-            pending: HashMap::new(),
+            pending: inner::Debounced::default(),
             targeted: HashMap::new(),
             resume_from: HashMap::new(),
-            last_event_at: None,
-            pending_since: None,
             needs_full_run: false,
-            run_retry_at: None,
-            run_retry_delay: inner::RUN_RETRY_BASE,
+            run_retry: inner::Backoff::default(),
             pending_work: None,
             reconcile_done: None,
             reconcile_cut_short: false,
-            saw_running: false,
+            run_in_flight: false,
             files_at: None,
             was_busy: false,
             write_conn: None,
@@ -298,10 +296,10 @@ impl IndexCoordinator {
 
     /// Bring the index up to date for these paths and nothing else.
     ///
-    /// For [`crate::live`]. Deliberately **not** gated on [`IndexMode`] — the
-    /// whole point is that the rows on screen stay honest with indexing
-    /// stopped — but still applied on the coordinator's own thread, so the
-    /// single-writer rule holds. A path that no longer exists is removed.
+    /// For [`crate::live`]. Deliberately not gated on [`IndexMode`], since the
+    /// point is that the rows on screen stay honest with indexing stopped, but
+    /// still applied on the coordinator's own thread, so the single-writer
+    /// rule holds. A path that no longer exists is removed.
     pub fn update_paths(&self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
@@ -323,8 +321,8 @@ impl IndexCoordinator {
     /// Stop the watcher, any running index pass, and the coordinator thread.
     /// Idempotent; usable from a signal handler through an Arc. The
     /// reconciliation is cancelled *before* the command is sent: the command
-    /// is read by the thread inside the scan, so the join — and the window
-    /// close behind it — would otherwise wait out the scan.
+    /// is read by the thread inside the scan, so the join, and the window
+    /// close behind it, would otherwise wait out the scan.
     pub fn shutdown(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
@@ -361,7 +359,7 @@ impl Drop for IndexCoordinator {
 /// The verb a path submitted through [`IndexCoordinator::update_paths`]
 /// deserves, or `None` to leave the index alone. `is_file()` folds every stat
 /// error into `false`, and a `Remove` costs the row *and everything beneath
-/// it* — so the negative answer, and only it, is confirmed with a second
+/// it*, so the negative answer, and only it, is confirmed with a second
 /// `stat` that can tell "gone" from "cannot see it just now".
 fn verb_for(path: PathBuf) -> Option<FsEvent> {
     if path.is_file() {
@@ -424,5 +422,3 @@ pub type Notify = Arc<dyn Fn() + Send + Sync>;
 fn summary_is_fresh(at: Instant, now: Instant) -> bool {
     now.duration_since(at) < RECONCILE_SUMMARY_LINGER
 }
-
-use crate::log::now_unix;

@@ -1,19 +1,17 @@
-//! The app's own font set. `egui` is built with `default-features = false`,
-//! so it embeds no fonts; the two faces below are the same files egui would
-//! have bundled, unmodified. Dropped: egui's two emoji faces — 736,668 bytes
-//! of `.rodata` for four glyphs, now `↻`, `×` and a colour. The faces have
-//! no CJK/Hebrew/Arabic and never did; emoji in filenames now render `◻`
-//! too, the one real regression.
+//! The app's fonts. egui is built without `default_fonts`, so we install its
+//! two text faces ourselves, unmodified, and skip its emoji faces (736,668
+//! bytes for the four glyphs we used). Cost: emoji in filenames render as
+//! `◻`, as CJK, Hebrew and Arabic always did.
 
 use std::sync::Arc;
 
-/// Proportional body text. Ubuntu Font Licence 1.0 — `assets/fonts/UFL.txt`.
+/// Proportional body text. Ubuntu Font Licence 1.0 (`assets/fonts/UFL.txt`).
 const UBUNTU_LIGHT: &[u8] = include_bytes!("../assets/fonts/Ubuntu-Light.ttf");
 
-/// Monospace. MIT/DejaVu/Bitstream Vera — `assets/fonts/Hack-Regular.txt`.
+/// Monospace. MIT/DejaVu/Bitstream Vera (`assets/fonts/Hack-Regular.txt`).
 const HACK_REGULAR: &[u8] = include_bytes!("../assets/fonts/Hack-Regular.ttf");
 
-/// Install the two faces on `ctx`. `set_fonts` only queues; applied in
+/// Installs the two faces on `ctx`. `set_fonts` only queues; applied in
 /// `begin_pass`, so it takes effect on frame 1 if called before the first run.
 pub fn install(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::empty();

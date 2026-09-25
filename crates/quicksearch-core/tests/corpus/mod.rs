@@ -3,7 +3,7 @@
 //! The per-extractor unit tests build fixtures with the libraries that read
 //! them back; a writer and reader sharing a wrong assumption agree with each
 //! other. This module is the other half: well-formed documents from
-//! *foreign* producers — every writer differs from its reader.
+//! *foreign* producers, where every writer differs from its reader.
 //!
 //! | format | written by | read by |
 //! |---|---|---|
@@ -17,7 +17,7 @@
 //! | plain text | `std`, plus a hand-rolled cp1252 encoder | `encoding_rs` |
 //! | doc, xls, ppt | LibreOffice, committed — see [`legacy`] | `cfb` |
 //!
-//! Two places take committed bytes — the legacy OLE2 binaries (`cfb` is the
+//! Two places take committed bytes: the legacy OLE2 binaries (`cfb` is the
 //! only OLE2 writer in Rust, and it is the reader; see
 //! `tests/fixtures/legacy/README.md`) and the `.flac`'s fifty milliseconds
 //! of silence (`lofty` reads a real frame for stream properties; see
@@ -55,6 +55,7 @@ pub fn seed() -> u64 {
 }
 
 pub use quicksearch_core::testutil::Lcg;
+use quicksearch_core::testutil::Scratch;
 
 /// Plain ASCII lowercase so it survives every encoding unchanged, and long
 /// enough that a drawn sentence is effectively unique.
@@ -116,9 +117,8 @@ pub struct Body {
     pub needle: String,
 }
 
-/// What every needle starts with — the same word as `common::BODY_TERM`, so
-/// a hit is attributable to extraction. This module stays self-contained;
-/// `corpus_needles_use_the_shared_body_term` keeps the two from drifting.
+/// What every needle starts with: `common::BODY_TERM`, spelled out so this
+/// module stays self-contained; see `corpus_needles_use_the_shared_body_term`.
 pub const NEEDLE_PREFIX: &str = "chalcedony";
 
 impl Body {
@@ -150,8 +150,8 @@ pub struct Sample {
     pub label: &'static str,
     /// Fragments that must appear in the extracted text, in this order.
     /// Ordered containment, not equality (readers drag in boilerplate and
-    /// separators) and not set membership (text assembled out of order is
-    /// exactly what a mis-read Word piece table produces, and must fail).
+    /// separators) and not set membership (text assembled out of order is what
+    /// a mis-read Word piece table produces, and must fail).
     pub must_contain: Vec<String>,
     /// Planted in the body and absent from the file name.
     pub needle: String,
@@ -206,8 +206,8 @@ fn tail(s: &str, n: usize) -> String {
 }
 
 /// Build the whole corpus into one directory and return it with its samples.
-pub fn build(tag: &str) -> (PathBuf, Vec<Sample>) {
-    let dir = quicksearch_core::testutil::scratch_dir(tag);
+pub fn build(tag: &str) -> (Scratch, Vec<Sample>) {
+    let dir = Scratch::dir(tag);
     let mut lcg = Lcg::new(seed());
     let mut samples = Vec::new();
     let mut next = 0usize;

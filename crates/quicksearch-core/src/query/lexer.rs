@@ -30,8 +30,8 @@ impl std::fmt::Display for LexError {
 impl std::error::Error for LexError {}
 
 /// Whether the `:` at `colon` is a drive letter's, not a property operator:
-/// true only when the word so far is exactly one ASCII letter *and* a path
-/// separator follows — narrow enough to leave `12:30` and `a:b` untouched.
+/// true only when the word so far is exactly one ASCII letter and a path
+/// separator follows, which leaves `12:30` and `a:b` untouched.
 fn is_drive_letter_colon(bytes: &[u8], start: usize, colon: usize) -> bool {
     colon == start + 1
         && bytes[start].is_ascii_alphabetic()
@@ -47,9 +47,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 }
 
 /// [`tokenize`], but each token carries its byte range and a trailing error
-/// is returned alongside the tokens lexed before it — the GUI's highlighter
-/// must color the intact prefix of a half-typed query. `Quoted` spans
-/// include both quote characters.
+/// is returned alongside the tokens lexed before it, so the GUI's highlighter
+/// can color the intact prefix of a half-typed query. `Quoted` spans include
+/// both quote characters.
 pub fn tokenize_spanned(input: &str) -> (Vec<(Token, std::ops::Range<usize>)>, Option<LexError>) {
     let bytes = input.as_bytes();
     let mut i = 0usize;
@@ -62,70 +62,53 @@ pub fn tokenize_spanned(input: &str) -> (Vec<(Token, std::ops::Range<usize>)>, O
             continue;
         }
         match b {
-            b'(' => {
-                out.push((Token::LParen, i..i + 1));
+            b'(' | b')' | b':' | b'=' => {
+                let token = match b {
+                    b'(' => Token::LParen,
+                    b')' => Token::RParen,
+                    b':' => Token::Op(Op::Contains),
+                    _ => Token::Op(Op::Eq),
+                };
+                out.push((token, i..i + 1));
                 i += 1;
             }
-            b')' => {
-                out.push((Token::RParen, i..i + 1));
-                i += 1;
-            }
-            b':' => {
-                out.push((Token::Op(Op::Contains), i..i + 1));
-                i += 1;
-            }
-            b'=' => {
-                out.push((Token::Op(Op::Eq), i..i + 1));
-                i += 1;
-            }
-            b'<' => {
-                if bytes.get(i + 1) == Some(&b'=') {
-                    out.push((Token::Op(Op::Le), i..i + 2));
-                    i += 2;
-                } else {
-                    out.push((Token::Op(Op::Lt), i..i + 1));
-                    i += 1;
-                }
-            }
-            b'>' => {
-                if bytes.get(i + 1) == Some(&b'=') {
-                    out.push((Token::Op(Op::Ge), i..i + 2));
-                    i += 2;
-                } else {
-                    out.push((Token::Op(Op::Gt), i..i + 1));
-                    i += 1;
-                }
+            b'<' | b'>' => {
+                let or_equal = bytes.get(i + 1) == Some(&b'=');
+                let op = match (b, or_equal) {
+                    (b'<', false) => Op::Lt,
+                    (b'<', true) => Op::Le,
+                    (_, false) => Op::Gt,
+                    (_, true) => Op::Ge,
+                };
+                let len = 1 + usize::from(or_equal);
+                out.push((Token::Op(op), i..i + len));
+                i += len;
             }
             b'"' => {
-                // Doubled-quote escape. Segments are copied as UTF-8 slices —
-                // `bytes[j] as char` would decode Latin-1 and mangle non-ASCII.
-                let mut j = i + 1;
+                // A doubled quote is an escaped one. Segments are copied as
+                // UTF-8 slices, so non-ASCII text survives.
                 let mut buf = String::new();
-                let mut segment_start = j;
-                while j < bytes.len() {
-                    if bytes[j] == b'"' {
-                        buf.push_str(&input[segment_start..j]);
-                        if bytes.get(j + 1) == Some(&b'"') {
-                            buf.push('"');
-                            j += 2;
-                            segment_start = j;
-                            continue;
-                        }
-                        break;
+                let mut rest = i + 1;
+                let end = loop {
+                    let Some(at) = input[rest..].find('"') else {
+                        return (
+                            out,
+                            Some(LexError {
+                                message: "unterminated quoted phrase".into(),
+                                offset: i,
+                            }),
+                        );
+                    };
+                    let quote = rest + at;
+                    buf.push_str(&input[rest..quote]);
+                    if bytes.get(quote + 1) != Some(&b'"') {
+                        break quote;
                     }
-                    j += 1;
-                }
-                if j >= bytes.len() {
-                    return (
-                        out,
-                        Some(LexError {
-                            message: "unterminated quoted phrase".into(),
-                            offset: i,
-                        }),
-                    );
-                }
-                out.push((Token::Quoted(buf), i..j + 1));
-                i = j + 1;
+                    buf.push('"');
+                    rest = quote + 2;
+                };
+                out.push((Token::Quoted(buf), i..end + 1));
+                i = end + 1;
             }
             _ => {
                 let start = i;
@@ -249,7 +232,7 @@ mod tests {
 
     #[test]
     fn non_ascii_survives_a_quoted_phrase() {
-        // Byte-wise copying decoded this as Latin-1 (`JosÃ©`).
+        // Byte-wise copying would decode this as Latin-1 (`JosÃ©`).
         let t = tokenize(r#""C:\Users\José\docs""#).unwrap();
         assert_eq!(t, vec![Token::Quoted(r"C:\Users\José\docs".into())]);
 

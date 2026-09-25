@@ -22,8 +22,9 @@ pub fn archive(entries: &[Entry<'_>]) -> Vec<u8> {
         out.extend_from_slice(&20u16.to_le_bytes()); // version needed
         out.extend_from_slice(&0u16.to_le_bytes()); // flags
         out.extend_from_slice(&0u16.to_le_bytes()); // method: stored
-                                                    // A fixed DOS timestamp (1980-01-01, the format's epoch): a real
-                                                    // clock would make two runs of the same seed produce different bytes.
+
+        // A fixed DOS timestamp (1980-01-01, the format's epoch): a real clock
+        // would make two runs of the same seed produce different bytes.
         out.extend_from_slice(&0u16.to_le_bytes()); // time
         out.extend_from_slice(&0x0021u16.to_le_bytes()); // date
         out.extend_from_slice(&crc.to_le_bytes());

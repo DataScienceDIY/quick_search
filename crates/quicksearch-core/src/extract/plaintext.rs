@@ -11,7 +11,7 @@ use super::{ExtractError, Extractor, Scratch};
 /// emitted by some MIME source and map to a [`crate::mime::FileType`]
 /// containing TEXT; the cross-check tests in `mime.rs` enforce both. The
 /// `audio/*` and `image/*` entries rely on this extractor registering before
-/// the audio and image extractors — first match wins.
+/// the audio and image extractors; first match wins.
 pub(crate) const EXTRA_TEXT_MIMES: &[&str] = &[
     "application/geo+json",
     "application/javascript",
@@ -38,21 +38,11 @@ pub(crate) const EXTRA_TEXT_MIMES: &[&str] = &[
     "message/rfc822",
 ];
 
-/// Decode into `out`, moving rather than copying where the class allows it.
-///
-/// This extractor is the one place a read buffer *becomes* the answer: a
-/// UTF-8 file's bytes are its text, so consuming the buffer turns the read
-/// into the output with no copy at all. That is why plaintext reads into a
-/// fresh buffer instead of the worker's scratch — a reused buffer here would
-/// trade one allocation for one full-length `memcpy` per file, on the format
-/// that dominates every corpus.
+/// Decode `bytes` into `out`. Valid UTF-8 is moved, not copied, which is why
+/// plaintext reads into a fresh buffer rather than the worker's scratch:
+/// reusing one would trade an allocation for a full-length `memcpy` per file.
 fn decode_into(bytes: Vec<u8>, path: &Path, out: &mut String) -> Result<(), ExtractError> {
-    let text = crate::textenc::decode_text(bytes, path)?;
-    if out.is_empty() {
-        *out = text;
-    } else {
-        out.push_str(&text);
-    }
+    super::append(out, crate::textenc::decode_text(bytes, path)?);
     Ok(())
 }
 
@@ -82,16 +72,15 @@ impl Extractor for PlaintextExtractor {
     }
 
     /// A file that shrank since the `fstat` keeps its prefix; one that grew is
-    /// read to the sized length — its mtime moved, so the next run re-extracts.
+    /// read to the sized length; its mtime moved, so the next run re-extracts.
     fn extract(
         &self,
         path: &Path,
         out: &mut String,
         scratch: &mut Scratch,
     ) -> Result<(), ExtractError> {
-        // `read`, not a constant of this module's own: the content pass never
-        // offers a file above it, so the only readers that reach the cap are
-        // the two below — a file that grew, and one whose size is a lie.
+        // The pass never offers a file above `limits().read`, so this cap only
+        // bites for a file that grew since the walk or reports a false size.
         let cap = scratch.limits().read;
         let mut f =
             File::open(path).map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
@@ -121,15 +110,7 @@ impl Extractor for PlaintextExtractor {
         head: &[u8],
         out: &mut String,
     ) -> Option<Result<(), ExtractError>> {
-        Some(
-            crate::textenc::decode_borrowed_text(head, path).map(|text| {
-                if out.is_empty() {
-                    *out = text;
-                } else {
-                    out.push_str(&text);
-                }
-            }),
-        )
+        Some(crate::textenc::decode_borrowed_text(head, path).map(|text| super::append(out, text)))
     }
 }
 
@@ -141,25 +122,19 @@ mod tests {
         Scratch::new(&crate::config::Config::default())
     }
 
-    /// The default `maximum_text_file_size`, which is what bounds a read now.
+    /// The default `maximum_text_file_size`, which bounds a read.
     fn max_read() -> usize {
         scratch().limits().read
     }
 
     fn extract(path: &Path) -> Result<String, ExtractError> {
-        let mut out = String::new();
-        PlaintextExtractor
-            .extract(path, &mut out, &mut scratch())
-            .map(|()| out)
+        crate::extract::extract_text(&PlaintextExtractor, path)
     }
 
     fn extract_from_head(path: &Path, head: &[u8]) -> Option<Result<String, ExtractError>> {
         let mut out = String::new();
-        match PlaintextExtractor.extract_from_head(path, head, &mut out) {
-            Some(Ok(())) => Some(Ok(out)),
-            Some(Err(e)) => Some(Err(e)),
-            None => None,
-        }
+        let outcome = PlaintextExtractor.extract_from_head(path, head, &mut out);
+        outcome.map(|r| r.map(|()| out))
     }
 
     fn tmp(tag: &str, body: &[u8]) -> std::path::PathBuf {

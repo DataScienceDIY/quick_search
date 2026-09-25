@@ -10,7 +10,6 @@ use std::time::Instant;
 
 use crate::config::Config;
 use crate::db;
-use crate::file_handling::normalize_root_string;
 
 mod config_check;
 mod pipeline;
@@ -61,7 +60,7 @@ pub enum IndexingStatus {
 }
 
 /// One setting whose stored (index-build-time) value differs from the current
-/// config. List values are newline-joined — display as multi-line columns.
+/// config. List values are newline-joined; display them as multi-line columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigChange {
     pub key: String,
@@ -85,7 +84,7 @@ pub struct IndexingService {
     command_tx: mpsc::Sender<IndexingCommand>,
     db_connection: Arc<Mutex<Option<Arc<Mutex<Connection>>>>>,
     /// The long statement a run is inside, if any: the prologue's reconcile
-    /// scan or the epilogue's VACUUM — never both, so one slot serves both.
+    /// scan or the epilogue's VACUUM, never both, so one slot serves both.
     interrupt: Arc<db::InterruptSlot>,
     _handle: thread::JoinHandle<()>,
 }
@@ -94,14 +93,8 @@ pub struct IndexingService {
 /// canonical roots the indexer walks; entries no longer indexed are dropped.
 fn resolved_root_workers(config: &Config) -> HashMap<String, usize> {
     config
-        .paths
-        .indexing_paths
-        .iter()
-        .zip(config.resolved_indexing_paths())
-        .filter_map(|(raw, resolved)| {
-            let workers = config.indexing.root_workers.get(raw).copied()?;
-            Some((normalize_root_string(&resolved.to_string_lossy()), workers))
-        })
+        .indexing_roots()
+        .filter_map(|(raw, root)| Some((root, *config.indexing.root_workers.get(raw)?)))
         .collect()
 }
 
@@ -112,17 +105,13 @@ impl IndexingService {
         let db_connection = Arc::new(Mutex::new(None));
         let interrupt: Arc<db::InterruptSlot> = Arc::new(db::InterruptSlot::default());
 
-        let status_clone = status.clone();
-        let db_connection_clone = db_connection.clone();
-        let interrupt_clone = interrupt.clone();
-        let handle = thread::spawn(move || {
-            Self::indexing_thread(
-                status_clone,
-                command_rx,
-                db_connection_clone,
-                interrupt_clone,
-            );
-        });
+        let handle = {
+            let (status, db_connection, interrupt) =
+                (status.clone(), db_connection.clone(), interrupt.clone());
+            thread::spawn(move || {
+                Self::indexing_thread(status, command_rx, db_connection, interrupt);
+            })
+        };
 
         IndexingService {
             status,
@@ -133,7 +122,7 @@ impl IndexingService {
         }
     }
 
-    /// Cut short the long statement a run is inside — an
+    /// Cut short the long statement a run is inside: an
     /// [`IndexingStatus::Optimizing`] VACUUM or the prologue's reconcile scan.
     /// Stop does *not* reach the VACUUM; an interrupted statement rolls back.
     pub fn cancel_db_work(&self) {
@@ -143,7 +132,7 @@ impl IndexingService {
     /// Start indexing one or more roots; duplicates collapse to one walk.
     /// Returns `Err` if a run is already in flight.
     ///
-    /// The `Idle → Preparing` transition happens **here**, synchronously: the
+    /// The `Idle → Preparing` transition happens here, synchronously: the
     /// command thread cannot flip the status until it has joined the previous
     /// run's thread, and a caller polling for the flip could start writing to
     /// a database this run is about to reopen.
@@ -194,27 +183,17 @@ impl IndexingService {
         self.stop_indexing_inner(true)
     }
 
-    /// [`Self::stop_indexing`] minus the checkpoint: copying the WAL into a
-    /// file the caller is about to delete is pure cost.
-    fn stop_indexing_for_delete(&self) -> Result<(), String> {
-        self.stop_indexing_inner(false)
-    }
-
     fn stop_indexing_inner(&self, checkpoint: bool) -> Result<(), String> {
         self.command_tx
             .send(IndexingCommand::Stop)
             .map_err(|e| format!("Failed to send stop command: {}", e))?;
 
-        let mut attempts = 0;
-        while attempts < 50 {
+        for _ in 0..50 {
             match self.get_status() {
                 IndexingStatus::Stopping => break,
-                IndexingStatus::Idle => return Ok(()), // Already stopped
-                IndexingStatus::Error(_) => return Ok(()), // Consider error state as stopped
-                _ => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    attempts += 1;
-                }
+                // Already stopped; an error state counts as stopped.
+                IndexingStatus::Idle | IndexingStatus::Error(_) => return Ok(()),
+                _ => std::thread::sleep(std::time::Duration::from_millis(100)),
             }
         }
 
@@ -282,44 +261,31 @@ impl IndexingService {
         }
     }
 
-    /// Stop indexing and delete the database file for a clean rebuild
+    /// Stop indexing and delete the database file for a clean rebuild.
     pub fn delete_index_for_rebuild(&self, db_path: &str) -> Result<(), String> {
-        self.stop_indexing_for_delete()
+        // No checkpoint: copying the WAL into a file about to be deleted is
+        // pure cost.
+        self.stop_indexing_inner(false)
             .map_err(|e| format!("Failed to stop indexing: {}", e))?;
         // The optimize pass holds open the file about to be deleted.
         self.cancel_db_work();
 
-        let mut attempts = 0;
-        while attempts < 50 {
-            match self.get_status() {
-                IndexingStatus::Idle => break,
-                IndexingStatus::Stopping
-                | IndexingStatus::Preparing { .. }
-                | IndexingStatus::Running { .. }
-                | IndexingStatus::Optimizing => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    attempts += 1;
-                }
-                IndexingStatus::Error(_) => break, // Consider error state as stopped
+        // An error state counts as stopped.
+        for _ in 0..50 {
+            if !self.is_active() {
+                break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
         // Unconditionally, before the removal: the half-deleted case is where
         // a stale reader handle does damage. See [`db::bump_index_epoch`].
         db::bump_index_epoch();
 
-        let path = std::path::Path::new(db_path);
-        if path.exists() {
-            // Readers may still hold handles (the search worker keeps its for
-            // `IDLE_RELEASE`); Windows fails the delete until they close.
-            crate::platform::remove_file_retrying(path)
-                .map_err(|e| format!("Failed to delete database file: {}", e))?;
-        }
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let _ = std::fs::remove_file(format!("{}{}", db_path, suffix));
-        }
-
-        Ok(())
+        // Readers may still hold handles (the search worker keeps its for
+        // `IDLE_RELEASE`), which the retrying delete waits out.
+        db::remove_index_files(std::path::Path::new(db_path))
+            .map_err(|e| format!("Failed to delete database file: {}", e))
     }
 
     fn indexing_thread(
@@ -345,37 +311,35 @@ impl IndexingService {
 
                     stop_flag.store(false, Ordering::Relaxed);
 
-                    let status_clone = status.clone();
-                    let stop_flag_clone = stop_flag.clone();
-                    let paths_owned = paths.clone();
-                    let db_path_owned = db_path.clone();
-                    let config_owned = config.clone();
-
-                    let db_connection_clone = db_connection.clone();
-                    let interrupt_clone = interrupt.clone();
+                    let (status, stop_flag, db_connection, interrupt) = (
+                        status.clone(),
+                        stop_flag.clone(),
+                        db_connection.clone(),
+                        interrupt.clone(),
+                    );
                     indexing_handle = Some(thread::spawn(move || {
                         // The writer thread: every DB write and text extraction happens here.
                         crate::platform::set_background_priority();
                         let result = Self::run_indexing(
-                            &status_clone,
-                            &paths_owned,
-                            &db_path_owned,
-                            &stop_flag_clone,
-                            &config_owned,
-                            &db_connection_clone,
-                            &interrupt_clone,
+                            &status,
+                            &paths,
+                            &db_path,
+                            &stop_flag,
+                            &config,
+                            &db_connection,
+                            &interrupt,
                         );
 
                         // Released before maintenance: VACUUM needs its own connection.
-                        *crate::lock_ok(&db_connection_clone) = None;
+                        *crate::lock_ok(&db_connection) = None;
 
                         match result {
-                            Err(e) => *crate::lock_ok(&status_clone) = IndexingStatus::Error(e),
+                            Err(e) => *crate::lock_ok(&status) = IndexingStatus::Error(e),
                             // Stopped runs included: a cut-short run still leaves a log to land.
                             Ok(()) => {
-                                *crate::lock_ok(&status_clone) = IndexingStatus::Optimizing;
-                                Self::run_maintenance(&db_path_owned, &interrupt_clone);
-                                *crate::lock_ok(&status_clone) = IndexingStatus::Idle;
+                                *crate::lock_ok(&status) = IndexingStatus::Optimizing;
+                                Self::run_maintenance(&db_path, &interrupt);
+                                *crate::lock_ok(&status) = IndexingStatus::Idle;
                             }
                         }
 
@@ -406,9 +370,9 @@ impl IndexingService {
     }
 
     /// Optimize the index once a run ends, completed or stopped; best-effort.
-    /// Runs on its own connection — VACUUM on the indexer's would build the
-    /// replacement index in RAM. Not cancelled by the stop flag: `interrupt`
-    /// is the one way out (see [`Self::cancel_db_work`]).
+    /// Runs on its own connection, since VACUUM on the indexer's would build
+    /// the replacement index in RAM. Not cancelled by the stop flag:
+    /// `interrupt` is the one way out (see [`Self::cancel_db_work`]).
     fn run_maintenance(db_path: &str, interrupt: &db::InterruptSlot) {
         let conn = match crate::db::open::open_maintenance(db_path) {
             Ok(conn) => conn,

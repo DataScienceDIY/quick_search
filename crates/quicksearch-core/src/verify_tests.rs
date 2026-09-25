@@ -54,8 +54,8 @@ fn identical_files_all_report_identical() {
 
 #[test]
 fn a_difference_is_reported_at_its_offset() {
-    // First byte, mid-file, and the very last byte: the last is the one a
-    // head-only hash can never see, and the reason this module exists.
+    // First byte, mid-file, and the very last byte: a head-only hash never
+    // sees the last, which is why this module exists.
     for (label, a, b, at) in [
         ("first", &b"Xbcdefgh"[..], &b"abcdefgh"[..], 0),
         ("middle", &b"abcdefgh"[..], &b"abcXefgh"[..], 3),
@@ -70,9 +70,9 @@ fn a_difference_is_reported_at_its_offset() {
     }
 }
 
-/// The realistic false positive: same size, same head, different tail — a
-/// pre-allocated disk image, which is what `[processing] hash_length`
-/// documents as the known limitation.
+/// The realistic false positive: same size, same head, different tail, as in
+/// a pre-allocated disk image; `[processing] hash_length` documents it as the
+/// known limitation.
 #[test]
 fn a_shared_head_with_a_different_tail_is_caught() {
     let head = vec![0u8; 64 * 1024];

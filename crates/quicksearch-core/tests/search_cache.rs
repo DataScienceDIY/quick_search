@@ -6,21 +6,18 @@
 //! break anywhere along that path leaves a connection quietly running on the
 //! read-only profile's 4 MiB with every test still green.
 //!
-//! Its own integration binary, and one `#[test]`, for the reason
-//! `tests/encrypted.rs` gives: it drives process-global state — the key and
-//! the cache override — which unit tests must never do, because the lib test
-//! binary runs them in parallel against the same globals.
+//! Its own integration binary, with one `#[test]`, because it sets the
+//! process-global key and cache override; see `tests/encrypted.rs`.
 
 use quicksearch_core::db;
 use quicksearch_core::db::schema::{
     recommended_search_cache_mib, SEARCH_CACHE_MAX_MIB, SEARCH_CACHE_PLAIN_MIB,
 };
-use quicksearch_core::testutil::{measurement_key, scratch_db, seed_index, SeedSpec};
+use quicksearch_core::testutil::{measurement_key, seed_index, Scratch, SeedSpec};
 
-/// Enough rows that the recommendation clears the floor and is therefore
-/// actually derived rather than clamped — at 168 B/file, 16 MiB is reached
-/// around 100k. Seeded without content: the FTS write is the slow part and
-/// this measures nothing about it.
+/// Enough rows that the recommendation clears the floor and is derived rather
+/// than clamped: at 168 B/file, 16 MiB is reached around 100k. Seeded without
+/// content: the FTS write is the slow part and this measures nothing about it.
 const FILES: usize = 150_000;
 
 fn spec() -> SeedSpec {
@@ -51,7 +48,7 @@ fn cache_mib(conn: &rusqlite::Connection) -> i64 {
 
 #[test]
 fn the_search_connection_opens_at_the_ceiling_it_was_sized_for() {
-    let path = scratch_db("searchcache");
+    let (_dir, path) = Scratch::db("searchcache");
     let db_path = path.to_string_lossy().into_owned();
 
     // --- keyed, automatic -------------------------------------------------
@@ -70,8 +67,8 @@ fn the_search_connection_opens_at_the_ceiling_it_was_sized_for() {
         );
     }
 
-    // `PRAGMA optimize` is what a real indexing run leaves behind; from here
-    // the row count is readable and the ceiling should track it.
+    // ANALYZE stands in for the `PRAGMA optimize` a real indexing run leaves
+    // behind; from here the row count is readable and the ceiling tracks it.
     {
         let conn = db::open_existing(&db_path, true).unwrap();
         conn.execute_batch("ANALYZE;").unwrap();
@@ -106,7 +103,7 @@ fn the_search_connection_opens_at_the_ceiling_it_was_sized_for() {
     // --- plain, automatic -------------------------------------------------
     // Same corpus, no key: the sweep found no knee unencrypted, so this must
     // be flat regardless of how large the index is.
-    let plain = scratch_db("searchcache-plain");
+    let (_plain_dir, plain) = Scratch::db("searchcache-plain");
     db::set_process_key(None);
     seed_index(&plain, &spec());
     {
@@ -121,7 +118,4 @@ fn the_search_connection_opens_at_the_ceiling_it_was_sized_for() {
             "an unencrypted index must not grow its cache with the corpus"
         );
     }
-
-    std::fs::remove_dir_all(path.parent().unwrap()).ok();
-    std::fs::remove_dir_all(plain.parent().unwrap()).ok();
 }

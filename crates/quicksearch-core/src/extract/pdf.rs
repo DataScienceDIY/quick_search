@@ -1,6 +1,6 @@
-//! PDF text extraction via `pdf_extract`.
-//! `lopdf` must come from `pdf_extract`'s `pub use lopdf::*`, never declared in
-//! `Cargo.toml` too: that resolved a second, older copy (plus a rayon pool).
+//! PDF text extraction via `pdf_extract`. `lopdf` comes from its
+//! `pub use lopdf::*`; see the note in `Cargo.toml` for why it is never
+//! declared directly.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -48,29 +48,24 @@ impl Extractor for PdfExtractor {
 
     /// The one format with no streaming option: `Document::load` builds the
     /// whole object graph before a byte of text comes out, and a 2 MiB file
-    /// has been measured holding tens of megabytes. Its *input* is bounded by
-    /// `maximum_text_file_size` and its output by `maximum_text_size`, but the
-    /// middle is `pdf_extract`'s and there is no scratch to reuse — so peak
-    /// for PDFs alone is `workers × amplification`, one pool per root.
+    /// has been measured holding tens of megabytes. Input and output are
+    /// bounded by the limits, but the middle is `pdf_extract`'s with no
+    /// scratch to reuse, so peak for PDFs alone is `workers × amplification`,
+    /// one pool per root.
     fn extract(
         &self,
         path: &Path,
         out: &mut String,
         _scratch: &mut Scratch,
     ) -> Result<(), ExtractError> {
-        // Loading is inside the guard too — a panic outside it takes the thread.
+        // Loading is inside the guard too: a panic outside it takes the thread.
         install_quiet_panic_hook();
-        let path_buf = path.to_path_buf();
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(true));
-        let result = std::panic::catch_unwind(move || extract_one_pass(&path_buf));
+        let result = std::panic::catch_unwind(|| extract_one_pass(path));
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(false));
         let text = result
             .map_err(|panic| format!("pdf_extract panicked: {}", panic_message(&*panic)))??;
-        if out.is_empty() {
-            *out = text;
-        } else {
-            out.push_str(&text);
-        }
+        super::append(out, text);
         Ok(())
     }
 }
@@ -96,9 +91,7 @@ mod tests {
     use super::*;
 
     fn extract(path: &Path) -> Result<String, ExtractError> {
-        let mut out = String::new();
-        let mut scratch = Scratch::new(&crate::config::Config::default());
-        PdfExtractor.extract(path, &mut out, &mut scratch).map(|()| out)
+        crate::extract::extract_text(&PdfExtractor, path)
     }
 
     #[test]
@@ -122,7 +115,7 @@ mod tests {
     use std::path::PathBuf;
 
     /// Write a one-page PDF drawing `body`, with `info` as its `Info`
-    /// dictionary, using only `pdf_extract`'s `lopdf` re-export — a move in
+    /// dictionary, using only `pdf_extract`'s `lopdf` re-export, so a move in
     /// that surface fails to compile here alongside the extractor. Helvetica
     /// is a base-14 font with built-in encoding tables, so no font file.
     fn write_pdf(tag: &str, body: &str, info: Option<Dictionary>) -> PathBuf {
@@ -217,15 +210,15 @@ mod tests {
     }
 
     /// A page whose `/Parent` is itself must be skipped, not fatal. Upstream
-    /// `get_inherited` walked `/Parent` with no depth bound; a cycle overflows
-    /// the stack, which aborts — `catch_unwind` cannot hold it — so
+    /// `get_inherited` walks `/Parent` with no depth bound, and a cycle
+    /// overflows the stack, which aborts past `catch_unwind`, so
     /// `vendor/pdf-extract` bounds the walk.
     #[test]
     fn a_self_referential_page_parent_is_contained() {
         let mut doc = Document::with_version("1.5");
         let contents = doc.add_object(Stream::new(dictionary! {}, b"BT ET".to_vec()));
         let page_id = doc.new_object_id();
-        // No `Resources` or `MediaBox`, so both lookups follow `/Parent` — into itself.
+        // No `Resources` or `MediaBox`, so both lookups follow `/Parent`, into itself.
         doc.objects.insert(
             page_id,
             Object::Dictionary(dictionary! {
@@ -252,8 +245,8 @@ mod tests {
         let _ = extract(&path);
     }
 
-    /// A Form XObject drawing itself must be skipped — the second unbounded
-    /// recursion (`process_stream`'s `Do` arm); the bound also caps the
+    /// A Form XObject drawing itself must be skipped: the second unbounded
+    /// recursion (`process_stream`'s `Do` arm). The bound also caps the
     /// 2^depth branching shape.
     #[test]
     fn a_self_drawing_form_xobject_is_contained() {

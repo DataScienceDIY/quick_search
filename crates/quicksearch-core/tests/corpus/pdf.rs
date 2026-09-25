@@ -3,7 +3,7 @@
 //!
 //! The text is Latin-1: Helvetica is a base-14 font, so nothing is embedded
 //! and no glyph can be missing for the wrong reason; its repertoire under
-//! `WinAnsiEncoding` is cp1252, which cannot express the Greek phrase —
+//! `WinAnsiEncoding` is cp1252, which cannot express the Greek phrase;
 //! demanding it would assert against the fixture, not the extractor.
 
 use std::path::Path;
@@ -34,7 +34,7 @@ pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec
     page.finish();
 
     // Without an explicit encoding the font falls back to StandardEncoding,
-    // whose upper half is not Latin-1 — `é` would come back as a bare accent.
+    // whose upper half is not Latin-1: `é` would come back as a bare accent.
     pdf.type1_font(font_id)
         .base_font(Name(b"Helvetica"))
         .encoding_predefined(Name(b"WinAnsiEncoding"));

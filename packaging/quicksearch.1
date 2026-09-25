@@ -1,6 +1,6 @@
-.\" The version in the .TH line above is rewritten from [workspace.package]
-.\" version by packaging/build-deb.sh at package time; the literal here is
-.\" only what an uninstalled read of this file shows.
+.\" packaging/build-deb.sh rewrites the version in the .TH line below from
+.\" [workspace.package] version; the literal here only shows when this file is
+.\" read uninstalled.
 .TH QUICKSEARCH 1 "2026-08-05" "quicksearch 1.0.2" "User Commands"
 .SH NAME
 quicksearch, quicksearch\-cli \- fast full\-text search across your files
@@ -18,55 +18,47 @@ quicksearch, quicksearch\-cli \- fast full\-text search across your files
 .IR "query terms" ...
 .SH DESCRIPTION
 .B quicksearch
-maintains a SQLite/FTS5 index of the paths listed in its configuration and
-searches it by filename and file content.
+maintains a SQLite/FTS5 index of the folders in its configuration and searches
+it by file name and content.
 .PP
-Invoked with no positional arguments it opens the desktop application, which
-owns the indexer: it walks the configured roots, watches them for changes and
-periodically reindexes.
+With no query it opens the desktop application, which owns the indexer: it
+walks the configured folders, watches them for changes and reindexes
+periodically.
 .PP
-Invoked with one or more query terms it runs the same ranked search cascade the
-application uses, prints the results and exits. Terminal mode never starts the
-indexer, the filesystem watcher or any background thread, so a one\-shot query
-neither leaves anything running nor competes for inotify watches with a running
-application. It requires an index that already exists; run the application once
-to build one.
+With one or more query terms it runs the application's ranked search, prints
+the results and exits. Terminal mode never starts the indexer, the file watcher
+or any background thread, so a one\-shot query leaves nothing running and does
+not compete with a running application for inotify watches. It needs an
+existing index; run the application once to build one.
 .PP
 .B quicksearch\-cli
-is terminal search and nothing else, and accepts the same flags and query
-syntax. On this platform it is equivalent to giving
+is terminal search only: it takes the same flags and query syntax, never opens
+a window, and exits 2 with usage when given no query. On Linux it is equivalent
+to giving
 .B quicksearch
-a query, and exists so that scripts and documentation have one name that never
-opens a window. It matters on Windows, where the two cannot be one executable:
-a GUI built as a console application flashes a console window at every launch,
-and a console tool built as a GUI application cannot write back to the shell
-that invoked it. Given no query it prints usage and exits 2 rather than falling
-back to the application.
+a query; on Windows it is required, because one executable cannot be both a
+GUI and a console program.
 .SH OPTIONS
 .TP
 .B \-\-toggle
 Bring a running QuickSearch to the front with the search box focused, or start
-it if none is running. Intended as the target of a key binding made in the
-desktop's own keyboard settings.
+it if none is running. Bind a key to this in your desktop's keyboard settings.
 .IP
-QuickSearch also claims a shortcut of its own while it is running
+While running, QuickSearch also holds a shortcut of its own
 .RI ( Ctrl+Shift+F
-by default, rebindable to any combination on the Settings tab), which needs no
-setting up. That one cannot fire while QuickSearch is not running, because
-nothing a program registers for itself can; this option is what a desktop
-binding runs so that a key can start it as well.
+by default, changeable on the Settings tab), but that cannot start it when it
+is closed; this option can.
 .IP
-The activation reaches the running instance over a unix socket in
+The request reaches the running instance through a socket in
 .IR $XDG_RUNTIME_DIR ,
-named after the configuration file; when nothing answers, this process becomes
-the application. On Wayland the window comes forward when the desktop supplied
-an activation token for the launch (a binding made with the Settings tab's
-set\-up button does); run by hand with no token, the window is highlighted in
-the task bar instead.
+named after the configuration file; if nothing answers, this process becomes
+the application. On Wayland the window comes forward only if the launcher
+supplied an activation token (bindings made with the Settings tab's set\-up
+button do); otherwise it is highlighted in the task bar.
 .TP
 .B \-\-fuzzy
-Also run the fuzzy filename and full\-text passes, which tolerate spelling
-differences at the cost of speed. The edit distance comes from
+Also run the fuzzy file name and full\-text passes, which tolerate
+misspellings at some cost in speed. The edit budget comes from
 .I [search].fuzzy_max_edits
 in the configuration.
 .TP
@@ -77,11 +69,11 @@ results. Defaults to
 .I [search].display_limit
 in the configuration.
 .B \-\-limit=N
-is also accepted.
+also works.
 .TP
 .B \-\-long
 Print rank, size, modification time and a matching snippet for each hit instead
-of bare paths. Highlights the match in bold when stdout is a terminal.
+of bare paths, with the match in bold when stdout is a terminal.
 .TP
 .BR \-h ", " \-\-help
 Print usage and exit.
@@ -90,11 +82,11 @@ Print usage and exit.
 Print the version and the commit it was built from, then exit. Quote this in
 bug reports.
 .PP
-An unrecognised option given without any query terms is passed through and the
-application is opened, since it may be an option for the windowing backend.
+An unrecognised option given without query terms is passed through and the
+application opens, since the option may be meant for the windowing backend.
 .SH QUERY SYNTAX
 Plain words form a single phrase, matched against names, contents and paths.
-Filters may be combined with it:
+Filters combine with it:
 .TP
 .B \(dq\fIexact phrase\fB\(dq
 Quoting keeps spaces, stars and filter\-like words literal.
@@ -146,7 +138,7 @@ Match a MIME type exactly, for example
 .IR mime:application/pdf .
 .TP
 .B name:\fIfragment\fR
-Match a fragment of the filename. A filter, so it does not affect ranking.
+Match a fragment of the file name. A filter, so it does not affect ranking.
 .B filename:
 is an alias; an unquoted
 .B *
@@ -158,54 +150,53 @@ text stays part of the search phrase.
 .BR AND ", " OR
 and parentheses are treated as plain words.
 .SH PASSWORD PROTECTION
-The index can be encrypted with a password (the Settings tab, Security).
-A protected index must be unlocked every time either binary starts. The
-application shows an unlock screen; terminal mode resolves the key from, in
-order: the OS keychain (when \(lqRemember on this device\(rq is enabled),
-the
+The index can be encrypted with a password (Settings tab, Security). A
+protected index must be unlocked every time either binary starts. The
+application shows an unlock screen; terminal mode takes the key from, in
+order: the OS keychain (when \(lqRemember on this device\(rq is on), the
 .B QUICKSEARCH_PASSWORD
-environment variable, then a hidden interactive prompt with three attempts.
-Without a terminal and with neither source available it exits 2 with an
-explanatory message. A wrong password never modifies the index.
+environment variable, then a hidden prompt with three attempts. Without a
+terminal and with neither source available it exits 2 with an explanation. A
+wrong password never modifies the index.
 .PP
-Enabling, disabling or changing the password deletes and rebuilds the index
-from the application; the password itself is never stored, only a derived
-key in the OS keychain when explicitly requested.
+Enabling, disabling or changing the password deletes and rebuilds the index.
+The password itself is never stored; only a derived key is, in the OS
+keychain, and only on request.
 .SH ENVIRONMENT
 .TP
 .B QUICKSEARCH_PASSWORD
-Password for a protected index, for scripted terminal search. Environment
-variables are readable by other processes of the same user; prefer the
-keychain where possible.
+Password for a protected index, for scripted terminal search. Other processes
+of the same user can read environment variables; prefer the keychain where
+possible.
 .SH FILES
 .TP
 .I ~/.config/quicksearch/config.toml
-Configuration. Created with defaults on first run. See
+Configuration, created with defaults on first run.
 .I /usr/share/doc/quicksearch/config_example.toml
-for the annotated reference.
+documents every key.
 .TP
 .I ~/.local/share/quicksearch/index.sqlite
-The index. The location is set by
+The index;
 .I [paths].database_path
-in the configuration.
+in the configuration sets its location.
 .TP
 .IR $XDG_RUNTIME_DIR /quicksearch\- <key> .sock
 The socket
 .B \-\-toggle
 connects to, where
 .I <key>
-is a hash of the configuration file's path \(em not the index's, which is a
-setting that can change while running. Present only while the application is
-running; a leftover one is inert and is replaced at the next start. Falls back
-to a private directory under the temporary directory when
+is a hash of the configuration file's path (not the index's, which can change
+while running). Present only while the application runs; a leftover one is
+inert and is replaced at the next start. Falls back to a private directory
+under the temporary directory when
 .I XDG_RUNTIME_DIR
 is unset.
 .TP
 .I ./config.toml
-A configuration file placed next to the
+A configuration file next to the
 .B quicksearch
 executable selects portable mode and overrides the per\-user configuration
-entirely. The packaged build deliberately installs no such file.
+entirely. The packaged build installs no such file.
 .PP
 .I XDG_CONFIG_HOME
 and
@@ -237,6 +228,7 @@ Recent PDFs under a directory, with details:
 Tolerate misspellings and cap the output:
 .B quicksearch \-\-fuzzy \-\-limit 10 recieve
 .SH SEE ALSO
-.I /usr/share/doc/quicksearch/README.md
+.IR /usr/share/doc/quicksearch/README.md ,
+.I /usr/share/doc/quicksearch/config_example.toml
 .SH AUTHOR
 Jeremy <jeremy@karsttech.com>

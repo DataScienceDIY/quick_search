@@ -4,9 +4,8 @@
 //! `quicksearch-cli`. A query passed here still seeds the search box.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-// Only the binary that declares it gets it — a library cannot choose an
-// allocator for its dependents — so this line is what actually puts the app
-// on mimalloc. See `platform::Allocator` for why it is not glibc's.
+// This line puts the app on mimalloc: a library cannot choose an allocator
+// for its dependents. See `platform::Allocator` for why it is not glibc's.
 #[global_allocator]
 static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
 
@@ -59,11 +58,7 @@ fn seed_query() -> Option<String> {
         .skip(1)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    if terms.is_empty() {
-        None
-    } else {
-        Some(terms.join(" "))
-    }
+    (!terms.is_empty()).then(|| terms.join(" "))
 }
 
 /// What the desktop's search shortcut runs. Not a query flag: it is checked
@@ -96,9 +91,9 @@ fn main() {
     };
 
     // The desktop's shortcut, on an app that is already up: hand the
-    // activation over and get out of the way. Failure is the normal case —
-    // nothing is running — and falls through to starting the GUI, which is
-    // what makes one binding both "raise it" and "launch it".
+    // activation over and get out of the way. Failure is the normal case
+    // (nothing is running) and falls through to starting the GUI, so one
+    // binding both raises and launches.
     if toggle && activate::signal(&Config::config_path()) {
         return;
     }
@@ -109,37 +104,30 @@ fn main() {
     );
     let initial_query = seed_query();
 
-    // After the CLI early-exit, deliberately: the CLI only reads. Two
-    // *windows* on one index are the problem — two indexers writing, and an
-    // attach that truncates the wal-index under a live mapping. Held for the
-    // life of the process; the kernel releases it however the exit happens.
+    // After the CLI early-exit, deliberately: the CLI only reads. Two windows
+    // on one index are the problem: two indexers writing, and an attach that
+    // truncates the wal-index under a live mapping. Held for the life of the
+    // process; the kernel releases it however the exit happens.
     match IndexLock::hold(&config.resolved_database_path()) {
         Ok(()) => {}
         Err(LockError::Held { pid }) => {
-            // Losing the race to an instance that came up between the signal
-            // above and here, or a plain second launch: either way the user
-            // asked to see QuickSearch, and there is one to show them.
-            //
-            // Retried, not tried once: the winner holds the lock the moment
+            // A second launch, or one that lost the race to an instance that
+            // came up after the signal above: either way there is a window to
+            // show. Retried because the winner holds the lock as soon as
             // `main` reaches it but only listens once eframe's creation
-            // closure has run, so a `--toggle` landing in that gap would see
-            // the lock held and no socket. Two seconds outlasts that gap by
-            // orders of magnitude; a wedged instance still gets the dialog.
+            // closure has run; two seconds outlasts that gap by orders of
+            // magnitude, and a wedged instance still gets the dialog.
             for _ in 0..20 {
                 if activate::signal(&Config::config_path()) {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            let who = match pid {
-                Some(pid) => format!(" (process {})", pid),
-                None => String::new(),
-            };
             let msg = format!(
                 "QuickSearch is already running{}.\n\nOnly one window can use \
                  the index at a time. Switch to the running window, or close \
                  it and try again.",
-                who
+                app::held_by(pid)
             );
             eprintln!("{}", msg);
             // Launched from a desktop icon, nothing watches stderr; show a dialog.
@@ -181,23 +169,16 @@ fn main() {
         "QuickSearch",
         native_options,
         Box::new(move |cc| {
-            // egui has no bundled fonts; this closure is the last place
-            // still ahead of frame 1.
+            // Everything here runs before frame 1 and before the unlock gate,
+            // so the unlock screen already has fonts, theme and working
+            // shortcuts.
             fonts::install(&cc.egui_ctx);
-            // Only once the index lock is held, which `main` has by now:
-            // binding the socket unlinks whatever is in the way, and the
-            // lock is what proves nobody else is listening on it. Before the
-            // gate, so the shortcut works while the unlock screen is up.
+            // Safe to bind now: we hold the index lock, so no other instance
+            // is listening.
             activate::listen(&cc.egui_ctx, &Config::config_path());
-            // Must run on the event-loop thread with the loop running — this
-            // closure is the first place that is true. Before the gate, so
-            // the shortcut works while the unlock screen is up.
+            // Needs the running event loop, which starts here.
             hotkey::init(&cc.egui_ctx, &config.ui.search_hotkey);
-            // Before the gate so the unlock screen honors the setting.
             app::apply_theme(&cc.egui_ctx, &config.ui.color_scheme);
-            // Both themes at once, so this survives a scheme switch — and
-            // before the gate, since the unlock screen is drawn without the
-            // app ever being built.
             color::apply_text_contrast(&cc.egui_ctx);
             let gate = match key_source {
                 Some(source) => {

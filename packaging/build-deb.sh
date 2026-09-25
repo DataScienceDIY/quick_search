@@ -14,9 +14,6 @@
 # of a standard Debian or Ubuntu install.
 
 set -euo pipefail
-# Directories created along the way must be 0755, not whatever the caller's
-# umask happens to be, or the package ships group-writable directories.
-umask 022
 
 readonly PKG=quicksearch
 # The GUI binary and the console-subsystem terminal binary. Both ship: on Unix
@@ -25,33 +22,8 @@ readonly PKG=quicksearch
 readonly BINARIES=(quicksearch quicksearch-cli)
 . "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 parse_args "$@"
-readonly ICON_SRC="$REPO_ROOT/crates/quicksearch-gui/assets/icons"
-readonly ICON_SVG="$ICON_SRC/quicksearch_icon.svg"
-readonly METAINFO=com.karsttech.quicksearch.metainfo.xml
 
-do_build=1
-do_strip=1
-out_dir="$REPO_ROOT/dist"
-
-die() { printf 'build-deb: %s\n' "$*" >&2; exit 1; }
-say() { printf '\033[1m==>\033[0m %s\n' "$*"; }
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --no-build) do_build=0 ;;
-        --no-strip) do_strip=0 ;;
-        -o|--output-dir) shift; [ $# -gt 0 ] || die "--output-dir needs a path"; out_dir="$1" ;;
-        # Print the header comment block, however long it grows.
-        -h|--help) awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; exit 0 ;;
-        *) die "unknown option: $1 (try --help)" ;;
-    esac
-    shift
-done
-
-for tool in dpkg-deb dpkg desktop-file-validate objdump gzip; do
-    command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
-done
-[ "$do_strip" -eq 0 ] || command -v strip >/dev/null 2>&1 || die "missing strip (install binutils, or pass --no-strip)"
+require_tools dpkg-deb dpkg desktop-file-validate objdump gzip
 
 # No Debian revision: QuickSearch is only ever packaged from its own source, so
 # the version is native (no hyphen) and the .deb is named for the crate version
@@ -89,48 +61,14 @@ for bin in "${BINARIES[@]}"; do
     install -Dm755 "$REPO_ROOT/target/release/$bin"     "$stage/usr/bin/$bin"
 done
 install -Dm644 "$REPO_ROOT/packaging/$PKG.desktop"      "$stage/usr/share/applications/$PKG.desktop"
-install -Dm644 "$ICON_SVG"                              "$stage/usr/share/icons/hicolor/scalable/apps/$PKG.svg"
-install -Dm644 "$REPO_ROOT/packaging/copyright"         "$stage/usr/share/doc/$PKG/copyright"
-install -Dm644 "$REPO_ROOT/config_example.toml"         "$stage/usr/share/doc/$PKG/config_example.toml"
-install -Dm644 "$REPO_ROOT/README.md"                   "$stage/usr/share/doc/$PKG/README.md"
-
-# The PNGs are committed next to the quicksearch_icon.svg they came from, so
-# this script only copies them and an ordinary `cargo build` needs no image
-# tooling. To re-render them after editing the SVG, build a throwaway crate
-# (outside this workspace, to keep it out of Cargo.lock) depending on
-# `resvg = { version = "0.45", default-features = false }` and, for each size N,
-# parse with usvg::Tree::from_data, make a tiny_skia::Pixmap::new(N, N), call
-# resvg::render with Transform::from_scale(N/240.0, N/240.0) and save_png. The
-# SVG contains no <text>, so no font support is needed.
-#
-# Sizes follow whatever is committed, so adding one needs no script change.
-shopt -s nullglob
-icons=("$ICON_SRC"/$PKG-*.png)
-shopt -u nullglob
-[ "${#icons[@]}" -gt 0 ] || die "no icons in $ICON_SRC"
-for png in "${icons[@]}"; do
-    n="$(basename "$png" .png)"; n="${n#$PKG-}"
-    # The glob would also catch a non-size name like quicksearch-cli.png.
-    case "$n" in ''|*[!0-9]*) die "unexpected icon name: $(basename "$png")" ;; esac
-    install -Dm644 "$png" "$stage/usr/share/icons/hicolor/${n}x${n}/apps/$PKG.png"
-done
-say "Installed ${#icons[@]} icon sizes plus the scalable SVG"
+install_docs "$stage"
+install_icons "$stage"
 
 # AppStream metadata, so software centres show a real listing rather than a bare
-# package name. @VERSION@/@DATE@ are substituted the same way the man page .TH
-# line is below, keeping [workspace.package] version the only thing a release
-# bumps. build-appimage.sh ships the identical file and is where it gets
+# package name. build-appimage.sh ships the identical file and is where it gets
 # validated - appstreamcli is not something a stock Debian install has, and this
 # script deliberately needs nothing beyond dpkg-deb and desktop-file-utils.
-if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
-    metainfo_date="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%d)"
-else
-    metainfo_date="$(date -u +%Y-%m-%d)"
-fi
-install -dm755 "$stage/usr/share/metainfo"
-sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$metainfo_date/" \
-    "$REPO_ROOT/packaging/$METAINFO" > "$stage/usr/share/metainfo/$METAINFO"
-chmod 644 "$stage/usr/share/metainfo/$METAINFO"
+install_metainfo "$stage"
 
 # Debian wants man pages and the changelog compressed, with no gzip timestamp so
 # repeat builds are byte-identical. quicksearch-cli.1 is a one-line .so stub
@@ -148,11 +86,7 @@ for page in "${BINARIES[@]}"; do
     chmod 644 "$stage/usr/share/man/man1/$page.1.gz"
 done
 
-if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
-    changelog_date="$(date -R -u -d "@$SOURCE_DATE_EPOCH")"
-else
-    changelog_date="$(date -R)"
-fi
+changelog_date="$(date -R ${SOURCE_DATE_EPOCH:+-u -d "@$SOURCE_DATE_EPOCH"})"
 # changelog.gz, not changelog.Debian.gz: with a native version there is no
 # separate Debian revision to log, and policy puts the one changelog here.
 gzip -9nc <<EOF > "$stage/usr/share/doc/$PKG/changelog.gz"
@@ -224,14 +158,13 @@ Depends: $depends
 Recommends: $recommends
 Homepage: https://code.karsttech.com/jeremy/quick_search
 Description: fast full-text search across your files
- QuickSearch keeps a SQLite/FTS5 index of the directories you choose and
- searches them by both filename and file content. It extracts text from
- documents, PDFs, archives and office files, watches the indexed paths for
- changes and reindexes in the background while the application is open.
+ QuickSearch indexes the folders you choose and searches them by file name
+ and content. It reads the text of plain-text files, PDFs, RTF and office
+ documents, and the tags of audio files, and keeps the index current while
+ the app is open.
  .
- The same binary doubles as a terminal search tool: "quicksearch <terms>"
- prints ranked results and exits without starting the indexer, the file
- watcher or any background thread.
+ It also searches from a terminal: "quicksearch" followed by search terms
+ prints ranked results without starting the indexer.
 EOF
 
 # No postinst/postrm: hicolor-icon-theme and desktop-file-utils declare

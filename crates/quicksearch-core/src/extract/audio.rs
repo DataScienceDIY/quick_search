@@ -29,13 +29,12 @@ impl Extractor for AudioExtractor {
             .read()
             .map_err(|e| format!("lofty read {}: {}", path.display(), e))?;
 
-        // Straight into the caller's buffer: the fields are short and few,
-        // and a `Vec<String>` then `join` allocated every piece twice over.
         if let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) {
             // The `Accessor` shortcuts hand back a `Cow`, so their fallbacks
             // are bound here rather than inside an `or_else` that would let
             // the temporary die before it is read.
             let (title, artist, album) = (tag.title(), tag.artist(), tag.album());
+            // Space-separated, straight into the caller's buffer.
             let mut push = |value: Option<&str>| {
                 if let Some(v) = value.filter(|v: &&str| !v.is_empty()) {
                     if !out.is_empty() {
@@ -45,21 +44,17 @@ impl Extractor for AudioExtractor {
                 }
             };
             // A tag can carry a value under `ItemKey` or the `Accessor` shortcut.
-            push(
-                tag.get_string(&ItemKey::TrackTitle)
-                    .filter(|v| !v.is_empty())
-                    .or(title.as_deref()),
-            );
-            push(
-                tag.get_string(&ItemKey::TrackArtist)
-                    .filter(|v| !v.is_empty())
-                    .or(artist.as_deref()),
-            );
-            push(
-                tag.get_string(&ItemKey::AlbumTitle)
-                    .filter(|v| !v.is_empty())
-                    .or(album.as_deref()),
-            );
+            for (key, fallback) in [
+                (ItemKey::TrackTitle, &title),
+                (ItemKey::TrackArtist, &artist),
+                (ItemKey::AlbumTitle, &album),
+            ] {
+                push(
+                    tag.get_string(&key)
+                        .filter(|v| !v.is_empty())
+                        .or(fallback.as_deref()),
+                );
+            }
             push(tag.get_string(&ItemKey::Genre));
             push(tag.get_string(&ItemKey::Comment));
         }
@@ -72,11 +67,8 @@ impl Extractor for AudioExtractor {
 mod tests {
     use super::*;
 
-    /// The one-file form: these assert on text, not on buffer reuse.
     fn extract(path: &std::path::Path) -> Result<String, ExtractError> {
-        let mut out = String::new();
-        let mut scratch = Scratch::new(&crate::config::Config::default());
-        AudioExtractor.extract(path, &mut out, &mut scratch).map(|()| out)
+        crate::extract::extract_text(&AudioExtractor, path)
     }
 
     /// An ID3v2.3 tag carrying `frames`, then silent MPEG frames so the probe
@@ -130,14 +122,6 @@ mod tests {
             ],
         );
         let out = extract(&path).expect("extract");
-        for expected in ["Blue Monday", "New Order", "Power Corruption", "Synthpop"] {
-            assert!(
-                out.contains(expected),
-                "{:?} missing from {:?}",
-                expected,
-                out
-            );
-        }
         assert_eq!(out, "Blue Monday New Order Power Corruption Synthpop");
     }
 

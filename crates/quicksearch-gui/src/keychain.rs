@@ -1,13 +1,7 @@
-//! OS keychain storage for the derived index key.
-//!
-//! Stores the *derived* SQLCipher key (hex), never the password: a
-//! keychain unlock skips the ~0.5 s Argon2 derivation, and the password
-//! itself never persists anywhere. Entries are keyed by database path so
-//! portable installs and multiple profiles don't clobber each other.
-//!
-//! Every failure here is non-fatal by design — a missing Secret Service
-//! daemon, a locked keyring, a denied prompt — and callers fall back to
-//! asking for the password.
+//! OS keychain storage for the derived index key (hex), keyed by database
+//! path. The password is never stored; the key lets a later unlock skip the
+//! Argon2 derivation. All failures are non-fatal: callers fall back to asking
+//! for the password.
 
 use keyring::Entry;
 
@@ -17,8 +11,8 @@ fn entry(db_path: &str) -> Result<Entry, String> {
     Entry::new(SERVICE, db_path).map_err(|e| format!("keychain unavailable: {}", e))
 }
 
-/// Remember the derived key for this database on this machine.
-pub fn store_key(db_path: &str, key_hex: &str) -> Result<(), String> {
+/// Remembers the derived key for this database on this machine.
+fn store_key(db_path: &str, key_hex: &str) -> Result<(), String> {
     entry(db_path)?
         .set_password(key_hex)
         .map_err(|e| format!("keychain store failed: {}", e))
@@ -33,12 +27,21 @@ pub fn load_key(db_path: &str) -> Result<Option<String>, String> {
     }
 }
 
-/// Forget the remembered key; an entry that never existed reports success.
+/// Forgets the remembered key; an entry that never existed reports success.
 /// A real failure means the key is still on the keychain, and callers must
 /// surface that rather than record "not remembered".
 pub fn delete_key(db_path: &str) -> Result<(), String> {
     match entry(db_path)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(format!("keychain delete failed: {}", e)),
+    }
+}
+
+/// Makes the keychain match the preference: stores `key_hex` when given,
+/// forgets the entry when not.
+pub fn sync(db_path: &str, key_hex: Option<&str>) -> Result<(), String> {
+    match key_hex {
+        Some(hex) => store_key(db_path, hex),
+        None => delete_key(db_path),
     }
 }

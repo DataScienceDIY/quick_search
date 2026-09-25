@@ -1,7 +1,7 @@
 # QuickSearch website-asset capture scenario, run by packaging/capture.sh.
-# Grammar and command list: crates/quicksearch-gui/src/capture.rs (feature
-# "capture"). Edit this file to re-choreograph the captures; timings are in
-# milliseconds and `max` caps bound clip length without failing the run.
+# Grammar and command list: crates/quicksearch-gui/src/capture/script.rs
+# (feature "capture"). Edit this file to re-choreograph the captures; timings
+# are in milliseconds and `max` caps bound clip length without failing the run.
 
 # The demo config sets [ui] scale = 1.25, so every window size here is 1.25x
 # the layout it shows: high-resolution captures of an unchanged layout.

@@ -13,20 +13,20 @@
 //! ./target/release/examples/extractprobe ~/Documents 16 4       # four such roots
 //! ```
 //!
-//! The question it answers: **does peak memory track the number of files or
-//! the number of workers?** A run's file count is the user's; its worker
-//! count is ours (`walk::thread_count_for`, one pool per root), so if the
-//! peak follows the pool, the fix is a bound and not a rewrite.
+//! It answers whether peak memory tracks the number of files or the number of
+//! workers. A run's file count is the user's; its worker count is ours
+//! (`walk::thread_count_for`, one pool per root), so if the peak follows the
+//! pool, bounding the pool bounds the peak.
 //!
-//! `peak live` is from a counting allocator and is exact; `VmHWM` is what the
-//! machine sees, and the gap between them is glibc holding freed chunks on
-//! its arena free lists. With one worker the per-file table is exact — the
+//! `peak live` comes from a counting allocator and is exact; `VmHWM` is what
+//! the machine sees, and the gap between them is freed memory the allocator
+//! has not returned. With one worker the per-file table is exact, and its
 //! largest entries are the files that would spike a real run.
 
 use std::alloc::{GlobalAlloc, Layout};
 
-// What `Counting` wraps: the allocator the shipped binaries install, or the
-// figures describe a build nobody runs. See `platform::Allocator`.
+// `Counting` wraps the allocator the shipped binaries install, so the figures
+// describe a real build. See `platform::Allocator`.
 use quicksearch_core::platform::Allocator as Inner;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -39,9 +39,9 @@ mod common;
 // Allocation accounting
 // ---------------------------------------------------------------------------
 
-/// [`Inner`], counting — per binary, so the shipped `quicksearch` is
-/// untouched. `PEAK_LIVE` is the high-water of live bytes: unlike RSS it
-/// cannot be inflated by the allocator declining to return pages.
+/// [`Inner`] with live-byte accounting, installed in this binary only.
+/// `PEAK_LIVE` is the high-water of live bytes, which, unlike RSS, the
+/// allocator's retention cannot inflate.
 struct Counting;
 
 static LIVE: AtomicU64 = AtomicU64::new(0);
@@ -92,9 +92,8 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// The high-water since the last call, rebased to live-now. Meaningful only
-/// while one thread is allocating — hence the per-file table's `workers == 1`
-/// guard.
+/// The high-water since the last call, above live-now. Meaningful only while
+/// one thread allocates, hence the per-file table's `workers == 1` guard.
 fn take_mark() -> u64 {
     let live = LIVE.load(Ordering::Relaxed);
     MARK.swap(live, Ordering::Relaxed).saturating_sub(live)
@@ -103,18 +102,7 @@ fn take_mark() -> u64 {
 use quicksearch_core::config::Config;
 use quicksearch_core::extract::Registry;
 use quicksearch_core::file_handling::decide_content;
-use quicksearch_core::testutil::mib;
-
-/// Head bytes read for the MIME sniff — the same window the walk uses, so
-/// this probe classifies files exactly as a run would.
-fn sniff(path: &Path, hash_length: usize) -> Option<&'static str> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut head = vec![0u8; hash_length];
-    let n = f.read(&mut head).ok()?;
-    head.truncate(n);
-    quicksearch_core::mime::guess_mime_from_head(path, &head)
-}
+use quicksearch_core::testutil::{self, mib};
 
 struct Candidate {
     path: String,
@@ -138,7 +126,8 @@ fn candidates(dir: &Path, config: &Config, registry: &Registry) -> Vec<Candidate
         let Some(path) = entry.path().to_str().map(str::to_string) else {
             continue;
         };
-        let Some(mime) = sniff(entry.path(), config.processing.hash_length) else {
+        // The walk's own sniff window, so files classify as a run's would.
+        let Some(mime) = testutil::sniff(entry.path(), config.processing.hash_length) else {
             continue;
         };
         if !registry.supports(mime) {
@@ -191,7 +180,7 @@ fn main() {
 
     // Baseline *after* the scan: the candidate list is the probe's own cost,
     // not extraction's.
-    let baseline_rss = rss();
+    let baseline_rss = common::rss().unwrap_or(0);
     let baseline_live = LIVE.load(Ordering::Relaxed);
     PEAK_LIVE.store(baseline_live, Ordering::Relaxed);
 
@@ -216,11 +205,11 @@ fn main() {
                 if per_file {
                     take_mark();
                 }
-                let outcome = decide_content(&c.path, Some(c.mime), &registry, &config, &mut scratch);
+                // Live through `take_mark`, so the cost excludes the result.
+                let _outcome =
+                    decide_content(&c.path, Some(c.mime), &registry, &config, &mut scratch);
                 if per_file {
                     let cost = take_mark();
-                    let text =
-                        quicksearch_core::file_handling::outcome_body(&outcome).map_or(0, str::len);
                     let mut w = worst
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -228,7 +217,6 @@ fn main() {
                     // Kept small so the table itself is not the peak.
                     w.sort_by_key(|(cost, ..)| std::cmp::Reverse(*cost));
                     w.truncate(12);
-                    let _ = text;
                 }
             });
         }
@@ -251,9 +239,9 @@ fn main() {
         mib(baseline_live),
     );
     eprintln!(
-        "  peak RSS    {} (VmHWM), now {} — the gap is glibc holding freed chunks",
+        "  peak RSS    {} (VmHWM), now {} — the gap is freed memory the allocator kept",
         mib(hwm),
-        mib(rss()),
+        mib(common::rss().unwrap_or(0)),
     );
     eprintln!(
         "  baseline    {} RSS before the first extraction",
@@ -285,13 +273,4 @@ fn main() {
             mib(config.processing.maximum_text_file_size),
         );
     }
-}
-
-/// Resident set size now, from `/proc/self/statm` field 2 (resident pages).
-fn rss() -> u64 {
-    std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
-        .map(|pages| pages * 4096)
-        .unwrap_or(0)
 }

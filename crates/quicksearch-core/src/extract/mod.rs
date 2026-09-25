@@ -19,27 +19,21 @@ pub mod rtf;
 pub type ExtractError = String;
 
 /// The ceilings one extraction works under, read from the config once per
-/// worker instead of being hardcoded per format.
-///
-/// Every extractor used to carry its own 64 MiB constants, chosen
-/// independently of the settings that actually bound the work: the content
-/// pass never offers a file above `maximum_text_file_size` (50 MiB by
-/// default), and everything an extractor produces past `maximum_text_size`
-/// (256 KiB) is discarded by the caller moments later. A ceiling 256× above
-/// the largest result that can be kept is not a safety margin, it is the
-/// worst case a worker can reach — multiplied by the pool size.
+/// worker. They follow the settings that already bound the work: the content
+/// pass never offers a file above `maximum_text_file_size`, and the caller
+/// discards text past `maximum_text_size`, so any higher ceiling would only
+/// raise the worst case a worker, times the pool size, can reach.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Largest file body to read. A backstop rather than a policy: the pass
-    /// already filtered on it, so this catches a file that grew since the
-    /// walk sized it and a node whose `fstat` lies (procfs reports zero).
+    /// Largest file body to read. A backstop: the pass already filtered on
+    /// it, so this catches a file that grew since the walk sized it and a
+    /// node whose `fstat` lies (procfs reports zero).
     pub read: usize,
-    /// Largest text an extraction may produce. Past this the caller
-    /// truncates, so producing more is work and memory spent to be thrown
-    /// away — extractors stop here instead.
+    /// Largest text an extraction may produce. The caller truncates past
+    /// this, so extractors stop here.
     pub text: usize,
     /// Largest a single container member may inflate to. A zip declares its
-    /// sizes but the deflate stream is what gets read, so this is the only
+    /// sizes, but reading follows the deflate stream, so this is the only
     /// bound on a crafted archive.
     pub inflate: usize,
 }
@@ -52,10 +46,8 @@ pub struct Limits {
 const INFLATE_FACTOR: usize = 16;
 
 /// Absolute ceiling on the inflation budget, whatever `maximum_text_size` is
-/// set to. The budget is held **per worker** and the pools multiply it (up
-/// to 64 workers, one pool per root), so it cannot be allowed to scale with
-/// a setting freely. This is the old hardcoded per-member cap, kept as the
-/// backstop it was always meant to be rather than the everyday value.
+/// set to. The budget is held per worker and the pools multiply it (up to 64
+/// workers, one pool per root), so it cannot scale freely with a setting.
 const MAX_INFLATE: usize = 64 * 1024 * 1024;
 
 impl Limits {
@@ -69,18 +61,14 @@ impl Limits {
     }
 }
 
-/// Buffers one worker reuses for every file it handles.
+/// Buffers one worker reuses for every file it handles. Each keeps the
+/// capacity the largest file so far needed, so intermediates cost no per-file
+/// allocation. The extracted text is not here: it crosses a channel to the
+/// writer.
 ///
-/// A pool member creates one of these before its loop and hands it to each
-/// extraction; the buffers keep whatever capacity the largest file so far
-/// needed, so per-file allocator traffic for the *intermediates* falls to
-/// zero. What it deliberately does not hold is the extracted text: that
-/// crosses a channel to the writer, so it is the payload rather than
-/// scratch.
-///
-/// Sizing is lazy on purpose. `maximum_text_file_size` clamps at 4 GiB
+/// Sized lazily: `maximum_text_file_size` clamps at 4 GiB
 /// ([`crate::config::Config::clamp_out_of_range`]), so reserving it eagerly
-/// would let a configured ceiling nobody reaches allocate per worker.
+/// would let a ceiling nobody reaches allocate per worker.
 pub struct Scratch {
     /// The head bytes a walk worker hashes and sniffs each file from.
     head: Vec<u8>,
@@ -112,10 +100,8 @@ impl Scratch {
         self.limits
     }
 
-    /// The head buffer, to be read into. Reused across files: the walk
-    /// hashes the head of every new or changed file, and a fresh
-    /// `hash_length` buffer apiece was one allocation per file. The caller
-    /// sizes it — [`crate::file_handling::get_file_hash`] does.
+    /// The head buffer, to be read into, reused across files. The caller
+    /// sizes it ([`crate::file_handling::get_file_hash`] does).
     pub(crate) fn head_buffer(&mut self) -> &mut Vec<u8> {
         &mut self.head
     }
@@ -132,14 +118,13 @@ impl Scratch {
     }
 
     /// The member and event buffers together, which a container walk holds
-    /// at once. Two `&mut self` accessors could not be.
+    /// at once; two `&mut self` accessors could not lend both.
     pub(crate) fn container_bufs(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>) {
         (&mut self.bytes, &mut self.events)
     }
 
-    /// The same pair plus the shared-string table — XLSX needs all three.
-    /// The table is cleared but its entries keep their capacity, which is
-    /// most of what a shared-string table costs to rebuild.
+    /// The same pair plus the shared-string table, cleared, which XLSX needs
+    /// all at once.
     pub(crate) fn xlsx_bufs(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>, &mut Vec<String>) {
         self.strings.clear();
         (&mut self.bytes, &mut self.events, &mut self.strings)
@@ -154,20 +139,26 @@ fn contain_panic<T>(path: &Path, f: impl FnOnce() -> T) -> Result<T, ExtractErro
         .map_err(|_| format!("extractor panicked on {}", path.display()))
 }
 
-/// A pluggable content extractor; stateless.
-///
-/// Text is **appended to `out`** rather than returned. The caller owns that
-/// buffer — it is the row that crosses the channel to the writer — so a
-/// returned `String` was one allocation handed over and, for the container
-/// formats, another one inside for the intermediate. `scratch` carries the
-/// intermediates and the [`Limits`] the extraction works under.
+/// Append `text` to `out`, moving it rather than copying when `out` is empty,
+/// as it is for every caller today.
+fn append(out: &mut String, text: String) {
+    if out.is_empty() {
+        *out = text;
+    } else {
+        out.push_str(&text);
+    }
+}
+
+/// A stateless content extractor. Text is appended to `out`, the caller's
+/// buffer, which becomes the row sent to the writer; `scratch` holds reusable
+/// intermediates and the [`Limits`].
 pub trait Extractor: Send + Sync {
     /// `mime` is normalized to lowercase before dispatch.
     fn supports(&self, mime: &str) -> bool;
 
     /// Extract this file's searchable text into `out`. An [`ExtractError`]
     /// marks the file's content state failed (so it is not retried every
-    /// run). Empty text is fine — filename search still works.
+    /// run). Empty text is fine: filename search still works.
     ///
     /// An extractor should stop once `out` reaches `scratch.limits().text`:
     /// the caller truncates there, so anything beyond is produced to be
@@ -183,12 +174,12 @@ pub trait Extractor: Send + Sync {
     /// memory at walk time; keeps the text consistent with the size, mtime
     /// and hash read alongside it.
     ///
-    /// The default `None` means "I need the file on disk" — formats that seek
-    /// or read a trailer must keep it; `Some(Err(_))` is a real failure.
-    /// `path` is only so failures name the file — nothing here may open it.
+    /// The default `None` means "I need the file on disk", which formats that
+    /// seek or read a trailer must keep; `Some(Err(_))` is a real failure.
+    /// `path` only names the file in failures; nothing here may open it.
     ///
     /// No `Scratch`: `head` is itself the walk worker's reused buffer, so an
-    /// extractor taking both would be holding two borrows of the same thing.
+    /// extractor taking both would hold two borrows of the same thing.
     fn extract_from_head(
         &self,
         _path: &Path,
@@ -205,41 +196,32 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn new() -> Self {
-        Self {
-            extractors: Vec::new(),
-        }
-    }
-
-    /// The lowercasing is a stack copy, not a heap one: `find` runs two or
-    /// three times per indexed file (`content_extractable` alone calls it
-    /// twice), and a `String` apiece was pure per-file allocator traffic.
+    /// The first extractor claiming `mime`, matched case-insensitively.
+    /// Lowercases on the stack: this runs several times per indexed file.
     fn find(&self, mime: &str) -> Option<&dyn Extractor> {
         let lower = crate::mime::LowerMime::new(mime);
-        let lower = lower.as_str(mime);
+        let lower = lower.as_str();
         self.extractors
             .iter()
             .find(|e| e.supports(lower))
             .map(|e| &**e)
     }
 
-    /// Whether any extractor claims `mime`, without touching the file — lets
-    /// the walk decide a row's `content_state` up front.
+    /// Whether any extractor claims `mime`, without touching the file, so the
+    /// walk can decide a row's `content_state` up front.
     pub fn supports(&self, mime: &str) -> bool {
         self.find(mime).is_some()
     }
 
     /// Run the handler for `mime` against `path`, appending its text to
-    /// `out`. `Ok(false)` means no extractor claims the MIME and `out` was
-    /// not touched.
+    /// `out`. `Ok(false)` means no extractor claims the MIME and `out` is
+    /// untouched.
     ///
-    /// A panicking parser becomes an `Err` here, at the boundary: every
-    /// caller has more than one file to lose (a walk worker's panic costs the
-    /// root its whole content pass; the live watcher's costs every displayed
-    /// row for the session), and containing at the boundary means a new
-    /// caller cannot forget. This cannot help with a stack overflow, which
-    /// aborts rather than unwinding — see `vendor/pdf-extract`, which bounds
-    /// the recursion that made that reachable.
+    /// A panicking parser becomes an `Err` here, at the boundary, so no caller
+    /// can forget to contain it: a walk worker's panic would cost the root its
+    /// content pass, the live watcher's every displayed row. A stack overflow
+    /// aborts rather than unwinding; `vendor/pdf-extract` bounds the recursion
+    /// that made one reachable.
     pub fn extract(
         &self,
         path: &Path,
@@ -257,7 +239,7 @@ impl Registry {
 
     /// [`Registry::extract`] for a file whose complete contents the caller
     /// already holds. `None` means "leave this to the content pass".
-    /// Contained the same way — and this is the one on a walk worker.
+    /// Contained the same way; this one runs on a walk worker.
     pub fn extract_complete_head(
         &self,
         path: &Path,
@@ -266,22 +248,16 @@ impl Registry {
         out: &mut String,
     ) -> Option<Result<(), ExtractError>> {
         let extractor = self.find(mime)?;
-        // The guard wraps the whole `Option` so a panic becomes
-        // `Some(Err(..))` — a failure this file is charged with, not a
-        // deferral to the content pass that would meet the same panic.
-        match contain_panic(path, || extractor.extract_from_head(path, head, out)) {
-            Ok(outcome) => outcome,
-            Err(e) => Some(Err(e)),
-        }
+        // A panic becomes `Some(Err(..))`: a failure charged to this file, not
+        // a deferral to the content pass, which would meet the same panic.
+        contain_panic(path, || extractor.extract_from_head(path, head, out))
+            .unwrap_or_else(|e| Some(Err(e)))
     }
 
-    /// [`Registry::extract`] into a `String` of its own, under default
-    /// limits.
-    ///
-    /// For callers holding **one** file — probes, tests, a CLI invocation —
-    /// where there is no loop for a reused buffer to amortize over. Anything
-    /// in a pool should own a [`Scratch`] and call [`Registry::extract`], or
-    /// it pays the per-file allocations this exists to avoid.
+    /// [`Registry::extract`] into a `String` of its own, under `config`'s
+    /// limits. For callers holding one file (probes, tests, a CLI
+    /// invocation); anything in a pool should own a [`Scratch`] and call
+    /// [`Registry::extract`], or it pays per-file allocations.
     pub fn extract_to_string(
         &self,
         path: &Path,
@@ -290,10 +266,9 @@ impl Registry {
     ) -> Result<Option<String>, ExtractError> {
         let mut out = String::new();
         let mut scratch = Scratch::new(config);
-        match self.extract(path, mime, &mut out, &mut scratch)? {
-            true => Ok(Some(out)),
-            false => Ok(None),
-        }
+        Ok(self
+            .extract(path, mime, &mut out, &mut scratch)?
+            .then_some(out))
     }
 
     /// [`Registry::extract_complete_head`] into a `String` of its own; see
@@ -305,19 +280,16 @@ impl Registry {
         head: &[u8],
     ) -> Option<Result<String, ExtractError>> {
         let mut out = String::new();
-        match self.extract_complete_head(path, mime, head, &mut out) {
-            Some(Ok(())) => Some(Ok(out)),
-            Some(Err(e)) => Some(Err(e)),
-            None => None,
-        }
+        self.extract_complete_head(path, mime, head, &mut out)
+            .map(|r| r.map(|()| out))
     }
 
     /// The default set. Order matters: RTF precedes plaintext, which claims
     /// every `text/*` and would swallow `text/rtf` as raw control words;
-    /// plaintext precedes audio because it deliberately claims playlist and
-    /// SVG MIMEs whose text is worth more than their tags. No image
-    /// extractor, deliberately: `image/*` unclaimed is what records images
-    /// `STATE_NA` at walk time and keeps the content pass from opening them.
+    /// plaintext precedes audio because it claims playlist and SVG MIMEs
+    /// whose text is worth more than their tags. There is no image extractor:
+    /// leaving `image/*` unclaimed records images `STATE_NA` at walk time and
+    /// keeps the content pass from opening them.
     pub fn default_set() -> Self {
         Self {
             extractors: vec![
@@ -337,48 +309,32 @@ impl Default for Registry {
     }
 }
 
+/// Run `e` on `path` into a fresh `String` under default limits: the
+/// one-file form the extractor tests assert text through.
+#[cfg(test)]
+fn extract_text(e: &dyn Extractor, path: &Path) -> Result<String, ExtractError> {
+    let mut out = String::new();
+    let mut scratch = Scratch::new(&crate::config::Config::default());
+    e.extract(path, &mut out, &mut scratch).map(|()| out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn cfg() -> crate::config::Config {
-        crate::config::Config::default()
-    }
-
-    /// The one-file form; the pool's buffer reuse is not what these assert.
-    fn extract(r: &Registry, path: &Path, mime: &str) -> Result<Option<String>, ExtractError> {
-        r.extract_to_string(path, mime, &cfg())
-    }
-
-    fn extract_complete_head(
-        r: &Registry,
-        path: &Path,
-        mime: &str,
-        head: &[u8],
-    ) -> Option<Result<String, ExtractError>> {
-        r.extract_head_to_string(path, mime, head)
-    }
-
-    #[test]
-    fn empty_registry_returns_none() {
-        let r = Registry::new();
-        let out = extract(&r, Path::new("/tmp/x"), "text/plain").expect("no error");
-        assert!(out.is_none());
-    }
-
     #[test]
     fn complete_head_extraction_dispatches_only_to_extractors_that_opt_in() {
         let r = Registry::default_set();
-        let p = Path::new("/tmp/whatever");
+        let head =
+            |mime, bytes: &[u8]| r.extract_head_to_string(Path::new("/tmp/whatever"), mime, bytes);
 
-        let out = extract_complete_head(&r, p, "text/plain", b"hello");
-        assert!(matches!(out, Some(Ok(ref c)) if c == "hello"));
+        assert!(matches!(head("text/plain", b"hello"), Some(Ok(ref c)) if c == "hello"));
 
         // A format that seeks or reads a trailer must not be handed a buffer.
-        assert!(extract_complete_head(&r, p, "application/pdf", b"%PDF-1.4").is_none());
-        assert!(extract_complete_head(&r, p, "image/png", b"\x89PNG").is_none());
+        assert!(head("application/pdf", b"%PDF-1.4").is_none());
+        assert!(head("image/png", b"\x89PNG").is_none());
 
-        assert!(extract_complete_head(&r, p, "application/x-nonesuch", b"..").is_none());
+        assert!(head("application/x-nonesuch", b"..").is_none());
     }
 
     #[test]
@@ -393,14 +349,14 @@ mod tests {
             "application/x-sql",
         ] {
             assert!(
-                extract_complete_head(&r, p, mime, b"x").is_some(),
+                r.extract_head_to_string(p, mime, b"x").is_some(),
                 "{} should extract from a head",
                 mime
             );
         }
         for mime in ["application/rtf", "text/rtf"] {
             assert!(
-                extract_complete_head(&r, p, mime, br"{\rtf1 x}").is_some(),
+                r.extract_head_to_string(p, mime, br"{\rtf1 x}").is_some(),
                 "{} should extract from a head",
                 mime
             );
@@ -411,7 +367,8 @@ mod tests {
     fn text_rtf_reaches_the_rtf_extractor_not_plaintext() {
         let r = Registry::default_set();
         let p = Path::new("/tmp/whatever.rtf");
-        let out = extract_complete_head(&r, p, "text/rtf", br"{\rtf1\ansi Hello {\b World}}")
+        let out = r
+            .extract_head_to_string(p, "text/rtf", br"{\rtf1\ansi Hello {\b World}}")
             .expect("claimed")
             .expect("parsed");
         assert_eq!(out, "Hello World");
@@ -441,7 +398,10 @@ mod tests {
             "application/octet-stream",
             "",
         ] {
-            let claimed = !matches!(extract(&r, missing, mime), Ok(None));
+            let claimed = !matches!(
+                r.extract_to_string(missing, mime, &crate::config::Config::default()),
+                Ok(None)
+            );
             assert_eq!(
                 r.supports(mime),
                 claimed,

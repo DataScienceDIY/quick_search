@@ -1,9 +1,8 @@
 //! Shared fixtures for the `search` and `index` benchmarks.
 //!
-//! Deterministic — the same LCG `search_perf.rs` and `indexprobe.rs` use —
-//! so two runs are comparable. Corpora are built once per process: Divan
-//! re-runs a closure thousands of times, and generating 256 KiB inside that
-//! loop would measure the generator.
+//! Deterministic (`testutil::Lcg`), so two runs are comparable. Corpora are
+//! built once per process: Divan re-runs a closure thousands of times, and
+//! generating 256 KiB inside that loop would measure the generator.
 
 // Both bench binaries compile the whole module but each uses only part of it.
 #![allow(dead_code)]
@@ -24,7 +23,7 @@ const WORDS: &[&str] = &[
 /// Nine bytes, no overlap with [`WORDS`], clears the trigram floor.
 pub const NEEDLE: &str = "quartzite";
 
-/// 1 KiB, 16 KiB and 256 KiB — the last is `maximum_text_size`, the worst
+/// 1 KiB, 16 KiB and 256 KiB. The last is `maximum_text_size`, the worst
 /// case a full-text pass survives per row.
 pub const SIZES: [usize; 3] = [1 << 10, 16 << 10, 256 << 10];
 
@@ -32,9 +31,9 @@ pub const SIZES: [usize; 3] = [1 << 10, 16 << 10, 256 << 10];
 /// so a full-text pass verifies far more rows than it accepts.
 pub const HITS: [usize; 3] = [0, 4, 64];
 
-/// ~`size` bytes with [`NEEDLE`] planted `hits` times at even spacing: a
-/// count must scan to the end and a snippet window never holds every match,
-/// which is what the cascade actually does.
+/// ~`size` bytes with [`NEEDLE`] planted `hits` times at even spacing, so a
+/// count scans to the end and a snippet window never holds every match, as
+/// in the cascade.
 pub fn document(size: usize, hits: usize) -> String {
     let mut lcg = Lcg::new(0x5eed);
     let mut out = String::with_capacity(size + 16);
@@ -47,14 +46,14 @@ pub fn document(size: usize, hits: usize) -> String {
             next_plant = next_plant.saturating_add(stride);
             continue;
         }
-        out.push_str(WORDS[lcg.next_u64() as usize % WORDS.len()]);
+        out.push_str(lcg.pick::<&str>(WORDS));
         out.push(' ');
     }
     out
 }
 
-/// [`document`] with the planted term capitalised: the stage-6/tier-4 row —
-/// the case the cascade pays a fold for.
+/// [`document`] with the planted term capitalised: the case the cascade
+/// pays a fold for.
 pub fn document_mixed_case(size: usize, hits: usize) -> String {
     let mut needle = NEEDLE.to_string();
     needle.replace_range(0..1, &NEEDLE[0..1].to_uppercase());
@@ -103,13 +102,13 @@ pub fn text_folded(size: usize, hits: usize) -> &'static str {
     &FOLDED[&(size, hits)]
 }
 
-/// [`text`] as stored: zstd level 3, exactly what `db/repo.rs` writes.
+/// [`text`] as stored: zstd level 3, as `db/repo.rs` writes it.
 pub fn blob(size: usize, hits: usize) -> &'static [u8] {
     &BLOBS[&(size, hits)]
 }
 
-/// Realistic names and paths for the filename pass, which scans the whole
-/// table — what matters is the per-row cost on a *miss*.
+/// Realistic names and paths for the filename pass. It scans the whole
+/// table, so the per-row cost on a miss is what matters.
 pub struct Row {
     pub name: String,
     pub path: String,
@@ -119,8 +118,8 @@ static ROWS: LazyLock<Vec<Row>> = LazyLock::new(|| {
     let mut lcg = Lcg::new(0xd00d);
     (0..2000)
         .map(|i| {
-            let w1 = WORDS[lcg.next_u64() as usize % WORDS.len()];
-            let w2 = WORDS[lcg.next_u64() as usize % WORDS.len()];
+            let w1 = *lcg.pick(WORDS);
+            let w2 = *lcg.pick(WORDS);
             let name = format!("{}-{}-{:05}.txt", w1, w2, i);
             // Mixed case in the directory portion, so the folded tiers resolve.
             let path = format!("/home/user/Documents/Quartzite/{:03}/{}", i % 40, name);
@@ -140,7 +139,7 @@ pub fn text_head() -> &'static [u8] {
     &HEAD
 }
 
-/// A binary head no extractor claims — the MIME sniff's control group.
+/// A binary head no extractor claims: the MIME sniff's control group.
 pub fn binary_head() -> &'static [u8] {
     static HEAD: LazyLock<Vec<u8>> = LazyLock::new(|| {
         let mut lcg = Lcg::new(0xbeef);

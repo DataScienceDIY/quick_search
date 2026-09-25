@@ -27,24 +27,19 @@ pub use duplicates::{find_duplicate_groups, DuplicateGroup};
 
 /// Idle window before the connection is released.
 ///
-/// Long, because releasing throws away [`PRAGMAS_SEARCH`]'s 32 MiB of
-/// decrypted pages and the next keystroke pays to refill them: on a 200k-file
-/// index the first query after a release costs 129 ms unencrypted and 192 ms
-/// encrypted, against ~10 ms warm. Encryption is why the gap widens — a
-/// refill is an AES decrypt per page rather than a `memcpy`. (The 192 ms was
-/// measured while `db::schema::HMAC_MODE` was still HMAC-SHA512 and there was
-/// a per-page verify to pay as well, so the gap is narrower now; the argument
-/// for a long idle timeout only gets stronger as the two converge.) What the
-/// release buys back is the ~42 MiB the trim in
-/// [`Worker::run`] returns, so this trades an idle process floor against
-/// stalling the one keystroke a user is most likely to notice.
+/// Long, because a release drops the search cache
+/// ([`db::schema::pragmas_search`]) and the next keystroke pays to refill it:
+/// on a 200k-file index the first query after a release costs 129 ms
+/// unencrypted and 192 ms encrypted, against ~10 ms warm, because a keyed
+/// refill decrypts every page. (The keyed figure predates `HMAC_MODE = Off`;
+/// see [`db::schema::HMAC_MODE`].) A release gives back the ~42 MiB the trim
+/// in [`Worker::drop_connection`] returns, so this trades an idle memory floor
+/// against stalling the keystroke a user most notices.
 ///
-/// It is *not* what lets a rebuild delete the file: `Backend::rebuild_index`
-/// and `clear_index` send [`WorkerMsg::ReleaseConnection`] first, because
-/// Windows fails the delete while any handle is open. Nor does holding a
-/// connection stop the WAL truncating — a read mark lives for the length of a
-/// statement, not of the connection (`db::repo_tests` pins both halves of
-/// that: a checkpoint loses to a reader *mid-query*, not to an idle one).
+/// Rebuilds do not wait on it: `Backend::rebuild_index` and `clear_index` send
+/// [`WorkerMsg::ReleaseConnection`] first, because Windows fails the delete
+/// while any handle is open. Nor does a held connection stop the WAL
+/// truncating: a read mark lasts for a statement, not a connection.
 const IDLE_RELEASE: Duration = Duration::from_secs(30 * 60);
 
 /// One search result. `rank` is the sort key (lower = better): integer part
@@ -175,7 +170,7 @@ type ReleaseAck = Arc<Mutex<Option<mpsc::Sender<()>>>>;
 const RELEASE_WAIT: Duration = Duration::from_secs(2);
 
 /// The release is a message rather than a flag because the worker is parked
-/// in a 30-second `recv_timeout` where a flag would not reach it.
+/// in `recv_timeout`, where a flag would not reach it.
 enum WorkerMsg {
     Search(SearchRequest),
     /// Drop the held connection so the index file can be deleted or replaced.
@@ -258,9 +253,9 @@ impl SearchService {
         generation
     }
 
-    /// Drop the held connection and wait briefly. Cancels first, necessarily:
-    /// a search enqueued just before this would otherwise run after the
-    /// release, **reopening** the connection. Best-effort.
+    /// Drop the held connection and wait briefly; best-effort. Cancels first: a
+    /// search enqueued just before this would otherwise run after the release
+    /// and reopen the connection.
     pub fn release_connection(&self) {
         self.cancel();
         let (ack_tx, ack_rx) = mpsc::channel();
@@ -281,9 +276,9 @@ impl SearchService {
         self.cancel();
     }
 
-    /// Kill the running statement — but only if the generation counter has
-    /// already moved past the search that owns it. Interrupting the *newest*
-    /// search does not cancel it, it fails it as `Search failed: interrupted`.
+    /// Kill the running statement, but only if the generation counter has moved
+    /// past the search that owns it: interrupting the newest search would fail
+    /// it as `Search failed: interrupted` rather than cancel it.
     fn interrupt_stale(&self) {
         let latest = self.latest_gen.load(Ordering::SeqCst);
         if let Some((generation, handle)) = crate::lock_ok(&self.in_flight).as_ref() {
@@ -307,8 +302,8 @@ impl SearchService {
 /// `DATABASE_CORRUPTED:` drives the GUI's recovery dialog.
 pub fn classify_sql_err(error_msg: &str) -> String {
     if error_msg.starts_with(db::KEY_MISMATCH_PREFIX) {
-        // Must never fall into the corruption bucket — the recovery dialog
-        // would offer to delete an index that is perfectly intact.
+        // Never the corruption bucket: the recovery dialog would offer to
+        // delete an intact index.
         error_msg.to_string()
     } else if error_msg.contains("malformed") || error_msg.contains("corrupt") {
         format!("DATABASE_CORRUPTED: {}", error_msg)
@@ -342,19 +337,15 @@ struct OpenIndex {
 impl Worker {
     fn run(mut self) {
         loop {
-            let first = match self.req_rx.recv_timeout(self.idle_release) {
+            let mut req = match self.req_rx.recv_timeout(self.idle_release) {
                 Ok(WorkerMsg::ReleaseConnection) => {
                     self.release();
                     continue;
                 }
                 Ok(WorkerMsg::Search(req)) => req,
+                // Once per idle transition, never a repeating tick.
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // glibc parks the dropped connection's page cache in an
-                    // arena; without the trim the process floor stays ~42 MiB
-                    // higher. Once per idle transition, never a repeating tick.
-                    if self.open.take().is_some() {
-                        crate::platform::release_free_heap();
-                    }
+                    self.drop_connection();
                     continue;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -362,7 +353,6 @@ impl Worker {
             // Only the newest search matters, but a release must not be
             // coalesced away; anything enqueued ahead of it is already
             // cancelled and drops out rather than reopening the connection.
-            let mut req = first;
             while let Ok(newer) = self.req_rx.try_recv() {
                 match newer {
                     WorkerMsg::Search(newer) => req = newer,
@@ -376,19 +366,26 @@ impl Worker {
         }
     }
 
-    /// Drop the held connection and tell whoever asked; same trim as idle.
-    fn release(&mut self) {
+    /// Drop the held connection, if any, and trim the heap: glibc parks the
+    /// dropped page cache in an arena, and without the trim the process floor
+    /// stays ~42 MiB higher.
+    fn drop_connection(&mut self) {
         if self.open.take().is_some() {
             crate::platform::release_free_heap();
         }
+    }
+
+    /// Drop the held connection and tell whoever asked.
+    fn release(&mut self) {
+        self.drop_connection();
         if let Some(ack) = crate::lock_ok(&self.release_ack).take() {
             let _ = ack.send(());
         }
     }
 
     /// Take the connection, reopening when the path changed or the epoch
-    /// moved — the file at the *same* path was replaced, which no path
-    /// comparison can catch and would leave this worker on a deleted inode.
+    /// moved. A moved epoch means the file at the same path was replaced, which
+    /// no path comparison catches; the worker would be left on a deleted inode.
     fn take_connection(&mut self, db_path: &Path) -> Result<OpenIndex, String> {
         let epoch = db::index_epoch();
         if let Some(open) = self.open.take() {
@@ -413,29 +410,30 @@ impl Worker {
     fn handle(&mut self, req: SearchRequest) {
         let generation = req.generation;
         self.send(SearchUpdate::Started { generation });
+        match self.search(&req) {
+            Ok(Some(Outcome { total, limited })) => self.send(SearchUpdate::Completed {
+                generation,
+                total,
+                limited,
+            }),
+            // Cancelled: the newer generation owns the UI now.
+            Ok(None) => {}
+            Err(message) => self.send(SearchUpdate::Error {
+                generation,
+                message,
+            }),
+        }
+    }
 
-        let split = match split_for_cascade(&req.input) {
-            Ok(s) => s,
-            Err(e) => {
-                self.send(SearchUpdate::Error {
-                    generation,
-                    message: e.to_string(),
-                });
-                return;
-            }
-        };
-
+    /// Run one request's cascade on the held connection, streaming its hits.
+    /// `Ok(None)` means cancelled; `Err` is the message to show.
+    fn search(&mut self, req: &SearchRequest) -> Result<Option<Outcome>, String> {
+        let generation = req.generation;
+        let split = split_for_cascade(&req.input).map_err(|e| e.to_string())?;
         let db_path = crate::lock_ok(&self.db_path).clone();
-        let open = match self.take_connection(&db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                self.send(SearchUpdate::Error {
-                    generation,
-                    message: classify_sql_err(&e),
-                });
-                return;
-            }
-        };
+        let open = self
+            .take_connection(&db_path)
+            .map_err(|e| classify_sql_err(&e))?;
         // Publish the kill handle before the first statement runs.
         *crate::lock_ok(&self.in_flight) = Some((generation, open.conn.get_interrupt_handle()));
 
@@ -453,25 +451,12 @@ impl Worker {
 
         *crate::lock_ok(&self.in_flight) = None;
 
-        // A failed cascade may have failed *because* of this connection;
-        // putting it back would wedge every later search behind it.
+        // A failed cascade may have failed because of this connection; putting
+        // it back would wedge every later search behind it.
         if outcome.is_ok() {
             self.open = Some(open);
         }
-
-        match outcome {
-            Ok(Some(Outcome { total, limited })) => self.send(SearchUpdate::Completed {
-                generation,
-                total,
-                limited,
-            }),
-            // Cancelled — the newer generation owns the UI now.
-            Ok(None) => {}
-            Err(e) => self.send(SearchUpdate::Error {
-                generation,
-                message: classify_sql_err(&e),
-            }),
-        }
+        outcome.map_err(|e| classify_sql_err(&e))
     }
 }
 
@@ -536,8 +521,8 @@ mod tests {
         service.shutdown();
     }
 
-    /// A superseded generation still dies promptly — a keystroke must not
-    /// wait on the previous query.
+    /// A superseded generation still dies promptly: a keystroke must not wait
+    /// on the previous query.
     #[test]
     fn cancelling_kills_a_superseded_generation() {
         let service = idle_service();

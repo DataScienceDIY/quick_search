@@ -1,7 +1,8 @@
 //! [`IgnoreSet`]: the compiled ignore-pattern matcher, split by scope
 //! (single path components vs full paths).
 
-use std::path::Path;
+use std::borrow::Cow;
+use std::path::{Component, Path};
 
 /// Longest name folded without allocating; comfortably above `NAME_MAX`.
 pub(super) const FOLD_BUF: usize = 256;
@@ -21,8 +22,8 @@ pub struct IgnoreSet {
     /// Plain-ASCII component names, held apart for speed: globset gives up
     /// every fast path the moment `case_insensitive` is set (measured: a
     /// regex DFA per directory entry on Windows vs five hash lookups).
-    /// Folded as **ASCII**, matching SQLite's `NOCASE`/`LIKE`; non-ASCII
-    /// patterns stay in `component` with globset's Unicode folding.
+    /// Folded as ASCII, matching SQLite's `NOCASE`/`LIKE`; non-ASCII patterns
+    /// stay in `component` with globset's Unicode folding.
     pub(super) literal_components: std::collections::HashSet<String>,
     component: globset::GlobSet,
     path: globset::GlobSet,
@@ -35,27 +36,23 @@ impl IgnoreSet {
         let mut component = globset::GlobSetBuilder::new();
         let mut path = globset::GlobSetBuilder::new();
         for pat in patterns {
-            // Trailing separators are stripped ("/tmp/" compares as "/tmp")
-            // — except a drive root, where the separator is the whole point:
-            // trimmed to "D:" it becomes a component pattern that can never
-            // match. Drive roots keep a normalized "D:/" spelling.
+            // Trailing separators are stripped ("/tmp/" compares as "/tmp"),
+            // except from a drive root, where the separator is the whole
+            // point: trimmed to "D:" it becomes a component pattern that can
+            // never match. Drive roots keep a normalized "D:/" spelling.
             let raw = pat.trim();
             let trimmed = raw.trim_end_matches(['/', '\\']);
             let is_drive_root = raw.len() > trimmed.len()
-                && trimmed.len() == 2
-                && trimmed.as_bytes()[0].is_ascii_alphabetic()
-                && trimmed.as_bytes()[1] == b':';
-            let drive_root;
-            let pat: &str = if is_drive_root {
-                drive_root = format!("{}/", trimmed);
-                &drive_root
+                && matches!(trimmed.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic());
+            let pat: Cow<str> = if is_drive_root {
+                Cow::Owned(format!("{}/", trimmed))
             } else {
-                trimmed
+                Cow::Borrowed(trimmed)
             };
             if pat.is_empty() {
                 continue;
             }
-            if pat.is_ascii() && is_literal_name(pat) {
+            if pat.is_ascii() && is_literal_name(&pat) {
                 literal_components.insert(if crate::platform::PATHS_ARE_CASE_INSENSITIVE {
                     pat.to_ascii_lowercase()
                 } else {
@@ -63,7 +60,7 @@ impl IgnoreSet {
                 });
                 continue;
             }
-            let glob = globset::GlobBuilder::new(pat)
+            let glob = globset::GlobBuilder::new(&pat)
                 .literal_separator(false)
                 // Match the filesystem's own rules, or `node_modules` fails
                 // to exclude `Node_Modules`.
@@ -128,35 +125,21 @@ impl IgnoreSet {
     /// ancestors* are tested, so a pattern matching a directory ignores
     /// everything beneath it.
     pub fn matches_path_pattern(&self, path: &Path) -> bool {
-        if self.path.is_empty() {
-            return false;
-        }
-        let mut cur = Some(path);
-        while let Some(p) = cur {
-            if self.path.is_match(p) {
-                return true;
-            }
-            cur = p.parent();
-        }
-        false
+        !self.path.is_empty() && path.ancestors().any(|p| self.path.is_match(p))
     }
 
-    /// Match a full path — for watcher events, where walk-time pruning never
+    /// Match a full path: for watcher events, where walk-time pruning never
     /// saw it.
     pub fn matches_path(&self, path: &Path) -> bool {
         if self.empty {
             return false;
         }
-        if self.matches_path_pattern(path) {
-            return true;
-        }
-        path.components().any(|c| match c {
-            // Through `matches_component`, or the literal patterns would be
-            // invisible here and the watcher would index what the walker
-            // prunes.
-            std::path::Component::Normal(name) => self.matches_component(&name.to_string_lossy()),
-            _ => false,
-        })
+        // Through `matches_component`, or the literal patterns would be
+        // invisible here and the watcher would index what the walker prunes.
+        self.matches_path_pattern(path)
+            || path.components().any(|c| {
+                matches!(c, Component::Normal(n) if self.matches_component(&n.to_string_lossy()))
+            })
     }
 
     pub fn is_empty(&self) -> bool {

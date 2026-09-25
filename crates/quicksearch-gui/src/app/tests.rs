@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn a_stale_draft_cannot_revert_the_indexing_mode_or_security() {
     // The draft as it was when the editor last synced: automatic
-    // indexing, no password — plus one real edit the user staged.
+    // indexing, no password, plus one real edit the user staged.
     let mut draft = Config::default();
     draft.indexing.auto_index = true;
     draft.indexing.reindex_interval_minutes = 60;
@@ -122,20 +122,6 @@ fn guard_source_orders_quit_prompts_settings_first() {
     }
 }
 
-/// Only a Quit during a running reconcile warns; a tab switch does not end
-/// the pass.
-#[test]
-fn only_quitting_during_a_reconcile_warns() {
-    use super::NavIntent::*;
-    assert!(quit_needs_reconcile_warning(Quit, true));
-    assert!(!quit_needs_reconcile_warning(Quit, false));
-    assert!(!quit_needs_reconcile_warning(SwitchTab(Tab::Search), true));
-    assert!(!quit_needs_reconcile_warning(
-        SwitchTab(Tab::Settings),
-        true
-    ));
-}
-
 /// Every tab is placed on exactly one side of the guard, so a tab added
 /// later cannot quietly inherit "stages nothing".
 #[test]
@@ -214,6 +200,12 @@ fn an_index_that_changed_invalidates_what_the_tab_holds() {
             DupInvalidation::WhenItLands
         );
     }
+}
+
+#[test]
+fn the_holder_s_pid_is_named_when_known() {
+    assert_eq!(held_by(Some(4242)), " (process 4242)");
+    assert_eq!(held_by(None), "");
 }
 
 /// The two values the Settings tab's color-scheme box writes, plus

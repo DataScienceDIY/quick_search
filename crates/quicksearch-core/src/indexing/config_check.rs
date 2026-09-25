@@ -13,7 +13,7 @@ use crate::extract::Registry;
 use super::*;
 
 impl IndexingService {
-    /// One list drives [`validate_config`], [`update_config`] and
+    /// One list drives [`Self::validate_config`], [`Self::update_config`] and
     /// [`crate::scope::stored_config`], so record, comparison and
     /// reconstruction cannot drift; `stored_config` parses these back.
     fn config_validation_entries(config: &Config, roots: &[String]) -> Vec<(&'static str, String)> {
@@ -62,11 +62,13 @@ impl IndexingService {
 
     /// Settings a difference in which cannot be reconciled: the FTS tokenizer
     /// is part of the table definition, and hashes under a different length or
-    /// algorithm cannot be compared. Everything else — see [`crate::scope`].
+    /// algorithm cannot be compared. Everything else reconciles; see
+    /// [`crate::scope`].
     const REBUILD_KEYS: [&'static str; 3] = ["hash_length", "hash_algorithm", "tokenize"];
 
-    /// The unreconcilable settings that no longer match — what a rebuild prompt
-    /// shows; `None` when none. A key absent (older index) never counts as changed.
+    /// The unreconcilable settings that no longer match, which a rebuild
+    /// prompt shows; `None` when none. A key absent (older index) never counts
+    /// as changed.
     pub(super) fn validate_config(
         conn: &Connection,
         config: &Config,
@@ -95,17 +97,13 @@ impl IndexingService {
                 }
             }
         }
-        Ok(if changes.is_empty() {
-            None
-        } else {
-            Some(changes)
-        })
+        Ok((!changes.is_empty()).then_some(changes))
     }
 
     /// Bring the index into line with `config` before a run walks anything.
     /// Runs in slices, so the stop flag is read between statements and
-    /// `interrupt` reaches the one in flight. Returns `false` if cut short —
-    /// nothing may then be recorded as reconciled.
+    /// `interrupt` reaches the one in flight. Returns `false` if cut short,
+    /// when nothing may be recorded as reconciled.
     pub(super) fn reconcile_stored_config(
         status: &Arc<Mutex<IndexingStatus>>,
         interrupt: &db::InterruptSlot,
@@ -128,14 +126,17 @@ impl IndexingService {
         );
         let registry = Registry::default_set();
         let mut cursor = crate::scope::WorkCursor::new(work, &current)?;
+        let interrupted = |cursor: &crate::scope::WorkCursor| {
+            crate::log_info!(
+                "configuration reconcile interrupted after {} index entries; \
+                 the next run starts it again",
+                cursor.progress().examined
+            );
+            false
+        };
         while !cursor.done() {
             if stop_flag.load(Ordering::Relaxed) {
-                crate::log_info!(
-                    "configuration reconcile interrupted after {} index entries; \
-                     the next run starts it again",
-                    cursor.progress().examined
-                );
-                return Ok(false);
+                return Ok(interrupted(&cursor));
             }
             let outcome = {
                 // Armed per slice, so the handle names only this scan's statement.
@@ -152,12 +153,7 @@ impl IndexingService {
             if let Err(e) = outcome {
                 // An interrupted statement fails like any other; ask the flag, not the message.
                 if stop_flag.load(Ordering::Relaxed) {
-                    crate::log_info!(
-                        "configuration reconcile interrupted after {} index entries; \
-                         the next run starts it again",
-                        cursor.progress().examined
-                    );
-                    return Ok(false);
+                    return Ok(interrupted(&cursor));
                 }
                 return Err(e);
             }

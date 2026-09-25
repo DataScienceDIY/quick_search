@@ -78,13 +78,14 @@ chardetng = "1.0"
 rtf-parser = { version = "0.4", default-features = false }
 # `lopdf` is deliberately NOT declared here. `pdf-extract` re-exports it
 # (`pub use lopdf::*`), and `extract/pdf.rs` reaches it that way. Naming it
-# directly resolves a *second*, older copy alongside pdf-extract's — which is
-# what used to make every PDF parse twice, and what pulled in rayon (whose
-# global thread pool is never torn down), chrono, time, md5 and a second nom.
+# directly resolves a *second*, older copy alongside pdf-extract's, which
+# parses every PDF twice and pulls in rayon (whose global thread pool is never
+# torn down), chrono, time, md5 and a second nom.
 pdf-extract = "0.12"
 lofty = "0.19"
 notify = "6.1"
-ctrlc = "3.4"
+# `termination` adds SIGTERM (and SIGHUP, which `shutdown` hands back) to SIGINT on Unix.
+ctrlc = { version = "3.4", features = ["termination"] }
 zstd = "0.13"
 globset = "0.4"
 regex = "1"
@@ -178,8 +179,8 @@ harness = false
 
 # Plain-main measurement probes, env-gated (QSB_SEARCH_PERF / QSB_SEARCH_ALLOC
 # / QSB_INDEX_ALLOC) so a bare `cargo bench` doesn't pay their seed cost.
-# snippet_perf, which compared the pre-schema-v3 FTS shape against v3, is
-# gone: the question is decided (v3 won on every axis) — don't re-measure it.
+# Schema v3's FTS shape beat the earlier one on every axis measured; that
+# comparison is settled and has no bench.
 [[bench]]
 name = "search_perf"
 harness = false

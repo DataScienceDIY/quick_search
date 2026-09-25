@@ -15,8 +15,8 @@ pub fn zstd_of(text: &str) -> Option<Vec<u8>> {
 /// Old enough that a failure investigated the next morning has its tree.
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
-/// Whether `name` is one of [`scratch_dir`]'s own directories. Matched on the
-/// *shape* — `quicksearch-{tag}-{pid}-{seq}` — not the prefix alone:
+/// Whether `name` is one of [`scratch_dir`]'s own directories, matched on the
+/// shape `quicksearch-{tag}-{pid}-{seq}` rather than the prefix alone:
 /// `packaging/capture.sh` keeps its output in `quicksearch-capture` in the
 /// same directory, and a prefix match would eat a capture run's screenshots.
 fn is_scratch_name(name: &str) -> bool {
@@ -32,7 +32,7 @@ fn is_scratch_name(name: &str) -> bool {
 }
 
 /// Remove scratch directories left by runs that are long over. Sweeping on
-/// the way *in* keeps this run's evidence and yesterday's while nothing
+/// the way in keeps this run's evidence and yesterday's while nothing
 /// accumulates without bound.
 fn sweep_stale() {
     let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
@@ -57,8 +57,9 @@ fn sweep_stale() {
 }
 
 /// A fresh, empty directory under the system temp dir, named for `tag`.
-/// Never cleaned up: a failing test's tree is most of the evidence. Long-dead
-/// runs' trees are swept once per process instead — see [`sweep_stale`].
+/// Never cleaned up, because a failing test's tree is most of the evidence;
+/// long-dead runs' trees are swept once per process instead (see
+/// [`sweep_stale`]).
 #[doc(hidden)]
 pub fn scratch_dir(tag: &str) -> PathBuf {
     static SWEPT: std::sync::Once = std::sync::Once::new();
@@ -92,10 +93,10 @@ pub fn touch(path: &std::path::Path, body: &[u8]) {
 }
 
 /// A filename that is legal on disk but cannot round-trip through the index:
-/// `to_string_lossy` yields exactly `{stem}\u{FFFD}{suffix}` — itself a name
-/// a *different* file can really have, the collision the walk and watcher
+/// `to_string_lossy` yields exactly `{stem}\u{FFFD}{suffix}`, itself a name a
+/// different file can really have. That is the collision the walk and watcher
 /// screens prevent; pair with [`lossy_twin`] to reproduce it. Some
-/// filesystems (FAT, exFAT) refuse the name — tests must tolerate that.
+/// filesystems (FAT, exFAT) refuse the name, and tests must tolerate that.
 #[doc(hidden)]
 pub fn unrepresentable_name(stem: &str, suffix: &str) -> std::ffi::OsString {
     #[cfg(unix)]
@@ -117,8 +118,8 @@ pub fn unrepresentable_name(stem: &str, suffix: &str) -> std::ffi::OsString {
     }
 }
 
-/// The genuinely-representable name [`unrepresentable_name`] collapses to
-/// under `to_string_lossy`.
+/// The representable name [`unrepresentable_name`] collapses to under
+/// `to_string_lossy`.
 #[doc(hidden)]
 pub fn lossy_twin(stem: &str, suffix: &str) -> String {
     format!("{}\u{FFFD}{}", stem, suffix)
@@ -127,12 +128,9 @@ pub fn lossy_twin(stem: &str, suffix: &str) -> String {
 /// Power-of-two bucket, so memory-map sizes group by what allocated them.
 #[doc(hidden)]
 pub fn size_class(bytes: u64) -> String {
-    let mib = bytes as f64 / (1024.0 * 1024.0);
-    if mib < 1.0 {
-        "< 1 MiB".to_string()
-    } else {
-        let bucket = 1u64 << (63 - (bytes / (1024 * 1024)).leading_zeros() as u64);
-        format!("~{} MiB", bucket)
+    match bytes / (1024 * 1024) {
+        0 => "< 1 MiB".to_string(),
+        whole => format!("~{} MiB", 1u64 << whole.ilog2()),
     }
 }
 
@@ -141,14 +139,19 @@ pub fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
-/// A scratch directory that removes itself on drop — **unless the thread is
-/// panicking**, keeping [`scratch_dir`]'s policy that a failing test's tree
-/// is the evidence.
+/// A scratch directory that removes itself on drop, unless the thread is
+/// panicking: [`scratch_dir`]'s policy that a failing test's tree is the
+/// evidence still holds.
 pub struct Scratch(PathBuf);
 
 impl Scratch {
     pub fn dir(tag: &str) -> Scratch {
         Scratch(scratch_dir(tag))
+    }
+
+    /// [`Scratch::dir`], canonicalized; see [`scratch_dir_canonical`].
+    pub fn canonical(tag: &str) -> Scratch {
+        Scratch(scratch_dir_canonical(tag))
     }
 
     /// A scratch database path; the guard owns the directory, so SQLite's
@@ -185,7 +188,7 @@ impl Drop for Scratch {
 // Seeded synthetic corpora, shared by tests/, benches/ and examples/.
 // ---------------------------------------------------------------------------
 
-/// Deterministic word picker — a fixed seed makes two runs comparable.
+/// Deterministic word picker: a fixed seed makes two runs comparable.
 pub struct Lcg(pub u64);
 
 impl Lcg {
@@ -215,16 +218,16 @@ pub fn scratch_db(tag: &str) -> PathBuf {
 /// `fuzzy_max_edits = 2` pigeonhole split into three-char chunks becomes legal.
 pub const NEEDLE: &str = "quartzite";
 
-/// A term planted only in document *bodies*, never in a file name — forces
-/// the full-text pass to do real work: the filename `LIKE` finds nothing, and
-/// every trigram candidate has to be decompressed and verified.
+/// A term planted only in document bodies, never in a file name, so the
+/// full-text pass does real work: the filename `LIKE` finds nothing, and every
+/// trigram candidate is decompressed and verified.
 pub const BODY_TERM: &str = "chalcedony";
 
-/// Filler vocabulary for seeded indexes. **Deliberately shares no trigram
-/// with [`NEEDLE`]**: with a vocabulary that merely resembled the needle,
-/// every query would fill the display limit in the first few hundred rows,
-/// the cascade would break out of pass A, and passes B–D would never run —
-/// while the harness looked perfectly healthy.
+/// Filler vocabulary for seeded indexes. It shares no trigram with
+/// [`NEEDLE`]: with a vocabulary that merely resembled the needle, every query
+/// would fill the display limit in the first few hundred rows, the cascade
+/// would stop after pass A, and passes B–D would never run while the harness
+/// looked healthy.
 pub const WORDS: &[&str] = &[
     "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
     "lambda", "brown", "fox", "jumps", "lazy", "index", "search", "cascade", "snippet", "document",
@@ -242,14 +245,13 @@ pub struct SeedSpec {
     pub body_words: usize,
     /// Directories to spread the rows across.
     pub dirs: usize,
-    /// Path segments in each stored `parent`. `1` is `/seed/NNN/` — short, and
-    /// what the search harnesses have always used. A real tree is nested, and
-    /// `parent` is stored per row, so this is most of what decides the width
-    /// of a `files` row and therefore how much cache a scan of it needs. Raise
-    /// it when calibrating anything against real-world row size.
+    /// Path segments in each stored `parent`. `1` is the short `/seed/NNN/`
+    /// the search harnesses use. `parent` is stored per row, so this mostly
+    /// decides the width of a `files` row and how much cache a scan of it
+    /// needs; raise it when calibrating against real-world row size.
     pub dir_depth: usize,
-    /// File names carrying [`NEEDLE`]. Kept far below any sane display limit
-    /// — an early-exiting query measures how fast the cascade gives up.
+    /// File names carrying [`NEEDLE`]. Kept far below any sane display limit:
+    /// an early-exiting query measures how fast the cascade gives up.
     pub needle_names: usize,
     /// Document bodies carrying [`NEEDLE`], on top of the names.
     pub needle_docs: usize,
@@ -258,57 +260,51 @@ pub struct SeedSpec {
     pub body_term_docs: usize,
     /// One row in every `dup_every` repeats its predecessor's content hash,
     /// giving [`crate::search::find_duplicate_groups`] real groups to rank.
-    /// `0` leaves every hash NULL — the shape the search harnesses seed, and
-    /// the one whose row width their numbers were taken against.
+    /// `0` leaves every hash NULL, the shape the search harnesses seed and
+    /// measured their row width against.
     pub dup_every: usize,
     /// Commit every N files instead of wrapping the whole seed in one
     /// transaction (`0`). Each commit flushes FTS5's in-memory hash to its own
-    /// segment, so this is what gives a later `merge` real work — the shape a
-    /// production run has, where the writer commits in slices. Harnesses that
-    /// only want rows as fast as possible leave it at `0`.
+    /// segment, which gives a later `merge` real work, as in a production run
+    /// whose writer commits in slices. Harnesses that only want rows fast
+    /// leave it at `0`.
     pub commit_every: usize,
     /// Build the index at this database page size instead of
     /// [`crate::db::schema::PAGE_SIZE`]. Installed as a process-global
-    /// override for the whole seed *and left installed*, because a keyed file
-    /// cannot be reopened without it — see
-    /// [`crate::db::set_page_size_override`].
+    /// override for the whole seed and left installed, because a keyed file
+    /// cannot be reopened without it (see
+    /// [`crate::db::set_page_size_override`]).
     pub page_size: Option<i64>,
-    /// Override FTS5's `pgsz` before a single row is written. `None` keeps
-    /// whatever the schema chose for this key state, which is what every
-    /// harness measuring the *product* wants. It exists so a benchmark can
-    /// pin FTS5's default 4050 on a keyed index and price
-    /// [`crate::db::schema::fts_pgsz_for`] against it in one process on
-    /// one corpus.
+    /// Override FTS5's `pgsz` before a single row is written. `None` keeps the
+    /// schema's choice for this key state, as a harness measuring the product
+    /// wants; `Some` lets a benchmark pin FTS5's default 4050 and price
+    /// [`crate::db::schema::fts_pgsz_for`] against it on one corpus.
     pub pgsz: Option<i64>,
     /// Build the index under this per-page authenticator instead of
-    /// [`crate::db::schema::HMAC_MODE`]. A process-global override for the
-    /// same reason `page_size` is one — it sets the page reserve, so a keyed
-    /// file cannot be reopened without it. Ignored on a plain arm, which has
-    /// no reserve.
+    /// [`crate::db::schema::HMAC_MODE`]. A process-global override like
+    /// `page_size`: it sets the page reserve, so a keyed file cannot be
+    /// reopened without it. Ignored on a plain arm, which has no reserve.
     pub hmac: Option<crate::db::schema::HmacMode>,
     /// `(extension, mime)` pairs cycled across the rows, deciding what a
-    /// `content_extensions` filter can select. [`EXT_PLAIN`] — one pair, so
-    /// every row is `.txt`/`text/plain` — is what every harness measuring
-    /// search or indexing wants, and it is the default so their corpora are
-    /// byte-identical to what they have always been.
+    /// `content_extensions` filter can select. The default, [`EXT_PLAIN`],
+    /// makes every row `.txt`/`text/plain`, as the search and indexing
+    /// harnesses want.
     ///
-    /// It exists for `contentprobe`, where a filter that either takes the
-    /// whole index or none of it answers nothing. **A mix whose length shares
-    /// a factor with `content_every` puts every document behind the same few
-    /// extensions** — the degenerate-corpus trap `pruneprobe` documents
-    /// against its own strides — so a harness using this should assert the
-    /// fractions it ends up with rather than trusting the arithmetic.
+    /// For `contentprobe`, where a filter taking all of the index or none of
+    /// it answers nothing. A mix whose length shares a factor with
+    /// `content_every` puts every document behind the same few extensions
+    /// (the degenerate-corpus trap `pruneprobe` documents against its own
+    /// strides), so a harness using it should assert the fractions it gets.
     pub ext_mix: &'static [(&'static str, &'static str)],
-    /// One row in every `pending_every` that *would* hold content is left in
-    /// the pending queue instead — born `STATE_PENDING` and never extracted,
-    /// which is the residue an interrupted content pass leaves behind. `0`
-    /// (the default) seeds none.
+    /// One row in every `pending_every` that would hold content is left
+    /// pending instead: born `STATE_PENDING` and never extracted, the residue
+    /// of an interrupted content pass. `0` (the default) seeds none.
     ///
-    /// It exists because such a row is the case a re-decision can skip the
-    /// most work on: it is neither `STATE_NA` (so a narrowed filter must still
-    /// flip it) nor `STATE_DONE` (so it has no posting and no stored text to
-    /// clear). A corpus without any cannot tell whether clearing content for
-    /// rows that cannot hold it costs anything.
+    /// Such a row is where a re-decision can skip the most work: it is
+    /// neither `STATE_NA` (a narrowed filter must still flip it) nor
+    /// `STATE_DONE` (it has no posting or stored text to clear). Without any,
+    /// a corpus cannot show whether clearing rows that hold no content costs
+    /// anything.
     pub pending_every: usize,
 }
 
@@ -320,8 +316,8 @@ impl Default for SeedSpec {
         SeedSpec {
             files: 50_000,
             content_every: 10,
-            // ~2 KB per document: a corpus of tiny documents makes the fuzzy
-            // full-text pass look free when it is the cascade's most expensive.
+            // ~2 KB per document: tiny documents would make the fuzzy
+            // full-text pass, the cascade's most expensive, look free.
             body_words: 300,
             dirs: 500,
             dir_depth: 1,
@@ -345,8 +341,8 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
     use crate::db::repo::{insert_file, set_content_done, NewFile};
     use crate::mime::mime_to_type;
 
-    // Before the open, not after: the profile decides how the file is
-    // *created*, and on a keyed file it decides whether it can be read at all.
+    // Before the open: the profile decides how the file is created, and on a
+    // keyed file whether it can be read at all.
     if let Some(page_size) = spec.page_size {
         crate::db::set_page_size_override(page_size);
     }
@@ -369,28 +365,26 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
     } else {
         spec.ext_mix
     };
-    // A row gets content only if an extractor would have claimed its MIME, so
-    // the seeded `content_state` is what a real run under an *unfiltered*
-    // config would have left. Without this a corpus of mixed extensions is
-    // born disagreeing with its own configuration, and the first reconcile
-    // against it spends its time repairing the seed rather than applying the
-    // edit. `EXT_PLAIN` is claimed by the plaintext extractor, so the
-    // single-extension corpus every other harness seeds is unchanged.
+    // A row gets content only if an extractor would claim its MIME, so the
+    // seeded `content_state` is what a real run under an unfiltered config
+    // leaves. Otherwise a mixed corpus would disagree with its own
+    // configuration, and the first reconcile would spend its time repairing
+    // the seed rather than applying the edit.
     let registry = crate::extract::Registry::default_set();
     // Spacing, not a random draw: a cluster at the front would let a pass
     // stop early and report a fraction of the work a real rare query costs.
     let name_stride = spec.files / spec.needle_names.max(1);
     let doc_stride = spec.files / spec.needle_docs.max(1);
     let body_stride = spec.files / spec.body_term_docs.max(1);
-    // `unchecked_transaction` borrows the connection shared, which is what
-    // lets `commit_every` end one and start the next inside the loop.
+    // `unchecked_transaction` borrows the connection shared, so
+    // `commit_every` can end one and start the next inside the loop.
     let mut tx = conn.unchecked_transaction().unwrap();
     for i in 0..spec.files {
         let w1 = rng.pick(WORDS);
         let w2 = rng.pick(WORDS);
-        // Extension and MIME move together: a row whose name says `.pdf` and
-        // whose MIME says `text/plain` would let `content_extractable`'s two
-        // halves disagree, which is exactly what a content filter is testing.
+        // Extension and MIME move together: a row named `.pdf` with MIME
+        // `text/plain` would let `content_extractable`'s two halves disagree,
+        // and a content filter tests exactly that agreement.
         let (ext, mime) = ext_mix[i % ext_mix.len()];
         let name = if spec.needle_names > 0 && i % name_stride.max(1) == 0 {
             format!("{}-{}-{:07}.{}", w1, NEEDLE, i, ext)
@@ -408,23 +402,20 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
         }
         dir.push('/');
         // Every `dup_every`-th row takes the hash of the one before it, so the
-        // groups are pairs of equal-sized rows — the shape `find_duplicate_groups`
-        // prices, since a hash covers the size.
+        // groups are pairs of equal-sized rows, the shape
+        // `find_duplicate_groups` prices, since a hash covers the size.
         let hash = (spec.dup_every > 0).then(|| {
             let group = if i % spec.dup_every == spec.dup_every - 1 {
                 i.saturating_sub(1)
             } else {
                 i
             };
-            let mut bytes = [0u8; 32];
-            for (b, slot) in bytes.iter_mut().enumerate() {
-                *slot = ((group as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (b % 8 * 8)) as u8;
-            }
-            bytes
+            std::array::from_fn::<u8, 32, _>(|b| {
+                ((group as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (b % 8 * 8)) as u8
+            })
         });
-        // `needs_content` is what the row is *born* as — `insert_file` gives it
-        // `STATE_PENDING`. Skipping the `set_content_done` below is therefore
-        // all it takes to leave one behind in the queue.
+        // `needs_content` rows are born `STATE_PENDING`, so skipping the
+        // `set_content_done` below leaves one in the queue.
         let needs_content = i % spec.content_every.max(1) == 0 && registry.supports(mime);
         let extracted = needs_content && (spec.pending_every == 0 || i % spec.pending_every != 0);
         let id = insert_file(
@@ -464,25 +455,68 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
 }
 
-/// A raw 32-byte key for the measurement harnesses, deliberately **not** an
-/// Argon2id derivation: the KDF costs half a second in release and minutes in
-/// debug, and proves nothing about page work. It reaches SQLCipher as raw hex
-/// either way (see `db::open::key_and_probe`), so a keyed arm measures what a
-/// real unlocked index does.
-pub const MEASUREMENT_KEY_HEX: &str =
+/// A raw 32-byte key for the measurement harnesses. Not an Argon2id
+/// derivation: the KDF costs half a second in release and minutes in debug,
+/// and proves nothing about page work. Both forms reach SQLCipher as raw hex
+/// (see `db::open::key_and_probe`), so a keyed arm measures a real unlocked
+/// index.
+const MEASUREMENT_KEY_HEX: &str =
     "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 
 pub fn measurement_key() -> crate::security::IndexKey {
     crate::security::IndexKey::from_hex(MEASUREMENT_KEY_HEX).expect("a 64-hex-digit key")
 }
 
+/// Run one cascade query to completion on `conn`; returns the time the
+/// cascade took (the split is not timed) and how many hits it streamed.
+pub fn run_cascade(
+    conn: &rusqlite::Connection,
+    query: &str,
+    options: &crate::search::SearchOptions,
+) -> (std::time::Duration, usize) {
+    let split = crate::query::split_for_cascade(query).expect("query parses");
+    let latest = std::sync::atomic::AtomicU64::new(1);
+    let mut hits = 0usize;
+    let mut sink = |batch: Vec<crate::search::SearchHit>| hits += batch.len();
+    let start = std::time::Instant::now();
+    crate::search::cascade::run(conn, &split, options, 1, &latest, &mut sink)
+        .expect("cascade runs");
+    (start.elapsed(), hits)
+}
+
+/// The MIME the walk would record for `path`, sniffed from its first
+/// `hash_length` bytes.
+pub fn sniff(path: &std::path::Path, hash_length: usize) -> Option<&'static str> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = vec![0u8; hash_length];
+    let n = f.read(&mut head).ok()?;
+    head.truncate(n);
+    crate::mime::guess_mime_from_head(path, &head)
+}
+
+/// `(leaf, overflow)` pages in `searchabletext_data`, from `dbstat`. An
+/// overflow page is a second fetch and decrypt on every read of its leaf;
+/// [`crate::db::schema::fts_pgsz_for`] keeps the count at zero.
+pub fn fts_page_counts(conn: &rusqlite::Connection) -> (i64, i64) {
+    let count = |pagetype: &str| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM dbstat \
+             WHERE name = 'searchabletext_data' AND pagetype = ?1",
+            [pagetype],
+            |r| r.get(0),
+        )
+        .expect("dbstat")
+    };
+    (count("leaf"), count("overflow"))
+}
+
 /// `(hits, misses)` in this connection's page cache since it was opened.
 ///
-/// A *miss* is the unit that costs money on a keyed index: the page has to be
-/// read and AES-CBC decrypted before a single row can be read out of it, where
-/// a hit is a pointer into memory SQLite already holds. So
-/// counting misses per query shape attributes cost to the table that caused
-/// it, which timing alone cannot do.
+/// A miss costs money on a keyed index: the page is read and AES-CBC
+/// decrypted before a row can come out of it, where a hit is a pointer into
+/// memory. Counting misses per query shape attributes cost to the table that
+/// caused it, which timing alone cannot do.
 ///
 /// `sqlite3_db_status` has no safe wrapper in rusqlite; the raw binding and
 /// `Connection::handle` are both public, and neither the pointer nor the
@@ -511,15 +545,13 @@ pub fn cache_stats(conn: &rusqlite::Connection) -> (i64, i64) {
     (hits.0 as i64, misses.0 as i64)
 }
 
-/// FTS5's own default page size, which a keyed index used to inherit. Pinned
-/// explicitly on the "before" arms of [`seed_arms`] so the cost of that
-/// inheritance is priced in the same run as the fix, not remembered from
-/// another one.
-pub use crate::db::schema::FTS5_DEFAULT_PGSZ;
+/// FTS5's own default `pgsz`, pinned on the `_4050` arms of [`seed_arms`] so
+/// its cost is priced in the same run as the derived value.
+use crate::db::schema::FTS5_DEFAULT_PGSZ;
 
 /// Indices into [`seed_arms`]'s fixed order. The two `_4050` arms exist only
-/// to price [`crate::db::schema::FTS_PGSZ_ENCRYPTED`] against what came
-/// before; the other two are the shipped product.
+/// to price [`crate::db::schema::fts_pgsz_for`] against FTS5's default; the
+/// other two are the shipped product.
 pub const ARM_PLAIN_4050: usize = 0;
 pub const ARM_PLAIN: usize = 1;
 pub const ARM_KEYED_4050: usize = 2;
@@ -544,14 +576,13 @@ const ARM_SHAPES: [(&str, bool, Option<i64>, &str); 4] = [
 ];
 
 /// One seeded index in a plain-vs-keyed comparison: `tests/encrypted_perf.rs`
-/// gates four of them on size, `benches/page_geometry.rs` sweeps page sizes
-/// across them. Defined here, once, so the harnesses report on the same shape.
+/// gates four of them on size, and `benches/page_geometry.rs` sweeps page
+/// sizes across them. Defined once so the harnesses report on the same shape.
 pub struct Arm {
     pub what: String,
     pub keyed: bool,
-    /// `None` takes whatever the schema chose for this key state — the
-    /// shipped behaviour. `Some` pins a value, only ever used to reproduce
-    /// the old geometry.
+    /// `None` takes the schema's choice for this key state, as shipped. `Some`
+    /// pins a value, to price FTS5's default against it.
     pub pgsz: Option<i64>,
     /// The database page size this arm was built at, and the one every open
     /// of it must re-install: a keyed file's header is ciphertext, so it
@@ -563,8 +594,8 @@ pub struct Arm {
     pub hmac: Option<crate::db::schema::HmacMode>,
     pub path: PathBuf,
     /// How long seeding spent writing it: the database-write half of indexing
-    /// (rows, zstd bodies, FTS postings), which is the half a page geometry
-    /// can change. The walk and the extractors are not in it.
+    /// (rows, zstd bodies, FTS postings), the half a page geometry can change.
+    /// The walk and the extractors are not in it.
     pub seeded_in: std::time::Duration,
 }
 
@@ -592,10 +623,10 @@ impl Arm {
         }
     }
 
-    /// Run `f` with this arm's key *and profile* installed process-wide, then
-    /// restore the shipped ones. Every open has to be wrapped: all three are
+    /// Run `f` with this arm's key and profile installed process-wide, then
+    /// restore the shipped ones. Every open must be wrapped: all three are
     /// process-globals, and an index seeded under them and opened without them
-    /// fails as a wrong-password error rather than quietly.
+    /// fails as a wrong password.
     pub fn with_key<T>(&self, f: impl FnOnce() -> T) -> T {
         crate::db::set_process_key(self.keyed.then(measurement_key));
         crate::db::set_page_size_override(self.page_size.unwrap_or(crate::db::schema::PAGE_SIZE));
@@ -626,9 +657,9 @@ impl Arm {
         std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
     }
 
-    /// Bytes `dbstat` attributes to one table. The number to compare a cache
-    /// ceiling against: `files` is what every keystroke rescans, so whether it
-    /// fits is what decides if a typing session stays warm.
+    /// Bytes `dbstat` attributes to one table: the number to compare a cache
+    /// ceiling against. Every keystroke rescans `files`, so whether it fits
+    /// decides if a typing session stays warm.
     pub fn table_bytes(&self, table: &str) -> u64 {
         let conn = self.open_search();
         conn.query_row(
@@ -639,33 +670,17 @@ impl Arm {
         .unwrap_or(0) as u64
     }
 
-    /// `(leaf, overflow)` pages in `searchabletext_data`. The overflow count
-    /// is the whole diagnosis: SQLCipher's page reserve drops the inline
-    /// payload limit below what a leaf built for another profile assumes, and
-    /// each miss costs a second page — a second fetch and decrypt on every
-    /// read of it. See `db::schema::fts_pgsz_for`, which is what keeps the
-    /// count at zero.
+    /// [`fts_page_counts`] for this arm.
     pub fn fts_pages(&self) -> (i64, i64) {
-        let conn = self.open_search();
-        let count = |pagetype: &str| -> i64 {
-            conn.query_row(
-                "SELECT COUNT(*) FROM dbstat \
-                 WHERE name = 'searchabletext_data' AND pagetype = ?1",
-                [pagetype],
-                |r| r.get(0),
-            )
-            .expect("dbstat")
-        };
-        (count("leaf"), count("overflow"))
+        fts_page_counts(&self.open_search())
     }
 }
 
 /// Seed the same corpus four times: plain and keyed, each on FTS5's default
-/// page size and on whatever the schema picks. Identical content and identical
-/// insertion order throughout, so arms differ *only* in those two variables —
-/// which is what lets a display-limited query be compared at all (the cascade
-/// stops when the limit fills, so a different rowid order would decide the
-/// answer rather than the encryption).
+/// `pgsz` and on the schema's. Content and insertion order are identical, so
+/// arms differ only in those two variables; that lets a display-limited query
+/// be compared at all, since the cascade stops when the limit fills and a
+/// different rowid order would decide the answer instead of the encryption.
 ///
 /// `spec.pgsz` is overridden per arm; everything else is the caller's.
 pub fn seed_arms(tag: &str, spec: &SeedSpec) -> Vec<Arm> {
@@ -704,8 +719,8 @@ mod tests {
         assert_eq!(std::fs::read(&deep).unwrap(), b"hi");
     }
 
-    /// The premise every collision test rests on, pinned per platform: if
-    /// this ever stops holding, those tests silently assert nothing.
+    /// The premise every collision test rests on, pinned per platform: if this
+    /// stops holding, those tests assert nothing.
     #[test]
     fn the_unrepresentable_name_collapses_onto_its_twin() {
         let bad = unrepresentable_name("x", ".txt");
@@ -729,7 +744,7 @@ mod tests {
     }
 
     /// The sweep runs against a shared temp directory, so what it matches is
-    /// the whole safety argument.
+    /// its whole safety argument.
     #[test]
     fn only_scratch_directories_are_swept() {
         for ours in [

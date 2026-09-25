@@ -1,8 +1,7 @@
 //! Print what the legacy-Office extractor gets out of a real file.
 //!
-//! The unit tests build their own fixtures, which proves the parsers agree
-//! with the format specs as read. This runs them against files a real
-//! producer wrote, which is the other half of the question.
+//! The unit tests prove the parsers agree with the format specs as read, on
+//! fixtures they build; this runs them against files a real producer wrote.
 //!
 //!     cargo run --example oleprobe -- some.doc some.xls some.ppt
 

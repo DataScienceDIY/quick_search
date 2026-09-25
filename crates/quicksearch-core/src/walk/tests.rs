@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::testutil::Scratch;
+use crate::testutil::{touch, Scratch};
 
 fn tmp_tree(tag: &str) -> Scratch {
     Scratch::dir(tag)
@@ -16,11 +16,6 @@ impl std::ops::Deref for TestDb {
     fn deref(&self) -> &Path {
         &self.path
     }
-}
-
-fn touch(p: &Path) {
-    fs::create_dir_all(p.parent().unwrap()).unwrap();
-    fs::write(p, b"x").unwrap();
 }
 
 fn db_with(tag: &str, rows: &[(String, u64)]) -> TestDb {
@@ -44,6 +39,39 @@ fn empty_db(tag: &str) -> TestDb {
     db_with(tag, &[])
 }
 
+/// A four-worker walk of `roots` against the index at `db`; `stopped` starts
+/// it with the stop flag already set.
+fn start_with(
+    roots: &[&Path],
+    db: &Path,
+    follow_symlinks: bool,
+    include_hidden: bool,
+    ignore: &[&str],
+    stopped: bool,
+) -> ParallelWalk {
+    let roots: Vec<String> = roots
+        .iter()
+        .map(|r| r.to_string_lossy().into_owned())
+        .collect();
+    let ignore: Vec<String> = ignore.iter().map(|p| p.to_string()).collect();
+    walk_indexable_files(
+        &roots,
+        follow_symlinks,
+        include_hidden,
+        IgnoreSet::compile(&ignore).unwrap(),
+        db.to_str().unwrap(),
+        Config::default(),
+        Arc::new(Registry::default_set()),
+        Arc::new(AtomicBool::new(stopped)),
+        4,
+    )
+}
+
+/// A walk of `root` with the default settings.
+fn start(root: &Path, db: &Path) -> ParallelWalk {
+    start_with(&[root], db, false, false, &[], false)
+}
+
 fn walk(root: &Path, db: &Path) -> Vec<WalkedFile> {
     walk_with(root, db, false, false)
 }
@@ -54,34 +82,33 @@ fn walk_with(
     follow_symlinks: bool,
     include_hidden: bool,
 ) -> Vec<WalkedFile> {
-    files_only(walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
+    files_only(start_with(
+        &[root],
+        db,
         follow_symlinks,
         include_hidden,
-        IgnoreSet::compile(&[]).unwrap(),
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
+        &[],
+        false,
     ))
 }
 
-fn files_only(walk: ParallelWalk) -> Vec<WalkedFile> {
-    walk.filter_map(|e| match e {
-        WalkEvent::File(f) => Some(f),
-        WalkEvent::Stale(_) => None,
-    })
-    .collect()
+fn files_only(events: impl Iterator<Item = WalkEvent>) -> Vec<WalkedFile> {
+    events
+        .filter_map(|e| match e {
+            WalkEvent::File(f) => Some(f),
+            WalkEvent::Stale(_) => None,
+        })
+        .collect()
 }
 
-fn stale_only(walk: ParallelWalk) -> Vec<String> {
-    walk.filter_map(|e| match e {
-        WalkEvent::Stale(paths) => Some(paths),
-        WalkEvent::File(_) => None,
-    })
-    .flatten()
-    .collect()
+fn stale_only(events: impl Iterator<Item = WalkEvent>) -> Vec<String> {
+    events
+        .filter_map(|e| match e {
+            WalkEvent::Stale(paths) => Some(paths),
+            WalkEvent::File(_) => None,
+        })
+        .flatten()
+        .collect()
 }
 
 fn names(files: &[WalkedFile]) -> Vec<String> {
@@ -102,10 +129,10 @@ fn names(files: &[WalkedFile]) -> Vec<String> {
 #[test]
 fn walks_a_nested_tree_exactly_once() {
     let root = tmp_tree("nested");
-    touch(&root.join("a.txt"));
-    touch(&root.join("sub/b.txt"));
-    touch(&root.join("sub/deep/c.txt"));
-    touch(&root.join("other/d.txt"));
+    touch(&root.join("a.txt"), b"x");
+    touch(&root.join("sub/b.txt"), b"x");
+    touch(&root.join("sub/deep/c.txt"), b"x");
+    touch(&root.join("other/d.txt"), b"x");
 
     let files = walk(&root, &empty_db("nested"));
     assert_eq!(names(&files), vec!["a.txt", "b.txt", "c.txt", "d.txt"]);
@@ -127,11 +154,11 @@ fn try_mkdir(path: &Path) -> bool {
 
 /// Windows hits this too: `OsString` there is WTF-8 over UTF-16, and
 /// `OsString::from_wide(&[0xD800])` builds an unpaired surrogate that NTFS
-/// stores happily — WSL and Samba trees produce them.
+/// stores happily; WSL and Samba trees produce them.
 #[test]
 fn a_non_utf8_name_is_dropped_at_the_entry() {
     let root = tmp_tree("nonutf8");
-    touch(&root.join("plain.txt"));
+    touch(&root.join("plain.txt"), b"x");
     let bad = root.join(crate::testutil::unrepresentable_name("DRH257", "~X.MP4"));
     if !try_touch(&bad) {
         eprintln!("skipped: this filesystem will not store an unrepresentable name");
@@ -155,8 +182,8 @@ fn a_non_utf8_name_is_dropped_at_the_entry() {
 fn dropping_a_bad_entry_deletes_nothing() {
     let root = tmp_tree("nonutf8-stale");
     let twin = crate::testutil::lossy_twin("DRH257", "~X.MP4");
-    touch(&root.join("plain.txt"));
-    touch(&root.join(&twin));
+    touch(&root.join("plain.txt"), b"x");
+    touch(&root.join(&twin), b"x");
     let bad = root.join(crate::testutil::unrepresentable_name("DRH257", "~X.MP4"));
     if !try_touch(&bad) {
         eprintln!("skipped: this filesystem will not store an unrepresentable name");
@@ -170,17 +197,7 @@ fn dropping_a_bad_entry_deletes_nothing() {
             (path_to_db_string(&root.join(&twin)), 0),
         ],
     );
-    let stale = stale_only(walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        false,
-        IgnoreSet::compile(&[]).unwrap(),
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    ));
+    let stale = stale_only(start(&root, &db));
 
     assert!(
         stale.is_empty(),
@@ -201,24 +218,14 @@ fn a_root_that_resolves_onto_an_unrepresentable_name_is_not_walked() {
         eprintln!("skipped: this filesystem will not store an unrepresentable name");
         return;
     }
-    touch(&real.join("inside.txt"));
+    touch(&real.join("inside.txt"), b"x");
 
     let link = base.join("docs");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let root = link.to_str().expect("the configured root is spellable");
 
     let db = empty_db("nonutf8-root");
-    let mut walk = walk_indexable_files(
-        &[root.to_string()],
-        false,
-        false,
-        IgnoreSet::compile(&[]).unwrap(),
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    );
+    let mut walk = start(Path::new(root), &db);
     let events: Vec<WalkEvent> = walk.by_ref().collect();
     assert!(
         events.is_empty(),
@@ -232,13 +239,13 @@ fn a_root_that_resolves_onto_an_unrepresentable_name_is_not_walked() {
 }
 
 /// A `WalkedFile`'s path is the key its row is written under, so a bad name
-/// yielded under its lossy spelling would claim the twin's row: whichever of
-/// the two files the walk reached second fell out of the index.
+/// yielded under its lossy spelling would claim the twin's row, and whichever
+/// of the two files the walk reached second would fall out of the index.
 #[test]
 fn a_bad_name_cannot_stand_in_for_its_lossy_twin() {
     let root = tmp_tree("nonutf8-twin");
     let twin = crate::testutil::lossy_twin("x", ".txt");
-    touch(&root.join(&twin));
+    touch(&root.join(&twin), b"x");
     let bad = root.join(crate::testutil::unrepresentable_name("x", ".txt"));
     if !try_touch(&bad) {
         eprintln!("skipped: this filesystem will not store an unrepresentable name");
@@ -260,39 +267,29 @@ fn a_bad_name_cannot_stand_in_for_its_lossy_twin() {
     );
 }
 
-/// The row prefetcher keys on the directory's lossy parent string, so a bad
-/// directory beside a real one with the colliding name was handed the real
-/// one's rows — and then reported every one of them stale.
+/// The row prefetcher keys on the directory's parent string, so a bad
+/// directory beside a real one with the colliding lossy name would be handed
+/// the real one's rows and report every one of them stale.
 #[test]
 fn a_bad_directory_is_pruned_with_its_whole_subtree() {
     let root = tmp_tree("nonutf8-dir");
     let twin = crate::testutil::lossy_twin("dir", "");
-    touch(&root.join(&twin).join("a.txt"));
+    touch(&root.join(&twin).join("a.txt"), b"x");
     let bad = root.join(crate::testutil::unrepresentable_name("dir", ""));
     if !try_mkdir(&bad) {
         eprintln!("skipped: this filesystem will not store an unrepresentable name");
         return;
     }
     for n in 0..5 {
-        touch(&bad.join(format!("b{}.txt", n)));
+        touch(&bad.join(format!("b{}.txt", n)), b"x");
     }
-    touch(&bad.join("deep/c.txt"));
+    touch(&bad.join("deep/c.txt"), b"x");
 
     let db = db_with(
         "nonutf8-dir",
         &[(path_to_db_string(&root.join(&twin).join("a.txt")), 0)],
     );
-    let stale = stale_only(walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        false,
-        IgnoreSet::compile(&[]).unwrap(),
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    ));
+    let stale = stale_only(start(&root, &db));
     assert!(
         stale.is_empty(),
         "the real directory's row must survive its bad-named sibling: {:?}",
@@ -312,7 +309,7 @@ fn wide_directory_is_split_across_workers_without_loss() {
     let root = tmp_tree("wide");
     let count = FILES_PER_JOB * 4 + 7;
     for i in 0..count {
-        touch(&root.join(format!("f{:05}.txt", i)));
+        touch(&root.join(format!("f{:05}.txt", i)), b"x");
     }
 
     let files = walk(&root, &empty_db("wide"));
@@ -329,10 +326,10 @@ fn terminates_on_an_empty_root() {
 
 #[test]
 fn unchanged_files_are_never_opened() {
-    // One stat per file and no opens is what makes SMB re-indexing bearable.
+    // One stat per file and no opens make SMB re-indexing bearable.
     let root = tmp_tree("skip");
-    touch(&root.join("a.txt"));
-    touch(&root.join("sub/b.txt"));
+    touch(&root.join("a.txt"), b"x");
+    touch(&root.join("sub/b.txt"), b"x");
 
     let first = walk(&root, &empty_db("skip-first"));
     assert_eq!(first.len(), 2);
@@ -361,8 +358,8 @@ fn unchanged_files_are_never_opened() {
 #[test]
 fn a_walk_agrees_with_a_stat_seeded_index() {
     let root = tmp_tree("stat-seeded");
-    touch(&root.join("a.txt"));
-    touch(&root.join("sub/b.txt"));
+    touch(&root.join("a.txt"), b"x");
+    touch(&root.join("sub/b.txt"), b"x");
 
     let seeded: Vec<(String, u64)> = [root.join("a.txt"), root.join("sub/b.txt")]
         .iter()
@@ -395,7 +392,7 @@ fn a_walk_agrees_with_a_stat_seeded_index() {
 #[cfg(windows)]
 fn cached_directory_metadata_matches_a_stat_field_for_field() {
     let root = tmp_tree("cached-meta");
-    touch(&root.join("a.txt"));
+    touch(&root.join("a.txt"), b"x");
     fs::write(root.join("b.bin"), vec![0u8; 5000]).unwrap();
 
     for entry in fs::read_dir(&root).unwrap() {
@@ -409,77 +406,57 @@ fn cached_directory_metadata_matches_a_stat_field_for_field() {
     }
 }
 
+/// A path missing from the stream gets its index row deleted.
 #[test]
+#[cfg(unix)]
 fn every_seen_file_is_reported_even_when_it_cannot_be_read() {
-    // A path missing from the stream gets its index row deleted.
+    use std::os::unix::fs::PermissionsExt;
+
     let root = tmp_tree("unreadable-file");
-    touch(&root.join("fine.txt"));
+    touch(&root.join("fine.txt"), b"x");
     let bad = root.join("bad.txt");
-    touch(&bad);
+    touch(&bad, b"x");
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+    let files = walk(&root, &empty_db("unreadable-file"));
+    fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).ok();
 
-        let files = walk(&root, &empty_db("unreadable-file"));
-        fs::set_permissions(&bad, fs::Permissions::from_mode(0o644)).ok();
-
-        assert_eq!(names(&files), vec!["bad.txt", "fine.txt"]);
-        let bad_entry = files.iter().find(|f| f.path.ends_with("bad.txt")).unwrap();
-        assert!(bad_entry.record.is_none(), "unopenable, so no record");
-    }
+    assert_eq!(names(&files), vec!["bad.txt", "fine.txt"]);
+    let bad_entry = files.iter().find(|f| f.path.ends_with("bad.txt")).unwrap();
+    assert!(bad_entry.record.is_none(), "unopenable, so no record");
 }
 
 #[test]
+#[cfg(unix)]
 fn unreadable_directory_is_recorded_not_silently_empty() {
+    use std::os::unix::fs::PermissionsExt;
+
     let root = tmp_tree("unreadable-dir");
-    touch(&root.join("visible.txt"));
+    touch(&root.join("visible.txt"), b"x");
     let locked = root.join("locked");
-    touch(&locked.join("inside.txt"));
+    touch(&locked.join("inside.txt"), b"x");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let db = empty_db("unreadable-dir");
+    let mut w = start(&root, &db);
+    let files = files_only(w.by_ref());
+    let recorded = !w.unreadable().is_empty();
+    let covers = w
+        .unreadable()
+        .covers(locked.join("inside.txt").to_str().unwrap());
 
-        let db = empty_db("unreadable-dir");
-        let mut w = walk_indexable_files(
-            &[root.to_string_lossy().into_owned()],
-            false,
-            false,
-            IgnoreSet::compile(&[]).unwrap(),
-            db.to_str().unwrap(),
-            Config::default(),
-            Arc::new(Registry::default_set()),
-            Arc::new(AtomicBool::new(false)),
-            4,
-        );
-        let files: Vec<WalkedFile> = w
-            .by_ref()
-            .filter_map(|e| match e {
-                WalkEvent::File(f) => Some(f),
-                WalkEvent::Stale(_) => None,
-            })
-            .collect();
-        let recorded = !w.unreadable().is_empty();
-        let covers = w
-            .unreadable()
-            .covers(locked.join("inside.txt").to_str().unwrap());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).ok();
 
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).ok();
-
-        assert_eq!(names(&files), vec!["visible.txt"]);
-        assert!(recorded, "the failure must be recorded");
-        assert!(covers, "so rows beneath it survive stale cleanup");
-    }
+    assert_eq!(names(&files), vec!["visible.txt"]);
+    assert!(recorded, "the failure must be recorded");
+    assert!(covers, "so rows beneath it survive stale cleanup");
 }
 
 #[test]
 #[cfg(unix)]
 fn symlink_loop_terminates() {
     let root = tmp_tree("loop");
-    touch(&root.join("real.txt"));
+    touch(&root.join("real.txt"), b"x");
     std::os::unix::fs::symlink(&root, root.join("self_link")).unwrap();
 
     let files = walk_with(&root, &empty_db("loop"), true, false);
@@ -493,7 +470,7 @@ fn symlinked_file_resolves_to_its_target_path() {
     // is yielded twice, so both routes must agree on the canonical path or
     // the writer would key two different rows for one file.
     let root = tmp_tree("symlink-file");
-    touch(&root.join("real/target.txt"));
+    touch(&root.join("real/target.txt"), b"x");
     fs::create_dir_all(root.join("links")).unwrap();
     std::os::unix::fs::symlink(root.join("real/target.txt"), root.join("links/alias.txt")).unwrap();
 
@@ -518,11 +495,11 @@ fn symlinked_file_resolves_to_its_target_path() {
 #[cfg(unix)]
 fn a_file_symlink_is_not_followed_when_links_are_off() {
     let root = tmp_tree("symlink-off");
-    touch(&root.join("real/target.txt"));
+    touch(&root.join("real/target.txt"), b"x");
     fs::create_dir_all(root.join("links")).unwrap();
     std::os::unix::fs::symlink(root.join("real/target.txt"), root.join("links/alias.txt")).unwrap();
     let outside = tmp_tree("symlink-off-outside");
-    touch(&outside.join("elsewhere.txt"));
+    touch(&outside.join("elsewhere.txt"), b"x");
     std::os::unix::fs::symlink(outside.join("elsewhere.txt"), root.join("links/out.txt")).unwrap();
 
     let files = walk_with(&root, &empty_db("symlink-off"), false, false);
@@ -541,7 +518,7 @@ fn a_file_symlink_is_not_followed_when_links_are_off() {
 #[cfg(windows)]
 fn a_followed_junction_stores_plain_paths() {
     let root = tmp_tree("junction");
-    touch(&root.join("real").join("target.txt"));
+    touch(&root.join("real").join("target.txt"), b"x");
     // Junctions need no privileges, unlike Windows symlinks.
     let made = std::process::Command::new("cmd")
         .args([
@@ -572,25 +549,16 @@ fn a_followed_junction_stores_plain_paths() {
 #[test]
 fn hidden_and_ignored_entries_are_pruned() {
     let root = tmp_tree("prune");
-    touch(&root.join("keep.txt"));
-    touch(&root.join("sub/keep2.txt"));
-    touch(&root.join("sub/skip.tmp"));
-    touch(&root.join(".hidden/inside.txt"));
-    touch(&root.join(".dotfile"));
-    touch(&root.join("node_modules/dep/index.js"));
+    touch(&root.join("keep.txt"), b"x");
+    touch(&root.join("sub/keep2.txt"), b"x");
+    touch(&root.join("sub/skip.tmp"), b"x");
+    touch(&root.join(".hidden/inside.txt"), b"x");
+    touch(&root.join(".dotfile"), b"x");
+    touch(&root.join("node_modules/dep/index.js"), b"x");
 
-    let ignore = IgnoreSet::compile(&["*.tmp".to_string(), "node_modules".to_string()]).unwrap();
-    let files: Vec<WalkedFile> = files_only(walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        false,
-        ignore,
-        empty_db("prune").to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    ));
+    let ignore = ["*.tmp", "node_modules"];
+    let db = empty_db("prune");
+    let files = files_only(start_with(&[&root], &db, false, false, &ignore, false));
     assert_eq!(names(&files), vec!["keep.txt", "keep2.txt"]);
 
     let files = walk_with(&root, &empty_db("prune-hidden"), false, true);
@@ -611,45 +579,30 @@ fn hidden_and_ignored_entries_are_pruned() {
 #[test]
 fn pruned_entries_are_counted_by_reason() {
     let root = tmp_tree("prune-counts");
-    touch(&root.join("keep.txt"));
-    touch(&root.join("sub/keep2.txt"));
-    touch(&root.join("sub/skip.tmp"));
-    touch(&root.join(".hidden/inside.txt"));
-    touch(&root.join(".hidden/also-inside.txt"));
-    touch(&root.join(".dotfile"));
-    touch(&root.join("node_modules/dep/lib/index.js"));
+    touch(&root.join("keep.txt"), b"x");
+    touch(&root.join("sub/keep2.txt"), b"x");
+    touch(&root.join("sub/skip.tmp"), b"x");
+    touch(&root.join(".hidden/inside.txt"), b"x");
+    touch(&root.join(".hidden/also-inside.txt"), b"x");
+    touch(&root.join(".dotfile"), b"x");
+    touch(&root.join("node_modules/dep/lib/index.js"), b"x");
 
-    let ignore = IgnoreSet::compile(&["*.tmp".to_string(), "node_modules".to_string()]).unwrap();
+    let ignore = ["*.tmp", "node_modules"];
     let db = empty_db("prune-counts");
-    let mut walk = walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        false,
-        ignore,
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    );
-    let files: Vec<WalkedFile> = (&mut walk)
-        .filter_map(|e| match e {
-            WalkEvent::File(f) => Some(f),
-            WalkEvent::Stale(_) => None,
-        })
-        .collect();
+    let mut walk = start_with(&[&root], &db, false, false, &ignore, false);
+    let files = files_only(walk.by_ref());
     assert_eq!(names(&files), vec!["keep.txt", "keep2.txt"]);
 
     let pruned = walk.pruned();
     assert_eq!(
         pruned.dot_named.load(Ordering::Relaxed),
         2,
-        "`.hidden` and `.dotfile` — not the two files inside `.hidden`"
+        "`.hidden` and `.dotfile`, not the two files inside `.hidden`"
     );
     assert_eq!(
         pruned.ignored.load(Ordering::Relaxed),
         2,
-        "`skip.tmp` and `node_modules` — not `index.js` three levels down"
+        "`skip.tmp` and `node_modules`, not `index.js` three levels down"
     );
     // Attributes are a Windows concept; on Linux nothing can reach this
     // counter, and on Windows a temp tree carries no Hidden bit.
@@ -663,27 +616,12 @@ fn pruned_entries_are_counted_by_reason() {
 #[test]
 fn a_tree_with_nothing_pruned_reports_no_summary() {
     let root = tmp_tree("prune-none");
-    touch(&root.join("keep.txt"));
-    touch(&root.join("sub/keep2.txt"));
+    touch(&root.join("keep.txt"), b"x");
+    touch(&root.join("sub/keep2.txt"), b"x");
 
     let db = empty_db("prune-none");
-    let mut walk = walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        false,
-        IgnoreSet::compile(&[]).unwrap(),
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    );
-    let files: Vec<WalkedFile> = (&mut walk)
-        .filter_map(|e| match e {
-            WalkEvent::File(f) => Some(f),
-            WalkEvent::Stale(_) => None,
-        })
-        .collect();
+    let mut walk = start(&root, &db);
+    let files = files_only(walk.by_ref());
     assert_eq!(names(&files), vec!["keep.txt", "keep2.txt"]);
 
     assert_eq!(walk.pruned().total(), 0);
@@ -693,8 +631,8 @@ fn a_tree_with_nothing_pruned_reports_no_summary() {
 #[test]
 fn a_directory_reports_rows_with_no_file_behind_them() {
     let root = tmp_tree("reconcile");
-    touch(&root.join("kept.txt"));
-    touch(&root.join("sub/nested.txt"));
+    touch(&root.join("kept.txt"), b"x");
+    touch(&root.join("sub/nested.txt"), b"x");
 
     let gone = path_to_db_string(&root.join("removed.txt"));
     let gone_nested = path_to_db_string(&root.join("sub/vanished.txt"));
@@ -708,17 +646,7 @@ fn a_directory_reports_rows_with_no_file_behind_them() {
         ],
     );
 
-    let mut stale = stale_only(walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        false,
-        IgnoreSet::compile(&[]).unwrap(),
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    ));
+    let mut stale = stale_only(start(&root, &db));
     stale.sort();
 
     let mut want = vec![gone, gone_nested];
@@ -736,7 +664,7 @@ fn an_unreadable_directory_reports_nothing_stale() {
 
     let root = tmp_tree("reconcile-locked");
     let locked = root.join("locked");
-    touch(&locked.join("inside.txt"));
+    touch(&locked.join("inside.txt"), b"x");
 
     let db = db_with(
         "reconcile-locked",
@@ -744,17 +672,7 @@ fn an_unreadable_directory_reports_nothing_stale() {
     );
 
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    let stale = stale_only(walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        false,
-        IgnoreSet::compile(&[]).unwrap(),
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    ));
+    let stale = stale_only(start(&root, &db));
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).ok();
 
     assert!(
@@ -767,7 +685,7 @@ fn an_unreadable_directory_reports_nothing_stale() {
 fn hidden_root_is_still_walked() {
     let base = tmp_tree("hidden-root");
     let root = base.join(".config");
-    touch(&root.join("app.conf"));
+    touch(&root.join("app.conf"), b"x");
 
     let files = walk(&root, &empty_db("hidden-root"));
     assert_eq!(names(&files), vec!["app.conf"]);
@@ -777,21 +695,11 @@ fn hidden_root_is_still_walked() {
 fn stop_flag_ends_the_walk_without_hanging() {
     let root = tmp_tree("stop");
     for i in 0..500 {
-        touch(&root.join(format!("f{:04}.txt", i)));
+        touch(&root.join(format!("f{:04}.txt", i)), b"x");
     }
 
-    let stop = Arc::new(AtomicBool::new(true));
-    let files: Vec<WalkedFile> = files_only(walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        false,
-        IgnoreSet::compile(&[]).unwrap(),
-        empty_db("stop").to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        stop,
-        4,
-    ));
+    let db = empty_db("stop");
+    let files = files_only(start_with(&[&root], &db, false, false, &[], true));
 
     assert!(
         files.len() < 500,
@@ -805,21 +713,11 @@ fn dropping_the_walk_early_does_not_hang() {
     // away, or `Drop` would join threads that never wake.
     let root = tmp_tree("early-drop");
     for i in 0..2000 {
-        touch(&root.join(format!("sub{}/f{}.txt", i % 10, i)));
+        touch(&root.join(format!("sub{}/f{}.txt", i % 10, i)), b"x");
     }
 
     let db = empty_db("early-drop");
-    let mut w = walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        false,
-        IgnoreSet::compile(&[]).unwrap(),
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    );
+    let mut w = start(&root, &db);
     assert!(w.next().is_some());
     drop(w); // must return, not deadlock
 }
@@ -827,22 +725,11 @@ fn dropping_the_walk_early_does_not_hang() {
 #[test]
 fn overlapping_roots_yield_each_file_once() {
     let root = tmp_tree("overlap");
-    touch(&root.join("sub/a.txt"));
+    touch(&root.join("sub/a.txt"), b"x");
 
-    let files: Vec<WalkedFile> = files_only(walk_indexable_files(
-        &[
-            root.to_string_lossy().into_owned(),
-            root.join("sub").to_string_lossy().into_owned(),
-        ],
-        false,
-        false,
-        IgnoreSet::compile(&[]).unwrap(),
-        empty_db("overlap").to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    ));
+    let sub = root.join("sub");
+    let db = empty_db("overlap");
+    let files = files_only(start_with(&[&root, &sub], &db, false, false, &[], false));
 
     assert_eq!(files.len(), 1, "the nested root must not double-index");
 }
@@ -852,7 +739,7 @@ fn repeated_walks_agree_on_the_result_set() {
     // Enough runs under contention for a racy premature exit to show up.
     let root = tmp_tree("repeat");
     for i in 0..40 {
-        touch(&root.join(format!("d{}/f{}.txt", i % 7, i)));
+        touch(&root.join(format!("d{}/f{}.txt", i % 7, i)), b"x");
     }
     let expected = names(&walk(&root, &empty_db("determinism-base")));
     assert_eq!(expected.len(), 40);
@@ -872,28 +759,12 @@ fn finish_reports_a_clean_walk_and_is_idempotent() {
     // The caller gates stale-row deletion on this: a partial walk's "not
     // seen" would otherwise read as "deleted".
     let root = tmp_tree("finish");
-    touch(&root.join("a.txt"));
-    touch(&root.join("sub/b.txt"));
+    touch(&root.join("a.txt"), b"x");
+    touch(&root.join("sub/b.txt"), b"x");
 
     let db = empty_db("finish");
-    let mut w = walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        false,
-        IgnoreSet::compile(&[]).unwrap(),
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    );
-    let files: Vec<WalkedFile> = w
-        .by_ref()
-        .filter_map(|e| match e {
-            WalkEvent::File(f) => Some(f),
-            WalkEvent::Stale(_) => None,
-        })
-        .collect();
+    let mut w = start(&root, &db);
+    let files = files_only(w.by_ref());
     assert_eq!(files.len(), 2);
     assert!(w.finish(), "no worker panicked");
     assert!(w.finish());
@@ -909,16 +780,13 @@ fn local_temp_dir_is_not_detected_as_network() {
     );
 }
 
-/// On Unix, closing any descriptor on an inode cancels every advisory lock
-/// the process holds on it: hashing `index.sqlite-shm` destroys SQLite's DMS
-/// lock, an attaching connection then truncates the wal-index under our live
-/// mapping, and the next commit dies with SIGBUS.
-/// `include_hidden` is on because the index lives under dot-named
-/// `~/.local/share`, which a default walk skips.
+/// The walk must never open the index's own files (see
+/// `file_handling::index_file_set`). `include_hidden` is on because the index
+/// lives under dot-named `~/.local/share`, which a default walk skips.
 #[test]
 fn the_index_and_its_sidecars_are_never_walked() {
     let root = tmp_tree("walk-self-index");
-    touch(&root.join("ordinary.txt"));
+    touch(&root.join("ordinary.txt"), b"x");
 
     let db = root.join("data").join("index.sqlite");
     let conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
@@ -947,16 +815,16 @@ fn the_index_and_its_sidecars_are_never_walked() {
     drop(conn);
 }
 
-/// A row written before the pruning existed has to go, or the live watcher and
-/// duplicate verification keep opening the file; a skip would keep the row, so
-/// the walk leaves the name out of the directory's `present` set instead.
+/// A stored row for the index itself has to go, or the live watcher and
+/// duplicate verification keep opening the file; a skip would keep the row,
+/// so the walk leaves the name out of the directory's `present` set instead.
 #[test]
 fn a_stored_row_for_the_index_falls_to_the_stale_sweep() {
     let root = crate::testutil::scratch_dir_canonical("walk-self-index-stale");
     let db = root.join("data").join("index.sqlite");
     let conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
 
-    // The row an older build would have written for the database itself.
+    // A row for the database itself.
     let stored = path_to_db_string(&db);
     let (parent, name) = crate::file_handling::split_db_path(&stored).expect("a file's path");
     conn.execute(
@@ -967,17 +835,7 @@ fn a_stored_row_for_the_index_falls_to_the_stale_sweep() {
     .unwrap();
     drop(conn);
 
-    let stale = stale_only(walk_indexable_files(
-        &[root.to_string_lossy().into_owned()],
-        false,
-        true,
-        IgnoreSet::compile(&[]).unwrap(),
-        db.to_str().unwrap(),
-        Config::default(),
-        Arc::new(Registry::default_set()),
-        Arc::new(AtomicBool::new(false)),
-        4,
-    ));
+    let stale = stale_only(start_with(&[&root], &db, false, true, &[], false));
     assert!(
         stale.contains(&stored),
         "the index's own row should be swept; got {:?}",

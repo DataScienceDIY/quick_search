@@ -1,7 +1,7 @@
-//! Programmatic query helpers, **consumed from outside this repository**
-//! (the parent repo's Baloo compat daemon) — *not dead code*; the signatures
-//! are a compatibility surface. The one mutator, [`clear_path`], opens its
-//! own writer and is safe only where no local coordinator is running.
+//! Programmatic query helpers, **consumed from outside this repository** (the
+//! parent repo's Baloo compat daemon), so not dead code: the signatures are a
+//! compatibility surface. The one mutator, [`clear_path`], opens its own
+//! writer and is safe only where no local coordinator is running.
 
 use rusqlite::{params, OptionalExtension};
 
@@ -89,29 +89,22 @@ pub fn status_for_path(db_path: &str, path: &str) -> Result<FileStatus, String> 
             .optional()
             .map_err(|e| format!("status_for_path({}): {}", path, e))?,
     };
-    Ok(match row {
-        None => FileStatus {
-            path: path.to_string(),
-            basic: IndexState::NotIndexed,
-            content: IndexState::NotIndexed,
-            failure_reason: None,
-        },
-        Some((content, reason)) => FileStatus {
-            path: path.to_string(),
-            basic: IndexState::Done,
-            content: IndexState::from(content),
-            failure_reason: reason,
-        },
+    let (basic, content, failure_reason) = match row {
+        None => (IndexState::NotIndexed, IndexState::NotIndexed, None),
+        Some((content, reason)) => (IndexState::Done, IndexState::from(content), reason),
+    };
+    Ok(FileStatus {
+        path: path.to_string(),
+        basic,
+        content,
+        failure_reason,
     })
 }
 
 /// Return every file that failed content extraction, newest first.
 pub fn list_failed(db_path: &str, limit: Option<u32>) -> Result<Vec<FailedEntry>, String> {
     let conn = open_existing(db_path, false)?;
-    let limit_sql = match limit {
-        Some(n) => format!(" LIMIT {}", n),
-        None => String::new(),
-    };
+    let limit_sql = limit.map(|n| format!(" LIMIT {}", n)).unwrap_or_default();
     let sql = format!(
         "SELECT ff.file_id, f.parent, f.name, ff.reason, ff.ts \
          FROM failed_files ff \
@@ -175,7 +168,7 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
     })
 }
 
-/// Count pending files — outstanding extraction work, not
+/// Count pending files: outstanding extraction work, not
 /// `files − searchabletext`, which would count never-extractable rows
 /// forever. Used by the Baloo compat daemon.
 pub fn pending_content_count(db_path: &str) -> Result<i64, String> {
@@ -206,47 +199,39 @@ mod tests {
     use crate::db::open_or_recreate;
     use crate::db::repo::{insert_file, set_content_done, set_content_failed, NewFile};
     use crate::mime::FileType;
-    use crate::testutil::zstd_of;
+    use crate::testutil::{zstd_of, Scratch};
 
-    fn tmp_path() -> std::path::PathBuf {
-        crate::testutil::scratch_dir("cli").join("index.sqlite")
+    /// A `/tmp/` row: a text file awaiting extraction when `text`, else a
+    /// binary that is `NA` on arrival.
+    fn row(tx: &rusqlite::Transaction<'_>, name: &str, text: bool) -> i64 {
+        insert_file(
+            tx,
+            &NewFile {
+                name,
+                parent: "/tmp/",
+                size: 1,
+                mtime: 1,
+                mime: text.then_some("text/plain"),
+                ftype: if text {
+                    FileType::TEXT
+                } else {
+                    FileType::EMPTY
+                },
+                hash: None,
+                needs_content: text,
+            },
+        )
+        .unwrap()
+        .expect("unique path")
     }
 
     fn seed_fixture(db_path: &str) -> (i64, i64) {
         let mut conn = open_or_recreate(db_path, "trigram").unwrap();
         let (a, b) = {
             let tx = conn.transaction().unwrap();
-            let a = insert_file(
-                &tx,
-                &NewFile {
-                    name: "a.txt",
-                    parent: "/tmp/",
-                    size: 1,
-                    mtime: 1,
-                    mime: Some("text/plain"),
-                    ftype: FileType::TEXT,
-                    hash: None,
-                    needs_content: true,
-                },
-            )
-            .unwrap()
-            .expect("unique path");
+            let a = row(&tx, "a.txt", true);
             set_content_done(&tx, a, "hello", zstd_of("hello").as_deref()).unwrap();
-            let b = insert_file(
-                &tx,
-                &NewFile {
-                    name: "b.bin",
-                    parent: "/tmp/",
-                    size: 1,
-                    mtime: 1,
-                    mime: None,
-                    ftype: FileType::EMPTY,
-                    hash: None,
-                    needs_content: false,
-                },
-            )
-            .unwrap()
-            .expect("unique path");
+            let b = row(&tx, "b.bin", false);
             set_content_failed(&tx, b, "bad extract").unwrap();
             tx.commit().unwrap();
             (a, b)
@@ -257,7 +242,7 @@ mod tests {
 
     #[test]
     fn status_for_path_returns_states() {
-        let p = tmp_path();
+        let (_dir, p) = Scratch::db("cli");
         let (_a, _b) = seed_fixture(p.to_str().unwrap());
 
         let st_a = status_for_path(p.to_str().unwrap(), "/tmp/a.txt").unwrap();
@@ -271,13 +256,11 @@ mod tests {
 
         let st_missing = status_for_path(p.to_str().unwrap(), "/tmp/never.txt").unwrap();
         assert_eq!(st_missing.basic, IndexState::NotIndexed);
-
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn list_failed_returns_failed_rows() {
-        let p = tmp_path();
+        let (_dir, p) = Scratch::db("cli");
         let (_a, b) = seed_fixture(p.to_str().unwrap());
 
         let failed = list_failed(p.to_str().unwrap(), None).unwrap();
@@ -285,15 +268,13 @@ mod tests {
         assert_eq!(failed[0].file_id, b);
         assert_eq!(failed[0].path, "/tmp/b.bin");
         assert_eq!(failed[0].reason.as_deref(), Some("bad extract"));
-
-        std::fs::remove_file(&p).ok();
     }
 
-    /// A file nothing extracts is settled, not waiting — it must not be
+    /// A file nothing extracts is settled, not waiting: it must not be
     /// reported as a backlog that never drains.
     #[test]
     fn pending_content_count_counts_only_outstanding_work() {
-        let p = tmp_path();
+        let (_dir, p) = Scratch::db("cli");
         let dbp = p.to_str().unwrap();
         let _ = seed_fixture(dbp);
         assert_eq!(pending_content_count(dbp).unwrap(), 0);
@@ -302,37 +283,9 @@ mod tests {
         {
             let tx = conn.transaction().unwrap();
             // Claimed by an extractor, text not read yet: the backlog.
-            insert_file(
-                &tx,
-                &NewFile {
-                    name: "c.txt",
-                    parent: "/tmp/",
-                    size: 1,
-                    mtime: 1,
-                    mime: Some("text/plain"),
-                    ftype: FileType::TEXT,
-                    hash: None,
-                    needs_content: true,
-                },
-            )
-            .unwrap()
-            .expect("unique path");
+            row(&tx, "c.txt", true);
             // NA on arrival; must not inflate the figure.
-            insert_file(
-                &tx,
-                &NewFile {
-                    name: "d.bin",
-                    parent: "/tmp/",
-                    size: 1,
-                    mtime: 1,
-                    mime: None,
-                    ftype: FileType::EMPTY,
-                    hash: None,
-                    needs_content: false,
-                },
-            )
-            .unwrap()
-            .expect("unique path");
+            row(&tx, "d.bin", false);
             tx.commit().unwrap();
         }
         drop(conn);
@@ -342,8 +295,6 @@ mod tests {
             1,
             "only the file awaiting extraction counts"
         );
-
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
@@ -354,7 +305,7 @@ mod tests {
 
     #[test]
     fn index_size_breakdown_counts_rows() {
-        let p = tmp_path();
+        let (_dir, p) = Scratch::db("cli");
         let _ = seed_fixture(p.to_str().unwrap());
 
         let r = index_size_breakdown(p.to_str().unwrap()).unwrap();
@@ -364,32 +315,16 @@ mod tests {
         assert_eq!(r.documents_text_row_count, 1);
         assert_eq!(r.documents_text_raw_bytes, "hello".len() as i64);
         assert!(r.documents_text_compressed_bytes > 0);
-
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn documents_text_ratio_reports_savings_on_compressible_prose() {
         // Guards against silently swapping compression for a pass-through.
-        let p = tmp_path();
+        let (_dir, p) = Scratch::db("cli");
         let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
         {
             let tx = conn.transaction().unwrap();
-            let id = insert_file(
-                &tx,
-                &NewFile {
-                    name: "big.txt",
-                    parent: "/tmp/",
-                    size: 1,
-                    mtime: 1,
-                    mime: Some("text/plain"),
-                    ftype: FileType::TEXT,
-                    hash: None,
-                    needs_content: true,
-                },
-            )
-            .unwrap()
-            .expect("unique path");
+            let id = row(&tx, "big.txt", true);
             let prose = "the quick brown fox jumps over the lazy dog. ".repeat(500);
             set_content_done(&tx, id, &prose, zstd_of(&prose).as_deref()).unwrap();
             tx.commit().unwrap();
@@ -405,47 +340,29 @@ mod tests {
             r.documents_text_raw_bytes,
             r.documents_text_compressed_bytes
         );
-
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn clear_path_removes_file_and_returns_true() {
-        let p = tmp_path();
+        let (_dir, p) = Scratch::db("cli");
         let _ = seed_fixture(p.to_str().unwrap());
 
         assert!(clear_path(p.to_str().unwrap(), "/tmp/a.txt").unwrap());
         let st = status_for_path(p.to_str().unwrap(), "/tmp/a.txt").unwrap();
         assert_eq!(st.basic, IndexState::NotIndexed);
         assert!(!clear_path(p.to_str().unwrap(), "/tmp/a.txt").unwrap());
-
-        std::fs::remove_file(&p).ok();
     }
 
     #[test]
     fn clear_path_on_nondefault_tokenizer_db_removes_only_target() {
         // Must never trigger the owner's schema-mismatch wipe.
-        let p = tmp_path();
+        let (_dir, p) = Scratch::db("cli");
         let dbp = p.to_str().unwrap();
         {
             let mut conn = open_or_recreate(dbp, "unicode61").unwrap();
             let tx = conn.transaction().unwrap();
             for name in ["a.txt", "b.txt"] {
-                insert_file(
-                    &tx,
-                    &NewFile {
-                        name,
-                        parent: "/tmp/",
-                        size: 1,
-                        mtime: 1,
-                        mime: Some("text/plain"),
-                        ftype: FileType::TEXT,
-                        hash: None,
-                        needs_content: true,
-                    },
-                )
-                .unwrap()
-                .expect("unique path");
+                row(&tx, name, true);
             }
             tx.commit().unwrap();
         }
@@ -459,7 +376,5 @@ mod tests {
             status_for_path(dbp, "/tmp/a.txt").unwrap().basic,
             IndexState::NotIndexed
         );
-
-        std::fs::remove_file(&p).ok();
     }
 }

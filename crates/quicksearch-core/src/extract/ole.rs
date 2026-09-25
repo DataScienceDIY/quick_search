@@ -1,10 +1,10 @@
 //! Legacy binary Office formats: `.doc`, `.xls`, `.ppt` and the template and
-//! slideshow names for the same three containers — OLE2 compound files; three
-//! parsers sharing a reader, wanting only the *text*. Every
-//! offset and count in these formats is attacker-controlled, so every read is
-//! bounds-checked, declared lengths are clamped, nothing is preallocated from
-//! a declared count, and a malformed file yields `Err` — never a partial
-//! string of garbage, and never a panic.
+//! slideshow names for the same three OLE2 compound files, read by three
+//! parsers sharing a reader, for the text alone. Every offset and count in
+//! these formats is attacker-controlled, so every read is bounds-checked,
+//! declared lengths are clamped, nothing is preallocated from a declared
+//! count, and a malformed file yields `Err`: never a partial string of
+//! garbage, and never a panic.
 
 use std::error::Error;
 use std::fs::File;
@@ -13,11 +13,8 @@ use std::path::Path;
 
 use super::Scratch;
 
-/// Ceiling on extracted text from one legacy document, from the caller's
-/// [`Limits::text`](super::Limits::text): the formats can declare far more
-/// text than they contain, and this bound keeps a hostile header from turning
-/// into an allocation. It used to be a hardcoded 64 MiB — 256× the largest
-/// result the caller keeps.
+/// Extract a legacy Office document's text into `out`, stopping at
+/// [`Limits::text`](super::Limits::text).
 pub fn extract_ole_text(
     path: &Path,
     extension: &str,
@@ -27,21 +24,14 @@ pub fn extract_ole_text(
     let budget = scratch.limits().text;
     let mut cfb = cfb::CompoundFile::open(File::open(path)?)
         .map_err(|e| format!("not a readable OLE2 compound file: {}", e))?;
-    // A template holds the same streams as the document written from it, and
-    // a `.pps` is a `.ppt` that opens in the slideshow: one parser each, three
-    // names apiece. They share a MIME with the plain form, so leaving them out
-    // meant a claimed file extracting to nothing at all.
+    // Templates and `.pps` slideshows are aliases; see the `office` module doc.
     let text = match extension {
         "doc" | "dot" => doc::extract(&mut cfb, budget),
         "xls" | "xlt" => xls::extract(&mut cfb, budget),
         "ppt" | "pps" | "pot" => ppt::extract(&mut cfb, budget),
         other => Err(format!("no OLE2 parser for .{}", other).into()),
     }?;
-    if out.is_empty() {
-        *out = text;
-    } else {
-        out.push_str(&text);
-    }
+    super::append(out, text);
     Ok(())
 }
 
@@ -60,16 +50,18 @@ fn u8_at(b: &[u8], off: usize) -> Option<u8> {
 }
 
 fn u16_at(b: &[u8], off: usize) -> Option<u16> {
-    let bytes = b.get(off..off.checked_add(2)?)?;
-    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+    Some(u16::from_le_bytes(
+        b.get(off..off.checked_add(2)?)?.try_into().ok()?,
+    ))
 }
 
 fn u32_at(b: &[u8], off: usize) -> Option<u32> {
-    let bytes = b.get(off..off.checked_add(4)?)?;
-    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    Some(u32::from_le_bytes(
+        b.get(off..off.checked_add(4)?)?.try_into().ok()?,
+    ))
 }
 
-/// windows-1252 — the "compressed"/8-bit form all three formats use.
+/// windows-1252, the "compressed" 8-bit form all three formats use.
 fn cp1252(bytes: &[u8]) -> String {
     encoding_rs::WINDOWS_1252.decode(bytes).0.into_owned()
 }
@@ -103,7 +95,7 @@ fn clean(raw: &str, out: &mut String) {
     }
 }
 
-// .doc — Word 97-2003. Text is not contiguous: the `WordDocument` stream
+// .doc, Word 97-2003. Text is not contiguous: the `WordDocument` stream
 // holds arbitrarily ordered runs, and a *piece table* in the companion table
 // stream says which run belongs where. Start-to-end reading yields storage
 // order interleaved with leftovers of earlier edits; only the piece table
@@ -168,7 +160,7 @@ mod doc {
     ///
     /// Two budgets, because the output one cannot bound the input: a piece of
     /// control bytes decodes at full width and appends nothing, and nothing
-    /// requires pieces to be disjoint or ordered — a table can point every
+    /// requires pieces to be disjoint or ordered: a table can point every
     /// piece at the same span, so a 2 MiB file can name tens of GiB of
     /// decoding. Charging the bytes actually read bounds both.
     pub(super) fn decode_pieces(doc: &[u8], pieces: &[Piece], budget: usize) -> String {
@@ -295,10 +287,10 @@ mod doc {
     }
 }
 
-// .xls — Excel 97-2003 (BIFF8): a flat sequence of records. Cell text is
+// .xls, Excel 97-2003 (BIFF8): a flat sequence of records. Cell text is
 // pooled in a shared-string table (`SST`) the cells index into. The SST can
 // overflow BIFF's 8224-byte record ceiling into `CONTINUE` records, cutting a
-// string mid-way and resuming with a fresh width flag — getting that boundary
+// string mid-way and resuming with a fresh width flag; getting that boundary
 // wrong is the classic way to read an Excel file as mojibake.
 mod xls {
     use super::*;
@@ -338,10 +330,10 @@ mod xls {
         Ok(out)
     }
 
-    /// Render every cell-bearing record, stopping at `budget` — the same two
-    /// budgets as [`super::doc::decode_pieces`]: `clean` can consume a whole
-    /// cell and emit nothing, and one six-byte `LABELSST` is free to name the
-    /// same 64 KiB shared string as thousands of others.
+    /// Render every cell-bearing record, stopping at `budget`, with the same
+    /// two budgets as [`super::doc::decode_pieces`]: `clean` can consume a
+    /// whole cell and emit nothing, and one six-byte `LABELSST` is free to
+    /// name the same 64 KiB shared string as thousands of others.
     fn decode_cells(records: &[Record<'_>], strings: &[String], budget: usize) -> String {
         let mut out = String::new();
         let mut row_open = false;
@@ -386,8 +378,8 @@ mod xls {
         body: &'a [u8],
     }
 
-    /// Split into records, stopping at the first header that does not fit —
-    /// a truncated file keeps whatever records were whole.
+    /// Split into records, stopping at the first header that does not fit; a
+    /// truncated file keeps whatever records were whole.
     fn split_records(book: &[u8]) -> Vec<Record<'_>> {
         let mut records = Vec::new();
         let mut i = 0usize;
@@ -428,18 +420,12 @@ mod xls {
             return Vec::new();
         };
         let mut cursor = 8usize;
-        let mut strings = Vec::new();
-        // Bounded by the bytes that exist, not by the attacker-controlled
-        // declared count.
-        for _ in 0..unique {
-            match read_string(&segments, &mut cursor) {
-                Ok(s) => strings.push(s),
-                // A malformed entry ends the table; earlier ones are still
-                // correct, and cells indexing past the end are dropped.
-                Err(_) => break,
-            }
-        }
-        strings
+        // Bounded by the bytes that exist, not the declared count: a malformed
+        // entry ends the table, earlier ones are still correct, and cells
+        // indexing past the end are dropped.
+        (0..unique)
+            .map_while(|_| read_string(&segments, &mut cursor).ok())
+            .collect()
     }
 
     /// Read an `XLUnicodeRichExtendedString` at `*cursor`, a byte offset into
@@ -533,10 +519,7 @@ mod xls {
     }
 
     fn number_at(body: &[u8], off: usize) -> Option<f64> {
-        let b = body.get(off..off + 8)?;
-        Some(f64::from_le_bytes([
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-        ]))
+        Some(f64::from_le_bytes(body.get(off..off + 8)?.try_into().ok()?))
     }
 
     /// An `RK` packs a number into 32 bits: bit 0 = scaled by 100, bit 1 =
@@ -564,7 +547,7 @@ mod xls {
     }
 }
 
-// .ppt — PowerPoint 97-2003: a tree of records where containers nest and
+// .ppt, PowerPoint 97-2003: a tree of records where containers nest and
 // atoms hold data; slide text sits in two atom types differing only in
 // width. This walks the whole tree instead of the slide-persistence
 // directory: file order is close enough for an index.
@@ -614,20 +597,14 @@ mod ppt {
             if version & 0x000F == VERSION_CONTAINER {
                 walk(payload, depth + 1, out, budget);
             } else {
-                match rec_type {
-                    TEXT_BYTES_ATOM | CSTRING_ATOM if rec_type == CSTRING_ATOM => {
-                        clean(&utf16le(payload), out);
-                        out.push('\n');
-                    }
-                    TEXT_BYTES_ATOM => {
-                        clean(&cp1252(payload), out);
-                        out.push('\n');
-                    }
-                    TEXT_CHARS_ATOM => {
-                        clean(&utf16le(payload), out);
-                        out.push('\n');
-                    }
-                    _ => {}
+                let text = match rec_type {
+                    TEXT_CHARS_ATOM | CSTRING_ATOM => Some(utf16le(payload)),
+                    TEXT_BYTES_ATOM => Some(cp1252(payload)),
+                    _ => None,
+                };
+                if let Some(text) = text {
+                    clean(&text, out);
+                    out.push('\n');
                 }
             }
             // A zero-length record at depth would spin forever without this.

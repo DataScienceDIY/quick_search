@@ -50,18 +50,15 @@ impl LogsTab {
             return;
         }
         let needle = self.filter.to_lowercase();
-        let warnings_only = self.warnings_only;
-        let mut shown = std::mem::take(&mut self.shown);
-        shown.clear();
-        shown.extend(
+        self.shown.clear();
+        self.shown.extend(
             self.lines
                 .iter()
                 .enumerate()
-                .filter(|(_, l)| keep(l, &needle, warnings_only))
+                .filter(|(_, l)| keep(l, &needle, self.warnings_only))
                 .map(|(i, _)| i),
         );
-        self.shown = shown;
-        self.shown_key = (self.seen, self.filter.clone(), warnings_only);
+        self.shown_key = (self.seen, self.filter.clone(), self.warnings_only);
     }
 
     fn refresh(&mut self) {
@@ -78,7 +75,6 @@ impl LogsTab {
             .request_repaint_after(std::time::Duration::from_millis(REFRESH_MS));
 
         self.resync_shown();
-        let shown = std::mem::take(&mut self.shown);
 
         let mut cleared = false;
         ui.horizontal(|ui| {
@@ -91,11 +87,12 @@ impl LogsTab {
                     .hint_text("Filter"),
             );
             if ui
-                .add_enabled(!shown.is_empty(), egui::Button::new("Copy"))
+                .add_enabled(!self.shown.is_empty(), egui::Button::new("Copy"))
                 .on_hover_text("Copy the lines shown below to the clipboard")
                 .clicked()
             {
-                let joined = shown
+                let joined = self
+                    .shown
                     .iter()
                     .map(|&i| self.lines[i].text.as_str())
                     .collect::<Vec<_>>()
@@ -111,12 +108,12 @@ impl LogsTab {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let count = if shown.len() == self.lines.len() {
+                let count = if self.shown.len() == self.lines.len() {
                     format!("{} lines", group_thousands(self.lines.len() as u64))
                 } else {
                     format!(
                         "{} of {} lines",
-                        group_thousands(shown.len() as u64),
+                        group_thousands(self.shown.len() as u64),
                         group_thousands(self.lines.len() as u64)
                     )
                 };
@@ -126,20 +123,15 @@ impl LogsTab {
         if cleared {
             // `shown` indexes lines that no longer exist; `refresh` moves
             // `seen`, which makes the next frame rebuild it.
-            self.shown = shown;
             self.refresh();
             return;
         }
         if self.dropped > 0 {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} earlier lines were dropped; the newest {} are kept.",
-                    group_thousands(self.dropped),
-                    group_thousands(log::CAPACITY as u64),
-                ))
-                .small()
-                .weak(),
-            );
+            ui.label(hint(format!(
+                "{} earlier lines were dropped; the newest {} are kept.",
+                group_thousands(self.dropped),
+                group_thousands(log::CAPACITY as u64),
+            )));
         }
         ui.separator();
 
@@ -147,16 +139,14 @@ impl LogsTab {
             ui.label(
                 egui::RichText::new(
                     "Nothing logged yet. Warnings from indexing, watching folders and \
-                     opening files appear here — the same lines the terminal would show.",
+                     opening files appear here, as they would in a terminal.",
                 )
                 .weak(),
             );
-            self.shown = shown;
             return;
         }
-        if shown.is_empty() {
+        if self.shown.is_empty() {
             ui.label(egui::RichText::new("No lines match the filter.").weak());
-            self.shown = shown;
             return;
         }
 
@@ -166,8 +156,8 @@ impl LogsTab {
         let scroll = egui::ScrollArea::both()
             .auto_shrink([false; 2])
             .stick_to_bottom(self.follow)
-            .show_rows(ui, row_height, shown.len(), |ui, range| {
-                for &i in &shown[range] {
+            .show_rows(ui, row_height, self.shown.len(), |ui, range| {
+                for &i in &self.shown[range] {
                     let line = &self.lines[i];
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(fmt_clock(line.at)).monospace().weak());
@@ -184,7 +174,6 @@ impl LogsTab {
                 }
             });
         crate::ui_util::more_below_hint(ui, &scroll);
-        self.shown = shown;
     }
 }
 

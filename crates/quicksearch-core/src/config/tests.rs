@@ -7,6 +7,13 @@ fn tmp_dir() -> Scratch {
     Scratch::dir("config")
 }
 
+/// A copy of `base` with `f` applied.
+fn edited(base: &Config, f: impl FnOnce(&mut Config)) -> Config {
+    let mut c = base.clone();
+    f(&mut c);
+    c
+}
+
 #[test]
 fn fresh_install_defaults_to_home_as_only_root() {
     let dir = tmp_dir();
@@ -144,13 +151,15 @@ fn content_allowed_extensionless_sentinel() {
     assert!(!content_allowed(Path::new("/a/x.(none)"), &cfg));
 
     for spelling in ["(none)", "(NONE)", "(NonE)", "(nOnE)"] {
-        let mut c = Config::default();
-        c.indexing.content_extensions = vec![spelling.to_string()];
+        let c = edited(&Config::default(), |c| {
+            c.indexing.content_extensions = vec![spelling.to_string()]
+        });
         assert!(content_allowed(Path::new("/a/README"), &c), "{spelling}");
     }
 
-    let mut only_txt = Config::default();
-    only_txt.indexing.content_extensions = vec!["txt".into()];
+    let only_txt = edited(&Config::default(), |c| {
+        c.indexing.content_extensions = vec!["txt".into()]
+    });
     assert!(!content_allowed(Path::new("/a/Makefile"), &only_txt));
 }
 
@@ -180,9 +189,10 @@ fn content_allowed_comments() {
     assert!(!content_allowed(Path::new("/a/b.docs"), &cfg));
 
     // Nothing but comments = same as an empty list.
-    let mut all_comments = Config::default();
-    all_comments.indexing.content_extensions =
-        vec!["# nothing enabled yet".into(), "  ".into(), "#".into()];
+    let all_comments = edited(&Config::default(), |c| {
+        c.indexing.content_extensions =
+            vec!["# nothing enabled yet".into(), "  ".into(), "#".into()]
+    });
     assert!(content_allowed(Path::new("/a/b.pdf"), &all_comments));
     assert!(content_allowed(Path::new("/a/Makefile"), &all_comments));
 }
@@ -199,38 +209,38 @@ fn comment_only_edit_is_no_work_at_all() {
         vec!["md".into(), "txt".into()],
         vec![".TXT".into(), ".Md".into()],
     ] {
-        let mut new = old.clone();
-        new.indexing.content_extensions = cosmetic;
+        let new = edited(&old, |c| c.indexing.content_extensions = cosmetic);
         let a = diff_actions(&old, &new);
         assert_eq!(a, ConfigActions::default(), "cosmetic edit is not a change");
     }
 
     // Widening: files already indexed by name need a run to extract text.
-    let mut widened = old.clone();
-    widened.indexing.content_extensions = vec!["txt".into(), "md".into(), "(none)".into()];
+    let widened = edited(&old, |c| {
+        c.indexing.content_extensions = vec!["txt".into(), "md".into(), "(none)".into()]
+    });
     let a = diff_actions(&old, &widened);
     assert!(!a.requires_rebuild);
     assert!(a.work.reconcile_content && a.work.reindex);
 
     // Narrowing: the stored text goes, and nothing needs walking.
-    let mut narrowed = old.clone();
-    narrowed.indexing.content_extensions = vec!["txt".into(), "# md".into()];
+    let narrowed = edited(&old, |c| {
+        c.indexing.content_extensions = vec!["txt".into(), "# md".into()]
+    });
     let a = diff_actions(&old, &narrowed);
     assert!(!a.requires_rebuild);
     assert!(a.work.reconcile_content && !a.work.reindex);
 }
 
-/// The size cap decides what gets read exactly as the extension filter
-/// does, so it has to be applied the same way. It was not: a raised cap left
-/// every file already written off as too large sitting at `NA`, and nothing
-/// re-asks about a file until the file itself changes — so the setting
-/// appeared to do nothing at all on an existing index.
+/// The size cap decides what gets read exactly as the extension filter does
+/// (see `IndexWork::reconcile_content`), so a raised cap must re-decide the
+/// files already written off as too large: nothing else re-asks about a file
+/// until the file itself changes.
 #[test]
 fn changing_the_text_file_size_cap_re_decides_the_stored_rows() {
     let old = Config::default();
+    let cap = old.processing.maximum_text_file_size;
 
-    let mut raised = old.clone();
-    raised.processing.maximum_text_file_size = old.processing.maximum_text_file_size * 2;
+    let raised = edited(&old, |c| c.processing.maximum_text_file_size = cap * 2);
     let a = diff_actions(&old, &raised);
     assert!(
         !a.requires_rebuild,
@@ -245,8 +255,7 @@ fn changing_the_text_file_size_cap_re_decides_the_stored_rows() {
         "widening needs a run: the content pass is what reads the newly eligible files"
     );
 
-    let mut lowered = old.clone();
-    lowered.processing.maximum_text_file_size = old.processing.maximum_text_file_size / 2;
+    let lowered = edited(&old, |c| c.processing.maximum_text_file_size = cap / 2);
     let a = diff_actions(&old, &lowered);
     assert!(
         a.work.reconcile_content,
@@ -264,14 +273,14 @@ fn changing_the_text_file_size_cap_re_decides_the_stored_rows() {
     );
 }
 
-/// An empty list means "everything allowed" — a superset of every other
-/// list, the case plain set arithmetic reads backwards.
+/// An empty list means "everything allowed", a superset of every other list:
+/// the case plain set arithmetic reads backwards.
 #[test]
 fn an_empty_content_filter_is_the_widest_one() {
-    let mut listed = Config::default();
-    listed.indexing.content_extensions = vec!["txt".into()];
-    let mut unfiltered = listed.clone();
-    unfiltered.indexing.content_extensions = vec![];
+    let listed = edited(&Config::default(), |c| {
+        c.indexing.content_extensions = vec!["txt".into()]
+    });
+    let unfiltered = edited(&listed, |c| c.indexing.content_extensions = vec![]);
 
     let widening = diff_actions(&listed, &unfiltered).work;
     assert!(widening.reconcile_content && widening.reindex);
@@ -321,7 +330,7 @@ fn directory_patterns_with_trailing_slash() {
 }
 
 /// A drive-root pattern must survive the trailing-separator trim as a path
-/// pattern — trimmed to "D:" it would land in the component set.
+/// pattern: trimmed to "D:" it would land in the component set.
 #[test]
 fn drive_root_patterns_are_not_component_patterns() {
     let set = IgnoreSet::compile(&[r"D:\".to_string(), "E:/".to_string()]).unwrap();
@@ -452,8 +461,8 @@ fn overlong_names_still_fold_correctly() {
     assert!(!set.matches_component(&"a".repeat(FOLD_BUF + 9)));
 }
 
-/// Literal patterns must be visible on the whole-path route too — otherwise
-/// the watcher indexes exactly what the walker prunes.
+/// Literal patterns must be visible on the whole-path route too, or the
+/// watcher indexes exactly what the walker prunes.
 #[test]
 fn full_path_matching_sees_literal_component_patterns() {
     let set = IgnoreSet::compile(&["node_modules".to_string()]).unwrap();
@@ -549,14 +558,10 @@ fn root_workers_round_trip() {
 fn only_unreadable_data_forces_a_rebuild() {
     let base = Config::default();
 
-    let mut tokenizer = base.clone();
-    tokenizer.processing.tokenize = "unicode61".into();
-    let mut hash = base.clone();
-    hash.processing.hash_length = base.processing.hash_length + 1;
-    let mut protect = base.clone();
-    protect.security.password_protected = true;
-    let mut salt = base.clone();
-    salt.security.salt = Some("00".repeat(16));
+    let tokenizer = edited(&base, |c| c.processing.tokenize = "unicode61".into());
+    let hash = edited(&base, |c| c.processing.hash_length += 1);
+    let protect = edited(&base, |c| c.security.password_protected = true);
+    let salt = edited(&base, |c| c.security.salt = Some("00".repeat(16)));
 
     for c in [&tokenizer, &hash, &protect, &salt] {
         let a = diff_actions(&base, c);
@@ -569,14 +574,23 @@ fn only_unreadable_data_forces_a_rebuild() {
     }
 
     // The keychain only decides where the key is remembered.
-    let mut keychain = base.clone();
-    keychain.security.use_keychain = true;
+    let keychain = edited(&base, |c| c.security.use_keychain = true);
     assert_eq!(diff_actions(&base, &keychain), ConfigActions::default());
 }
 
-/// Narrowing deletes; widening walks. Nothing here may wipe.
+/// A base with every narrowable setting at its widest: one ignore pattern,
+/// hidden files and symlinks both on.
+fn wide_base() -> Config {
+    edited(&Config::default(), |c| {
+        c.indexing.ignore_patterns = vec!["node_modules".into()];
+        c.indexing.include_hidden = true;
+        c.indexing.follow_symlinks = true;
+    })
+}
+
+/// Removing a root deletes its rows by range; adding one walks. Neither wipes.
 #[test]
-fn diff_actions_matrix() {
+fn a_removed_root_is_dropped_and_an_added_one_walked() {
     let dir = tmp_dir();
     let kept = dir.join("kept");
     let dropped = dir.join("dropped");
@@ -587,17 +601,13 @@ fn diff_actions_matrix() {
         dropped.to_string_lossy().into_owned(),
     );
 
-    let mut base = Config::default();
-    base.paths.indexing_paths = vec![kept.clone(), dropped.clone()];
-    base.indexing.ignore_patterns = vec!["node_modules".into()];
-    base.indexing.include_hidden = true;
-    base.indexing.follow_symlinks = true;
-
+    let base = edited(&wide_base(), |c| {
+        c.paths.indexing_paths = vec![kept.clone(), dropped.clone()]
+    });
     assert_eq!(diff_actions(&base, &base.clone()), ConfigActions::default());
 
     // Removing a root: rows deleted by range, no walk needed.
-    let mut c = base.clone();
-    c.paths.indexing_paths = vec![kept.clone()];
+    let c = edited(&base, |c| c.paths.indexing_paths = vec![kept.clone()]);
     let a = diff_actions(&base, &c);
     assert!(!a.requires_rebuild);
     assert_eq!(a.work.drop_roots, vec![dropped.clone()]);
@@ -607,27 +617,20 @@ fn diff_actions_matrix() {
     let a = diff_actions(&c, &base);
     assert!(!a.requires_rebuild);
     assert!(a.work.drop_roots.is_empty() && a.work.reindex && !a.work.prune_scope);
+}
 
+/// Narrowing the walk prunes stored rows; widening it walks. Neither wipes.
+#[test]
+fn narrowing_the_walk_prunes_and_widening_it_walks() {
+    let base = wide_base();
     for (narrow, widen, what) in [
         (
-            {
-                let mut c = base.clone();
-                c.indexing.ignore_patterns.push("*.log".into());
-                c
-            },
-            {
-                let mut c = base.clone();
-                c.indexing.ignore_patterns.clear();
-                c
-            },
+            edited(&base, |c| c.indexing.ignore_patterns.push("*.log".into())),
+            edited(&base, |c| c.indexing.ignore_patterns.clear()),
             "ignore patterns",
         ),
         (
-            {
-                let mut c = base.clone();
-                c.indexing.include_hidden = false;
-                c
-            },
+            edited(&base, |c| c.indexing.include_hidden = false),
             base.clone(),
             "hidden files",
         ),
@@ -647,11 +650,14 @@ fn diff_actions_matrix() {
             what
         );
     }
+}
 
-    // Symlinks take their own route: turning them off strands the rows
-    // *outside* every root, which no per-root scan would ever revisit.
-    let mut no_links = base.clone();
-    no_links.indexing.follow_symlinks = false;
+/// Symlinks take their own route: turning them off strands the rows
+/// *outside* every root, which no per-root scan would ever revisit.
+#[test]
+fn turning_symlinks_off_drops_aliases_and_on_walks() {
+    let base = wide_base();
+    let no_links = edited(&base, |c| c.indexing.follow_symlinks = false);
     let a = diff_actions(&base, &no_links);
     assert!(!a.requires_rebuild);
     assert!(
@@ -663,30 +669,38 @@ fn diff_actions_matrix() {
         a.work.reindex && !a.work.drop_aliases && !a.work.prune_scope,
         "turning links on only adds"
     );
+}
 
-    // Stored text: on = re-extract, off = drop the blobs; never a rebuild.
-    let mut off = base.clone();
-    off.processing.store_text_for_snippets = false;
-    let mut on = base.clone();
-    on.processing.store_text_for_snippets = true;
+/// Stored text: on re-extracts, off drops the blobs; never a rebuild.
+#[test]
+fn stored_text_on_re_extracts_and_off_drops_it() {
+    let base = wide_base();
+    let off = edited(&base, |c| c.processing.store_text_for_snippets = false);
+    let on = edited(&base, |c| c.processing.store_text_for_snippets = true);
     let a = diff_actions(&on, &off);
     assert!(a.work.drop_text && !a.work.restore_text && !a.work.reindex);
     let a = diff_actions(&off, &on);
     assert!(a.work.restore_text && !a.work.drop_text && a.work.reindex);
+}
 
-    let mut c = base.clone();
-    c.paths.database_path = "/elsewhere.sqlite".into();
-    let a = diff_actions(&base, &c);
+#[test]
+fn soft_knobs_are_not_index_work() {
+    let base = wide_base();
+    let moved = edited(&base, |c| {
+        c.paths.database_path = "/elsewhere.sqlite".into()
+    });
+    let a = diff_actions(&base, &moved);
     assert!(a.search_db_changed && !a.requires_rebuild && a.work.is_empty());
 
-    let mut c = base.clone();
-    c.search.display_limit = 5000;
-    c.processing.batch_size = 999;
-    c.processing.maximum_wal_size = 0;
-    c.indexing.auto_index = false;
-    c.indexing.reindex_interval_minutes = 5;
+    let tuned = edited(&base, |c| {
+        c.search.display_limit = 5000;
+        c.processing.batch_size = 999;
+        c.processing.maximum_wal_size = 0;
+        c.indexing.auto_index = false;
+        c.indexing.reindex_interval_minutes = 5;
+    });
     assert_eq!(
-        diff_actions(&base, &c),
+        diff_actions(&base, &tuned),
         ConfigActions::default(),
         "soft knobs are not index work"
     );
@@ -719,8 +733,8 @@ fn merging_two_plans_loses_nothing() {
     assert!(merged.prune_scope && merged.drop_text);
     assert!(merged.reconcile_content && merged.reindex);
 
-    // Empty merge is a no-op and self-merge is the identity — both are what
-    // make a restart safe.
+    // Empty merge is a no-op and self-merge is the identity; both make a
+    // restart safe.
     let mut untouched = first.clone();
     untouched.merge_from(&IndexWork::default());
     assert_eq!(untouched, first);
@@ -737,30 +751,34 @@ fn respelling_a_list_is_not_a_change() {
     fs::create_dir_all(&a_dir).unwrap();
     fs::create_dir_all(&b_dir).unwrap();
 
-    let mut base = Config::default();
-    base.paths.indexing_paths = vec![
-        a_dir.to_string_lossy().into_owned(),
-        b_dir.to_string_lossy().into_owned(),
-    ];
-    base.indexing.ignore_patterns = vec!["node_modules".into(), "*.tmp".into()];
+    let base = edited(&Config::default(), |c| {
+        c.paths.indexing_paths = vec![
+            a_dir.to_string_lossy().into_owned(),
+            b_dir.to_string_lossy().into_owned(),
+        ];
+        c.indexing.ignore_patterns = vec!["node_modules".into(), "*.tmp".into()];
+    });
 
-    let mut reordered = base.clone();
-    reordered.paths.indexing_paths.reverse();
-    reordered.indexing.ignore_patterns.reverse();
+    let reordered = edited(&base, |c| {
+        c.paths.indexing_paths.reverse();
+        c.indexing.ignore_patterns.reverse();
+    });
     assert_eq!(diff_actions(&base, &reordered), ConfigActions::default());
 
     // A trailing separator, a `.` hop and a duplicate all name the same roots.
-    let mut respelled = base.clone();
-    respelled.paths.indexing_paths = vec![
-        format!("{}{}", a_dir.to_string_lossy(), std::path::MAIN_SEPARATOR),
-        b_dir.join(".").to_string_lossy().into_owned(),
-        a_dir.to_string_lossy().into_owned(),
-    ];
+    let respelled = edited(&base, |c| {
+        c.paths.indexing_paths = vec![
+            format!("{}{}", a_dir.to_string_lossy(), std::path::MAIN_SEPARATOR),
+            b_dir.join(".").to_string_lossy().into_owned(),
+            a_dir.to_string_lossy().into_owned(),
+        ]
+    });
     assert_eq!(diff_actions(&base, &respelled), ConfigActions::default());
 
     // Whitespace around an ignore pattern is trimmed before it compiles.
-    let mut padded = base.clone();
-    padded.indexing.ignore_patterns = vec!["  node_modules ".into(), "*.tmp".into()];
+    let padded = edited(&base, |c| {
+        c.indexing.ignore_patterns = vec!["  node_modules ".into(), "*.tmp".into()]
+    });
     assert_eq!(diff_actions(&base, &padded), ConfigActions::default());
 }
 
@@ -821,7 +839,7 @@ fn salt_bytes_validates_hostile_configs() {
     assert!(sec.salt_bytes().is_ok());
 }
 
-/// Pure UI bookkeeping must never cost a rebuild or a watcher restart —
+/// Pure UI bookkeeping must never cost a rebuild or a watcher restart:
 /// restarting the watcher would re-trip the very warning being dismissed.
 #[test]
 fn ui_bookkeeping_fields_are_soft_knobs() {
@@ -844,16 +862,13 @@ fn ui_bookkeeping_fields_are_soft_knobs() {
         }),
     ];
     for (label, mutate) in cases {
-        let mut c = base.clone();
-        mutate(&mut c);
+        let c = edited(&base, mutate);
         assert_eq!(diff_actions(&base, &c), ConfigActions::default(), "{label}");
     }
 }
 
-/// Newer fields round-trip and default correctly in configs written before
-/// they existed; existing keys keep parsing either way.
 #[test]
-fn newer_fields_round_trip_and_default_when_absent() {
+fn newer_fields_round_trip() {
     let dir = tmp_dir();
     let path = dir.join("config.toml");
 
@@ -876,8 +891,14 @@ fn newer_fields_round_trip_and_default_when_absent() {
     assert_eq!(loaded.ui.color_scheme, "light");
     assert_eq!(loaded.search.fuzzy_max_edits, 4);
     assert_eq!(loaded.duplicates, cfg.duplicates);
+}
 
-    assert_eq!(Config::default().ui.color_scheme, "dark");
+/// A config written before the newer fields existed gets their defaults, and
+/// its existing keys still parse.
+#[test]
+fn newer_fields_default_when_absent() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
     fs::write(
         &path,
         "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n\
@@ -895,10 +916,18 @@ fn newer_fields_round_trip_and_default_when_absent() {
     assert_eq!(cfg.search.fuzzy_max_edits, 2);
     assert_eq!(cfg.ui.scale, 1.25, "existing ui keys still parse");
     // `false` is the non-default value, so this only passes if the key parsed.
-    assert!(!cfg.search.fuzzy_default, "existing search keys still parse");
+    assert!(
+        !cfg.search.fuzzy_default,
+        "existing search keys still parse"
+    );
     assert_eq!(cfg.search.display_limit, 250);
+}
 
-    // A value nobody recognises is not a broken config file.
+/// A value nobody recognises is not a broken config file.
+#[test]
+fn an_unknown_color_scheme_still_loads() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
     fs::write(
         &path,
         "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n\
@@ -906,6 +935,7 @@ fn newer_fields_round_trip_and_default_when_absent() {
     )
     .unwrap();
     assert_eq!(Config::load_from(&path).unwrap().ui.color_scheme, "drak");
+    assert_eq!(Config::default().ui.color_scheme, "dark");
 }
 
 #[test]
@@ -972,8 +1002,8 @@ fn only_a_freshly_written_config_asks_for_the_tour() {
 fn the_search_table_ships_without_size_or_modified() {
     let cols = ColumnsConfig::default();
     assert!(cols.name && cols.content_match && cols.rank);
-    assert!(!cols.size, "the size column is on by default");
-    assert!(!cols.modified, "the modified column is on by default");
+    assert!(!cols.size, "size must default off");
+    assert!(!cols.modified, "modified must default off");
 
     let older: Config = toml::from_str("[search]\ndisplay_limit = 500\n").expect("parses");
     assert_eq!(older.search.columns, cols);
@@ -981,7 +1011,7 @@ fn the_search_table_ships_without_size_or_modified() {
     assert!(older.search.live_results, "live results default to on");
 }
 
-/// The guard consulted before opening a path that came from a `files` row —
+/// The guard consulted before opening a path that came from a `files` row;
 /// see [`crate::file_handling::index_file_set`] for what opening one costs.
 #[test]
 fn the_index_and_every_sidecar_are_recognised() {
@@ -1056,18 +1086,9 @@ fn in_range_numbers_are_left_exactly_alone() {
     let before = cfg.clone();
     let warnings = cfg.clamp_out_of_range();
     assert!(warnings.is_empty(), "defaults must not warn: {warnings:?}");
-    assert_eq!(cfg.search.display_limit, before.search.display_limit);
-    assert_eq!(cfg.processing.hash_length, before.processing.hash_length);
-    assert_eq!(
-        cfg.processing.maximum_text_file_size,
-        before.processing.maximum_text_file_size
-    );
-    assert_eq!(
-        cfg.processing.writer_turn_slice_ms,
-        before.processing.writer_turn_slice_ms
-    );
+    assert_eq!(cfg, before);
 
-    // Zero is a legal turn slice — one quantum per turn.
+    // Zero is a legal turn slice: one batch per turn.
     cfg.processing.writer_turn_slice_ms = 0;
     assert!(cfg.clamp_out_of_range().is_empty());
     assert_eq!(cfg.processing.writer_turn_slice_ms, 0);

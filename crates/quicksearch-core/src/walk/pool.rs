@@ -9,7 +9,7 @@ const PREFETCH_AHEAD: usize = 64;
 #[derive(Default)]
 pub(super) struct Queue {
     /// LIFO: a directory's children are processed close in time to the read
-    /// that discovered them, which is what the attribute cache rewards.
+    /// that discovered them, which the attribute cache rewards.
     pub(super) jobs: Vec<Job>,
     pub(super) needs_rows: Vec<PathBuf>,
     pub(super) needs_alias: Vec<PathBuf>,
@@ -43,7 +43,7 @@ pub(super) struct Shared {
     pub(super) stats: WorkerStats,
 }
 
-/// Decrements the busy count however the worker leaves — stop or panic.
+/// Decrements the busy count however the worker leaves, stop or panic.
 pub(crate) struct BusyGuard<'a>(&'a AtomicUsize);
 
 impl Drop for BusyGuard<'_> {
@@ -82,9 +82,9 @@ impl WorkerStats {
 }
 
 impl Shared {
-    /// Claim a job. Returns `None` only when the queue is empty *and* no
-    /// worker holds a job — at that instant nobody is left who could push
-    /// more, so the walk is provably finished.
+    /// Claim a job. Returns `None` only when the queue is empty and no worker
+    /// holds a job: at that instant nobody is left who could push more, so the
+    /// walk is provably finished.
     pub(super) fn take(&self) -> Option<(Job, ActiveJob<'_>)> {
         let mut q = crate::lock_ok(&self.queue);
         loop {
@@ -113,10 +113,7 @@ impl Shared {
                 self.idle.notify_all();
                 return None;
             }
-            q = self
-                .idle
-                .wait(q)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            q = crate::wait_ok(&self.idle, q);
         }
     }
 
@@ -144,10 +141,7 @@ impl Shared {
                 self.idle.notify_all();
                 return None;
             }
-            q = self
-                .idle
-                .wait(q)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            q = crate::wait_ok(&self.idle, q);
         }
     }
 
@@ -184,8 +178,8 @@ pub(super) enum Found {
 }
 
 impl Shared {
-    /// Push discovered work and give the job slot back under a single lock:
-    /// that makes the idle test in [`Shared::take`] a proof, not a race — a
+    /// Push discovered work and give the job slot back under a single lock,
+    /// which makes the idle test in [`Shared::take`] a proof, not a race: a
     /// worker that popped the last job but has not yet published its
     /// children must never look idle.
     pub(super) fn publish(&self, found: Vec<Found>) {

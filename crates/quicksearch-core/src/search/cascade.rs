@@ -20,17 +20,16 @@
 //! MATCH verified against the text; passes C/D (opt-in) bitap-scan the table.
 //! Path tiers are buffered and flushed last.
 //!
-//! Batches are ordered within themselves, not against each other — do not
-//! assume arrival order is rank order.
+//! Batches are ordered within themselves, not against each other: arrival
+//! order is not rank order.
 
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
-
-use rusqlite::OptionalExtension;
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::IgnoreSet;
 use crate::query::pattern::clamp_match_range;
@@ -38,7 +37,7 @@ use crate::query::split::CascadeQuery;
 use crate::query::translator::{escape_like, quote_phrase};
 use crate::snippet;
 
-use super::fuzzy::{edit_budget, pigeonhole_chunks, Bitap};
+use super::fuzzy::{matcher_for, pigeonhole_chunks, Bitap};
 use super::{prefilter, SearchHit, SearchOptions};
 
 mod passes;
@@ -47,28 +46,30 @@ mod passes;
 const CANCEL_CHECK_ROWS: usize = 256;
 
 /// Snippet window budget: the GUI trims to column width; mouseover shows the rest.
-const SNIPPET_WINDOW_CHARS: usize = 600;
+const SNIPPET_WINDOW_BYTES: usize = 600;
+
+const SNIPPET_OPTS: snippet::Options = snippet::Options {
+    approx_bytes: SNIPPET_WINDOW_BYTES,
+};
 
 /// The Content Match snippet for one document body, cut exactly as the
 /// full-text passes cut it; shared with [`crate::live`] so a re-cut matches.
-/// `folded` must be `text` ASCII-lowercased — byte-length preserving, which
-/// is the whole reason offsets found in it can slice `text`.
+/// `folded` must be `text` ASCII-lowercased; the fold preserves byte length,
+/// so offsets found in it slice `text`.
 pub fn text_snippet(
     pattern: &crate::query::pattern::TermPattern,
     text: &str,
     folded: &str,
 ) -> Option<snippet::Snippet> {
-    let opts = snippet::Options {
-        approx_chars: SNIPPET_WINDOW_CHARS,
-    };
-    match text_snippet_counted(pattern, text, folded) {
-        Some((snip, _)) => Some(snip),
-        None => pattern.find_first_folded(folded).map(|r| {
-            // A greedy pattern can match megabytes; clamp before the window.
-            let r = clamp_match_range(text, r, SNIPPET_WINDOW_CHARS);
-            snippet::window_around(text, (r.start, r.end), &opts)
-        }),
-    }
+    text_snippet_counted(pattern, text, folded)
+        .map(|(snip, _)| snip)
+        .or_else(|| {
+            pattern.find_first_folded(folded).map(|r| {
+                // A greedy pattern can match megabytes; clamp before the window.
+                let r = clamp_match_range(text, r, SNIPPET_WINDOW_BYTES);
+                snippet::window_around(text, (r.start, r.end), &SNIPPET_OPTS)
+            })
+        })
 }
 
 /// [`text_snippet`] for a literal pattern, plus the case-insensitive
@@ -78,38 +79,37 @@ pub fn text_snippet_counted(
     text: &str,
     folded: &str,
 ) -> Option<(snippet::Snippet, usize)> {
-    let opts = snippet::Options {
-        approx_chars: SNIPPET_WINDOW_CHARS,
-    };
     let term = pattern.literal_folded()?;
-    Some(snippet::extract_folded(text, folded, &[term], &opts))
+    Some(snippet::extract_folded(
+        text,
+        folded,
+        &[term],
+        &SNIPPET_OPTS,
+    ))
 }
 
 /// The fuzzy full-text match in one document body: occurrence count within
 /// the edit budget and the window around the first occurrence; `None` when
-/// absent. Shared with [`crate::live`]; no folded copy — the matcher folds
-/// in its mask table.
+/// absent. Shared with [`crate::live`]. No folded copy: the matcher folds in
+/// its mask table.
 pub fn fuzzy_snippet(
     bitap: &crate::search::fuzzy::Bitap,
     text: &str,
 ) -> Option<(usize, snippet::Snippet)> {
-    let opts = snippet::Options {
-        approx_chars: SNIPPET_WINDOW_CHARS,
-    };
     let (count, first) = bitap.count_and_first(text.as_bytes());
-    first.map(|range| (count, snippet::window_around(text, range, &opts)))
+    first.map(|range| (count, snippet::window_around(text, range, &SNIPPET_OPTS)))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outcome {
     pub total: usize,
     pub limited: bool,
 }
 
 /// Run the cascade, streaming rank-ordered batches into `sink`. `Ok(None)`
-/// means cancelled (generation moved on) — the caller sends no completion.
-/// SQL errors are returned as strings *unless* already cancelled (an
-/// interrupted statement is normal cancellation, not an error).
+/// means cancelled (the generation moved on), and the caller sends no
+/// completion. SQL errors come back as strings unless the search was already
+/// cancelled: an interrupted statement is normal cancellation.
 pub fn run(
     conn: &Connection,
     query: &CascadeQuery,
@@ -119,10 +119,7 @@ pub fn run(
     sink: &mut dyn FnMut(Vec<SearchHit>),
 ) -> Result<Option<Outcome>, String> {
     if query.is_empty() {
-        return Ok(Some(Outcome {
-            total: 0,
-            limited: false,
-        }));
+        return Ok(Some(Outcome::default()));
     }
     let ignore = IgnoreSet::compile(&options.session_ignores)
         .map_err(|e| format!("session ignore filter: {}", e))?;
@@ -147,44 +144,43 @@ pub fn run(
         sink,
     };
 
-    // With no term at all the regex drives its own scans; `Path` still
-    // flushes the deferred rank-10 buffer the name pass sets aside.
+    // With no term at all the regex drives its own scans; the path flush
+    // still emits the rank-10 hits the name pass sets aside.
     let passes: &[Pass] = if query.pattern.is_empty() {
-        &[Pass::RegexName, Pass::RegexContent, Pass::Path]
+        &[
+            Pass::RegexName,
+            Pass::RegexContent,
+            Pass::Flush(DeferSlot::Path),
+        ]
     } else {
         &[
             Pass::Filename,
             Pass::FullText,
             Pass::FuzzyFilename,
             Pass::FuzzyFullText,
-            Pass::Path,
-            Pass::FuzzyPath,
+            Pass::Flush(DeferSlot::Path),
+            Pass::Flush(DeferSlot::FuzzyPath),
         ]
     };
     for pass in passes {
         if cx.cancelled() {
             return Ok(None);
         }
-        // Stop, but do not call it truncation: `remaining() == 0` is also
-        // what an exactly-full result set looks like. `flush_pass` sets
-        // `limited` only when it actually drops rows.
+        // Stop, but not as truncation: an exactly-full result set also has
+        // `remaining() == 0`, and `flush_pass` sets `limited` only when it
+        // drops rows.
         if cx.remaining() == 0 {
             break;
         }
-        let run_pass = match pass {
+        let run_pass = match *pass {
             Pass::Filename => cx.pass_filename(),
             Pass::FullText => cx.pass_fulltext(),
             Pass::FuzzyFilename => cx.pass_fuzzy_filename(),
             Pass::FuzzyFullText => cx.pass_fuzzy_fulltext(),
             Pass::RegexName => cx.pass_regex_name(),
             Pass::RegexContent => cx.pass_regex_content(),
-            Pass::Path => {
-                let d = std::mem::take(&mut cx.deferred_path);
-                cx.flush_deferred(d);
-                Ok(true)
-            }
-            Pass::FuzzyPath => {
-                let d = std::mem::take(&mut cx.deferred_fuzzy_path);
+            Pass::Flush(slot) => {
+                let d = std::mem::take(cx.deferred_mut(slot));
                 cx.flush_deferred(d);
                 Ok(true)
             }
@@ -222,9 +218,16 @@ enum Pass {
     RegexName,
     /// Regex-only: content hits at rank 6.
     RegexContent,
-    /// Flush of the rank 9–10 hits pass A set aside.
+    /// Emit the hits the earlier scans set aside in this slot.
+    Flush(DeferSlot),
+}
+
+/// Which [`Deferred`] buffer a scan's held-back hits go to.
+#[derive(Clone, Copy)]
+enum DeferSlot {
+    /// Ranks 9–10, set aside by pass A and the regex name pass.
     Path,
-    /// Flush of the rank 11 hits pass C set aside.
+    /// Rank 11, set aside by pass C.
     FuzzyPath,
 }
 
@@ -237,7 +240,7 @@ fn col<T: rusqlite::types::FromSql>(row: &rusqlite::Row<'_>, idx: usize) -> Resu
     row.get(idx).map_err(|e| e.to_string())
 }
 
-/// Rank, then name, then path — the path tiebreak makes the order total.
+/// Rank, then name, then path; the path tiebreak makes the order total.
 fn rank_order(a: &SearchHit, b: &SearchHit) -> std::cmp::Ordering {
     a.rank
         .total_cmp(&b.rank)
@@ -260,7 +263,7 @@ fn size_and_mtime(row: &rusqlite::Row<'_>) -> Result<(u64, i64), String> {
 
 /// Same specificity floor as the trigram pass; wildcards count only literals.
 fn path_tiers_enabled(pattern: &crate::query::pattern::TermPattern) -> bool {
-    pattern.literal_char_count() >= 3
+    pattern.literal_char_count() >= prefilter::TRIGRAM_FLOOR
 }
 
 /// Hits ranked below later scans, held back until every better stage emitted.
@@ -270,12 +273,12 @@ struct Deferred {
     overflowed: bool,
 }
 
-/// Longest a pass may sit on hits: draining on a clock keeps a sparse query
-/// painting; short enough to land 2–3 batches inside the GUI's 250 ms fade.
+/// Longest a pass may sit on hits. Draining on a clock keeps a sparse query
+/// painting, and this lands 2–3 batches inside the GUI's 250 ms fade.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(80);
 
-/// Multiplicative hasher (odd constant — a bijection) for SQLite rowids.
-/// Measured ~5% of a fuzzy search over SipHash; don't put SipHash back.
+/// Multiplicative hasher for SQLite rowids (an odd constant, so a bijection).
+/// SipHash measured ~5% of a fuzzy search.
 #[derive(Default)]
 struct IdHasher(u64);
 
@@ -315,10 +318,8 @@ struct Cx<'a> {
     deferred_path: Deferred,
     /// Rank 11, filled by pass C.
     deferred_fuzzy_path: Deferred,
-    /// Decoder for [`Cx::regex_accepts`]'s content fetches, built once per
-    /// search and only when the query carries a regex — the predicate runs
-    /// per candidate row, exactly the shape [`crate::db::repo::DocDecoder`]
-    /// exists for.
+    /// Decoder for [`Cx::regex_accepts`]'s per-row content fetches, built once
+    /// per search when the query carries a regex.
     regex_doc: Option<crate::db::repo::DocDecoder>,
     total: usize,
     limited: bool,
@@ -339,10 +340,7 @@ impl FlushClock {
     }
 
     fn due(&self, len: usize, batch: usize) -> bool {
-        if len == 0 {
-            return false;
-        }
-        !self.sent_anything || len >= batch || self.last.elapsed() >= FLUSH_INTERVAL
+        len > 0 && (!self.sent_anything || len >= batch || self.last.elapsed() >= FLUSH_INTERVAL)
     }
 
     fn mark_sent(&mut self) {
@@ -365,13 +363,17 @@ impl<'a> Cx<'a> {
         4096.max(2 * self.remaining())
     }
 
-    fn params_with_filters(
-        &self,
-        leading: Vec<rusqlite::types::Value>,
-    ) -> Vec<rusqlite::types::Value> {
+    fn params_with_filters(&self, leading: Vec<Value>) -> Vec<Value> {
         let mut p = leading;
         p.extend(self.query.filter_params.iter().cloned());
         p
+    }
+
+    fn deferred_mut(&mut self, slot: DeferSlot) -> &mut Deferred {
+        match slot {
+            DeferSlot::Path => &mut self.deferred_path,
+            DeferSlot::FuzzyPath => &mut self.deferred_fuzzy_path,
+        }
     }
 
     fn skip(&self, file_id: i64, path: &str) -> bool {
@@ -379,13 +381,12 @@ impl<'a> Cx<'a> {
     }
 
     /// The `regex:` accept-predicate when a regex accompanies a term. The
-    /// path contains the name, so one path check covers both; content is
-    /// fetched only for rows whose path missed — per candidate row, which is
-    /// why the statement is cached and the decoder ([`Cx::regex_doc`]) is
-    /// reused, and the blob is decoded borrowed rather than copied out.
-    /// Measured (`benches/search_alloc.rs`, case "term + regex"): 42.6 MiB
-    /// churned per keystroke → 4.3, and ~1.3x on the case's time, over the
-    /// `query_row` + `decode_all` shape this replaced.
+    /// path contains the name, so one path check covers both. Content is
+    /// fetched only for rows whose path missed, once per candidate row, so the
+    /// statement is cached, the decoder ([`Cx::regex_doc`]) reused and the
+    /// blob decoded borrowed. Measured (`benches/search_alloc.rs`, "term +
+    /// regex"): 42.6 MiB churned per keystroke → 4.3, and ~1.3x faster, against
+    /// `query_row` plus `decode_all`.
     fn regex_accepts(
         &mut self,
         file_id: i64,
@@ -415,9 +416,9 @@ impl<'a> Cx<'a> {
             .and_then(|mut stmt| {
                 stmt.query_row([file_id], |r| {
                     let blob = r.get_ref(0)?.as_blob()?;
-                    // Strict UTF-8 via `decode` is not a behaviour change:
-                    // bodies are written from `&str` (`repo::set_content_done`),
-                    // and `stored_text` already treats non-UTF-8 as absent.
+                    // Strict UTF-8 loses nothing: bodies are written from `&str`
+                    // (`repo::set_content_done`), and `stored_text` also treats
+                    // non-UTF-8 as absent.
                     Ok(doc.decode(blob).is_some_and(|t| re.is_match(t)))
                 })
                 .optional()
@@ -440,13 +441,8 @@ impl<'a> Cx<'a> {
     fn flush_pass(&mut self, mut buf: Vec<SearchHit>, overflowed: bool) {
         buf.sort_by(rank_order);
         let room = self.remaining();
-        if buf.len() > room {
-            buf.truncate(room);
-            self.limited = true;
-        }
-        if overflowed {
-            self.limited = true;
-        }
+        self.limited |= overflowed || buf.len() > room;
+        buf.truncate(room);
         self.total += buf.len();
         for hit in &buf {
             self.emitted.insert(hit.file_id);
@@ -454,7 +450,7 @@ impl<'a> Cx<'a> {
         let batch = self.options.batch.max(1);
         let mut buf = buf.into_iter().peekable();
         while buf.peek().is_some() {
-            // A cancelled search stops emitting — the newer generation owns the UI.
+            // A cancelled search stops emitting: the newer generation owns the UI.
             if self.cancelled() {
                 return;
             }

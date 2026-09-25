@@ -1,16 +1,12 @@
 use super::pipeline::RootPipeline;
 use super::*;
 use crate::extract::Registry;
-use crate::file_handling::ExtractCursor;
+use crate::file_handling::{normalize_root_string, ExtractCursor};
+use crate::testutil::scratch_dir_canonical as tmp_dir;
 use crate::walk::walk_indexable_files;
+use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
-
-fn tmp_dir(tag: &str) -> std::path::PathBuf {
-    // Canonical: the temp dir may sit behind a symlink (/tmp -> /private/tmp)
-    // and these tests compare walked paths against the root they passed in.
-    crate::testutil::scratch_dir_canonical(tag)
-}
 
 fn config_with(roots: Vec<String>, overrides: &[(&str, usize)]) -> Config {
     let mut cfg = Config::default();
@@ -75,46 +71,44 @@ fn a_root_without_an_override_gets_no_entry() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[test]
-fn worker_counts_follow_the_phase() {
-    let dir = tmp_dir("phase-workers");
-    std::fs::write(dir.join("a.txt"), "hello").unwrap();
-    let db_path = dir.join("index.db").to_string_lossy().into_owned();
-    drop(db::open_or_recreate(&db_path, "trigram").unwrap());
-
+/// A walking pipeline for `dir` whose walk pool has `workers` threads and
+/// whose content pass has `content_workers`. The pass covers an empty range,
+/// so it ends at once, but its pool size is fixed when it is built.
+fn idle_pipeline(
+    dir: &Path,
+    db_path: &str,
+    workers: usize,
+    content_workers: usize,
+    stop: &Arc<AtomicBool>,
+) -> RootPipeline {
     let root = dir.to_string_lossy().into_owned();
-    let stop = Arc::new(AtomicBool::new(false));
     let walk = walk_indexable_files(
         std::slice::from_ref(&root),
         false,
         false,
         crate::config::IgnoreSet::compile(&[]).unwrap(),
-        &db_path,
+        db_path,
         Config::default(),
         Arc::new(Registry::default_set()),
         stop.clone(),
-        3,
+        workers,
     );
-    // An empty range, so the pass ends immediately — but its pool size is
-    // fixed when it is built, which is what the display reports.
     let content = crate::content::extract_content(
-        &db_path,
+        db_path,
         &ExtractCursor::for_root(&dir.join("nothing").to_string_lossy()),
         Arc::new(Registry::default_set()),
         Config::default(),
-        stop,
-        2,
+        stop.clone(),
+        content_workers,
     );
-
-    let mut p = RootPipeline {
+    RootPipeline {
         root,
         walk,
         count_total: Arc::new(AtomicUsize::new(0)),
-        workers: 3,
+        workers,
         pending_updates: Vec::new(),
         pending_inserts: Vec::new(),
         walked: 0,
-        walk_clean: true,
         phase: RootPhase::Walking,
         phase_started: Instant::now(),
         content: Some(content),
@@ -122,7 +116,18 @@ fn worker_counts_follow_the_phase() {
         written: 0,
         totals: None,
         current_file: None,
-    };
+    }
+}
+
+#[test]
+fn worker_counts_follow_the_phase() {
+    let dir = tmp_dir("phase-workers");
+    std::fs::write(dir.join("a.txt"), "hello").unwrap();
+    let db_path = dir.join("index.db").to_string_lossy().into_owned();
+    drop(db::open_or_recreate(&db_path, "trigram").unwrap());
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut p = idle_pipeline(&dir, &db_path, 3, 2, &stop);
 
     assert_eq!(p.worker_counts().1, 3, "walking: the walk's own pool");
     p.phase = RootPhase::Extracting;
@@ -159,7 +164,7 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
                 &NewFile {
                     name: &format!("f{}.txt", i),
                     // A stored parent always ends in a separator; without one
-                    // the row sorts below every `ExtractCursor` range.
+                    // the row sorts below every `RootRange`.
                     parent: &crate::file_handling::dir_to_db_parent(&tree),
                     size: 22,
                     mtime: 1,
@@ -186,47 +191,13 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
     }
     let conn_mutex = Arc::new(Mutex::new(conn));
 
-    let root = dir.to_string_lossy().into_owned();
     let stop = Arc::new(AtomicBool::new(false));
     let config = Config::default();
-    let walk = walk_indexable_files(
-        std::slice::from_ref(&root),
-        false,
-        false,
-        crate::config::IgnoreSet::compile(&[]).unwrap(),
-        &db_path,
-        config.clone(),
-        Arc::new(Registry::default_set()),
-        stop.clone(),
-        1,
-    );
-    // An empty range: the pass reports `Finished` on its own, and the turn
-    // has to keep going past that until `ready` is empty.
-    let content = crate::content::extract_content(
-        &db_path,
-        &ExtractCursor::for_root(&dir.join("nothing").to_string_lossy()),
-        Arc::new(Registry::default_set()),
-        config.clone(),
-        stop.clone(),
-        1,
-    );
-    let mut p = RootPipeline {
-        root,
-        walk,
-        count_total: Arc::new(AtomicUsize::new(0)),
-        workers: 1,
-        pending_updates: Vec::new(),
-        pending_inserts: Vec::new(),
-        walked: 0,
-        walk_clean: true,
-        phase: RootPhase::Extracting,
-        phase_started: Instant::now(),
-        content: Some(content),
-        ready,
-        written: 0,
-        totals: None,
-        current_file: None,
-    };
+    // The pass reports `Finished` on its own, and the turn has to keep going
+    // past that until `ready` is empty.
+    let mut p = idle_pipeline(&dir, &db_path, 1, 1, &stop);
+    p.phase = RootPhase::Extracting;
+    p.ready = ready;
     let mut cx = RunCx::new(
         conn_mutex.clone(),
         &config,
@@ -279,7 +250,7 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
     assert_eq!(done, 5, "every row reached the index");
     assert_eq!(p.snapshot().extracted, 5);
     assert_eq!(p.snapshot().extract_total, Some(0));
-    // A whole path, as the walk phase publishes — not the bare `files.name`.
+    // A whole path, as the walk phase publishes, not the bare `files.name`.
     // The rows land in order, so the last one written is the last one seeded.
     assert_eq!(
         p.snapshot().current_file.as_deref(),
@@ -291,11 +262,12 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-fn run_with(config: &Config, db_path: &str, stop: &Arc<AtomicBool>) -> Result<(), String> {
+/// One run, stopped from the start when `stop` is set.
+fn run_with(config: &Config, db_path: &str, stop: bool) -> Result<(), String> {
     run_indexing_with(
         config,
         db_path,
-        stop,
+        &Arc::new(AtomicBool::new(stop)),
         &Arc::new(Mutex::new(IndexingStatus::Idle)),
     )
 }
@@ -316,6 +288,14 @@ fn run_indexing_with(
         &Arc::new(Mutex::new(None)),
         &db::InterruptSlot::default(),
     )
+}
+
+/// A config indexing `root` alone into `db_path`.
+fn run_config(root: &Path, db_path: &str) -> Config {
+    let mut config = Config::default();
+    config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
+    config.paths.database_path = db_path.to_string();
+    config
 }
 
 fn outstanding_work(db_path: &str, config: &Config) -> crate::config::IndexWork {
@@ -349,13 +329,11 @@ fn an_unreadable_directory_keeps_the_walk_count_unrecorded() {
     std::fs::write(locked.join("inside.txt"), "never seen").unwrap();
 
     let db_path = dir.join("index.db").to_string_lossy().into_owned();
-    let mut config = Config::default();
-    config.paths.indexing_paths = vec![tree.to_string_lossy().into_owned()];
-    config.paths.database_path = db_path.clone();
+    let config = run_config(&tree, &db_path);
     let root = normalize_root_string(&tree.to_string_lossy());
 
     crate::platform::deny_read(&locked).unwrap();
-    let blocked = run_with(&config, &db_path, &Arc::new(AtomicBool::new(false)));
+    let blocked = run_with(&config, &db_path, false);
     // Restore before asserting, so a failure still leaves a removable tree.
     crate::platform::restore_read(&locked).ok();
     blocked.unwrap();
@@ -366,7 +344,7 @@ fn an_unreadable_directory_keeps_the_walk_count_unrecorded() {
         "a walk that could not read a directory saw only part of the tree"
     );
 
-    run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+    run_with(&config, &db_path, false).unwrap();
     assert_eq!(
         stored_walk_count(&db_path, &root),
         Some(2),
@@ -383,12 +361,10 @@ fn a_stopped_run_keeps_the_walk_count_unrecorded() {
         std::fs::write(dir.join(format!("f{}.txt", i)), "body").unwrap();
     }
     let db_path = dir.join("index.db").to_string_lossy().into_owned();
-    let mut config = Config::default();
-    config.paths.indexing_paths = vec![dir.to_string_lossy().into_owned()];
-    config.paths.database_path = db_path.clone();
+    let config = run_config(&dir, &db_path);
     let root = normalize_root_string(&dir.to_string_lossy());
 
-    run_with(&config, &db_path, &Arc::new(AtomicBool::new(true))).unwrap();
+    run_with(&config, &db_path, true).unwrap();
     assert_eq!(stored_walk_count(&db_path, &root), None);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -405,13 +381,11 @@ fn a_completed_run_records_what_each_root_holds() {
     std::fs::write(tree.join("c.log"), "outside the whitelist").unwrap();
 
     let db_path = dir.join("index.db").to_string_lossy().into_owned();
-    let mut config = Config::default();
-    config.paths.indexing_paths = vec![tree.to_string_lossy().into_owned()];
-    config.paths.database_path = db_path.clone();
+    let mut config = run_config(&tree, &db_path);
     config.indexing.content_extensions = vec!["txt".into()];
     let root = normalize_root_string(&tree.to_string_lossy());
 
-    run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+    run_with(&config, &db_path, false).unwrap();
 
     let stored = stored_root_counts(&db_path, &root).expect("a completed run records them");
     assert_eq!(
@@ -443,25 +417,23 @@ fn a_stopped_run_keeps_the_recorded_counts() {
     std::fs::write(tree.join("a.txt"), "alpha body").unwrap();
 
     let db_path = dir.join("index.db").to_string_lossy().into_owned();
-    let mut config = Config::default();
-    config.paths.indexing_paths = vec![tree.to_string_lossy().into_owned()];
-    config.paths.database_path = db_path.clone();
+    let config = run_config(&tree, &db_path);
     let root = normalize_root_string(&tree.to_string_lossy());
 
-    run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+    run_with(&config, &db_path, false).unwrap();
     let after_run = stored_root_counts(&db_path, &root).expect("recorded");
     assert_eq!(after_run.files, 1);
 
     std::fs::write(tree.join("b.txt"), "beta body").unwrap();
     std::fs::write(tree.join("c.txt"), "gamma body").unwrap();
-    run_with(&config, &db_path, &Arc::new(AtomicBool::new(true))).unwrap();
+    run_with(&config, &db_path, true).unwrap();
     assert_eq!(
         stored_root_counts(&db_path, &root),
         Some(after_run),
         "a stopped run leaves the last completed run's figures alone"
     );
 
-    run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+    run_with(&config, &db_path, false).unwrap();
     assert_eq!(stored_root_counts(&db_path, &root).unwrap().files, 3);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -476,25 +448,23 @@ fn an_interrupted_reconcile_records_nothing() {
     std::fs::write(dir.join("drop.log"), "dropped").unwrap();
     let db_path = dir.join("index.db").to_string_lossy().into_owned();
 
-    let mut config = Config::default();
-    config.paths.indexing_paths = vec![dir.to_string_lossy().into_owned()];
-    config.paths.database_path = db_path.clone();
+    let mut config = run_config(&dir, &db_path);
     config.indexing.ignore_patterns = vec![];
-    run_with(&config, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+    run_with(&config, &db_path, false).unwrap();
 
     let mut narrowed = config.clone();
     narrowed.indexing.ignore_patterns = vec!["*.log".into()];
     let pending = outstanding_work(&db_path, &narrowed);
     assert!(pending.touches_index(), "the narrowing has rows to remove");
 
-    run_with(&narrowed, &db_path, &Arc::new(AtomicBool::new(true))).unwrap();
+    run_with(&narrowed, &db_path, true).unwrap();
     assert_eq!(
         outstanding_work(&db_path, &narrowed),
         pending,
         "the same work is still owed"
     );
 
-    run_with(&narrowed, &db_path, &Arc::new(AtomicBool::new(false))).unwrap();
+    run_with(&narrowed, &db_path, false).unwrap();
     assert!(
         outstanding_work(&db_path, &narrowed).is_empty(),
         "a completed run leaves nothing to reconcile"
@@ -564,9 +534,9 @@ fn an_upkeep_step_is_published_for_exactly_as_long_as_it_runs() {
     };
 }
 
-/// The command thread owns the `Stopping` transition — the rule
-/// `publish_status` has always kept, and an upkeep step is no exception:
-/// neither end of it may resurrect a run that has been told to stop.
+/// The command thread owns the `Stopping` transition, as `publish_status`
+/// keeps, and an upkeep step is no exception: neither end of it may
+/// resurrect a run that has been told to stop.
 #[test]
 fn an_upkeep_step_never_clobbers_a_stop() {
     let config = Config::default();
@@ -614,7 +584,7 @@ fn progress(phase: RootPhase, walked: usize, walk_total: Option<usize>) -> RootP
 }
 
 /// An overtaken estimate would pin the bar at 100% and read as a hang; past
-/// the walk the exact count wins — `find` counts tree entries where `walked`
+/// the walk the exact count wins: `find` counts tree entries where `walked`
 /// counts walkable files, so the estimate reads far high.
 #[test]
 fn the_walk_denominator_prefers_the_best_available_count() {
@@ -667,11 +637,10 @@ fn the_walk_denominator_prefers_the_best_available_count() {
 
 #[test]
 fn overall_progress_sums_both_halves_of_every_root() {
-    let mut walking = progress(RootPhase::Walking, 100, Some(1000));
+    let walking = progress(RootPhase::Walking, 100, Some(1000));
     let mut extracting = progress(RootPhase::Extracting, 500, Some(9999));
     extracting.extracted = 200;
     extracting.extract_total = Some(400);
-    walking.extracted = 0;
 
     let o = overall_progress(&[walking, extracting]);
     assert_eq!(o.processed, 100 + 500 + 200);
@@ -684,7 +653,6 @@ fn overall_progress_sums_both_halves_of_every_root() {
 fn an_uncounted_extraction_contributes_only_its_walk() {
     let mut counting = progress(RootPhase::Extracting, 500, None);
     counting.extracted = 7;
-    counting.extract_total = None;
     let o = overall_progress(&[counting]);
     assert_eq!(o.processed, 500);
     assert_eq!(o.total, Some(500));
@@ -709,8 +677,8 @@ fn a_run_past_its_walks_needs_no_estimate_at_all() {
     assert_eq!(overall_progress(&roots).total, Some(15));
 }
 
-/// Regression: with the `find` estimate held past the walk, this run finished
-/// at 7,999,707 / 10,562,418 = 76% and the bar never filled; real figures.
+/// Real figures from a run that, with the `find` estimate held past the walk,
+/// would finish at 7,999,707 / 10,562,418 = 76% and never fill the bar.
 #[test]
 fn a_finished_run_reaches_exactly_one_hundred_percent() {
     let roots: Vec<RootProgress> = [
@@ -735,10 +703,8 @@ fn a_finished_run_reaches_exactly_one_hundred_percent() {
     assert_eq!(o.fraction(), Some(1.0));
 }
 
-/// `walked` can outrun a denominator that was exact when taken — a root
-/// re-walked through symlink aliases — and must stop the bar at full.
 #[test]
-fn overall_progress_edge_cases() {
+fn nothing_to_do_is_a_known_zero_with_no_fraction() {
     let o = overall_progress(&[]);
     assert_eq!(o.processed, 0);
     assert_eq!(o.total, Some(0));
@@ -746,7 +712,12 @@ fn overall_progress_edge_cases() {
     let o = overall_progress(&[progress(RootPhase::Done, 0, None)]);
     assert_eq!(o.total, Some(0));
     assert_eq!(o.fraction(), None, "no division by zero");
+}
 
+/// `walked` can outrun a denominator that was exact when taken (a root
+/// re-walked through symlink aliases) and must stop the bar at full.
+#[test]
+fn work_past_an_exact_denominator_stops_the_bar_at_full() {
     let mut p = progress(RootPhase::Done, 10, None);
     p.extracted = 100;
     // A counted scope the writes then overran; an uncounted one would be

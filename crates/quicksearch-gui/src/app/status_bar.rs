@@ -2,6 +2,7 @@
 
 use super::*;
 
+use crate::format::{fmt_prep_step, fmt_progress, REBUILDING_FTS_CACHE};
 use crate::tips::{self, Tipped};
 use crate::ui_util::hint;
 
@@ -36,102 +37,82 @@ impl QuickSearchApp {
 
     pub(super) fn status_bar(&mut self, ctx: &egui::Context) {
         let state = self.backend.coordinator.state();
-        self.manage.observe(&state.activity);
+        self.manage.track_speed(&state.activity);
         self.check_watch_cap_warning(&state);
 
         let panel = egui::TopBottomPanel::bottom("status-bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                match &state.activity {
-                    // A coordinator reconcile runs with activity `Idle`.
-                    IndexingStatus::Idle if state.reconcile.is_some() => {
-                        match state.reconcile.expect("matched Some") {
-                            ReconcileState::Running(r) => {
-                                ui.label(
-                                    egui::RichText::new(match (r.total, r.fraction()) {
-                                        (Some(total), Some(frac)) => format!(
-                                            "Rebuilding FTS cache · {} / {} ({:.0}%)",
-                                            group_thousands(r.examined as u64),
-                                            group_thousands(total as u64),
-                                            frac * 100.0
-                                        ),
-                                        _ => format!(
-                                            "Rebuilding FTS cache · {} entries",
-                                            group_thousands(r.examined as u64)
-                                        ),
-                                    })
-                                    .small(),
-                                )
-                                .tip(&tips::REBUILDING_FTS);
-                                progress_widget(ui, r.fraction());
+                // A coordinator reconcile runs with activity `Idle`.
+                match (&state.activity, state.reconcile) {
+                    (IndexingStatus::Idle, Some(ReconcileState::Running(r))) => {
+                        let count = match (r.total, r.fraction()) {
+                            (Some(total), Some(frac)) => {
+                                fmt_progress(r.examined, total, frac * 100.0)
                             }
-                            ReconcileState::Finished(r) => {
-                                ui.label(
-                                    egui::RichText::new(crate::format::fmt_reconcile_summary(
-                                        r.deleted,
-                                        r.recontented,
-                                    ))
-                                    .small(),
-                                );
-                            }
-                        }
-                    }
-                    IndexingStatus::Preparing { start_time, step } => {
-                        // Only the reconcile step has a wait worth explaining;
-                        // the rest are over in a moment.
-                        let (label, frac, tip) = match step {
-                            PrepStep::PreviousRun => {
-                                ("Finishing the previous run…".to_string(), None, None)
-                            }
-                            PrepStep::OpeningIndex => {
-                                ("Opening the index…".to_string(), None, None)
-                            }
-                            PrepStep::Starting => {
-                                ("Getting the index ready…".to_string(), None, None)
-                            }
-                            PrepStep::Reconciling(r) => (
-                                format!(
-                                    "Rebuilding FTS cache · {} entries",
-                                    group_thousands(r.examined as u64)
-                                ),
-                                r.fraction(),
-                                Some(&tips::REBUILDING_FTS),
-                            ),
+                            _ => format!("{} entries", group_thousands(r.examined as u64)),
                         };
-                        let response = ui.label(
-                            egui::RichText::new(format!(
-                                "{} · {}",
-                                label,
-                                crate::format::fmt_duration_clock(start_time.elapsed())
+                        ui.label(
+                            egui::RichText::new(format!("{} · {}", REBUILDING_FTS_CACHE, count))
+                                .small(),
+                        )
+                        .tip(&tips::REBUILDING_FTS);
+                        progress_widget(ui, r.fraction());
+                    }
+                    (IndexingStatus::Idle, Some(ReconcileState::Finished(r))) => {
+                        ui.label(
+                            egui::RichText::new(crate::format::fmt_reconcile_summary(
+                                r.deleted,
+                                r.recontented,
                             ))
                             .small(),
                         );
-                        if let Some(tip) = tip {
-                            response.tip(tip);
-                        }
-                        progress_widget(ui, frac);
                     }
-                    IndexingStatus::Idle => {
+                    (IndexingStatus::Preparing { start_time, step }, _) => {
+                        let clock = crate::format::fmt_duration_clock(start_time.elapsed());
+                        let label = match step {
+                            PrepStep::Reconciling(r) => format!(
+                                "{} · {} entries · {}",
+                                REBUILDING_FTS_CACHE,
+                                group_thousands(r.examined as u64),
+                                clock
+                            ),
+                            _ => format!("{} · {}", fmt_prep_step(step), clock),
+                        };
+                        let response = ui.label(egui::RichText::new(label).small());
+                        // Only the reconcile step has a wait worth explaining;
+                        // the rest are over in a moment.
+                        if let PrepStep::Reconciling(r) = step {
+                            response.tip(&tips::REBUILDING_FTS);
+                            progress_widget(ui, r.fraction());
+                        } else {
+                            progress_widget(ui, None);
+                        }
+                    }
+                    (IndexingStatus::Idle, None) => {
                         let colors = palette(ui.visuals().dark_mode);
                         status_line(
                             ui,
                             &idle_line(state.mode, state.files.unwrap_or(0), &colors),
                         );
                     }
-                    IndexingStatus::Error(e) => {
+                    (IndexingStatus::Error(e), _) => {
                         ui.colored_label(
                             ui.visuals().error_fg_color,
                             egui::RichText::new(format!("Indexing error: {}", e)).small(),
                         );
                     }
-                    IndexingStatus::Stopping => {
+                    (IndexingStatus::Stopping, _) => {
                         ui.label(egui::RichText::new("Stopping indexing…").small());
                     }
-                    IndexingStatus::Optimizing => {
+                    (IndexingStatus::Optimizing, _) => {
                         ui.label(egui::RichText::new("Optimizing index…").small());
                     }
-                    IndexingStatus::Running {
-                        roots, maintenance, ..
-                    } => {
+                    (
+                        IndexingStatus::Running {
+                            roots, maintenance, ..
+                        },
+                        _,
+                    ) => {
                         let colors = palette(ui.visuals().dark_mode);
                         let rate = self.manage.speed.files_per_sec();
                         status_line(ui, &running_line(roots, *maintenance, rate, &colors));
@@ -212,12 +193,9 @@ fn running_line(
     let done = roots.iter().filter(|r| r.phase == RootPhase::Done).count();
     let progress = overall_progress(roots);
     let mut rest = match (progress.total, progress.fraction()) {
-        (Some(total), Some(frac)) => format!(
-            " {} / {} ({:.0}%)",
-            group_thousands(progress.processed as u64),
-            group_thousands(total as u64),
-            frac * 100.0
-        ),
+        (Some(total), Some(frac)) => {
+            format!(" {}", fmt_progress(progress.processed, total, frac * 100.0))
+        }
         _ => format!(" · {} files", group_thousands(progress.processed as u64)),
     };
     if roots.len() > 1 {

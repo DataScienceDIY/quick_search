@@ -60,8 +60,8 @@ impl Seeder {
     }
 }
 
-/// Run a search and return its hits in rank order — arrival order is scan
-/// order, not rank order. Use [`run_collect_batches`] for the stream itself.
+/// Run a search and return its hits in rank order; arrival order is scan
+/// order. Use [`run_collect_batches`] for the stream itself.
 fn run_collect(
     conn: &rusqlite::Connection,
     input: &str,
@@ -94,6 +94,22 @@ fn run_collect_batches(
     .expect("cascade run")
     .expect("not cancelled");
     (batches, outcome)
+}
+
+/// Each hit's file id, in order.
+fn ids(hits: &[SearchHit]) -> Vec<i64> {
+    hits.iter().map(|h| h.file_id).collect()
+}
+
+/// Each hit's file id and stage, in order.
+fn staged(hits: &[SearchHit]) -> Vec<(i64, u8)> {
+    hits.iter().map(|h| (h.file_id, h.stage)).collect()
+}
+
+/// `ids` sorted, for tests that pin which files match but not their order.
+fn sorted(mut ids: Vec<i64>) -> Vec<i64> {
+    ids.sort();
+    ids
 }
 
 fn fuzzy_options() -> SearchOptions {
@@ -130,9 +146,8 @@ fn rank_classification_across_all_stages() {
     let conn = s.done();
 
     let (hits, outcome) = run_collect(&conn, "Report", &fuzzy_options());
-    let order: Vec<(i64, u8)> = hits.iter().map(|h| (h.file_id, h.stage)).collect();
     assert_eq!(
-        order,
+        staged(&hits),
         vec![
             (rank1, 1),
             (rank2, 2),
@@ -171,9 +186,8 @@ fn rank_classification_across_all_stages() {
     }
 }
 
-/// Found through the `parent LIKE` half of the one-piece prefilter — the
-/// other half of the boundary story told by
-/// [`a_wildcard_spanning_the_directory_boundary_is_still_found`].
+/// Found through the `parent LIKE` half of the one-piece prefilter; see
+/// [`a_wildcard_spanning_the_directory_boundary_is_still_found`] for the rest.
 #[test]
 fn path_substring_tiers_split_by_case() {
     let (_dir, p) = Scratch::db("pathcase");
@@ -185,9 +199,7 @@ fn path_substring_tiers_split_by_case() {
 
     let (hits, _) = run_collect(&conn, "Vacation", &SearchOptions::default());
     assert_eq!(
-        hits.iter()
-            .map(|h| (h.file_id, h.stage))
-            .collect::<Vec<_>>(),
+        staged(&hits),
         vec![(exact, 9), (anycase, 10)],
         "exact-case path matches outrank any-case ones"
     );
@@ -226,7 +238,7 @@ fn short_terms_respect_the_three_char_trigram_floor() {
 
     let (short, _) = run_collect(&conn, "ab", &fuzzy_options());
     assert_eq!(
-        short.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        ids(&short),
         vec![name_hit],
         "2-char term: filename stages only (text, path and fuzzy all skipped)"
     );
@@ -234,9 +246,7 @@ fn short_terms_respect_the_three_char_trigram_floor() {
     // Fuzzy is off here, so `ab.txt` (1 edit from `abc`) stays out of it.
     let (long, _) = run_collect(&conn, "abc", &SearchOptions::default());
     assert_eq!(
-        long.iter()
-            .map(|h| (h.file_id, h.stage))
-            .collect::<Vec<_>>(),
+        staged(&long),
         vec![(dir_only, 9)],
         "3-char term: the directory match surfaces"
     );
@@ -252,9 +262,7 @@ fn term_with_separator_matches_across_the_path() {
 
     let (hits, _) = run_collect(&conn, "docs/report", &SearchOptions::default());
     assert_eq!(
-        hits.iter()
-            .map(|h| (h.file_id, h.stage))
-            .collect::<Vec<_>>(),
+        staged(&hits),
         vec![(nested, 9)],
         "a term spanning a separator can only match the full path"
     );
@@ -271,10 +279,7 @@ fn fuzzy_path_tier_requires_the_fuzzy_flag() {
     assert!(off.is_empty(), "no fuzzy stages without the flag");
 
     let (on, _) = run_collect(&conn, "Report", &fuzzy_options());
-    assert_eq!(
-        on.iter().map(|h| (h.file_id, h.stage)).collect::<Vec<_>>(),
-        vec![(typo_dir, 11)]
-    );
+    assert_eq!(staged(&on), vec![(typo_dir, 11)]);
     assert!((on[0].rank - 11.2).abs() < 1e-9, "2 edits adds 0.2");
 }
 
@@ -288,7 +293,7 @@ fn fuzzy_max_edits_widens_and_narrows_the_budget() {
 
     let (default, _) = run_collect(&conn, "quarterly", &fuzzy_options());
     assert_eq!(
-        default.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        ids(&default),
         vec![two_edits],
         "the default budget of 2 can't reach a 3-edit typo"
     );
@@ -296,7 +301,7 @@ fn fuzzy_max_edits_widens_and_narrows_the_budget() {
 
     let (widened, _) = run_collect(&conn, "quarterly", &fuzzy_options_with_edits(3));
     assert_eq!(
-        widened.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        ids(&widened),
         vec![two_edits, three_edits],
         "raising the cap admits the 3-edit typo, ranked after the closer one"
     );
@@ -309,8 +314,8 @@ fn fuzzy_max_edits_widens_and_narrows_the_budget() {
     assert!(off.is_empty(), "a cap of 0 disables the fuzzy stages");
 }
 
-/// `7.0 + 0.1 * distance` reaches 8.0 — the fuzzy *full-text* tier — at ten
-/// edits, so a distant filename hit read as a match on the file's contents.
+/// `7.0 + 0.1 * distance` reaches 8.0, the fuzzy full-text tier's rank, at ten
+/// edits; the stage still says a distant filename hit matched the name.
 #[test]
 fn a_distant_fuzzy_filename_hit_stays_a_name_hit() {
     let (_dir, p) = Scratch::db("fuzzystage");
@@ -324,10 +329,7 @@ fn a_distant_fuzzy_filename_hit_stays_a_name_hit() {
         "abcdefghijklmnopqrstuvwxyz0123",
         &fuzzy_options_with_edits(10),
     );
-    assert_eq!(
-        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
-        vec![far]
-    );
+    assert_eq!(ids(&hits), vec![far]);
     assert!(
         (hits[0].rank - 8.0).abs() < 1e-9,
         "rank {} is not the 8.0 that used to truncate into the next stage",
@@ -361,9 +363,8 @@ fn occurrence_counts_order_within_rank() {
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "zebra", &SearchOptions::default());
-    let ids: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
     assert_eq!(
-        ids,
+        ids(&hits),
         vec![thousand, three, one],
         "more occurrences sorts earlier within the rank"
     );
@@ -385,16 +386,14 @@ fn like_metacharacters_are_literal() {
 
     let (hits, _) = run_collect(&conn, "100%", &SearchOptions::default());
     assert_eq!(
-        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        ids(&hits),
         vec![percent],
         "% in the term must not act as a wildcard"
     );
 
     let (hits, _) = run_collect(&conn, "100*", &SearchOptions::default());
-    let mut ids: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
-    ids.sort();
     assert_eq!(
-        ids,
+        sorted(ids(&hits)),
         vec![percent, underscore, contains],
         "star globs, % and _ stay literal"
     );
@@ -405,16 +404,13 @@ fn diacritic_fts_candidates_are_dropped() {
     let (_dir, p) = Scratch::db("diacritic");
     let mut s = Seeder::new(&p, true);
     // trigram remove_diacritics 1 makes this an FTS candidate for "cafe",
-    // but the exact bytes never occur — exact full-text must drop it.
+    // but the exact bytes never occur, so exact full-text must drop it.
     let _accented = s.add("menu.txt", "/d", 1, Some("le café est ouvert"));
     let plain = s.add("plain.txt", "/d", 2, Some("the cafe is open"));
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "cafe", &SearchOptions::default());
-    assert_eq!(
-        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
-        vec![plain]
-    );
+    assert_eq!(ids(&hits), vec![plain]);
 }
 
 #[test]
@@ -435,12 +431,7 @@ fn contentless_mode_degrades_to_unranked_stage6() {
 
     // Without stored text a floor-clearing wildcard can't be pattern-verified.
     let (hits, _) = run_collect(&conn, "wal*rus", &SearchOptions::default());
-    assert_eq!(
-        hits.iter()
-            .map(|h| (h.file_id, h.stage))
-            .collect::<Vec<_>>(),
-        vec![(doc, 6)]
-    );
+    assert_eq!(staged(&hits), vec![(doc, 6)]);
     assert!(hits[0].snippet.is_none());
 
     // The short-segment fallback has no FTS evidence, so it finds nothing.
@@ -463,110 +454,61 @@ fn filters_apply_to_every_stage() {
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "alpha path:/keep", &fuzzy_options());
-    let mut ids: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
-    ids.sort();
-    let mut want = vec![keep_name, keep_text, keep_fuzzy, keep_path];
-    want.sort();
-    assert_eq!(ids, want, "the path filter must gate all stages");
+    assert_eq!(
+        sorted(ids(&hits)),
+        sorted(vec![keep_name, keep_text, keep_fuzzy, keep_path]),
+        "the path filter must gate all stages"
+    );
 }
 
-/// `flush_pass` is the authority on `limited`: it sets the flag when it
-/// actually truncates. `remaining()` reaches zero at the pass boundary
-/// whether or not anything was dropped, and the outer loop used to set
-/// `limited` there — "(truncated…)" over a set that had dropped nothing.
+/// `flush_pass` owns `limited`: it sets the flag only when it truncates.
+/// `remaining()` reaches zero at a pass boundary whether or not anything was
+/// dropped, so setting it there would report "(truncated…)" over a complete set.
 ///
-/// The mid-pass boundary is deliberately *not* fixed: a limit filled by the
-/// first hits of a pass breaks the scan with rows unexamined, and
-/// `cut_short` reports that honestly as "there may be more", which may not
-/// be so. Distinguishing the two costs a row scanned past the limit in
-/// every pass that fills it — not worth paying on every keystroke.
+/// The mid-pass boundary is not fixed: a limit filled by the first hits of a
+/// pass breaks the scan with rows unexamined, and `cut_short` reports "there
+/// may be more", which may not be so. Telling the two apart costs a row
+/// scanned past the limit in every pass that fills it, on every keystroke.
 ///
-/// The break sits *after* classification: the filename pass's SQL is a
-/// superset feeding two rank tiers, so a scanned row is not yet a match,
-/// and breaking on one would lose the hits below it.
+/// The break sits after classification: the filename pass's SQL is a superset
+/// feeding two rank tiers, so a scanned row is not yet a match, and breaking on
+/// one would lose the hits below it.
 #[test]
 fn the_limit_truncates_flags_and_keeps_the_best_hits() {
-    struct Case {
-        tag: &'static str,
-        subs: usize,
-        exact_last: bool,
-        limit: usize,
-        expect_len: usize,
-        expect_limited: bool,
-        expect_first: &'static str,
-        why: &'static str,
-    }
+    // (tag, `zz-match-NN.txt` files, then an exact `match`?, limit)
+    //     => (hits, limited, first hit)
     let cases = [
-        Case {
-            tag: "limit",
-            subs: 10,
-            exact_last: false,
-            limit: 3,
-            expect_len: 3,
-            expect_limited: true,
-            expect_first: "zz-match-00.txt",
-            why: "10 matches under a limit of 3 is a cut set",
-        },
-        Case {
-            // Exactly `limit` results is a complete answer: nothing truncated.
-            tag: "limit-exact",
-            subs: 3,
-            exact_last: false,
-            limit: 3,
-            expect_len: 3,
-            expect_limited: false,
-            expect_first: "zz-match-00.txt",
-            why: "3 matches under a limit of 3 dropped nothing",
-        },
-        Case {
-            // The known not-fixed boundary: the scan breaks with rows
-            // unexamined and `cut_short` says "there may be more".
-            tag: "limit-one",
-            subs: 1,
-            exact_last: false,
-            limit: 1,
-            expect_len: 1,
-            expect_limited: true,
-            expect_first: "zz-match-00.txt",
-            why: "a scan that stopped with rows unexamined says so",
-        },
-        Case {
-            // The exact match, seeded last, must survive the break.
-            tag: "limit-break",
-            subs: 20,
-            exact_last: true,
-            limit: 2,
-            expect_len: 2,
-            expect_limited: true,
-            expect_first: "match",
-            why: "21 matches under a limit of 2 is a cut set",
-        },
+        // 10 matches under a limit of 3 is a cut set.
+        (("limit", 10, false, 3), (3, true, "zz-match-00.txt")),
+        // Exactly `limit` results is a complete answer: nothing truncated.
+        (("limit-exact", 3, false, 3), (3, false, "zz-match-00.txt")),
+        // The not-fixed boundary: the scan breaks with rows unexamined and
+        // `cut_short` says "there may be more".
+        (("limit-one", 1, false, 1), (1, true, "zz-match-00.txt")),
+        // The exact match, seeded last, survives the break.
+        (("limit-break", 20, true, 2), (2, true, "match")),
     ];
 
-    for case in &cases {
-        let (_dir, p) = Scratch::db(case.tag);
+    for ((tag, subs, exact_last, limit), (len, limited, first)) in cases {
+        let (_dir, p) = Scratch::db(tag);
         let mut s = Seeder::new(&p, true);
-        for i in 0..case.subs {
+        for i in 0..subs {
             s.add(&format!("zz-match-{:02}.txt", i), "/d", 1, None);
         }
-        if case.exact_last {
+        if exact_last {
             s.add("match", "/d", 1, None);
         }
         let conn = s.done();
 
         let options = SearchOptions {
-            limit: case.limit,
+            limit,
             ..SearchOptions::default()
         };
         let (hits, outcome) = run_collect(&conn, "match", &options);
-        assert_eq!(hits.len(), case.expect_len, "{}", case.tag);
-        assert_eq!(outcome.total, case.expect_len, "{}", case.tag);
-        assert_eq!(
-            outcome.limited, case.expect_limited,
-            "{}: {}",
-            case.tag, case.why
-        );
-        assert_eq!(hits[0].name, case.expect_first, "{}", case.tag);
+        assert_eq!(hits.len(), len, "{}", tag);
+        assert_eq!(outcome.total, len, "{}", tag);
+        assert_eq!(outcome.limited, limited, "{}", tag);
+        assert_eq!(hits[0].name, first, "{}", tag);
     }
 }
 
@@ -586,10 +528,7 @@ fn session_ignores_hide_hits_before_the_cap() {
         ..SearchOptions::default()
     };
     let (hits, outcome) = run_collect(&conn, "match", &options);
-    assert_eq!(
-        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
-        vec![keep]
-    );
+    assert_eq!(ids(&hits), vec![keep]);
     assert_eq!(outcome.total, 1, "ignored rows never count toward totals");
 }
 
@@ -659,9 +598,7 @@ fn wildcard_name_ranks_through_the_same_tiers() {
 
     let (hits, _) = run_collect(&conn, "report*", &SearchOptions::default());
     assert_eq!(
-        hits.iter()
-            .map(|h| (h.file_id, h.stage))
-            .collect::<Vec<_>>(),
+        staged(&hits),
         // Within rank 3 the tie breaks by name: "2024…" sorts first.
         vec![
             (whole_cs, 1),
@@ -715,15 +652,13 @@ fn wildcard_fulltext_narrows_with_fts_and_verifies_order() {
     let mut s = Seeder::new(&p, true);
     let ordered = s.add("a.txt", "/d", 1, Some("a wondrous world indeed"));
     // FTS AND-of-segments finds this too (both trigram runs occur), but the
-    // pattern requires "wond" before "world" — verification drops it.
+    // pattern requires "wond" before "world", so verification drops it.
     let _reversed = s.add("b.txt", "/d", 2, Some("world of wonders"));
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "wond*world", &SearchOptions::default());
     assert_eq!(
-        hits.iter()
-            .map(|h| (h.file_id, h.stage))
-            .collect::<Vec<_>>(),
+        staged(&hits),
         vec![(ordered, 5)],
         "unordered FTS candidates must fail pattern verification"
     );
@@ -745,20 +680,14 @@ fn wildcard_with_short_segments_falls_back_to_a_full_scan() {
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "ab*cd", &SearchOptions::default());
-    assert_eq!(
-        hits.iter()
-            .map(|h| (h.file_id, h.stage))
-            .collect::<Vec<_>>(),
-        vec![(hit, 5)]
-    );
+    assert_eq!(staged(&hits), vec![(hit, 5)]);
 }
 
-/// The `LIKE` prefilter a straddling wildcard gets must be a *superset* of
-/// what the classifier accepts, or real hits vanish silently. Seeds rows
-/// exercising every way a segment can sit across `parent || name`, and
-/// checks the prefiltered pass against the unfiltered one — obtained via a
-/// pattern whose segments all contain a separator, the arm that still scans,
-/// so both sides run through the real cascade.
+/// The `LIKE` prefilter a straddling wildcard gets is a superset of what the
+/// classifier accepts, or real hits would vanish silently. Seeds rows
+/// exercising every way a segment can sit across `parent || name`, and checks
+/// the prefiltered pass against a reference set computed from the compiled
+/// pattern.
 #[test]
 fn a_wildcard_prefilter_never_loses_a_hit_the_full_scan_finds() {
     let (_dir, p) = Scratch::db("wildprefilter");
@@ -782,8 +711,7 @@ fn a_wildcard_prefilter_never_loses_a_hit_the_full_scan_finds() {
     let opts = SearchOptions::default();
     for query in ["rep*q3", "rep*rt", "*report*", "re*or*q3", "e/pq*txt"] {
         let (hits, _) = run_collect(&conn, query, &opts);
-        let mut got: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
-        got.sort();
+        let got = sorted(ids(&hits));
 
         // The reference set is computed directly: a row is expected exactly
         // when the compiled pattern matches its name or its full path.
@@ -811,13 +739,13 @@ fn a_wildcard_prefilter_never_loses_a_hit_the_full_scan_finds() {
     }
 }
 
-/// The pigeonhole `LIKE` prefilter the fuzzy filename pass gained must be a
-/// superset of what the bitap accepts over name and path, or fuzzy hits
-/// vanish silently. The reference set is computed with the same matcher the
-/// pass uses, so the assertion is against the semantics, not a copy of the
-/// SQL. `fuzzy_max_edits: 1` keeps `k` at 1, which "report" is long enough
-/// to split for — at the default 2 the term is too short and the pass would
-/// scan, exercising nothing.
+/// The fuzzy filename pass's pigeonhole `LIKE` prefilter is a superset of what
+/// the bitap accepts over name and path, or fuzzy hits would vanish silently.
+/// The reference set is computed with the same matcher the pass uses, so the
+/// assertion is against the semantics, not a copy of the SQL.
+/// `fuzzy_max_edits: 1` keeps `k` at 1, which "report" is long enough to split
+/// for; at the default 2 the term is too short and the pass would scan,
+/// exercising nothing.
 #[test]
 fn a_fuzzy_prefilter_never_loses_a_hit_the_full_scan_finds() {
     use quicksearch_core::search::fuzzy::{edit_budget, Bitap};
@@ -850,8 +778,7 @@ fn a_fuzzy_prefilter_never_loses_a_hit_the_full_scan_finds() {
     };
     let term = "report";
     let (hits, _) = run_collect(&conn, term, &opts);
-    let mut got: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
-    got.sort();
+    let got = sorted(ids(&hits));
 
     let k = edit_budget(term.len(), opts.fuzzy_max_edits).unwrap();
     let bitap = Bitap::new(term.as_bytes(), k).unwrap();
@@ -875,7 +802,7 @@ fn a_fuzzy_prefilter_never_loses_a_hit_the_full_scan_finds() {
 
 /// A term carrying a separator disqualifies every chunk set
 /// (`prefilter::Required::like_predicate`), so the fuzzy pass falls back to
-/// the full scan — and must still find a hit whose only match spans the
+/// the full scan, and still finds a hit whose only match spans the
 /// `parent‖name` join.
 #[test]
 fn a_fuzzy_term_with_a_separator_still_scans_and_matches() {
@@ -892,14 +819,11 @@ fn a_fuzzy_term_with_a_separator_still_scans_and_matches() {
     };
     // Within one edit of "/a/rep/orts" read across the join.
     let (hits, _) = run_collect(&conn, "rep/orts", &opts);
-    assert_eq!(
-        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
-        vec![hit]
-    );
+    assert_eq!(ids(&hits), vec![hit]);
 }
 
 /// A pattern every segment of which carries a separator has nothing to anchor
-/// on, so the pass falls back to scanning — and must still find its hits.
+/// on, so the pass falls back to scanning, and still finds its hits.
 #[test]
 fn a_wildcard_with_only_separator_segments_still_scans_and_matches() {
     let (_dir, p) = Scratch::db("wildnoanchor");
@@ -909,10 +833,7 @@ fn a_wildcard_with_only_separator_segments_still_scans_and_matches() {
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "a/rep*rts/", &SearchOptions::default());
-    assert_eq!(
-        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
-        vec![hit]
-    );
+    assert_eq!(ids(&hits), vec![hit]);
 }
 
 #[test]
@@ -924,18 +845,11 @@ fn wildcard_path_tier_and_filters() {
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "Vac*tion", &SearchOptions::default());
-    let mut ids: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
-    ids.sort();
-    let mut want = vec![dir_hit, filtered];
-    want.sort();
-    assert_eq!(ids, want);
+    assert_eq!(sorted(ids(&hits)), sorted(vec![dir_hit, filtered]));
     assert!(hits.iter().all(|h| h.stage == 9), "term only in the path");
 
     let (kept, _) = run_collect(&conn, "Vac*tion path:/elsewhere", &SearchOptions::default());
-    assert_eq!(
-        kept.iter().map(|h| h.file_id).collect::<Vec<_>>(),
-        vec![filtered]
-    );
+    assert_eq!(ids(&kept), vec![filtered]);
 }
 
 #[test]
@@ -950,7 +864,7 @@ fn wildcard_terms_skip_the_fuzzy_stages() {
 
     let (hits, _) = run_collect(&conn, "rep*rt", &fuzzy_options());
     assert_eq!(
-        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+        ids(&hits),
         vec![real],
         "no stage 7/8/11 hits for a wildcard term even with fuzzy on"
     );
@@ -968,9 +882,7 @@ fn regex_only_query_hits_name_content_and_path() {
 
     let (hits, _) = run_collect(&conn, r"regex:qz\d+", &SearchOptions::default());
     assert_eq!(
-        hits.iter()
-            .map(|h| (h.file_id, h.stage))
-            .collect::<Vec<_>>(),
+        staged(&hits),
         vec![(by_name, 4), (by_content, 6), (by_path, 10)],
         "regex-only reuses the name/content/path tiers in cascade order"
     );
@@ -995,10 +907,7 @@ fn regex_is_case_insensitive_by_default_and_respects_filters() {
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, r"regex:qz\d path:/keep", &SearchOptions::default());
-    assert_eq!(
-        hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
-        vec![keep]
-    );
+    assert_eq!(ids(&hits), vec![keep]);
 
     let (cs, _) = run_collect(&conn, r"regex:(?-i:qz)\d", &SearchOptions::default());
     assert!(!cs.iter().any(|h| h.file_id == keep));
@@ -1008,16 +917,14 @@ fn regex_is_case_insensitive_by_default_and_respects_filters() {
 fn regex_alongside_a_term_is_an_accept_predicate() {
     let (_dir, p) = Scratch::db("regexpred");
     let mut s = Seeder::new(&p, true);
-    // Kept via the lazy content fetch — the regex is nowhere in its name/path.
+    // Kept via the lazy content fetch: the regex is nowhere in its name/path.
     let kept = s.add("budget-a.txt", "/d", 1, Some("code acme7 inside"));
     let _dropped = s.add("budget-b.txt", "/d", 2, None);
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, r"budget regex:acme\d", &SearchOptions::default());
     assert_eq!(
-        hits.iter()
-            .map(|h| (h.file_id, h.stage))
-            .collect::<Vec<_>>(),
+        staged(&hits),
         vec![(kept, 3)],
         "the term drives ranking; the regex gates acceptance"
     );
@@ -1048,23 +955,8 @@ fn service_surfaces_invalid_regex_as_an_error() {
     drop(s.done());
 
     let (service, updates) = SearchService::new(p.clone(), Arc::new(|| {}));
-    let generation = service.search("regex:[", SearchOptions::default());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut message = None;
-    while std::time::Instant::now() < deadline {
-        match updates.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(SearchUpdate::Error {
-                generation: g,
-                message: m,
-            }) if g == generation => {
-                message = Some(m);
-                break;
-            }
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-    let message = message.expect("invalid regex must surface as a search error");
+    let message = search_names(&service, &updates, "regex:[")
+        .expect_err("invalid regex must surface as a search error");
     assert!(message.contains("regex"), "unhelpful message: {}", message);
     service.shutdown();
 }
@@ -1148,20 +1040,8 @@ fn service_rapid_fire_completes_only_the_last_generation() {
 fn service_reports_missing_db_as_error() {
     let (_dir, missing) = Scratch::db("missing");
     let (service, updates) = SearchService::new(missing.clone(), Arc::new(|| {}));
-    let generation = service.search("anything", SearchOptions::default());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut got_error = false;
-    while std::time::Instant::now() < deadline {
-        match updates.recv_timeout(std::time::Duration::from_millis(200)) {
-            Ok(SearchUpdate::Error { generation: g, .. }) if g == generation => {
-                got_error = true;
-                break;
-            }
-            Ok(_) => {}
-            Err(_) => break,
-        }
-    }
-    assert!(got_error, "missing index must surface as a search error");
+    search_names(&service, &updates, "anything")
+        .expect_err("missing index must surface as a search error");
     service.shutdown();
 }
 
@@ -1221,9 +1101,9 @@ fn repeated_searches_on_one_service_stay_correct() {
     service.shutdown();
 }
 
-/// A rebuild replaces the file at the *same path*, so nothing about the path
-/// tells a held connection it now looks at a deleted inode — the reason
-/// `db::index_epoch` exists.
+/// A rebuild replaces the file at the same path, so nothing about the path
+/// tells a held connection it now looks at a deleted inode; `db::index_epoch`
+/// does.
 #[test]
 fn a_rebuilt_index_at_the_same_path_is_picked_up() {
     let (_dir, p) = Scratch::db("warmrebuild");
@@ -1389,11 +1269,11 @@ fn a_release_supersedes_a_search_queued_before_it() {
     service.shutdown();
 }
 
-/// A pass hands hits over *while* it scans. Proven by ordering rather than
-/// by batch count — `flush_pass` has always chunked its output, so counting
-/// sink calls proves nothing. Pass A scans in stored `(parent, name)` order,
-/// so a *worse* match seeded early must arrive before a *better* one at a
-/// late path; emitting at the end would sort them and lead with rank 1.
+/// A pass hands hits over while it scans. Proven by ordering, not batch count:
+/// `flush_pass` chunks its output either way, so counting sink calls proves
+/// nothing. Pass A scans in stored `(parent, name)` order, so a worse match
+/// seeded early must arrive before a better one at a late path; emitting at
+/// the end would sort them and lead with rank 1.
 #[test]
 fn a_pass_hands_hits_over_before_the_scan_reaches_the_end() {
     let (_dir, p) = Scratch::db("stream");
@@ -1434,7 +1314,7 @@ fn a_pass_hands_hits_over_before_the_scan_reaches_the_end() {
         };
         let (hits, outcome) = run_collect(&conn, "zebra", &options);
         assert_eq!(
-            hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+            ids(&hits),
             vec![late_better, early_worse, content],
             "batch size {} must not change the set or its ranking",
             batch
@@ -1476,10 +1356,8 @@ fn a_sparse_match_still_streams_before_the_scan_ends() {
 }
 
 // ---------------------------------------------------------------------------
-// Fuzzy-snippet regressions, three symptoms of one shape: bitap reports
-// only where a match *ends*, and the mark's start and extent are derived
-// from that — the whole-field window, the start (`end - term.len()`), and
-// the stop-at-first-accept extent each went wrong. One test per symptom.
+// Fuzzy snippets. Bitap reports only where a match ends, and the mark's
+// window, start and extent are derived from that end; one test pins each.
 // ---------------------------------------------------------------------------
 
 /// The window of a fuzzy name/path hit is the whole field, never a suffix of
@@ -1488,8 +1366,8 @@ fn a_sparse_match_still_streams_before_the_scan_ends() {
 fn fuzzy_name_and_path_snippets_carry_the_whole_field() {
     let (_dir, p) = Scratch::db("fuzzy-whole-field");
     let mut s = Seeder::new(&p, true);
-    // The match sits in the last third of the name, which is what used to
-    // push the window's start off zero.
+    // The match sits in the last third of the name, where a windowed snippet
+    // would start past zero.
     s.add(
         "a_long_and_deliberately_padded_out_quarterly_repot.txt",
         "/home/me/documents/archive",
@@ -1517,14 +1395,14 @@ fn fuzzy_name_and_path_snippets_carry_the_whole_field() {
     }
 }
 
-/// The mark covers the matched text and nothing else — `repot` used to mark
-/// `1Repo` inside `1Reporter`, reaching back over the digit.
+/// The mark covers the matched text and nothing else: `repot` marks `Repo`
+/// inside `1Reporter`, not the digit before it.
 #[test]
 fn a_fuzzy_mark_covers_the_matched_text_and_nothing_else() {
     let (_dir, p) = Scratch::db("fuzzy-mark-span");
     let mut s = Seeder::new(&p, true);
-    // The leading digit is the point: it is what the old range reached back
-    // over. In the body too, for the full-text tier.
+    // A start taken as `end - term.len()` would reach back over the leading
+    // digit. In the body too, for the full-text tier.
     s.add("1Reporter.txt", "/home/me/docs", 1, None);
     s.add(
         "body.txt",
@@ -1536,7 +1414,7 @@ fn a_fuzzy_mark_covers_the_matched_text_and_nothing_else() {
 
     let (hits, _) = run_collect(&conn, "repot", &fuzzy_options());
 
-    // Stage 7 — fuzzy filename, marked inside the whole name.
+    // Stage 7, fuzzy filename: marked inside the whole name.
     let name_hit = hits
         .iter()
         .find(|h| h.stage == 7)
@@ -1550,7 +1428,7 @@ fn a_fuzzy_mark_covers_the_matched_text_and_nothing_else() {
         &snip.window[a..b]
     );
 
-    // Stage 8 — fuzzy full text, marked inside the snippet window.
+    // Stage 8, fuzzy full text: marked inside the snippet window.
     let body_hit = hits
         .iter()
         .find(|h| h.stage == 8)
@@ -1566,15 +1444,15 @@ fn a_fuzzy_mark_covers_the_matched_text_and_nothing_else() {
 }
 
 /// The mark extends to the best alignment rather than stopping at the first
-/// accept: `quarterly` over `quartrly` must light the whole word (one edit),
-/// not the two-edit `quartrl` prefix.
+/// accept: `quarterly` over `quartrly` lights the whole word (one edit), not
+/// the two-edit `quartrl` prefix.
 #[test]
 fn a_fuzzy_mark_is_not_truncated_to_a_leading_part_of_the_term() {
     let (_dir, p) = Scratch::db("fuzzy-mark-full");
     let mut s = Seeder::new(&p, true);
     // The name must not match at all: a row the filename tier claims never
-    // reaches the full-text tier. And the body must hold a fuzzy *variant* —
-    // the term verbatim would be an exact content match, stage 5 or 6.
+    // reaches the full-text tier. And the body must hold a fuzzy variant: the
+    // term verbatim would be an exact content match, stage 5 or 6.
     s.add(
         "notes.txt",
         "/home/me/docs",
@@ -1599,10 +1477,10 @@ fn a_fuzzy_mark_is_not_truncated_to_a_leading_part_of_the_term() {
 }
 
 /// `files` stores `parent` and `name` with no concatenation, so a one-piece
-/// term uses `name LIKE ? OR parent LIKE ?` — equivalent, since a
-/// separator-free term cannot span the boundary. A multi-segment wildcard
-/// *can* span it and neither half fires; those fall back to scanning, and
-/// this fixture fails if that fallback is ever "optimised" away.
+/// term uses `name LIKE ? OR parent LIKE ?`, which is equivalent because a
+/// separator-free term cannot span the boundary. A multi-segment wildcard can
+/// span it and neither half fires; those fall back to scanning, and this
+/// fixture fails if that fallback is ever optimised away.
 #[test]
 fn a_wildcard_spanning_the_directory_boundary_is_still_found() {
     let (_dir, p) = Scratch::db("pathstraddle");
@@ -1615,11 +1493,11 @@ fn a_wildcard_spanning_the_directory_boundary_is_still_found() {
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "doc*q3", &SearchOptions::default());
-    let mut ids: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
-    ids.sort();
-    let mut want = vec![straddling, in_name];
-    want.sort();
-    assert_eq!(ids, want, "the straddling path match must not be dropped");
+    assert_eq!(
+        sorted(ids(&hits)),
+        sorted(vec![straddling, in_name]),
+        "the straddling path match must not be dropped"
+    );
 
     let hit = hits.iter().find(|h| h.file_id == straddling).unwrap();
     assert_eq!(hit.stage, 9);
@@ -1640,9 +1518,9 @@ fn the_folder_filter_covers_the_folder_itself_and_its_subtree() {
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "txt folder:/srv/data", &SearchOptions::default());
-    let mut ids: Vec<i64> = hits.iter().map(|h| h.file_id).collect();
-    ids.sort();
-    let mut want = vec![own, nested];
-    want.sort();
-    assert_eq!(ids, want, "the folder's own files count as inside it");
+    assert_eq!(
+        sorted(ids(&hits)),
+        sorted(vec![own, nested]),
+        "the folder's own files count as inside it"
+    );
 }

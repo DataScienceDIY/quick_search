@@ -1,31 +1,18 @@
-//! Bringing the window to the front when a search shortcut fires — either the
-//! one QuickSearch registered for itself (`crate::hotkey`) or one a desktop
-//! binding relayed through `--toggle`. Both land here. Every display server
-//! stops applications raising themselves, so the request has to carry a
-//! reason a window manager will accept.
+//! Raising the window when a search shortcut fires (our own hotkey or a
+//! `--toggle` relay). Display servers stop apps raising themselves, so each
+//! path carries a reason the window manager accepts:
 //!
-//! * **X11**: winit asks with `_NET_ACTIVE_WINDOW` source indication 1
-//!   ("application"), which KWin, Mutter and Xfwm all refuse from an
-//!   unfocused window, and its `focus_window` does nothing while minimised.
-//!   Hence [`x11_activate`], which sends source indication 2 (EWMH's "direct
-//!   user action"). Do not replace it with winit's version.
-//! * **Wayland**: a client cannot raise itself; the compositor only honours
-//!   an xdg-activation token. winit 0.30 applies one in exactly one place —
-//!   window creation — and its `focus_window` is an empty body, so for a
-//!   *live* window we speak `xdg_activation_v1` ourselves ([`wayland`]): the
-//!   `--toggle` sender forwards the `XDG_ACTIVATION_TOKEN` its launcher gave
-//!   it over the socket, and this process hands it to the compositor for its
-//!   own surface. Without a token (a manual binding whose launcher minted
-//!   none) the fallback is a request for attention — a highlighted task
-//!   entry.
-//! * **Windows**: `SetForegroundWindow` is refused to background processes —
-//!   but the `--toggle` sender was launched by the user's keypress and
-//!   donates its right over the pipe with `AllowSetForegroundWindow` (see
-//!   `crate::activate`'s Windows module), after which [`win32_activate`]'s
-//!   `SetForegroundWindow` is honoured. The in-app hotkey path needs no
-//!   grant: the press was delivered to this process. Only a request with no
-//!   grant — e.g. some other process poking the pipe — degrades to a
-//!   taskbar flash.
+//! * X11: [`x11_activate`] sends `_NET_ACTIVE_WINDOW` with source 2 ("user
+//!   action") and a real server timestamp. winit sends source 1, which KWin,
+//!   Mutter and Xfwm refuse from an unfocused window; do not switch back to
+//!   it.
+//! * Wayland: only an xdg-activation token works, and winit applies one only
+//!   at window creation, so [`wayland`] hands the token relayed by `--toggle`
+//!   to the compositor itself. Without a token we can only request attention.
+//! * Windows: `SetForegroundWindow` works because the `--toggle` sender
+//!   grants us its foreground right (`AllowSetForegroundWindow`), and the
+//!   in-app hotkey's press was delivered to us; without either it degrades
+//!   to a taskbar flash.
 
 /// Whether this is a Wayland session, where raising needs an activation
 /// token; the Settings tab words its note accordingly. See the module docs.
@@ -33,7 +20,7 @@ pub fn is_wayland() -> bool {
     cfg!(all(unix, not(target_os = "macos"))) && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
-/// Bring the window to the front, restoring it if it was minimised.
+/// Brings the window to the front, restoring it if it was minimised.
 /// `token` is an xdg-activation token relayed by a `--toggle` sender, the
 /// compositor's permission to take focus; only Wayland consumes it.
 pub fn raise(ctx: &egui::Context, frame: &eframe::Frame, token: Option<&str>) {
@@ -80,7 +67,7 @@ pub fn raise(ctx: &egui::Context, frame: &eframe::Frame, token: Option<&str>) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
 }
 
-/// Restore and foreground our window with the Win32 calls themselves.
+/// Restores and foregrounds our window with the Win32 calls themselves.
 /// `false` falls back to winit's viewport commands.
 ///
 /// Not `ViewportCommand::Focus`: winit's `focus_window` routes through the
@@ -189,13 +176,10 @@ impl X11State {
         Ok(state)
     }
 
-    /// The server's current time.
-    ///
-    /// **Not `CURRENT_TIME`.** KWin reads a zero timestamp as the window
-    /// saying it does not want focus and refuses the activation, which is
-    /// what made the shortcut raise the window only sometimes. The standard
-    /// way to get a real one is a zero-length property append, which comes
-    /// back as a `PropertyNotify` stamped by the server.
+    /// The server's current time, not `CURRENT_TIME`: KWin reads a zero
+    /// timestamp as the window not wanting focus and refuses the activation.
+    /// A zero-length property append gets a real one, back as a
+    /// `PropertyNotify` stamped by the server.
     fn now(&self) -> Result<u32, Box<dyn std::error::Error>> {
         use x11rb::connection::Connection;
         use x11rb::protocol::xproto::{AtomEnum, PropMode};
@@ -255,14 +239,14 @@ impl X11State {
     }
 }
 
-/// Activate our window, EWMH style. `false` when this is not X11 or the
+/// Activates our window, EWMH style. `false` when this is not X11 or the
 /// server would not take it, so the caller can fall back to winit.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn x11_activate(frame: &eframe::Frame) -> bool {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    // Both of these used to fail silently, which is how a shortcut that never
-    // raised the window looked like a shortcut that never fired.
+    // Logged, or a shortcut that never raised the window would look like one
+    // that never fired.
     let handle = match frame.window_handle() {
         Ok(handle) => handle,
         Err(e) => {
@@ -298,9 +282,9 @@ fn x11_activate(frame: &eframe::Frame) -> bool {
     }
 }
 
-/// The Wayland activation path. winit applies an activation token in exactly
-/// one place — window creation — so for a live window we speak the protocol
-/// ourselves, over winit's own connection: `from_foreign_display` wraps its
+/// The Wayland activation path. winit applies an activation token only at
+/// window creation, so for a live window we speak the protocol ourselves,
+/// over winit's own connection: `from_foreign_display` wraps its
 /// `wl_display` as a "guest" backend with a private libwayland event queue.
 /// Roundtrips here dispatch only that queue; events for winit's objects stay
 /// queued for winit, and dropping the guest never disconnects the display
@@ -327,7 +311,7 @@ mod wayland {
     }
 
     struct WaylandState {
-        /// The wl_display this guest connection wraps — winit's. Compared on
+        /// The wl_display this guest connection wraps (winit's). Compared on
         /// every press so a different display gets a fresh connection.
         display_ptr: *mut c_void,
         conn: Connection,
@@ -419,11 +403,11 @@ mod wayland {
         }
     }
 
-    /// Activate our already-mapped window with an xdg-activation token minted
-    /// by the compositor for a real user action. `false` when this is not a
-    /// Wayland window, the compositor lacks `xdg_activation_v1`, or anything
-    /// on the way failed — the caller then falls back to a request for
-    /// attention. Note the compositor may still quietly downgrade a stale
+    /// Activates our already-mapped window with an xdg-activation token
+    /// minted by the compositor for a real user action. `false` when this is
+    /// not a Wayland window, the compositor lacks `xdg_activation_v1`, or
+    /// anything on the way failed; the caller then falls back to a request
+    /// for attention. Note the compositor may still quietly downgrade a stale
     /// token to that same attention hint; v1 has no error event to say so.
     pub(super) fn activate(frame: &eframe::Frame, token: &str) -> bool {
         let display_ptr = match frame.display_handle().map(|h| h.as_raw()) {

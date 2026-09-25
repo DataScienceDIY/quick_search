@@ -28,6 +28,11 @@ fn le32(v: u32) -> [u8; 4] {
     v.to_le_bytes()
 }
 
+/// `s` encoded as windows-1252, the formats' 8-bit form.
+fn cp1252_bytes(s: &str) -> Vec<u8> {
+    encoding_rs::WINDOWS_1252.encode(s).0.into_owned()
+}
+
 // -- .doc ------------------------------------------------------------
 
 /// A structurally real Word 97 file: a FIB whose variable sections lead to a
@@ -57,7 +62,7 @@ fn word_doc(pieces: &[(&str, bool)]) -> Vec<(&'static str, Vec<u8>)> {
     for (text, compressed) in pieces {
         let start = doc.len();
         let chars = if *compressed {
-            let bytes = encoding_rs::WINDOWS_1252.encode(text).0.into_owned();
+            let bytes = cp1252_bytes(text);
             doc.extend_from_slice(&bytes);
             bytes.len()
         } else {
@@ -185,12 +190,19 @@ fn sst_string(s: &str, wide: bool) -> Vec<u8> {
             out.extend_from_slice(&le16(u));
         }
     } else {
-        let bytes = encoding_rs::WINDOWS_1252.encode(s).0.into_owned();
+        let bytes = cp1252_bytes(s);
         out.extend_from_slice(&le16(bytes.len() as u16));
         out.push(0x00);
         out.extend_from_slice(&bytes);
     }
     out
+}
+
+/// An `SST` record body: the total and unique counts, both `strings.len()`,
+/// then the strings.
+fn sst(strings: &[Vec<u8>]) -> Vec<u8> {
+    let n = le32(strings.len() as u32);
+    [&n[..], &n[..], &strings.concat()].concat()
 }
 
 fn labelsst(index: u32) -> Vec<u8> {
@@ -204,12 +216,7 @@ fn labelsst(index: u32) -> Vec<u8> {
 
 #[test]
 fn xls_resolves_shared_strings() {
-    let mut sst = Vec::new();
-    sst.extend_from_slice(&le32(2)); // total
-    sst.extend_from_slice(&le32(2)); // unique
-    sst.extend_from_slice(&sst_string("Revenue", false));
-    sst.extend_from_slice(&sst_string("Ω omega", true));
-
+    let sst = sst(&[sst_string("Revenue", false), sst_string("Ω omega", true)]);
     let mut book = biff(xls::REC_SST, &sst);
     book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(0)));
     book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(1)));
@@ -224,13 +231,9 @@ fn xls_resolves_shared_strings() {
 /// second half of the string as the wrong encoding.
 #[test]
 fn xls_reads_a_string_split_across_a_continue_record() {
-    let mut sst = Vec::new();
-    sst.extend_from_slice(&le32(1));
-    sst.extend_from_slice(&le32(1));
-    // Declares 10 characters; only 4 sit in the SST record, the rest continue.
-    sst.extend_from_slice(&le16(10));
-    sst.push(0x00); // compressed
-    sst.extend_from_slice(b"ABCD");
+    // Declares 10 compressed characters; only 4 sit in the SST record, the
+    // rest continue.
+    let sst = sst(&[[&le16(10)[..], &[0x00], b"ABCD"].concat()]);
 
     let mut cont = vec![0x00u8]; // still compressed after the boundary
     cont.extend_from_slice(b"EFGHIJ");
@@ -246,12 +249,7 @@ fn xls_reads_a_string_split_across_a_continue_record() {
 
 #[test]
 fn xls_honours_a_width_change_at_a_continue_boundary() {
-    let mut sst = Vec::new();
-    sst.extend_from_slice(&le32(1));
-    sst.extend_from_slice(&le32(1));
-    sst.extend_from_slice(&le16(6));
-    sst.push(0x00);
-    sst.extend_from_slice(b"abc");
+    let sst = sst(&[[&le16(6)[..], &[0x00], b"abc"].concat()]);
 
     let mut cont = vec![0x01u8]; // wide from here on
     for u in "ΔΕΖ".encode_utf16() {
@@ -287,11 +285,7 @@ fn xls_indexes_numbers_as_typed() {
 
 #[test]
 fn xls_drops_an_out_of_range_shared_string_index() {
-    let mut sst = Vec::new();
-    sst.extend_from_slice(&le32(1));
-    sst.extend_from_slice(&le32(1));
-    sst.extend_from_slice(&sst_string("only", false));
-
+    let sst = sst(&[sst_string("only", false)]);
     let mut book = biff(xls::REC_SST, &sst);
     book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(0)));
     book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(9999)));
@@ -302,11 +296,9 @@ fn xls_drops_an_out_of_range_shared_string_index() {
 
 #[test]
 fn xls_ignores_a_lying_shared_string_count() {
-    let mut sst = Vec::new();
-    sst.extend_from_slice(&le32(u32::MAX));
-    sst.extend_from_slice(&le32(u32::MAX));
-    sst.extend_from_slice(&sst_string("real", false));
-
+    let mut sst = sst(&[sst_string("real", false)]);
+    // Both counts claim u32::MAX strings.
+    sst[..8].fill(0xFF);
     let mut book = biff(xls::REC_SST, &sst);
     book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(0)));
 
@@ -344,10 +336,7 @@ fn ppt_record(version: u16, rec_type: u16, payload: &[u8]) -> Vec<u8> {
 
 #[test]
 fn ppt_reads_both_atom_widths() {
-    let bytes = encoding_rs::WINDOWS_1252
-        .encode("Slide title")
-        .0
-        .into_owned();
+    let bytes = cp1252_bytes("Slide title");
     let mut wide = Vec::new();
     for u in "Ωmega body".encode_utf16() {
         wide.extend_from_slice(&le16(u));
@@ -361,15 +350,11 @@ fn ppt_reads_both_atom_widths() {
     assert!(text.contains("Ωmega body"), "{text}");
 }
 
-/// A template and a slideshow are the same container under another name, and
-/// they share the plain form's MIME — so a name the dispatch did not know was
-/// claimed, opened, and extracted to nothing rather than failing.
+/// Template and slideshow names reach their format's parser (see the
+/// `office` module doc).
 #[test]
 fn legacy_alias_names_reach_the_same_parser() {
-    let bytes = encoding_rs::WINDOWS_1252
-        .encode("Slide title")
-        .0
-        .into_owned();
+    let bytes = cp1252_bytes("Slide title");
     let deck = container(
         "ole-alias-ppt",
         "ppt",
@@ -401,11 +386,7 @@ fn legacy_alias_names_reach_the_same_parser() {
         );
     }
 
-    let mut sst = Vec::new();
-    sst.extend_from_slice(&le32(1));
-    sst.extend_from_slice(&le32(1));
-    sst.extend_from_slice(&sst_string("Revenue", false));
-    let mut book = biff(xls::REC_SST, &sst);
+    let mut book = biff(xls::REC_SST, &sst(&[sst_string("Revenue", false)]));
     book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(0)));
     let sheet = container("ole-alias-xls", "xls", &[("Workbook", book)]);
     for ext in ["xls", "xlt"] {
@@ -426,10 +407,7 @@ fn an_unknown_extension_is_an_error() {
 
 #[test]
 fn ppt_descends_into_containers() {
-    let bytes = encoding_rs::WINDOWS_1252
-        .encode("Nested deep")
-        .0
-        .into_owned();
+    let bytes = cp1252_bytes("Nested deep");
     let atom = ppt_record(0x0000, ppt::TEXT_BYTES_ATOM, &bytes);
     let inner = ppt_record(0x000F, 0x0FF0, &atom);
     let outer = ppt_record(0x000F, 0x03E8, &inner);
@@ -440,7 +418,7 @@ fn ppt_descends_into_containers() {
 
 #[test]
 fn ppt_bounds_container_recursion() {
-    let bytes = encoding_rs::WINDOWS_1252.encode("buried").0.into_owned();
+    let bytes = cp1252_bytes("buried");
     let mut rec = ppt_record(0x0000, ppt::TEXT_BYTES_ATOM, &bytes);
     for _ in 0..(ppt::MAX_DEPTH + 20) {
         rec = ppt_record(0x000F, 0x0FF0, &rec);
@@ -491,60 +469,30 @@ fn an_empty_file_is_an_error() {
 /// decode gigabytes; `clean` drops the whole C0 range, so an emitted-text
 /// brake never fires. The budget has to charge what was *read*.
 #[test]
-fn doc_overlapping_control_pieces_stop_at_the_budget() {
+fn doc_decoding_charges_the_bytes_read_to_the_budget() {
     const SPAN: usize = 4 * 1024;
     let mut doc = vec![0x01u8; SPAN];
     let marker_at = doc.len();
     doc.extend_from_slice(b"MARKER");
 
-    let mut pieces: Vec<doc::Piece> = (0..64)
-        .map(|_| doc::Piece {
-            start: 0,
-            end: SPAN,
+    // (overlapping control pieces, what survives): the budget below is 32
+    // spans, so 64 exhaust it before the marker piece and 4 do not.
+    for (overlapping, expected) in [(64, ""), (4, "MARKER")] {
+        let mut pieces: Vec<doc::Piece> = (0..overlapping)
+            .map(|_| doc::Piece {
+                start: 0,
+                end: SPAN,
+                compressed: true,
+            })
+            .collect();
+        pieces.push(doc::Piece {
+            start: marker_at,
+            end: doc.len(),
             compressed: true,
-        })
-        .collect();
-    // Reachable only if the budget did not stop the walk first.
-    pieces.push(doc::Piece {
-        start: marker_at,
-        end: doc.len(),
-        compressed: true,
-    });
-
-    // A budget of half what those pieces decode.
-    let out = doc::decode_pieces(&doc, &pieces, SPAN * 32);
-    assert!(
-        !out.contains("MARKER"),
-        "the walk ran past its budget: {out:?}"
-    );
-    assert!(
-        out.trim().is_empty(),
-        "control bytes must not survive `clean`: {out:?}"
-    );
-}
-
-#[test]
-fn doc_pieces_within_the_budget_are_all_decoded() {
-    const SPAN: usize = 4 * 1024;
-    let mut doc = vec![0x01u8; SPAN];
-    let marker_at = doc.len();
-    doc.extend_from_slice(b"MARKER");
-
-    let mut pieces: Vec<doc::Piece> = (0..4)
-        .map(|_| doc::Piece {
-            start: 0,
-            end: SPAN,
-            compressed: true,
-        })
-        .collect();
-    pieces.push(doc::Piece {
-        start: marker_at,
-        end: doc.len(),
-        compressed: true,
-    });
-
-    let out = doc::decode_pieces(&doc, &pieces, SPAN * 32);
-    assert!(out.contains("MARKER"), "stopped early: {out:?}");
+        });
+        let out = doc::decode_pieces(&doc, &pieces, SPAN * 32);
+        assert_eq!(out.trim(), expected, "{overlapping} overlapping pieces");
+    }
 }
 
 /// Every `LABELSST` resolves to a shared string `clean` erases, so an
@@ -553,12 +501,7 @@ fn doc_pieces_within_the_budget_are_all_decoded() {
 fn xls_control_character_cells_stop_at_the_budget() {
     let control: String = std::iter::repeat_n('\u{1}', 4096).collect();
 
-    let mut sst = Vec::new();
-    sst.extend_from_slice(&le32(2)); // total
-    sst.extend_from_slice(&le32(2)); // unique
-    sst.extend_from_slice(&sst_string(&control, false));
-    sst.extend_from_slice(&sst_string("MARKER", false));
-
+    let sst = sst(&[sst_string(&control, false), sst_string("MARKER", false)]);
     let mut book = biff(xls::REC_SST, &sst);
     for _ in 0..64 {
         book.extend_from_slice(&biff(xls::REC_LABELSST, &labelsst(0)));

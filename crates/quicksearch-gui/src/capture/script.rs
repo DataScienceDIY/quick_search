@@ -48,8 +48,7 @@ enum Token {
     Str(String),
 }
 
-fn tokenize(line: &str, line_no: usize) -> Result<Vec<Token>, ParseError> {
-    let err = |msg: String| ParseError { line: line_no, msg };
+fn tokenize(line: &str) -> Result<Vec<Token>, String> {
     let mut tokens = Vec::new();
     let mut chars = line.chars().peekable();
     while let Some(&c) = chars.peek() {
@@ -62,12 +61,12 @@ fn tokenize(line: &str, line_no: usize) -> Result<Vec<Token>, ParseError> {
             let mut s = String::new();
             loop {
                 match chars.next() {
-                    None => return Err(err("unclosed string".to_string())),
+                    None => return Err("unclosed string".to_string()),
                     Some('"') => break,
                     Some('\\') => match chars.next() {
                         Some(e @ ('"' | '\\')) => s.push(e),
-                        Some(e) => return Err(err(format!("unknown escape \\{e}"))),
-                        None => return Err(err("unclosed string".to_string())),
+                        Some(e) => return Err(format!("unknown escape \\{e}")),
+                        None => return Err("unclosed string".to_string()),
                     },
                     Some(other) => s.push(other),
                 }
@@ -80,7 +79,7 @@ fn tokenize(line: &str, line_no: usize) -> Result<Vec<Token>, ParseError> {
                     break;
                 }
                 if c == '"' {
-                    return Err(err("quotes may only start a token".to_string()));
+                    return Err("quotes may only start a token".to_string());
                 }
                 w.push(c);
                 chars.next();
@@ -91,88 +90,68 @@ fn tokenize(line: &str, line_no: usize) -> Result<Vec<Token>, ParseError> {
     Ok(tokens)
 }
 
+/// The commands in `src`, or the first line that fails to parse.
 pub(super) fn parse_script(src: &str) -> Result<Vec<Cmd>, ParseError> {
-    let mut cmds = Vec::new();
-    for (i, line) in src.lines().enumerate() {
-        let line_no = i + 1;
-        let tokens = tokenize(line, line_no)?;
-        if let Some(cmd) = parse_line(&tokens, line_no)? {
-            cmds.push(cmd);
-        }
-    }
-    Ok(cmds)
+    src.lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            tokenize(line)
+                .and_then(|tokens| parse_line(&tokens))
+                .map_err(|msg| ParseError { line: i + 1, msg })
+                .transpose()
+        })
+        .collect()
 }
 
-fn parse_line(tokens: &[Token], line_no: usize) -> Result<Option<Cmd>, ParseError> {
-    let err = |msg: String| ParseError { line: line_no, msg };
+fn parse_line(tokens: &[Token]) -> Result<Option<Cmd>, String> {
     let Some(first) = tokens.first() else {
         return Ok(None);
     };
     let Token::Word(name) = first else {
-        return Err(err(
-            "a line must start with a command, not a string".to_string()
-        ));
+        return Err("a line must start with a command, not a string".to_string());
     };
 
     let rest = &mut tokens[1..].iter();
     let cmd = match name.as_str() {
-        "wait_ms" => Cmd::WaitMs(parse_int(
-            "duration",
-            next_word(rest, line_no, "duration in ms")?,
-            line_no,
-        )?),
+        "wait_ms" => Cmd::WaitMs(next_int(rest, "duration", "duration in ms")?),
         "type" => {
             let text = match rest.next() {
                 Some(Token::Str(s)) => s.clone(),
-                Some(Token::Word(_)) => {
-                    return Err(err("the text to type must be quoted".to_string()));
-                }
-                None => return Err(err("missing text to type".to_string())),
+                Some(Token::Word(_)) => return Err("the text to type must be quoted".to_string()),
+                None => return Err("missing text to type".to_string()),
             };
             let cps = match rest.next() {
                 None => 7.0,
                 Some(Token::Word(w)) if w == "cps" => {
-                    let v = next_word(rest, line_no, "cps value")?;
+                    let v = next_word(rest, "cps value")?;
                     let cps: f32 = v
                         .parse()
-                        .map_err(|_| err(format!("invalid cps {v:?}: expected a number")))?;
+                        .map_err(|_| format!("invalid cps {v:?}: expected a number"))?;
                     if !(cps.is_finite() && cps > 0.0) {
-                        return Err(err("cps must be positive".to_string()));
+                        return Err("cps must be positive".to_string());
                     }
                     cps
                 }
-                Some(other) => return Err(err(format!("expected `cps`, found {other:?}"))),
+                Some(other) => return Err(format!("expected `cps`, found {other:?}")),
             };
             Cmd::Type { text, cps }
         }
         "clear_query" => Cmd::ClearQuery,
         "focus_search" => Cmd::FocusSearch,
         "window" => {
-            let w = parse_int(
-                "width",
-                next_word(rest, line_no, "width in points")?,
-                line_no,
-            )?;
-            let h = parse_int(
-                "height",
-                next_word(rest, line_no, "height in points")?,
-                line_no,
-            )?;
+            let w = next_int(rest, "width", "width in points")?;
+            let h = next_int(rest, "height", "height in points")?;
             if w == 0 || h == 0 {
-                return Err(err("window dimensions must be positive".to_string()));
+                return Err("window dimensions must be positive".to_string());
             }
             Cmd::Window {
                 w: w as f32,
                 h: h as f32,
             }
         }
-        "hover_match" => {
-            Cmd::HoverMatch(
-                parse_int("row", next_word(rest, line_no, "row index")?, line_no)? as usize,
-            )
-        }
+        "hover_match" => Cmd::HoverMatch(next_int(rest, "row", "row index")? as usize),
         "hover_off" => Cmd::HoverOff,
-        "tab" => Cmd::Tab(match next_word(rest, line_no, "tab name")? {
+        "tab" => Cmd::Tab(match next_word(rest, "tab name")? {
             "search" => Tab::Search,
             "manage" => Tab::Manage,
             "duplicates" => Tab::Duplicates,
@@ -180,21 +159,19 @@ fn parse_line(tokens: &[Token], line_no: usize) -> Result<Option<Cmd>, ParseErro
             "help" => Tab::Help,
             "settings" => Tab::Settings,
             other => {
-                return Err(err(format!(
+                return Err(format!(
                     "unknown tab {other:?}: expected search, manage, duplicates, \
                      logs, help or settings"
-                )));
+                ));
             }
         }),
         "wait_index_running" | "wait_index_idle" | "wait_search_done" | "wait_dups_done" => {
             let max_ms = match rest.next() {
                 None => None,
-                Some(Token::Word(w)) if w == "max" => Some(parse_int(
-                    "max",
-                    next_word(rest, line_no, "max value in ms")?,
-                    line_no,
-                )?),
-                Some(other) => return Err(err(format!("expected `max`, found {other:?}"))),
+                Some(Token::Word(w)) if w == "max" => {
+                    Some(next_int(rest, "max", "max value in ms")?)
+                }
+                Some(other) => return Err(format!("expected `max`, found {other:?}")),
             };
             match name.as_str() {
                 "wait_index_running" => Cmd::WaitIndexRunning { max_ms },
@@ -203,64 +180,47 @@ fn parse_line(tokens: &[Token], line_no: usize) -> Result<Option<Cmd>, ParseErro
                 _ => Cmd::WaitDupsDone { max_ms },
             }
         }
-        "record_start" => Cmd::RecordStart(parse_name(
-            next_word(rest, line_no, "output name")?,
-            line_no,
-        )?),
+        "record_start" => Cmd::RecordStart(parse_name(next_word(rest, "output name")?)?),
         "record_stop" => Cmd::RecordStop,
-        "screenshot" => Cmd::Screenshot(parse_name(
-            next_word(rest, line_no, "output name")?,
-            line_no,
-        )?),
+        "screenshot" => Cmd::Screenshot(parse_name(next_word(rest, "output name")?)?),
         "quit" => Cmd::Quit,
-        other => return Err(err(format!("unknown command {other:?}"))),
+        other => return Err(format!("unknown command {other:?}")),
     };
 
     if let Some(extra) = rest.next() {
-        return Err(err(format!(
-            "unexpected {extra:?} after a complete command"
-        )));
+        return Err(format!("unexpected {extra:?} after a complete command"));
     }
     Ok(Some(cmd))
 }
 
-fn next_word<'a>(
-    rest: &mut std::slice::Iter<'a, Token>,
-    line_no: usize,
-    what: &str,
-) -> Result<&'a str, ParseError> {
+/// The next token as a bare word; `what` names it in the error.
+fn next_word<'a>(rest: &mut std::slice::Iter<'a, Token>, what: &str) -> Result<&'a str, String> {
     match rest.next() {
         Some(Token::Word(w)) => Ok(w.as_str()),
-        Some(Token::Str(_)) => Err(ParseError {
-            line: line_no,
-            msg: format!("expected {what}, found a string"),
-        }),
-        None => Err(ParseError {
-            line: line_no,
-            msg: format!("missing {what}"),
-        }),
+        Some(Token::Str(_)) => Err(format!("expected {what}, found a string")),
+        None => Err(format!("missing {what}")),
     }
 }
 
-fn parse_int(what: &str, w: &str, line_no: usize) -> Result<u64, ParseError> {
-    w.parse::<u64>().map_err(|_| ParseError {
-        line: line_no,
-        msg: format!("invalid {what} {w:?}: expected an integer"),
-    })
+/// The next token as a whole number: `name` is what an invalid one is
+/// called, `what` what a missing one is.
+fn next_int(rest: &mut std::slice::Iter<'_, Token>, name: &str, what: &str) -> Result<u64, String> {
+    let w = next_word(rest, what)?;
+    w.parse::<u64>()
+        .map_err(|_| format!("invalid {name} {w:?}: expected an integer"))
 }
 
 /// A plain filename stem inside `$QS_CAPTURE_OUT`; the driver adds the suffix.
-fn parse_name(w: &str, line_no: usize) -> Result<String, ParseError> {
+fn parse_name(w: &str) -> Result<String, String> {
     let ok = !w.is_empty()
         && w.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
     if ok {
         Ok(w.to_string())
     } else {
-        Err(ParseError {
-            line: line_no,
-            msg: format!("invalid name {w:?}: use only letters, digits, `.`, `_`, `-`"),
-        })
+        Err(format!(
+            "invalid name {w:?}: use only letters, digits, `.`, `_`, `-`"
+        ))
     }
 }
 

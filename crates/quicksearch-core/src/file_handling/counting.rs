@@ -22,8 +22,8 @@ fn parse_wc_l_stdout(bytes: &[u8]) -> Result<usize, String> {
 const COUNT_POLL_MS: u64 = 50;
 
 /// Wait on every member of the pipeline; returns the status of a member that
-/// failed, or `None` when all succeeded. `terminal_status` is the one already
-/// collected by the caller.
+/// failed, or `None` when all succeeded. `terminal_status` is the last
+/// member's, already collected by the caller.
 #[cfg(unix)]
 fn reap_all(
     children: &mut [&mut std::process::Child],
@@ -31,10 +31,7 @@ fn reap_all(
 ) -> Option<std::process::ExitStatus> {
     let mut failed = (!terminal_status.success()).then_some(terminal_status);
     let last = children.len().saturating_sub(1);
-    for (i, child) in children.iter_mut().enumerate() {
-        if i == last {
-            continue;
-        }
+    for child in &mut children[..last] {
         if let Ok(status) = child.wait() {
             if !status.success() && failed.is_none() {
                 failed = Some(status);
@@ -45,6 +42,14 @@ fn reap_all(
 }
 
 #[cfg(unix)]
+fn kill_all(children: &mut [&mut std::process::Child]) {
+    for child in children.iter_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(unix)]
 fn wait_pipeline_cancellable(
     children: &mut [&mut std::process::Child],
     cancel: &std::sync::atomic::AtomicBool,
@@ -52,10 +57,7 @@ fn wait_pipeline_cancellable(
     use std::sync::atomic::Ordering;
     loop {
         if cancel.load(Ordering::Relaxed) {
-            for child in children.iter_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            kill_all(children);
             return Err("count cancelled".to_string());
         }
         let Some(terminal) = children.last_mut() else {
@@ -66,14 +68,13 @@ fn wait_pipeline_cancellable(
                 // The terminal child's output is a couple dozen bytes, so
                 // reading after exit can't deadlock.
                 let mut out = Vec::new();
-                if let Some(stdout) = terminal.stdout.take() {
+                if let Some(mut stdout) = terminal.stdout.take() {
                     use std::io::Read;
-                    let mut stdout = stdout;
                     let _ = stdout.read_to_end(&mut out);
                 }
                 // Every member, not just the terminal: a failed `find` writes
-                // nothing while `wc -l` prints `0` and exits *successfully* —
-                // read through the terminal alone that is a tree of zero
+                // nothing while `wc -l` prints `0` and exits successfully,
+                // which read through the terminal alone is a tree of zero
                 // files. Reaping also keeps `find` from living on as a zombie.
                 let failed = reap_all(children, status);
                 if let Some(bad) = failed {
@@ -83,10 +84,7 @@ fn wait_pipeline_cancellable(
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(COUNT_POLL_MS)),
             Err(e) => {
-                for child in children.iter_mut() {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
+                kill_all(children);
                 return Err(format!("count wait: {}", e));
             }
         }
@@ -135,7 +133,7 @@ fn count_find_pipe_wc(
 /// test; the `walkdir` import is local because a file-level one is invisible
 /// to a host that cannot compile this branch.
 #[cfg(all(windows, test))]
-fn count_tree_entries_walkdir(
+pub(super) fn count_tree_entries_walkdir(
     path: &str,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<usize, String> {
@@ -156,11 +154,11 @@ fn count_tree_entries_walkdir(
 }
 
 /// Count tree entries by reading directories in bulk through
-/// `GetFileInformationByHandleEx` — one syscall per 64 KiB of directory data
+/// `GetFileInformationByHandleEx`: one syscall per 64 KiB of directory data
 /// instead of `read_dir`'s one per entry. Iterative so a deep tree cannot
 /// exhaust the stack.
 #[cfg(windows)]
-fn count_tree_entries_win32(
+pub(super) fn count_tree_entries_win32(
     path: &str,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<usize, String> {
@@ -195,8 +193,8 @@ fn count_tree_entries_win32(
             return Err("count cancelled".to_string());
         }
 
-        // FILE_FLAG_BACKUP_SEMANTICS is what makes CreateFileW open a
-        // directory rather than fail.
+        // FILE_FLAG_BACKUP_SEMANTICS makes CreateFileW open a directory
+        // rather than fail.
         let handle = unsafe {
             CreateFileW(
                 wide(&dir).as_ptr(),
@@ -238,8 +236,8 @@ fn count_tree_entries_win32(
                 let info =
                     unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
 
-                // FileNameLength is in bytes; FileName is UTF-16 and *not*
-                // NUL-terminated — the length is all that says where it ends.
+                // FileNameLength is in bytes; FileName is UTF-16 and not
+                // NUL-terminated, so the length alone says where it ends.
                 let name_units = (info.FileNameLength as usize) / 2;
                 let name =
                     unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), name_units) };

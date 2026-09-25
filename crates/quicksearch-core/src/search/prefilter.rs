@@ -3,11 +3,11 @@
 //!
 //! # The one rule
 //!
-//! A prefilter must be a **superset** of what the pass accepts. It may admit
-//! rows the pass then rejects — every candidate is verified afterwards, so
+//! **A prefilter must be a superset of what the pass accepts.** It may admit
+//! rows the pass then rejects: every candidate is verified afterwards, so
 //! results do not change, only how many rows are looked at. It must never
 //! exclude a row the pass would have accepted, because that failure has no
-//! symptom: the file simply stops appearing, and no error is raised anywhere.
+//! symptom: the file stops appearing, and no error is raised anywhere.
 
 use rusqlite::types::Value;
 
@@ -30,13 +30,13 @@ pub struct Required(Vec<String>);
 
 impl Required {
     /// `None` when the set cannot constrain anything: empty, too wide to be
-    /// worth it, or containing an empty literal (`""` says "a match may begin
-    /// with nothing" — no constraint at all). Callers see `None` and scan.
+    /// worth it, or containing an empty literal (`""` says a match may begin
+    /// with nothing). Callers see `None` and scan.
     pub fn new(literals: Vec<String>) -> Option<Required> {
-        if literals.is_empty() || literals.len() > MAX_LITERALS {
-            return None;
-        }
-        if literals.iter().any(|l| l.is_empty()) {
+        if literals.is_empty()
+            || literals.len() > MAX_LITERALS
+            || literals.iter().any(|l| l.is_empty())
+        {
             return None;
         }
         Some(Required(literals))
@@ -48,12 +48,11 @@ impl Required {
 
     /// A `searchabletext MATCH` expression: `(text: "a" OR text: "b" …)`.
     ///
-    /// `None` when any literal is shorter than [`TRIGRAM_FLOOR`]
-    /// **characters** — the tokenizer indexes character triples, so a
-    /// byte-length test would admit a phrase that matches no token.
-    /// [`quote_phrase`] renders FTS5 syntax in user text inert; the index
-    /// folds case and diacritics, so it matches *more* than the literal as
-    /// written — the harmless direction.
+    /// `None` when any literal is shorter than [`TRIGRAM_FLOOR`] characters:
+    /// the tokenizer indexes character triples, so a byte-length test would
+    /// admit a phrase that matches no token. [`quote_phrase`] renders FTS5
+    /// syntax in user text inert. The index folds case and diacritics, so it
+    /// matches more than the literal as written, the harmless direction.
     pub fn fts_expr(&self) -> Option<String> {
         if self.0.iter().any(|l| l.chars().count() < TRIGRAM_FLOOR) {
             return None;
@@ -77,7 +76,7 @@ impl Required {
     /// separator-free literal cannot span the join, because `parent`'s last
     /// byte is always a separator ([`crate::file_handling::dir_to_db_parent`]).
     /// The set is an OR, so one untestable literal disqualifies the whole
-    /// predicate. No trigram floor here — `LIKE '%ab%'` is a fine filter.
+    /// predicate. No trigram floor here: `LIKE '%ab%'` is a fine filter.
     pub fn like_predicate(&self) -> Option<(String, Vec<Value>)> {
         if self.0.iter().any(|l| l.contains(std::path::MAIN_SEPARATOR)) {
             return None;

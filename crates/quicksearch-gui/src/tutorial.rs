@@ -2,18 +2,10 @@
 //! only in a config file this version created, so upgrading does not summon
 //! it. The Help tab can bring it back afterwards.
 //!
-//! Every page points at what it is talking about. Words wrapped in `[square
-//! brackets]` in a page's prose are keywords: the brackets are markup,
-//! stripped before anything is painted, and what was inside is coloured and
-//! pulsed. The n-th keyword on a page pairs with the n-th entry of its
-//! `spots` and the two share a colour, so "[search bar]" pulsing blue in the
-//! prose is unambiguously about the box pulsing blue on screen. The pairing
-//! is only as good as the two lists agreeing, which
-//! `every_keyword_has_a_spot_to_point_at` holds them to.
-//!
-//! The window is deliberately not modal and not anchored: the user can drag
-//! it off whatever it is covering, and can use the app underneath while it
-//! is up.
+//! `[bracketed]` words in a page's prose are keywords: the brackets are
+//! stripped, and the n-th keyword is painted in the same pulsing colour as
+//! the glow around the n-th entry of `spots`. The window is not modal or
+//! anchored, so the user can drag it aside and keep using the app.
 
 use std::borrow::Cow;
 
@@ -28,10 +20,10 @@ struct Page {
     /// A first paragraph built from live state, ahead of `body`.
     lead: Option<fn(&[String]) -> String>,
     body: &'static [&'static str],
-    /// Rendered small under the body — where to go, not what the thing is.
+    /// Rendered small under the body: where to go, not what the thing is.
     pointer: Option<&'static str>,
     /// Switched to as the page is entered, so the page's subject is on screen.
-    tab: Option<Tab>,
+    tab: Tab,
     /// Paired in order with the keywords in `lead` then `body`.
     spots: &'static [Spot],
     /// Typed into the search box a character at a time, on entry.
@@ -51,13 +43,13 @@ enum Extra {
     Shortcut,
 }
 
-/// Field defaults for the pages that do not point anywhere.
+/// Field defaults: a Search tab page that points at nothing.
 const PLAIN: Page = Page {
     title: "",
     lead: None,
     body: &[],
     pointer: None,
-    tab: None,
+    tab: Tab::Search,
     spots: &[],
     type_query: None,
     extra: None,
@@ -69,32 +61,26 @@ const PAGES: &[Page] = &[
         body: &[
             "QuickSearch is a search engine for your local files and their contents.",
             "By default, only your user folder is indexed and searchable.",
-            "Because the answers come from the index rather than from reading \
-             your disk, results appear as fast as you can type, even across \
-             hundreds of thousands of files.",
+            "Answers come from the index rather than the disk, so results \
+             appear as you type, even across hundreds of thousands of files.",
         ],
         pointer: Some(
-            "A quick tutorial for new users! Drag this window by its title bar \
-             if it covers something. Hit Skip to exit.",
+            "A short tour for new users. Drag this window by its title bar if it \
+             is in the way, or click Skip to leave.",
         ),
-        tab: Some(Tab::Search),
         extra: Some(Extra::Scale),
         ..PLAIN
     },
     Page {
         title: "Open QuickSearch hotkey",
         body: &[
-            "Would you like a keyboard shortcut that brings QuickSearch up \
-             from anywhere? Click the button below and press the keys you \
-             want — it takes effect at once.",
-            "QuickSearch does not sit in the background waiting for that key, \
-             though. When you close it, it closes completely and gives back \
-             the memory it was using; it starts again, index and all, in a \
-             moment. So to have a key start it as well, bind the command \
-             underneath in your desktop's own keyboard settings.",
+            "Want a key that brings QuickSearch up from anywhere? Click the \
+             button below and press the keys; it works at once.",
+            "QuickSearch doesn't run in the background, so once closed the key \
+             can't reach it. To have the key start it too, bind the command \
+             below in your desktop's keyboard settings.",
         ],
         pointer: Some("Both of these are on the Settings tab too, under Interface."),
-        tab: Some(Tab::Search),
         extra: Some(Extra::Shortcut),
         ..PLAIN
     },
@@ -105,41 +91,36 @@ const PAGES: &[Page] = &[
             "A folder you add is indexed in the background; everything already \
              in the index is left alone.",
         ),
-        tab: Some(Tab::Manage),
+        tab: Tab::Manage,
         spots: &[Spot::IndexedFolderAdd],
         ..PLAIN
     },
     Page {
         title: "What is indexing?",
         body: &[
-            "Indexing is QuickSearch reading through your folders once and \
-             remembering what it found, so that searching later is instant. It \
-             runs on its own in the background and keeps up with changes as you \
-             make them.",
+            "Indexing is QuickSearch reading your folders once and remembering \
+             what it found, so later searches are instant. It runs in the \
+             background and keeps up as your files change.",
             "You decide what gets read: [ignore patterns] keep files and folders \
-             out of the index entirely, while the [extensions whitelist] limits \
-             which file types have their contents read. Both are under Content \
+             out of the index entirely, and the [extensions whitelist] limits \
+             which file types have their text read. Both are under Content \
              filters on this tab.",
-            "QuickSearch never connects to the internet, and always respects your privacy. \
-             QuickSearch can encrypt your index to make this remembered data more secure.",
+            "QuickSearch never connects to the internet, and it can encrypt the \
+             index with a password.",
         ],
-        pointer: Some("To set an index password, look near the bottom of the Settings tab."),
-        tab: Some(Tab::Manage),
+        pointer: Some("The password setting is near the bottom of the Settings tab."),
+        tab: Tab::Manage,
         spots: &[Spot::IgnorePatterns, Spot::ExtWhitelist],
         ..PLAIN
     },
     Page {
         title: "Search: Input",
         body: &[
-            "QuickSearch begins searching as soon as you start typing in the \
-             [search bar]. It accepts words, filenames, file extensions, and \
-             several other specifiers. Click the \"[?]\" block for full details.",
+            "QuickSearch searches as you type in the [search bar]. It takes \
+             words, file names, extensions and filters; click the \"[?]\" \
+             button for the full syntax.",
         ],
-        pointer: Some(
-            "Filters you can type into a query look like type:Document or \
-             modified:>=2024-01-01.",
-        ),
-        tab: Some(Tab::Search),
+        pointer: Some("Filters look like type:Document or modified:>=2024-01-01."),
         spots: &[Spot::SearchBar, Spot::QueryHelp],
         type_query: Some("QuickSearch"),
         ..PLAIN
@@ -147,88 +128,77 @@ const PAGES: &[Page] = &[
     Page {
         title: "How results are ranked",
         body: &[
-            "The best search matches come first (have the lowest rank). \
-             Exact file-name matches are best, then names that contain what you typed; then \
-             files whose contents contain the search terms, the ones mentioning it most often \
-             first; and last, files matched only by their full folder path.",
-            "The coloured number in the [Rank] column is which of those tiers a \
-             result came from: blue is a great match, red is a distant one. \
-             Clicking a column heading sorts by something else instead.",
+            "The best matches come first, with the lowest rank: exact file \
+             names, then names containing what you typed, then files whose \
+             contents contain it (most mentions first), and last, files matched \
+             only by a folder in their path.",
+            "The coloured number in the [Rank] column shows a result's tier: \
+             blue is a close match, red a distant one. Click a column heading \
+             to sort by something else.",
         ],
-        pointer: Some("Right-click any column heading to choose which columns are shown."),
-        tab: Some(Tab::Search),
+        pointer: Some("Right-click any column heading to choose the columns shown."),
         spots: &[Spot::RankColumn],
         ..PLAIN
     },
     Page {
         title: "The status bar",
         body: &[
-            "The [status bar] along the bottom of the window is what QuickSearch \
-             is doing. While it is indexing it shows the phase, how far through \
-             it is, and how fast; when it has nothing to do it shows how many \
-             files are indexed.",
-            "Searching works the whole time, including during that first indexing run, \
-             but some files might not be shown in the results until the scan completes.",
+            "The [status bar] along the bottom shows what QuickSearch is \
+             doing: while indexing, the phase, progress and speed; when idle, \
+             how many files are indexed.",
+            "Searching works throughout, even during the first indexing run, \
+             though files not yet reached won't appear until the scan gets to \
+             them.",
         ],
-        tab: Some(Tab::Search),
         spots: &[Spot::StatusBar],
         ..PLAIN
     },
     Page {
-        title: "Fuzzy Finding",
+        title: "Fuzzy finding",
         body: &[
-            "Tick [Fuzzy] beside the search box to also match words with typos \
-             in them! When checked, \"repot\" will find \"report\". It searches more \
-             thoroughly, so it is a little slower to find all results, but the exact \
-             matches will be found just as fast and be displayed first.",
-            "Right-click any result for more options: open it, open the folder holding \
-             it, copy its path, or build a filter that hides files like it from \
-             future searches.",
+            "Tick [Fuzzy] beside the search box to also match words with typos, \
+             so \"repot\" finds \"report\". The extra searching takes a little \
+             longer, but exact matches arrive just as fast and come first.",
+            "Right-click any result to open it or its folder, copy its path, or \
+             build a filter that hides files like it from future searches.",
         ],
-        tab: Some(Tab::Search),
         spots: &[Spot::FuzzyToggle],
         ..PLAIN
     },
     Page {
         title: "Duplicates",
         body: &[
-            "The [Duplicates] tab looks for files across all indexed folders for identical copies. \
-             They are shown grouped together, with the largest wasted space first — or grouped \
-             by file extension, if that is how you would rather work through them.",
+            "The [Duplicates] tab finds copies of the same file across your \
+             indexed folders, grouped with the most wasted space first, or by \
+             extension if you prefer.",
             "It is a quick way to find the same download sitting in three \
-             places. QuickSearch only shows you the groups; deleting anything is \
-             left to you.",
-            "For speed, files are matched on their size and on how they begin — the \
-             first few kilobytes — which makes a group a strong suspicion rather \
-             than a certainty. Right-click any group and choose \"Verify copies are \
-             identical\" to read every byte before you delete anything. The tab says \
-             so at the top, every time.",
+             places. It only shows the groups; deleting is up to you.",
+            "For speed, files are matched on size and their first few \
+             kilobytes, so a group is a strong suspicion, not a certainty. \
+             Right-click a group and choose \"Verify copies are identical\" to \
+             compare every byte before you delete anything.",
         ],
         pointer: Some(
-            "A group you never want to see again can be hidden, and a folder that is \
-             meant to hold copies can be excluded — both from that same right-click \
-             menu.",
+            "From the same menu you can hide a group for good, or exclude a \
+             folder that is meant to hold copies.",
         ),
-        tab: Some(Tab::Duplicates),
+        tab: Tab::Duplicates,
         spots: &[Spot::TabButton(Tab::Duplicates)],
         ..PLAIN
     },
     Page {
         title: "Settings",
         body: &[
-            "The [Settings] tab, at the right-hand end of the tab strip, is where \
-             you can tweak and tune the software. Mouse over any of \
-             the settings for a brief description of what they do.",
+            "The [Settings] tab, at the right end of the tab strip, is where you \
+             tune QuickSearch. Hover any setting for a short description.",
             "Most changes wait for the Apply & Save button at the bottom.",
-            "You can see this introduction again at any time from the [Help] tab \
-             — the \"Show the introduction again\" button at the top.",
-            "QuickSearch is completely free for anyone to use. If you love it, please let your friends know about us!",
+            "To see this introduction again, use the \"Show the introduction \
+             again\" button at the top of the [Help] tab.",
+            "QuickSearch is free for anyone to use. If you like it, please tell \
+             your friends!",
         ],
-        tab: Some(Tab::Settings),
-        spots: &[
-            Spot::TabButton(Tab::Settings),
-            Spot::TabButton(Tab::Help),
-        ],
+        tab: Tab::Settings,
+        spots: &[Spot::TabButton(Tab::Settings), Spot::TabButton(Tab::Help)],
         ..PLAIN
     },
 ];
@@ -333,9 +303,9 @@ fn paragraph_job(ui: &egui::Ui, text: &str, next_keyword: &mut usize, pulse: f32
     job
 }
 
-/// The tour's own note size. `hint` is egui's `Small`, which is a touch fine
-/// to read in the one window a first-time user meets the app through; full
-/// Body would stop a note reading as an aside.
+/// The tour's note size: 2 points up on `hint`'s `Small`, which is a touch
+/// fine for a first-time user's first window, and still below Body so a note
+/// reads as an aside.
 fn note(ui: &egui::Ui, text: impl Into<egui::RichText>) -> egui::RichText {
     hint(text).size(egui::TextStyle::Small.resolve(ui.style()).size + 2.0)
 }
@@ -345,8 +315,8 @@ fn note(ui: &egui::Ui, text: impl Into<egui::RichText>) -> egui::RichText {
 struct Live<'a> {
     /// `ctx.zoom_factor()`, read before the window is laid out.
     zoom: f32,
-    /// The slider's position while it differs from `zoom` — chosen but not
-    /// yet applied. `None` once Apply is clicked or nothing is pending.
+    /// The slider's position while it differs from `zoom`: chosen, not yet
+    /// applied. `None` once Apply is clicked or nothing is pending.
     staged_scale: &'a mut Option<f32>,
     /// The shortcut in force, as the config spells it.
     hotkey: &'a str,
@@ -382,8 +352,8 @@ fn extra_ui(ui: &mut egui::Ui, extra: Extra, live: &mut Live, actions: &mut Tour
             });
             ui.label(note(
                 ui,
-                "Makes everything larger or smaller together. You can change \
-                 it again on the Settings tab.",
+                "Makes everything larger or smaller. You can change it later on \
+                 the Settings tab.",
             ));
         }
         // Both of the Settings tab's shortcut controls, and the same two
@@ -448,44 +418,59 @@ impl Typing {
 /// What the tour asks the app to do after this frame.
 #[derive(Default)]
 pub struct TourActions {
-    /// The tour is over — skipped or read to the end.
+    /// The tour is over: skipped or read to the end.
     pub dismissed: bool,
     pub goto_tab: Option<Tab>,
     pub set_query: Option<String>,
     pub focus_search: bool,
-    /// A new UI scale from the welcome page's slider, applied and saved on
-    /// its Apply button — never mid-drag, which would rescale the slider
-    /// under the pointer.
+    /// A new UI scale from the welcome page's slider, sent only by its Apply
+    /// button (see `extra_ui`), to apply and save.
     pub set_scale: Option<f32>,
     /// A shortcut captured on the shortcut page, to register and save.
     pub set_hotkey: Option<String>,
 }
 
+/// A footer click. Applied after the window, so the page rendered stays the
+/// one its buttons were laid out for.
+enum Nav {
+    Back,
+    Next,
+    /// Skip, or Finish on the last page.
+    Dismiss,
+}
+
+#[derive(Default)]
 pub struct Tutorial {
     page: usize,
     /// The page whose arrival has already been acted on. Entering a page
     /// switches tabs once, not every frame: a user who clicks another tab
     /// mid-page is not dragged back.
-    shown: Option<usize>,
+    entered_page: Option<usize>,
     typing: Option<Typing>,
     /// The user has dragged the window, so where it sits is their business.
-    moved: bool,
+    user_dragged: bool,
     /// The shortcut button is armed and the next key combination is the
-    /// answer — the Settings tab's own capture, and its own flag.
+    /// answer: the Settings tab's own capture, with its own flag.
     capturing_hotkey: bool,
     /// The welcome page's scale slider, between moving and Apply.
     staged_scale: Option<f32>,
 }
 
 impl Tutorial {
-    pub fn new() -> Tutorial {
-        Tutorial {
-            page: 0,
-            shown: None,
-            typing: None,
-            moved: false,
-            capturing_hotkey: false,
-            staged_scale: None,
+    /// Arrival on the current page: its tab, and its typing from empty.
+    fn enter_page(&mut self, page: &Page, now: f64, actions: &mut TourActions) {
+        self.entered_page = Some(self.page);
+        actions.goto_tab = Some(page.tab);
+        self.typing = page.type_query.map(|text| Typing {
+            text,
+            started: now,
+            emitted: 0,
+        });
+        if self.typing.is_some() {
+            // From empty, with the caret in the box: what follows should
+            // read as someone typing, not as a value appearing.
+            actions.set_query = Some(String::new());
+            actions.focus_search = true;
         }
     }
 
@@ -496,23 +481,11 @@ impl Tutorial {
         let page = &PAGES[self.page.min(PAGES.len() - 1)];
         let (first, last) = (self.page == 0, self.page + 1 == PAGES.len());
         let mut actions = TourActions::default();
-        let mut step: i64 = 0;
+        let mut nav = None;
         let now = ctx.input(|i| i.time);
 
-        if self.shown != Some(self.page) {
-            self.shown = Some(self.page);
-            actions.goto_tab = page.tab;
-            self.typing = page.type_query.map(|text| Typing {
-                text,
-                started: now,
-                emitted: 0,
-            });
-            if self.typing.is_some() {
-                // From empty, with the caret in the box: what follows should
-                // read as someone typing, not as a value appearing.
-                actions.set_query = Some(String::new());
-                actions.focus_search = true;
-            }
+        if self.entered_page != Some(self.page) {
+            self.enter_page(page, now, &mut actions);
         }
         if let Some(typing) = &mut self.typing {
             if let Some(typed) = typing.advance(now) {
@@ -526,23 +499,15 @@ impl Tutorial {
         // rather than snapping to the old value mid-drag. It also follows an
         // ad-hoc Ctrl +/- zoom, which is the size the user is looking at.
         let zoom = ctx.zoom_factor();
-        // Lifted out of `self` for the window's closure, and put back after:
-        // the closure already holds the page and the actions.
-        let mut capturing = self.capturing_hotkey;
-        let mut staged_scale = self.staged_scale;
-        let mut dismissed = false;
         let mut window = egui::Window::new(page.title)
             .id(egui::Id::new(WINDOW_ID))
             .collapsible(false)
             .resizable(false)
             .pivot(egui::Align2::CENTER_CENTER);
-        if !self.moved {
-            // Re-centred every frame rather than positioned once: the window
-            // is measured on its first frame and the viewport is not
-            // necessarily its final size on ours, so a position chosen then
-            // can be anywhere. Dropped the moment the user drags — the drag
-            // delta is applied after this, so the first drag frame already
-            // moves and the next one stops overriding.
+        if !self.user_dragged {
+            // Re-centre every frame until the user drags: the viewport may
+            // not have its final size on the first frame, so a one-off
+            // position can land anywhere.
             window = window.current_pos(ctx.screen_rect().center());
         }
         let shown = window.show(ctx, |ui| {
@@ -553,15 +518,13 @@ impl Tutorial {
                 ui.label(job);
                 ui.add_space(6.0);
             }
-            // The page's control first, then its note: a note that mentions
-            // what is on the page has to come after it, and it is the last
-            // and smallest thing before the footer either way.
+            // The page's control, then its note, which may mention it.
             if let Some(extra) = page.extra {
                 let mut live = Live {
                     zoom,
-                    staged_scale: &mut staged_scale,
+                    staged_scale: &mut self.staged_scale,
                     hotkey,
-                    capturing_hotkey: &mut capturing,
+                    capturing_hotkey: &mut self.capturing_hotkey,
                 };
                 extra_ui(ui, extra, &mut live, &mut actions);
             }
@@ -578,12 +541,12 @@ impl Tutorial {
                 // one is stretched to the full third.
                 cols[0].with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                     if ui.add_enabled(!first, egui::Button::new("Back")).clicked() {
-                        step = -1;
+                        nav = Some(Nav::Back);
                     }
                 });
                 cols[1].vertical_centered(|ui| {
                     if ui.button("Skip").clicked() {
-                        dismissed = true;
+                        nav = Some(Nav::Dismiss);
                     }
                 });
                 // `Align::Min`: a column is as tall as the window, so
@@ -595,21 +558,15 @@ impl Tutorial {
                         .add(crate::ui_util::bordered_button(next, p.blue))
                         .clicked()
                     {
-                        if last {
-                            dismissed = true;
-                        } else {
-                            step = 1;
-                        }
+                        nav = Some(if last { Nav::Dismiss } else { Nav::Next });
                     }
                     ui.label(hint(format!("{} of {}", self.page + 1, PAGES.len())));
                 });
             });
         });
         if shown.is_some_and(|window| window.response.dragged()) {
-            self.moved = true;
+            self.user_dragged = true;
         }
-        self.capturing_hotkey = capturing;
-        self.staged_scale = staged_scale;
 
         // The widgets this page names, in the colours its keywords were given.
         let dark_mode = ctx.style().visuals.dark_mode;
@@ -622,18 +579,18 @@ impl Tutorial {
             ctx.request_repaint_after(ANIMATION_TICK);
         }
 
-        // After the closure, so the rendered page stays the one its buttons
-        // were laid out for.
-        if step != 0 {
-            let next = self.page as i64 + step;
-            self.page = next.clamp(0, PAGES.len() as i64 - 1) as usize;
-        }
-        if dismissed {
-            // Leave the user on the tab they will actually work in, with a
-            // box holding only what they typed themselves.
-            actions.dismissed = true;
-            actions.goto_tab = Some(Tab::Search);
-            actions.set_query = Some(String::new());
+        let last_page = PAGES.len() - 1;
+        match nav {
+            Some(Nav::Back) => self.page = self.page.saturating_sub(1).min(last_page),
+            Some(Nav::Next) => self.page = (self.page + 1).min(last_page),
+            Some(Nav::Dismiss) => {
+                // Leave the user on the tab they will actually work in, with a
+                // box holding only what they typed themselves.
+                actions.dismissed = true;
+                actions.goto_tab = Some(Tab::Search);
+                actions.set_query = Some(String::new());
+            }
+            None => {}
         }
         actions
     }

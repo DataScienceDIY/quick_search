@@ -116,7 +116,7 @@ fn unrecognized_keys_stay_plain() {
             segs(input)
         );
     }
-    // Stars in glue are literal to the engine — no green.
+    // Stars in glue are literal to the engine: no green.
     assert!(segs("foo:ba*r").iter().all(|(_, c, _)| *c == Plain));
 }
 
@@ -152,7 +152,7 @@ fn quoted_phrases_get_green_delimiters() {
             ("\"", Operator, false),
         ])
     );
-    // Quoted stars are literal — content stays plain.
+    // Quoted stars are literal: content stays plain.
     assert!(segs("\"a*b\"")
         .iter()
         .all(|(s, c, _)| s == "\"" || *c == Plain));
@@ -253,7 +253,7 @@ fn stars_in_words_and_name_values_go_green() {
 #[test]
 fn invalid_arguments_go_error_uniformly() {
     // (`regex:(` is not here: `(` lexes as a paren, so that input is an
-    // *incomplete* filter — bare-key optimism applies, not an error.)
+    // *incomplete* filter: bare-key optimism applies, not an error.)
     for input in [
         "type:NotAThing",
         "modified:>=tomorrow",

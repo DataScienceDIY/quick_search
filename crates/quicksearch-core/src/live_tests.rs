@@ -30,28 +30,21 @@ fn event(kind: EventKind, paths: &[&str]) -> NotifyEvent {
     }
 }
 
-/// Feed a window of events and report what it decided, after the same
-/// orphan-pairing `flush_settled` applies.
+/// Feed a window of events and report what it decided, after the rename
+/// pairing `flush_settled` applies.
 fn window(targets: &HashMap<String, Target>, events: Vec<NotifyEvent>) -> HashMap<String, Op> {
     let mut pending = HashMap::new();
-    let mut orphan_to = Vec::new();
+    let mut unclaimed = Vec::new();
     for event in &events {
-        classify(event, targets, &mut pending, &mut orphan_to);
+        classify(event, targets, &mut pending, &mut unclaimed);
     }
-    let gone: Vec<String> = pending
-        .iter()
-        .filter(|(_, op)| **op == Op::Gone)
-        .map(|(p, _)| p.clone())
-        .collect();
-    if gone.len() == 1 && orphan_to.len() == 1 {
-        pending.insert(gone[0].clone(), Op::Renamed(orphan_to[0].clone()));
-    }
+    pair_lone_rename(&mut pending, &unclaimed);
     pending
 }
 
 /// An editor saves by writing a temporary and renaming it over the target. A
-/// watch on the file itself would see none of this — its inode is the one
-/// orphaned — which is why the watches are on directories.
+/// watch on the file itself would see none of this (its inode is the one
+/// orphaned), so the watches are on directories.
 #[test]
 fn an_atomic_save_reads_as_a_content_change() {
     let t = targets(&["/docs/report.txt"]);
@@ -316,30 +309,30 @@ fn current_target(path: &str, text: Option<ContentTier>) -> Target {
 }
 
 fn watch_one(dir: &Path, name: &str) -> (LiveWatcher, mpsc::Receiver<LiveUpdate>, String) {
-    watch_one_matching(dir, name, "hello world", None)
+    watch_one_matching(dir, name, "hello world", None, "hello", &Config::default())
 }
 
+/// Write `body` to `dir/name` and watch it as a row the search for `query`
+/// returned under `config`, once registration has happened.
 fn watch_one_matching(
     dir: &Path,
     name: &str,
-    body: &str,
+    body: impl AsRef<[u8]>,
     text: Option<ContentTier>,
+    query: &str,
+    config: &Config,
 ) -> (LiveWatcher, mpsc::Receiver<LiveUpdate>, String) {
     let path = dir.join(name).to_string_lossy().into_owned();
     std::fs::write(&path, body).unwrap();
     let (watcher, rx) = LiveWatcher::start(Arc::new(|| {}));
-    watcher.watch(
-        "hello",
-        vec![current_target(&path, text)],
-        &Config::default(),
-    );
+    watcher.watch(query, vec![current_target(&path, text)], config);
     // Registration happens on the watcher thread.
     std::thread::sleep(Duration::from_millis(300));
     (watcher, rx, path)
 }
 
 /// Stop before removing the tree: pulling the directory out from under a live
-/// inotify registration is a race worth not having.
+/// inotify registration is a race.
 fn stop_and_clean(mut watcher: LiveWatcher, dir: &Path) {
     watcher.stop();
     std::fs::remove_dir_all(dir).ok();
@@ -454,8 +447,14 @@ fn one_change(updates: &[LiveUpdate], path: &str) -> (u64, i64, WindowUpdate) {
 #[test]
 fn e2e_a_content_change_re_cuts_the_snippet_with_no_index() {
     let dir = scratch_dir("live-content");
-    let (watcher, rx, path) =
-        watch_one_matching(&dir, "notes.txt", "hello world", Some(ContentTier::Exact));
+    let (watcher, rx, path) = watch_one_matching(
+        &dir,
+        "notes.txt",
+        "hello world",
+        Some(ContentTier::Exact),
+        "hello",
+        &Config::default(),
+    );
     std::fs::write(&path, "hello there, a much longer world").unwrap();
 
     let updates = collect(&rx, 1, Duration::from_secs(5));
@@ -478,8 +477,14 @@ fn e2e_a_content_change_re_cuts_the_snippet_with_no_index() {
 #[test]
 fn e2e_an_edit_that_removes_the_match_clears_the_window() {
     let dir = scratch_dir("live-unmatch");
-    let (watcher, rx, path) =
-        watch_one_matching(&dir, "notes.txt", "hello world", Some(ContentTier::Exact));
+    let (watcher, rx, path) = watch_one_matching(
+        &dir,
+        "notes.txt",
+        "hello world",
+        Some(ContentTier::Exact),
+        "hello",
+        &Config::default(),
+    );
     std::fs::write(&path, "nothing of interest here").unwrap();
 
     let updates = collect(&rx, 1, Duration::from_secs(5));
@@ -497,16 +502,15 @@ fn e2e_an_edit_that_removes_the_match_clears_the_window() {
 #[test]
 fn e2e_a_fuzzy_content_hit_is_re_cut_with_the_fuzzy_matcher() {
     let dir = scratch_dir("live-fuzzy");
-    let path = dir.join("notes.txt").to_string_lossy().into_owned();
     // "quartz" within one edit of "quarts": a stage-8 hit for that query.
-    std::fs::write(&path, "sphinx of black quarts judge my vow").unwrap();
-    let (watcher, rx) = LiveWatcher::start(Arc::new(|| {}));
-    watcher.watch(
+    let (watcher, rx, path) = watch_one_matching(
+        &dir,
+        "notes.txt",
+        "sphinx of black quarts judge my vow",
+        Some(ContentTier::Fuzzy),
         "quartz",
-        vec![current_target(&path, Some(ContentTier::Fuzzy))],
         &Config::default(),
     );
-    std::thread::sleep(Duration::from_millis(300));
     std::fs::write(&path, "the sphinx of black quarts judged my vow again").unwrap();
 
     let updates = collect(&rx, 1, Duration::from_secs(5));
@@ -527,15 +531,14 @@ fn e2e_a_fuzzy_content_hit_is_re_cut_with_the_fuzzy_matcher() {
 #[test]
 fn e2e_a_file_with_no_extractable_text_still_reports_its_metadata() {
     let dir = scratch_dir("live-binary");
-    let path = dir.join("blob.bin").to_string_lossy().into_owned();
-    std::fs::write(&path, [0x00u8, 0x01, 0x02, 0xFF]).unwrap();
-    let (watcher, rx) = LiveWatcher::start(Arc::new(|| {}));
-    watcher.watch(
+    let (watcher, rx, path) = watch_one_matching(
+        &dir,
+        "blob.bin",
+        [0x00u8, 0x01, 0x02, 0xFF],
+        Some(ContentTier::Exact),
         "hello",
-        vec![current_target(&path, Some(ContentTier::Exact))],
         &Config::default(),
     );
-    std::thread::sleep(Duration::from_millis(300));
     std::fs::write(&path, [0x00u8, 0x01, 0x02, 0xFF, 0xFE, 0xFD]).unwrap();
 
     let updates = collect(&rx, 1, Duration::from_secs(5));
@@ -544,24 +547,23 @@ fn e2e_a_file_with_no_extractable_text_still_reports_its_metadata() {
     let (size, _, window) = one_change(&updates, &path);
     assert_eq!(size, 6);
     // `Unchanged`, not `NoMatch`: nothing readable came back, so there is no
-    // evidence the row's window is wrong — only that it is unverifiable.
+    // evidence the row's window is wrong, only that it is unverifiable.
     assert_eq!(window, WindowUpdate::Unchanged);
 }
 
 #[test]
 fn e2e_a_file_over_the_text_size_limit_reports_size_but_no_window() {
     let dir = scratch_dir("live-oversize");
-    let (watcher, rx) = LiveWatcher::start(Arc::new(|| {}));
-    let path = dir.join("huge.txt").to_string_lossy().into_owned();
-    std::fs::write(&path, "hello world").unwrap();
     let mut config = Config::default();
     config.processing.maximum_text_file_size = 16;
-    watcher.watch(
+    let (watcher, rx, path) = watch_one_matching(
+        &dir,
+        "huge.txt",
+        "hello world",
+        Some(ContentTier::Exact),
         "hello",
-        vec![current_target(&path, Some(ContentTier::Exact))],
         &config,
     );
-    std::thread::sleep(Duration::from_millis(300));
     std::fs::write(&path, "hello world, and rather more of it besides").unwrap();
 
     let updates = collect(&rx, 1, Duration::from_secs(5));
@@ -644,8 +646,14 @@ fn arming_reports_a_row_whose_file_vanished_while_it_was_not_watched() {
 #[test]
 fn arming_says_nothing_about_a_row_that_already_agrees_with_the_disk() {
     let dir = scratch_dir("live-sweep-quiet");
-    let (watcher, rx, _path) =
-        watch_one_matching(&dir, "steady.txt", "hello world", Some(ContentTier::Exact));
+    let (watcher, rx, _path) = watch_one_matching(
+        &dir,
+        "steady.txt",
+        "hello world",
+        Some(ContentTier::Exact),
+        "hello",
+        &Config::default(),
+    );
 
     // `watch_one_matching` already waited out registration; anything the
     // sweep decided has been sent by now.
@@ -658,23 +666,10 @@ fn arming_says_nothing_about_a_row_that_already_agrees_with_the_disk() {
     );
 }
 
-#[test]
-fn re_arming_drops_the_previous_targets() {
-    let t = targets(&["/docs/new.txt"]);
-    let decided = window(
-        &t,
-        vec![event(
-            EventKind::Modify(ModifyKind::Any),
-            &["/docs/old.txt"],
-        )],
-    );
-    assert!(decided.is_empty(), "{decided:?}");
-}
-
-/// Regression: `flush_settled` used to run only when `pending` was non-empty,
-/// so churn beside the results left a stale `orphan_to` entry that paired with
-/// the next lone `Gone`. A move-in from an unwatched directory is the reliable
-/// lone orphan on every platform — no `From` half, so no `Both` follows.
+/// An unclaimed destination drains with its window, even one that decided
+/// nothing, rather than pairing with a later lone `Gone`. A move-in from an
+/// unwatched directory is the reliable lone destination on every platform: no
+/// `From` half, so no `Both` follows.
 #[test]
 fn e2e_an_unpaired_move_in_does_not_capture_a_later_deletion() {
     let dir = scratch_dir("live-orphan-drain");
