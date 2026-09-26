@@ -55,7 +55,7 @@ pub struct SearchHit {
     pub rank: f64,
     pub stage: u8,
     /// The matched span in context: name, path, or a window of the body per
-    /// stage (absent for full-text stages when no text is stored).
+    /// stage; absent only where no window could be cut.
     pub snippet: Option<Snippet>,
 }
 

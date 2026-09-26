@@ -397,9 +397,7 @@ fn run_stage_with(
             continue;
         }
 
-        // `scope::apply_page`'s decision. `restore_text` is false because this
-        // probe only narrows the filter, so the second arm reduces to "wants
-        // content but has none".
+        // `scope::apply_page`'s decision.
         let at = Instant::now();
         pending.clear();
         for row in &rows {
@@ -463,9 +461,8 @@ fn write_page(tx: &Connection, stage: Stage, pending: &Pending, t: &mut Timing) 
         (&pending.all, &pending.all)
     };
 
-    // The per-row clears are `repo::remove_content_for_id` followed by
-    // `set_state_clearing_failure`'s `failed_files` delete, one bound
-    // statement at a time. They prepare through the connection's cache, as
+    // The per-row clears are `repo::remove_content_for_id` followed by a
+    // `failed_files` delete, one bound statement at a time. They prepare through the connection's cache, as
     // `repo::exec` does; preparing afresh per row would price a mistake the
     // product does not make.
     if stage.clears() {

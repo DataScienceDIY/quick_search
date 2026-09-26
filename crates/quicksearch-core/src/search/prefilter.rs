@@ -24,6 +24,35 @@ pub const TRIGRAM_FLOOR: usize = 3;
 /// cheaper than the scan it replaces, and falling back is always correct.
 const MAX_LITERALS: usize = 32;
 
+/// A `searchabletext MATCH` expression every document containing `literal`
+/// satisfies, for an index built with or without positions (see
+/// [`crate::db::repo::fts_positions`]); `None` below [`TRIGRAM_FLOOR`]
+/// characters, where the tokenizer indexes nothing to find.
+///
+/// With positions it is the literal as one phrase, exact up to the index's
+/// case folding. Without them a phrase of several tokens is refused outright,
+/// so it is the AND of the literal's distinct trigrams, each a one-token
+/// phrase: a superset, since adjacency goes unchecked, which the full-text
+/// pass's verification narrows back. Either way [`quote_phrase`] renders
+/// FTS5 syntax in user text inert.
+pub fn fts_literal(literal: &str, positions: bool) -> Option<String> {
+    let chars: Vec<char> = literal.chars().collect();
+    if chars.len() < TRIGRAM_FLOOR {
+        return None;
+    }
+    if positions {
+        return Some(format!("text: {}", quote_phrase(literal)));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let trigrams: Vec<String> = chars
+        .windows(TRIGRAM_FLOOR)
+        .map(|w| w.iter().collect::<String>())
+        .filter(|t| seen.insert(t.clone()))
+        .map(|t| quote_phrase(&t))
+        .collect();
+    Some(format!("({})", trigrams.join(" AND ")))
+}
+
 /// Literals of which at least one occurs in anything the query can match.
 #[derive(Debug, Clone)]
 pub struct Required(Vec<String>);
@@ -46,25 +75,20 @@ impl Required {
         &self.0
     }
 
-    /// A `searchabletext MATCH` expression: `(text: "a" OR text: "b" …)`.
+    /// A `searchabletext MATCH` expression: the OR of each literal's
+    /// [`fts_literal`].
     ///
     /// `None` when any literal is shorter than [`TRIGRAM_FLOOR`] characters:
     /// the tokenizer indexes character triples, so a byte-length test would
-    /// admit a phrase that matches no token. [`quote_phrase`] renders FTS5
-    /// syntax in user text inert. The index folds case and diacritics, so it
+    /// admit a phrase that matches no token. The index folds case, so it
     /// matches more than the literal as written, the harmless direction.
-    pub fn fts_expr(&self) -> Option<String> {
-        if self.0.iter().any(|l| l.chars().count() < TRIGRAM_FLOOR) {
-            return None;
-        }
-        Some(format!(
-            "({})",
-            self.0
-                .iter()
-                .map(|l| format!("text: {}", quote_phrase(l)))
-                .collect::<Vec<_>>()
-                .join(" OR ")
-        ))
+    pub fn fts_expr(&self, positions: bool) -> Option<String> {
+        let each = self
+            .0
+            .iter()
+            .map(|l| fts_literal(l, positions))
+            .collect::<Option<Vec<_>>>()?;
+        Some(format!("({})", each.join(" OR ")))
     }
 
     /// A predicate over the `files` columns, plus the values it binds:
@@ -114,23 +138,50 @@ mod tests {
 
     #[test]
     fn the_trigram_floor_counts_characters_not_bytes() {
-        assert!(req(&["café"]).unwrap().fts_expr().is_some());
-        assert!(req(&["日本"]).unwrap().fts_expr().is_none());
-        assert!(req(&["ab"]).unwrap().fts_expr().is_none());
-        assert!(
-            req(&["abc", "de"]).unwrap().fts_expr().is_none(),
-            "all of them"
-        );
+        for positions in [true, false] {
+            assert!(req(&["café"]).unwrap().fts_expr(positions).is_some());
+            assert!(req(&["日本"]).unwrap().fts_expr(positions).is_none());
+            assert!(req(&["ab"]).unwrap().fts_expr(positions).is_none());
+            assert!(
+                req(&["abc", "de"]).unwrap().fts_expr(positions).is_none(),
+                "all of them"
+            );
+        }
     }
 
     #[test]
     fn fts5_syntax_in_a_literal_is_quoted_inert() {
-        let expr = req(&["a\"b", "NEAR", "x*y"]).unwrap().fts_expr().unwrap();
+        let expr = req(&["a\"b", "NEAR", "x*y"])
+            .unwrap()
+            .fts_expr(true)
+            .unwrap();
         // The embedded quote is doubled, which is FTS5's own escape.
         assert!(expr.contains(r#""a""b""#), "{expr}");
         assert!(expr.contains(r#""NEAR""#), "{expr}");
         assert!(expr.contains(r#""x*y""#), "{expr}");
         assert_eq!(expr.matches(" OR ").count(), 2);
+
+        // Each trigram is its own quoted phrase, so a quote inside one is
+        // escaped the same way.
+        let expr = req(&["a\"bc"]).unwrap().fts_expr(false).unwrap();
+        assert!(expr.contains(r#""a""b""#), "{expr}");
+        assert!(expr.contains(r#""""bc""#), "{expr}");
+    }
+
+    /// Without positions a literal is the AND of its distinct trigrams, the
+    /// literals still OR'ed: the only shape a `detail=none` table accepts.
+    #[test]
+    fn without_positions_a_literal_is_its_trigrams() {
+        assert_eq!(fts_literal("abcd", false).unwrap(), r#"("abc" AND "bcd")"#);
+        assert_eq!(
+            fts_literal("aaaa", false).unwrap(),
+            r#"("aaa")"#,
+            "a repeated trigram is asked for once"
+        );
+        assert_eq!(fts_literal("café", false).unwrap(), r#"("caf" AND "afé")"#);
+        assert_eq!(fts_literal("abcd", true).unwrap(), r#"text: "abcd""#);
+        let expr = req(&["abc", "xyz"]).unwrap().fts_expr(false).unwrap();
+        assert_eq!(expr, r#"(("abc") OR ("xyz"))"#);
     }
 
     #[test]

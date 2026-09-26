@@ -84,7 +84,7 @@ mod text_pipeline {
         let path = Path::new("/tmp/bench/notes.txt");
         bencher.bench(|| {
             let looks = textenc::looks_like_text(divan::black_box(head));
-            let text = textenc::decode_text(head.to_vec(), path).unwrap();
+            let text = textenc::decode_text(head.to_vec(), path, false).unwrap();
             (looks, text.len())
         });
     }
@@ -101,7 +101,7 @@ mod text_pipeline {
     fn decode_only(bencher: Bencher) {
         let head = corpus::text_head();
         let path = Path::new("/tmp/bench/notes.txt");
-        bencher.bench(|| textenc::decode_text(divan::black_box(head).to_vec(), path));
+        bencher.bench(|| textenc::decode_text(divan::black_box(head).to_vec(), path, false));
     }
 }
 
@@ -167,7 +167,8 @@ mod update_narrowing {
     fn seeded_na(tag: &str) -> (Scratch, Connection) {
         let (dir, p) = Scratch::db(tag);
         let mut conn =
-            quicksearch_core::db::open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+            quicksearch_core::db::open_or_recreate(p.to_str().unwrap(), &Default::default())
+                .unwrap();
         let tx = conn.transaction().unwrap();
         let names: Vec<String> = (0..ROWS).map(|i| format!("f{:04}.txt", i)).collect();
         for name in &names {
@@ -231,5 +232,56 @@ mod update_narrowing {
             }
             tx.commit().unwrap();
         });
+    }
+}
+
+/// A watcher event for a directory whose files are all indexed and unchanged:
+/// a re-sent `Create`, a `chmod -R`, the live view re-checking what it shows.
+/// Nothing is written, so the cost is whatever it reads to learn that; the
+/// full walk's answer is one `stat` per file.
+mod unchanged_event {
+    use super::*;
+    use quicksearch_core::config::{Config, IgnoreSet};
+    use quicksearch_core::extract::Registry;
+    use quicksearch_core::incremental::{apply_fs_event, Budget};
+    use quicksearch_core::testutil::Scratch;
+    use quicksearch_core::watcher::FsEvent;
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    const FILES: usize = 500;
+
+    #[divan::bench]
+    fn directory_create(bencher: Bencher) {
+        let (dir, db) = Scratch::db("bench-unchanged-event");
+        let tree = db.with_file_name("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        for i in 0..FILES {
+            std::fs::write(
+                tree.join(format!("f{:04}.txt", i)),
+                corpus::text(1 << 10, 4),
+            )
+            .unwrap();
+        }
+        let mut conn =
+            quicksearch_core::db::open_or_recreate(db.to_str().unwrap(), &Default::default())
+                .unwrap();
+        let config = Config::default();
+        let ignore = IgnoreSet::compile(&config.indexing.ignore_patterns).unwrap();
+        let registry = Registry::default_set();
+        let event = FsEvent::Create(tree.clone());
+        let cancel = AtomicBool::new(false);
+        let mut apply = move || {
+            let budget = Budget {
+                deadline: Instant::now() + Duration::from_secs(3600),
+                cancel: &cancel,
+                resume_from: 0,
+            };
+            apply_fs_event(&mut conn, &event, &config, &ignore, &registry, &budget).unwrap()
+        };
+        // Indexed once; every timed run finds it unchanged.
+        apply();
+        bencher.bench_local(apply);
+        drop(dir);
     }
 }

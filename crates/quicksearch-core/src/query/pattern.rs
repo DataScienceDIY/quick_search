@@ -263,22 +263,19 @@ impl TermPattern {
     pub fn count_folded(&self, folded: &str) -> usize {
         match self {
             TermPattern::Empty => 0,
-            TermPattern::Literal(l) => snippet::count_occurrences(folded, &l.folded, true),
+            TermPattern::Literal(l) => snippet::count_occurrences(folded, &l.folded),
             TermPattern::Wildcard(w) => w.search_ci.find_iter(folded).take(COUNT_CAP).count(),
         }
     }
 
-    /// Non-overlapping occurrence count. Wildcards stop at 1000, where the
+    /// Case-sensitive, non-overlapping occurrence count; the case-insensitive
+    /// one is [`TermPattern::count_folded`]. Wildcards stop at 1000, where the
     /// cascade's `count_frac` saturates anyway.
-    pub fn count(&self, text: &str, case_insensitive: bool) -> usize {
+    pub fn count(&self, text: &str) -> usize {
         match self {
             TermPattern::Empty => 0,
-            TermPattern::Literal(l) => snippet::count_occurrences(text, &l.text, !case_insensitive),
-            TermPattern::Wildcard(w) => w
-                .search(case_insensitive)
-                .find_iter(text)
-                .take(COUNT_CAP)
-                .count(),
+            TermPattern::Literal(l) => snippet::count_occurrences(text, &l.text),
+            TermPattern::Wildcard(w) => w.search_cs.find_iter(text).take(COUNT_CAP).count(),
         }
     }
 }
@@ -428,7 +425,7 @@ mod tests {
             assert!(p.is_empty(), "{:?}", parts);
             assert!(!p.whole_match("anything", true));
             assert!(p.find_first("anything", true).is_none());
-            assert_eq!(p.count("anything", true), 0);
+            assert_eq!(p.count("anything"), 0);
         }
     }
 
@@ -516,9 +513,9 @@ mod tests {
     #[test]
     fn count_is_nonoverlapping_and_capped() {
         let p = TermPattern::build(&[part("a*b", true)]).unwrap();
-        assert_eq!(p.count("ab ab ab", false), 3);
+        assert_eq!(p.count("ab ab ab"), 3);
         let many = "ab ".repeat(2000);
-        assert_eq!(p.count(&many, false), 1000);
+        assert_eq!(p.count(&many), 1000);
     }
 
     #[test]
@@ -530,8 +527,8 @@ mod tests {
         assert_eq!(p.find_first("my Report.pdf", false), Some(3..9));
         assert_eq!(p.find_first("my report.pdf", true), Some(3..9));
         assert_eq!(p.find_first("my report.pdf", false), None);
-        assert_eq!(p.count("report Report", false), 1);
-        assert_eq!(p.count("report Report", true), 2);
+        assert_eq!(p.count("report Report"), 1);
+        assert_eq!(p.count_folded("report report"), 2);
     }
 
     #[test]

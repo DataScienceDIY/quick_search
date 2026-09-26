@@ -16,8 +16,8 @@ use crate::extract::Registry;
 use crate::file_handling::{
     cleanup_stale_index_entries, count_tree_entries_fast, fts_begin_bulk_write,
     fts_finalize_after_text_indexing, mark_oversize_pending_na, normalize_root_string,
-    process_batch_inserts, process_batch_updates, store_extracted, ExtractCursor, ExtractScope,
-    FileIndexAction, OwnedNewFile, RootRange,
+    process_batch_inserts, process_batch_updates, store_extracted, Bodies, ExtractCursor,
+    ExtractScope, FileIndexAction, OwnedNewFile, RootRange,
 };
 use crate::walk::{thread_count_for, walk_indexable_files, ParallelWalk, TryNext, WalkEvent};
 
@@ -149,12 +149,27 @@ pub(super) struct RootPipeline {
 const IDLE_BACKOFF: Duration = Duration::from_millis(2);
 
 /// A batch writer: [`process_batch_updates`] or [`process_batch_inserts`].
-type WriteBatch =
-    fn(&Arc<Mutex<Connection>>, &[OwnedNewFile], &Arc<AtomicBool>, &Config) -> Result<(), String>;
+type WriteBatch = fn(
+    &Arc<Mutex<Connection>>,
+    &[OwnedNewFile],
+    &Arc<AtomicBool>,
+    &Config,
+    &mut Bodies,
+) -> Result<(), String>;
 
 /// Write `rows` through `write`, then clear them; on an error they stay.
-fn flush(cx: &RunCx<'_>, rows: &mut Vec<OwnedNewFile>, write: WriteBatch) -> Result<(), String> {
-    write(&cx.conn_mutex, rows, cx.stop_flag, cx.config)?;
+fn flush(
+    cx: &mut RunCx<'_>,
+    rows: &mut Vec<OwnedNewFile>,
+    write: WriteBatch,
+) -> Result<(), String> {
+    write(
+        &cx.conn_mutex,
+        rows,
+        cx.stop_flag,
+        cx.config,
+        &mut cx.bodies,
+    )?;
     rows.clear();
     Ok(())
 }
@@ -227,9 +242,7 @@ mod census {
             let inline = |rows: &[crate::file_handling::OwnedNewFile]| -> u64 {
                 rows.iter()
                     .map(|r| {
-                        (r.inline_text.as_ref().map_or(0, String::len)
-                            + r.name.len()
-                            + r.parent.len()) as u64
+                        (r.inline_text.as_ref().map_or(0, String::len) + r.path().len()) as u64
                     })
                     .sum()
             };
@@ -500,7 +513,20 @@ impl RootPipeline {
             if ready.is_empty() {
                 break;
             }
-            let stored = store_extracted(&cx.conn_mutex, ready, cx.stop_flag, cx.config, deadline)?;
+            // Rowid order: FTS5 flushes its pending terms to a new segment
+            // whenever a write's rowid falls below the previous one, and the
+            // pool finishes rows in completion order, not id order. Measured
+            // (`indexprobe cold`, 10k docs of 9–20 KiB): 5% less CPU, 9% less
+            // WAL written; docs past FTS5's 1 MiB hash flush anyway, so a
+            // corpus of 8–200 KiB docs gained only the WAL figure (7%).
+            ready.sort_unstable_by_key(|row| row.file_id);
+            let stored = store_extracted(
+                &cx.conn_mutex,
+                ready,
+                cx.stop_flag,
+                deadline,
+                &mut cx.bodies,
+            )?;
             if stored.consumed > 0 {
                 // The last row *written*, not the last fetched. The whole path,
                 // as the walk phase publishes: the hint must not change what it
@@ -548,6 +574,8 @@ pub(super) struct RunCx<'a> {
     /// Writer time one root's turn may take before the round moves on
     /// ([`crate::config::ProcessingConfig::writer_turn_slice_ms`]).
     pub(super) slice: Duration,
+    /// The run's one set of compression buffers, shared by every write.
+    pub(super) bodies: Bodies,
     /// Rows with no file behind them, per-directory plus the vanished sweep.
     pub(super) stale_candidates: Vec<String>,
     /// Paths reached via symlink; their rows may live outside every root.
@@ -562,8 +590,8 @@ impl<'a> RunCx<'a> {
         db_path: &'a str,
         stop_flag: &'a Arc<AtomicBool>,
         status: Arc<Mutex<IndexingStatus>>,
-    ) -> RunCx<'a> {
-        RunCx {
+    ) -> Result<RunCx<'a>, String> {
+        Ok(RunCx {
             conn_mutex,
             config,
             db_path,
@@ -572,10 +600,11 @@ impl<'a> RunCx<'a> {
             registry: Arc::new(Registry::default_set()),
             batch: config.processing.batch_size.max(1),
             slice: Duration::from_millis(config.processing.writer_turn_slice_ms),
+            bodies: Bodies::new()?,
             stale_candidates: Vec::new(),
             aliased_paths: HashSet::new(),
             stale_cleanup_ok: true,
-        }
+        })
     }
 
     /// Publish `step` on the running status until the returned guard drops, so
@@ -656,7 +685,14 @@ fn build_pipeline(
         workers,
     );
 
-    // A walked root needs no scan: its stored count is exact.
+    // A walked root needs no scan: its stored count is exact. A never-walked
+    // one gets a second, count-only traversal beside the walk, kept for the
+    // first run's progress figure. Measured (`indexprobe cold`, 50k files in
+    // 5k directories, alternating runs): on a virtiofs share it cost ~4% of
+    // wall time (2.29 s against 2.20 s without it) and ~7% of CPU, and no
+    // prefetch benefit to the walk showed; on warm local disk the difference
+    // was within noise. Its figure counts directories and ignored entries
+    // too, so it runs high.
     let count_total = Arc::new(AtomicUsize::new(0));
     match stored_count {
         // `max(1)`: 0 is the "unknown" sentinel; an empty root must not store it.
@@ -857,7 +893,7 @@ impl IndexingService {
     ) -> Result<Option<Connection>, String> {
         // A large WAL recovery happens here; announced before attempted.
         Self::set_prep_step(status, PrepStep::OpeningIndex);
-        let mut conn = db::open_or_recreate(db_path, &config.processing.tokenize)?;
+        let mut conn = db::open_or_recreate(db_path, &config.processing)?;
 
         // Reconcile against the settings the index was last written under,
         // *before* stamping the new ones: the old record is the only thing
@@ -944,7 +980,7 @@ impl IndexingService {
         let count_cancel = Arc::new(AtomicBool::new(false));
         let _count_guard = CancelOnDrop(count_cancel.clone());
 
-        let mut cx = RunCx::new(conn_mutex, config, db_path, stop_flag, status.clone());
+        let mut cx = RunCx::new(conn_mutex, config, db_path, stop_flag, status.clone())?;
 
         let stored_counts: Vec<Option<usize>> = {
             let conn = crate::lock_ok(&cx.conn_mutex);

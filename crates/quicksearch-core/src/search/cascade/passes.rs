@@ -70,19 +70,17 @@ fn doc_scan_sql(filter_sql: &str) -> String {
     )
 }
 
-/// The scan behind a `searchabletext MATCH` prefilter. `require_text` picks
-/// the join to `documents_text`: `false` is [`Cx::pass_fulltext`]'s LEFT
-/// JOIN, which keeps an FTS-matched row whose stored text was dropped.
-fn fts_match_sql(filter_sql: &str, require_text: bool) -> String {
+/// The scan behind a `searchabletext MATCH` prefilter. Every candidate is
+/// verified against its stored text, and a row with a posting always has
+/// some: text is stored whenever there is any.
+fn fts_match_sql(filter_sql: &str) -> String {
     format!(
         "SELECT {}, dt.text_zstd \
          FROM searchabletext \
          JOIN files f ON f.id = searchabletext.rowid \
-         {} documents_text dt ON dt.file_id = f.id \
+         JOIN documents_text dt ON dt.file_id = f.id \
          WHERE searchabletext MATCH ?{}",
-        HIT_COLUMNS,
-        if require_text { "JOIN" } else { "LEFT JOIN" },
-        filter_sql
+        HIT_COLUMNS, filter_sql
     )
 }
 
@@ -109,12 +107,11 @@ fn anchor_segment(pattern: &crate::query::pattern::TermPattern) -> Option<&str> 
 
 impl<'a> Cx<'a> {
     /// The SQL and parameters for a scan over document bodies: an FTS MATCH on
-    /// `expr` when there is one (`require_text` as in [`fts_match_sql`]),
-    /// else every stored document.
-    fn body_scan(&self, expr: Option<String>, require_text: bool) -> (String, Vec<Value>) {
+    /// `expr` when there is one, else every stored document.
+    fn body_scan(&self, expr: Option<String>) -> (String, Vec<Value>) {
         match expr {
             Some(expr) => (
-                fts_match_sql(&self.query.filter_sql, require_text),
+                fts_match_sql(&self.query.filter_sql),
                 self.params_with_filters(vec![Value::Text(expr)]),
             ),
             None => (
@@ -309,77 +306,60 @@ impl<'a> Cx<'a> {
             // Below the trigram floor the MATCH can't return anything.
             return Ok(true);
         }
-        // The column filter goes inside the MATCH (`text: "..."`) so only
-        // bodies match. A literal term is one quoted phrase; a wildcard
-        // narrows with an AND of its segments of 3+ characters; with none
-        // (`ab*cd`) the pass scans every stored document. Every row is
-        // pattern-verified either way.
-        let match_expr = match pattern.literal() {
-            Some(term) => Some(format!("text: {}", quote_phrase(term))),
-            None => Some(
-                pattern
-                    .segments()
-                    .iter()
-                    .filter(|s| s.chars().count() >= prefilter::TRIGRAM_FLOOR)
-                    .map(|s| format!("text: {}", quote_phrase(s)))
-                    .collect::<Vec<_>>()
-                    .join(" AND "),
-            )
-            .filter(|expr| !expr.is_empty()),
-        };
-        let narrowed = match_expr.is_some();
-        let (sql, params) = self.body_scan(match_expr, false);
+        // A literal term is one segment; a wildcard narrows with an AND of
+        // its segments of 3+ characters, each asked for as the index allows
+        // ([`prefilter::fts_literal`]); with none (`ab*cd`) the pass scans
+        // every stored document. Every row is pattern-verified either way,
+        // which is what makes an index without positions exact.
+        let match_expr = Some(
+            pattern
+                .segments()
+                .iter()
+                .filter_map(|s| prefilter::fts_literal(s, self.positions))
+                .collect::<Vec<_>>()
+                .join(" AND "),
+        )
+        .filter(|expr| !expr.is_empty());
+        let (sql, params) = self.body_scan(match_expr);
         let mut doc = crate::db::repo::DocDecoder::new()?;
         let mut lower = String::new();
         // Decompression dominates: check cancellation every row.
         self.scan_pass(&sql, params, 1, None, |cx, row, file_id, path, name| {
-            let text = stored_text(row, &mut doc)?;
-
-            let (rank, stage, snip) = match text {
-                Some(text) => {
-                    // Fold once: count, first match and snippet all need it,
-                    // even on rows about to be dropped.
-                    fold_into(&mut lower, text);
-                    match super::text_snippet_counted(pattern, text, &lower) {
-                        Some((snip, count_ci)) => {
-                            if count_ci == 0 {
-                                return Ok(RowHit::Skip);
-                            }
-                            let count_cs = pattern.count(text, false);
-                            let (count, stage) = if count_cs > 0 {
-                                (count_cs, 5)
-                            } else {
-                                (count_ci, 6)
-                            };
-                            (stage as f64 + count_frac(count), stage as u8, Some(snip))
-                        }
-                        None => {
-                            let count_cs = pattern.count(text, false);
-                            let (count, stage) = if count_cs > 0 {
-                                (count_cs, 5)
-                            } else {
-                                let count_ci = pattern.count_folded(&lower);
-                                if count_ci == 0 {
-                                    return Ok(RowHit::Skip);
-                                }
-                                (count_ci, 6)
-                            };
-                            let snip = super::text_snippet(pattern, text, &lower);
-                            (stage as f64 + count_frac(count), stage as u8, snip)
-                        }
-                    }
-                }
-                // No stored text: FTS-narrowed rows are accepted at the bottom
-                // of rank 6 as count-unknown; on the full-scan fallback an
-                // unverifiable row is skipped.
-                None => {
-                    if !narrowed {
+            // A body that will not decode cannot be verified.
+            let Some(text) = stored_text(row, &mut doc)? else {
+                return Ok(RowHit::Skip);
+            };
+            // Fold once: count, first match and snippet all need it, even on
+            // rows about to be dropped.
+            fold_into(&mut lower, text);
+            let (count, stage, snip) = match super::text_snippet_counted(pattern, text, &lower) {
+                Some((snip, count_ci)) => {
+                    if count_ci == 0 {
                         return Ok(RowHit::Skip);
                     }
-                    (6.0 + count_frac(1), 6, None)
+                    let count_cs = pattern.count(text);
+                    if count_cs > 0 {
+                        (count_cs, 5, Some(snip))
+                    } else {
+                        (count_ci, 6, Some(snip))
+                    }
+                }
+                None => {
+                    let count_cs = pattern.count(text);
+                    let (count, stage) = if count_cs > 0 {
+                        (count_cs, 5)
+                    } else {
+                        let count_ci = pattern.count_folded(&lower);
+                        if count_ci == 0 {
+                            return Ok(RowHit::Skip);
+                        }
+                        (count_ci, 6)
+                    };
+                    (count, stage, super::text_snippet(pattern, text, &lower))
                 }
             };
-            if !cx.regex_accepts(file_id, path, text)? {
+            let rank = stage as f64 + count_frac(count);
+            if !cx.regex_accepts(file_id, path, Some(text))? {
                 return Ok(RowHit::Skip);
             }
 
@@ -463,8 +443,8 @@ impl<'a> Cx<'a> {
             .and_then(|chunks| {
                 prefilter::Required::new(chunks.iter().map(|c| c.to_string()).collect())
             })
-            .and_then(|required| required.fts_expr());
-        let (sql, params) = self.body_scan(expr, true);
+            .and_then(|required| required.fts_expr(self.positions));
+        let (sql, params) = self.body_scan(expr);
         // No fold buffer: the matcher folds in its mask table.
         let mut doc = crate::db::repo::DocDecoder::new()?;
         // Decompression dominates: check cancellation every row.
@@ -541,7 +521,8 @@ impl<'a> Cx<'a> {
     pub(super) fn pass_regex_content(&mut self) -> Result<bool, String> {
         let query = self.query;
         let re = query.regex.as_ref().expect("regex-only pass list");
-        let (sql, params) = self.body_scan(re.required().and_then(|r| r.fts_expr()), true);
+        let expr = re.required().and_then(|r| r.fts_expr(self.positions));
+        let (sql, params) = self.body_scan(expr);
         let mut doc = crate::db::repo::DocDecoder::new()?;
         // Decompression dominates: check cancellation every row.
         self.scan_pass(&sql, params, 1, None, |_cx, row, file_id, path, name| {

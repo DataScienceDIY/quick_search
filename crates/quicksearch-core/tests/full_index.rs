@@ -67,16 +67,9 @@ fn count(db: &Path, sql: &str) -> i64 {
         .unwrap()
 }
 
-/// FTS rows matching the phrase `word`.
+/// FTS rows matching `word`.
 fn hits(db: &Path, word: &str) -> i64 {
-    rusqlite::Connection::open(db)
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH ?1",
-            [format!("\"{}\"", word)],
-            |r| r.get(0),
-        )
-        .unwrap()
+    quicksearch_core::testutil::fts_count(&rusqlite::Connection::open(db).unwrap(), word)
 }
 
 /// Bytes in `db`'s write-ahead log; 0 when there is none.
@@ -1065,26 +1058,32 @@ fn the_content_extension_filter_still_excludes_small_text_files() {
     );
 }
 
+/// Both layouts index the same files the same way; only the FTS table
+/// differs, and every file with text keeps its body for verification.
 #[test]
-fn contentless_mode_still_indexes_inlined_files_without_storing_bodies() {
-    let root = Scratch::dir("inline-contentless");
-    let (_db_dir, db) = Scratch::db("inline-contentless-db");
+fn either_index_layout_stores_and_finds_the_same_files() {
+    for compact in [true, false] {
+        let root = Scratch::dir("layout");
+        let (_db_dir, db) = Scratch::db("layout-db");
+        let mut config = Config::default();
+        config.processing.compact_text_index = compact;
+        touch(&root.join("small.txt"), b"searchable xylophone body");
+        touch(&root.join("other.txt"), b"nothing to see");
+        index_once(&root, &db, &config);
 
-    let mut config = Config::default();
-    config.processing.store_text_for_snippets = false;
-    touch(&root.join("small.txt"), b"searchable xylophone body");
-    index_once(&root, &db, &config);
-
-    assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM documents_text"),
-        0,
-        "contentless mode stores no bodies"
-    );
-    assert_eq!(
-        hits(&db, "xylophone"),
-        1,
-        "an inlined file is still searchable in contentless mode"
-    );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM documents_text"),
+            2,
+            "every body is stored (compact = {compact})"
+        );
+        assert_eq!(hits(&db, "xylophone"), 1, "compact = {compact}");
+        let detail_none = count(
+            &db,
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE name = 'searchabletext' AND sql LIKE '%detail=none%'",
+        );
+        assert_eq!(detail_none == 1, compact);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,11 +1250,13 @@ const MIN_ROWS_SAMPLED: usize = 4;
 /// Removes the fixture before asserting, unlike the rest of this file: it is
 /// generated and identical every run, and leaving tens of MB in a RAM-backed
 /// /tmp behind a failure is itself a reason to fail.
+#[allow(clippy::too_many_arguments)]
 fn watch_heavy_beside_light(
     tag: &str,
     heavy_files: usize,
     heavy_dirs: usize,
     body: &[u8],
+    ext: &str,
     workers: usize,
     mut config: Config,
 ) -> Overlap {
@@ -1263,7 +1264,7 @@ fn watch_heavy_beside_light(
     let heavy = Scratch::dir(&heavy_tag);
     for i in 0..heavy_files {
         touch(
-            &heavy.join(format!("d{}/big{:04}.txt", i % heavy_dirs, i)),
+            &heavy.join(format!("d{}/big{:04}.{}", i % heavy_dirs, i, ext)),
             body,
         );
     }
@@ -1336,9 +1337,14 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     // with the row count, while what the light root drains does not. Sized
     // for the guards: enough that the rows arrive over separate writer
     // rounds, cheap enough that a loaded runner still finishes in seconds.
+    // RTF, because its extractor reads and parses the whole file, where
+    // plaintext stops at twice `maximum_text_size`.
     const HEAVY_FILES: usize = 12;
     // ~2 MiB each, 24 MB total.
-    let body = "sphinx of black quartz judge my vow ".repeat(58_000);
+    let body = format!(
+        "{{\\rtf1\\ansi {}}}",
+        "sphinx of black quartz judge my vow ".repeat(58_000)
+    );
 
     let mut config = Config::default();
     config.processing.maximum_text_size = 1024;
@@ -1347,7 +1353,7 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     config.processing.maximum_text_file_size = 4 * 1024 * 1024;
     // One extraction thread: with the default four the pass is four times
     // shorter, and so is the margin.
-    let seen = watch_heavy_beside_light("stall", HEAVY_FILES, 4, body.as_bytes(), 1, config);
+    let seen = watch_heavy_beside_light("stall", HEAVY_FILES, 4, body.as_bytes(), "rtf", 1, config);
 
     eprintln!(
         "light files drained while the heavy root extracted: {} against {} heavy \
@@ -1392,6 +1398,7 @@ fn a_heavy_root_does_not_stall_a_light_one_at_the_writer() {
         HEAVY_FILES,
         8,
         body.as_bytes(),
+        "txt",
         4,
         Config::default(),
     );
@@ -1631,7 +1638,10 @@ fn the_wal_stays_bounded_through_the_tail_of_a_warm_reindex() {
     let root = seed_text_tree("wal-tail");
     let (db_dir, db) = Scratch::db("wal-tail-db");
     let dir_key = db_dir.to_string_lossy().into_owned();
-    let config = Config::default();
+    // With positions: the log is measured against the index's size, and
+    // position lists make this fixture's index several times larger.
+    let mut config = Config::default();
+    config.processing.compact_text_index = false;
 
     // An empty root first, purely to bring the index into existence so the
     // reader below can be opened before the run that matters.

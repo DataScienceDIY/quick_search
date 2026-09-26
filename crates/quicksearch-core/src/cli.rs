@@ -197,7 +197,8 @@ pub fn clear_path(db_path: &str, path: &str) -> Result<bool, String> {
 mod tests {
     use super::*;
     use crate::db::open_or_recreate;
-    use crate::db::repo::{insert_file, set_content_done, set_content_failed, NewFile};
+    use crate::db::repo::{complete_pending, insert_file, store_pending_text, NewFile};
+    use crate::file_handling::ContentOutcome;
     use crate::mime::FileType;
     use crate::testutil::{zstd_of, Scratch};
 
@@ -226,13 +227,15 @@ mod tests {
     }
 
     fn seed_fixture(db_path: &str) -> (i64, i64) {
-        let mut conn = open_or_recreate(db_path, "trigram").unwrap();
+        let mut conn = open_or_recreate(db_path, &Default::default()).unwrap();
         let (a, b) = {
             let tx = conn.transaction().unwrap();
             let a = row(&tx, "a.txt", true);
-            set_content_done(&tx, a, "hello", zstd_of("hello").as_deref()).unwrap();
-            let b = row(&tx, "b.bin", false);
-            set_content_failed(&tx, b, "bad extract").unwrap();
+            store_pending_text(&tx, a, "hello", zstd_of("hello").as_deref()).unwrap();
+            // Pending, not NA: only an extraction that ran can fail.
+            let b = row(&tx, "b.bin", true);
+            let failed = ContentOutcome::Failed("bad extract".into());
+            assert!(complete_pending(&tx, b, &failed, None).unwrap());
             tx.commit().unwrap();
             (a, b)
         };
@@ -279,7 +282,7 @@ mod tests {
         let _ = seed_fixture(dbp);
         assert_eq!(pending_content_count(dbp).unwrap(), 0);
 
-        let mut conn = open_or_recreate(dbp, "trigram").unwrap();
+        let mut conn = open_or_recreate(dbp, &Default::default()).unwrap();
         {
             let tx = conn.transaction().unwrap();
             // Claimed by an extractor, text not read yet: the backlog.
@@ -321,12 +324,12 @@ mod tests {
     fn documents_text_ratio_reports_savings_on_compressible_prose() {
         // Guards against silently swapping compression for a pass-through.
         let (_dir, p) = Scratch::db("cli");
-        let mut conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+        let mut conn = open_or_recreate(p.to_str().unwrap(), &Default::default()).unwrap();
         {
             let tx = conn.transaction().unwrap();
             let id = row(&tx, "big.txt", true);
             let prose = "the quick brown fox jumps over the lazy dog. ".repeat(500);
-            set_content_done(&tx, id, &prose, zstd_of(&prose).as_deref()).unwrap();
+            store_pending_text(&tx, id, &prose, zstd_of(&prose).as_deref()).unwrap();
             tx.commit().unwrap();
         }
         drop(conn);
@@ -359,7 +362,11 @@ mod tests {
         let (_dir, p) = Scratch::db("cli");
         let dbp = p.to_str().unwrap();
         {
-            let mut conn = open_or_recreate(dbp, "unicode61").unwrap();
+            let unicode61 = crate::config::ProcessingConfig {
+                tokenize: "unicode61".into(),
+                ..Default::default()
+            };
+            let mut conn = open_or_recreate(dbp, &unicode61).unwrap();
             let tx = conn.transaction().unwrap();
             for name in ["a.txt", "b.txt"] {
                 row(&tx, name, true);

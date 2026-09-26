@@ -28,6 +28,11 @@ impl IndexingService {
             ("hash_algorithm", "size+head".to_string()),
             ("indexing_path", sorted_joined(roots)),
             ("tokenize", config.processing.tokenize.clone()),
+            // The effective layout, not the flag: see `fts_positions`.
+            (
+                "fts_positions",
+                config.processing.fts_positions().to_string(),
+            ),
             ("include_hidden", config.indexing.include_hidden.to_string()),
             (
                 "follow_symlinks",
@@ -40,10 +45,6 @@ impl IndexingService {
             (
                 "content_extensions",
                 sorted_joined(&config.indexing.content_extensions),
-            ),
-            (
-                "store_text_for_snippets",
-                config.processing.store_text_for_snippets.to_string(),
             ),
         ]
     }
@@ -61,10 +62,11 @@ impl IndexingService {
     }
 
     /// Settings a difference in which cannot be reconciled: the FTS tokenizer
-    /// is part of the table definition, and hashes under a different length or
-    /// algorithm cannot be compared. Everything else reconciles; see
-    /// [`crate::scope`].
-    const REBUILD_KEYS: [&'static str; 3] = ["hash_length", "hash_algorithm", "tokenize"];
+    /// and position setting are part of the table definition, and hashes
+    /// under a different length or algorithm cannot be compared. Everything
+    /// else reconciles; see [`crate::scope`].
+    const REBUILD_KEYS: [&'static str; 4] =
+        ["hash_length", "hash_algorithm", "tokenize", "fts_positions"];
 
     /// The unreconcilable settings that no longer match, which a rebuild
     /// prompt shows; `None` when none. A key absent (older index) never counts

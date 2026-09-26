@@ -1,5 +1,7 @@
 use super::*;
 
+use std::time::UNIX_EPOCH;
+
 use crate::testutil::{touch, Scratch};
 
 fn tmp_tree(tag: &str) -> Scratch {
@@ -20,7 +22,7 @@ impl std::ops::Deref for TestDb {
 
 fn db_with(tag: &str, rows: &[(String, u64)]) -> TestDb {
     let (dir, p) = Scratch::db(tag);
-    let conn = crate::db::open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    let conn = crate::db::open_or_recreate(p.to_str().unwrap(), &Default::default()).unwrap();
     for (path, mtime) in rows {
         // Split the same way the indexer does, so the seeded parent carries
         // its trailing separator and the prefetcher's `parent = ?` finds it.
@@ -789,7 +791,7 @@ fn the_index_and_its_sidecars_are_never_walked() {
     touch(&root.join("ordinary.txt"), b"x");
 
     let db = root.join("data").join("index.sqlite");
-    let conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+    let conn = crate::db::open_or_recreate(db.to_str().unwrap(), &Default::default()).unwrap();
     // A write, so the WAL and SHM exist to be walked over.
     conn.execute(
         "INSERT INTO files (name, parent, size, mtime, type, content_state)
@@ -822,7 +824,7 @@ fn the_index_and_its_sidecars_are_never_walked() {
 fn a_stored_row_for_the_index_falls_to_the_stale_sweep() {
     let root = crate::testutil::scratch_dir_canonical("walk-self-index-stale");
     let db = root.join("data").join("index.sqlite");
-    let conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+    let conn = crate::db::open_or_recreate(db.to_str().unwrap(), &Default::default()).unwrap();
 
     // A row for the database itself.
     let stored = path_to_db_string(&db);

@@ -228,10 +228,17 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
         .collect();
 
     let conn_mutex = Arc::new(Mutex::new(
-        crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap(),
+        crate::db::open_or_recreate(db.to_str().unwrap(), &Default::default()).unwrap(),
     ));
     let stop = Arc::new(AtomicBool::new(false));
-    process_batch_inserts(&conn_mutex, &records, &stop, &config).unwrap();
+    process_batch_inserts(
+        &conn_mutex,
+        &records,
+        &stop,
+        &config,
+        &mut Bodies::new().unwrap(),
+    )
+    .unwrap();
 
     let range = RootRange::for_root(root.to_str().unwrap());
     let scope = extract_scope_prepare(&conn_mutex, &range, &config).unwrap();

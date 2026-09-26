@@ -15,6 +15,24 @@ fn info(conn: &Connection, key: &str) -> String {
     .unwrap()
 }
 
+/// Processing settings asking for `tokenize`, the rest default.
+fn with_tokenizer(tokenize: &str) -> ProcessingConfig {
+    ProcessingConfig {
+        tokenize: tokenize.into(),
+        ..Default::default()
+    }
+}
+
+/// The DDL the full-text table was created with.
+fn fts_sql(conn: &Connection) -> String {
+    conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE name = 'searchabletext'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
 fn file_count(conn: &Connection) -> i64 {
     conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
         .unwrap()
@@ -42,15 +60,15 @@ fn write_v1_index(p: &str, name: &str) {
 #[test]
 fn fresh_db_gets_current_version() {
     let (_dir, p) = db();
-    let conn = open_or_recreate(&p, "trigram").unwrap();
+    let conn = open_or_recreate(&p, &Default::default()).unwrap();
     assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
 }
 
 #[test]
 fn reopen_is_idempotent() {
     let (_dir, p) = db();
-    drop(open_or_recreate(&p, "trigram").unwrap());
-    let conn = open_or_recreate(&p, "trigram").unwrap();
+    drop(open_or_recreate(&p, &Default::default()).unwrap());
+    let conn = open_or_recreate(&p, &Default::default()).unwrap();
     assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
 }
 
@@ -58,7 +76,7 @@ fn reopen_is_idempotent() {
 fn older_versioned_db_is_wiped_and_recreated() {
     let (_dir, p) = db();
     write_v1_index(&p, "a.txt");
-    let conn = open_or_recreate(&p, "trigram").unwrap();
+    let conn = open_or_recreate(&p, &Default::default()).unwrap();
     assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
     assert_eq!(file_count(&conn), 0, "old rows should be wiped");
 }
@@ -79,7 +97,7 @@ fn legacy_layout_db_is_wiped_and_recreated() {
         )
         .unwrap();
     }
-    let conn = open_or_recreate(&p, "trigram").unwrap();
+    let conn = open_or_recreate(&p, &Default::default()).unwrap();
     assert_eq!(file_count(&conn), 0);
     // An unknown column name fails to prepare.
     conn.prepare("SELECT content_state, type, mime FROM files LIMIT 0")
@@ -90,7 +108,7 @@ fn legacy_layout_db_is_wiped_and_recreated() {
 fn tokenizer_drift_wipes_db() {
     let (_dir, p) = db();
     let first_effective = {
-        let conn = open_or_recreate(&p, "trigram").unwrap();
+        let conn = open_or_recreate(&p, &Default::default()).unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) \
              VALUES ('x', '/', 0, 0)",
@@ -99,16 +117,77 @@ fn tokenizer_drift_wipes_db() {
         .unwrap();
         info(&conn, "tokenize")
     };
-    let conn = open_or_recreate(&p, "unicode61").unwrap();
+    let conn = open_or_recreate(&p, &with_tokenizer("unicode61")).unwrap();
     assert_eq!(file_count(&conn), 0, "tokenizer drift should wipe rows");
     assert_ne!(first_effective, info(&conn, "tokenize"));
+}
+
+/// The position setting is part of the table definition, like the
+/// tokenizer: a change wipes, and the layout built is the one recorded,
+/// which is what every search reads back.
+#[test]
+fn position_drift_wipes_db_and_the_layout_is_recorded() {
+    let (_dir, p) = db();
+    {
+        let conn = open_or_recreate(&p, &Default::default()).unwrap();
+        assert!(fts_sql(&conn).contains("detail=none"), "compact by default");
+        assert_eq!(info(&conn, "fts_positions"), "false");
+        assert!(!crate::db::repo::fts_positions(&conn));
+        conn.execute(
+            "INSERT INTO files (name, parent, size, mtime) VALUES ('x', '/', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+    let full = ProcessingConfig {
+        compact_text_index: false,
+        ..Default::default()
+    };
+    let conn = open_or_recreate(&p, &full).unwrap();
+    assert_eq!(file_count(&conn), 0, "a layout change wipes the rows");
+    assert!(!fts_sql(&conn).contains("detail"));
+    assert_eq!(info(&conn, "fts_positions"), "true");
+    assert!(crate::db::repo::fts_positions(&conn));
+}
+
+/// A word tokenizer cannot be queried by trigrams, so it keeps positions
+/// whatever the flag says, and the flag alone then changes nothing.
+#[test]
+fn a_word_tokenizer_keeps_positions_and_ignores_the_flag() {
+    let (_dir, p) = db();
+    {
+        let conn = open_or_recreate(&p, &with_tokenizer("unicode61")).unwrap();
+        assert!(!fts_sql(&conn).contains("detail"));
+        assert_eq!(info(&conn, "fts_positions"), "true");
+        conn.execute(
+            "INSERT INTO files (name, parent, size, mtime) VALUES ('x', '/', 0, 0)",
+            [],
+        )
+        .unwrap();
+    }
+    let flag_off = ProcessingConfig {
+        compact_text_index: false,
+        ..with_tokenizer("unicode61")
+    };
+    let conn = open_or_recreate(&p, &flag_off).unwrap();
+    assert_eq!(file_count(&conn), 1, "the same layout: nothing to rebuild");
+}
+
+/// An index from before the layout was recorded kept positions.
+#[test]
+fn an_unrecorded_layout_reads_as_positions() {
+    let (_dir, p) = db();
+    let conn = open_or_recreate(&p, &Default::default()).unwrap();
+    conn.execute("DELETE FROM schema_info WHERE key = 'fts_positions'", [])
+        .unwrap();
+    assert!(crate::db::repo::fts_positions(&conn));
 }
 
 #[test]
 fn open_existing_reads_nondefault_tokenizer_without_wiping() {
     let (_dir, p) = db();
     {
-        let conn = open_or_recreate(&p, "unicode61").unwrap();
+        let conn = open_or_recreate(&p, &with_tokenizer("unicode61")).unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) \
              VALUES ('note', '/', 0, 0)",
@@ -129,6 +208,7 @@ fn open_existing_reads_nondefault_tokenizer_without_wiping() {
         1,
         "open_existing must not wipe a non-default-tokenizer DB"
     );
+    // A word tokenizer: `hello` is one token, so a bare MATCH is exact.
     let hits: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH 'hello'",
@@ -145,7 +225,7 @@ fn open_existing_reads_nondefault_tokenizer_without_wiping() {
 fn open_or_recreate_creates_missing_parent_dirs() {
     let dir = Scratch::dir("mkdir");
     let db = dir.join("nested/deeper/index.sqlite");
-    drop(open_or_recreate(db.to_str().unwrap(), "trigram").unwrap());
+    drop(open_or_recreate(db.to_str().unwrap(), &Default::default()).unwrap());
     assert!(db.exists());
 }
 
@@ -156,7 +236,7 @@ fn writable_opens_use_wal_and_it_persists() {
         conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap()
     };
-    let conn = open_or_recreate(&p, "trigram").unwrap();
+    let conn = open_or_recreate(&p, &Default::default()).unwrap();
     assert_eq!(mode(&conn).to_lowercase(), "wal");
     drop(conn);
     // WAL is persistent in the file: a later read-only consumer sees it.
@@ -173,7 +253,7 @@ fn maintenance_opens_keep_temporaries_on_disk() {
         conn.query_row("PRAGMA temp_store", [], |r| r.get(0))
             .unwrap()
     };
-    let conn = open_or_recreate(&p, "trigram").unwrap();
+    let conn = open_or_recreate(&p, &Default::default()).unwrap();
     assert_eq!(temp_store(&conn), 2, "the indexer's own profile is MEMORY");
     drop(conn);
 
@@ -211,13 +291,13 @@ fn index_needs_rebuild_only_when_the_schema_really_differs() {
     let cases: [(Fixture, bool, &str); 5] = [
         (|_| {}, false, "no file yet is a fresh install, not a reset"),
         (
-            |p| drop(open_or_recreate(p, "trigram").unwrap()),
+            |p| drop(open_or_recreate(p, &Default::default()).unwrap()),
             false,
             "a current index is not going to be rebuilt",
         ),
         (
             |p| {
-                drop(open_or_recreate(p, "trigram").unwrap());
+                drop(open_or_recreate(p, &Default::default()).unwrap());
                 open_existing(p, true)
                     .unwrap()
                     .execute(
@@ -289,7 +369,7 @@ fn keyed_create_reopen_and_header_is_encrypted() {
     let (_dir, p) = db();
     let key = test_key(0xa1);
     {
-        let conn = open_or_recreate_keyed(&p, "trigram", Some(&key)).unwrap();
+        let conn = open_or_recreate_keyed(&p, &Default::default(), Some(&key)).unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) \
              VALUES ('secret', '/', 0, 0)",
@@ -300,7 +380,7 @@ fn keyed_create_reopen_and_header_is_encrypted() {
     let head = &file_bytes(&p)[..16];
     assert_ne!(head, b"SQLite format 3\0", "file must not be plaintext");
 
-    let conn = open_or_recreate_keyed(&p, "trigram", Some(&key)).unwrap();
+    let conn = open_or_recreate_keyed(&p, &Default::default(), Some(&key)).unwrap();
     assert_eq!(
         file_count(&conn),
         1,
@@ -315,7 +395,7 @@ fn keyed_create_reopen_and_header_is_encrypted() {
 fn wrong_key_errors_without_wiping() {
     let (_dir, p) = db();
     {
-        let conn = open_or_recreate_keyed(&p, "trigram", Some(&test_key(0xa1))).unwrap();
+        let conn = open_or_recreate_keyed(&p, &Default::default(), Some(&test_key(0xa1))).unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) \
              VALUES ('x', '/', 0, 0)",
@@ -329,7 +409,7 @@ fn wrong_key_errors_without_wiping() {
         assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     }
     // A wrong key is never a "schema mismatch" to answer with a wipe.
-    let err = open_or_recreate_keyed(&p, "trigram", Some(&test_key(0xb2))).unwrap_err();
+    let err = open_or_recreate_keyed(&p, &Default::default(), Some(&test_key(0xb2))).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     assert_eq!(before, file_bytes(&p), "file must be byte-identical");
 }
@@ -337,12 +417,12 @@ fn wrong_key_errors_without_wiping() {
 #[test]
 fn missing_key_on_encrypted_db_errors_without_wiping() {
     let (_dir, p) = db();
-    drop(open_or_recreate_keyed(&p, "trigram", Some(&test_key(0xa1))).unwrap());
+    drop(open_or_recreate_keyed(&p, &Default::default(), Some(&test_key(0xa1))).unwrap());
     let before = file_bytes(&p);
     let err = open_existing_keyed(&p, false, None).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     assert!(err.contains("password-protected"), "got: {err}");
-    let err = open_or_recreate_keyed(&p, "trigram", None).unwrap_err();
+    let err = open_or_recreate_keyed(&p, &Default::default(), None).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     assert_eq!(before, file_bytes(&p));
 }
@@ -350,13 +430,13 @@ fn missing_key_on_encrypted_db_errors_without_wiping() {
 #[test]
 fn key_on_plaintext_db_errors_without_wiping() {
     let (_dir, p) = db();
-    drop(open_or_recreate(&p, "trigram").unwrap());
+    drop(open_or_recreate(&p, &Default::default()).unwrap());
     let before = file_bytes(&p);
     let err = open_existing_keyed(&p, false, Some(&test_key(0xa1))).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     // The sniffed plaintext header yields the precise diagnosis.
     assert!(err.contains("not encrypted"), "got: {err}");
-    let err = open_or_recreate_keyed(&p, "trigram", Some(&test_key(0xa1))).unwrap_err();
+    let err = open_or_recreate_keyed(&p, &Default::default(), Some(&test_key(0xa1))).unwrap_err();
     assert!(err.starts_with(KEY_MISMATCH_PREFIX), "got: {err}");
     assert_eq!(before, file_bytes(&p));
 }
@@ -377,7 +457,7 @@ fn schema_mismatch_under_key_wipes_and_recreates_encrypted() {
         key_and_probe(&conn, &p, Some(&key), previous).unwrap();
         write_v1_schema_info(&conn);
     }
-    let conn = open_or_recreate_keyed(&p, "trigram", Some(&key)).unwrap();
+    let conn = open_or_recreate_keyed(&p, &Default::default(), Some(&key)).unwrap();
     assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
     drop(conn);
     let head = &file_bytes(&p)[..16];
@@ -401,7 +481,7 @@ fn garbage_file_with_key_reports_mismatch_not_corruption() {
 fn open_existing_rw_allows_delete() {
     let (_dir, p) = db();
     {
-        let conn = open_or_recreate(&p, "trigram").unwrap();
+        let conn = open_or_recreate(&p, &Default::default()).unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) \
              VALUES ('a', '/', 0, 0)",
@@ -428,7 +508,7 @@ fn a_fresh_index_and_its_sidecars_are_owner_only() {
     // test: an existing directory keeps whatever mode its owner chose.
     let dir = Scratch::dir("open");
     let p = dir.join("data").join("index.sqlite");
-    let conn = open_or_recreate(p.to_str().unwrap(), "trigram").unwrap();
+    let conn = open_or_recreate(p.to_str().unwrap(), &Default::default()).unwrap();
     conn.execute(
         "INSERT INTO files (name, parent, size, mtime) \
          VALUES ('a', '/', 0, 0)",
@@ -462,7 +542,7 @@ fn maintain_reads_its_pragmas_on_a_keyed_index() {
     let (_dir, p) = db();
     let key = test_key(0xc3);
     {
-        let conn = open_or_recreate_keyed(&p, "trigram", Some(&key)).unwrap();
+        let conn = open_or_recreate_keyed(&p, &Default::default(), Some(&key)).unwrap();
         conn.execute(
             "INSERT INTO files (name, parent, size, mtime) VALUES ('x', '/', 0, 0)",
             [],
@@ -482,6 +562,16 @@ fn maintain_reads_its_pragmas_on_a_keyed_index() {
         crate::db::repo::pragma_number(&conn, "page_size").unwrap() >= 512,
         "a real page size, not a silent zero"
     );
+}
+
+/// A layout with positions: `pgsz` caps a leaf the same in either layout,
+/// and position lists fill leaves soonest, so the geometry tests below need
+/// the smallest corpus this way.
+fn positional() -> ProcessingConfig {
+    ProcessingConfig {
+        compact_text_index: false,
+        ..Default::default()
+    }
 }
 
 /// Write enough text that FTS5 emits several *full* leaves. A corpus of tiny
@@ -565,7 +655,7 @@ fn assert_leaves_inline(conn: &Connection, keyed: bool) {
 fn keyed_fts_leaves_stay_inline() {
     let (_dir, p) = db();
     let key = test_key(0xd4);
-    let conn = open_or_recreate_keyed(&p, "trigram", Some(&key)).unwrap();
+    let conn = open_or_recreate_keyed(&p, &positional(), Some(&key)).unwrap();
     assert_eq!(
         fts_stored_pgsz(&conn),
         Some(crate::db::schema::fts_pgsz_for(
@@ -638,7 +728,7 @@ fn derived_fts_pgsz_fits_inline_at_every_swept_page_size() {
 fn a_plain_index_gets_the_derived_pgsz_for_its_page_size() {
     use crate::db::schema::{fts_pgsz_for, PROFILE};
     let (_dir, p) = db();
-    let conn = open_or_recreate(&p, "trigram").unwrap();
+    let conn = open_or_recreate(&p, &positional()).unwrap();
     assert_eq!(
         fts_stored_pgsz(&conn),
         Some(fts_pgsz_for(PROFILE, false)),
@@ -672,7 +762,7 @@ fn a_foreign_database_is_refused_not_wiped() {
         )
         .unwrap();
     }
-    let err = open_or_recreate(&p, "trigram").unwrap_err();
+    let err = open_or_recreate(&p, &Default::default()).unwrap_err();
     assert!(err.starts_with(FOREIGN_DB_PREFIX), "got: {err}");
     assert!(
         err.contains("moz_places"),
@@ -692,7 +782,7 @@ fn an_empty_database_file_is_still_ours_to_build() {
     let (_dir, p) = db();
     // An empty but real SQLite file, header and all.
     drop(Connection::open(&p).unwrap());
-    let conn = open_or_recreate(&p, "trigram").unwrap();
+    let conn = open_or_recreate(&p, &Default::default()).unwrap();
     assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
 }
 
@@ -706,7 +796,7 @@ fn a_legacy_table_marks_a_file_as_ours() {
             .unwrap()
             .execute(&format!("CREATE TABLE {} (x INTEGER)", table), [])
             .unwrap();
-        open_or_recreate(&p, "trigram")
+        open_or_recreate(&p, &Default::default())
             .unwrap_or_else(|e| panic!("{table} should read as ours, got: {e}"));
     }
 }
@@ -723,7 +813,7 @@ fn a_schema_info_without_a_version_row_is_still_ours() {
             [],
         )
         .unwrap();
-    open_or_recreate(&p, "trigram").expect("half-built index is ours");
+    open_or_recreate(&p, &Default::default()).expect("half-built index is ours");
 }
 
 /// A table that merely *shares the name* `schema_info` is not ours.
@@ -737,7 +827,7 @@ fn a_foreign_schema_info_is_refused() {
         conn.execute("INSERT INTO schema_info(revision) VALUES(3)", [])
             .unwrap();
     }
-    let err = open_or_recreate(&p, "trigram").unwrap_err();
+    let err = open_or_recreate(&p, &Default::default()).unwrap_err();
     assert!(err.starts_with(FOREIGN_DB_PREFIX), "got: {err}");
 
     let conn = Connection::open(&p).unwrap();

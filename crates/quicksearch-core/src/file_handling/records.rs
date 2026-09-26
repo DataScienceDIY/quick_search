@@ -43,11 +43,23 @@ pub fn classify_by_mtime(stored: Option<u64>, mtime: u64) -> FileIndexAction {
 }
 
 /// Truncate in place to at most `max_bytes`, backing up to a UTF-8 char
-/// boundary.
+/// boundary, and give back the capacity: the text goes on to wait in the
+/// content pass's queues, where a 40 MiB log truncated without the shrink
+/// would still hold 40 MiB per queued row.
 pub(crate) fn safe_truncate(s: &mut String, max_bytes: usize) {
     if s.len() > max_bytes {
         s.truncate(s.floor_char_boundary(max_bytes));
+        s.shrink_to_fit();
     }
+}
+
+/// A file's modified time in whole seconds, the unit `files.mtime` stores and
+/// every unchanged-file check compares; `None` when the platform has none.
+pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> Option<u64> {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
 }
 
 /// A SHA-256 digest, held inline rather than as a `Vec` so hashing allocates
@@ -254,9 +266,10 @@ pub fn fts_finalize_after_text_indexing(conn: &Connection) {
 /// An owned, fully-derived file record, produced by [`prepare_file_record`].
 #[derive(Debug, Clone)]
 pub struct OwnedNewFile {
-    pub name: String,
-    /// The containing directory, ending in the platform separator.
-    pub parent: String,
+    /// Parent and name in one buffer; the parent ends in the platform
+    /// separator. One allocation rather than two: `indexprobe cold`, 100k
+    /// files, 7.2 → 6.2 allocations per file.
+    pub path: repo::RowPath,
     pub size: u64,
     pub mtime: u64,
     /// Borrowed from the static tables [`guess_mime_from_head`] answers from.
@@ -275,14 +288,14 @@ pub struct OwnedNewFile {
 }
 
 impl OwnedNewFile {
-    pub fn path(&self) -> String {
-        format!("{}{}", self.parent, self.name)
+    pub fn path(&self) -> &str {
+        self.path.as_str()
     }
 
     pub fn as_new_file(&self) -> NewFile<'_> {
         NewFile {
-            name: &self.name,
-            parent: &self.parent,
+            name: self.path.name(),
+            parent: self.path.parent(),
             size: self.size,
             mtime: self.mtime,
             mime: self.mime,
@@ -327,11 +340,7 @@ pub fn prepare_file_record(
     }
 
     let size = meta.len();
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())?;
+    let mtime = mtime_secs(meta)?;
 
     // A dehydrated cloud file is indexed from its metadata alone: reading
     // even the first byte would block on downloading the whole file.
@@ -362,7 +371,7 @@ pub fn prepare_file_record(
     };
 
     let (parent, name) = split_db_path(path)?;
-    let (parent, name) = (parent.to_string(), name.to_string());
+    let row_path = repo::RowPath::new(parent, name);
     let head = scratch.head();
     let mime = guess_mime_from_head(Path::new(path), head);
     let ftype = mime.map(mime_to_type).unwrap_or(FileType::EMPTY);
@@ -389,8 +398,7 @@ pub fn prepare_file_record(
         });
 
     Some(OwnedNewFile {
-        name,
-        parent,
+        path: row_path,
         size,
         mtime,
         mime,
@@ -401,26 +409,10 @@ pub fn prepare_file_record(
     })
 }
 
-/// [`prepare_file_record`] for a path not yet resolved: the watcher path. One
-/// file at a time, so it owns the scratch rather than being handed one.
-pub fn prepare_file_record_from_path(
-    path: &Path,
-    config: &Config,
-    registry: &Registry,
-) -> Option<OwnedNewFile> {
-    let canonical = path.canonicalize().ok()?;
-    if warn_if_unrepresentable(&canonical) {
-        return None;
-    }
-    let db_path = path_to_db_string(&canonical);
-    let meta = std::fs::metadata(&canonical).ok()?;
-    let mut scratch = Scratch::new(config);
-    prepare_file_record(&db_path, &meta, config, registry, &mut scratch)
-}
-
-/// Extract content for one file and record the outcome on its row. `mime` is
-/// authoritative, including when it is `None`: the head was already sniffed
-/// by [`prepare_file_record`], and re-sniffing gives the same answer.
+/// Extract content for one pending file and record the outcome on its row
+/// ([`repo::complete_pending`]). `mime` is authoritative, including when it
+/// is `None`: the head was already sniffed by [`prepare_file_record`], and
+/// re-sniffing gives the same answer.
 pub fn extract_and_store(
     tx: &rusqlite::Transaction<'_>,
     file_id: i64,
@@ -434,10 +426,10 @@ pub fn extract_and_store(
     let mut scratch = Scratch::new(config);
     let outcome = decide_content(path, mime, registry, config, &mut scratch);
     let zstd = match outcome_body(&outcome) {
-        Some(text) => repo::encode_one(text, config.processing.store_text_for_snippets)?,
+        Some(text) => repo::encode_one(text)?,
         None => None,
     };
-    store_content_outcome(tx, file_id, &outcome, zstd.as_deref())
+    repo::complete_pending(tx, file_id, &outcome, zstd.as_deref()).map(|_| ())
 }
 
 /// What should be written for one file's content, decided without touching
@@ -493,21 +485,6 @@ pub fn decide_content(
         }
         Ok(false) => ContentOutcome::NotApplicable,
         Err(reason) => ContentOutcome::Failed(reason),
-    }
-}
-
-/// Apply a decision from [`decide_content`]: the cheap half, all that runs
-/// with the connection held. `text_zstd`: see [`repo::set_content_done`].
-pub fn store_content_outcome(
-    tx: &rusqlite::Transaction<'_>,
-    file_id: i64,
-    outcome: &ContentOutcome,
-    text_zstd: Option<&[u8]>,
-) -> Result<(), String> {
-    match outcome {
-        ContentOutcome::Done { text } => repo::set_content_done(tx, file_id, text, text_zstd),
-        ContentOutcome::NotApplicable => repo::set_content_na(tx, file_id),
-        ContentOutcome::Failed(reason) => repo::set_content_failed(tx, file_id, reason),
     }
 }
 

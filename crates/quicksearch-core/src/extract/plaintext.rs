@@ -38,11 +38,17 @@ pub(crate) const EXTRA_TEXT_MIMES: &[&str] = &[
     "message/rfc822",
 ];
 
-/// Decode `bytes` into `out`. Valid UTF-8 is moved, not copied, which is why
-/// plaintext reads into a fresh buffer rather than the worker's scratch:
-/// reusing one would trade an allocation for a full-length `memcpy` per file.
-fn decode_into(bytes: Vec<u8>, path: &Path, out: &mut String) -> Result<(), ExtractError> {
-    super::append(out, crate::textenc::decode_text(bytes, path)?);
+/// Decode `bytes`, a prefix of the file when `truncated`, into `out`. Valid
+/// UTF-8 is moved, not copied, which is why plaintext reads into a fresh
+/// buffer rather than the worker's scratch: reusing one would trade an
+/// allocation for a full-length `memcpy` per file.
+fn decode_into(
+    bytes: Vec<u8>,
+    path: &Path,
+    truncated: bool,
+    out: &mut String,
+) -> Result<(), ExtractError> {
+    super::append(out, crate::textenc::decode_text(bytes, path, truncated)?);
     Ok(())
 }
 
@@ -79,9 +85,12 @@ impl Extractor for PlaintextExtractor {
         out: &mut String,
         scratch: &mut Scratch,
     ) -> Result<(), ExtractError> {
-        // The pass never offers a file above `limits().read`, so this cap only
-        // bites for a file that grew since the walk or reports a false size.
-        let cap = scratch.limits().read;
+        // Only the prefix that can survive truncation to `limits().text` is
+        // read: UTF-16 is the widest input per byte of UTF-8 output (2:1), so
+        // no file contributes more than twice the limit. Reading a 40 MiB log
+        // whole to keep 256 KiB of it was the content pass's peak memory.
+        let limits = scratch.limits();
+        let cap = limits.read.min(limits.text.saturating_mul(2));
         let mut f =
             File::open(path).map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
         let size = f
@@ -96,10 +105,12 @@ impl Extractor for PlaintextExtractor {
             f.take(cap as u64)
                 .read_to_end(&mut buf)
                 .map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
-            return decode_into(buf, path, out);
+            let truncated = buf.len() == cap;
+            return decode_into(buf, path, truncated, out);
         }
 
-        decode_into(read_sized(&mut f, size, cap, path)?, path, out)
+        let buf = read_sized(&mut f, size, cap, path)?;
+        decode_into(buf, path, size > cap, out)
     }
 
     /// The head belongs to the walk worker and is reused for the next file,
@@ -298,6 +309,36 @@ mod tests {
         let mut f = File::open(&p).unwrap();
         let out = read_sized(&mut f, 1_000_000, max_read(), &p).unwrap();
         assert_eq!(out, b"only ten!!");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Twice the text limit: the most any file can contribute to stored text.
+    fn prefix_cap() -> usize {
+        scratch().limits().text * 2
+    }
+
+    #[test]
+    fn a_file_far_over_the_text_limit_reads_only_the_keepable_prefix() {
+        let body = vec![b'z'; prefix_cap() * 3];
+        let p = tmp("prefix", &body);
+        let out = extract(&p).unwrap();
+        assert_eq!(out.len(), prefix_cap(), "read past what can be kept");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// A read that cuts a multibyte character must not demote a UTF-8 file to
+    /// a legacy charset, which would decode the whole prefix as mojibake.
+    #[test]
+    fn a_character_cut_by_the_prefix_read_is_dropped_not_misdecoded() {
+        let mut body = vec![b'a'; prefix_cap() - 1];
+        body.extend_from_slice("é and more after the cut".as_bytes());
+        let p = tmp("cutchar", &body);
+        let out = extract(&p).unwrap();
+        assert_eq!(out.len(), prefix_cap() - 1, "the cut é's stub is dropped");
+        assert!(
+            out.bytes().all(|b| b == b'a'),
+            "decoded as UTF-8, not legacy"
+        );
         std::fs::remove_file(&p).ok();
     }
 

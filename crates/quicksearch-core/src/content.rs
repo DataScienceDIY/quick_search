@@ -331,11 +331,17 @@ mod tests {
 
     use crate::db::open_or_recreate;
     use crate::db::repo::{self, insert_file, NewFile};
-    use crate::file_handling::{extract_scope_prepare, store_extracted, ExtractScope, Stored};
+    use crate::file_handling::{
+        extract_scope_prepare, store_extracted, Bodies, ExtractScope, Stored,
+    };
     use crate::mime::FileType;
     use crate::testutil::Scratch;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    fn bodies() -> Bodies {
+        Bodies::new().unwrap()
+    }
 
     fn tree(s: &Scratch) -> PathBuf {
         s.join("tree")
@@ -349,7 +355,7 @@ mod tests {
     /// a pending row for each. The guard owns both.
     fn seed(tag: &str, dirs: &[(&str, usize)]) -> Scratch {
         let s = Scratch::dir(tag);
-        let mut conn = open_or_recreate(db(&s).to_str().unwrap(), "trigram").unwrap();
+        let mut conn = open_or_recreate(db(&s).to_str().unwrap(), &Default::default()).unwrap();
         let tx = conn.transaction().unwrap();
         for (dir, n) in dirs {
             let d = tree(&s).join(dir);
@@ -385,7 +391,7 @@ mod tests {
 
     fn writer(s: &Scratch) -> Arc<Mutex<rusqlite::Connection>> {
         Arc::new(Mutex::new(
-            open_or_recreate(db(s).to_str().unwrap(), "trigram").unwrap(),
+            open_or_recreate(db(s).to_str().unwrap(), &Default::default()).unwrap(),
         ))
     }
 
@@ -422,7 +428,7 @@ mod tests {
         assert!(pass.finish());
         let stop = Arc::new(AtomicBool::new(false));
         let far = Instant::now() + Duration::from_secs(60);
-        store_extracted(conn, &rows, &stop, &Config::default(), far).unwrap()
+        store_extracted(conn, &rows, &stop, far, &mut bodies()).unwrap()
     }
 
     #[test]
@@ -479,15 +485,7 @@ mod tests {
             "out-of-range row untouched"
         );
 
-        let hits: i64 = conn_mutex
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH '\"sphinx\"'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let hits = crate::testutil::fts_count(&conn_mutex.lock().unwrap(), "sphinx");
         assert_eq!(hits, 3);
     }
 
@@ -545,7 +543,6 @@ mod tests {
     fn store_extracted_honours_its_deadline_but_always_makes_progress() {
         let s = seed("deadline", &[("r1", 5)]);
         let conn_mutex = writer(&s);
-        let config = Config::default();
         let mut pass = pass_for(&s, "r1", 2);
         let rows = drain(&mut pass);
         assert!(pass.finish());
@@ -555,7 +552,7 @@ mod tests {
         // A deadline already gone by: one row, then out.
         let past = Instant::now() - Duration::from_secs(1);
         assert_eq!(
-            store_extracted(&conn_mutex, &rows, &stop, &config, past).unwrap(),
+            store_extracted(&conn_mutex, &rows, &stop, past, &mut bodies()).unwrap(),
             Stored {
                 consumed: 1,
                 written: 1
@@ -563,7 +560,7 @@ mod tests {
         );
         let far = Instant::now() + Duration::from_secs(60);
         assert_eq!(
-            store_extracted(&conn_mutex, &rows[1..], &stop, &config, far).unwrap(),
+            store_extracted(&conn_mutex, &rows[1..], &stop, far, &mut bodies()).unwrap(),
             Stored {
                 consumed: 4,
                 written: 4
@@ -583,7 +580,7 @@ mod tests {
         // Stopped before it starts: nothing consumed.
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            store_extracted(&conn_mutex, &rows, &stop, &config, far).unwrap(),
+            store_extracted(&conn_mutex, &rows, &stop, far, &mut bodies()).unwrap(),
             Stored::default()
         );
     }

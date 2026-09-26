@@ -51,8 +51,8 @@ const DOCS: usize = 60;
 /// the corpus goes straight into the term and the FTS chunks: FTS5
 /// metacharacters (must be quoted into inertness by
 /// `translator::quote_phrase`), multi-byte characters at 2, 3 and 4 bytes,
-/// diacritics (folded by the trigram index but not by bitap, so the prefilter
-/// must stay a superset across that), mixed case, and a degenerate
+/// diacritics (a fuzzy match may span an accented character, which the
+/// prefilter must survive), mixed case, and a degenerate
 /// repeated-character shape.
 fn bodies() -> Vec<String> {
     let mut out = Vec::new();
@@ -586,7 +586,8 @@ fn seed_files(path: &std::path::Path, rows: &[(String, String)]) -> Vec<i64> {
     use quicksearch_core::mime::FileType;
 
     let mut conn =
-        quicksearch_core::db::open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+        quicksearch_core::db::open_or_recreate(path.to_str().unwrap(), &Default::default())
+            .unwrap();
     let tx = conn.transaction().unwrap();
     let mut ids = Vec::with_capacity(rows.len());
     for (parent, name) in rows {
@@ -838,12 +839,13 @@ fn a_regex_finds_exactly_the_documents_it_matches() {
 }
 
 fn seed(path: &std::path::Path, bodies: &[String]) -> Vec<i64> {
-    use quicksearch_core::db::repo::{insert_file, set_content_done, NewFile};
+    use quicksearch_core::db::repo::{insert_file, store_pending_text, NewFile};
     use quicksearch_core::mime::FileType;
     use quicksearch_core::testutil::zstd_of;
 
     let mut conn =
-        quicksearch_core::db::open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+        quicksearch_core::db::open_or_recreate(path.to_str().unwrap(), &Default::default())
+            .unwrap();
     let tx = conn.transaction().unwrap();
     let mut ids = Vec::with_capacity(bodies.len());
     for (i, body) in bodies.iter().enumerate() {
@@ -864,7 +866,7 @@ fn seed(path: &std::path::Path, bodies: &[String]) -> Vec<i64> {
         )
         .unwrap()
         .expect("unique path");
-        set_content_done(&tx, id, body, zstd_of(body).as_deref()).unwrap();
+        store_pending_text(&tx, id, body, zstd_of(body).as_deref()).unwrap();
         ids.push(id);
     }
     tx.commit().unwrap();

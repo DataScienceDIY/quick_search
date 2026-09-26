@@ -219,7 +219,7 @@ mod tests {
     fn seed(dir: &str, rows: &[(&str, u64, Option<&[u8]>)]) -> (Scratch, String) {
         let (scratch, p) = Scratch::db(dir);
         let p = p.to_str().unwrap().to_string();
-        let mut conn = open_or_recreate(&p, "trigram").unwrap();
+        let mut conn = open_or_recreate(&p, &Default::default()).unwrap();
         let tx = conn.transaction().unwrap();
         for &(name, size, hash) in rows {
             insert_file(

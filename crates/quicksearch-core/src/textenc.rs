@@ -77,13 +77,22 @@ pub fn looks_like_text(head: &[u8]) -> bool {
 /// Takes the buffer by value so a UTF-8 file, the overwhelming majority,
 /// becomes its `String` with no copy. Callers holding only a borrow want
 /// [`decode_borrowed_text`].
-pub fn decode_text(bytes: Vec<u8>, path: &Path) -> Result<String, String> {
+///
+/// `truncated` marks a prefix of the file rather than all of it: a multibyte
+/// character cut by the read is dropped instead of demoting the file to
+/// `Legacy`. The other encodings replace a cut tail with one U+FFFD.
+pub fn decode_text(mut bytes: Vec<u8>, path: &Path, truncated: bool) -> Result<String, String> {
     if bytes.is_empty() {
         return Ok(String::new());
     }
-    match classify(&bytes, false) {
-        // Cannot fail: classify ran strict validation with truncated=false.
-        TextClass::Utf8 => Ok(String::from_utf8(bytes).expect("classified as UTF-8")),
+    match classify(&bytes, truncated) {
+        TextClass::Utf8 => {
+            // `classify` forgave only a cut final character; drop its stub.
+            if let Err(e) = std::str::from_utf8(&bytes) {
+                bytes.truncate(e.valid_up_to());
+            }
+            Ok(String::from_utf8(bytes).expect("classified as UTF-8"))
+        }
         _ => decode_borrowed_text(&bytes, path),
     }
 }
@@ -157,7 +166,7 @@ mod tests {
         let body = "plain ascii and café über 日本語".as_bytes().to_vec();
         assert!(looks_like_text(&body));
         assert_eq!(
-            decode_text(body, &p()).unwrap(),
+            decode_text(body, &p(), false).unwrap(),
             "plain ascii and café über 日本語"
         );
     }
@@ -167,7 +176,7 @@ mod tests {
         let mut body = vec![0xEF, 0xBB, 0xBF];
         body.extend_from_slice("hello".as_bytes());
         assert!(looks_like_text(&body));
-        let text = decode_text(body, &p()).unwrap();
+        let text = decode_text(body, &p(), false).unwrap();
         assert_eq!(text, "hello", "BOM must not survive into stored text");
     }
 
@@ -180,7 +189,7 @@ mod tests {
             body.extend_from_slice(&unit.to_le_bytes());
         }
         assert!(looks_like_text(&body));
-        assert_eq!(decode_text(body, &p()).unwrap(), src);
+        assert_eq!(decode_text(body, &p(), false).unwrap(), src);
     }
 
     #[test]
@@ -191,7 +200,7 @@ mod tests {
             body.extend_from_slice(&unit.to_be_bytes());
         }
         assert!(looks_like_text(&body));
-        assert_eq!(decode_text(body, &p()).unwrap(), src);
+        assert_eq!(decode_text(body, &p(), false).unwrap(), src);
     }
 
     /// Legacy charsets decode, but do not *sniff*.
@@ -203,7 +212,7 @@ mod tests {
             "the sniff must not adopt a non-UTF-8 head on its own"
         );
         assert_eq!(
-            decode_text(body, &p()).unwrap(),
+            decode_text(body, &p(), false).unwrap(),
             "Le café près de la fenêtre est agréable en été."
         );
     }
@@ -217,7 +226,7 @@ mod tests {
             body.extend_from_slice(head);
         }
         body.extend_from_slice(b"caf\xe9-tail-marker");
-        let out = decode_text(body, &p()).unwrap();
+        let out = decode_text(body, &p(), false).unwrap();
         assert!(
             out.ends_with("café-tail-marker"),
             "the tail past the detection prefix must still be decoded"
@@ -230,7 +239,7 @@ mod tests {
         let body = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9.".to_vec();
         assert!(body.len() < DETECT_PREFIX);
         assert_eq!(
-            decode_text(body, &p()).unwrap(),
+            decode_text(body, &p(), false).unwrap(),
             "Le café près de la fenêtre est agréable en été."
         );
     }
@@ -242,14 +251,14 @@ mod tests {
         assert!(!had_errors);
         let body = encoded.into_owned();
         assert!(!looks_like_text(&body));
-        assert_eq!(decode_text(body, &p()).unwrap(), src);
+        assert_eq!(decode_text(body, &p(), false).unwrap(), src);
     }
 
     #[test]
     fn nul_bytes_are_binary() {
         let body = b"looks like text until\x00it does not".to_vec();
         assert!(!looks_like_text(&body));
-        let err = decode_text(body, &p()).unwrap_err();
+        let err = decode_text(body, &p(), false).unwrap_err();
         assert!(err.contains("binary content"), "{err}");
         assert!(
             err.contains("textenc-test-file"),
@@ -262,7 +271,7 @@ mod tests {
         // 4 control bytes in 24 total = 16% > 10%.
         let body = b"abcdefghijklmnopqrst\x01\x02\x03\x04".to_vec();
         assert!(!looks_like_text(&body));
-        assert!(decode_text(body, &p()).is_err());
+        assert!(decode_text(body, &p(), false).is_err());
     }
 
     #[test]
@@ -270,7 +279,7 @@ mod tests {
         let body =
             b"\x1b[31mERROR\x1b[0m something failed\n\x1b[33mWARN\x1b[0m retrying\n".to_vec();
         assert!(looks_like_text(&body));
-        assert!(decode_text(body, &p()).is_ok());
+        assert!(decode_text(body, &p(), false).is_ok());
     }
 
     #[test]
@@ -280,13 +289,13 @@ mod tests {
         assert!(looks_like_text(&head));
         // The same bytes as a complete file are not valid UTF-8, so the
         // decoder treats them as legacy-encoded: still Ok, never a panic.
-        assert!(decode_text(head, &p()).is_ok());
+        assert!(decode_text(head, &p(), false).is_ok());
     }
 
     #[test]
     fn empty_head_is_not_text_but_empty_file_decodes() {
         assert!(!looks_like_text(b""));
-        assert_eq!(decode_text(Vec::new(), &p()).unwrap(), "");
+        assert_eq!(decode_text(Vec::new(), &p(), false).unwrap(), "");
     }
 
     /// UTF-16 without a BOM is out of scope by decision: its NULs trip the
@@ -298,7 +307,7 @@ mod tests {
             body.extend_from_slice(&unit.to_le_bytes());
         }
         assert!(!looks_like_text(&body));
-        assert!(decode_text(body, &p()).is_err());
+        assert!(decode_text(body, &p(), false).is_err());
     }
 
     /// Every head the sniff accepts must decode, which makes "sniffed as
@@ -329,7 +338,7 @@ mod tests {
                 "sniff verdict changed for {head:?}"
             );
             assert!(
-                decode_text(head.clone(), &p()).is_ok(),
+                decode_text(head.clone(), &p(), false).is_ok(),
                 "head failed to decode: {head:?}"
             );
         }

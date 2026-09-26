@@ -30,11 +30,6 @@ pub struct IndexWork {
     /// back to pending; newly excluded ones lose text and FTS but keep their
     /// row.
     pub reconcile_content: bool,
-    /// `store_text_for_snippets` turned on; rows extracted under the old
-    /// setting kept no text, so they must run again.
-    pub restore_text: bool,
-    /// `store_text_for_snippets` turned off.
-    pub drop_text: bool,
     /// Newly in-scope files exist only on disk, so only a walk can find them.
     pub reindex: bool,
 }
@@ -56,8 +51,6 @@ impl IndexWork {
         self.drop_aliases |= other.drop_aliases;
         self.prune_scope |= other.prune_scope;
         self.reconcile_content |= other.reconcile_content;
-        self.restore_text |= other.restore_text;
-        self.drop_text |= other.drop_text;
         self.reindex |= other.reindex;
     }
 
@@ -67,14 +60,12 @@ impl IndexWork {
             || self.drop_aliases
             || self.prune_scope
             || self.reconcile_content
-            || self.restore_text
-            || self.drop_text
     }
 
     /// Whether applying this scans rows under each surviving root, instead
     /// of only deleting whole ranges.
     pub fn scans_rows(&self) -> bool {
-        self.prune_scope || self.reconcile_content || self.restore_text || self.drop_text
+        self.prune_scope || self.reconcile_content
     }
 
     /// The plan in one line for the log, naming what changed.
@@ -88,8 +79,6 @@ impl IndexWork {
                 self.reconcile_content,
                 "changed which files have their text read",
             ),
-            (self.restore_text, "snippet text turned on"),
-            (self.drop_text, "snippet text turned off"),
         ]
         .into_iter()
         .filter_map(|(changed, part)| changed.then_some(part))
@@ -174,12 +163,13 @@ fn ignore_set(c: &Config) -> BTreeSet<&str> {
 pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
     let search_db_changed = old.paths.database_path != new.paths.database_path;
 
-    // The only three: a different key makes the file unreadable, the
-    // tokenizer is baked into the FTS table definition, and `hash_length`
-    // decides what bytes a stored hash covers. (`use_keychain` changes only
-    // where the key is remembered.)
+    // The only four: a different key makes the file unreadable, the
+    // tokenizer and the position setting are baked into the FTS table
+    // definition, and `hash_length` decides what bytes a stored hash covers.
+    // (`use_keychain` changes only where the key is remembered.)
     let requires_rebuild = old.processing.hash_length != new.processing.hash_length
         || old.processing.tokenize != new.processing.tokenize
+        || old.processing.fts_positions() != new.processing.fts_positions()
         || old.security.password_protected != new.security.password_protected
         || old.security.salt != new.security.salt;
     if requires_rebuild {
@@ -200,9 +190,6 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
     let new_content = content_filter_set(&new_idx.content_extensions);
     let old_cap = old.processing.maximum_text_file_size;
     let new_cap = new.processing.maximum_text_file_size;
-    let old_store = old.processing.store_text_for_snippets;
-    let new_store = new.processing.store_text_for_snippets;
-    let restore_text = !old_store && new_store;
 
     let work = IndexWork {
         drop_roots: old_roots.difference(&new_roots).cloned().collect(),
@@ -215,8 +202,6 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
         drop_aliases: old_idx.follow_symlinks && !new_idx.follow_symlinks,
         // See the field: the size cap decides what the extension filter does.
         reconcile_content: old_content != new_content || old_cap != new_cap,
-        restore_text,
-        drop_text: old_store && !new_store,
         // Widening only adds files, and a file absent from the index is not
         // findable from it: only a walk produces those rows. Re-extraction
         // needs a run too, since the content pass runs as part of one; a
@@ -226,8 +211,7 @@ pub fn diff_actions(old: &Config, new: &Config) -> ConfigActions {
             || (!old_idx.include_hidden && new_idx.include_hidden)
             || (!old_idx.follow_symlinks && new_idx.follow_symlinks)
             || filter_widened(&old_content, &new_content)
-            || new_cap > old_cap
-            || restore_text,
+            || new_cap > old_cap,
     };
 
     ConfigActions {

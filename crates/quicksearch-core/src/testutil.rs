@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// The compressed body [`crate::db::repo::set_content_done`] wants.
+/// The compressed body [`crate::db::repo::store_pending_text`] wants.
 pub fn zstd_of(text: &str) -> Option<Vec<u8>> {
-    crate::db::repo::encode_one(text, true).expect("zstd encode")
+    crate::db::repo::encode_one(text).expect("zstd encode")
 }
 
 /// Old enough that a failure investigated the next morning has its tree.
@@ -338,7 +338,7 @@ impl Default for SeedSpec {
 /// Seed an index with synthetic rows, in one transaction. Shared by the
 /// measurement harnesses so they all describe the same corpus.
 pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
-    use crate::db::repo::{insert_file, set_content_done, NewFile};
+    use crate::db::repo::{insert_file, store_pending_text, NewFile};
     use crate::mime::mime_to_type;
 
     // Before the open: the profile decides how the file is created, and on a
@@ -349,7 +349,7 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
     if let Some(hmac) = spec.hmac {
         crate::db::set_hmac_mode_override(hmac);
     }
-    let conn = crate::db::open_or_recreate(path.to_str().unwrap(), "trigram").unwrap();
+    let conn = crate::db::open_or_recreate(path.to_str().unwrap(), &Default::default()).unwrap();
     // Before the first row: `pgsz` decides how leaves are built, so setting it
     // afterwards would only affect segments merged later.
     if let Some(pgsz) = spec.pgsz {
@@ -415,7 +415,7 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
             })
         });
         // `needs_content` rows are born `STATE_PENDING`, so skipping the
-        // `set_content_done` below leaves one in the queue.
+        // `store_pending_text` below leaves one in the queue.
         let needs_content = i % spec.content_every.max(1) == 0 && registry.supports(mime);
         let extracted = needs_content && (spec.pending_every == 0 || i % spec.pending_every != 0);
         let id = insert_file(
@@ -444,7 +444,7 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
                 body[spec.body_words * 2 / 3] = BODY_TERM;
             }
             let body = body.join(" ");
-            set_content_done(&tx, id, &body, zstd_of(&body).as_deref()).unwrap();
+            store_pending_text(&tx, id, &body, zstd_of(&body).as_deref()).unwrap();
         }
         if spec.commit_every > 0 && (i + 1) % spec.commit_every == 0 {
             tx.commit().unwrap();
@@ -493,6 +493,30 @@ pub fn sniff(path: &std::path::Path, hash_length: usize) -> Option<&'static str>
     let n = f.read(&mut head).ok()?;
     head.truncate(n);
     crate::mime::guess_mime_from_head(path, &head)
+}
+
+/// The rows the full-text index matches for `term`, asked for as a search
+/// would ask ([`crate::search::prefilter::fts_literal`], by the layout the
+/// index records): a bare `MATCH 'word'` is a phrase of several trigrams,
+/// which an index without positions refuses. Unverified, so on such an index
+/// these are candidates, a superset of the documents containing `term`.
+pub fn fts_rowids(conn: &rusqlite::Connection, term: &str) -> Vec<i64> {
+    let expr = crate::search::prefilter::fts_literal(term, crate::db::repo::fts_positions(conn))
+        .expect("a term of three characters or more");
+    let mut stmt = conn
+        .prepare("SELECT rowid FROM searchabletext WHERE searchabletext MATCH ?1")
+        .expect("prepare fts query");
+    let rows = stmt
+        .query_map([expr], |r| r.get(0))
+        .expect("fts query")
+        .collect::<Result<Vec<i64>, _>>()
+        .expect("fts rows");
+    rows
+}
+
+/// How many rows [`fts_rowids`] finds.
+pub fn fts_count(conn: &rusqlite::Connection, term: &str) -> i64 {
+    fts_rowids(conn, term).len() as i64
 }
 
 /// `(leaf, overflow)` pages in `searchabletext_data`, from `dbstat`. An

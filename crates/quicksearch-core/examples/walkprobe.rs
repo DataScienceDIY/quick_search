@@ -40,7 +40,7 @@ fn main() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&db);
-    quicksearch_core::db::open_or_recreate(db.to_str().unwrap(), &config.processing.tokenize)
+    quicksearch_core::db::open_or_recreate(db.to_str().unwrap(), &config.processing)
         .expect("scratch index");
     let existing = DirRows::new();
 

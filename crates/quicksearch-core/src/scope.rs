@@ -418,8 +418,6 @@ struct PagePlan {
     /// posting (see [`repo::delete_ids`]).
     doomed: Vec<i64>,
     doomed_with_postings: Vec<i64>,
-    /// Rows keeping their posting but losing the snippet source.
-    stale_text: Vec<i64>,
     /// Surviving rows changing `content_state`, and across both, those whose
     /// stored state holds a posting or a failure record to clear first.
     to_pending: Vec<i64>,
@@ -433,7 +431,6 @@ impl PagePlan {
         for list in [
             &mut self.doomed,
             &mut self.doomed_with_postings,
-            &mut self.stale_text,
             &mut self.to_pending,
             &mut self.to_na,
             &mut self.restated_with_postings,
@@ -460,7 +457,6 @@ impl PagePlan {
     /// Returns `(deleted, recontented)`.
     fn write(&self, tx: &Transaction<'_>) -> Result<(usize, usize), String> {
         let deleted = repo::delete_ids(tx, &self.doomed, &self.doomed_with_postings)?;
-        repo::drop_stored_text(tx, &self.stale_text)?;
         repo::clear_content_for_ids(tx, &self.restated_with_postings)?;
         repo::clear_failed_for_ids(tx, &self.restated_with_failures)?;
         repo::set_content_state(tx, &self.to_pending, repo::STATE_PENDING)?;
@@ -493,21 +489,14 @@ fn apply_page(
             }
             continue;
         }
-        // Only a DONE row can have a `documents_text` body to drop.
-        if work.drop_text && row.content_state == repo::STATE_DONE {
-            plan.stale_text.push(row.id);
-        }
-        if work.reconcile_content || work.restore_text {
-            // The walker's decision, recomputed. Both directions run whenever
-            // either flag is set: a disagreeing row is wrong however it got that way.
+        if work.reconcile_content {
+            // The walker's decision, recomputed. Both directions: a
+            // disagreeing row is wrong however it got that way.
             let wants = row.size <= config.processing.maximum_text_file_size
                 && content_extractable(path, row.mime.as_deref(), config, registry);
             if !wants && row.content_state != repo::STATE_NA {
                 plan.restate(row, false);
-            } else if wants
-                && (row.content_state == repo::STATE_NA
-                    || (work.restore_text && row.content_state == repo::STATE_DONE))
-            {
+            } else if wants && row.content_state == repo::STATE_NA {
                 plan.restate(row, true);
             }
         }
@@ -535,9 +524,9 @@ pub fn stored_config(conn: &Connection, config: &Config) -> Result<Config, Strin
             "content_extensions" => stored.indexing.content_extensions = lines(&value),
             "include_hidden" => stored.indexing.include_hidden = value == "true",
             "follow_symlinks" => stored.indexing.follow_symlinks = value == "true",
-            "store_text_for_snippets" => {
-                stored.processing.store_text_for_snippets = value == "true"
-            }
+            // Recorded as the effective layout; a flag that reproduces it
+            // under the recorded tokenizer (see `fts_positions`).
+            "fts_positions" => stored.processing.compact_text_index = value == "false",
             "hash_length" => match value.parse() {
                 Ok(n) => stored.processing.hash_length = n,
                 Err(e) => crate::log_warn!("stored hash_length {:?} unreadable: {}", value, e),

@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::UNIX_EPOCH;
 
 use crate::config::{Config, IgnoreSet};
 use crate::extract::Registry;
@@ -170,8 +169,17 @@ fn read_directory(
         }
     };
     // Every `continue` in the loop must be a genuine "not indexable", or the
-    // stale diff below deletes live rows.
-    let mut present: HashSet<String> = HashSet::new();
+    // stale diff below deletes live rows. Only names that have a row matter to
+    // that diff, so `present` borrows them from `rows`: no allocation per
+    // entry, and none at all for a directory with no rows yet. Measured
+    // (`indexprobe cold`, 100k files): 8.2 → 7.2 allocations per file,
+    // churn 42 → 35 MiB; time did not move, being `stat`-bound.
+    let mut present: HashSet<&str> = HashSet::new();
+    let mut mark_present = |name: &str| {
+        if let Some((known, _)) = rows.get_key_value(name) {
+            present.insert(known.as_str());
+        }
+    };
     let mut unreadable_entry = false;
 
     let mut files = Vec::new();
@@ -263,15 +271,13 @@ fn read_directory(
                 }
             }
             Ok(_) => {
-                present.insert(name.to_string());
+                mark_present(name);
                 // `None` on Unix and on any reparse point.
                 let cached = crate::platform::entry_cached_metadata(|| entry.metadata().ok());
                 files.push(PendingFile { path, cached });
             }
             // Type unknown: mark it present so an existing row survives.
-            Err(_) => {
-                present.insert(name.to_string());
-            }
+            Err(_) => mark_present(name),
         }
     }
 
@@ -363,12 +369,7 @@ fn prepare(
         // "deleted".
         return WalkedFile::skipped(db_path, aliased);
     };
-    let Some(mtime) = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-    else {
+    let Some(mtime) = crate::file_handling::mtime_secs(&meta) else {
         return WalkedFile::skipped(db_path, aliased);
     };
 
@@ -517,6 +518,11 @@ impl ParallelWalk {
     /// Every canonical directory the walk queued, in `files.parent` spelling.
     /// The vanished-directory sweep needs this: a directory deleted wholesale
     /// is never read, so nothing reconciles the rows beneath it.
+    ///
+    /// Measured and not adopted: moving the set out and reusing each path's
+    /// buffer, so it is never held twice, left VmHWM where it was
+    /// (`memprobe cold`, 200k directories: 84–105 MiB against 86–97 MiB). The
+    /// run's peak is not at the sweep.
     pub fn seen_dirs(&self) -> HashSet<String> {
         crate::lock_ok(&self.shared.queue)
             .seen_dirs

@@ -1281,9 +1281,11 @@ impl SearchTab {
         ) {
             self.live_armed = self.live_wanted.clone();
             actions.live_targets = Some(self.live_wanted.clone());
-        } else if settled && !armed_already {
+        } else if self.live_enabled && settled && !armed_already {
             // Once settled nothing else asks for frames, so a bare `Instant`
-            // deadline would never come due.
+            // deadline would never come due. Only while arming can happen:
+            // with live results off the set is never armed, and past the
+            // delay this asked for a frame every frame, forever.
             if let Some(changed) = self.live_changed_at {
                 let waited = now.duration_since(changed);
                 ui.ctx()

@@ -7,10 +7,11 @@ use std::path::Path;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use super::schema::{
-    effective_tokenizer, fts_create_sql, fts_set_pgsz, pragmas_search,
-    recommended_search_cache_mib, Profile, PRAGMAS_FAST, PRAGMAS_INCREMENTAL, PRAGMAS_MAINTENANCE,
-    PRAGMAS_READONLY, PRAGMAS_WALK_READER, SCHEMA_CURRENT,
+    fts_create_sql, fts_set_pgsz, pragmas_search, recommended_search_cache_mib, Profile,
+    PRAGMAS_FAST, PRAGMAS_INCREMENTAL, PRAGMAS_MAINTENANCE, PRAGMAS_READONLY, PRAGMAS_WALK_READER,
+    SCHEMA_CURRENT,
 };
+use crate::config::ProcessingConfig;
 use crate::security::IndexKey;
 
 /// Prefix tagging every "the key does not fit this file" error, so a wrong
@@ -26,18 +27,25 @@ pub const KEY_MISMATCH_PREFIX: &str = "KEY_MISMATCH: ";
 /// table. Keyed indexes are rebuilt anyway via the profile retry in
 /// [`open_probed`]; the bump rebuilds unprotected ones too.
 ///
+/// v12 dropped the `mtime` and `mime` indexes (see [`schema::SCHEMA_CURRENT`]).
+///
 /// [`schema::HMAC_MODE`]: super::schema::HMAC_MODE
-pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+/// [`schema::SCHEMA_CURRENT`]: super::schema::SCHEMA_CURRENT
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
 
-/// Open `db_path`; on any schema or tokenizer mismatch, delete the file and
+/// Open `db_path`; on a schema mismatch, or a full-text layout other than
+/// `processing` asks for (tokenizer, positions), delete the file and
 /// recreate it empty, for the caller to re-index.
-pub fn open_or_recreate(db_path: &str, tokenizer: &str) -> Result<Connection, String> {
-    open_or_recreate_keyed(db_path, tokenizer, super::key::process_key().as_ref())
+pub fn open_or_recreate(
+    db_path: &str,
+    processing: &ProcessingConfig,
+) -> Result<Connection, String> {
+    open_or_recreate_keyed(db_path, processing, super::key::process_key().as_ref())
 }
 
 pub(crate) fn open_or_recreate_keyed(
     db_path: &str,
-    tokenizer: &str,
+    processing: &ProcessingConfig,
     key: Option<&IndexKey>,
 ) -> Result<Connection, String> {
     let path = Path::new(db_path).to_path_buf();
@@ -67,7 +75,7 @@ pub(crate) fn open_or_recreate_keyed(
         ProfileMatch::Previous(found) => {
             format!("was built with {} and this build uses {}", found, want)
         }
-        ProfileMatch::Current if db_matches_current(&conn, tokenizer)? => return Ok(conn),
+        ProfileMatch::Current if db_matches_current(&conn, processing)? => return Ok(conn),
         ProfileMatch::Current => "does not match current schema".to_string(),
     };
     crate::log_warn!(
@@ -76,7 +84,7 @@ pub(crate) fn open_or_recreate_keyed(
         why
     );
     let conn = wipe_and_reopen(conn, &path, key, want)?;
-    apply_current_schema(&conn, tokenizer, key, want)?;
+    apply_current_schema(&conn, processing, key, want)?;
     Ok(conn)
 }
 
@@ -491,9 +499,9 @@ fn schema_version_current(conn: &Connection) -> Result<bool, String> {
     Ok(version.as_deref() == Some(&CURRENT_SCHEMA_VERSION.to_string()))
 }
 
-/// True iff the DB has the current schema version *and* the
-/// effective-tokenizer string this caller asked for.
-fn db_matches_current(conn: &Connection, tokenizer: &str) -> Result<bool, String> {
+/// True iff the DB has the current schema version *and* the full-text layout
+/// this caller asked for.
+fn db_matches_current(conn: &Connection, processing: &ProcessingConfig) -> Result<bool, String> {
     if !schema_version_current(conn)? {
         // Refuse rather than wipe unless the file is recognisably ours:
         // `database_path` is free text with no confirmation, and a typo
@@ -504,8 +512,11 @@ fn db_matches_current(conn: &Connection, tokenizer: &str) -> Result<bool, String
         }
         return Ok(false);
     }
-    let want_tokenize = effective_tokenizer(tokenizer);
-    Ok(stored_info(conn, "tokenize")?.as_deref() == Some(&*want_tokenize))
+    Ok(
+        stored_info(conn, "tokenize")?.as_deref() == Some(processing.tokenize.trim())
+            && stored_info(conn, "fts_positions")?.as_deref()
+                == Some(&*processing.fts_positions().to_string()),
+    )
 }
 
 /// Delete the index at `path` and its SQLite sidecars (`-wal`, `-shm`,
@@ -557,13 +568,14 @@ fn wipe_and_reopen(
 
 fn apply_current_schema(
     conn: &Connection,
-    tokenizer: &str,
+    processing: &ProcessingConfig,
     key: Option<&IndexKey>,
     profile: Profile,
 ) -> Result<(), String> {
     conn.execute_batch(SCHEMA_CURRENT)
         .map_err(|e| format!("Failed to create current schema tables: {}", e))?;
-    let fts = fts_create_sql(tokenizer);
+    let positions = processing.fts_positions();
+    let fts = fts_create_sql(&processing.tokenize, positions);
     conn.execute_batch(&fts)
         .map_err(|e| format!("Failed to create searchabletext: {}", e))?;
     // Only here: FTS5's leaf size must suit this file's page size and
@@ -573,13 +585,16 @@ fn apply_current_schema(
         .map_err(|e| format!("Failed to set searchabletext pgsz: {}", e))?;
 
     let now = crate::log::now_unix();
-    let effective = effective_tokenizer(tokenizer);
+    // `fts_positions` is read back by every search (`repo::fts_positions`),
+    // which must phrase its queries for the table as it was built.
     conn.execute(
-        "INSERT INTO schema_info(key, value) VALUES ('version', ?1), ('created_at', ?2), ('tokenize', ?3)",
+        "INSERT INTO schema_info(key, value) VALUES ('version', ?1), ('created_at', ?2), \
+         ('tokenize', ?3), ('fts_positions', ?4)",
         params![
             CURRENT_SCHEMA_VERSION.to_string(),
             now.to_string(),
-            effective
+            processing.tokenize.trim(),
+            positions.to_string()
         ],
     )
     .map_err(|e| format!("Failed to seed schema_info: {}", e))?;

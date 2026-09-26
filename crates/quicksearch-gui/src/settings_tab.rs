@@ -322,11 +322,13 @@ impl SettingsTab {
                 // with advanced settings shown.
                 ui.label(hint(if form.advanced {
                     "Narrowing a filter removes the entries it excludes; widening \
-                     one reindexes to find what it now allows. Only the tokenizer \
-                     and hash sample size require a full rebuild."
+                     one reindexes to find what it now allows. Only the tokenizer, \
+                     the compact text index and the hash sample size require a \
+                     full rebuild."
                 } else {
                     "Narrowing a filter removes the entries it excludes; widening \
-                     one reindexes to find what it now allows."
+                     one reindexes to find what it now allows. Changing the \
+                     compact text index rebuilds the index."
                 }));
             });
         crate::ui_util::more_below_hint(ui, &scroll);
@@ -880,9 +882,9 @@ fn config_editor_ui(
                     form.row(
                         Level::Everyday,
                         ui,
-                        "Store text for snippets",
-                        &tips::STORE_TEXT,
-                        |ui| ui.checkbox(&mut config.processing.store_text_for_snippets, ""),
+                        "Compact text index",
+                        &tips::COMPACT_INDEX,
+                        |ui| ui.checkbox(&mut config.processing.compact_text_index, ""),
                     );
                 });
         }

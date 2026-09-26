@@ -87,6 +87,11 @@ fn names(db: &Path) -> Vec<String> {
         .collect()
 }
 
+/// FTS rows matching `term`, asked for as the index's layout allows.
+fn fts_count(db: &Path, term: &str) -> i64 {
+    quicksearch_core::testutil::fts_count(&conn(db), term)
+}
+
 fn count(db: &Path, sql: &str) -> i64 {
     conn(db).query_row(sql, [], |r| r.get(0)).unwrap()
 }
@@ -177,10 +182,7 @@ fn adding_an_ignore_pattern_prunes_instead_of_rebuilding() {
     );
     assert_eq!(orphans(&db), 0);
     assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH 'echo'"
-        ),
+        fts_count(&db, "echo"),
         0,
         "the ignored file's content is no longer findable"
     );
@@ -304,13 +306,7 @@ fn narrowing_content_extensions_keeps_the_file_findable_by_name() {
     assert_eq!(recontented, 1);
     assert_eq!(paths(&db).len(), 2, "both rows are still there");
     assert_eq!(residue(&db).0, 1, "only the .txt keeps its postings");
-    assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH 'markdown'"
-        ),
-        0
-    );
+    assert_eq!(fts_count(&db, "markdown"), 0);
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM files WHERE content_state = 3"),
         1,
@@ -327,38 +323,6 @@ fn narrowing_content_extensions_keeps_the_file_findable_by_name() {
     );
     index_once(&db, &old);
     assert_eq!(residue(&db).0, 2, "its text came back");
-    assert_eq!(created_at(&db), born, "the index was never rebuilt");
-}
-
-/// On again re-extracts: the text of files already indexed was never kept.
-#[test]
-fn store_text_toggles_without_losing_full_text_search() {
-    let root = Scratch::canonical("store-text");
-    let db_dir = Scratch::canonical("store-text-db");
-    let db = db_dir.join("index.sqlite");
-    touch(&root.join("a.txt"), b"alpha unique-token");
-
-    let on = base_config(&root, &db);
-    index_once(&db, &on);
-    let born = created_at(&db);
-    assert_eq!(residue(&db).1, 1, "text stored");
-
-    let mut off = on.clone();
-    off.processing.store_text_for_snippets = false;
-    reconcile(&db, &on, &off);
-    assert_eq!(residue(&db).1, 0, "blobs dropped");
-    assert_eq!(
-        count(
-            &db,
-            "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH 'unique'"
-        ),
-        1,
-        "full-text search is unaffected"
-    );
-
-    reconcile(&db, &off, &on);
-    index_once(&db, &on);
-    assert_eq!(residue(&db).1, 1, "text re-extracted");
     assert_eq!(created_at(&db), born, "the index was never rebuilt");
 }
 

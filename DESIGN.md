@@ -21,12 +21,16 @@ memory, memory churn, and indexing and search speed.
 
 The index is a single SQLite database: file metadata, an FTS5 full-text index
 over document contents, and the extracted text itself, stored zstd-compressed
-for snippets and ranking. The database runs in WAL mode with exactly one
+for snippets, ranking and verification. The database runs in WAL mode with exactly one
 writer at a time, so read-only searches are never blocked by indexing. Schema
 changes wipe and rebuild the index rather than migrating: the index is a cache
 of the filesystem, so rebuilding is always safe, and only the indexer may do
 it. FTS5 runs in trigram mode for full-text search and also speeds up regex
-and fuzzy searches. Tuning this database is central to QuickSearch's
+and fuzzy searches. By default it records no word positions: every candidate
+is checked against the stored text anyway, so positions only narrow the
+candidates, and dropping them makes the index several times smaller and
+faster to build, for content searches up to two or three times slower. A
+setting trades the other way. Tuning this database is central to QuickSearch's
 performance.
 
 ## The search path never stalls

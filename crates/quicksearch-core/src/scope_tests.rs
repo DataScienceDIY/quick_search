@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 fn empty_db(dir: &Path) -> PathBuf {
     let db = dir.join("index.sqlite");
-    crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+    crate::db::open_or_recreate(db.to_str().unwrap(), &Default::default()).unwrap();
     db
 }
 

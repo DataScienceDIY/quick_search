@@ -916,7 +916,7 @@ fn hovering_the_size_explains_how_to_shrink_the_index() {
         "ignore filters",
         "Indexed folders",
         "whitelist",
-        "Store text for snippets",
+        "Compact text index",
         "Settings tab",
     ] {
         assert!(text.contains(lever), "tooltip never mentions {}", lever);

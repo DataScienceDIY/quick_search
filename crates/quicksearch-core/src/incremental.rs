@@ -6,14 +6,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::config::{Config, IgnoreSet};
 use crate::db::repo;
-use crate::extract::Registry;
+use crate::extract::{Registry, Scratch};
 use crate::file_handling::{
-    db_key_for_missing_path, extract_and_store, filtered_walk, prepare_file_record_from_path,
-    RootRange, UnreadableDirs,
+    db_key_for_missing_path, extract_and_store, filtered_walk, mtime_secs, path_to_db_string,
+    prepare_file_record, warn_if_unrepresentable, RootRange, UnreadableDirs,
 };
 use crate::platform::path_has_hidden_component_under;
 use crate::watcher::FsEvent;
@@ -90,8 +90,7 @@ fn upsert_path(
         return Ok(Applied::Done);
     }
     // Checked before the followed `metadata` below: with following off the
-    // walk records no symlinks, and `prepare_file_record_from_path`
-    // canonicalizes, so a followed link targeting outside every root would
+    // walk records no symlinks, and `upsert_file` canonicalizes, so a followed link targeting outside every root would
     // write a row no sweep range covers and only a rebuild clears.
     if !config.indexing.follow_symlinks {
         match std::fs::symlink_metadata(path) {
@@ -143,7 +142,14 @@ fn upsert_file(
     config: &Config,
     registry: &Registry,
 ) -> Result<(), String> {
-    let Some(rec) = prepare_file_record_from_path(path, config, registry) else {
+    let Ok(canonical) = path.canonicalize() else {
+        return Ok(());
+    };
+    if warn_if_unrepresentable(&canonical) {
+        return Ok(());
+    }
+    let db_path = path_to_db_string(&canonical);
+    let Ok(meta) = std::fs::metadata(&canonical) else {
         return Ok(());
     };
 
@@ -151,45 +157,43 @@ fn upsert_file(
         .transaction()
         .map_err(|e| format!("begin incremental tx: {}", e))?;
 
-    let existing: Option<(i64, i64)> = tx
-        .query_row(
-            "SELECT id, mtime FROM files WHERE parent = ?1 AND name = ?2",
-            rusqlite::params![rec.parent, rec.name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .map_err(|e| format!("lookup {}: {}", rec.path(), e))?;
-
-    let file_id = match existing {
-        Some((_, mtime)) if mtime.max(0) as u64 == rec.mtime => return Ok(()),
-        Some((id, _)) => {
-            repo::update_file_basic(&tx, &rec.as_new_file())?;
-            id
-        }
-        None => match repo::insert_file(&tx, &rec.as_new_file())? {
-            Some(id) => id,
-            // Lost a race with another writer; the row that won is current enough.
-            None => return Ok(()),
-        },
+    // Settled before the file is opened, as the full walk settles it: an
+    // unchanged file (a re-sent event, a `chmod`, the live view re-checking a
+    // row it shows) costs one lookup, never a read and a hash. Measured
+    // (`benches/index.rs`, `unchanged_event`, 500 small text files): 3.3 ms
+    // hashing and sniffing each against 1.4 ms.
+    let stored = repo::mtime_for_path(&tx, &db_path)?;
+    if stored.is_some() && stored == mtime_secs(&meta) {
+        return Ok(());
+    }
+    // One file at a time, so it owns the scratch rather than being handed one.
+    let mut scratch = Scratch::new(config);
+    let Some(rec) = prepare_file_record(&db_path, &meta, config, registry, &mut scratch) else {
+        return Ok(());
+    };
+    let written = match stored {
+        Some(_) => repo::update_file_basic(&tx, &rec.as_new_file())?,
+        None => repo::insert_file(&tx, &rec.as_new_file())?,
+    };
+    // `None`: lost a race with another writer; the row that won is current
+    // enough.
+    let Some(file_id) = written else {
+        return Ok(());
     };
 
-    // The only size gate on this path: `decide_content` has none, and falling
-    // through would read a multi-gigabyte `.txt` whole into memory.
-    if !rec.needs_content {
-        repo::set_content_na(&tx, file_id)?;
-    } else if let Some(text) = rec.inline_text.as_deref() {
-        // `prepare_file_record_from_path` already read the whole file.
-        let zstd = repo::encode_one(text, config.processing.store_text_for_snippets)?;
-        repo::set_content_done(&tx, file_id, text, zstd.as_deref())?;
-    } else {
-        extract_and_store(
-            &tx,
-            file_id,
-            &rec.path(),
-            rec.mime,
-            registry,
-            config,
-        )?;
+    // A row that needs no content is already NA: both writers above set its
+    // state from `rec`. That gate is also the only size gate on this path:
+    // `decide_content` has none, and falling through would read a
+    // multi-gigabyte `.txt` whole into memory.
+    if rec.needs_content {
+        match rec.inline_text.as_deref() {
+            // `prepare_file_record` already read the whole file.
+            Some(text) => {
+                let zstd = repo::encode_one(text)?;
+                repo::store_pending_text(&tx, file_id, text, zstd.as_deref())?;
+            }
+            None => extract_and_store(&tx, file_id, rec.path(), rec.mime, registry, config)?,
+        }
     }
 
     tx.commit()
@@ -236,6 +240,7 @@ pub fn remove_paths(
 mod tests {
     use super::*;
     use crate::db::open_or_recreate;
+    use rusqlite::OptionalExtension;
     use std::time::Duration;
 
     struct Fixture {
@@ -253,7 +258,7 @@ mod tests {
             let dir = scratch.join("tree");
             std::fs::create_dir_all(&dir).unwrap();
             let db = scratch.join("index.sqlite");
-            let conn = open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+            let conn = open_or_recreate(db.to_str().unwrap(), &Default::default()).unwrap();
             let config = Config::default();
             let ignore = IgnoreSet::compile(&config.indexing.ignore_patterns).unwrap();
             Fixture {
@@ -332,13 +337,7 @@ mod tests {
         }
 
         fn fts_hits(&self, term: &str) -> i64 {
-            self.conn
-                .query_row(
-                    "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH ?1",
-                    rusqlite::params![format!("\"{}\"", term)],
-                    |r| r.get(0),
-                )
-                .unwrap()
+            crate::testutil::fts_count(&self.conn, term)
         }
     }
 
@@ -470,6 +469,36 @@ mod tests {
         assert_eq!(f.fts_hits("edition"), 1);
         assert_eq!(f.fts_hits("version"), 0, "stale tokens removed");
         assert_eq!(f.counts(), (1, 1, 1), "still exactly one of everything");
+    }
+
+    /// An unchanged file is settled from its stored mtime, as the full walk
+    /// settles it, without being opened. Here it cannot be opened, so an
+    /// attempt would log a hash failure naming it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unchanged_file_is_not_opened() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = Fixture::new();
+        let p = f.write("sealed.txt", "sphinx of black quartz");
+        f.apply(&FsEvent::Create(p.clone()));
+        let key = f.canonical(&p);
+        let before = f.row(&key).expect("indexed");
+
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway, and then there is nothing to prove.
+        let readable = std::fs::File::open(&p).is_ok();
+        f.apply(&FsEvent::Modify(p.clone()));
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(f.row(&key), Some(before), "the row is untouched");
+        if !readable {
+            assert!(
+                !crate::log::snapshot()
+                    .iter()
+                    .any(|line| line.text.contains("cannot hash") && line.text.contains(&key)),
+                "the unchanged file was opened"
+            );
+        }
     }
 
     #[test]

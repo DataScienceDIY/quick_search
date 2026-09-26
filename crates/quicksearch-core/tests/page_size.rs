@@ -272,7 +272,7 @@ fn check_previous_profile(previous: Profile, keyed: bool, stale_version: bool) {
     );
 
     // The rebuild lands at the current layout, encrypted if it was.
-    let conn = db::open_or_recreate(&db_path, "trigram")
+    let conn = db::open_or_recreate(&db_path, &Default::default())
         .unwrap_or_else(|e| panic!("{}: rebuild failed: {}", what, e));
     assert_eq!(
         page_size_of(&conn),

@@ -94,17 +94,20 @@ writer_turn_slice_ms = 100
 # searches that run alongside indexing and lengthens crash recovery. The
 # default favours faster runs.
 maximum_wal_size = 2147483648
-# FTS5 tokenizer: 'trigram' (substring matching, the default; gets
-# remove_diacritics 1 appended), 'unicode61', 'porter', or a full FTS5 option
-# string. See https://www.sqlite.org/fts5.html#tokenizers. Changing it
-# rebuilds the index.
+# FTS5 tokenizer: 'trigram' (substring matching, the default), 'unicode61',
+# 'porter', or a full FTS5 option string. See
+# https://www.sqlite.org/fts5.html#tokenizers. Matching is exact apart from
+# ASCII case: "cafe" does not find "café". Changing it rebuilds the index.
 tokenize = "trigram"
-# Store extracted text (zstd-compressed) alongside the FTS index. Off, the
-# index shrinks considerably, but search loses snippet previews, occurrence
-# ranking, case verification and fuzzy full-text. Turning it off discards
-# the stored text at once; turning it on re-extracts, because the text of
-# files already indexed was never kept.
-store_text_for_snippets = true
+# Build the full-text index without word positions. Several times smaller
+# and faster to build (1.1 GB of source code: a 219 MiB index instead of
+# 1.3 GB, built a third faster), and searches return exactly the same files,
+# because every candidate is checked against the stored text. The cost is
+# more candidates to check: searching contents for a word can take up to
+# twice as long, for a phrase of common words up to three times. Only the
+# trigram tokenizer can use it; other tokenizers always record positions.
+# Changing it rebuilds the index.
+compact_text_index = true
 
 [security]
 # Encrypt the index with a password (SQLCipher). The password is asked for at

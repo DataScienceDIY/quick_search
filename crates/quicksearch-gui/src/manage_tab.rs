@@ -531,9 +531,8 @@ fn db_size_tooltip(ui: &mut egui::Ui) {
         "Remove indexed folders you do not need (Indexed folders, below).",
         "Narrow the full-text extension whitelist to the file types whose text \
          you search.",
-        "Turn off \"Store text for snippets\" on the Settings tab. Full-text search \
-         keeps working, without previews, occurrence ranking or fuzzy matching \
-         inside file contents.",
+        "Keep \"Compact text index\" on, on the Settings tab: it makes the \
+         full-text part of the index several times smaller.",
         "Lower \"Max text file size\" and \"Max stored text\", both on the Settings tab.",
     ] {
         ui.label(format!("•  {}", lever));

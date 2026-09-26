@@ -177,10 +177,10 @@ mod substring {
             let (s, b) = snippet::extract_folded(
                 divan::black_box(text),
                 divan::black_box(folded),
-                &[corpus::NEEDLE],
+                corpus::NEEDLE,
                 &opts,
             );
-            let a = pattern.count(text, false);
+            let a = pattern.count(text);
             (a, b, s.ranges.len())
         });
     }
@@ -194,9 +194,9 @@ mod substring {
         let folded = corpus::text_folded(size, 4);
         let opts = snippet::Options { approx_bytes: 600 };
         bencher.bench(|| {
-            let a = pattern.count(divan::black_box(text), false);
+            let a = pattern.count(divan::black_box(text));
             let b = pattern.count_folded(divan::black_box(folded));
-            let (s, _) = snippet::extract_folded(text, folded, &[corpus::NEEDLE], &opts);
+            let (s, _) = snippet::extract_folded(text, folded, corpus::NEEDLE, &opts);
             (a, b, s.ranges.len())
         });
     }
@@ -216,7 +216,7 @@ mod snippet_extract {
             snippet::extract_folded(
                 divan::black_box(text),
                 divan::black_box(folded),
-                &[corpus::NEEDLE],
+                corpus::NEEDLE,
                 &opts,
             )
         });

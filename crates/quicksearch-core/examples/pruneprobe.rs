@@ -674,10 +674,10 @@ fn main() {
 
         // The page cache. `PRAGMAS_INCREMENTAL` gives the reconcile a flat
         // 4 MiB for a pass across the whole index. A delete also maintains
-        // `idx_files_mtime`, `idx_files_mime` and `idx_files_hash`, three
-        // b-trees in orders uncorrelated with `(parent, name)`, so every
-        // doomed row scatters ~3 page touches that a 512-page cache cannot
-        // hold. Read the `misses` column. Both commit policies are swept,
+        // `idx_files_hash`, a b-tree in an order uncorrelated with
+        // `(parent, name)`, so every doomed row scatters a page touch that a
+        // 512-page cache cannot hold (three, before `idx_files_mtime` and
+        // `idx_files_mime` were dropped). Read the `misses` column. Both commit policies are swept,
         // because a cache that holds the working set may make commit cadence
         // stop mattering.
         println!("\n  page cache, at +fts(all)  [{} = shipped]:", SHIPPED_MIB);

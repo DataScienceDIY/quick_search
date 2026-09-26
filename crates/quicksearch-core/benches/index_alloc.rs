@@ -183,7 +183,7 @@ fn compression_traffic_per_chunk(config: &Config) {
 
     let per_row = measure(|| {
         (0..CHUNK)
-            .map(|_| repo::encode_one(&doc, true).expect("encode"))
+            .map(|_| repo::encode_one(&doc).expect("encode"))
             .collect::<Vec<_>>()
     });
     // What `Bodies::fill` does: one encoder and one arena for the chunk.

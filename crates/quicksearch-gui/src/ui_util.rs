@@ -197,6 +197,11 @@ pub fn middle_elide<'a>(
 
 /// A semitransparent down-arrow while more content lies below the fold.
 /// Painter-only, so it never swallows clicks; the fonts have no ▼ glyph.
+///
+/// Static on purpose. It used to pulse, which needed a repaint every 50 ms
+/// for as long as it showed: on an idle Search tab with more results than
+/// rows, that re-laid-out every visible row 20 times a second, measured at
+/// 11.8 s of CPU per idle 30 s (100k-file index, 1000 results).
 pub fn more_below_hint<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutput<R>) {
     let more_below = out.state.offset.y + out.inner_rect.height() < out.content_size.y - 1.0;
     if !more_below {
@@ -206,12 +211,7 @@ pub fn more_below_hint<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutp
     let cx = out.inner_rect.center().x;
     let tip = out.inner_rect.bottom() - 5.0;
     let (half_width, height) = (7.0, 6.0);
-    // A slow opacity pulse; repaints only while visible, at a lazy cadence.
-    let t = ui.ctx().input(|i| i.time);
-    let pulse = 0.35 + 0.10 * ((t * std::f64::consts::TAU / 2.5).sin() as f32);
-    let color = ui.visuals().strong_text_color().gamma_multiply(pulse);
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(50));
+    let color = ui.visuals().strong_text_color().gamma_multiply(0.35);
     painter.add(egui::Shape::convex_polygon(
         vec![
             egui::pos2(cx - half_width, tip - height),

@@ -2067,6 +2067,39 @@ fn should_arm_waits_for_the_results_to_settle_and_hold_still() {
     );
 }
 
+/// An idle table asks for no frames. With live results off nothing is ever
+/// armed, and past the arm delay the wait for it asked for a frame every
+/// frame, forever; the "more below" hint must not animate either. On a
+/// software-rendered desktop the two cost a third of a core while idle.
+#[test]
+fn an_idle_table_with_more_rows_than_fit_asks_for_no_frames() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = tab_with_results(200);
+    tab.live_enabled = false;
+    for _ in 0..200 {
+        run_frame(&ctx, &mut tab, vec![]);
+        if tab.fade_settled() {
+            break;
+        }
+    }
+    assert!(tab.fade_settled(), "the reveal never finished");
+    // The visible rows have stood still for longer than the arm delay.
+    tab.live_changed_at = Some(Instant::now() - LIVE_ARM_DELAY * 2);
+
+    // egui's own layout passes ask for a few frames of their own first.
+    for _ in 0..8 {
+        run_frame(&ctx, &mut tab, vec![]);
+    }
+    let out = run_frame(&ctx, &mut tab, vec![]);
+    let delay = out
+        .viewport_output
+        .values()
+        .map(|v| v.repaint_delay)
+        .min()
+        .expect("a viewport");
+    assert_eq!(delay, std::time::Duration::MAX, "an idle table repaints");
+}
+
 /// What counts as "already watching these rows": the paths and whether each
 /// needs its body re-read, and nothing else.
 #[test]

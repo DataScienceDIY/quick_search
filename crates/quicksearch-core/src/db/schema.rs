@@ -170,6 +170,13 @@ pub const PRAGMAS_WALK_READER: &str = "
 /// Measured: an index cost ~10% on inserts and 805 pages at 300k rows, pages
 /// that compete with the ones search wants resident.
 ///
+/// Nor do `mtime` and `mime`, which only the `modified:` and `mime:` filters
+/// could seek, while every insert, update and delete paid for both. Measured
+/// (`indexprobe cold`, 100k tiny files): index 23.0 → 19.5 MiB, wall time
+/// 0.47 → 0.41 s. The filters now cost what the `files` scan behind every
+/// filename query already does: `searchtime` at 300k rows, 25 ms with or
+/// without a filter, where the indexes had made a one-day filter 0.06 ms.
+///
 /// `documents_text` holds a row only when the extractor produced text (an
 /// audio file with empty tags is done but has none), so `files.content_state`
 /// is the authority on "content indexed". The uncompressed length is not
@@ -196,8 +203,6 @@ CREATE TABLE files (
 );
 
 CREATE UNIQUE INDEX idx_files_parent ON files(parent, name);
-CREATE INDEX idx_files_mtime  ON files(mtime);
-CREATE INDEX idx_files_mime   ON files(mime);
 CREATE INDEX idx_files_hash   ON files(hash);
 CREATE INDEX idx_files_content_pending ON files(id) WHERE content_state = 0;
 
@@ -481,29 +486,42 @@ pub const FTS5_DEFAULT_PGSZ: i64 = 4050;
 ///
 /// One column: only document bodies are ever MATCHed, and a `name` column
 /// would cost (len − 2) postings per file.
-pub fn fts_create_sql(tokenizer: &str) -> String {
-    let effective = effective_tokenizer(tokenizer);
+///
+/// `positions` is [`crate::config::ProcessingConfig::fts_positions`]. Without
+/// them (`detail=none`, the default through `compact_text_index`) the table
+/// answers only single-token phrases, so the search side asks for a term as
+/// the AND of its trigrams (`search::prefilter::fts_literal`) and the
+/// full-text pass drops the documents where they are not adjacent, which it
+/// can because text is always stored. Measured on 1.1 GB of crate sources
+/// (`indexprobe cold`, then `searchtime`), identical results either way:
+///
+/// | | positions | none |
+/// |---|---|---|
+/// | index | 1291 MiB | **219 MiB** |
+/// | build | 37.4 s | **24.6 s** |
+/// | written through the WAL | 4.1 GB | **0.7 GB** |
+/// | candidates per true hit | 1 | 1.0–2x a word, 8–13x a phrase |
+/// | warm search time | 1 | 0.9–1.8x a word, 2.8x a phrase |
+///
+/// The slowest was a phrase of common words (`impl Iterator for`, 24 → 67
+/// ms), whose trigrams occur in many documents that lack the phrase.
+///
+/// The configured tokenizer is applied as written. Plain `trigram` once got
+/// `remove_diacritics 1` appended, but full-text verification folds ASCII
+/// only (`tests/cascade.rs`, `diacritic_fts_candidates_are_dropped`), so the
+/// extra candidates it matched were always dropped again. Dropping it measured
+/// neutral on indexing time (`indexprobe cold`, 5k accented documents).
+pub fn fts_create_sql(tokenizer: &str, positions: bool) -> String {
     format!(
         "CREATE VIRTUAL TABLE searchabletext USING fts5(\
             text, \
             tokenize='{}', \
             content='', \
-            contentless_delete=1\
+            contentless_delete=1{}\
         );",
-        effective.replace('\'', "''")
+        tokenizer.trim().replace('\'', "''"),
+        if positions { "" } else { ", detail=none" }
     )
-}
-
-/// Map a user-facing tokenizer name to the FTS5 option string applied: plain
-/// `trigram` gets `remove_diacritics 1` (so `cafe` matches `café`); any
-/// explicit option string is used verbatim.
-pub fn effective_tokenizer(tokenizer: &str) -> String {
-    let trimmed = tokenizer.trim();
-    if trimmed.eq_ignore_ascii_case("trigram") {
-        "trigram remove_diacritics 1".to_string()
-    } else {
-        trimmed.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -630,24 +648,19 @@ mod tests {
     }
 
     #[test]
-    fn plain_trigram_gets_accent_stripping() {
-        assert_eq!(
-            effective_tokenizer("trigram"),
-            "trigram remove_diacritics 1"
-        );
-        assert_eq!(
-            effective_tokenizer("  trigram  "),
-            "trigram remove_diacritics 1"
+    fn the_tokenizer_is_applied_as_written() {
+        assert!(fts_create_sql("  trigram  ", true).contains("tokenize='trigram',"));
+        assert!(fts_create_sql("unicode61", true).contains("tokenize='unicode61',"));
+        assert!(
+            fts_create_sql("trigram remove_diacritics 1", true)
+                .contains("tokenize='trigram remove_diacritics 1',"),
+            "an explicit option string still passes through"
         );
     }
 
     #[test]
-    fn explicit_tokenizers_pass_through() {
-        assert_eq!(
-            effective_tokenizer("trigram remove_diacritics 0"),
-            "trigram remove_diacritics 0"
-        );
-        assert_eq!(effective_tokenizer("porter"), "porter");
-        assert_eq!(effective_tokenizer("unicode61"), "unicode61");
+    fn positions_decide_the_detail_option() {
+        assert!(!fts_create_sql("trigram", true).contains("detail"));
+        assert!(fts_create_sql("trigram", false).contains(", detail=none)"));
     }
 }

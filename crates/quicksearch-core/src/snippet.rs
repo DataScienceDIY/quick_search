@@ -1,7 +1,7 @@
 //! Snippet extraction for search results; contentless FTS5 has no
 //! `snippet()`. Output is structural (window text plus byte ranges), never
-//! markup. Matching folds ASCII only: `cafe` finds `café` via the tokenizer,
-//! but the snippet does not mark the accented occurrence.
+//! markup. Matching folds ASCII case only, as full-text verification does:
+//! `cafe` neither finds nor marks `café`.
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -44,75 +44,58 @@ impl Snippet {
 /// must be `text.to_ascii_lowercase()`: the fold preserves byte length, so
 /// offsets found in it slice the original.
 ///
-/// Returns the window and how many occurrences it found before touching
-/// ranges were coalesced, the count the full-text pass ranks on. Blank terms
-/// are dropped, but a padded term is searched as given, never trimmed.
-pub fn extract_folded(
-    text: &str,
-    folded: &str,
-    terms: &[&str],
-    opts: &Options,
-) -> (Snippet, usize) {
+/// Returns the window and how many occurrences of `term` it found before
+/// touching ranges were coalesced, the count the full-text pass ranks on. A
+/// blank term matches nothing, but a padded term is searched as given, never
+/// trimmed.
+pub fn extract_folded(text: &str, folded: &str, term: &str, opts: &Options) -> (Snippet, usize) {
     debug_assert_eq!(folded.len(), text.len(), "ASCII folding preserves length");
     if text.is_empty() {
         return (Snippet::empty(), 0);
     }
-    let effective_terms: Vec<&str> = terms
-        .iter()
-        .copied()
-        .filter(|t| !t.trim().is_empty())
-        .collect();
-    if effective_terms.is_empty() {
+    if term.trim().is_empty() {
         return (head_window(text, opts.approx_bytes), 0);
     }
 
+    // Borrow when the term is already folded, as every cascade call's is,
+    // to avoid an allocation per candidate row.
+    let pattern: std::borrow::Cow<'_, str> = if term.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(term.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(term)
+    };
     // `memmem`, not `str::match_indices`: measured faster on whole-body
     // scans. The walk runs to the end (the count must see every occurrence),
-    // but matches past the window's right edge are not stored. Only a single
-    // term is bounded: with several, two terms can coalesce across the edge,
-    // which no single-pass bound sees.
-    let bounded = effective_terms.len() == 1;
+    // but matches past the window's right edge are not stored.
     let mut matches: Vec<(usize, usize)> = Vec::new();
     let mut found = 0usize;
     // The window's right edge once the first match fixes it, from the same
     // [`window_bounds`] the window itself uses.
     let mut keep_below: Option<usize> = None;
-
-    for term in &effective_terms {
-        // Borrow when the term is already folded, as every cascade call's is,
-        // to avoid an allocation per candidate row.
-        let pattern: std::borrow::Cow<'_, str> = if term.bytes().any(|b| b.is_ascii_uppercase()) {
-            std::borrow::Cow::Owned(term.to_ascii_lowercase())
-        } else {
-            std::borrow::Cow::Borrowed(*term)
-        };
-        // The end of the last kept match, so a chain of touching occurrences
-        // (`abab…` for `ab`) that starts inside the window and continues past
-        // it stays intact for `coalesce_overlapping` and the expansion step.
-        let mut chain_end = 0usize;
-        for at in memchr::memmem::find_iter(folded.as_bytes(), pattern.as_bytes()) {
-            // Before any dropping: two abutting occurrences are two hits for
-            // ranking even though they paint as one highlight.
-            found += 1;
-            if bounded {
-                let bound =
-                    *keep_below.get_or_insert_with(|| window_bounds(text, at, opts.approx_bytes).1);
-                if at >= bound && at > chain_end {
-                    // Past the edge and not chained to anything kept: keep
-                    // counting, stop storing.
-                    continue;
-                }
-            }
-            chain_end = at + pattern.len();
-            matches.push((at, chain_end));
+    // The end of the last kept match, so a chain of touching occurrences
+    // (`abab…` for `ab`) that starts inside the window and continues past
+    // it stays intact for `coalesce_overlapping` and the expansion step.
+    let mut chain_end = 0usize;
+    for at in memchr::memmem::find_iter(folded.as_bytes(), pattern.as_bytes()) {
+        // Before any dropping: two abutting occurrences are two hits for
+        // ranking even though they paint as one highlight.
+        found += 1;
+        let bound = *keep_below.get_or_insert_with(|| window_bounds(text, at, opts.approx_bytes).1);
+        if at >= bound && at > chain_end {
+            // Past the edge and not chained to anything kept: keep counting,
+            // stop storing.
+            continue;
         }
+        chain_end = at + pattern.len();
+        matches.push((at, chain_end));
     }
 
     if matches.is_empty() {
         return (head_window(text, opts.approx_bytes), 0);
     }
 
-    matches.sort_by_key(|(a, _)| *a);
+    // One term's occurrences arrive in order and never overlap; only
+    // abutting ones merge.
     let matches = coalesce_overlapping(matches);
 
     let (win_start, mut win_end) = window_bounds(text, matches[0].0, opts.approx_bytes);
@@ -213,21 +196,13 @@ pub fn window_around(text: &str, range: (usize, usize), opts: &Options) -> Snipp
     }
 }
 
-/// Count non-overlapping occurrences of `term` in `text`. Case-insensitive
-/// counting folds ASCII only, matching the rest of the search pipeline.
-pub fn count_occurrences(text: &str, term: &str, case_sensitive: bool) -> usize {
+/// Count non-overlapping occurrences of `term` in `text`, byte for byte: a
+/// case-insensitive count passes both already folded.
+pub fn count_occurrences(text: &str, term: &str) -> usize {
     if term.is_empty() || text.len() < term.len() {
         return 0;
     }
-    if case_sensitive {
-        memchr::memmem::find_iter(text.as_bytes(), term.as_bytes()).count()
-    } else {
-        memchr::memmem::find_iter(
-            text.to_ascii_lowercase().as_bytes(),
-            term.to_ascii_lowercase().as_bytes(),
-        )
-        .count()
-    }
+    memchr::memmem::find_iter(text.as_bytes(), term.as_bytes()).count()
 }
 
 /// The first `n` bytes of `text` (char-aligned) as a match-less window.
@@ -264,12 +239,12 @@ fn coalesce_overlapping(v: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 mod tests {
     use super::*;
 
-    fn extract(text: &str, terms: &[&str], opts: &Options) -> Snippet {
-        extract_folded(text, &text.to_ascii_lowercase(), terms, opts).0
+    fn extract(text: &str, term: &str, opts: &Options) -> Snippet {
+        extract_folded(text, &text.to_ascii_lowercase(), term, opts).0
     }
 
-    fn extract_counted(text: &str, terms: &[&str], opts: &Options) -> (Snippet, usize) {
-        extract_folded(text, &text.to_ascii_lowercase(), terms, opts)
+    fn extract_counted(text: &str, term: &str, opts: &Options) -> (Snippet, usize) {
+        extract_folded(text, &text.to_ascii_lowercase(), term, opts)
     }
 
     fn opts_small() -> Options {
@@ -280,11 +255,11 @@ mod tests {
     #[test]
     fn extract_folded_counts_occurrences_not_ranges() {
         let text = "abab and ab";
-        let (s, n) = extract_counted(text, &["ab"], &opts_small());
+        let (s, n) = extract_counted(text, "ab", &opts_small());
         assert_eq!(n, 3, "three occurrences");
         assert_eq!(
             n,
-            count_occurrences(text, "ab", true),
+            count_occurrences(text, "ab"),
             "must agree with count_occurrences"
         );
         assert_eq!(s.ranges.len(), 2, "the abutting pair paints as one range");
@@ -304,10 +279,10 @@ mod tests {
         ];
         for (text, term) in cases {
             let folded = text.to_ascii_lowercase();
-            let (_, n) = extract_folded(text, &folded, &[term], &opts_small());
+            let (_, n) = extract_folded(text, &folded, term, &opts_small());
             assert_eq!(
                 n,
-                count_occurrences(&folded, &term.to_ascii_lowercase(), true),
+                count_occurrences(&folded, &term.to_ascii_lowercase()),
                 "count mismatch for {:?} in {:?}",
                 term,
                 text
@@ -321,8 +296,8 @@ mod tests {
     fn extract_folded_needle_case_does_not_change_matches() {
         let text = "The Needle and the needle";
         let folded = text.to_ascii_lowercase();
-        let (upper, n_upper) = extract_folded(text, &folded, &["Needle"], &opts_small());
-        let (lower, n_lower) = extract_folded(text, &folded, &["needle"], &opts_small());
+        let (upper, n_upper) = extract_folded(text, &folded, "Needle", &opts_small());
+        let (lower, n_lower) = extract_folded(text, &folded, "needle", &opts_small());
         assert_eq!(n_upper, 2);
         assert_eq!(n_upper, n_lower);
         assert_eq!(upper.ranges, lower.ranges);
@@ -335,7 +310,7 @@ mod tests {
         let text = "some text";
         let folded = text.to_ascii_lowercase();
         for term in ["", "   ", "\t"] {
-            let (s, n) = extract_folded(text, &folded, &[term], &opts_small());
+            let (s, n) = extract_folded(text, &folded, term, &opts_small());
             assert_eq!(n, 0, "blank term {:?} counted", term);
             assert!(s.ranges.is_empty(), "blank term {:?} highlighted", term);
         }
@@ -346,9 +321,9 @@ mod tests {
     fn extract_folded_does_not_trim_a_padded_term() {
         let text = "needle needlework";
         let folded = text.to_ascii_lowercase();
-        let (_, n) = extract_folded(text, &folded, &["needle "], &opts_small());
+        let (_, n) = extract_folded(text, &folded, "needle ", &opts_small());
         assert_eq!(n, 1, "only the occurrence followed by a space");
-        assert_eq!(n, count_occurrences(&folded, "needle ", true));
+        assert_eq!(n, count_occurrences(&folded, "needle "));
     }
 
     /// The `Snippet::ranges` contract egui's LayoutJob sections rely on.
@@ -374,7 +349,7 @@ mod tests {
     fn occurrences_past_the_window_are_counted_but_not_kept() {
         let unit = "needle filler filler ";
         let text = unit.repeat(400);
-        let (snip, found) = extract_counted(&text, &["needle"], &opts_small());
+        let (snip, found) = extract_counted(&text, "needle", &opts_small());
 
         assert_eq!(found, 400, "every occurrence must still be counted");
         assert_ranges_valid(&snip);
@@ -403,7 +378,7 @@ mod tests {
     #[test]
     fn a_coalescing_chain_is_not_cut_at_the_window_edge() {
         let text = "ab".repeat(400);
-        let (snip, found) = extract_counted(&text, &["ab"], &opts_small());
+        let (snip, found) = extract_counted(&text, "ab", &opts_small());
 
         assert_eq!(found, 400, "non-overlapping occurrences, all counted");
         assert_ranges_valid(&snip);
@@ -428,31 +403,16 @@ mod tests {
         );
     }
 
-    /// Several terms disable the bound; pin that the multi-term path still
-    /// produces the full, correct answer.
-    #[test]
-    fn several_terms_still_coalesce_across_the_edge() {
-        let text = format!("{}{}", "x".repeat(10), "abc".repeat(200));
-        let (snip, found) = extract_counted(&text, &["ab", "bc"], &opts_small());
-        assert_eq!(found, 400, "200 of each term");
-        assert_ranges_valid(&snip);
-        assert_eq!(
-            snip.ranges.len(),
-            1,
-            "the two terms interleave into one run"
-        );
-    }
-
     #[test]
     fn empty_text_returns_empty() {
-        let s = extract("", &["foo"], &Options::default());
+        let s = extract("", "foo", &Options::default());
         assert_eq!(s, Snippet::empty());
     }
 
     #[test]
-    fn no_terms_returns_head_marked_truncated() {
+    fn a_blank_term_returns_head_marked_truncated() {
         let long = "abcdefghijklmnop".repeat(10);
-        let s = extract(&long, &[], &opts_small());
+        let s = extract(&long, "", &opts_small());
         assert!(s.truncated_end);
         assert!(!s.truncated_start);
         assert!(s.ranges.is_empty());
@@ -460,40 +420,29 @@ mod tests {
     }
 
     #[test]
-    fn no_terms_untruncated() {
-        let s = extract("short text", &[], &opts_small());
+    fn a_blank_term_untruncated() {
+        let s = extract("short text", "", &opts_small());
         assert_eq!(s.window, "short text");
         assert!(!s.truncated_end && !s.truncated_start);
     }
 
     #[test]
     fn simple_match_range() {
-        let s = extract("the quick brown fox", &["quick"], &opts_small());
+        let s = extract("the quick brown fox", "quick", &opts_small());
         assert_eq!(marked(&s), vec!["quick"]);
         assert_ranges_valid(&s);
     }
 
     #[test]
     fn case_insensitive_match_reports_original_case() {
-        let s = extract("The QUICK brown fox", &["quick"], &opts_small());
+        let s = extract("The QUICK brown fox", "quick", &opts_small());
         assert_eq!(marked(&s), vec!["QUICK"]);
-    }
-
-    #[test]
-    fn multiple_terms_both_marked() {
-        let s = extract(
-            "the quick brown fox jumps over the lazy dog",
-            &["quick", "lazy"],
-            &Options::default(),
-        );
-        assert_eq!(marked(&s), vec!["quick", "lazy"]);
-        assert_ranges_valid(&s);
     }
 
     #[test]
     fn window_truncation_flags_on_both_sides() {
         let text = "prefix ".repeat(20) + "MATCH in middle " + &"suffix ".repeat(20);
-        let s = extract(&text, &["MATCH"], &opts_small());
+        let s = extract(&text, "MATCH", &opts_small());
         assert!(s.truncated_start);
         assert!(s.truncated_end);
         assert_eq!(marked(&s), vec!["MATCH"]);
@@ -503,7 +452,7 @@ mod tests {
     fn match_at_start_not_truncated_left() {
         let s = extract(
             "MATCH right at the start of this paragraph",
-            &["match"],
+            "match",
             &opts_small(),
         );
         assert!(!s.truncated_start);
@@ -513,22 +462,15 @@ mod tests {
     #[test]
     fn no_match_returns_head_without_ranges() {
         let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
-        let s = extract(text, &["nomatch"], &opts_small());
+        let s = extract(text, "nomatch", &opts_small());
         assert!(s.ranges.is_empty());
         assert!(s.window.starts_with("alpha"));
     }
 
     #[test]
-    fn overlapping_terms_coalesce() {
-        let s = extract("the RUSTC compiler", &["rust", "rustc"], &opts_small());
-        assert_eq!(marked(&s), vec!["RUSTC"]);
-        assert_ranges_valid(&s);
-    }
-
-    #[test]
     fn utf8_boundaries_hold_with_multibyte_text() {
         let text = "café café café café café café café café café café";
-        let s = extract(text, &["café"], &opts_small());
+        let s = extract(text, "café", &opts_small());
         assert!(!s.ranges.is_empty());
         assert_ranges_valid(&s);
         for m in marked(&s) {
@@ -540,14 +482,8 @@ mod tests {
     fn match_near_right_edge_is_fully_included() {
         let prefix = "x".repeat(30);
         let text = format!("{}{}", prefix, "LONGMATCHTERMTEXT");
-        let s = extract(&text, &["LONGMATCHTERMTEXT"], &opts_small());
+        let s = extract(&text, "LONGMATCHTERMTEXT", &opts_small());
         assert_eq!(marked(&s), vec!["LONGMATCHTERMTEXT"]);
-    }
-
-    #[test]
-    fn empty_query_term_ignored() {
-        let s = extract("hello world", &["", "world"], &opts_small());
-        assert_eq!(marked(&s), vec!["world"]);
     }
 
     #[test]
@@ -579,12 +515,11 @@ mod tests {
 
     #[test]
     fn count_occurrences_cases() {
-        assert_eq!(count_occurrences("aaaa", "aaa", true), 1, "non-overlapping");
-        assert_eq!(count_occurrences("abcABC", "abc", true), 1);
-        assert_eq!(count_occurrences("abcABC", "abc", false), 2);
-        assert_eq!(count_occurrences("", "x", true), 0);
-        assert_eq!(count_occurrences("xyz", "", true), 0);
-        assert_eq!(count_occurrences("no hits here", "zzz", false), 0);
-        assert_eq!(count_occurrences("ab ab ab", "ab", true), 3);
+        assert_eq!(count_occurrences("aaaa", "aaa"), 1, "non-overlapping");
+        assert_eq!(count_occurrences("abcABC", "abc"), 1, "byte for byte");
+        assert_eq!(count_occurrences("", "x"), 0);
+        assert_eq!(count_occurrences("xyz", ""), 0);
+        assert_eq!(count_occurrences("no hits here", "zzz"), 0);
+        assert_eq!(count_occurrences("ab ab ab", "ab"), 3);
     }
 }

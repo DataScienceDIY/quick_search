@@ -32,12 +32,7 @@ fn header(db_path: &Path) -> [u8; 16] {
 
 fn match_count(db_path: &Path, term: &str) -> i64 {
     let conn = db::open_existing(&db_path.to_string_lossy(), false).unwrap();
-    conn.query_row(
-        "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH ?1",
-        [term],
-        |r| r.get(0),
-    )
-    .unwrap()
+    quicksearch_core::testutil::fts_count(&conn, term)
 }
 
 #[test]

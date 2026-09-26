@@ -9,7 +9,7 @@ use crate::testutil::{zstd_of, Scratch};
 fn fresh() -> (Scratch, String, Connection) {
     let (dir, path) = Scratch::db("repo");
     let path = path.to_str().unwrap().to_string();
-    let conn = open_or_recreate(&path, "trigram").unwrap();
+    let conn = open_or_recreate(&path, &Default::default()).unwrap();
     (dir, path, conn)
 }
 
@@ -76,14 +76,9 @@ fn fts_rows(conn: &Connection) -> i64 {
     count(conn, "SELECT COUNT(*) FROM searchabletext")
 }
 
-/// Rows whose body matches the FTS query `term`.
+/// Rows whose body the FTS index matches for `term`.
 fn matches(conn: &Connection, term: &str) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH ?1",
-        [term],
-        |r| r.get(0),
-    )
-    .unwrap()
+    crate::testutil::fts_count(conn, term)
 }
 
 fn state(conn: &Connection, id: i64) -> i64 {
@@ -91,6 +86,22 @@ fn state(conn: &Connection, id: i64) -> i64 {
         r.get(0)
     })
     .unwrap()
+}
+
+/// Store `text` on a pending row, which must still be pending.
+fn done(tx: &Transaction<'_>, id: i64, text: &str) {
+    assert!(store_pending_text(tx, id, text, zstd_of(text).as_deref()).unwrap());
+}
+
+/// Fail a row as a later run would: a changed file clears it back to pending
+/// (the state `update_file_basic` leaves), then its extraction fails.
+fn fail(tx: &Transaction<'_>, id: i64, reason: &str) {
+    if state(tx, id) == STATE_DONE {
+        clear_content_for_ids(tx, &[id]).unwrap();
+    }
+    set_content_state(tx, &[id], STATE_PENDING).unwrap();
+    let failed = ContentOutcome::Failed(reason.to_string());
+    assert!(complete_pending(tx, id, &failed, None).unwrap());
 }
 
 /// Every stored path, in `(parent, name)` order.
@@ -114,18 +125,18 @@ fn seeded(conn: &mut Connection, paths: &[&str]) -> std::collections::HashMap<St
             .iter()
             .map(|path| {
                 let id = insert_at(tx, path, true);
-                set_content_done(tx, id, "body text", zstd_of("body text").as_deref()).unwrap();
+                done(tx, id, "body text");
                 (path.to_string(), id)
             })
             .collect()
     })
 }
 
-/// `set_content_done_fresh` skips the pre-delete, so its safety is the
-/// caller's claim that the row is clean. A duplicate `searchabletext` row
-/// shows up as a file appearing twice in results, never as an error.
+/// [`complete_pending`] clears nothing first, so its safety is that only a
+/// pending row is written. A duplicate `searchabletext` row shows up as a file
+/// appearing twice in results, never as an error.
 #[test]
-fn the_fresh_content_write_leaves_exactly_one_fts_row() {
+fn a_pending_write_leaves_exactly_one_fts_row() {
     let row = |mtime| NewFile {
         size: 10,
         mtime,
@@ -135,13 +146,12 @@ fn the_fresh_content_write_leaves_exactly_one_fts_row() {
 
     let id = with_tx(&mut conn, |tx| {
         let id = insert_file(tx, &row(1)).unwrap().unwrap();
-        set_content_done_fresh(tx, id, "sphinx quartz", zstd_of("sphinx quartz").as_deref())
-            .unwrap();
+        done(tx, id, "sphinx quartz");
 
         // The update path: the sequence `process_batch_updates` performs.
         let same = update_file_basic(tx, &row(2)).unwrap().unwrap();
         assert_eq!(same, id, "the same row");
-        set_content_done_fresh(tx, id, "sphinx onyx", zstd_of("sphinx onyx").as_deref()).unwrap();
+        done(tx, id, "sphinx onyx");
         id
     });
 
@@ -150,16 +160,43 @@ fn the_fresh_content_write_leaves_exactly_one_fts_row() {
     assert_eq!(matches(&conn, "onyx"), 1, "the new body is searchable");
     assert_eq!(matches(&conn, "quartz"), 0, "the old body is gone");
 
-    // The idempotent entry point, which the content pass and the watcher use,
-    // still repairs a row that really does hold content.
-    with_tx(&mut conn, |tx| {
-        set_content_done(tx, id, "sphinx jasper", zstd_of("sphinx jasper").as_deref()).unwrap()
+    // A second write to a row that is no longer pending (the content pass
+    // holding a row the walk's inline text already stored) writes nothing.
+    let stored = with_tx(&mut conn, |tx| {
+        store_pending_text(tx, id, "sphinx jasper", zstd_of("sphinx jasper").as_deref()).unwrap()
     });
-
+    assert!(!stored);
     assert_eq!(fts_rows(&conn), 1);
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents_text"), 1);
-    assert_eq!(matches(&conn, "jasper"), 1);
-    assert_eq!(matches(&conn, "onyx"), 0);
+    assert_eq!(matches(&conn, "jasper"), 0);
+    assert_eq!(matches(&conn, "onyx"), 1);
+}
+
+/// Stale cleanup can delete a pending row while its extraction is in flight.
+/// Writing the outcome anyway would leave a posting with no `files` row,
+/// matching searches forever and inherited by whichever file reuses the id.
+#[test]
+fn an_outcome_for_a_row_deleted_in_flight_writes_nothing() {
+    let (_dir, _path, mut conn) = fresh();
+    let (text_id, failed_id) = with_tx(&mut conn, |tx| {
+        let a = insert_at(tx, "/gone/a.txt", true);
+        let b = insert_at(tx, "/gone/b.txt", true);
+        delete_ids(tx, &[a, b], &[]).unwrap();
+        (a, b)
+    });
+    with_tx(&mut conn, |tx| {
+        let text = ContentOutcome::Done {
+            text: "sphinx quartz".into(),
+        };
+        assert!(
+            !complete_pending(tx, text_id, &text, zstd_of("sphinx quartz").as_deref()).unwrap()
+        );
+        let failed = ContentOutcome::Failed("boom".into());
+        assert!(!complete_pending(tx, failed_id, &failed, None).unwrap());
+    });
+    assert_eq!(fts_rows(&conn), 0, "no orphan posting");
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents_text"), 0);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM failed_files"), 0);
 }
 
 /// The size report reads each body's length out of its zstd frame header,
@@ -252,17 +289,10 @@ fn insert_update_delete_round_trip() {
             ..text_row("/tmp/", "a.txt")
         };
         let id = insert_file(tx, &row).unwrap().expect("unique path");
-        set_content_done(tx, id, "hello world", zstd_of("hello world").as_deref()).unwrap();
+        done(tx, id, "hello world");
     });
 
-    let hit: i64 = conn
-        .query_row(
-            "SELECT rowid FROM searchabletext WHERE searchabletext MATCH 'hello'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(hit > 0);
+    assert_eq!(matches(&conn, "hello"), 1);
 
     with_tx(&mut conn, |tx| {
         assert!(delete_file_by_path(tx, "/tmp/a.txt").unwrap())
@@ -294,11 +324,11 @@ fn update_writes_content_state_from_needs_content() {
     let (_dir, _path, mut conn) = fresh();
     let row = NewFile {
         size: 10,
-        ..na_row("/tmp/", "a.txt")
+        ..text_row("/tmp/", "a.txt")
     };
     let id = with_tx(&mut conn, |tx| {
         let id = insert_file(tx, &row).unwrap().expect("unique path");
-        set_content_done(tx, id, "old text", zstd_of("old text").as_deref()).unwrap();
+        done(tx, id, "old text");
         id
     });
 
@@ -365,7 +395,7 @@ fn delete_subtree_clears_every_dependent_table() {
         ],
     );
     with_tx(&mut conn, |tx| {
-        set_content_failed(tx, ids["/tree/deep/c.txt"], "bad parse").unwrap()
+        fail(tx, ids["/tree/deep/c.txt"], "bad parse")
     });
 
     let range = RootRange::for_root("/tree");
@@ -441,9 +471,7 @@ fn delete_ids_clears_every_dependent_table() {
         &mut conn,
         &["/t/a.txt", "/t/b.log", "/t/deep/c.log", "/t/keep.txt"],
     );
-    with_tx(&mut conn, |tx| {
-        set_content_failed(tx, ids["/t/deep/c.log"], "bad parse").unwrap()
-    });
+    with_tx(&mut conn, |tx| fail(tx, ids["/t/deep/c.log"], "bad parse"));
 
     let doomed = vec![ids["/t/b.log"], ids["/t/deep/c.log"]];
     // `c.log` is FAILED and so holds no posting: the distinction the second
@@ -499,7 +527,7 @@ fn updating_clears_content_exactly_for_the_states_that_hold_it() {
     let ids = seeded(&mut conn, &["/t/done.txt", "/t/failed.txt", "/t/keep.txt"]);
     let (na_id, pending_id) = with_tx(&mut conn, |tx| {
         // Clears failed.txt's posting too; the narrowing rests on that.
-        set_content_failed(tx, ids["/t/failed.txt"], "bad parse").unwrap();
+        fail(tx, ids["/t/failed.txt"], "bad parse");
         let na = insert_file(tx, &na_row("/t/", "na.bin"))
             .unwrap()
             .expect("unique path");
@@ -586,25 +614,6 @@ fn id_and_state_for_path_reads_the_stored_state() {
         id_and_state_for_path(&conn, "no-separator").unwrap(),
         None,
         "an unsplittable path resolves to nothing rather than erroring"
-    );
-}
-
-/// Dropping stored text must cost the file its snippets and nothing else.
-#[test]
-fn drop_stored_text_keeps_the_file_searchable() {
-    let (_dir, _path, mut conn) = fresh();
-    let ids = seeded(&mut conn, &["/t/a.txt", "/t/b.txt"]);
-    with_tx(&mut conn, |tx| {
-        drop_stored_text(tx, &[ids["/t/a.txt"]]).unwrap()
-    });
-
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents_text"), 1);
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2);
-    assert_eq!(fts_rows(&conn), 2);
-    assert_eq!(
-        matches(&conn, "body"),
-        2,
-        "both files still match on content"
     );
 }
 
@@ -742,7 +751,7 @@ fn seed_rows(conn: &mut Connection, range: std::ops::Range<usize>) {
             let id = insert_file(tx, &text_row("/tmp/bulk/", &name))
                 .unwrap()
                 .unwrap();
-            set_content_done(tx, id, &body, zstd_of(&body).as_deref()).unwrap();
+            done(tx, id, &body);
         }
     });
 }
@@ -788,7 +797,15 @@ fn checkpoint_truncate_reports_an_incomplete_checkpoint() {
 /// [`crate::config::MINIMUM_WAL_SIZE`]; this shows the limit works.
 #[test]
 fn journal_size_limit_gives_the_space_back_after_a_blocked_truncate() {
-    let (_dir, p, mut writer) = fresh();
+    // With positions: the test needs more than 16 MiB of log, and position
+    // lists write it from the fewest rows.
+    let (_dir, p) = Scratch::db("repo");
+    let p = p.to_str().unwrap().to_string();
+    let positional = crate::config::ProcessingConfig {
+        compact_text_index: false,
+        ..Default::default()
+    };
+    let mut writer = open_or_recreate(&p, &positional).unwrap();
     seed_rows(&mut writer, 0..10);
     writer
         .busy_timeout(std::time::Duration::from_millis(100))
@@ -864,7 +881,7 @@ fn a_busy_reader_defeats_the_autocheckpoint_but_not_a_forced_one() {
     }
 
     fn run(p: &str, force_every: usize) -> u64 {
-        let mut conn = open_or_recreate(p, "trigram").unwrap();
+        let mut conn = open_or_recreate(p, &Default::default()).unwrap();
         seed_bare(&mut conn, 0..500);
 
         // Stands in for a walk prefetcher: short reads, no gaps.
@@ -1006,15 +1023,11 @@ fn maintain_skips_vacuum_on_a_tight_file() {
 }
 
 #[test]
-fn set_content_failed_writes_failed_table() {
+fn a_failed_extraction_records_its_reason() {
     let (_dir, _path, mut conn) = fresh();
     let id = with_tx(&mut conn, |tx| {
-        let row = NewFile {
-            size: 0,
-            ..na_row("/tmp/", "oops.bin")
-        };
-        let id = insert_file(tx, &row).unwrap().expect("unique path");
-        set_content_failed(tx, id, "bad parse").unwrap();
+        let id = insert_at(tx, "/tmp/oops.txt", true);
+        fail(tx, id, "bad parse");
         id
     });
 
@@ -1029,11 +1042,8 @@ fn set_content_failed_writes_failed_table() {
     assert_eq!(state(&conn, id), STATE_FAILED);
 }
 
-/// A way out of `STATE_DONE`, applied to the row with the given id.
-type Transition = fn(&Transaction<'_>, i64);
-
-/// Every transition out of [`STATE_DONE`] takes the posting and the stored
-/// body with it, so its invariant holds however a row got where it is.
+/// Every way a changed file leaves [`STATE_DONE`] takes the posting and the
+/// stored body with it, so its invariant holds however a row got where it is.
 ///
 /// `count_root_counts_the_fts_rows_it_says_it_does` checks rows that were
 /// never DONE, which passes even for a transition that leaves a stale posting
@@ -1044,31 +1054,22 @@ type Transition = fn(&Transaction<'_>, i64);
 fn leaving_done_always_takes_the_posting_with_it() {
     let (_dir, _path, mut conn) = fresh();
 
-    // Each row starts DONE, with a posting and a stored body, and then takes
-    // one of the three ways out.
-    let leave: [(&str, Transition); 3] = [
-        ("/t/failed.txt", |tx, id| {
-            set_content_failed(tx, id, "bad parse").unwrap()
-        }),
-        ("/t/na.txt", |tx, id| set_content_na(tx, id).unwrap()),
-        ("/t/rewritten.txt", |tx, _id| {
-            // The shape a changed file takes: metadata updated in place.
+    // Each row starts DONE, with a posting and a stored body, and is then
+    // rewritten in place: still text (back to pending), or no longer
+    // anything an extractor claims (NA).
+    for (name, needs_content) in [("rewritten.txt", true), ("now-binary.txt", false)] {
+        with_tx(&mut conn, |tx| {
+            let id = insert_at(tx, &format!("/t/{}", name), true);
+            done(tx, id, "body text");
             let row = NewFile {
                 size: 99,
                 mtime: 99,
-                ..text_row("/t/", "rewritten.txt")
+                needs_content,
+                ..text_row("/t/", name)
             };
             update_file_basic(tx, &row)
                 .unwrap()
                 .expect("the row is there");
-        }),
-    ];
-
-    for (path, transition) in leave {
-        with_tx(&mut conn, |tx| {
-            let id = insert_at(tx, path, true);
-            set_content_done(tx, id, "body text", zstd_of("body text").as_deref()).unwrap();
-            transition(tx, id);
         });
     }
 
@@ -1094,12 +1095,12 @@ fn count_root_counts_the_fts_rows_it_says_it_does() {
         // Two searchable, and one of each way a row can fail to be.
         for path in ["/tree/a.txt", "/tree/b.txt"] {
             let id = insert_at(tx, path, true);
-            set_content_done(tx, id, "body text", zstd_of("body text").as_deref()).unwrap();
+            done(tx, id, "body text");
         }
         let failed = insert_at(tx, "/tree/c.bin", true);
-        set_content_failed(tx, failed, "bad parse").unwrap();
+        fail(tx, failed, "bad parse");
         let na = insert_at(tx, "/tree/d.iso", true);
-        set_content_na(tx, na).unwrap();
+        assert!(complete_pending(tx, na, &ContentOutcome::NotApplicable, None).unwrap());
         insert_at(tx, "/tree/e.txt", true); // still pending
     });
 
@@ -1116,7 +1117,7 @@ fn count_root_counts_the_fts_rows_it_says_it_does() {
     // root's figure.
     with_tx(&mut conn, |tx| {
         let id = insert_at(tx, "/elsewhere/f.txt", true);
-        set_content_done(tx, id, "body text", zstd_of("body text").as_deref()).unwrap();
+        done(tx, id, "body text");
     });
     assert_eq!(fts_rows(&conn), 3);
     assert_eq!(
@@ -1226,11 +1227,10 @@ fn deleting_a_file_row_cascades_the_fk_tables() {
     let (_dir, _path, mut conn) = fresh();
     seeded(&mut conn, &["/casc/a.txt", "/casc/b.txt"]);
     // The failure goes on a row that never extracted, the only way a run
-    // reaches `set_content_failed`, so the FTS figures below stay about the
-    // cascade.
+    // reaches a failure, so the FTS figures below stay about the cascade.
     with_tx(&mut conn, |tx| {
         let never = insert_at(tx, "/casc/c.bin", true);
-        set_content_failed(tx, never, "boom").unwrap();
+        fail(tx, never, "boom");
     });
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents_text"), 2);
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM failed_files"), 1);
@@ -1260,7 +1260,7 @@ fn retry_failed_files_resets_state_and_clears_records() {
     let (_dir, _path, mut conn) = fresh();
     let ids = seeded(&mut conn, &["/retry/bad.txt", "/retry/good.txt"]);
     with_tx(&mut conn, |tx| {
-        set_content_failed(tx, ids["/retry/bad.txt"], "parser choked").unwrap()
+        fail(tx, ids["/retry/bad.txt"], "parser choked")
     });
 
     assert_eq!(with_tx(&mut conn, |tx| retry_failed_files(tx).unwrap()), 1);
@@ -1281,8 +1281,8 @@ fn a_changed_file_clears_its_failure_record() {
     let (_dir, _path, mut conn) = fresh();
     let ids = seeded(&mut conn, &["/chg/a.txt", "/chg/b.txt"]);
     with_tx(&mut conn, |tx| {
-        set_content_failed(tx, ids["/chg/a.txt"], "boom").unwrap();
-        set_content_failed(tx, ids["/chg/b.txt"], "boom").unwrap();
+        fail(tx, ids["/chg/a.txt"], "boom");
+        fail(tx, ids["/chg/b.txt"], "boom");
     });
 
     let changed = |name: &'static str, needs_content: bool| NewFile {

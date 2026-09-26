@@ -93,11 +93,30 @@ pub struct ProcessingConfig {
     /// User-facing guidance is in `config_example.toml`.
     pub maximum_wal_size: u64,
     pub tokenize: String,
-    /// When `true` (default), extracted text is stored zstd-compressed in
-    /// `documents_text` for snippet previews. When `false` queries return the
-    /// same hits, but results carry no snippets, can't be case-verified or
-    /// occurrence-ranked, and fuzzy full-text search is unavailable.
-    pub store_text_for_snippets: bool,
+    /// When `true` (default), the full-text index keeps no word positions
+    /// (FTS5 `detail=none`): a term is looked up as the AND of its trigrams
+    /// and the full-text pass drops the documents where they are not
+    /// adjacent, against the stored text. Several times smaller and faster
+    /// to build, at the cost of checking more candidates per search; see
+    /// [`crate::db::schema::fts_create_sql`] for the measurements. Only
+    /// `trigram` can be queried that way; see [`ProcessingConfig::fts_positions`].
+    pub compact_text_index: bool,
+}
+
+impl ProcessingConfig {
+    /// Whether the full-text index is built with word positions. Everything
+    /// that decides the index's layout asks this, never
+    /// [`ProcessingConfig::compact_text_index`] directly: a word tokenizer
+    /// keeps positions whatever that says, because a multi-word phrase has no
+    /// trigram form to fall back on, and toggling it there changes nothing.
+    pub fn fts_positions(&self) -> bool {
+        let trigram = self
+            .tokenize
+            .split_whitespace()
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("trigram"));
+        !(self.compact_text_index && trigram)
+    }
 }
 
 /// Floor on a non-zero [`ProcessingConfig::maximum_wal_size`]: a checkpoint
@@ -231,7 +250,7 @@ impl Default for ProcessingConfig {
             writer_turn_slice_ms: 100,
             maximum_wal_size: 1024 * 1024 * 1024 * 2,
             tokenize: "trigram".to_string(),
-            store_text_for_snippets: true,
+            compact_text_index: true,
         }
     }
 }

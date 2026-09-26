@@ -246,7 +246,7 @@ const ROWS: &[(Section, &str, &tips::Tip, Level)] = &[
     (Section::Processing, "Max text file size (bytes)", &tips::MAX_TEXT_FILE_SIZE, Level::Advanced),
     (Section::Processing, "Batch size", &tips::BATCH_SIZE, Level::Advanced),
     (Section::Processing, "Max WAL size (bytes)", &tips::MAX_WAL_SIZE, Level::Advanced),
-    (Section::Processing, "Store text for snippets", &tips::STORE_TEXT, Level::Everyday),
+    (Section::Processing, "Compact text index", &tips::COMPACT_INDEX, Level::Everyday),
     (Section::Search, "Fuzzy search ON by default", &tips::FUZZY_DEFAULT, Level::Everyday),
     (Section::Search, "Fuzzy edit distance", &tips::FUZZY_EDITS, Level::Advanced),
     (Section::Search, "Display limit", &tips::DISPLAY_LIMIT, Level::Advanced),

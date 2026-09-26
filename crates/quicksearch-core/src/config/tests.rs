@@ -671,16 +671,41 @@ fn turning_symlinks_off_drops_aliases_and_on_walks() {
     );
 }
 
-/// Stored text: on re-extracts, off drops the blobs; never a rebuild.
+/// The position setting is part of the FTS table definition, so a change
+/// rebuilds; but only a change of the layout it produces, and a word
+/// tokenizer keeps positions either way.
 #[test]
-fn stored_text_on_re_extracts_and_off_drops_it() {
+fn the_compact_index_flag_rebuilds_only_when_the_layout_changes() {
     let base = wide_base();
-    let off = edited(&base, |c| c.processing.store_text_for_snippets = false);
-    let on = edited(&base, |c| c.processing.store_text_for_snippets = true);
-    let a = diff_actions(&on, &off);
-    assert!(a.work.drop_text && !a.work.restore_text && !a.work.reindex);
-    let a = diff_actions(&off, &on);
-    assert!(a.work.restore_text && !a.work.drop_text && a.work.reindex);
+    let full = edited(&base, |c| c.processing.compact_text_index = false);
+    assert!(diff_actions(&base, &full).requires_rebuild);
+    assert!(diff_actions(&full, &base).requires_rebuild);
+
+    let words = edited(&base, |c| c.processing.tokenize = "unicode61".into());
+    let words_full = edited(&words, |c| c.processing.compact_text_index = false);
+    assert_eq!(
+        diff_actions(&words, &words_full),
+        ConfigActions::default(),
+        "positions either way: nothing to do"
+    );
+}
+
+#[test]
+fn only_trigram_can_drop_positions() {
+    let mut p = ProcessingConfig::default();
+    assert!(p.compact_text_index, "compact by default");
+    assert!(!p.fts_positions());
+    p.tokenize = "trigram case_sensitive 1".into();
+    assert!(!p.fts_positions(), "trigram with options is still trigram");
+    p.tokenize = "  TRIGRAM ".into();
+    assert!(!p.fts_positions());
+    for word in ["unicode61", "porter", "porter unicode61", "trigrammer"] {
+        p.tokenize = word.into();
+        assert!(p.fts_positions(), "{word} cannot be queried by trigrams");
+    }
+    p.tokenize = "trigram".into();
+    p.compact_text_index = false;
+    assert!(p.fts_positions());
 }
 
 #[test]
@@ -713,7 +738,7 @@ fn merging_two_plans_loses_nothing() {
     let first = IndexWork {
         drop_roots: vec!["/gone".into(), "/shared".into()],
         prune_scope: true,
-        drop_text: true,
+        drop_aliases: true,
         ..IndexWork::default()
     };
     let second = IndexWork {
@@ -730,7 +755,7 @@ fn merging_two_plans_loses_nothing() {
         vec!["/shared", "/also-gone", "/gone"],
         "every root from both, each once"
     );
-    assert!(merged.prune_scope && merged.drop_text);
+    assert!(merged.prune_scope && merged.drop_aliases);
     assert!(merged.reconcile_content && merged.reindex);
 
     // Empty merge is a no-op and self-merge is the identity; both make a

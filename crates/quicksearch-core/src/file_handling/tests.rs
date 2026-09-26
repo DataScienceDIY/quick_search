@@ -576,7 +576,7 @@ fn a_symlinked_root_yields_no_directories_when_following_is_off() {
 fn a_bulk_write_repairs_a_delete_merge_threshold_left_off() {
     let dir = crate::testutil::scratch_dir("deletemerge-repair");
     let db = dir.join("index.sqlite");
-    let conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+    let conn = crate::db::open_or_recreate(db.to_str().unwrap(), &Default::default()).unwrap();
 
     // What a killed burst leaves behind.
     fts_begin_tombstone_burst(&conn);
@@ -626,9 +626,10 @@ fn seed_stale_corpus(
         .expect("unique path");
         ids.insert(name, id);
     }
-    repo::set_content_done(&tx, ids["done-stale.txt"], "body one", None).unwrap();
-    repo::set_content_done(&tx, ids["done-kept.txt"], "body two", None).unwrap();
-    repo::set_content_failed(&tx, ids["failed-stale.txt"], "bad parse").unwrap();
+    repo::store_pending_text(&tx, ids["done-stale.txt"], "body one", None).unwrap();
+    repo::store_pending_text(&tx, ids["done-kept.txt"], "body two", None).unwrap();
+    let failed = crate::file_handling::ContentOutcome::Failed("bad parse".into());
+    repo::complete_pending(&tx, ids["failed-stale.txt"], &failed, None).unwrap();
     tx.commit().unwrap();
     ids
 }
@@ -646,7 +647,7 @@ fn stale_cleanup_deletes_exactly_the_stale_rows_and_their_postings() {
 
     let dir = crate::testutil::scratch_dir("stale-cleanup");
     let db = dir.join("index.sqlite");
-    let mut conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+    let mut conn = crate::db::open_or_recreate(db.to_str().unwrap(), &Default::default()).unwrap();
     let ids = seed_stale_corpus(&mut conn);
 
     // `vanished.txt` was never indexed: a stale list can legitimately name a
@@ -675,14 +676,11 @@ fn stale_cleanup_deletes_exactly_the_stale_rows_and_their_postings() {
     assert_eq!(count("SELECT COUNT(*) FROM searchabletext"), 1);
     assert_eq!(count("SELECT COUNT(*) FROM documents_text"), 0);
     assert_eq!(count("SELECT COUNT(*) FROM failed_files"), 0);
-    let hit: i64 = conn
-        .query_row(
-            "SELECT rowid FROM searchabletext WHERE searchabletext MATCH 'body'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(hit, ids["done-kept.txt"], "the survivor is still findable");
+    assert_eq!(
+        crate::testutil::fts_rowids(&conn, "body"),
+        vec![ids["done-kept.txt"]],
+        "the survivor is still findable"
+    );
     assert_eq!(
         deletemerge(&conn),
         Some(i64::from(FTS_DELETEMERGE)),
@@ -704,7 +702,7 @@ fn a_stopped_stale_cleanup_deletes_nothing_and_leaves_the_burst() {
 
     let dir = crate::testutil::scratch_dir("stale-cleanup-stop");
     let db = dir.join("index.sqlite");
-    let mut conn = crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap();
+    let mut conn = crate::db::open_or_recreate(db.to_str().unwrap(), &Default::default()).unwrap();
     seed_stale_corpus(&mut conn);
 
     let conn_mutex = Arc::new(Mutex::new(conn));

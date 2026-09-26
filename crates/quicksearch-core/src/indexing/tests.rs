@@ -124,7 +124,7 @@ fn worker_counts_follow_the_phase() {
     let dir = tmp_dir("phase-workers");
     std::fs::write(dir.join("a.txt"), "hello").unwrap();
     let db_path = dir.join("index.db").to_string_lossy().into_owned();
-    drop(db::open_or_recreate(&db_path, "trigram").unwrap());
+    drop(db::open_or_recreate(&db_path, &Default::default()).unwrap());
 
     let stop = Arc::new(AtomicBool::new(false));
     let mut p = idle_pipeline(&dir, &db_path, 3, 2, &stop);
@@ -150,7 +150,7 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
 
     let dir = tmp_dir("slice-leftovers");
     let db_path = dir.join("index.db").to_string_lossy().into_owned();
-    let mut conn = db::open_or_recreate(&db_path, "trigram").unwrap();
+    let mut conn = db::open_or_recreate(&db_path, &Default::default()).unwrap();
     let tree = dir.join("tree");
     std::fs::create_dir_all(&tree).unwrap();
     let mut ready: Vec<ExtractedRow> = Vec::new();
@@ -204,7 +204,8 @@ fn an_extracting_turn_lands_its_leftovers_one_slice_at_a_time() {
         &db_path,
         &stop,
         Arc::new(Mutex::new(IndexingStatus::Idle)),
-    );
+    )
+    .unwrap();
     cx.slice = Duration::ZERO;
 
     let mut turns = 0;
@@ -488,6 +489,7 @@ fn cx_for<'a>(
         stop,
         status.clone(),
     )
+    .unwrap()
 }
 
 fn running_status(maintenance: Option<MaintenanceStep>) -> Arc<Mutex<IndexingStatus>> {

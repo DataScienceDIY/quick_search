@@ -34,7 +34,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::config::IgnoreSet;
 use crate::query::pattern::clamp_match_range;
 use crate::query::split::CascadeQuery;
-use crate::query::translator::{escape_like, quote_phrase};
+use crate::query::translator::escape_like;
 use crate::snippet;
 
 use super::fuzzy::{matcher_for, pigeonhole_chunks, Bitap};
@@ -80,12 +80,7 @@ pub fn text_snippet_counted(
     folded: &str,
 ) -> Option<(snippet::Snippet, usize)> {
     let term = pattern.literal_folded()?;
-    Some(snippet::extract_folded(
-        text,
-        folded,
-        &[term],
-        &SNIPPET_OPTS,
-    ))
+    Some(snippet::extract_folded(text, folded, term, &SNIPPET_OPTS))
 }
 
 /// The fuzzy full-text match in one document body: occurrence count within
@@ -128,6 +123,7 @@ pub fn run(
         conn,
         query,
         options,
+        positions: crate::db::repo::fts_positions(conn),
         generation,
         latest_gen,
         ignore,
@@ -310,6 +306,10 @@ struct Cx<'a> {
     conn: &'a Connection,
     query: &'a CascadeQuery,
     options: &'a SearchOptions,
+    /// Whether the full-text index keeps positions, read from the index each
+    /// search: it decides how every `MATCH` is phrased
+    /// ([`prefilter::fts_literal`]).
+    positions: bool,
     generation: u64,
     latest_gen: &'a AtomicU64,
     ignore: IgnoreSet,
@@ -417,7 +417,7 @@ impl<'a> Cx<'a> {
                 stmt.query_row([file_id], |r| {
                     let blob = r.get_ref(0)?.as_blob()?;
                     // Strict UTF-8 loses nothing: bodies are written from `&str`
-                    // (`repo::set_content_done`), and `stored_text` also treats
+                    // (`repo::store_pending_text`), and `stored_text` also treats
                     // non-UTF-8 as absent.
                     Ok(doc.decode(blob).is_some_and(|t| re.is_match(t)))
                 })

@@ -3,7 +3,7 @@
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 
-use crate::file_handling::{ExtractCursor, RootRange};
+use crate::file_handling::{ContentOutcome, ExtractCursor, RootRange};
 use crate::mime::FileType;
 
 pub const STATE_PENDING: i64 = 0;
@@ -25,30 +25,6 @@ fn exec(
     conn.prepare_cached(sql)
         .and_then(|mut stmt| stmt.execute(params))
         .map_err(|e| format!("{}: {}", what(), e))
-}
-
-/// Set a file's content state and clear any failure record with it:
-/// `list-failed` reads `failed_files` directly, so a stale entry keeps
-/// reporting a file broken. [`set_content_failed`] does not use this.
-fn set_state_clearing_failure(
-    tx: &Transaction<'_>,
-    file_id: i64,
-    state: i64,
-    transition: &'static str,
-) -> Result<(), String> {
-    exec(
-        tx,
-        "UPDATE files SET content_state = ?1 WHERE id = ?2",
-        params![state, file_id],
-        || format!("{} content_state {}", transition, file_id),
-    )?;
-    exec(
-        tx,
-        "DELETE FROM failed_files WHERE file_id = ?1",
-        params![file_id],
-        || format!("clear failed_files {}", file_id),
-    )?;
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -154,9 +130,8 @@ pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option
     }
     let new_state = initial_content_state(f);
     if old_state != new_state {
-        // A plain assignment, not `set_state_clearing_failure`: the FAILED
-        // arm above already took the failure record, and no other state can
-        // hold one.
+        // The FAILED arm above already took the failure record, and no
+        // other state can hold one.
         exec(
             tx,
             "UPDATE files SET content_state = ?1 WHERE id = ?2",
@@ -167,29 +142,64 @@ pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option
     Ok(Some(id))
 }
 
-/// Mark a file's content indexing as complete and write the extracted text
-/// atomically. `text_zstd` is the pre-compressed `documents_text` sidecar
-/// body, or `None` for no sidecar. Compression is the caller's job: this runs
-/// inside the writer's transaction, so compress before taking the lock.
-pub fn set_content_done(
-    tx: &Transaction<'_>,
-    file_id: i64,
-    text: &str,
-    text_zstd: Option<&[u8]>,
-) -> Result<(), String> {
-    remove_content_for_id(tx, file_id)?;
-    set_content_done_fresh(tx, file_id, text, text_zstd)
+/// Move a [`STATE_PENDING`] row to `state`; `false`, writing nothing, when
+/// the row is no longer pending (or no longer exists).
+fn claim_pending(tx: &Transaction<'_>, file_id: i64, state: i64) -> Result<bool, String> {
+    let changed = exec(
+        tx,
+        "UPDATE files SET content_state = ?1 WHERE id = ?2 AND content_state = ?3",
+        params![state, file_id, STATE_PENDING],
+        || format!("set content_state {} on {}", state, file_id),
+    )?;
+    Ok(changed > 0)
 }
 
-/// [`set_content_done`] for a row that **provably holds no content yet**,
-/// skipping the pre-delete. Use it only where the same transaction has
-/// established that; a wrong call leaves a duplicate FTS entry, not an error.
-pub fn set_content_done_fresh(
+/// Record the outcome of extracting a pending row: the one way content state
+/// leaves [`STATE_PENDING`]. `text_zstd` is the pre-compressed
+/// `documents_text` body for a `Done` outcome, or `None` for no sidecar;
+/// compress before taking the writer's lock. Returns whether the row was
+/// still pending, and so whether anything was written.
+///
+/// Pending is also what makes it cheap: a pending row provably holds no
+/// posting, stored body or failure record (see [`STATE_DONE`] and
+/// [`STATE_FAILED`]), so nothing is cleared first. A row that stopped being
+/// pending while its extraction was in flight (stored by another route, or
+/// deleted by stale cleanup) is left alone: writing it anyway would leave a
+/// posting with no `files` row behind it, which a reused rowid inherits.
+pub fn complete_pending(
+    tx: &Transaction<'_>,
+    file_id: i64,
+    outcome: &ContentOutcome,
+    text_zstd: Option<&[u8]>,
+) -> Result<bool, String> {
+    match outcome {
+        ContentOutcome::Done { text } => store_pending_text(tx, file_id, text, text_zstd),
+        ContentOutcome::NotApplicable => claim_pending(tx, file_id, STATE_NA),
+        ContentOutcome::Failed(reason) => {
+            if !claim_pending(tx, file_id, STATE_FAILED)? {
+                return Ok(false);
+            }
+            exec(
+                tx,
+                "INSERT INTO failed_files(file_id, reason, ts) VALUES (?1, ?2, ?3)",
+                params![file_id, reason, crate::log::now_unix() as i64],
+                || format!("insert failed_files {}", file_id),
+            )?;
+            Ok(true)
+        }
+    }
+}
+
+/// [`complete_pending`] with extracted text, for callers holding it borrowed.
+pub fn store_pending_text(
     tx: &Transaction<'_>,
     file_id: i64,
     text: &str,
     text_zstd: Option<&[u8]>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    if !claim_pending(tx, file_id, STATE_DONE)? {
+        return Ok(false);
+    }
     // Contentless FTS5 takes the text on INSERT for the tokenizer and does
     // not store it.
     exec(
@@ -198,7 +208,6 @@ pub fn set_content_done_fresh(
         params![file_id, text],
         || format!("insert FTS row {}", file_id),
     )?;
-
     if let Some(compressed) = text_zstd {
         exec(
             tx,
@@ -207,8 +216,7 @@ pub fn set_content_done_fresh(
             || format!("insert documents_text {}", file_id),
         )?;
     }
-
-    set_state_clearing_failure(tx, file_id, STATE_DONE, "update DONE")
+    Ok(true)
 }
 
 /// Reusable decode buffer and context for the readers of `documents_text`;
@@ -313,9 +321,10 @@ impl DocEncoder {
     }
 }
 
-/// Compress one body, for the writers that handle a single row.
-pub fn encode_one(text: &str, store_text: bool) -> Result<Option<Vec<u8>>, String> {
-    if !store_text || text.is_empty() {
+/// Compress one body, for the writers that handle a single row; `None` for
+/// an empty one, which gets no `documents_text` row.
+pub fn encode_one(text: &str) -> Result<Option<Vec<u8>>, String> {
+    if text.is_empty() {
         return Ok(None);
     }
     DocEncoder::new()?.encode(text).map(Some)
@@ -325,38 +334,6 @@ pub fn encode_one(text: &str, store_text: bool) -> Result<Option<Vec<u8>>, Strin
 /// frame header. Only the *header* is read, so `blob` may be a prefix.
 pub fn raw_text_len(blob: &[u8]) -> Option<u64> {
     zstd::zstd_safe::get_frame_content_size(blob).ok().flatten()
-}
-
-/// Mark a file's content extraction as failed, keeping the row.
-///
-/// Clears any posting and stored body first, so text from an earlier version
-/// of the file stops matching and [`STATE_DONE`]'s invariant holds. Callers
-/// usually reach here on a row that is already clear, so the deletes are
-/// normally no-ops.
-pub fn set_content_failed(tx: &Transaction<'_>, file_id: i64, reason: &str) -> Result<(), String> {
-    remove_content_for_id(tx, file_id)?;
-    let now = crate::log::now_unix() as i64;
-    exec(
-        tx,
-        "UPDATE files SET content_state = ?1 WHERE id = ?2",
-        params![STATE_FAILED, file_id],
-        || format!("update content_state FAILED {}", file_id),
-    )?;
-    exec(
-        tx,
-        "INSERT OR REPLACE INTO failed_files(file_id, reason, ts) VALUES (?1, ?2, ?3)",
-        params![file_id, reason, now],
-        || format!("insert failed_files {}", file_id),
-    )?;
-    Ok(())
-}
-
-/// Mark content extraction as not applicable; the row still serves filename
-/// search. Clears any posting and stored body first, as
-/// [`set_content_failed`] does.
-pub fn set_content_na(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
-    remove_content_for_id(tx, file_id)?;
-    set_state_clearing_failure(tx, file_id, STATE_NA, "update NA")
 }
 
 /// Delete a file row by path, keeping FTS in sync; returns whether a row went.
@@ -504,10 +481,9 @@ pub fn delete_ids(
 
 /// Set `content_state` on many rows at once, leaving everything else alone.
 ///
-/// The batch form of [`set_state_clearing_failure`]'s `UPDATE`, without its
-/// `failed_files` sweep: a caller that knows the stored states clears the few
-/// [`STATE_FAILED`] rows with [`clear_failed_for_ids`]. A caller that does not
-/// know them must use the per-row helpers.
+/// No `failed_files` sweep: a caller that knows the stored states clears the
+/// few [`STATE_FAILED`] rows with [`clear_failed_for_ids`], and their content
+/// with [`clear_content_for_ids`].
 pub fn set_content_state(tx: &Transaction<'_>, ids: &[i64], state: i64) -> Result<usize, String> {
     let mut changed = 0;
     for chunk in ids.chunks(DELETE_IDS_CHUNK) {
@@ -551,9 +527,8 @@ pub fn clear_content_for_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<(), St
     Ok(())
 }
 
-/// Forget the failure records of many rows at once: the batch half of
-/// [`set_state_clearing_failure`]. Pass only [`STATE_FAILED`] ids; nothing
-/// else holds a record.
+/// Forget the failure records of many rows at once. Pass only
+/// [`STATE_FAILED`] ids; nothing else holds a record.
 pub fn clear_failed_for_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<(), String> {
     exec_chunked(
         tx,
@@ -586,7 +561,7 @@ pub fn dir_rows(
 /// A stored path that remembers where its `name` begins: `parent + name` in
 /// one buffer instead of two or three strings. The content pass moves one per
 /// file from the feeder to the writer.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RowPath {
     path: String,
     name_at: usize,
@@ -611,6 +586,11 @@ impl RowPath {
     pub fn name(&self) -> &str {
         // `name_at` is the parent's length, so it is a char boundary.
         &self.path[self.name_at..]
+    }
+
+    /// The `files.parent` half, trailing separator included.
+    pub fn parent(&self) -> &str {
+        &self.path[..self.name_at]
     }
 }
 
@@ -755,18 +735,6 @@ pub fn rows_in_range_page(
         .map_err(|e| format!("query range page after {}: {}", after_parent, e))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("read range page row: {}", e))
-}
-
-/// Drop the stored text of the given file ids, leaving their FTS row and
-/// `files` row intact: full-text search keeps working, only the snippet
-/// source goes away.
-pub fn drop_stored_text(tx: &Transaction<'_>, ids: &[i64]) -> Result<usize, String> {
-    exec_chunked(
-        tx,
-        "DELETE FROM documents_text WHERE file_id IN (",
-        ids,
-        |n| format!("drop stored text for {} ids", n),
-    )
 }
 
 /// Reset every failed file to pending and drop the failure records, so the
@@ -1090,6 +1058,15 @@ fn set_info(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<usize
         "INSERT OR REPLACE INTO schema_info(key, value) VALUES (?1, ?2)",
         params![key, value],
     )
+}
+
+/// Whether the full-text index was built with positions, which decides how
+/// a search may phrase its `MATCH` (`search::prefilter::fts_literal`). Read
+/// from the index rather than the config, which may already ask for the
+/// other layout before the rebuild that brings it. An index that never
+/// recorded it predates the compact layout, so kept positions.
+pub fn fts_positions(conn: &Connection) -> bool {
+    get_info(conn, "fts_positions").is_none_or(|v| v != "false")
 }
 
 /// Unix seconds of the last *successful* full indexing run; `None` means

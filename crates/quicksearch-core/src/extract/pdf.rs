@@ -51,17 +51,19 @@ impl Extractor for PdfExtractor {
     /// has been measured holding tens of megabytes. Input and output are
     /// bounded by the limits, but the middle is `pdf_extract`'s with no
     /// scratch to reuse, so peak for PDFs alone is `workers × amplification`,
-    /// one pool per root.
+    /// one pool per root. Pages stop being rendered once the text reaches
+    /// `limits().text`.
     fn extract(
         &self,
         path: &Path,
         out: &mut String,
-        _scratch: &mut Scratch,
+        scratch: &mut Scratch,
     ) -> Result<(), ExtractError> {
+        let limit = scratch.limits().text;
         // Loading is inside the guard too: a panic outside it takes the thread.
         install_quiet_panic_hook();
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(true));
-        let result = std::panic::catch_unwind(|| extract_one_pass(path));
+        let result = std::panic::catch_unwind(|| extract_one_pass(path, limit));
         SUPPRESS_PANIC_PRINT.with(|flag| flag.set(false));
         let text = result
             .map_err(|panic| format!("pdf_extract panicked: {}", panic_message(&*panic)))??;
@@ -70,8 +72,36 @@ impl Extractor for PdfExtractor {
     }
 }
 
-/// `pdf_extract::extract_text`'s body (load, decrypt, `output_doc`) spelled out.
-fn extract_one_pass(path: &Path) -> Result<String, ExtractError> {
+/// The text sink, full at `limit` bytes. Once the text reaches what the
+/// caller keeps, the next write fails, which ends `output_doc` rather than
+/// rendering pages whose text would only be truncated away. Measured
+/// (`extractprobe`, text-only PDFs of 684 and ~340 pages at the default
+/// 256 KiB limit): 1.7 s → 0.8 s of CPU.
+struct Capped<'a> {
+    text: &'a mut String,
+    limit: usize,
+}
+
+impl std::fmt::Write for Capped<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if self.text.len() >= self.limit {
+            return Err(std::fmt::Error);
+        }
+        self.text.push_str(s);
+        Ok(())
+    }
+}
+
+impl pdf_extract::ConvertToFmt for Capped<'_> {
+    type Writer = Self;
+    fn convert(self) -> Self {
+        self
+    }
+}
+
+/// `pdf_extract::extract_text`'s body (load, decrypt, `output_doc`) spelled
+/// out, stopping once `limit` bytes of text are in.
+fn extract_one_pass(path: &Path, limit: usize) -> Result<String, ExtractError> {
     let mut doc = Document::load(path).map_err(|e| format!("pdf_extract: {}", e))?;
     // Empty-password decrypt only; nothing on this path can prompt for a real one.
     if doc.is_encrypted() {
@@ -79,11 +109,19 @@ fn extract_one_pass(path: &Path) -> Result<String, ExtractError> {
     }
 
     let mut text = String::new();
-    {
-        let mut sink = PlainTextOutput::new(&mut text);
-        pdf_extract::output_doc(&doc, &mut sink).map_err(|e| format!("pdf_extract: {}", e))?;
+    let rendered = {
+        let mut sink = PlainTextOutput::new(Capped {
+            text: &mut text,
+            limit,
+        });
+        pdf_extract::output_doc(&doc, &mut sink)
+    };
+    match rendered {
+        Ok(()) => Ok(text),
+        // The sink filled: the stop is ours, not a failure.
+        Err(_) if text.len() >= limit => Ok(text),
+        Err(e) => Err(format!("pdf_extract: {}", e)),
     }
-    Ok(text)
 }
 
 #[cfg(test)]
@@ -193,6 +231,72 @@ mod tests {
         let path = write_pdf("pdf-noinfo", "Body Only", None);
         let out = extract(&path).expect("extract");
         assert!(out.contains("Body Only"));
+    }
+
+    /// Rendering stops once the text limit is reached: a later page's text
+    /// is never produced, not produced and cut.
+    #[test]
+    fn extraction_stops_at_the_text_limit() {
+        let mut doc = Document::with_version("1.5");
+        let font = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let resources = doc.add_object(dictionary! {
+            "Font" => dictionary! { "F1" => font },
+        });
+        let pages_id = doc.new_object_id();
+        let kids: Vec<Object> = ["alphapage", "bravopage", "charliepage", "deltapage"]
+            .iter()
+            .map(|word| {
+                let content = format!("BT /F1 24 Tf 72 720 Td ({}) Tj ET", word);
+                let contents = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+                doc.add_object(dictionary! {
+                    "Type" => "Page",
+                    "Parent" => pages_id,
+                    "Contents" => contents,
+                    "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                })
+                .into()
+            })
+            .collect();
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Count" => kids.len() as i64,
+                "Kids" => kids,
+                "Resources" => resources,
+            }),
+        );
+        let catalog = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog);
+        let path = crate::testutil::scratch_dir("pdf-limit").join("pages.pdf");
+        doc.save(&path).expect("write fixture pdf");
+
+        let whole = extract(&path).expect("extract");
+        assert!(
+            whole.contains("deltapage"),
+            "every page renders: {:?}",
+            whole
+        );
+
+        let mut config = crate::config::Config::default();
+        config.processing.maximum_text_size = 12;
+        let mut out = String::new();
+        PdfExtractor
+            .extract(&path, &mut out, &mut Scratch::new(&config))
+            .expect("a stop at the limit is not a failure");
+        assert!(out.contains("alphapage"), "got {:?}", out);
+        assert!(
+            !out.contains("deltapage"),
+            "rendered past the limit: {:?}",
+            out
+        );
     }
 
     #[test]

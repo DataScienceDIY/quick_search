@@ -14,17 +14,19 @@ use crate::db::repo;
 /// with `slots[i]` saying where row `i`'s is, that it has none, or that its
 /// compression failed (kept per row rather than failing the batch).
 ///
-/// Everything here is reused across chunks: the encoder because a zstd
-/// context per chunk is wasted CPU (`benches/index.rs`, `zstd_encode`), the
-/// arena so the writer allocates nothing per document.
-struct Bodies {
+/// One per indexing run, reused by every batch and turn the writer takes: the
+/// encoder because a zstd context per chunk is wasted CPU (`benches/index.rs`,
+/// `zstd_encode`), the arena so the writer allocates nothing per document.
+/// Measured against one per writer turn (`indexprobe cold`, 10k docs of
+/// 9–20 KiB): VmHWM 60–65 → 44–50 MiB, CPU ~2% lower.
+pub struct Bodies {
     enc: repo::DocEncoder,
     arena: Vec<u8>,
     slots: Vec<Result<Option<std::ops::Range<usize>>, String>>,
 }
 
 impl Bodies {
-    fn new() -> Result<Bodies, String> {
+    pub fn new() -> Result<Bodies, String> {
         Ok(Bodies {
             enc: repo::DocEncoder::new()?,
             arena: Vec::new(),
@@ -34,14 +36,12 @@ impl Bodies {
 
     /// Compress one chunk's bodies before the caller takes the connection, so
     /// the lock covers only the SQL.
-    fn fill<'a>(&mut self, texts: impl Iterator<Item = Option<&'a str>>, config: &Config) {
+    fn fill<'a>(&mut self, texts: impl Iterator<Item = Option<&'a str>>) {
         self.arena.clear();
         self.slots.clear();
         for text in texts {
             let slot = match text {
-                Some(t) if config.processing.store_text_for_snippets && !t.is_empty() => {
-                    self.enc.encode_into(t, &mut self.arena).map(Some)
-                }
+                Some(t) if !t.is_empty() => self.enc.encode_into(t, &mut self.arena).map(Some),
                 _ => Ok(None),
             };
             self.slots.push(slot);
@@ -61,29 +61,25 @@ impl Bodies {
 /// The skeleton behind [`process_batch_updates`] and
 /// [`process_batch_inserts`]: compress each chunk's bodies outside the lock,
 /// write its rows in one transaction through `write_row`, and store any
-/// inline text on a fresh row.
-///
-/// `_fresh` is sound here because both row writers leave a row that provably
-/// holds no content: see their comments at the call sites.
+/// inline text on the row, which both row writers leave pending.
 fn write_prepared_records(
     conn_mutex: &Arc<Mutex<Connection>>,
     records: &[OwnedNewFile],
     stop_flag: &Arc<AtomicBool>,
     config: &Config,
+    bodies: &mut Bodies,
     write_row: impl Fn(&rusqlite::Transaction<'_>, &OwnedNewFile) -> Result<Option<i64>, String>,
 ) -> Result<(), String> {
     // `.max(1)`: `chunks(0)` panics on the indexing thread, so a hand-edited
     // `batch_size = 0` would wedge indexing while the UI reads "Running".
     let chunk_size = config.processing.batch_size.max(1);
-    // One set of buffers for every chunk this call writes.
-    let mut bodies = Bodies::new()?;
     for batch in records.chunks(chunk_size) {
         if stop_flag.load(Ordering::Relaxed) {
             return Ok(());
         }
 
         // Outside the lock; see `Bodies::fill`.
-        bodies.fill(batch.iter().map(|r| r.inline_text.as_deref()), config);
+        bodies.fill(batch.iter().map(|r| r.inline_text.as_deref()));
         let conn = crate::lock_ok(conn_mutex);
         let tx = conn
             .unchecked_transaction()
@@ -96,7 +92,9 @@ fn write_prepared_records(
             let id = write_row(&tx, rec)?;
             if let (Some(id), Some(text)) = (id, rec.inline_text.as_deref()) {
                 match bodies.get(i) {
-                    Ok(zstd) => repo::set_content_done_fresh(&tx, id, text, zstd)?,
+                    Ok(zstd) => {
+                        repo::store_pending_text(&tx, id, text, zstd)?;
+                    }
                     Err(e) => crate::log_warn!("compress text for {}: {}", rec.path(), e),
                 }
             }
@@ -117,19 +115,21 @@ pub fn process_batch_updates(
     files_to_update: &[OwnedNewFile],
     stop_flag: &Arc<AtomicBool>,
     config: &Config,
+    bodies: &mut Bodies,
 ) -> Result<(), String> {
     if files_to_update.is_empty() {
         return Ok(());
     }
 
-    // The row leaves this closure `_fresh`: `update_file_basic` cleared a
-    // DONE row's content in this same transaction, every other state
-    // provably holds none, and the insert fallback created the row outright.
+    // The row leaves this closure pending whenever it carries inline text:
+    // `update_file_basic` cleared a DONE row's content and reset its state
+    // in this same transaction, and the insert fallback created it pending.
     write_prepared_records(
         conn_mutex,
         files_to_update,
         stop_flag,
         config,
+        bodies,
         |tx, rec| {
             let updated = repo::update_file_basic(tx, &rec.as_new_file()).map_err(|e| {
                 format!(
@@ -162,18 +162,20 @@ pub fn process_batch_inserts(
     files_to_insert: &[OwnedNewFile],
     stop_flag: &Arc<AtomicBool>,
     config: &Config,
+    bodies: &mut Bodies,
 ) -> Result<(), String> {
     if files_to_insert.is_empty() {
         return Ok(());
     }
 
-    // The row leaves this closure `_fresh`: `insert_file` returned `Some`
-    // only by creating it, so it cannot carry content from anywhere.
+    // `insert_file` returned `Some` only by creating the row, pending when it
+    // needs content, so it cannot carry content from anywhere.
     write_prepared_records(
         conn_mutex,
         files_to_insert,
         stop_flag,
         config,
+        bodies,
         |tx, rec| {
             repo::insert_file(tx, &rec.as_new_file())
                 .map_err(|e| format!("Failed to insert file record: {}", e))
@@ -365,7 +367,8 @@ const STORE_CHUNK: usize = 32;
 pub struct Stored {
     /// Rows the caller must now drop from its buffer, written or not.
     pub consumed: usize,
-    /// Rows whose write succeeded, so whose `content_state` moved.
+    /// Rows whose write succeeded, so whose `content_state` moved; a row
+    /// no longer pending by the time it is written is consumed, not written.
     pub written: usize,
 }
 
@@ -379,12 +382,10 @@ pub fn store_extracted(
     conn_mutex: &Arc<Mutex<Connection>>,
     rows: &[crate::content::ExtractedRow],
     stop_flag: &Arc<AtomicBool>,
-    config: &Config,
     deadline: std::time::Instant,
+    bodies: &mut Bodies,
 ) -> Result<Stored, String> {
     let mut done = Stored::default();
-    // One set of buffers for every chunk this turn writes.
-    let mut bodies = Bodies::new()?;
     for chunk in rows.chunks(STORE_CHUNK) {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -394,7 +395,6 @@ pub fn store_extracted(
             chunk
                 .iter()
                 .map(|r| crate::file_handling::outcome_body(&r.outcome)),
-            config,
         );
         let conn = crate::lock_ok(conn_mutex);
         let tx = conn
@@ -406,8 +406,10 @@ pub fn store_extracted(
             done.consumed += 1;
             match bodies.get(i) {
                 Err(e) => crate::log_warn!("compress text for {}: {}", row.path(), e),
-                Ok(zstd) => match store_content_outcome(&tx, row.file_id, &row.outcome, zstd) {
-                    Ok(()) => done.written += 1,
+                Ok(zstd) => match repo::complete_pending(&tx, row.file_id, &row.outcome, zstd) {
+                    Ok(true) => done.written += 1,
+                    // No longer pending: stored or deleted since it was paged.
+                    Ok(false) => {}
                     Err(e) => crate::log_warn!("content indexing for {}: {}", row.path(), e),
                 },
             }
