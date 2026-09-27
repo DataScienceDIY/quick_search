@@ -240,7 +240,7 @@ pub static COMPACT_INDEX: Tip = Tip {
     body: "Builds the index of your files' text without recording where in \
            each file every word sits, which makes it several times smaller \
            and quicker to build.\n\n\
-           Searches find exactly the same files either way, this simply trades \ 
+           Searches find exactly the same files either way, this simply trades \
            reduced index size and faster indexing speed for slower searches. \
            Only the trigram tokenizer can use this feature. Other tokenizers always \
            record positions.",
