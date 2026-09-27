@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use rusqlite::Connection;
+use rusqlite::Transaction;
 
 use crate::config::{Config, IgnoreSet};
 use crate::db::repo;
@@ -40,19 +40,19 @@ impl Budget<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applied {
     Done,
-    /// Budget spent. What was written is committed; the caller should re-queue
-    /// the same event with `resume_from` set to `done`.
+    /// Budget spent. What was written stays written; the caller should
+    /// re-queue the same event with `resume_from` set to `done`.
     Unfinished {
         done: usize,
     },
 }
 
-/// Apply one filesystem event to the index. Missing files are treated as
-/// no-ops (the pending Remove event resolves them); unchanged mtimes
-/// short-circuit without touching the DB. See [`Budget`] for the one event
-/// that is not small.
+/// Apply one filesystem event to the index, inside the caller's transaction,
+/// which may hold many events. Missing files are treated as no-ops (the
+/// pending Remove event resolves them); unchanged mtimes short-circuit without
+/// touching the DB. See [`Budget`] for the one event that is not small.
 pub fn apply_fs_event(
-    conn: &mut Connection,
+    tx: &Transaction<'_>,
     event: &FsEvent,
     config: &Config,
     ignore: &IgnoreSet,
@@ -61,18 +61,18 @@ pub fn apply_fs_event(
 ) -> Result<Applied, String> {
     match event {
         FsEvent::Create(p) | FsEvent::Modify(p) => {
-            upsert_path(conn, p, config, ignore, registry, budget)
+            upsert_path(tx, p, config, ignore, registry, budget)
         }
-        FsEvent::Remove(p) => remove_path(conn, p).map(|()| Applied::Done),
+        FsEvent::Remove(p) => remove_paths(tx, std::slice::from_ref(p)).map(|()| Applied::Done),
         FsEvent::Rename { from, to } => {
-            remove_path(conn, from)?;
-            upsert_path(conn, to, config, ignore, registry, budget)
+            remove_paths(tx, std::slice::from_ref(from))?;
+            upsert_path(tx, to, config, ignore, registry, budget)
         }
     }
 }
 
 fn upsert_path(
-    conn: &mut Connection,
+    tx: &Transaction<'_>,
     path: &Path,
     config: &Config,
     ignore: &IgnoreSet,
@@ -127,17 +127,37 @@ fn upsert_path(
             if budget.spent() {
                 return Ok(Applied::Unfinished { done });
             }
-            upsert_file(conn, entry.path(), config, registry)?;
+            upsert_file(tx, entry.path(), config, registry)?;
             done += 1;
         }
         Ok(Applied::Done)
     } else {
-        upsert_file(conn, path, config, registry).map(|()| Applied::Done)
+        upsert_file(tx, path, config, registry).map(|()| Applied::Done)
+    }
+}
+
+/// Run `write` all or nothing inside the caller's transaction: a file whose
+/// writes fail part-way must not keep a row that claims text its posting
+/// never got.
+fn atomically(
+    tx: &Transaction<'_>,
+    write: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    tx.execute_batch("SAVEPOINT one_path")
+        .map_err(|e| format!("begin incremental savepoint: {}", e))?;
+    match write() {
+        Ok(()) => tx
+            .execute_batch("RELEASE one_path")
+            .map_err(|e| format!("release incremental savepoint: {}", e)),
+        Err(e) => {
+            let _ = tx.execute_batch("ROLLBACK TO one_path; RELEASE one_path");
+            Err(e)
+        }
     }
 }
 
 fn upsert_file(
-    conn: &mut Connection,
+    tx: &Transaction<'_>,
     path: &Path,
     config: &Config,
     registry: &Registry,
@@ -153,16 +173,12 @@ fn upsert_file(
         return Ok(());
     };
 
-    let tx = conn
-        .transaction()
-        .map_err(|e| format!("begin incremental tx: {}", e))?;
-
     // Settled before the file is opened, as the full walk settles it: an
     // unchanged file (a re-sent event, a `chmod`, the live view re-checking a
     // row it shows) costs one lookup, never a read and a hash. Measured
-    // (`benches/index.rs`, `unchanged_event`, 500 small text files): 3.3 ms
-    // hashing and sniffing each against 1.4 ms.
-    let stored = repo::mtime_for_path(&tx, &db_path)?;
+    // (`benches/index.rs`, `directory_event::unchanged`, 500 small text
+    // files): 3.3 ms hashing and sniffing each against 1.4 ms.
+    let stored = repo::mtime_for_path(tx, &db_path)?;
     if stored.is_some() && stored == mtime_secs(&meta) {
         return Ok(());
     }
@@ -171,67 +187,54 @@ fn upsert_file(
     let Some(rec) = prepare_file_record(&db_path, &meta, config, registry, &mut scratch) else {
         return Ok(());
     };
-    let written = match stored {
-        Some(_) => repo::update_file_basic(&tx, &rec.as_new_file())?,
-        None => repo::insert_file(&tx, &rec.as_new_file())?,
-    };
-    // `None`: lost a race with another writer; the row that won is current
-    // enough.
-    let Some(file_id) = written else {
-        return Ok(());
-    };
+    atomically(tx, || {
+        let written = match stored {
+            Some(_) => repo::update_file_basic(tx, &rec.as_new_file())?,
+            None => repo::insert_file(tx, &rec.as_new_file())?,
+        };
+        // `None`: lost a race with another writer; the row that won is
+        // current enough.
+        let Some(file_id) = written else {
+            return Ok(());
+        };
 
-    // A row that needs no content is already NA: both writers above set its
-    // state from `rec`. That gate is also the only size gate on this path:
-    // `decide_content` has none, and falling through would read a
-    // multi-gigabyte `.txt` whole into memory.
-    if rec.needs_content {
-        match rec.inline_text.as_deref() {
-            // `prepare_file_record` already read the whole file.
-            Some(text) => {
-                let zstd = repo::encode_one(text)?;
-                repo::store_pending_text(&tx, file_id, text, zstd.as_deref())?;
+        // A row that needs no content is already NA: both writers above set
+        // its state from `rec`. That gate is also the only size gate on this
+        // path: `decide_content` has none, and falling through would read a
+        // multi-gigabyte `.txt` whole into memory.
+        if rec.needs_content {
+            match rec.inline_text.as_deref() {
+                // `prepare_file_record` already read the whole file.
+                Some(text) => {
+                    let zstd = repo::encode_one(text)?;
+                    repo::store_pending_text(tx, file_id, text, zstd.as_deref())?;
+                }
+                None => extract_and_store(tx, file_id, rec.path(), rec.mime, registry, config)?,
             }
-            None => extract_and_store(&tx, file_id, rec.path(), rec.mime, registry, config)?,
         }
-    }
-
-    tx.commit()
-        .map_err(|e| format!("commit incremental tx: {}", e))
+        Ok(())
+    })
 }
 
-fn remove_path(conn: &mut Connection, path: &Path) -> Result<(), String> {
-    remove_paths(conn, std::slice::from_ref(&path.to_path_buf()), 1)
-}
-
-/// Delete `paths` and everything indexed beneath them, in transactions of at
-/// most `chunk` paths. Pays off only when the caller has reduced the set to
-/// its *roots*: then `rm -rf dir/` is a fixed handful of range-driven
-/// statements ([`repo::delete_subtree`]) rather than five per file.
-pub fn remove_paths(
-    conn: &mut Connection,
-    paths: &[std::path::PathBuf],
-    chunk: usize,
-) -> Result<(), String> {
-    for batch in paths.chunks(chunk.max(1)) {
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("begin incremental tx: {}", e))?;
-        for path in batch {
-            // A path the index cannot spell was never indexed, so there is
-            // nothing to delete; its lossy spelling names another file (see
-            // `path_to_db_string`), whose row and subtree this would delete.
-            if path.to_str().is_none() {
-                continue;
-            }
-            // The stored key is canonicalized, but the file is already gone,
-            // so `canonicalize` cannot run; `db_key_for_missing_path` approximates it.
-            let path_str = db_key_for_missing_path(path);
-            repo::delete_file_by_path(&tx, &path_str)?;
-            repo::delete_subtree(&tx, &RootRange::for_root(&path_str))?;
+/// Delete `paths` and everything indexed beneath them, inside the caller's
+/// transaction. Pays off only when the caller has reduced the set to its
+/// *roots*: then `rm -rf dir/` is a fixed handful of range-driven statements
+/// ([`repo::delete_subtree`]) rather than five per file.
+pub fn remove_paths(tx: &Transaction<'_>, paths: &[std::path::PathBuf]) -> Result<(), String> {
+    for path in paths {
+        // A path the index cannot spell was never indexed, so there is
+        // nothing to delete; its lossy spelling names another file (see
+        // `path_to_db_string`), whose row and subtree this would delete.
+        if path.to_str().is_none() {
+            continue;
         }
-        tx.commit()
-            .map_err(|e| format!("commit incremental tx: {}", e))?;
+        // The stored key is canonicalized, but the file is already gone, so
+        // `canonicalize` cannot run; `db_key_for_missing_path` approximates it.
+        let path_str = db_key_for_missing_path(path);
+        atomically(tx, || {
+            repo::delete_file_by_path(tx, &path_str)?;
+            repo::delete_subtree(tx, &RootRange::for_root(&path_str)).map(|_| ())
+        })?;
     }
     Ok(())
 }
@@ -240,7 +243,7 @@ pub fn remove_paths(
 mod tests {
     use super::*;
     use crate::db::open_or_recreate;
-    use rusqlite::OptionalExtension;
+    use rusqlite::{Connection, OptionalExtension};
     use std::time::Duration;
 
     struct Fixture {
@@ -281,8 +284,9 @@ mod tests {
         }
 
         fn apply_resuming(&mut self, event: &FsEvent, budget: Duration, from: usize) -> Applied {
-            apply_fs_event(
-                &mut self.conn,
+            let tx = self.conn.transaction().unwrap();
+            let applied = apply_fs_event(
+                &tx,
                 event,
                 &self.config,
                 &self.ignore,
@@ -293,7 +297,9 @@ mod tests {
                     resume_from: from,
                 },
             )
-            .unwrap()
+            .unwrap();
+            tx.commit().unwrap();
+            applied
         }
 
         fn write(&self, name: &str, content: &str) -> std::path::PathBuf {
@@ -429,7 +435,9 @@ mod tests {
         ];
         // Collapsed to its root, as the coordinator's `collapse_pending_removals` does.
         let roots = vec![reported[0].clone()];
-        remove_paths(&mut f.conn, &roots, 200).unwrap();
+        let tx = f.conn.transaction().unwrap();
+        remove_paths(&tx, &roots).unwrap();
+        tx.commit().unwrap();
         assert_eq!(f.counts(), (1, 1, 1), "only tree2 survives");
         let survivor = f.canonical(&f.dir.join("tree2").join("keep.txt"));
         assert!(f.row(&survivor).is_some());
@@ -690,8 +698,9 @@ mod tests {
         }
         std::fs::write(bad.join("inside.txt"), "body").unwrap();
 
+        let tx = f.conn.transaction().unwrap();
         let outcome = apply_fs_event(
-            &mut f.conn,
+            &tx,
             &FsEvent::Create(bad),
             &f.config,
             &f.ignore,
@@ -707,6 +716,7 @@ mod tests {
             Ok(Applied::Done),
             "an unindexable subtree is not a failure"
         );
+        tx.commit().unwrap();
         assert_eq!(f.counts().0, 0, "and nothing under it is indexed");
     }
 

@@ -72,12 +72,10 @@ impl Limits {
 pub struct Scratch {
     /// The head bytes a walk worker hashes and sniffs each file from.
     head: Vec<u8>,
-    /// One container member or one whole file, for a parser that will not
-    /// take a reader. Grows to the largest member the worker has met and
-    /// stays there, bounded by [`Limits::inflate`].
+    /// One whole file, for a parser that will not take a reader. Grows to
+    /// the largest file the worker has met and stays there.
     bytes: Vec<u8>,
-    /// quick-xml's per-event buffer. Separate from `bytes` because a
-    /// container walk holds both at once.
+    /// quick-xml's per-event buffer.
     events: Vec<u8>,
     /// XLSX's shared-string table. Cleared between files; the entries keep
     /// their capacity, which is most of what a table costs.
@@ -110,24 +108,22 @@ impl Scratch {
         &self.head
     }
 
-    /// The raw-bytes buffer: one container member, one OLE stream, or one
-    /// whole file for a format whose parser will not take a reader. The
-    /// caller clears it before filling.
+    /// The raw-bytes buffer: one whole file for a format whose parser will
+    /// not take a reader. The caller clears it before filling.
     pub(crate) fn bytes_mut(&mut self) -> &mut Vec<u8> {
         &mut self.bytes
     }
 
-    /// The member and event buffers together, which a container walk holds
-    /// at once; two `&mut self` accessors could not lend both.
-    pub(crate) fn container_bufs(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>) {
-        (&mut self.bytes, &mut self.events)
+    /// quick-xml's event buffer, for a container's XML members.
+    pub(crate) fn events(&mut self) -> &mut Vec<u8> {
+        &mut self.events
     }
 
-    /// The same pair plus the shared-string table, cleared, which XLSX needs
-    /// all at once.
-    pub(crate) fn xlsx_bufs(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>, &mut Vec<String>) {
+    /// The event buffer plus the shared-string table, cleared, which XLSX
+    /// needs at once; two `&mut self` accessors could not lend both.
+    pub(crate) fn xlsx_bufs(&mut self) -> (&mut Vec<u8>, &mut Vec<String>) {
         self.strings.clear();
-        (&mut self.bytes, &mut self.events, &mut self.strings)
+        (&mut self.events, &mut self.strings)
     }
 }
 

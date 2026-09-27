@@ -20,14 +20,11 @@
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::Instant;
 
 use quicksearch_core::config::{Config, IgnoreSet};
 use quicksearch_core::extract::Registry;
-use quicksearch_core::file_handling::{
-    classify_for_indexing, filtered_walk, prepare_file_record, DirRows, FileIndexAction,
-    UnreadableDirs,
-};
+use quicksearch_core::file_handling::{filtered_walk, prepare_file_record, UnreadableDirs};
 use quicksearch_core::walk::{walk_indexable_files, WalkEvent};
 
 fn main() {
@@ -42,11 +39,10 @@ fn main() {
     let _ = std::fs::remove_file(&db);
     quicksearch_core::db::open_or_recreate(db.to_str().unwrap(), &config.processing)
         .expect("scratch index");
-    let existing = DirRows::new();
 
     let start = Instant::now();
     let (seen, prepared) = match mode.as_str() {
-        "serial" => serial(&root, &config, &existing),
+        "serial" => serial(&root, &config),
         _ => parallel(&root, &config, db.to_str().unwrap()),
     };
     let _ = std::fs::remove_file(&db);
@@ -59,7 +55,8 @@ fn main() {
     );
 }
 
-fn serial(root: &str, config: &Config, existing: &DirRows) -> (usize, usize) {
+/// Against the same empty index, so every file is new and gets prepared.
+fn serial(root: &str, config: &Config) -> (usize, usize) {
     let ignore = IgnoreSet::compile(&[]).unwrap();
     let registry = Registry::default_set();
     // One for the whole walk, as a walk worker holds one.
@@ -74,21 +71,7 @@ fn serial(root: &str, config: &Config, existing: &DirRows) -> (usize, usize) {
         let Ok(meta) = std::fs::metadata(entry.path()) else {
             continue;
         };
-        let Some(mtime) = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-        else {
-            continue;
-        };
-        let name = std::path::Path::new(&path)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if classify_for_indexing(&name, mtime, existing) != FileIndexAction::Skip
-            && prepare_file_record(&path, &meta, config, &registry, &mut scratch).is_some()
-        {
+        if prepare_file_record(&path, &meta, config, &registry, &mut scratch).is_some() {
             prepared += 1;
         }
     }

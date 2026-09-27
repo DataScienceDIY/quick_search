@@ -17,7 +17,8 @@ pub(super) struct Queue {
     /// end-of-walk proof in [`Shared::take`].
     pub(super) prefetching: bool,
     /// What [`PREFETCH_AHEAD`] bounds. Not `jobs.len()`: that also counts
-    /// `Job::Files` chunks, which carry no rows and would starve prefetching.
+    /// `Job::Files` chunks, which hold no directory's rows and would starve
+    /// prefetching.
     pub(super) dirs_ready: usize,
     pub(super) active: usize,
     /// Canonical directories already queued: collapses overlapping roots,
@@ -173,8 +174,8 @@ pub(super) enum PrefetchWork {
 pub(super) enum Found {
     Dir(PathBuf),
     Alias(PathBuf),
-    /// Overflow files from the directory just read, which already has rows.
-    Files(Vec<PendingFile>, Arc<DirRows>),
+    /// Overflow files from the directory just read, each carrying its row.
+    Files(Vec<PendingFile>),
 }
 
 impl Shared {
@@ -192,7 +193,7 @@ impl Shared {
                     }
                 }
                 Found::Alias(path) => q.needs_alias.push(path),
-                Found::Files(files, rows) => q.jobs.push(Job::Files(files, rows)),
+                Found::Files(files) => q.jobs.push(Job::Files(files)),
             }
         }
         q.active -= 1;

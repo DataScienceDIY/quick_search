@@ -452,6 +452,8 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
         }
     }
     tx.commit().unwrap();
+    // As a finished run's maintenance leaves it.
+    crate::db::repo::build_hash_index(&conn).unwrap();
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
 }
 

@@ -8,9 +8,10 @@ const RUN_RETRY_BASE: Duration = Duration::from_secs(30);
 
 const RUN_RETRY_MAX: Duration = Duration::from_secs(300);
 
-/// The watcher's event queue and the two timers that decide when to apply
-/// it: once no event has arrived for `pending_settle`, or once the oldest
-/// has waited `pending_max_defer`, so a trickle cannot defer it forever.
+/// An event queue and the two timers that decide when to apply it: once no
+/// event has arrived for `pending_settle`, or once the oldest has waited
+/// `pending_max_defer`, so a trickle cannot defer it forever. One for the
+/// watcher's events, one for the paths a frontend is displaying.
 #[derive(Default)]
 pub(super) struct Debounced {
     pub(super) events: HashMap<PathBuf, FsEvent>,
@@ -107,6 +108,17 @@ impl Backoff {
     }
 }
 
+/// Whether `new` changes anything [`Inner::start_watcher`] registers with.
+/// Every other edit (theme, shortcut, search limits) keeps the running
+/// watcher: restarting it re-walks every directory under every root to
+/// re-register its watch, and misses whatever changes in the gap.
+pub(super) fn watch_inputs_differ(old: &Config, new: &Config) -> bool {
+    old.resolved_indexing_paths() != new.resolved_indexing_paths()
+        || old.indexing.include_hidden != new.indexing.include_hidden
+        || old.indexing.follow_symlinks != new.indexing.follow_symlinks
+        || old.indexing.ignore_patterns != new.indexing.ignore_patterns
+}
+
 /// Log a failed apply of `what` by the queue's policy: a targeted failure
 /// only logs, a pending one also schedules a full run. `true` for the latter.
 fn apply_failed(targeted: bool, what: &str, e: impl std::fmt::Display) -> bool {
@@ -149,7 +161,7 @@ pub(super) struct Inner {
     /// Paths a frontend asked for by name ([`IndexCoordinator::update_paths`]).
     /// Survives [`Inner::clear_pending`] and applies in manual mode: it keeps
     /// the rows a user is *reading* in step with the disk.
-    pub(super) targeted: HashMap<PathBuf, FsEvent>,
+    pub(super) targeted: Debounced,
     /// How far a directory event got before its turn's budget ran out.
     pub(super) resume_from: HashMap<PathBuf, usize>,
     pub(super) needs_full_run: bool,
@@ -163,7 +175,9 @@ pub(super) struct Inner {
     /// Set while a full run holds the database; cleared by the tick that sees
     /// it end.
     pub(super) run_in_flight: bool,
-    pub(super) files_at: Option<Instant>,
+    /// The published row count may be behind the database: set by anything
+    /// that could have written, cleared by [`Inner::refresh_file_count`].
+    pub(super) files_stale: bool,
     /// Drives [`Inner::go_idle`] once per busy→idle transition.
     pub(super) was_busy: bool,
     pub(super) write_conn: Option<Connection>,
@@ -207,13 +221,14 @@ impl Inner {
             CoordCmd::ConfigChanged(new) => {
                 let want_auto = new.indexing.auto_index;
                 let actions = diff_actions(&self.config, &new);
+                let rewatch = self.watcher.is_none() || watch_inputs_differ(&self.config, &new);
                 self.config = new;
                 if let Err(e) = self.reload_filters() {
                     crate::log_warn!("coordinator: {}", e);
                 }
                 // The write connection may point at an old database_path.
                 self.write_conn = None;
-                self.files_at = None;
+                self.files_stale = true;
                 if !actions.requires_rebuild && !actions.work.is_empty() {
                     self.start_work(actions.work);
                 }
@@ -221,7 +236,8 @@ impl Inner {
                     (true, false) => self.enter_auto(),
                     (false, true) => self.enter_manual_stopped(),
                     // Still automatic: the watcher follows the new config.
-                    (true, true) => self.start_watcher(),
+                    (true, true) if rewatch => self.start_watcher(),
+                    (true, true) => {}
                     (false, false) => {}
                 }
                 self.refresh_last_full_index();
@@ -229,7 +245,7 @@ impl Inner {
             CoordCmd::RebuildIndex => {
                 let db = self.db_path();
                 self.write_conn = None;
-                self.files_at = None;
+                self.files_stale = true;
                 self.pending_work = None;
                 self.reconcile_done = None;
                 if let Err(e) = self.indexing.delete_index_for_rebuild(&db) {
@@ -260,7 +276,7 @@ impl Inner {
                 shared.files = Some(0);
                 shared.root_counts = Arc::new(Vec::new());
                 drop(shared);
-                self.files_at = None;
+                self.files_stale = true;
             }
             CoordCmd::UpdatePaths(paths) => {
                 // Only paths under an indexed root: nothing downstream checks,
@@ -275,11 +291,8 @@ impl Inner {
                     let spelled = path.to_string_lossy();
                     prefixes.iter().any(|lo| spelled.starts_with(lo.as_str()))
                 };
-                paths
-                    .into_iter()
-                    .filter(under_root)
-                    .filter_map(verb_for)
-                    .for_each(|event| enqueue(&mut self.targeted, event));
+                self.targeted
+                    .push(paths.into_iter().filter(under_root).filter_map(verb_for));
                 self.was_busy = true;
             }
             CoordCmd::Shutdown => unreachable!("handled in run()"),
@@ -313,7 +326,7 @@ impl Inner {
                 self.defer_runs();
             }
             self.refresh_last_full_index();
-            self.files_at = None;
+            self.files_stale = true;
             if self.mode == IndexMode::ManualRunning {
                 self.mode = IndexMode::ManualStopped;
             }
@@ -321,8 +334,10 @@ impl Inner {
 
         self.refresh_file_count();
 
-        // Ahead of every gate: rows a user is looking at right now.
-        if !self.targeted.is_empty() {
+        // Ahead of every gate: rows a user is looking at right now. Settled
+        // like the watcher's queue, or a growing file on screen, re-sent on
+        // every live refresh, is re-read, hashed and re-indexed every tick.
+        if !self.targeted.events.is_empty() && self.targeted.settled(&self.watcher_config) {
             self.apply_targeted();
         }
 
@@ -369,6 +384,8 @@ impl Inner {
             return;
         }
         self.was_busy = false;
+        // Whatever made it busy may have added or removed rows.
+        self.files_stale = true;
         self.write_conn = None;
         crate::platform::release_free_heap();
     }
@@ -486,7 +503,7 @@ impl Inner {
         self.pending.clear();
         // Resume points for `targeted` survive: that queue outlives this call.
         self.resume_from
-            .retain(|p, _| self.targeted.contains_key(p));
+            .retain(|p, _| self.targeted.events.contains_key(p));
     }
 
     /// Apply as much of the queue as fits in [`APPLY_BUDGET`], removals first:
@@ -510,49 +527,64 @@ impl Inner {
         self.pending.after_partial_apply();
     }
 
-    /// Drain one queue's removals, then its upserts, within [`APPLY_BUDGET`].
-    /// `targeted` picks the queue and the failure policy: pending failures
-    /// escalate to [`Inner::needs_full_run`], targeted ones only log.
+    /// Drain one queue's removals, then its upserts, within [`APPLY_BUDGET`],
+    /// in one transaction. `targeted` picks the queue and the failure policy:
+    /// pending failures escalate to [`Inner::needs_full_run`], targeted ones
+    /// only log. Measured against a transaction per file (`benches/index.rs`,
+    /// `directory_event`, one event over 500 small text files): 250 →
+    /// 88 ms with every file changed, 1.55 → 1.09 ms with none.
     fn apply_queue(&mut self, conn: &mut Connection, targeted: bool) {
         let deadline = Instant::now() + APPLY_BUDGET;
         let chunk = self.config.processing.batch_size.max(1);
+        let tx = match conn.transaction() {
+            Ok(tx) => tx,
+            Err(e) => {
+                self.needs_full_run |= apply_failed(targeted, "begin", e);
+                return;
+            }
+        };
         let queue = if targeted {
-            &mut self.targeted
+            &mut self.targeted.events
         } else {
             &mut self.pending.events
         };
 
-        let removals: Vec<PathBuf> = queue
-            .iter()
-            .filter(|(_, ev)| is_removal(ev))
-            .map(|(p, _)| p.clone())
-            .collect();
+        // Moved out, not cloned: what the budget leaves goes back below, so a
+        // storm's queue is not copied whole on every slice, and the map it
+        // leaves behind holds only what is left. Measured (200k targeted
+        // removals): drained in 10.0 → 9.1 s, peak RSS 85 → 81 MB.
+        let (mut removals, mut upserts) = (Vec::new(), Vec::new());
+        for (path, ev) in std::mem::take(queue) {
+            if is_removal(&ev) {
+                removals.push(path);
+            } else {
+                upserts.push((path, ev));
+            }
+        }
+
+        let mut removed = 0;
         for batch in removals.chunks(chunk) {
-            if let Err(e) = crate::incremental::remove_paths(conn, batch, chunk) {
+            if let Err(e) = crate::incremental::remove_paths(&tx, batch) {
                 // The batch leaves the queue either way: retrying a failed
                 // write every tick is worse, and the full run recovers the rows.
                 self.needs_full_run |= apply_failed(targeted, "remove", e);
             }
-            for path in batch {
-                queue.remove(path);
-            }
+            removed += batch.len();
             if Instant::now() >= deadline {
                 break;
             }
         }
+        queue.extend(
+            removals
+                .drain(removed..)
+                .map(|path| (path.clone(), FsEvent::Remove(path))),
+        );
 
+        let mut upserts = upserts.into_iter();
         if Instant::now() < deadline {
-            let upserts: Vec<PathBuf> = queue
-                .iter()
-                .filter(|(_, ev)| !is_removal(ev))
-                .map(|(p, _)| p.clone())
-                .collect();
-            for path in upserts {
-                let Some(ev) = queue.remove(&path) else {
-                    continue;
-                };
+            for (path, ev) in upserts.by_ref() {
                 match apply_fs_event(
-                    conn,
+                    &tx,
                     &ev,
                     &self.config,
                     &self.ignore,
@@ -582,6 +614,10 @@ impl Inner {
                 }
             }
         }
+        queue.extend(upserts);
+        if let Err(e) = tx.commit() {
+            self.needs_full_run |= apply_failed(targeted, "commit", e);
+        }
     }
 
     /// Apply the by-name queue: the paths a frontend is displaying. Never
@@ -603,6 +639,7 @@ impl Inner {
         };
         self.apply_queue(&mut conn, true);
         self.write_conn = Some(conn);
+        self.targeted.after_partial_apply();
     }
 
     fn ensure_write_conn(&mut self) -> Result<Connection, String> {
@@ -684,8 +721,9 @@ impl Inner {
         // target (`aliased_paths`), and those rows would leak until a rebuild.
         self.pending.keep_removals();
         // A stale resume point would `skip` entries of an unrelated walk.
-        self.resume_from
-            .retain(|p, _| self.pending.events.contains_key(p) || self.targeted.contains_key(p));
+        self.resume_from.retain(|p, _| {
+            self.pending.events.contains_key(p) || self.targeted.events.contains_key(p)
+        });
         if let Err(e) = self
             .indexing
             .start_indexing(roots, self.db_path(), self.config.clone())
@@ -864,8 +902,16 @@ impl Inner {
         self.set_watcher_status(WatcherStatus::Off);
     }
 
+    /// Publish `status`, waking the frontend when it changed: registration
+    /// can finish minutes after startup with no input to repaint on, and a
+    /// frontend polling for it would repaint the whole time.
     fn set_watcher_status(&self, status: WatcherStatus) {
-        crate::lock_ok(&self.shared).watcher = status;
+        let mut shared = crate::lock_ok(&self.shared);
+        if shared.watcher != status {
+            shared.watcher = status;
+            drop(shared);
+            (self.notify)();
+        }
     }
 
     fn db_path(&self) -> String {
@@ -883,20 +929,18 @@ impl Inner {
         Ok(())
     }
 
-    /// Re-read the published row count, at most every [`FILE_COUNT_INTERVAL`].
+    /// Re-read the published row count once something may have changed it.
     /// Called only from the idle half of [`Inner::tick`], so it cannot run
     /// while a full run holds the database; `COUNT(*)` is still a key scan,
-    /// hence the interval and the interrupt guard.
+    /// hence the interrupt guard. It used to run every 30 s whatever the
+    /// mode, opening a connection each time to recount an unchanged index.
     fn refresh_file_count(&mut self) {
-        if self
-            .files_at
-            .is_some_and(|at| at.elapsed() < FILE_COUNT_INTERVAL)
-        {
+        if !self.files_stale {
             return;
         }
-        // Stamped before the read: a failing count must back off like a
-        // successful one, or a missing index means an open attempt every tick.
-        self.files_at = Some(Instant::now());
+        // Cleared before the read: a failing count must not retry every
+        // tick, or a missing index means an open attempt every second.
+        self.files_stale = false;
 
         let Ok(conn) = db::open_existing(&self.db_path(), false) else {
             return;
@@ -962,7 +1006,7 @@ impl Inner {
         let busy = reconcile.is_some() || self.indexing.is_active();
         let mut shared = crate::lock_ok(&self.shared);
         shared.mode = self.mode;
-        shared.queued_events = self.pending.events.len() + self.targeted.len();
+        shared.queued_events = self.pending.events.len() + self.targeted.events.len();
         shared.reconcile = reconcile;
         drop(shared);
 

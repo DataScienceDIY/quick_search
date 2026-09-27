@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use lofty::{
+    config::ParseOptions,
     file::TaggedFileExt,
     probe::Probe,
     tag::{Accessor, ItemKey},
@@ -24,8 +25,14 @@ impl Extractor for AudioExtractor {
         out: &mut String,
         _scratch: &mut Scratch,
     ) -> Result<(), ExtractError> {
+        // Tags only: the audio properties (duration, bitrate) cost a seek to
+        // the end and, in an MP3 without a Xing header, a frame-sync search
+        // back from it, and fail a file whose audio is cut short. Measured
+        // (`extractprobe`, 18 generated 3-minute MP3s and 40 Ogg sounds):
+        // `lseek` + `read` calls 2,567 → 790, cached throughput 1.4–2.3x.
         let tagged = Probe::open(path)
             .map_err(|e| format!("lofty probe {}: {}", path.display(), e))?
+            .options(ParseOptions::new().read_properties(false))
             .read()
             .map_err(|e| format!("lofty read {}: {}", path.display(), e))?;
 
@@ -123,6 +130,17 @@ mod tests {
         );
         let out = extract(&path).expect("extract");
         assert_eq!(out, "Blue Monday New Order Power Corruption Synthpop");
+    }
+
+    /// A download cut short keeps its tag: the audio after it is never read.
+    #[test]
+    fn a_truncated_stream_still_yields_its_tags() {
+        let path = write_mp3("audio-truncated", &[("TIT2", "Half Written")]);
+        let bytes = std::fs::read(&path).unwrap();
+        // The tag, the first frame's header and a few bytes of its body.
+        let tag_end = bytes.len() - 4 * 417;
+        std::fs::write(&path, &bytes[..tag_end + 10]).unwrap();
+        assert_eq!(extract(&path).expect("extract"), "Half Written");
     }
 
     #[test]

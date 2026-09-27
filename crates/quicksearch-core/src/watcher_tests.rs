@@ -18,19 +18,11 @@ fn default_filters() -> WatchFilters {
     }
 }
 
-fn fast_config() -> WatcherConfig {
-    WatcherConfig {
-        throttle_window: Duration::from_millis(50),
-        tick_interval: Duration::from_millis(20),
-        ..WatcherConfig::default()
-    }
-}
-
-/// [`fast_config`] with a directory budget of `n`.
+/// The default config with a directory budget of `n`.
 fn capped(n: usize) -> WatcherConfig {
     WatcherConfig {
         max_watched_dirs: n,
-        ..fast_config()
+        ..WatcherConfig::default()
     }
 }
 
@@ -39,9 +31,9 @@ fn watch_with(dir: &Path, config: WatcherConfig, sink: EventSink) -> Result<Watc
     Watcher::start(vec![dir.to_path_buf()], default_filters(), config, sink)
 }
 
-/// [`watch_with`] at the fast defaults, into a sink nobody reads.
+/// [`watch_with`] at the defaults, into a sink nobody reads.
 fn watch(dir: &Path) -> Watcher {
-    watch_with(dir, fast_config(), sink_to_vec().0).unwrap()
+    watch_with(dir, WatcherConfig::default(), sink_to_vec().0).unwrap()
 }
 
 /// Seeds `dirs` directly so set logic is tested without real kernel watches.
@@ -72,88 +64,44 @@ fn remove_tree_skips_the_scan_for_a_path_that_is_not_watched() {
     );
 }
 
+/// Nothing holds an event back: a directory's second change reaches the
+/// sink as promptly as its first. A per-directory throttle once held it for
+/// 30 s; the coordinator's queue does the debouncing now.
 #[test]
-fn enqueue_create_then_remove_cancels() {
-    let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-    let p = PathBuf::from("/tmp/a.txt");
-    enqueue(&mut map, p.clone(), QueuedOp::Create);
-    enqueue(&mut map, p.clone(), QueuedOp::Remove);
-    let entry = map.get(p.parent().unwrap()).unwrap();
-    assert!(entry.queue.is_empty(), "Create then Remove should cancel");
-}
-
-#[test]
-fn modify_after_modify_is_one() {
-    let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-    let p = PathBuf::from("/tmp/a.txt");
-    enqueue(&mut map, p.clone(), QueuedOp::Modify);
-    enqueue(&mut map, p.clone(), QueuedOp::Modify);
-    let entry = map.get(p.parent().unwrap()).unwrap();
-    assert_eq!(entry.queue.len(), 1);
-}
-
-#[test]
-fn flush_ready_leading_edge_fires_immediately() {
-    let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-    enqueue(&mut map, PathBuf::from("/tmp/a.txt"), QueuedOp::Create);
+fn every_event_reaches_the_sink_as_it_happens() {
+    let dir = crate::testutil::scratch_dir("prompt");
     let (sink, got) = sink_to_vec();
-    let config = WatcherConfig::default();
-    flush_ready(&mut map, &sink, &config);
-    let got = got.lock().unwrap();
-    assert_eq!(got.len(), 1);
-    assert!(matches!(got[0], FsEvent::Create(_)));
-}
+    let mut w = watch_with(&dir, WatcherConfig::default(), sink).unwrap();
 
-#[test]
-fn flush_ready_respects_max_dirs_per_tick() {
-    let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-    for i in 0..10 {
-        enqueue(
-            &mut map,
-            PathBuf::from(format!("/dir{}/a", i)),
-            QueuedOp::Create,
-        );
-    }
-    let (sink, got) = sink_to_vec();
-    let config = WatcherConfig {
-        max_dirs_per_tick: 3,
-        ..WatcherConfig::default()
+    let seen = |name: &str| {
+        let path = dir.join(name);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let found = got
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, FsEvent::Create(p) | FsEvent::Modify(p) if p == &path));
+            if found {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
     };
-    flush_ready(&mut map, &sink, &config);
-    // Each dir contributes one event because each entry has one path.
-    assert_eq!(got.lock().unwrap().len(), 3);
-}
-
-#[test]
-fn prune_stale_drops_empty_old_entries() {
-    let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-    map.insert(
-        PathBuf::from("/tmp"),
-        DirThrottleEntry {
-            record_time: Instant::now() - Duration::from_secs(3600),
-            queue: HashMap::new(),
-            immediate: false,
-        },
+    std::fs::write(dir.join("first.txt"), "a").unwrap();
+    assert!(seen("first.txt"));
+    let second = std::time::Instant::now();
+    std::fs::write(dir.join("second.txt"), "b").unwrap();
+    assert!(seen("second.txt"));
+    assert!(
+        second.elapsed() < Duration::from_secs(2),
+        "the second event in a directory took {:?}",
+        second.elapsed()
     );
-    prune_stale(&mut map, Duration::from_secs(1));
-    assert!(map.is_empty());
-}
 
-#[test]
-fn prune_stale_keeps_active_entries() {
-    let mut map: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-    let mut queue = HashMap::new();
-    queue.insert(PathBuf::from("/tmp/a"), QueuedOp::Modify);
-    map.insert(
-        PathBuf::from("/tmp"),
-        DirThrottleEntry {
-            record_time: Instant::now() - Duration::from_secs(3600),
-            queue,
-            immediate: false,
-        },
-    );
-    prune_stale(&mut map, Duration::from_secs(1));
-    assert_eq!(map.len(), 1);
+    w.stop();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -161,7 +109,7 @@ fn e2e_create_modify_remove_surfaces() {
     let dir = crate::testutil::scratch_dir("e2e");
     let (sink, got) = sink_to_vec();
 
-    let mut w = watch_with(&dir, fast_config(), sink).unwrap();
+    let mut w = watch_with(&dir, WatcherConfig::default(), sink).unwrap();
 
     let f = dir.join("hello.txt");
     std::fs::write(&f, "hi").unwrap();
@@ -200,7 +148,7 @@ fn events_for_an_unrepresentable_name_never_surface() {
     std::fs::remove_file(&bad).unwrap();
 
     let (sink, got) = sink_to_vec();
-    let mut w = watch_with(&dir, fast_config(), sink).unwrap();
+    let mut w = watch_with(&dir, WatcherConfig::default(), sink).unwrap();
 
     std::fs::write(&bad, "hi").unwrap();
     std::thread::sleep(Duration::from_millis(150));
@@ -270,7 +218,13 @@ fn include_hidden_registers_dotted_dirs() {
         include_hidden: true,
         ..default_filters()
     };
-    let w = Watcher::start(vec![dir.clone()], filters, fast_config(), sink_to_vec().0).unwrap();
+    let w = Watcher::start(
+        vec![dir.clone()],
+        filters,
+        WatcherConfig::default(),
+        sink_to_vec().0,
+    )
+    .unwrap();
 
     assert_eq!(w.watched_dirs(), 2, "root + .hidden");
     drop(w);
@@ -303,7 +257,7 @@ fn an_unreadable_directory_is_skipped_not_fatal() {
     std::fs::create_dir_all(&locked).unwrap();
     crate::platform::deny_read(&locked).unwrap();
 
-    let started = watch_with(&dir, fast_config(), sink_to_vec().0);
+    let started = watch_with(&dir, WatcherConfig::default(), sink_to_vec().0);
     crate::platform::restore_read(&locked).ok();
     let w = started.expect("an unreadable directory must not fail the watcher");
 
@@ -351,7 +305,7 @@ fn a_tree_inside_the_cap_registers() {
 fn a_directory_created_after_start_is_watched() {
     let dir = crate::testutil::scratch_dir("newdir");
     let (sink, got) = sink_to_vec();
-    let mut w = watch_with(&dir, fast_config(), sink).unwrap();
+    let mut w = watch_with(&dir, WatcherConfig::default(), sink).unwrap();
     assert_eq!(w.watched_dirs(), 1, "only the root to begin with");
 
     let sub = dir.join("later");

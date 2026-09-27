@@ -224,29 +224,18 @@ fn a_compressed_body_carries_its_uncompressed_length() {
     }
 }
 
-/// Several rows into one arena, as the writer does. `zstd`'s `WriteBuf` for
-/// `Vec` writes from offset zero and sets the length, so compressing straight
-/// into a shared arena would overwrite the previous row. Each body must come
-/// back byte-identical out of its own range.
+/// Several rows through one encoder, as the writer does: each body must come
+/// back byte-identical from the slice handed out for it, whatever the size
+/// of the rows before it, and an empty body gets none.
 #[test]
-fn an_arena_keeps_every_row_it_is_given() {
+fn one_encoder_serves_every_row_it_is_given() {
     let mut enc = DocEncoder::new().unwrap();
-    let bodies = [
-        "the first document",
-        "",
-        "a considerably longer second document ".repeat(512).as_str(),
-        "third",
-    ]
-    .map(str::to_string);
-
-    let mut arena = Vec::new();
-    let mut ranges = Vec::new();
-    for text in &bodies {
-        ranges.push(enc.encode_into(text, &mut arena).unwrap());
-    }
-
-    for (text, at) in bodies.iter().zip(&ranges) {
-        let blob = &arena[at.clone()];
+    let long = "a considerably longer second document ".repeat(512);
+    for text in ["the first document", "", long.as_str(), "third"] {
+        let Some(blob) = enc.body(text).unwrap() else {
+            assert!(text.is_empty(), "only an empty body has no blob");
+            continue;
+        };
         assert_eq!(
             raw_text_len(blob),
             Some(text.len() as u64),
@@ -254,28 +243,10 @@ fn an_arena_keeps_every_row_it_is_given() {
         );
         assert_eq!(
             DocDecoder::new().unwrap().decode(blob),
-            Some(text.as_str()),
-            "a row did not survive sharing the arena"
+            Some(text),
+            "a row did not survive the reused buffer"
         );
     }
-
-    // The ranges tile the arena in order: a gap or an overlap means one row
-    // landed on another.
-    let mut next = 0;
-    for at in &ranges {
-        assert_eq!(at.start, next, "rows must be contiguous");
-        next = at.end;
-    }
-    assert_eq!(next, arena.len(), "the arena holds exactly the four bodies");
-
-    // Reuse: a second batch must not read the first one's bytes.
-    arena.clear();
-    let at = enc.encode_into("a fresh batch", &mut arena).unwrap();
-    assert_eq!(at.start, 0);
-    assert_eq!(
-        DocDecoder::new().unwrap().decode(&arena[at]),
-        Some("a fresh batch")
-    );
 }
 
 #[test]

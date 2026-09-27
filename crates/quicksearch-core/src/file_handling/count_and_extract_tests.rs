@@ -235,8 +235,7 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
         &conn_mutex,
         &records,
         &stop,
-        &config,
-        &mut Bodies::new().unwrap(),
+        &mut crate::db::repo::DocEncoder::new().unwrap(),
     )
     .unwrap();
 

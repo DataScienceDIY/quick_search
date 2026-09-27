@@ -12,7 +12,6 @@ use regex::{Regex, RegexBuilder};
 
 use super::translator::TranslateError;
 use crate::search::prefilter::Required;
-use crate::snippet;
 
 /// Keeps a hostile pattern (`a{1000000}{1000}`) from ballooning the program.
 const REGEX_SIZE_LIMIT: usize = 4 << 20;
@@ -78,6 +77,21 @@ impl WildcardPattern {
         } else {
             &self.anchored_cs
         }
+    }
+
+    /// Non-overlapping occurrences in `text`, stopping at 1000 where the
+    /// cascade's `count_frac` saturates, and the first of them, in one sweep.
+    pub fn count_and_first(
+        &self,
+        text: &str,
+        case_insensitive: bool,
+    ) -> (usize, Option<Range<usize>>) {
+        let mut found = self
+            .search(case_insensitive)
+            .find_iter(text)
+            .take(COUNT_CAP);
+        let first = found.next().map(|m| m.range());
+        (first.as_ref().map_or(0, |_| 1 + found.count()), first)
     }
 }
 
@@ -246,38 +260,6 @@ impl TermPattern {
             TermPattern::Wildcard(w) => w.search(case_insensitive).find(text).map(|m| m.range()),
         }
     }
-
-    /// [`TermPattern::find_first`], case-insensitive, on a pre-folded haystack.
-    pub fn find_first_folded(&self, folded: &str) -> Option<Range<usize>> {
-        match self {
-            TermPattern::Empty => None,
-            TermPattern::Literal(l) => {
-                let pos = folded.find(&l.folded)?;
-                Some(pos..pos + l.text.len())
-            }
-            TermPattern::Wildcard(w) => w.search_ci.find(folded).map(|m| m.range()),
-        }
-    }
-
-    /// Case-insensitive [`TermPattern::count`] against an already-folded haystack.
-    pub fn count_folded(&self, folded: &str) -> usize {
-        match self {
-            TermPattern::Empty => 0,
-            TermPattern::Literal(l) => snippet::count_occurrences(folded, &l.folded),
-            TermPattern::Wildcard(w) => w.search_ci.find_iter(folded).take(COUNT_CAP).count(),
-        }
-    }
-
-    /// Case-sensitive, non-overlapping occurrence count; the case-insensitive
-    /// one is [`TermPattern::count_folded`]. Wildcards stop at 1000, where the
-    /// cascade's `count_frac` saturates anyway.
-    pub fn count(&self, text: &str) -> usize {
-        match self {
-            TermPattern::Empty => 0,
-            TermPattern::Literal(l) => snippet::count_occurrences(text, &l.text),
-            TermPattern::Wildcard(w) => w.search_cs.find_iter(text).take(COUNT_CAP).count(),
-        }
-    }
 }
 
 /// A compiled `regex:` query. Case-insensitive by default (override with
@@ -369,9 +351,13 @@ impl RegexQuery {
         self.re.find(text).map(|m| m.range())
     }
 
-    /// Non-overlapping occurrence count, capped at 1000.
-    pub fn count(&self, text: &str) -> usize {
-        self.re.find_iter(text).take(COUNT_CAP).count()
+    /// Non-overlapping occurrences, capped at 1000, and the first of them,
+    /// in one sweep. Against a count and then a second search for the first
+    /// (`searchtime`, cargo registry): within noise to 3% faster.
+    pub fn count_and_first(&self, text: &str) -> (usize, Option<Range<usize>>) {
+        let mut found = self.re.find_iter(text).take(COUNT_CAP);
+        let first = found.next().map(|m| m.range());
+        (first.as_ref().map_or(0, |_| 1 + found.count()), first)
     }
 }
 
@@ -425,7 +411,6 @@ mod tests {
             assert!(p.is_empty(), "{:?}", parts);
             assert!(!p.whole_match("anything", true));
             assert!(p.find_first("anything", true).is_none());
-            assert_eq!(p.count("anything"), 0);
         }
     }
 
@@ -512,10 +497,14 @@ mod tests {
 
     #[test]
     fn count_is_nonoverlapping_and_capped() {
-        let p = TermPattern::build(&[part("a*b", true)]).unwrap();
-        assert_eq!(p.count("ab ab ab"), 3);
+        let TermPattern::Wildcard(w) = TermPattern::build(&[part("a*b", true)]).unwrap() else {
+            panic!("a star makes a wildcard");
+        };
+        assert_eq!(w.count_and_first("xx ab ab ab", false), (3, Some(3..5)));
         let many = "ab ".repeat(2000);
-        assert_eq!(p.count(&many), 1000);
+        assert_eq!(w.count_and_first(&many, false).0, 1000);
+        assert_eq!(w.count_and_first("AB aB", false), (0, None), "exact case");
+        assert_eq!(w.count_and_first("AB aB", true), (2, Some(0..2)));
     }
 
     #[test]
@@ -527,8 +516,6 @@ mod tests {
         assert_eq!(p.find_first("my Report.pdf", false), Some(3..9));
         assert_eq!(p.find_first("my report.pdf", true), Some(3..9));
         assert_eq!(p.find_first("my report.pdf", false), None);
-        assert_eq!(p.count("report Report"), 1);
-        assert_eq!(p.count_folded("report report"), 2);
     }
 
     #[test]
@@ -585,7 +572,8 @@ mod tests {
         let r = RegexQuery::new("b[aeiou]d").unwrap();
         let hay = "bad bed bodkin";
         assert_eq!(r.find_first(hay), Some(0..3));
-        assert_eq!(r.count(hay), 3);
+        assert_eq!(r.count_and_first(hay), (3, Some(0..3)));
+        assert_eq!(r.count_and_first("nothing here"), (0, None));
     }
 
     #[test]

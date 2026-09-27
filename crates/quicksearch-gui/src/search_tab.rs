@@ -568,7 +568,6 @@ impl SearchTab {
             return;
         }
         match update {
-            SearchUpdate::Started { .. } => {}
             SearchUpdate::Hits { hits, .. } => {
                 // An empty batch is not a result; the cascade never sends one,
                 // but the event is public and this is what it would mean.

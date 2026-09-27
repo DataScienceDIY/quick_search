@@ -350,12 +350,10 @@ fn stopping_cancels_a_queued_walk_but_not_a_queued_prune() {
     coord.shutdown();
 }
 
-/// Short debounce windows so trailing-edge events flush within test
-/// timeouts (production defaults are 30 s / 2 s).
+/// Short debounce windows so trailing-edge events apply within test
+/// timeouts (production defaults are 2 s / 30 s).
 fn fast_watcher() -> WatcherConfig {
     WatcherConfig {
-        throttle_window: Duration::from_millis(300),
-        tick_interval: Duration::from_millis(100),
         pending_settle: Duration::from_millis(200),
         pending_max_defer: Duration::from_secs(3),
         ..WatcherConfig::default()
@@ -473,6 +471,38 @@ fn update_paths_indexes_one_file_with_indexing_stopped() {
     coord.shutdown();
 }
 
+/// A path re-sent on every live refresh, as a growing file on screen is,
+/// waits for the queue to settle instead of being re-indexed every tick.
+#[test]
+fn update_paths_waits_for_the_queue_to_settle() {
+    let f = Fixture::new(false);
+    std::fs::write(f.dir.join("seed.txt"), "initial content").unwrap();
+    f.seed_index();
+    let settle = WatcherConfig {
+        pending_settle: Duration::from_secs(1),
+        pending_max_defer: Duration::from_secs(20),
+        ..WatcherConfig::default()
+    };
+    let coord = start_coord_watching(f.config.clone(), settle);
+    let added = f.dir.join("growing.log");
+    std::fs::write(&added, "first line").unwrap();
+
+    let spam_until = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < spam_until {
+        coord.update_paths(vec![added.clone()]);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        f.stored_mtime(&added),
+        None,
+        "applied while the path was still being re-sent"
+    );
+    wait_for("the settled insert", Duration::from_secs(20), || {
+        f.stored_mtime(&added).is_some()
+    });
+    coord.shutdown();
+}
+
 #[test]
 fn update_paths_leaves_a_row_that_already_agrees_alone() {
     let f = Fixture::new(false);
@@ -579,6 +609,38 @@ fn auto_mode_runs_initial_index_and_applies_watcher_events() {
         f.file_count() == 1
     });
 
+    coord.shutdown();
+}
+
+/// The published count follows the coordinator's own writes, and an idle
+/// coordinator does not go back to recount: a row slipped in behind its back
+/// stays unreported until something it does changes the index.
+#[test]
+fn the_file_count_is_refreshed_by_writes_not_by_time() {
+    let f = Fixture::new(true);
+    std::fs::write(f.dir.join("seed.txt"), "initial content").unwrap();
+    let coord = start_coord_watching(f.config.clone(), fast_watcher());
+    wait_for("initial auto index", Duration::from_secs(20), || {
+        coord.state().files == Some(1)
+    });
+
+    std::fs::write(f.dir.join("later.txt"), "arrived later").unwrap();
+    wait_for(
+        "the count to follow an incremental add",
+        Duration::from_secs(20),
+        || coord.state().files == Some(2),
+    );
+
+    let conn = db::open_existing(&f.db.to_string_lossy(), true).unwrap();
+    conn.execute(
+        "INSERT INTO files (name, parent, size, mtime, type, content_state)
+         VALUES ('ghost.txt', '/nowhere/', 0, 0, 0, 3)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(coord.state().files, Some(2), "an idle tick recounted");
     coord.shutdown();
 }
 
@@ -880,6 +942,33 @@ fn an_unreadable_path_is_not_treated_as_deleted() {
         let _ = crate::platform::restore_read(&locked);
     }
     std::fs::remove_file(&present).ok();
+}
+
+/// Only what the watcher registers with restarts it; a theme or search
+/// setting must leave a large tree's watches alone.
+#[test]
+fn only_watch_inputs_restart_the_watcher() {
+    let old = Config::default();
+    let differs = |edit: fn(&mut Config)| {
+        let mut new = old.clone();
+        edit(&mut new);
+        inner::watch_inputs_differ(&old, &new)
+    };
+    assert!(!differs(|_| {}));
+    assert!(!differs(|c| c.search.debounce_ms += 100));
+    assert!(!differs(|c| c.processing.batch_size += 1));
+    assert!(!differs(|c| c.indexing.reindex_interval_minutes += 1));
+    assert!(differs(|c| c
+        .paths
+        .indexing_paths
+        .push("/elsewhere".into())));
+    assert!(differs(
+        |c| c.indexing.include_hidden = !c.indexing.include_hidden
+    ));
+    assert!(differs(
+        |c| c.indexing.follow_symlinks = !c.indexing.follow_symlinks
+    ));
+    assert!(differs(|c| c.indexing.ignore_patterns.push("*.tmp".into())));
 }
 
 #[test]

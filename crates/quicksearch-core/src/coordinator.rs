@@ -43,8 +43,6 @@ use inner::Inner;
 /// Pending-event ceiling; beyond this a full run is cheaper than replay.
 const PENDING_OVERFLOW: usize = 100_000;
 
-const FILE_COUNT_INTERVAL: Duration = Duration::from_secs(30);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexMode {
     Auto,
@@ -211,7 +209,7 @@ impl IndexCoordinator {
             watcher_rx: None,
             watcher_gen: 0,
             pending: inner::Debounced::default(),
-            targeted: HashMap::new(),
+            targeted: inner::Debounced::default(),
             resume_from: HashMap::new(),
             needs_full_run: false,
             run_retry: inner::Backoff::default(),
@@ -219,7 +217,7 @@ impl IndexCoordinator {
             reconcile_done: None,
             reconcile_cut_short: false,
             run_in_flight: false,
-            files_at: None,
+            files_stale: true,
             was_busy: false,
             write_conn: None,
             ignore: Arc::new(IgnoreSet::compile(&[]).expect("empty ignore set")),

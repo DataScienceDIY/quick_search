@@ -100,9 +100,6 @@ impl SearchHit {
 
 #[derive(Debug, Clone)]
 pub enum SearchUpdate {
-    Started {
-        generation: u64,
-    },
     Hits {
         generation: u64,
         hits: Vec<SearchHit>,
@@ -121,8 +118,7 @@ pub enum SearchUpdate {
 impl SearchUpdate {
     pub fn generation(&self) -> u64 {
         match self {
-            SearchUpdate::Started { generation }
-            | SearchUpdate::Hits { generation, .. }
+            SearchUpdate::Hits { generation, .. }
             | SearchUpdate::Completed { generation, .. }
             | SearchUpdate::Error { generation, .. } => *generation,
         }
@@ -409,7 +405,6 @@ impl Worker {
 
     fn handle(&mut self, req: SearchRequest) {
         let generation = req.generation;
-        self.send(SearchUpdate::Started { generation });
         match self.search(&req) {
             Ok(Some(Outcome { total, limited })) => self.send(SearchUpdate::Completed {
                 generation,

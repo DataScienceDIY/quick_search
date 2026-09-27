@@ -157,12 +157,12 @@ fn walk_traffic_per_file(samples: &[corpus::Sample], config: &Config, registry: 
     );
 }
 
-/// Rows per writer chunk: `batch::STORE_CHUNK`, the unit `Bodies::fill` is
-/// handed.
-const CHUNK: usize = 32;
+/// Rows per writer turn: `pipeline::READY_TOPUP`, the most one
+/// `store_extracted` call is handed.
+const CHUNK: usize = 64;
 
-/// The writer's half that runs outside the connection lock: one output
-/// `Vec<u8>` per row against one arena per chunk.
+/// The writer's compression: one output `Vec<u8>` per row against the run's
+/// one encoder and its reused buffer.
 ///
 /// The zstd context does not appear here: `zstd::bulk::Compressor::new`
 /// allocates through zstd's own C allocator, so its cost is CPU only
@@ -186,17 +186,15 @@ fn compression_traffic_per_chunk(config: &Config) {
             .map(|_| repo::encode_one(&doc).expect("encode"))
             .collect::<Vec<_>>()
     });
-    // What `Bodies::fill` does: one encoder and one arena for the chunk.
-    let arena = measure(|| {
+    // What `store_extracted` does: one encoder, its buffer reused per row.
+    let reused = measure(|| {
         let mut enc = DocEncoder::new().expect("encoder");
-        let mut arena = Vec::new();
         (0..CHUNK)
-            .map(|_| enc.encode_into(&doc, &mut arena).expect("encode"))
-            .collect::<Vec<_>>()
-            .len()
+            .map(|_| enc.body(&doc).expect("encode").map_or(0, <[u8]>::len))
+            .sum::<usize>()
     });
 
-    for (shape, usage) in [("a Vec per row", per_row), ("one arena, chunk", arena)] {
+    for (shape, usage) in [("a Vec per row", per_row), ("one encoder, reused", reused)] {
         println!(
             "{:<24} {:>10} {:>10} {:>12} {:>12}",
             shape,
@@ -207,8 +205,8 @@ fn compression_traffic_per_chunk(config: &Config) {
         );
     }
     println!(
-        "\n  The arena is reused across every chunk a writer call handles, so after the\n  \
-         first its growth is zero too. The zstd context is invisible here — see above.\n"
+        "\n  The encoder lives for the whole run, so after the first turn its growth is\n  \
+         zero too. The zstd context is invisible here — see above.\n"
     );
 }
 

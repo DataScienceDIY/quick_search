@@ -15,6 +15,10 @@
 //! database in RAM (the gap widens on cold or encrypted storage). An innocent
 //! edit can lose this, so a test reads the query plan back and fails on
 //! anything but a covering scan.
+//!
+//! The index exists only once a run has finished (see
+//! [`crate::db::repo::build_hash_index`]); before that the same query sorts
+//! the table, slower but with the same answer.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -239,6 +243,8 @@ mod tests {
             .expect("unique path");
         }
         tx.commit().unwrap();
+        // As a finished run's maintenance leaves it.
+        crate::db::repo::build_hash_index(&conn).unwrap();
         (scratch, p)
     }
 
@@ -280,6 +286,28 @@ mod tests {
         assert_eq!(groups[1].redundant_size, 20);
         assert_eq!(groups[1].members.len(), 3);
         assert_eq!(groups[1].members[0].1, "a1.txt", "members path-ordered");
+    }
+
+    /// A fresh index has no hash index until its first run's maintenance
+    /// builds one; the listing must not depend on it, only get faster.
+    #[test]
+    fn groups_are_the_same_before_the_hash_index_is_built() {
+        let (_dir, p) = seed_db();
+        let indexed = find_duplicate_groups(&p, 10).unwrap();
+        let conn = db::open_existing(&p, true).unwrap();
+        conn.execute_batch("DROP INDEX idx_files_hash;").unwrap();
+        assert_eq!(find_duplicate_groups(&p, 10).unwrap(), indexed);
+
+        crate::db::repo::maintain(&conn, &p).unwrap();
+        let rebuilt: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_files_hash'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rebuilt, 1, "maintenance builds the missing index");
+        assert_eq!(find_duplicate_groups(&p, 10).unwrap(), indexed);
     }
 
     #[test]

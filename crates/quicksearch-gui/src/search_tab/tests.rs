@@ -53,7 +53,11 @@ fn timed_frame(ctx: &egui::Context, tab: &mut SearchTab) {
 /// Per-visible-row frame cost, printed rather than asserted. Measured: 1000
 /// rows with content snippets cost 615 µs/frame (<4% of a 60 fps budget), so
 /// the Content Match cut is not memoized; re-measure here before optimizing
-/// the row renderer.
+/// the row renderer. Re-measured for formatting each hit's size, date, rank
+/// and flattened window once on arrival instead of every frame: rows cost
+/// 231 µs/frame (names only) and 434 µs (content snippets), against about
+/// 20 ms for a whole frame under software GL (llvmpipe), so caching could
+/// save at most ~2% of a fade or cursor-blink frame. Not adopted.
 ///
 /// ```text
 /// QSB_RENDER_PERF=1 cargo test --release -p quicksearch-gui -- render_perf --nocapture

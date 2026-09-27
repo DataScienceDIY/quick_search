@@ -146,11 +146,6 @@ impl QuickSearchApp {
         {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
-        // Watcher registration walks every root, so its verdict can land
-        // minutes after startup, with no input to repaint on.
-        if matches!(state.watcher, WatcherStatus::Starting) {
-            ctx.request_repaint_after(Duration::from_millis(500));
-        }
     }
 }
 

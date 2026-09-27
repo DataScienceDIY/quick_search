@@ -474,12 +474,10 @@ impl Loop {
             return WindowUpdate::Unchanged;
         };
         let cut = match tier {
+            // Unlike in the passes, the body may have stopped matching here.
             ContentTier::Exact => {
-                // Unlike in the passes, the body may have stopped matching
-                // here; an unmarked window says so.
-                let folded = text.to_ascii_lowercase();
-                crate::search::cascade::text_snippet(&query.pattern, text, &folded)
-                    .filter(|snip| !snip.ranges.is_empty())
+                crate::search::cascade::body_match(&query.pattern, text, &mut String::new())
+                    .map(|m| m.snippet)
             }
             ContentTier::Fuzzy => match &self.fuzzy {
                 Some(bitap) => crate::search::cascade::fuzzy_snippet(bitap, text).map(|(_, s)| s),

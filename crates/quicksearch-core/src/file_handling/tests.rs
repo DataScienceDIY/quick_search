@@ -170,31 +170,8 @@ fn filtered_walk_hidden_root_still_walked() {
 }
 
 #[test]
-fn classify_uses_mtime_against_the_existing_index() {
-    let mut rows = DirRows::new();
-    rows.insert("known.txt".to_string(), 100);
-
-    assert_eq!(
-        classify_for_indexing("new.txt", 100, &rows),
-        FileIndexAction::Insert,
-        "a name absent from the directory's rows is new"
-    );
-    assert_eq!(
-        classify_for_indexing("known.txt", 100, &rows),
-        FileIndexAction::Skip,
-        "same mtime means nothing to do"
-    );
-    assert_eq!(
-        classify_for_indexing("known.txt", 101, &rows),
-        FileIndexAction::Update,
-        "a changed mtime means re-read"
-    );
-}
-
-#[test]
-fn classify_by_mtime_matches_the_name_keyed_path() {
-    // Resolved symlink targets take this route: their row is found by
-    // exact path.
+fn classify_uses_mtime_against_the_stored_row() {
+    // No row: new. Same mtime: nothing to do. Changed: re-read.
     assert_eq!(classify_by_mtime(None, 100), FileIndexAction::Insert);
     assert_eq!(classify_by_mtime(Some(100), 100), FileIndexAction::Skip);
     assert_eq!(classify_by_mtime(Some(99), 100), FileIndexAction::Update);

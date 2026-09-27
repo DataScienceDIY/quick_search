@@ -16,9 +16,8 @@ fn main() {
     divan::main();
 }
 
-/// Compressing an extracted document: pure CPU, done before the writer takes
-/// the connection. `batch_*` measures a whole chunk, as `Bodies::fill`
-/// compresses one.
+/// Compressing an extracted document: pure CPU, done by the writer as each
+/// row is stored. `batch_*` measures a whole walk batch of small bodies.
 mod zstd_encode {
     use super::*;
 
@@ -38,9 +37,8 @@ mod zstd_encode {
         bencher.bench_local(move || enc.compress(divan::black_box(text)).unwrap());
     }
 
-    /// One writer chunk of typical documents. A contention figure, not a
-    /// throughput one: the lock serializes the indexer against itself, and
-    /// all compression together is under 1% of a cold run.
+    /// One walk batch of typical documents. All compression together is
+    /// under 1% of a cold run.
     const BATCH: usize = 500;
 
     #[divan::bench]
@@ -235,11 +233,9 @@ mod update_narrowing {
     }
 }
 
-/// A watcher event for a directory whose files are all indexed and unchanged:
-/// a re-sent `Create`, a `chmod -R`, the live view re-checking what it shows.
-/// Nothing is written, so the cost is whatever it reads to learn that; the
-/// full walk's answer is one `stat` per file.
-mod unchanged_event {
+/// A watcher event for a directory of indexed files, applied in one
+/// transaction as the coordinator applies a slice of its queue.
+mod directory_event {
     use super::*;
     use quicksearch_core::config::{Config, IgnoreSet};
     use quicksearch_core::extract::Registry;
@@ -251,8 +247,11 @@ mod unchanged_event {
 
     const FILES: usize = 500;
 
+    /// Every file unchanged: a re-sent `Create`, a `chmod -R`, the live view
+    /// re-checking what it shows. Nothing is written, so the cost is whatever
+    /// it reads to learn that; the full walk's answer is one `stat` per file.
     #[divan::bench]
-    fn directory_create(bencher: Bencher) {
+    fn unchanged(bencher: Bencher) {
         let (dir, db) = Scratch::db("bench-unchanged-event");
         let tree = db.with_file_name("tree");
         std::fs::create_dir_all(&tree).unwrap();
@@ -277,11 +276,65 @@ mod unchanged_event {
                 cancel: &cancel,
                 resume_from: 0,
             };
-            apply_fs_event(&mut conn, &event, &config, &ignore, &registry, &budget).unwrap()
+            // One transaction per event, as the coordinator's apply slice is.
+            let tx = conn.transaction().unwrap();
+            let applied =
+                apply_fs_event(&tx, &event, &config, &ignore, &registry, &budget).unwrap();
+            tx.commit().unwrap();
+            applied
         };
         // Indexed once; every timed run finds it unchanged.
         apply();
         bencher.bench_local(apply);
+        drop(dir);
+    }
+
+    /// The same directory with every file's mtime moved on before each run,
+    /// so each event rewrites all of its rows and their text: a checkout or
+    /// an unpack, where commit and FTS5 segment costs add up per file.
+    #[divan::bench]
+    fn changed(bencher: Bencher) {
+        let (dir, db) = Scratch::db("bench-changed-event");
+        let tree = db.with_file_name("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let files: Vec<std::path::PathBuf> =
+            (0..FILES).map(|i| tree.join(format!("f{:04}.txt", i))).collect();
+        for file in &files {
+            std::fs::write(file, corpus::text(1 << 10, 4)).unwrap();
+        }
+        let mut conn =
+            quicksearch_core::db::open_or_recreate(db.to_str().unwrap(), &Default::default())
+                .unwrap();
+        let config = Config::default();
+        let ignore = IgnoreSet::compile(&config.indexing.ignore_patterns).unwrap();
+        let registry = Registry::default_set();
+        let event = FsEvent::Create(tree.clone());
+        let cancel = AtomicBool::new(false);
+        let mut apply = move || {
+            let budget = Budget {
+                deadline: Instant::now() + Duration::from_secs(3600),
+                cancel: &cancel,
+                resume_from: 0,
+            };
+            // One transaction per event, as the coordinator's apply slice is.
+            let tx = conn.transaction().unwrap();
+            let applied =
+                apply_fs_event(&tx, &event, &config, &ignore, &registry, &budget).unwrap();
+            tx.commit().unwrap();
+            applied
+        };
+        apply();
+        let mut tick = 0u64;
+        bencher
+            .with_inputs(|| {
+                tick += 1;
+                let at = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + tick);
+                for file in &files {
+                    let f = std::fs::File::options().write(true).open(file).unwrap();
+                    f.set_modified(at).unwrap();
+                }
+            })
+            .bench_local_values(|()| apply());
         drop(dir);
     }
 }

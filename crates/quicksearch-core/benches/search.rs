@@ -165,39 +165,40 @@ mod substring {
         bencher.bench(|| finder.find_iter(divan::black_box(text)).count());
     }
 
-    /// What `pass_fulltext` runs per row on the literal path: a
-    /// case-sensitive count, then one folded extraction yielding both.
+    /// What `pass_fulltext` runs per row on the literal path: one folded
+    /// extraction yielding the window and both counts.
     #[divan::bench(args = corpus::SIZES)]
     fn cascade_row_sweeps(bencher: Bencher, size: usize) {
-        let pattern = literal(corpus::NEEDLE);
         let text = corpus::text_mixed(size, 4);
         let folded = corpus::text_folded(size, 4);
-        let opts = snippet::Options { approx_bytes: 600 };
+        let term = corpus::NEEDLE.to_ascii_lowercase();
+        let budget = 600;
         bencher.bench(|| {
-            let (s, b) = snippet::extract_folded(
+            snippet::extract_folded(
                 divan::black_box(text),
                 divan::black_box(folded),
+                &term,
                 corpus::NEEDLE,
-                &opts,
-            );
-            let a = pattern.count(text);
-            (a, b, s.ranges.len())
+                budget,
+            )
+            .map(|f| (f.count, f.exact, f.snippet.ranges.len()))
         });
     }
 
-    /// The rejected shape: a separate folded count sweeps the document a
-    /// third time for a number the extraction already has.
+    /// The replaced shape: a separate case-sensitive count sweeps the
+    /// document a second time for a number the extraction now has.
     #[divan::bench(args = corpus::SIZES)]
     fn cascade_row_sweeps_separate_count(bencher: Bencher, size: usize) {
-        let pattern = literal(corpus::NEEDLE);
         let text = corpus::text_mixed(size, 4);
         let folded = corpus::text_folded(size, 4);
-        let opts = snippet::Options { approx_bytes: 600 };
+        let term = corpus::NEEDLE.to_ascii_lowercase();
+        let budget = 600;
         bencher.bench(|| {
-            let a = pattern.count(divan::black_box(text));
-            let b = pattern.count_folded(divan::black_box(folded));
-            let (s, _) = snippet::extract_folded(text, folded, corpus::NEEDLE, &opts);
-            (a, b, s.ranges.len())
+            let exact =
+                memchr::memmem::find_iter(divan::black_box(text).as_bytes(), corpus::NEEDLE)
+                    .count();
+            let f = snippet::extract_folded(text, folded, &term, corpus::NEEDLE, budget);
+            (exact, f.map(|f| (f.count, f.snippet.ranges.len())))
         });
     }
 }
@@ -211,13 +212,15 @@ mod snippet_extract {
     fn extract_folded(bencher: Bencher, size: usize) {
         let text = corpus::text_mixed(size, 64);
         let folded = corpus::text_folded(size, 64);
-        let opts = snippet::Options { approx_bytes: 600 };
+        let term = corpus::NEEDLE.to_ascii_lowercase();
+        let budget = 600;
         bencher.bench(|| {
             snippet::extract_folded(
                 divan::black_box(text),
                 divan::black_box(folded),
+                &term,
                 corpus::NEEDLE,
-                &opts,
+                budget,
             )
         });
     }
@@ -249,7 +252,6 @@ mod filename_ladder {
 
     #[divan::bench]
     fn find_first_ci_scratch(bencher: Bencher) {
-        let pattern = literal("quartzite");
         let rows = corpus::rows();
         let mut scratch = String::new();
         bencher.bench_local(move || {
@@ -258,14 +260,14 @@ mod filename_ladder {
                 scratch.clear();
                 scratch.push_str(&row.name);
                 scratch.make_ascii_lowercase();
-                if pattern.find_first_folded(&scratch).is_some() {
+                if memchr::memmem::find(scratch.as_bytes(), b"quartzite").is_some() {
                     found += 1;
                     continue;
                 }
                 scratch.clear();
                 scratch.push_str(&row.path);
                 scratch.make_ascii_lowercase();
-                if pattern.find_first_folded(&scratch).is_some() {
+                if memchr::memmem::find(scratch.as_bytes(), b"quartzite").is_some() {
                     found += 1;
                 }
             }

@@ -275,13 +275,11 @@ impl DocDecoder {
 const ZSTD_LEVEL: i32 = 3;
 
 /// Reusable compression context for the `documents_text` sidecar; one per
-/// batch. Measured (`benches/index.rs`, group `zstd_encode`).
+/// indexing run. Measured (`benches/index.rs`, group `zstd_encode`).
 pub struct DocEncoder {
     ctx: zstd::bulk::Compressor<'static>,
-    /// One row's compressed output, reused. `zstd`'s `WriteBuf` for `Vec`
-    /// writes from offset 0 and sets the length, so a body cannot be
-    /// compressed straight into a shared arena; it lands here and is copied
-    /// across, with no allocation once both buffers have grown.
+    /// The last row's compressed output, reused, so the writer allocates
+    /// nothing per document once it has grown.
     row: Vec<u8>,
 }
 
@@ -300,14 +298,12 @@ impl DocEncoder {
             .map_err(|e| format!("zstd encode: {}", e))
     }
 
-    /// Append the compressed form of `text` to `arena`, returning where it
-    /// landed, so a whole batch's bodies share one allocation instead of one
-    /// `Vec` per document.
-    pub fn encode_into(
-        &mut self,
-        text: &str,
-        arena: &mut Vec<u8>,
-    ) -> Result<std::ops::Range<usize>, String> {
+    /// The compressed form of `text`, valid until the next call; `None` for an
+    /// empty body, which gets no `documents_text` row.
+    pub fn body(&mut self, text: &str) -> Result<Option<&[u8]>, String> {
+        if text.is_empty() {
+            return Ok(None);
+        }
         self.row.clear();
         // `compress_to_buffer` writes into the buffer's capacity and fails
         // rather than growing it, so the room has to be there first.
@@ -315,9 +311,7 @@ impl DocEncoder {
         self.ctx
             .compress_to_buffer(text.as_bytes(), &mut self.row)
             .map_err(|e| format!("zstd encode: {}", e))?;
-        let start = arena.len();
-        arena.extend_from_slice(&self.row);
-        Ok(start..arena.len())
+        Ok(Some(&self.row))
     }
 }
 
@@ -739,10 +733,16 @@ pub fn rows_in_range_page(
 
 /// Reset every failed file to pending and drop the failure records, so the
 /// coming run re-attempts them. Returns how many rows were reset.
+///
+/// Found through `failed_files`, which holds exactly the failed rows (see
+/// [`STATE_FAILED`]): no index covers `content_state = 2`, so asking `files`
+/// scanned the table every run. Measured at 373k rows, 287 failed: 16 →
+/// 0.3 ms with the table cached.
 pub fn retry_failed_files(tx: &Transaction<'_>) -> Result<usize, String> {
     let reset = exec(
         tx,
-        "UPDATE files SET content_state = ?1 WHERE content_state = ?2",
+        "UPDATE files SET content_state = ?1 \
+         WHERE id IN (SELECT file_id FROM failed_files) AND content_state = ?2",
         params![STATE_PENDING, STATE_FAILED],
         || "reset failed files to pending".to_string(),
     )?;
@@ -895,9 +895,22 @@ pub fn analyzed_file_count(conn: &Connection) -> Option<i64> {
     rows.max()
 }
 
-/// Checkpoint, VACUUM, `PRAGMA optimize`, checkpoint; the trailing checkpoint
-/// empties what VACUUM's copy-back and `optimize` wrote to the log. Returns
-/// whether it vacuumed.
+/// Create `idx_files_hash` if it is missing: after a fresh index's first run,
+/// in one sorted build. It is not in [`crate::db::schema::SCHEMA_CURRENT`]:
+/// a SHA-256 key lands on a random leaf, so kept up through a bulk load, every
+/// walk commit rewrote hundreds of the index's pages. Measured (`memprobe
+/// cold`): bytes written 4.77 → 2.87 GB over `/usr` (373k files), 938 → 855
+/// MiB over the cargo registry (41k), CPU within noise, and about 10 MiB more
+/// peak for the sort. Only [`crate::search::find_duplicate_groups`] reads it,
+/// and until the build it sorts the table instead.
+pub fn build_hash_index(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);")
+        .map_err(|e| format!("build hash index: {}", e))
+}
+
+/// Checkpoint, [`build_hash_index`], VACUUM, `PRAGMA optimize`, checkpoint;
+/// the trailing checkpoint empties what VACUUM's copy-back and `optimize`
+/// wrote to the log. Returns whether it vacuumed.
 ///
 /// Run on a connection from [`crate::db::open::open_maintenance`], never the
 /// indexer's. VACUUM's temporary database goes in the directory of `db_path`,
@@ -921,6 +934,8 @@ pub fn maintain(conn: &Connection, db_path: &str) -> Result<bool, String> {
     }
     #[cfg(feature = "probe")]
     probe.step("maintain checkpoint");
+
+    build_hash_index(conn)?;
 
     let page_count = pragma_number(conn, "page_count")?;
     let freelist = pragma_number(conn, "freelist_count")?;

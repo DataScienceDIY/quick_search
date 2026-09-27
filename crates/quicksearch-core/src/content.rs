@@ -331,16 +331,14 @@ mod tests {
 
     use crate::db::open_or_recreate;
     use crate::db::repo::{self, insert_file, NewFile};
-    use crate::file_handling::{
-        extract_scope_prepare, store_extracted, Bodies, ExtractScope, Stored,
-    };
+    use crate::file_handling::{extract_scope_prepare, store_extracted, ExtractScope, Stored};
     use crate::mime::FileType;
     use crate::testutil::Scratch;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    fn bodies() -> Bodies {
-        Bodies::new().unwrap()
+    fn encoder() -> crate::db::repo::DocEncoder {
+        crate::db::repo::DocEncoder::new().unwrap()
     }
 
     fn tree(s: &Scratch) -> PathBuf {
@@ -428,7 +426,7 @@ mod tests {
         assert!(pass.finish());
         let stop = Arc::new(AtomicBool::new(false));
         let far = Instant::now() + Duration::from_secs(60);
-        store_extracted(conn, &rows, &stop, far, &mut bodies()).unwrap()
+        store_extracted(conn, &rows, &stop, far, &mut encoder()).unwrap()
     }
 
     #[test]
@@ -552,7 +550,7 @@ mod tests {
         // A deadline already gone by: one row, then out.
         let past = Instant::now() - Duration::from_secs(1);
         assert_eq!(
-            store_extracted(&conn_mutex, &rows, &stop, past, &mut bodies()).unwrap(),
+            store_extracted(&conn_mutex, &rows, &stop, past, &mut encoder()).unwrap(),
             Stored {
                 consumed: 1,
                 written: 1
@@ -560,7 +558,7 @@ mod tests {
         );
         let far = Instant::now() + Duration::from_secs(60);
         assert_eq!(
-            store_extracted(&conn_mutex, &rows[1..], &stop, far, &mut bodies()).unwrap(),
+            store_extracted(&conn_mutex, &rows[1..], &stop, far, &mut encoder()).unwrap(),
             Stored {
                 consumed: 4,
                 written: 4
@@ -580,7 +578,7 @@ mod tests {
         // Stopped before it starts: nothing consumed.
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            store_extracted(&conn_mutex, &rows, &stop, far, &mut bodies()).unwrap(),
+            store_extracted(&conn_mutex, &rows, &stop, far, &mut encoder()).unwrap(),
             Stored::default()
         );
     }

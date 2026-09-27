@@ -56,6 +56,11 @@ pub struct PlaintextExtractor;
 
 /// Read `size` bytes from `f`, never more than `cap`. A short read is not an
 /// error: a file that shrank keeps its prefix.
+///
+/// Zero-filled, and still the faster shape: `take(size).read_to_end` into a
+/// reserved `Vec` skips the fill but starts at 8 KiB reads and doubles, so
+/// over `/usr/include` it made 18,431 `read` calls against 15,419 here and
+/// ran 8% slower (`extractprobe`). Measured and rejected.
 fn read_sized(f: &mut File, size: usize, cap: usize, path: &Path) -> Result<Vec<u8>, ExtractError> {
     let size = size.min(cap);
     let mut buf = vec![0u8; size];

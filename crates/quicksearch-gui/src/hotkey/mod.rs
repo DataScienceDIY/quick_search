@@ -52,13 +52,16 @@ struct Registry {
 }
 
 enum Backend {
-    /// Nothing registered: no shortcut set, a Wayland session (see the
-    /// module docs), or the backend never started.
+    /// A Wayland session (see the module docs): nothing is ever registered.
     Idle,
-    /// Windows and X11.
+    /// Windows and X11, holding no key, and so no manager either: on X11 one
+    /// polls the display twenty times a second for as long as it exists,
+    /// whether or not it holds anything.
+    Ready,
+    /// Windows and X11, holding `registered`.
     Grab {
         manager: GlobalHotKeyManager,
-        registered: Option<HotKey>,
+        registered: HotKey,
     },
 }
 
@@ -75,34 +78,27 @@ pub fn init(ctx: &egui::Context, setting: &str) {
         }
     }));
 
-    let (registry, started) = match choose_backend() {
-        Ok(backend) => (
-            Registry {
-                backend,
-                status: Status::Disabled,
-            },
-            true,
-        ),
-        Err(message) => {
-            quicksearch_core::log_warn!("global shortcut: {}", message);
-            (
-                Registry {
-                    backend: Backend::Idle,
-                    status: Status::Error(message),
-                },
-                false,
-            )
-        }
+    // No X11 grab as a fallback under Wayland: it succeeds inside a Wayland
+    // session and then only fires while an XWayland window has focus, which
+    // looks broken.
+    let backend = if crate::activate::raise::is_wayland() {
+        Backend::Idle
+    } else {
+        Backend::Ready
     };
-    REGISTRY.with_borrow_mut(|slot| *slot = Some(registry));
-    if started {
-        apply(setting);
-    }
+    REGISTRY.with_borrow_mut(|slot| {
+        *slot = Some(Registry {
+            backend,
+            status: Status::Disabled,
+        })
+    });
+    apply(setting);
 }
 
 /// Registers `setting`, releasing whatever was registered before. An
 /// unparseable or refused shortcut is reported through [`status`], never by
-/// failing: not worth blocking a config the user has already applied.
+/// failing: not worth blocking a config the user has already applied. On the
+/// event-loop thread, like [`init`]: registering creates the manager.
 pub fn apply(setting: &str) {
     REGISTRY.with_borrow_mut(|slot| {
         let Some(registry) = slot.as_mut() else {
@@ -156,53 +152,43 @@ pub fn status() -> Status {
 }
 
 impl Backend {
-    /// Hold `wanted` and nothing else. `None` releases without registering.
+    /// Hold `wanted` and nothing else. `None` releases without registering,
+    /// and drops the manager with it.
     fn register(&mut self, wanted: Option<Binding>) -> Result<(), String> {
-        match self {
-            Backend::Idle => Ok(()),
-            Backend::Grab {
-                manager,
-                registered,
-            } => {
-                if let Some(old) = registered.take() {
-                    // Worth reporting, not worth refusing the new binding over.
-                    if let Err(e) = manager.unregister(old) {
-                        quicksearch_core::log_warn!("releasing the old global shortcut: {}", e);
-                    }
-                }
-                let Some(binding) = wanted else {
-                    return Ok(());
-                };
-                let hotkey: HotKey = binding
-                    .to_string()
-                    .parse()
-                    .map_err(|e| format!("{} is not a usable shortcut: {}", binding, e))?;
-                manager.register(hotkey).map_err(|e| match e {
-                    global_hotkey::Error::AlreadyRegistered(_) => {
-                        format!("another application is already using {}", binding)
-                    }
-                    other => format!("{} could not be registered: {}", binding, other),
-                })?;
-                *registered = Some(hotkey);
-                Ok(())
+        if matches!(self, Backend::Idle) {
+            return Ok(());
+        }
+        if let Backend::Grab {
+            manager,
+            registered,
+        } = std::mem::replace(self, Backend::Ready)
+        {
+            // Worth reporting, not worth refusing the new binding over.
+            if let Err(e) = manager.unregister(registered) {
+                quicksearch_core::log_warn!("releasing the old global shortcut: {}", e);
             }
         }
-    }
-}
-
-/// A Wayland session gets no backend (see the module docs). No X11 grab as a
-/// fallback either: it succeeds inside a Wayland session and then only fires
-/// while an XWayland window has focus, which looks broken.
-fn choose_backend() -> Result<Backend, String> {
-    if crate::activate::raise::is_wayland() {
-        return Ok(Backend::Idle);
-    }
-    GlobalHotKeyManager::new()
-        .map(|manager| Backend::Grab {
+        let Some(binding) = wanted else {
+            return Ok(());
+        };
+        let hotkey: HotKey = binding
+            .to_string()
+            .parse()
+            .map_err(|e| format!("{} is not a usable shortcut: {}", binding, e))?;
+        let manager = GlobalHotKeyManager::new()
+            .map_err(|e| format!("global shortcuts are unavailable: {}", e))?;
+        manager.register(hotkey).map_err(|e| match e {
+            global_hotkey::Error::AlreadyRegistered(_) => {
+                format!("another application is already using {}", binding)
+            }
+            other => format!("{} could not be registered: {}", binding, other),
+        })?;
+        *self = Backend::Grab {
             manager,
-            registered: None,
-        })
-        .map_err(|e| format!("global shortcuts are unavailable: {}", e))
+            registered: hotkey,
+        };
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -226,5 +212,15 @@ mod tests {
             backend.register(Some("Ctrl+Shift+F".parse().unwrap())),
             Ok(())
         );
+        assert!(matches!(backend, Backend::Idle));
+    }
+
+    /// Holding no key must not start a manager: on X11 its thread polls the
+    /// display until it is dropped.
+    #[test]
+    fn releasing_holds_no_manager() {
+        let mut backend = Backend::Ready;
+        assert_eq!(backend.register(None), Ok(()));
+        assert!(matches!(backend, Backend::Ready));
     }
 }

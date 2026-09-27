@@ -16,8 +16,8 @@ use crate::extract::Registry;
 use crate::file_handling::{
     cleanup_stale_index_entries, count_tree_entries_fast, fts_begin_bulk_write,
     fts_finalize_after_text_indexing, mark_oversize_pending_na, normalize_root_string,
-    process_batch_inserts, process_batch_updates, store_extracted, Bodies, ExtractCursor,
-    ExtractScope, FileIndexAction, OwnedNewFile, RootRange,
+    process_batch_inserts, process_batch_updates, store_extracted, ExtractCursor, ExtractScope,
+    FileIndexAction, OwnedNewFile, RootRange,
 };
 use crate::walk::{thread_count_for, walk_indexable_files, ParallelWalk, TryNext, WalkEvent};
 
@@ -153,8 +153,7 @@ type WriteBatch = fn(
     &Arc<Mutex<Connection>>,
     &[OwnedNewFile],
     &Arc<AtomicBool>,
-    &Config,
-    &mut Bodies,
+    &mut crate::db::repo::DocEncoder,
 ) -> Result<(), String>;
 
 /// Write `rows` through `write`, then clear them; on an error they stay.
@@ -163,13 +162,7 @@ fn flush(
     rows: &mut Vec<OwnedNewFile>,
     write: WriteBatch,
 ) -> Result<(), String> {
-    write(
-        &cx.conn_mutex,
-        rows,
-        cx.stop_flag,
-        cx.config,
-        &mut cx.bodies,
-    )?;
+    write(&cx.conn_mutex, rows, cx.stop_flag, &mut cx.encoder)?;
     rows.clear();
     Ok(())
 }
@@ -525,7 +518,7 @@ impl RootPipeline {
                 ready,
                 cx.stop_flag,
                 deadline,
-                &mut cx.bodies,
+                &mut cx.encoder,
             )?;
             if stored.consumed > 0 {
                 // The last row *written*, not the last fetched. The whole path,
@@ -574,8 +567,8 @@ pub(super) struct RunCx<'a> {
     /// Writer time one root's turn may take before the round moves on
     /// ([`crate::config::ProcessingConfig::writer_turn_slice_ms`]).
     pub(super) slice: Duration,
-    /// The run's one set of compression buffers, shared by every write.
-    pub(super) bodies: Bodies,
+    /// The run's one compression context, shared by every write.
+    pub(super) encoder: crate::db::repo::DocEncoder,
     /// Rows with no file behind them, per-directory plus the vanished sweep.
     pub(super) stale_candidates: Vec<String>,
     /// Paths reached via symlink; their rows may live outside every root.
@@ -600,7 +593,7 @@ impl<'a> RunCx<'a> {
             registry: Arc::new(Registry::default_set()),
             batch: config.processing.batch_size.max(1),
             slice: Duration::from_millis(config.processing.writer_turn_slice_ms),
-            bodies: Bodies::new()?,
+            encoder: crate::db::repo::DocEncoder::new()?,
             stale_candidates: Vec::new(),
             aliased_paths: HashSet::new(),
             stale_cleanup_ok: true,

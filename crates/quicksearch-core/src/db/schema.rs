@@ -177,6 +177,9 @@ pub const PRAGMAS_WALK_READER: &str = "
 /// filename query already does: `searchtime` at 300k rows, 25 ms with or
 /// without a filter, where the indexes had made a one-day filter 0.06 ms.
 ///
+/// `idx_files_hash` is left out on purpose and built after the first run; see
+/// [`crate::db::repo::build_hash_index`].
+///
 /// `documents_text` holds a row only when the extractor produced text (an
 /// audio file with empty tags is done but has none), so `files.content_state`
 /// is the authority on "content indexed". The uncompressed length is not
@@ -203,7 +206,6 @@ CREATE TABLE files (
 );
 
 CREATE UNIQUE INDEX idx_files_parent ON files(parent, name);
-CREATE INDEX idx_files_hash   ON files(hash);
 CREATE INDEX idx_files_content_pending ON files(id) WHERE content_state = 0;
 
 CREATE TABLE failed_files (

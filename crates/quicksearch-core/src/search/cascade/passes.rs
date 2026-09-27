@@ -84,14 +84,6 @@ fn fts_match_sql(filter_sql: &str) -> String {
     )
 }
 
-/// Fold `text` into `dst`, reusing its allocation. The ASCII fold is
-/// byte-length preserving, so folded offsets are valid in the original.
-fn fold_into(dst: &mut String, text: &str) {
-    dst.clear();
-    dst.push_str(text);
-    dst.make_ascii_lowercase();
-}
-
 /// The segment pass A's path-tier prefilter runs on: the longest one
 /// containing no path separator, or `None` when every segment has one. Any
 /// single segment is a superset test, and a separator-free one cannot span
@@ -157,7 +149,6 @@ impl<'a> Cx<'a> {
             .map_err(|e| e.to_string())?;
 
         let mut buf: Vec<SearchHit> = Vec::new();
-        let mut overflowed = false;
         let mut deferred = Deferred::default();
         let mut scanned = 0usize;
         let mut clock = FlushClock::new();
@@ -189,8 +180,9 @@ impl<'a> Cx<'a> {
             match classify(self, row, file_id, &path, &path[name_at..])? {
                 RowHit::Skip => {}
                 RowHit::Emit(hit) => {
+                    // No cap here: `flush_if_due` hands the buffer over at
+                    // every `batch` rows, so only deferred hits accumulate.
                     buf.push(hit);
-                    overflowed |= self.enforce_cap(&mut buf);
                     self.flush_if_due(&mut buf, &mut clock);
                     // Stop once the display limit is full. Recorded, not
                     // turned into `limited` here: `flush_pass` owns that call.
@@ -213,7 +205,7 @@ impl<'a> Cx<'a> {
             Some(slot) => *self.deferred_mut(slot) = deferred,
             None => debug_assert!(deferred.hits.is_empty(), "deferred hits with no slot"),
         }
-        self.flush_pass(buf, overflowed);
+        self.flush_pass(buf, false);
         // After the flush, so it cannot be undone by one that truncated nothing;
         // without this a cut set can report itself complete.
         self.limited |= cut_short;
@@ -329,41 +321,24 @@ impl<'a> Cx<'a> {
             let Some(text) = stored_text(row, &mut doc)? else {
                 return Ok(RowHit::Skip);
             };
-            // Fold once: count, first match and snippet all need it, even on
-            // rows about to be dropped.
-            fold_into(&mut lower, text);
-            let (count, stage, snip) = match super::text_snippet_counted(pattern, text, &lower) {
-                Some((snip, count_ci)) => {
-                    if count_ci == 0 {
-                        return Ok(RowHit::Skip);
-                    }
-                    let count_cs = pattern.count(text);
-                    if count_cs > 0 {
-                        (count_cs, 5, Some(snip))
-                    } else {
-                        (count_ci, 6, Some(snip))
-                    }
-                }
-                None => {
-                    let count_cs = pattern.count(text);
-                    let (count, stage) = if count_cs > 0 {
-                        (count_cs, 5)
-                    } else {
-                        let count_ci = pattern.count_folded(&lower);
-                        if count_ci == 0 {
-                            return Ok(RowHit::Skip);
-                        }
-                        (count_ci, 6)
-                    };
-                    (count, stage, super::text_snippet(pattern, text, &lower))
-                }
+            let Some(m) = super::body_match(pattern, text, &mut lower) else {
+                return Ok(RowHit::Skip);
             };
-            let rank = stage as f64 + count_frac(count);
+            let rank = m.stage as f64 + count_frac(m.count);
             if !cx.regex_accepts(file_id, path, Some(text))? {
                 return Ok(RowHit::Skip);
             }
 
-            row_hit(row, file_id, path, name, rank, stage, snip, false)
+            row_hit(
+                row,
+                file_id,
+                path,
+                name,
+                rank,
+                m.stage,
+                Some(m.snippet),
+                false,
+            )
         })
     }
 
@@ -529,15 +504,12 @@ impl<'a> Cx<'a> {
             let Some(text) = stored_text(row, &mut doc)? else {
                 return Ok(RowHit::Skip);
             };
-            let count = re.count(text);
-            if count == 0 {
+            let (count, Some(first)) = re.count_and_first(text) else {
                 return Ok(RowHit::Skip);
-            }
+            };
             // A greedy user regex can match megabytes; clamp before the window.
-            let snip = re.find_first(text).map(|r| {
-                let r = clamp_match_range(text, r, SNIPPET_WINDOW_BYTES);
-                snippet::window_around(text, (r.start, r.end), &SNIPPET_OPTS)
-            });
+            let r = clamp_match_range(text, first, SNIPPET_WINDOW_BYTES);
+            let snip = snippet::window_around(text, (r.start, r.end), SNIPPET_WINDOW_BYTES);
             row_hit(
                 row,
                 file_id,
@@ -545,7 +517,7 @@ impl<'a> Cx<'a> {
                 name,
                 6.0 + count_frac(count),
                 6,
-                snip,
+                Some(snip),
                 false,
             )
         })

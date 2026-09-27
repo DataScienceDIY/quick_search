@@ -16,8 +16,8 @@ use std::thread::JoinHandle;
 use crate::config::{Config, IgnoreSet};
 use crate::extract::Registry;
 use crate::file_handling::{
-    classify_by_mtime, classify_for_indexing, dir_to_db_parent, path_to_db_string,
-    prepare_file_record, DirRows, FileIndexAction, OwnedNewFile, UnreadableDirs,
+    classify_by_mtime, dir_to_db_parent, path_to_db_string, prepare_file_record, DirRows,
+    FileIndexAction, OwnedNewFile, UnreadableDirs,
 };
 
 mod pool;
@@ -30,6 +30,10 @@ use pool::{Found, PrefetchWork, Queue, Shared};
 /// Files one worker takes for itself before handing the rest to the pool.
 const FILES_PER_JOB: usize = 128;
 
+/// Events a root's walk may run ahead of the writer. Each can carry up to
+/// `hash_length` of inline text, but the run's peak is set during extraction:
+/// measured at 512 (`memprobe cold`, `/usr`, 373k files), peak RSS 343–355
+/// against 293–309 MiB here and the walk no faster. Measured and rejected.
 const CHANNEL_CAP: usize = 4096;
 
 const LOCAL_THREADS: usize = 4;
@@ -77,11 +81,14 @@ pub enum WalkEvent {
 struct PendingFile {
     path: PathBuf,
     cached: Option<crate::platform::CachedMetadata>,
+    /// The stored mtime, taken out of the directory's rows as it was listed;
+    /// `None` when the file has no row yet.
+    stored: Option<u64>,
 }
 
 enum Job {
-    Dir(PathBuf, Arc<DirRows>),
-    Files(Vec<PendingFile>, Arc<DirRows>),
+    Dir(PathBuf, DirRows),
+    Files(Vec<PendingFile>),
     /// A resolved symlink target, with the stored mtime for its own path.
     Alias(PathBuf, Option<u64>),
 }
@@ -146,9 +153,12 @@ pub fn reset_run_warnings() {
 /// for the pool, the remaining files come back for this worker, `stale` gets
 /// the paths whose row has no file behind it. A directory that cannot be read
 /// returns before reconciling: it must not read as an empty one.
+///
+/// Each listed file takes its row out of `rows`, carrying the stored mtime
+/// with it, so what is left afterwards is exactly the stale set.
 fn read_directory(
     dir: &Path,
-    rows: &Arc<DirRows>,
+    mut rows: DirRows,
     ctx: &Ctx,
     found: &mut Vec<Found>,
     stale: &mut Vec<String>,
@@ -169,17 +179,11 @@ fn read_directory(
         }
     };
     // Every `continue` in the loop must be a genuine "not indexable", or the
-    // stale diff below deletes live rows. Only names that have a row matter to
-    // that diff, so `present` borrows them from `rows`: no allocation per
-    // entry, and none at all for a directory with no rows yet. Measured
-    // (`indexprobe cold`, 100k files): 8.2 → 7.2 allocations per file,
-    // churn 42 → 35 MiB; time did not move, being `stat`-bound.
-    let mut present: HashSet<&str> = HashSet::new();
-    let mut mark_present = |name: &str| {
-        if let Some((known, _)) = rows.get_key_value(name) {
-            present.insert(known.as_str());
-        }
-    };
+    // stale diff below deletes live rows: only a name taken out of `rows`
+    // keeps its row. Measured against marking names present in a set borrowed
+    // from `rows` and looking each one up again in `prepare` (`indexprobe
+    // warm`, `/usr`, 373k files): 9.3–9.8 → 8.8–9.3 allocations per file,
+    // churn 246–257 → 231–240 MiB; time within noise, being `stat`-bound.
     let mut unreadable_entry = false;
 
     let mut files = Vec::new();
@@ -198,17 +202,22 @@ fn read_directory(
             }
         };
 
-        let name = entry.file_name();
+        // The name borrowed from the path, which the entry allocates either
+        // way: `file_name()` would allocate a second copy. With the path's
+        // buffer becoming its `String` in `prepare`, measured (`indexprobe
+        // warm`, `/usr`, 373k files): 9.2–9.6 → 6.6–6.9 allocations per
+        // file, churn 240–247 → 203–210 MiB, user CPU 0.92–1.01 → 0.83–0.92 s.
+        let path = entry.path();
         // The walk's one screen for names the index cannot spell (invalid
         // UTF-8 on Unix, unpaired UTF-16 surrogates on Windows; see
-        // `path_to_db_string`), skipped by choice. Leaving the entry out of
-        // `present` is safe: no stored row can carry such a name.
-        let Some(name) = name.to_str() else {
+        // `path_to_db_string`), skipped by choice. Its row cannot exist: no
+        // stored row can carry such a name.
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             if UNREPRESENTABLE_WARNINGS.allow() {
                 crate::log_warn!(
                     "Skipping {:?} (name is not valid UTF-8, so it cannot be stored, hashed \
                      or text-indexed)",
-                    entry.path()
+                    path
                 );
             }
             continue;
@@ -233,7 +242,7 @@ fn read_directory(
                     crate::log_info!(
                         "skipping {}: hidden attribute set (enable \"include hidden \
                          files\" to index it)",
-                        entry.path().display()
+                        path.display()
                     );
                 }
                 continue;
@@ -242,13 +251,12 @@ fn read_directory(
         }
         // Ignored, or the index's own database and sidecars (see
         // `file_handling::index_file_set`). `continue`, not `skipped`: the
-        // name stays out of `present`, so old rows for the index fall to the
-        // stale sweep; `skipped` would keep them.
+        // row stays in `rows`, so old rows for the index fall to the stale
+        // sweep; `skipped` would keep them.
         if ctx.ignore.matches_component(name) {
             ctx.pruned.ignored.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        let path = entry.path();
         if ctx.ignore.matches_path_pattern(&path) || ctx.index_files.contains(&path) {
             ctx.pruned.ignored.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -256,13 +264,13 @@ fn read_directory(
 
         // `file_type` is the cached `d_type` from the directory read.
         match entry.file_type() {
-            // Not marked present: a name that was a file last run and is a
+            // Row left in `rows`: a name that was a file last run and is a
             // directory now should lose its row.
             Ok(ft) if ft.is_dir() => found.push(Found::Dir(path)),
             // Directory and file targets gate together, or the walkers
             // disagree: `filtered_walk` follows neither kind, so a file target
-            // followed only here would never update between runs. Never
-            // marked present: the target's row belongs to its own directory.
+            // followed only here would never update between runs. Row left
+            // in `rows`: the target's row belongs to its own directory.
             Ok(ft) if ft.is_symlink() => {
                 if ctx.follow_symlinks {
                     if let Some(target) = resolve_link(&path, ctx) {
@@ -271,29 +279,31 @@ fn read_directory(
                 }
             }
             Ok(_) => {
-                mark_present(name);
+                let stored = rows.remove(name);
                 // `None` on Unix and on any reparse point.
                 let cached = crate::platform::entry_cached_metadata(|| entry.metadata().ok());
-                files.push(PendingFile { path, cached });
+                files.push(PendingFile {
+                    path,
+                    cached,
+                    stored,
+                });
             }
-            // Type unknown: mark it present so an existing row survives.
-            Err(_) => mark_present(name),
+            // Type unknown: taken out so an existing row survives.
+            Err(_) => {
+                rows.remove(name);
+            }
         }
     }
 
     if !unreadable_entry {
-        stale.extend(
-            rows.keys()
-                .filter(|name| !present.contains(name.as_str()))
-                .map(|name| path_to_db_string(&dir.join(name))),
-        );
+        stale.extend(rows.into_keys().map(|name| path_to_db_string(&dir.join(name))));
     }
 
     // Spread a wide directory across the pool, keeping the tail for ourselves
     // so the entries the read just warmed are handled now.
     while files.len() > FILES_PER_JOB {
         let chunk = files.split_off(files.len() - FILES_PER_JOB);
-        found.push(Found::Files(chunk, rows.clone()));
+        found.push(Found::Files(chunk));
     }
     files
 }
@@ -333,38 +343,35 @@ fn resolve_link(path: &Path, ctx: &Ctx) -> Option<Found> {
     }
 }
 
-/// How a file's stored mtime is to be found.
-enum Known<'a> {
-    InDir(&'a DirRows),
-    /// Resolved by exact path: a symlink target's row lives under a
-    /// different parent.
-    Exact(Option<u64>),
-}
-
 /// At most one `stat`, then classify; only files that will be written get
 /// opened, and small text files are finished outright. "At most": on Windows
 /// [`PendingFile::cached`] may already hold the answer.
 ///
-/// `scratch` is this worker's, carrying the head buffer every hash and MIME
-/// sniff reads into.
+/// `aliased`: reached by resolving a symlink, so its row lives under a
+/// different parent than the link's. `scratch` is this worker's, carrying the
+/// head buffer every hash and MIME sniff reads into.
 fn prepare(
     file: PendingFile,
-    known: Known<'_>,
+    aliased: bool,
     ctx: &Ctx,
     scratch: &mut crate::extract::Scratch,
 ) -> WalkedFile {
-    let PendingFile { path, cached } = file;
-    // Every route here has already screened the path for UTF-8; see
-    // `path_to_db_string`.
-    debug_assert!(
-        path.to_str().is_some(),
-        "an unrepresentable path reached prepare(): {:?}",
-        path
-    );
-    let db_path = path_to_db_string(&path);
-    let aliased = matches!(known, Known::Exact(_));
+    let PendingFile {
+        path,
+        cached,
+        stored,
+    } = file;
+    // Every route here has already screened the path for UTF-8, and every
+    // walk path is a normalized root or link target with names joined on, so
+    // it already is its stored spelling: the buffer becomes the `String`
+    // without a copy (see `path_to_db_string`).
+    let db_path = path.into_os_string().into_string().unwrap_or_else(|path| {
+        debug_assert!(false, "an unrepresentable path reached prepare(): {:?}", path);
+        path_to_db_string(Path::new(&path))
+    });
+    debug_assert_eq!(db_path, path_to_db_string(Path::new(&db_path)));
 
-    let Ok(meta) = crate::platform::metadata_or_stat(&path, cached) else {
+    let Ok(meta) = crate::platform::metadata_or_stat(Path::new(&db_path), cached) else {
         // Seen but unreadable: a transient stat failure must not read as
         // "deleted".
         return WalkedFile::skipped(db_path, aliased);
@@ -373,17 +380,7 @@ fn prepare(
         return WalkedFile::skipped(db_path, aliased);
     };
 
-    let action = match known {
-        Known::InDir(rows) => {
-            // `to_str`, never lossy; the screen makes it always `Some`.
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default();
-            classify_for_indexing(name, mtime, rows)
-        }
-        Known::Exact(stored) => classify_by_mtime(stored, mtime),
-    };
+    let action = classify_by_mtime(stored, mtime);
     let record = match action {
         // Unchanged: never opened or hashed, so it stays at one syscall.
         FileIndexAction::Skip => None,
@@ -414,20 +411,24 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
         let delivered = match job {
             Job::Dir(dir, rows) => {
                 let (mut found, mut stale) = (Vec::new(), Vec::new());
-                let files = read_directory(&dir, &rows, ctx, &mut found, &mut stale);
+                let files = read_directory(&dir, rows, ctx, &mut found, &mut stale);
                 // Hand the subdirectories over before doing our own per-file
                 // work, so the rest of the pool never idles behind one worker.
                 slot.finish(found);
-                deliver(files, &rows, stale, ctx, tx, &mut scratch)
+                deliver(files, stale, ctx, tx, &mut scratch)
             }
-            Job::Files(files, rows) => {
+            Job::Files(files) => {
                 slot.finish(Vec::new());
-                deliver(files, &rows, Vec::new(), ctx, tx, &mut scratch)
+                deliver(files, Vec::new(), ctx, tx, &mut scratch)
             }
             Job::Alias(path, stored) => {
                 slot.finish(Vec::new());
-                let file = PendingFile { path, cached: None };
-                let walked = prepare(file, Known::Exact(stored), ctx, &mut scratch);
+                let file = PendingFile {
+                    path,
+                    cached: None,
+                    stored,
+                };
+                let walked = prepare(file, true, ctx, &mut scratch);
                 tx.send(WalkEvent::File(walked)).is_ok()
             }
         };
@@ -443,7 +444,6 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
 /// failed: not an error.
 fn deliver(
     files: Vec<PendingFile>,
-    rows: &DirRows,
     stale: Vec<String>,
     ctx: &Ctx,
     tx: &mpsc::SyncSender<WalkEvent>,
@@ -456,7 +456,7 @@ fn deliver(
         if ctx.stop_flag.load(Ordering::Relaxed) {
             return false;
         }
-        let walked = prepare(file, Known::InDir(rows), ctx, scratch);
+        let walked = prepare(file, false, ctx, scratch);
         tx.send(WalkEvent::File(walked)).is_ok()
     })
 }
@@ -478,7 +478,7 @@ fn prefetcher(shared: &Shared, db_path: &str) {
     while let Some(work) = shared.take_prefetch() {
         let job = match work {
             PrefetchWork::Dir(dir) => crate::db::repo::dir_rows(&conn, &dir_to_db_parent(&dir))
-                .map(|rows| Job::Dir(dir, Arc::new(rows))),
+                .map(|rows| Job::Dir(dir, rows)),
             PrefetchWork::Alias(path) => {
                 crate::db::repo::mtime_for_path(&conn, &path_to_db_string(&path))
                     .map(|stored| Job::Alias(path, stored))

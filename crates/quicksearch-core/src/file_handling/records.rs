@@ -26,14 +26,10 @@ pub enum FileIndexAction {
     Insert,
 }
 
-/// Decide what Phase 1 should do with a file. A file whose parent is not this
-/// directory (a resolved symlink target) must not be classified here: it
-/// would read as `Insert`, and `INSERT OR IGNORE` would silently not update
-/// it. Use [`classify_by_mtime`] for those.
-pub fn classify_for_indexing(name: &str, mtime: u64, rows: &DirRows) -> FileIndexAction {
-    classify_by_mtime(rows.get(name).copied(), mtime)
-}
-
+/// Decide what Phase 1 should do with a file from its stored mtime, `None`
+/// when it has no row. For a resolved symlink target that is the row under
+/// the target's own path: its link's directory rows would read it as
+/// `Insert`, and `INSERT OR IGNORE` would silently not update it.
 pub fn classify_by_mtime(stored: Option<u64>, mtime: u64) -> FileIndexAction {
     match stored {
         Some(known) if known == mtime => FileIndexAction::Skip,

@@ -6,11 +6,17 @@
 //! byte are set), so neither side is folded. Measured: folding the haystack
 //! cost a copy per scanned field and per stored document.
 
+use std::ops::ControlFlow;
+
 use crate::query::split::CascadeQuery;
 
 /// Registers: one per error count `0..=k`. [`edit_budget`]'s ladder against a
 /// 64-byte pattern caps `k` at 21; [`Bitap::new`] rejects more.
 const MAX_REGISTERS: usize = 22;
+
+/// [`Bitap::step`]'s register count, taken from `k` at run time rather than
+/// fixed by [`Bitap::each_match`]'s dispatch.
+const RUNTIME_K: usize = usize::MAX;
 
 pub struct Bitap {
     /// `masks[c]` has bit `i` set iff `pattern[i] == c` ignoring ASCII case.
@@ -19,6 +25,8 @@ pub struct Bitap {
     rev_masks: [u64; 256],
     len: usize,
     k: usize,
+    /// The bit that says the whole pattern has matched: `1 << (len - 1)`.
+    done: u64,
 }
 
 impl Bitap {
@@ -44,6 +52,7 @@ impl Bitap {
             rev_masks,
             len: pattern.len(),
             k,
+            done: 1 << (pattern.len() - 1),
         })
     }
 
@@ -56,31 +65,75 @@ impl Bitap {
         }
     }
 
-    /// Advance all registers by one haystack byte; returns the smallest error
-    /// count d at which the full pattern just matched. `masks` selects the
-    /// scan direction: [`Bitap::masks`] forwards, [`Bitap::rev_masks`] back.
-    #[inline]
-    fn step(&self, masks: &[u64; 256], r: &mut [u64], byte: u8) -> Option<usize> {
+    /// Advance all registers by one haystack byte; `true` when the full
+    /// pattern just matched within `k` errors. `masks` selects the scan
+    /// direction: [`Bitap::masks`] forwards, [`Bitap::rev_masks`] back.
+    ///
+    /// Registers only grow with the error count (`r[d] ⊇ r[d-1]`, from
+    /// `reset` on by induction), so `r[k]` alone answers "matched", and
+    /// [`Bitap::errors`] finds how well only when it did. Measured against
+    /// testing every register every byte (`searchtime`, cargo registry, 41k
+    /// files): `~recieve` 361 → 310 ms, `~serialze` 453 → 397, `~HashMpa`
+    /// 569 → 517.
+    #[inline(always)]
+    fn step<const K: usize>(
+        &self,
+        masks: &[u64; 256],
+        r: &mut [u64; MAX_REGISTERS],
+        byte: u8,
+    ) -> bool {
+        let k = if K == RUNTIME_K { self.k } else { K };
         let mask = masks[byte as usize];
-        let done = 1u64 << (self.len - 1);
-        let mut hit = None;
         let mut prev_old = r[0]; // R_old[d-1] for the d-th iteration
         r[0] = ((r[0] << 1) | 1) & mask;
-        if r[0] & done != 0 {
-            hit = Some(0);
-        }
-        for d in 1..=self.k {
+        for d in 1..=k {
             let old = r[d];
             r[d] = (((old << 1) | 1) & mask)      // extend a ≤d-error state
                 | prev_old                          // insertion in text
                 | (prev_old << 1)                   // substitution
                 | ((r[d - 1] << 1) | 1); // deletion (pattern byte skipped)
             prev_old = old;
-            if hit.is_none() && r[d] & done != 0 {
-                hit = Some(d);
+        }
+        r[k] & self.done != 0
+    }
+
+    /// Call `hit` with the end of every match a forward scan finds and the
+    /// registers there, which it may reset; stop when it breaks. The budgets
+    /// default searches use get a copy with the register count fixed, so the
+    /// loop unrolls. Measured against the runtime count, on top of the note
+    /// at [`Bitap::step`]: `~recieve` 307–322 → 195–199 ms, `~serialze`
+    /// 391–398 → 239–240, `~HashMpa` 497–505 → 302–304.
+    fn each_match(
+        &self,
+        hay: &[u8],
+        hit: impl FnMut(usize, &mut [u64; MAX_REGISTERS]) -> ControlFlow<()>,
+    ) {
+        match self.k {
+            1 => self.scan::<1>(hay, hit),
+            2 => self.scan::<2>(hay, hit),
+            _ => self.scan::<RUNTIME_K>(hay, hit),
+        }
+    }
+
+    fn scan<const K: usize>(
+        &self,
+        hay: &[u8],
+        mut hit: impl FnMut(usize, &mut [u64; MAX_REGISTERS]) -> ControlFlow<()>,
+    ) {
+        let mut r = [0u64; MAX_REGISTERS];
+        self.reset(&mut r);
+        for (i, &b) in hay.iter().enumerate() {
+            if self.step::<K>(&self.masks, &mut r, b) && hit(i + 1, &mut r).is_break() {
+                return;
             }
         }
-        hit
+    }
+
+    /// The fewest errors the match [`Bitap::step`] just reported has.
+    fn errors(&self, r: &[u64; MAX_REGISTERS]) -> usize {
+        (0..=self.k)
+            .find(|&d| r[d] & self.done != 0)
+            .unwrap_or(self.k)
     }
 
     /// Where the match that ended at `end` with `errors` edits began: the same
@@ -95,10 +148,8 @@ impl Bitap {
         let mut r = [0u64; MAX_REGISTERS];
         self.reset(&mut r);
         for (back, &b) in hay[floor..end].iter().rev().enumerate() {
-            if self
-                .step(&self.rev_masks, &mut r, b)
-                .is_some_and(|d| d <= errors)
-            {
+            self.step::<RUNTIME_K>(&self.rev_masks, &mut r, b);
+            if r[errors] & self.done != 0 {
                 return end - (back + 1);
             }
         }
@@ -121,7 +172,8 @@ impl Bitap {
         let mut best = (errors, end);
         let mut probe = *r;
         for (ahead, &b) in hay[end..].iter().take(errors).enumerate() {
-            if let Some(d) = self.step(&self.masks, &mut probe, b) {
+            if self.step::<RUNTIME_K>(&self.masks, &mut probe, b) {
+                let d = self.errors(&probe);
                 if d < best.0 {
                     best = (d, end + ahead + 1);
                 }
@@ -133,21 +185,18 @@ impl Bitap {
     /// The smallest edit distance (≤ k) at which the pattern occurs in `hay`,
     /// and that occurrence's byte range: the span a frontend marks.
     pub fn best_distance_and_first(&self, hay: &[u8]) -> Option<(usize, (usize, usize))> {
-        let mut r = [0u64; MAX_REGISTERS];
-        self.reset(&mut r);
         let mut best: Option<(usize, usize)> = None;
-        for (i, &b) in hay.iter().enumerate() {
-            if let Some(d) = self.step(&self.masks, &mut r, b) {
-                let end = i + 1;
-                if d == 0 {
-                    best = Some((0, end));
-                    break;
-                }
-                if best.is_none_or(|(cur, _)| d < cur) {
-                    best = Some((d, end));
-                }
+        self.each_match(hay, |end, r| {
+            let d = self.errors(r);
+            if best.is_none_or(|(cur, _)| d < cur) {
+                best = Some((d, end));
             }
-        }
+            if d == 0 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
         best.map(|(d, end)| (d, (self.match_start(hay, end, d), end)))
     }
 
@@ -155,20 +204,17 @@ impl Bitap {
     /// one's byte range in `hay`. After each hit the automaton resets, so
     /// overlapping suffix matches don't inflate counts.
     pub fn count_and_first(&self, hay: &[u8]) -> (usize, Option<(usize, usize)>) {
-        let mut r = [0u64; MAX_REGISTERS];
-        self.reset(&mut r);
         let mut count = 0usize;
         let mut first: Option<(usize, usize)> = None;
-        for (i, &b) in hay.iter().enumerate() {
-            if let Some(d) = self.step(&self.masks, &mut r, b) {
-                count += 1;
-                if first.is_none() {
-                    let (errors, end) = self.refine_end(hay, &r, i + 1, d);
-                    first = Some((self.match_start(hay, end, errors), end));
-                }
-                self.reset(&mut r);
+        self.each_match(hay, |end, r| {
+            count += 1;
+            if first.is_none() {
+                let (errors, end) = self.refine_end(hay, r, end, self.errors(r));
+                first = Some((self.match_start(hay, end, errors), end));
             }
-        }
+            self.reset(r);
+            ControlFlow::Continue(())
+        });
         (count, first)
     }
 }
@@ -514,6 +560,35 @@ mod tests {
             Some(best)
         } else {
             None
+        }
+    }
+
+    /// The budgets with a fixed register count must report exactly the
+    /// matches, and the errors at each, that the runtime-count loop does.
+    #[test]
+    fn fixed_register_counts_agree_with_the_runtime_loop() {
+        fn matches(b: &Bitap, hay: &[u8], fixed: bool) -> Vec<(usize, usize)> {
+            let mut out = Vec::new();
+            let hit = |end, r: &mut [u64; MAX_REGISTERS]| {
+                out.push((end, b.errors(r)));
+                b.reset(r);
+                ControlFlow::Continue(())
+            };
+            if fixed {
+                b.each_match(hay, hit);
+            } else {
+                b.scan::<RUNTIME_K>(hay, hit);
+            }
+            out
+        }
+        let hay = b"the quick brown fox jumps over the lazy dog; The Quikc Browm Fx";
+        for pattern in ["quick", "brown", "fox", "lazy dog", "jumps", "QUICK"] {
+            for k in 1..=2 {
+                let b = Bitap::new(pattern.as_bytes(), k).unwrap();
+                let fixed = matches(&b, hay, true);
+                assert!(!fixed.is_empty(), "{pattern} occurs at k={k}");
+                assert_eq!(fixed, matches(&b, hay, false), "{pattern} k={k}");
+            }
         }
     }
 

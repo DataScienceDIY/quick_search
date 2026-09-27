@@ -6,12 +6,12 @@
 //! the whole watcher fails: a half-watched root looks live while going
 //! silently stale.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use notify::event::{ModifyKind, RenameMode};
 use notify::{
@@ -116,20 +116,15 @@ fn fmt_cap(cap: usize) -> String {
     }
 }
 
-/// Tuning for the whole filesystem-event pipeline.
+/// Tuning for the whole filesystem-event pipeline. The watcher forwards
+/// events as they arrive; the coordinator's queue coalesces them by path and
+/// decides when to apply them.
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
     /// How long the coordinator's queue must go quiet before it is applied.
     pub pending_settle: Duration,
     /// Ceiling on how long `pending_settle` may hold the queue back.
     pub pending_max_defer: Duration,
-    /// Per-directory debounce window.
-    pub throttle_window: Duration,
-    pub tick_interval: Duration,
-    /// Directories *selected* per tick; [`FLUSH_BUDGET`] is the real limit.
-    pub max_dirs_per_tick: usize,
-    /// When to garbage-collect stale throttle entries (idle > window * N).
-    pub prune_max_age_multiplier: u32,
     /// Directory budget; see [`DEFAULT_MAX_WATCHED_DIRS`].
     pub max_watched_dirs: usize,
 }
@@ -139,10 +134,6 @@ impl Default for WatcherConfig {
         Self {
             pending_settle: Duration::from_secs(2),
             pending_max_defer: Duration::from_secs(30),
-            throttle_window: Duration::from_secs(30),
-            tick_interval: Duration::from_millis(500),
-            max_dirs_per_tick: 512,
-            prune_max_age_multiplier: 10,
             max_watched_dirs: DEFAULT_MAX_WATCHED_DIRS,
         }
     }
@@ -156,8 +147,6 @@ struct WatchRegistry {
     cap: usize,
 }
 
-/// How long one flush pass may spend handing events to the sink.
-const FLUSH_BUDGET: Duration = Duration::from_millis(50);
 
 const WATCH_MODE: RecursiveMode = if crate::platform::WATCH_ROOTS_RECURSIVELY {
     RecursiveMode::Recursive
@@ -240,7 +229,9 @@ fn add_watch(reg: &mut WatchRegistry, dir: &Path) -> Result<(), WatchError> {
 
 /// Handle to a running watcher. Dropping calls [`Self::stop`] implicitly.
 pub struct Watcher {
-    stop_flag: Arc<AtomicBool>,
+    /// The loop's own channel: `None` ends it. The notify handle holds the
+    /// other sender, so the channel never closes while the loop runs.
+    stop_tx: mpsc::Sender<Option<NotifyEvent>>,
     handle: Option<JoinHandle<()>>,
     dir_count: Arc<AtomicUsize>,
     degraded: Degraded,
@@ -261,7 +252,8 @@ impl Watcher {
         config: WatcherConfig,
         sink: EventSink,
     ) -> Result<Self, WatchError> {
-        let (tx, rx) = mpsc::channel::<NotifyEvent>();
+        let (tx, rx) = mpsc::channel::<Option<NotifyEvent>>();
+        let stop_tx = tx.clone();
         let degraded: Degraded = Arc::new(Mutex::new(None));
         let degraded_cb = degraded.clone();
         let raw = RecommendedWatcher::new(
@@ -274,7 +266,7 @@ impl Watcher {
                         crate::lock_ok(&degraded_cb).get_or_insert(WatchError::Overflowed);
                         return;
                     }
-                    let _ = tx.send(ev);
+                    let _ = tx.send(Some(ev));
                 }
                 Err(e) => {
                     // The limit can also be hit asynchronously, when notify
@@ -330,11 +322,8 @@ impl Watcher {
         }
 
         let dir_count = Arc::new(AtomicUsize::new(crate::lock_ok(&registry).dirs.len()));
-        let stop_flag = Arc::new(AtomicBool::new(false));
         let ctx = LoopCtx {
             sink,
-            config,
-            stop: stop_flag.clone(),
             registry: registry.clone(),
             filters,
             roots,
@@ -344,7 +333,7 @@ impl Watcher {
         let handle = thread::spawn(move || run_loop(rx, ctx));
 
         Ok(Self {
-            stop_flag,
+            stop_tx,
             handle: Some(handle),
             dir_count,
             degraded,
@@ -376,7 +365,7 @@ impl Watcher {
 
     /// Stop the background thread and join it; safe to call multiple times.
     pub fn stop(&mut self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
+        let _ = self.stop_tx.send(None);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -400,8 +389,6 @@ impl std::fmt::Debug for Watcher {
 
 struct LoopCtx {
     sink: EventSink,
-    config: WatcherConfig,
-    stop: Arc<AtomicBool>,
     registry: Arc<Mutex<WatchRegistry>>,
     filters: WatchFilters,
     /// Configured roots; "hidden" is judged relative to them, since a root
@@ -412,56 +399,21 @@ struct LoopCtx {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueuedOp {
+enum Op {
     Create,
     Modify,
     Remove,
 }
 
-#[derive(Debug)]
-struct DirThrottleEntry {
-    record_time: Instant,
-    queue: HashMap<PathBuf, QueuedOp>,
-    /// Flush on the next tick regardless of window age; set for the first
-    /// event in a previously-idle directory so it reacts fast.
-    immediate: bool,
-}
-
-/// Ticks between sweeps of idle throttle entries.
-const PRUNE_EVERY_TICKS: u32 = 20;
-
-fn run_loop(rx: mpsc::Receiver<NotifyEvent>, ctx: LoopCtx) {
-    let mut throttle: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-    let mut tick_counter: u32 = 0;
-
-    while !ctx.stop.load(Ordering::Relaxed) {
-        let deadline = Instant::now() + ctx.config.tick_interval;
-        while !ctx.stop.load(Ordering::Relaxed) {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(ev) => handle_notify_event(&ev, &mut throttle, &ctx),
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-        }
-
-        if ctx.stop.load(Ordering::Relaxed) {
-            break;
-        }
-
-        flush_ready(&mut throttle, &ctx.sink, &ctx.config);
-
-        tick_counter = tick_counter.wrapping_add(1);
-        if tick_counter.is_multiple_of(PRUNE_EVERY_TICKS) {
-            let max_age = ctx
-                .config
-                .throttle_window
-                .saturating_mul(ctx.config.prune_max_age_multiplier);
-            prune_stale(&mut throttle, max_age);
-        }
+/// Forward each interesting event to the sink as it arrives, blocking in
+/// between; `None` is [`Watcher::stop`]. Nothing is held back here: the
+/// coordinator's queue coalesces by path and waits for `pending_settle`
+/// (at most `pending_max_defer`). A per-directory throttle here used to hold
+/// a directory's second event for 30 s and woke this thread twice a second
+/// while idle.
+fn run_loop(rx: mpsc::Receiver<Option<NotifyEvent>>, ctx: LoopCtx) {
+    while let Ok(Some(ev)) = rx.recv() {
+        handle_notify_event(&ev, &ctx);
     }
 }
 
@@ -525,7 +477,7 @@ fn unwatch_tree(ctx: &LoopCtx, path: &Path) {
 
 /// Whether an event for `path` is worth queueing at all: the same predicate
 /// the walk applies. Under a recursive root watch it alone keeps
-/// `node_modules` churn out of the throttle map. A path the index cannot
+/// `node_modules` churn out of the coordinator's queue. A path the index cannot
 /// spell is dropped (see `path_to_db_string`).
 fn is_event_interesting(ctx: &LoopCtx, path: &Path) -> bool {
     path.to_str().is_some()
@@ -533,11 +485,7 @@ fn is_event_interesting(ctx: &LoopCtx, path: &Path) -> bool {
         && (ctx.filters.include_hidden || !path_has_hidden_component_under(path, &ctx.roots))
 }
 
-fn handle_notify_event(
-    ev: &NotifyEvent,
-    throttle: &mut HashMap<PathBuf, DirThrottleEntry>,
-    ctx: &LoopCtx,
-) {
+fn handle_notify_event(ev: &NotifyEvent, ctx: &LoopCtx) {
     let op = match ev.kind {
         EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if ev.paths.len() == 2 => {
             // A rename is only uninteresting when *both* ends are: out of an
@@ -556,13 +504,9 @@ fn handle_notify_event(
         }
         // Split renames degrade to Create/Remove; notify 6.x does not bundle
         // halves by cookie uniformly across backends.
-        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
-            QueuedOp::Create
-        }
-        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
-            QueuedOp::Remove
-        }
-        EventKind::Modify(_) => QueuedOp::Modify,
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => Op::Create,
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => Op::Remove,
+        EventKind::Modify(_) => Op::Modify,
         _ => return,
     };
 
@@ -570,83 +514,20 @@ fn handle_notify_event(
         if !is_event_interesting(ctx, p) {
             continue;
         }
-        // Keep the watch set in step before debouncing: a directory created
-        // now may be populated before its window expires and needs its watch.
-        match op {
-            QueuedOp::Create => watch_if_new_dir(ctx, p),
-            QueuedOp::Remove => unwatch_tree(ctx, p),
-            QueuedOp::Modify => {}
-        }
-        enqueue(throttle, p.clone(), op);
-    }
-}
-
-fn enqueue(throttle: &mut HashMap<PathBuf, DirThrottleEntry>, path: PathBuf, op: QueuedOp) {
-    let dir = path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| path.clone());
-    let entry = throttle.entry(dir).or_insert_with(|| DirThrottleEntry {
-        record_time: Instant::now(),
-        queue: HashMap::new(),
-        immediate: true,
-    });
-    // Created and deleted within one window: the file never surfaces.
-    if op == QueuedOp::Remove && entry.queue.get(&path) == Some(&QueuedOp::Create) {
-        entry.queue.remove(&path);
-    } else {
-        entry.queue.insert(path, op);
-    }
-}
-
-fn flush_ready(
-    throttle: &mut HashMap<PathBuf, DirThrottleEntry>,
-    sink: &EventSink,
-    config: &WatcherConfig,
-) {
-    let now = Instant::now();
-    let mut ready: Vec<PathBuf> = Vec::new();
-    for (dir, entry) in throttle.iter() {
-        let age = now.saturating_duration_since(entry.record_time);
-        if entry.immediate || (!entry.queue.is_empty() && age >= config.throttle_window) {
-            ready.push(dir.clone());
-            if ready.len() >= config.max_dirs_per_tick {
-                break;
+        // Keep the watch set in step before the event is applied: a
+        // directory created now may be populated at once and needs its watch.
+        let event = match op {
+            Op::Create => {
+                watch_if_new_dir(ctx, p);
+                FsEvent::Create(p.clone())
             }
-        }
-    }
-    let deadline = now + FLUSH_BUDGET;
-    for dir in ready {
-        if Instant::now() >= deadline {
-            break;
-        }
-        if let Some(entry) = throttle.get_mut(&dir) {
-            let drained: Vec<(PathBuf, QueuedOp)> = entry.queue.drain().collect();
-            entry.immediate = false;
-            entry.record_time = now;
-            for (path, op) in drained {
-                let ev = match op {
-                    QueuedOp::Create => FsEvent::Create(path),
-                    QueuedOp::Modify => FsEvent::Modify(path),
-                    QueuedOp::Remove => FsEvent::Remove(path),
-                };
-                sink(ev);
+            Op::Remove => {
+                unwatch_tree(ctx, p);
+                FsEvent::Remove(p.clone())
             }
-        }
-    }
-}
-
-fn prune_stale(throttle: &mut HashMap<PathBuf, DirThrottleEntry>, max_age: Duration) {
-    let now = Instant::now();
-    throttle.retain(|_, entry| {
-        !entry.queue.is_empty()
-            || entry.immediate
-            || now.saturating_duration_since(entry.record_time) < max_age
-    });
-    // `retain` keeps the table sized for the busiest moment this map has ever
-    // seen; a single unpack burst would otherwise hold that memory for days.
-    if throttle.is_empty() {
-        throttle.shrink_to_fit();
+            Op::Modify => FsEvent::Modify(p.clone()),
+        };
+        (ctx.sink)(event);
     }
 }
 

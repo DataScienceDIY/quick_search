@@ -218,59 +218,53 @@ fn open_container(path: &Path) -> Result<Archive, Box<dyn Error>> {
     Ok(ZipArchive::new(BufReader::new(File::open(path)?))?)
 }
 
-/// Inflate one whole member into `buf`, the worker's buffer, reused across
-/// members and files so members cost no allocation after the first document.
-/// Bounded by `limit` ([`super::Limits::inflate`]); the buffer never shrinks,
-/// so one hostile document leaves the worker holding up to `limit` for the
-/// rest of the pass.
-fn member_bytes<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
+/// One member, inflated as the parser reads it, bounded by `limit`
+/// ([`super::Limits::inflate`]): inflation stops where parsing does, at the
+/// text limit, and nothing holds a whole member. Measured against inflating
+/// each member into a per-worker buffer that kept its largest size
+/// (`extractprobe`, 1.25 MB `document.xml` members): peak live per worker
+/// 2.3 → 0.4 MiB, VmHWM 20.5 → 14.4 MiB, throughput unchanged.
+fn member<'a, R: Read + Seek>(
+    archive: &'a mut ZipArchive<R>,
     name: &str,
     limit: usize,
-    buf: &mut Vec<u8>,
-) -> Result<(), Box<dyn Error>> {
-    buf.clear();
-    archive
-        .by_name(name)?
-        .take(limit as u64)
-        .read_to_end(buf)?;
-    Ok(())
+) -> Result<impl BufRead + 'a, Box<dyn Error>> {
+    Ok(BufReader::new(archive.by_name(name)?.take(limit as u64)))
 }
 
-/// Names of the `.xml` members under `prefix`, in archive order, not
-/// `file_names()`, which iterates a hash map and would shuffle the slides of
-/// every presentation.
-fn xml_members_under<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    prefix: &str,
-) -> Result<Vec<String>, Box<dyn Error>> {
-    let mut names = Vec::new();
-    for i in 0..archive.len() {
-        let name = archive.by_index(i)?.name().to_string();
-        if name.starts_with(prefix) && name.ends_with(".xml") {
-            names.push(name);
-        }
-    }
-    Ok(names)
+/// Names of the `.xml` members under `prefix`, in number order: shorter
+/// first, so `slide2.xml` comes before `slide10.xml`. From the central
+/// directory the archive already holds; naming members through `by_index`
+/// seeks to and reads each one's local header, about 3 `lseek` and 2 reads a
+/// member, twice for a deck. Measured (`extractprobe`, 20 copies of a real
+/// 86-member deck plus 4 other documents): `lseek` + `read` calls 22,289 →
+/// 4,444, throughput 1,800 → 2,330 files/s.
+fn xml_members_under<R: Read + Seek>(archive: &ZipArchive<R>, prefix: &str) -> Vec<String> {
+    let mut names: Vec<String> = archive
+        .file_names()
+        .filter(|name| name.starts_with(prefix) && name.ends_with(".xml"))
+        .map(str::to_string)
+        .collect();
+    names.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+    names
 }
 
 /// A format whose whole text lives in one member under one spec.
 fn single_member(
     path: &Path,
-    member: &str,
+    name: &str,
     spec: &TextSpec,
     out: &mut String,
     scratch: &mut Scratch,
 ) -> Result<(), Box<dyn Error>> {
     let limits = scratch.limits();
     let mut archive = open_container(path)?;
-    let (bytes, events) = scratch.container_bufs();
-    member_bytes(&mut archive, member, limits.inflate, bytes)?;
-    collect_xml_text(bytes.as_slice(), spec, out, limits.text, events)
+    let xml = member(&mut archive, name, limits.inflate)?;
+    collect_xml_text(xml, spec, out, limits.text, scratch.events())
 }
 
 /// Concatenate what `collect` gets out of each `.xml` member under `prefix`,
-/// in archive order, stopping once the text reaches [`super::Limits::text`],
+/// in number order, stopping once the text reaches [`super::Limits::text`],
 /// the point past which the caller would discard it anyway.
 fn collect_members(
     archive: &mut Archive,
@@ -279,7 +273,7 @@ fn collect_members(
     limit: usize,
     mut collect: impl FnMut(&mut Archive, &str, &mut String) -> Result<(), Box<dyn Error>>,
 ) -> Result<(), Box<dyn Error>> {
-    for name in xml_members_under(archive, prefix)? {
+    for name in xml_members_under(archive, prefix) {
         if out.len() >= limit {
             break;
         }
@@ -300,15 +294,15 @@ fn collect_members(
 fn extract_pptx(path: &Path, out: &mut String, scratch: &mut Scratch) -> Result<(), Box<dyn Error>> {
     let limits = scratch.limits();
     let mut archive = open_container(path)?;
-    let (bytes, events) = scratch.container_bufs();
+    let events = scratch.events();
     collect_members(
         &mut archive,
         "ppt/slides/slide",
         out,
         limits.text,
         |archive, name, out| {
-            member_bytes(archive, name, limits.inflate, bytes)?;
-            collect_xml_text(bytes.as_slice(), &PPTX, out, limits.text, events)?;
+            let xml = member(archive, name, limits.inflate)?;
+            collect_xml_text(xml, &PPTX, out, limits.text, events)?;
             out.push_str("\n--- New Slide ---\n");
             Ok(())
         },
@@ -321,9 +315,9 @@ fn extract_pptx(path: &Path, out: &mut String, scratch: &mut Scratch) -> Result<
         out,
         limits.text,
         |archive, name, out| {
-            member_bytes(archive, name, limits.inflate, bytes)?;
+            let xml = member(archive, name, limits.inflate)?;
             out.push_str("\n--- Speaker Notes ---\n");
-            collect_xml_text(bytes.as_slice(), &PPTX, out, limits.text, events)
+            collect_xml_text(xml, &PPTX, out, limits.text, events)
         },
     )
 }
@@ -338,14 +332,13 @@ fn extract_pptx(path: &Path, out: &mut String, scratch: &mut Scratch) -> Result<
 fn shared_strings<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     limit: usize,
-    bytes: &mut Vec<u8>,
     events: &mut Vec<u8>,
     strings: &mut Vec<String>,
 ) {
-    if member_bytes(archive, "xl/sharedStrings.xml", limit, bytes).is_err() {
+    let Ok(xml) = member(archive, "xl/sharedStrings.xml", limit) else {
         return;
-    }
-    let mut reader = Reader::from_reader(bytes.as_slice());
+    };
+    let mut reader = Reader::from_reader(xml);
     // No `trim_text`; see `collect_xml_text`.
     events.clear();
     let mut in_text = false;
@@ -481,18 +474,18 @@ fn collect_sheet<R: BufRead>(
 fn extract_xlsx(path: &Path, out: &mut String, scratch: &mut Scratch) -> Result<(), Box<dyn Error>> {
     let limits = scratch.limits();
     let mut archive = open_container(path)?;
-    // All three at once: the sheets are read while the table is live, and
+    // Both at once: the sheets are read while the table is live, and
     // separate `&mut scratch` borrows cannot overlap.
-    let (bytes, events, strings) = scratch.xlsx_bufs();
-    shared_strings(&mut archive, limits.inflate, bytes, events, strings);
+    let (events, strings) = scratch.xlsx_bufs();
+    shared_strings(&mut archive, limits.inflate, events, strings);
     collect_members(
         &mut archive,
         "xl/worksheets/sheet",
         out,
         limits.text,
         |archive, name, out| {
-            member_bytes(archive, name, limits.inflate, bytes)?;
-            collect_sheet(bytes.as_slice(), strings, out, limits.text, events)
+            let xml = member(archive, name, limits.inflate)?;
+            collect_sheet(xml, strings, out, limits.text, events)
         },
     )
 }
@@ -796,7 +789,7 @@ mod tests {
          </sheetData></worksheet>";
 
     #[test]
-    fn pptx_marks_each_slide_and_keeps_archive_order() {
+    fn pptx_marks_each_slide() {
         let p = container(
             "pptx",
             "pptx",
@@ -809,6 +802,36 @@ mod tests {
             extract_document_text(&p, "pptx").unwrap(),
             "Title\nBody\n\n--- New Slide ---\nTitle\nBody\n\n--- New Slide ---\n"
         );
+    }
+
+    /// Slides come out in number order whatever order the archive stores
+    /// them in, and `slide10` is not read between `slide1` and `slide2`.
+    #[test]
+    fn pptx_slides_come_out_in_number_order() {
+        let slide = |text: &str| {
+            format!(
+                "<p:sld><p:cSld><p:spTree><p:sp><p:txBody>\
+                 <a:p><a:r><a:t>{text}</a:t></a:r></a:p>\
+                 </p:txBody></p:sp></p:spTree></p:cSld></p:sld>"
+            )
+        };
+        let (s10, s2, s1) = (slide("ten"), slide("two"), slide("one"));
+        let p = container(
+            "pptx-order",
+            "pptx",
+            &[
+                ("ppt/slides/slide10.xml", s10.as_str()),
+                ("ppt/slides/slide2.xml", s2.as_str()),
+                ("ppt/slides/slide1.xml", s1.as_str()),
+            ],
+        );
+        let text = extract_document_text(&p, "pptx").unwrap();
+        let slides: Vec<&str> = text
+            .split("\n--- New Slide ---\n")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(slides, ["one", "two", "ten"]);
     }
 
     /// Speaker notes live in parts of their own that the slide text never

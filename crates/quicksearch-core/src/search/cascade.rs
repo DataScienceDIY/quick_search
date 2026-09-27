@@ -48,39 +48,72 @@ const CANCEL_CHECK_ROWS: usize = 256;
 /// Snippet window budget: the GUI trims to column width; mouseover shows the rest.
 const SNIPPET_WINDOW_BYTES: usize = 600;
 
-const SNIPPET_OPTS: snippet::Options = snippet::Options {
-    approx_bytes: SNIPPET_WINDOW_BYTES,
-};
-
-/// The Content Match snippet for one document body, cut exactly as the
-/// full-text passes cut it; shared with [`crate::live`] so a re-cut matches.
-/// `folded` must be `text` ASCII-lowercased; the fold preserves byte length,
-/// so offsets found in it slice `text`.
-pub fn text_snippet(
-    pattern: &crate::query::pattern::TermPattern,
-    text: &str,
-    folded: &str,
-) -> Option<snippet::Snippet> {
-    text_snippet_counted(pattern, text, folded)
-        .map(|(snip, _)| snip)
-        .or_else(|| {
-            pattern.find_first_folded(folded).map(|r| {
-                // A greedy pattern can match megabytes; clamp before the window.
-                let r = clamp_match_range(text, r, SNIPPET_WINDOW_BYTES);
-                snippet::window_around(text, (r.start, r.end), &SNIPPET_OPTS)
-            })
-        })
+/// How one document body matched the term: stage 5 when it occurs exactly
+/// as typed, 6 when only in another case; `count` is what the stage ranks
+/// on, `snippet` the window around the first occurrence.
+#[derive(Debug, Clone)]
+pub struct BodyMatch {
+    pub stage: u8,
+    pub count: usize,
+    pub snippet: snippet::Snippet,
 }
 
-/// [`text_snippet`] for a literal pattern, plus the case-insensitive
-/// occurrence count found on the way. `None` when the pattern is not literal.
-pub fn text_snippet_counted(
+/// The term's match in one document body, verified and cut exactly as the
+/// full-text pass does; `None` when it does not occur. Shared with
+/// [`crate::live`], so a re-cut matches. `lower` is reused scratch for the
+/// folded body a literal is searched in.
+///
+/// One sweep per body where there were three: a literal counts both cases in
+/// its one folded scan, and a wildcard is never folded, its exact-case regex
+/// giving the count and the first match together. Measured against folding
+/// every body, then a folded scan, a case-sensitive recount and, for a
+/// wildcard, a third scan for the window (`searchtime`, cargo registry, 41k
+/// files): `Hash*Map` 103.5–104.2 → 97.4–98.0 ms, `Serial*ize` 56–59 → 53.5;
+/// literals within ±2% (`serialize` 38.6–39.2 → 38.7–39.2).
+pub fn body_match(
     pattern: &crate::query::pattern::TermPattern,
     text: &str,
-    folded: &str,
-) -> Option<(snippet::Snippet, usize)> {
-    let term = pattern.literal_folded()?;
-    Some(snippet::extract_folded(text, folded, term, &SNIPPET_OPTS))
+    lower: &mut String,
+) -> Option<BodyMatch> {
+    use crate::query::pattern::TermPattern;
+    match pattern {
+        TermPattern::Empty => None,
+        TermPattern::Literal(_) => {
+            let (typed, term) = (pattern.literal()?, pattern.literal_folded()?);
+            fold_into(lower, text);
+            let found = snippet::extract_folded(text, lower, term, typed, SNIPPET_WINDOW_BYTES)?;
+            let (stage, count) = match found.exact {
+                0 => (6, found.count),
+                exact => (5, exact),
+            };
+            Some(BodyMatch {
+                stage,
+                count,
+                snippet: found.snippet,
+            })
+        }
+        TermPattern::Wildcard(w) => {
+            let (stage, (count, first)) = match w.count_and_first(text, false) {
+                (0, _) => (6, w.count_and_first(text, true)),
+                exact => (5, exact),
+            };
+            // A greedy pattern can match megabytes; clamp before the window.
+            let r = clamp_match_range(text, first?, SNIPPET_WINDOW_BYTES);
+            Some(BodyMatch {
+                stage,
+                count,
+                snippet: snippet::window_around(text, (r.start, r.end), SNIPPET_WINDOW_BYTES),
+            })
+        }
+    }
+}
+
+/// Fold `text` into `dst`, reusing its allocation. The ASCII fold is
+/// byte-length preserving, so folded offsets are valid in the original.
+fn fold_into(dst: &mut String, text: &str) {
+    dst.clear();
+    dst.push_str(text);
+    dst.make_ascii_lowercase();
 }
 
 /// The fuzzy full-text match in one document body: occurrence count within
@@ -92,7 +125,7 @@ pub fn fuzzy_snippet(
     text: &str,
 ) -> Option<(usize, snippet::Snippet)> {
     let (count, first) = bitap.count_and_first(text.as_bytes());
-    first.map(|range| (count, snippet::window_around(text, range, &SNIPPET_OPTS)))
+    first.map(|range| (count, snippet::window_around(text, range, SNIPPET_WINDOW_BYTES)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -465,13 +498,20 @@ impl<'a> Cx<'a> {
         self.flush_pass(deferred.hits, deferred.overflowed);
     }
 
-    /// Sort + cut back to display-limit room once past the cap; true if anything dropped.
+    /// Cut a deferred buffer back to display-limit room once past the cap;
+    /// true if anything dropped. Partitioned, not sorted: [`Cx::flush_pass`]
+    /// sorts what is left. Measured against a full sort (`searchtime`, cargo
+    /// registry, terms every path holds): `1949cf` 25–30 → 21–22 ms, `src`
+    /// 40–42 → 37–39, `crates` 89–99 → 86–87.
     fn enforce_cap(&self, buf: &mut Vec<SearchHit>) -> bool {
         if buf.len() <= self.buffer_cap() {
             return false;
         }
-        buf.sort_by(rank_order);
-        buf.truncate(self.remaining());
+        let keep = self.remaining();
+        if keep > 0 {
+            buf.select_nth_unstable_by(keep - 1, rank_order);
+        }
+        buf.truncate(keep);
         true
     }
 }

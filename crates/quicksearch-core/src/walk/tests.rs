@@ -177,9 +177,9 @@ fn a_non_utf8_name_is_dropped_at_the_entry() {
     );
 }
 
-/// A `continue` in `read_directory` leaves the name out of `present`, and
-/// everything left out of `present` is deleted; the row spelled with the lossy
-/// name belongs to a different file, which must mark itself present.
+/// A `continue` in `read_directory` leaves the name's row in `rows`, and
+/// every row left there is deleted; the row spelled with the lossy name
+/// belongs to a different file, which must take its own row out.
 #[test]
 fn dropping_a_bad_entry_deletes_nothing() {
     let root = tmp_tree("nonutf8-stale");
@@ -659,6 +659,50 @@ fn a_directory_reports_rows_with_no_file_behind_them() {
     );
 }
 
+/// A directory wider than one job is spread across the pool, and each file
+/// takes its stored mtime with it: every chunk must classify against the
+/// file's own row, and only the row with no file is stale.
+#[test]
+fn every_file_of_a_wide_directory_is_classified_against_its_own_row() {
+    let root = tmp_tree("wide");
+    let total = FILES_PER_JOB * 2 + 7;
+    let path = |i: usize| root.join(format!("f{:04}.txt", i));
+    for i in 0..total {
+        touch(&path(i), b"x");
+    }
+    let mtime =
+        |i: usize| crate::file_handling::mtime_secs(&fs::metadata(path(i)).unwrap()).unwrap();
+    // Thirds: unchanged, changed, never indexed.
+    let mut rows: Vec<(String, u64)> = (0..total)
+        .filter(|i| i % 3 != 2)
+        .map(|i| (path_to_db_string(&path(i)), mtime(i) + (i % 3) as u64))
+        .collect();
+    let gone = path_to_db_string(&root.join("gone.txt"));
+    rows.push((gone.clone(), 1));
+    let db = db_with("wide", &rows);
+
+    let (mut files, mut stale) = (Vec::new(), Vec::new());
+    for event in start(&root, &db) {
+        match event {
+            WalkEvent::File(f) => files.push(f),
+            WalkEvent::Stale(paths) => stale.extend(paths),
+        }
+    }
+
+    assert_eq!(files.len(), total);
+    for f in &files {
+        let name = Path::new(&f.path).file_name().unwrap().to_str().unwrap();
+        let i: usize = name[1..5].parse().unwrap();
+        let want = [
+            FileIndexAction::Skip,
+            FileIndexAction::Update,
+            FileIndexAction::Insert,
+        ][i % 3];
+        assert_eq!(f.action, want, "{}", name);
+    }
+    assert_eq!(stale, vec![gone], "only the row with no file behind it");
+}
+
 #[test]
 #[cfg(unix)]
 fn an_unreadable_directory_reports_nothing_stale() {
@@ -819,7 +863,7 @@ fn the_index_and_its_sidecars_are_never_walked() {
 
 /// A stored row for the index itself has to go, or the live watcher and
 /// duplicate verification keep opening the file; a skip would keep the row,
-/// so the walk leaves the name out of the directory's `present` set instead.
+/// so the walk leaves the name's row in the directory's `rows` instead.
 #[test]
 fn a_stored_row_for_the_index_falls_to_the_stale_sweep() {
     let root = crate::testutil::scratch_dir_canonical("walk-self-index-stale");
