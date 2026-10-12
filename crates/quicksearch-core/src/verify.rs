@@ -4,17 +4,24 @@
 //! second time is worth it only because the bytes are compared.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Total read-buffer memory, split across the files being compared: a group
-/// can be thousands of files (a hardlink farm), so a fixed per-file buffer
-/// would become the largest allocation the process ever makes.
+/// Read-buffer memory for one batch, split evenly across the reference and
+/// the batch's members: chunk = CHUNK_BUDGET / (batch + 1), at most
+/// [`MAX_CHUNK`]. Only one batch is read at a time, so the bound holds
+/// whatever the group size (a hardlink farm can be thousands of files).
 const CHUNK_BUDGET: usize = 8 * 1024 * 1024;
-const MIN_CHUNK: usize = 16 * 1024;
 const MAX_CHUNK: usize = 256 * 1024;
+
+/// Members held open at once, besides the reference. Descriptors are a
+/// per-process limit (RLIMIT_NOFILE is 1024 on Linux and often 256 on
+/// macOS) shared with search, SQLite and a concurrent run's extraction, so
+/// a large group is compared a batch at a time. It also floors the chunk:
+/// CHUNK_BUDGET / (MAX_OPEN + 1) is about 126 KiB.
+const MAX_OPEN: usize = 64;
 
 /// How often progress is emitted; each one repaints the UI.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -76,8 +83,10 @@ struct Live {
     buf: Vec<u8>,
 }
 
-/// Compare every path against the first one that opens, byte for byte.
-/// Emits `Progress` while it works and exactly one terminal update.
+/// Compare every path against the first one that opens, byte for byte. The
+/// rest are compared in input order, in batches of at most [`MAX_OPEN`],
+/// each batch reading the reference again from its start. Emits `Progress`
+/// while it works and exactly one terminal update.
 pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnMut(VerifyUpdate)) {
     if cancel.load(Ordering::Relaxed) {
         on(VerifyUpdate::Cancelled);
@@ -85,23 +94,19 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
     }
     let mut verdicts = vec![MemberVerdict::Identical; paths.len()];
 
-    // The reference is the first path that both opens and stats: one
-    // unreadable member must not cost the answer about all the others.
-    let mut reference: Option<(usize, File, u64)> = None;
-    let mut rest: Vec<(usize, File)> = Vec::new();
+    // The reference is the first path that opens: one unreadable member must
+    // not cost the answer about all the others. Its handle stays open for
+    // the whole run, and the length its `fstat` gave is the one every member
+    // must have. `open_regular_file`, here and per batch: a member replaced
+    // by a FIFO since the walk would strand this worker on a blocking open.
+    let mut reference = None;
     for (i, path) in paths.iter().enumerate() {
-        // `open_regular_file`: a member replaced by a FIFO since the walk
-        // would strand this worker on a blocking open.
-        match (
-            crate::platform::open_regular_file(path),
-            reference.is_some(),
-        ) {
-            (Err(e), _) => verdicts[i] = MemberVerdict::Unreadable(describe(path, &e)),
-            (Ok(file), true) => rest.push((i, file)),
-            (Ok(file), false) => match file.metadata() {
-                Ok(m) => reference = Some((i, file, m.len())),
-                Err(e) => verdicts[i] = MemberVerdict::Unreadable(describe(path, &e)),
-            },
+        match crate::platform::open_regular_file(path) {
+            Ok((file, meta)) => {
+                reference = Some((i, file, meta.len()));
+                break;
+            }
+            Err(e) => verdicts[i] = MemberVerdict::Unreadable(describe(path, &e)),
         }
     }
 
@@ -115,108 +120,167 @@ pub fn verify_identical(paths: &[PathBuf], cancel: &AtomicBool, on: &mut dyn FnM
         return;
     };
 
-    // A length mismatch is decided from the handles, before a byte is read.
-    let mut live: Vec<Live> = Vec::with_capacity(rest.len());
-    for (i, file) in rest {
-        match file.metadata() {
-            Ok(m) if m.len() != reference_len => {
-                verdicts[i] = MemberVerdict::LengthDiffers {
-                    len: m.len(),
-                    reference_len,
-                };
-            }
-            Ok(_) => live.push(Live {
-                index: i,
-                file,
-                buf: Vec::new(),
-            }),
-            Err(e) => verdicts[i] = MemberVerdict::Unreadable(describe(&paths[i], &e)),
-        }
-    }
-
-    let chunk = (CHUNK_BUDGET / (live.len() + 1)).clamp(MIN_CHUNK, MAX_CHUNK);
-    let mut reference_buf = vec![0u8; chunk];
-    for l in live.iter_mut() {
-        l.buf = vec![0u8; chunk];
-    }
-
-    let bytes_total = match live.len() {
-        0 => 0,
-        n => reference_len.saturating_mul(n as u64 + 1),
-    };
+    // Every member once and the reference once per batch, less what opening
+    // decides: a member whose length differs or that will not open reads
+    // nothing, nor does the reference for a batch left with no member. Exact
+    // unless a member differs or the reference fails part way.
+    let members = paths.len() - reference - 1;
+    let mut bytes_total =
+        reference_len.saturating_mul((members + members.div_ceil(MAX_OPEN)) as u64);
     let mut bytes_read = 0u64;
-    let mut offset = 0u64;
     // Backdated so the first chunk reports: a progress bar that only appears
     // after the first interval reads as a frozen window on a slow disk.
     let mut last_progress = Instant::now()
         .checked_sub(PROGRESS_INTERVAL)
         .unwrap_or_else(Instant::now);
 
-    while !live.is_empty() {
-        if cancel.load(Ordering::Relaxed) {
-            on(VerifyUpdate::Cancelled);
-            return;
+    for start in (reference + 1..paths.len()).step_by(MAX_OPEN) {
+        let end = (start + MAX_OPEN).min(paths.len());
+        // A length mismatch is decided from the handles, before a byte is
+        // read, and its handle is closed at once.
+        let mut live: Vec<Live> = Vec::with_capacity(end - start);
+        for i in start..end {
+            match crate::platform::open_regular_file(&paths[i]) {
+                Ok((_, meta)) if meta.len() != reference_len => {
+                    verdicts[i] = MemberVerdict::LengthDiffers {
+                        len: meta.len(),
+                        reference_len,
+                    };
+                    bytes_total = bytes_total.saturating_sub(reference_len);
+                }
+                Ok((file, _)) => live.push(Live {
+                    index: i,
+                    file,
+                    buf: Vec::new(),
+                }),
+                Err(e) => {
+                    verdicts[i] = MemberVerdict::Unreadable(describe(&paths[i], &e));
+                    bytes_total = bytes_total.saturating_sub(reference_len);
+                }
+            }
+        }
+        if live.is_empty() {
+            bytes_total = bytes_total.saturating_sub(reference_len);
         }
 
-        // Termination is driven by what the reference actually reads, so a
-        // file truncated underneath us degrades to a short comparison
-        // instead of a hang or a false match.
-        let n = match read_chunk(&mut reference_file, &mut reference_buf) {
-            Ok(0) => break, // EOF: everything still live matched all the way.
-            Ok(n) => n,
-            Err(e) => {
-                verdicts[reference] = MemberVerdict::Unreadable(describe(&paths[reference], &e));
-                // Survivors agreed up to here but cannot be finished.
-                for l in live.iter() {
-                    verdicts[l.index] = MemberVerdict::Unreadable(format!(
-                        "compared only to byte {offset}: {} could not be read to the end",
+        let chunk = (CHUNK_BUDGET / (live.len() + 1)).min(MAX_CHUNK);
+        let mut reference_buf = vec![0u8; chunk];
+        for l in live.iter_mut() {
+            l.buf = vec![0u8; chunk];
+        }
+
+        // Set when the reference fails or changes: why every member the run
+        // never reached is not Identical either.
+        let mut stop: Option<String> = None;
+        let mut offset = 0u64;
+        while !live.is_empty() {
+            if cancel.load(Ordering::Relaxed) {
+                on(VerifyUpdate::Cancelled);
+                return;
+            }
+
+            // The reference is read only up to the length the members were
+            // matched against: where it ends within that drives termination,
+            // and growth past it shows in its handle's length.
+            let want = (chunk as u64).min(reference_len - offset) as usize;
+            // Each batch reads the reference from its start; a failed seek is
+            // a failed read.
+            let read = match offset {
+                0 => reference_file.rewind(),
+                _ => Ok(()),
+            }
+            .and_then(|()| read_chunk(&mut reference_file, &mut reference_buf[..want]));
+            let n = match read {
+                // The reference ended, or reached the length it had. It
+                // changed if it ended early or its handle now says another
+                // length; a survivor changed if its handle does. This arm
+                // must end the batch: falling through as a read of 0 bytes
+                // would loop forever.
+                Ok(0) => {
+                    if offset != reference_len || !has_len(&reference_file, reference_len) {
+                        let why = changed(&paths[reference]);
+                        verdicts[reference] = MemberVerdict::Unreadable(why.clone());
+                        for l in &live {
+                            verdicts[l.index] = MemberVerdict::Unreadable(why.clone());
+                        }
+                        stop = Some(why);
+                    } else {
+                        for l in live.iter().filter(|l| !has_len(&l.file, offset)) {
+                            verdicts[l.index] = MemberVerdict::Unreadable(changed(&paths[l.index]));
+                        }
+                    }
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    verdicts[reference] =
+                        MemberVerdict::Unreadable(describe(&paths[reference], &e));
+                    // Survivors agreed up to here but cannot be finished.
+                    for l in live.iter() {
+                        verdicts[l.index] = MemberVerdict::Unreadable(format!(
+                            "compared only to byte {offset}: {} could not be read to the end",
+                            paths[reference].display()
+                        ));
+                    }
+                    stop = Some(format!(
+                        "not compared: {} could not be read to the end",
                         paths[reference].display()
                     ));
+                    break;
                 }
-                break;
-            }
-        };
-        bytes_read += n as u64;
-
-        // A member that reaches a verdict stops being read; the verdict goes
-        // in by index, so the order `live` keeps does not matter.
-        live.retain_mut(|l| {
-            let verdict = match read_chunk(&mut l.file, &mut l.buf[..n]) {
-                Ok(m) => {
-                    bytes_read += m as u64;
-                    let common = n.min(m);
-                    if let Some(k) = first_difference(&reference_buf[..common], &l.buf[..common]) {
-                        Some(MemberVerdict::DiffersAt(offset + k as u64))
-                    } else if m < n {
-                        // Same length a moment ago, shorter now.
-                        Some(MemberVerdict::Unreadable(format!(
-                            "{}: ended at byte {} while the file it was compared \
-                             against had more",
-                            paths[l.index].display(),
-                            offset + m as u64
-                        )))
-                    } else {
-                        None
-                    }
-                }
-                Err(e) => Some(MemberVerdict::Unreadable(describe(&paths[l.index], &e))),
             };
-            match verdict {
-                Some(v) => {
-                    verdicts[l.index] = v;
-                    false
-                }
-                None => true,
-            }
-        });
-        offset += n as u64;
+            bytes_read += n as u64;
 
-        if last_progress.elapsed() >= PROGRESS_INTERVAL {
-            last_progress = Instant::now();
-            on(VerifyUpdate::Progress {
-                bytes_read,
-                bytes_total,
+            // A member that reaches a verdict stops being read; the verdict
+            // goes in by index, so the order `live` keeps does not matter.
+            live.retain_mut(|l| {
+                let verdict = match read_chunk(&mut l.file, &mut l.buf[..n]) {
+                    Ok(m) => {
+                        bytes_read += m as u64;
+                        let common = n.min(m);
+                        if let Some(k) =
+                            first_difference(&reference_buf[..common], &l.buf[..common])
+                        {
+                            Some(MemberVerdict::DiffersAt(offset + k as u64))
+                        } else if m < n {
+                            // Same length a moment ago, shorter now.
+                            Some(MemberVerdict::Unreadable(format!(
+                                "{}: ended at byte {} while the file it was compared \
+                                 against had more",
+                                paths[l.index].display(),
+                                offset + m as u64
+                            )))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => Some(MemberVerdict::Unreadable(describe(&paths[l.index], &e))),
+                };
+                match verdict {
+                    Some(v) => {
+                        verdicts[l.index] = v;
+                        false
+                    }
+                    None => true,
+                }
             });
+            offset += n as u64;
+
+            if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                last_progress = Instant::now();
+                on(VerifyUpdate::Progress {
+                    bytes_read,
+                    bytes_total,
+                });
+            }
+        }
+
+        // No member the run never reached keeps the Identical default.
+        if let Some(why) = stop {
+            for v in &mut verdicts[end..] {
+                *v = MemberVerdict::Unreadable(why.clone());
+            }
+            break;
         }
     }
 
@@ -255,6 +319,16 @@ fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
             .position(|(x, y)| x != y)
             .unwrap_or(a.len().min(b.len())),
     )
+}
+
+/// Whether the handle still says `len` bytes. A failed `fstat` counts as a
+/// change: only a length it confirms can back an Identical.
+fn has_len(file: &File, len: u64) -> bool {
+    file.metadata().is_ok_and(|m| m.len() == len)
+}
+
+fn changed(path: &Path) -> String {
+    format!("{} changed while it was being compared", path.display())
 }
 
 fn describe(path: &Path, e: &std::io::Error) -> String {

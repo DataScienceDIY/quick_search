@@ -17,8 +17,9 @@ const QUERY_SYNTAX: [(&str, &str); 9] = [
         "* matches any run of characters (within a line); also works in name: values",
     ),
     (
-        "regex:\"(foo|bar)\\d+\"",
-        "regular expression, matched against names, contents, and paths",
+        "regex:(foo|bar)\\d+",
+        "regular expression, matched against names, contents, and paths; quote patterns \
+         containing spaces",
     ),
     (
         "type:Document",
@@ -27,7 +28,7 @@ const QUERY_SYNTAX: [(&str, &str); 9] = [
     ),
     (
         "modified:>=2024-01-01",
-        "modification date (yyyy-mm-dd); also <, <=, > and =",
+        "modification date (yyyy-mm-dd), in whole local days; also <, <=, > and =",
     ),
     (
         "path:/home/me/docs",
@@ -68,6 +69,10 @@ impl SearchTab {
                 ui.label("Example:");
                 ui.monospace("type:Document modified:>=2024-01-01 quarterly budget");
                 ui.add_space(6.0);
+                ui.label(hint(
+                    "Keys: Up and Down, or Page Up and Page Down, move through the results \
+                     while you type; Enter opens the selected result, or the top one.",
+                ));
                 ui.label(hint(
                     "Ranking: exact filename matches, then filename substrings, then \
                      full-text matches (ordered by occurrences), then fuzzy matches \

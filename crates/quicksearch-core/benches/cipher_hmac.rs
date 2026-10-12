@@ -26,8 +26,7 @@ const MODES: [HmacMode; 3] = [HmacMode::Off, HmacMode::Sha256, HmacMode::Sha512]
 
 /// The shape tier: all four arms, cheap enough to run every time.
 const SHAPE_FILES: usize = 200_000;
-/// The confirmation tier, where the working set stops fitting the OS cache and
-/// real reads enter. `QSB_HMAC_SHAPE_ONLY=1` skips it.
+/// The confirmation tier. `QSB_HMAC_SHAPE_ONLY=1` skips it.
 const SCALE_FILES: usize = 1_000_000;
 
 fn enabled() -> bool {
@@ -63,7 +62,7 @@ fn main() {
         eprintln!("skipping: set QSB_HMAC=1 to run");
         return;
     }
-    arms::warn_if_tmpdir_unset("every 'cold' figure below is RAM and the scale tier may not fit");
+    arms::warn_if_tmpdir_unset("the scale tier may not fit");
 
     tier(SHAPE_FILES, "shape");
     if shape_only() {

@@ -1,5 +1,6 @@
-//! Build identity: bakes the commit into `QS_COMMIT`, and on Windows
-//! compiles a VERSIONINFO resource so Explorer's Properties shows a version.
+//! Build identity: bakes the commit into `QS_COMMIT`, and for windows-gnu
+//! (the release target) compiles a VERSIONINFO resource so Explorer's
+//! Properties shows a version.
 //! No dependencies on purpose: a build-script crate would land in
 //! Cargo.lock, and every build here runs `--locked`.
 

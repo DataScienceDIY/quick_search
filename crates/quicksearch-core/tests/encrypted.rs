@@ -85,7 +85,7 @@ fn encrypted_index_lifecycle() {
         .unwrap();
         drop(conn);
 
-        let conn = db::open::open_maintenance(&db_path.to_string_lossy()).unwrap();
+        let conn = db::open_existing(&db_path.to_string_lossy(), true).unwrap();
         assert!(
             quicksearch_core::db::repo::maintain(&conn, &db_path.to_string_lossy()).unwrap(),
             "that much slack should have been reclaimed"

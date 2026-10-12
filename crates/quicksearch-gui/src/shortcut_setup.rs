@@ -583,11 +583,10 @@ mod lnk {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn the_desktop_is_detected_from_the_list_case_insensitively() {
         assert_eq!(desktop_for("GNOME"), Desktop::Gnome);
@@ -599,7 +598,6 @@ mod tests {
     }
 
     /// Round trip through the exact spellings gsettings prints.
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn the_gvariant_list_round_trips() {
         assert_eq!(parse_string_list("@as []"), Vec::<String>::new());
@@ -612,7 +610,6 @@ mod tests {
 
     /// A path with a quote in it must survive both directions, or the write
     /// back would corrupt the user's other bindings.
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn escaped_quotes_round_trip() {
         let paths = vec!["/it's/".to_string(), "/back\\slash/".to_string()];
@@ -622,7 +619,6 @@ mod tests {
 
     /// Malicious or truncated gsettings output must never panic; at worst it
     /// yields fewer paths.
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn garbage_lists_parse_to_something_harmless() {
         for garbage in ["", "[", "['unterminated", "not a list", "['a'", "\\"] {
@@ -632,7 +628,6 @@ mod tests {
 
     /// What the KDE launch key runs: a well-formed desktop entry whose Exec
     /// is the toggle command, hidden from menus.
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn the_kde_desktop_entry_launches_the_toggle() {
         let binding: Binding = "Ctrl+Shift+F".parse().unwrap();
@@ -651,7 +646,6 @@ mod tests {
     /// The holder tuples come out in the daemon's own field order (captured
     /// live from Plasma 6.6), and it is the portal's leftover entry that the
     /// ours-test must recognise.
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn key_holders_parse_and_ours_is_recognised() {
         let reply = "([('search', 'Focus the QuickSearch search box', \
@@ -676,7 +670,6 @@ mod tests {
     }
 
     /// Unquoted, a path with a space would split into a broken Exec line.
-    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn the_toggle_command_quotes_a_path_with_a_space() {
         assert_eq!(

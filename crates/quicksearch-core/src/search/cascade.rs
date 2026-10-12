@@ -34,13 +34,14 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::config::IgnoreSet;
 use crate::query::pattern::clamp_match_range;
 use crate::query::split::CascadeQuery;
-use crate::query::translator::escape_like;
 use crate::snippet;
 
 use super::fuzzy::{matcher_for, pigeonhole_chunks, Bitap};
 use super::{prefilter, SearchHit, SearchOptions};
 
 mod passes;
+#[cfg(test)]
+mod tests;
 
 /// Cancellation check stride for row-cheap passes; decompression-heavy passes check every row.
 const CANCEL_CHECK_ROWS: usize = 256;
@@ -131,13 +132,18 @@ pub fn fuzzy_snippet(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outcome {
     pub total: usize,
+    /// Set when a hit was dropped or the cascade stopped before every pass
+    /// ran to its end, so more may match than were returned. An exactly full
+    /// set whose unrun passes would have found nothing reads as limited too:
+    /// telling the two apart means running them.
     pub limited: bool,
 }
 
-/// Run the cascade, streaming rank-ordered batches into `sink`. `Ok(None)`
-/// means cancelled (the generation moved on), and the caller sends no
-/// completion. SQL errors come back as strings unless the search was already
-/// cancelled: an interrupted statement is normal cancellation.
+/// Run the cascade, streaming batches into `sink`, each sorted by rank
+/// within itself. `Ok(None)` means cancelled (the generation moved on), and
+/// the caller sends no completion. SQL errors come back as strings unless the
+/// search was already cancelled: a statement the worker's progress handler
+/// killed (`search::arm_cancel`) is normal cancellation.
 pub fn run(
     conn: &Connection,
     query: &CascadeQuery,
@@ -149,29 +155,7 @@ pub fn run(
     if query.is_empty() {
         return Ok(Some(Outcome::default()));
     }
-    let ignore = IgnoreSet::compile(&options.session_ignores)
-        .map_err(|e| format!("session ignore filter: {}", e))?;
-
-    let mut cx = Cx {
-        conn,
-        query,
-        options,
-        positions: crate::db::repo::fts_positions(conn),
-        generation,
-        latest_gen,
-        ignore,
-        emitted: IdSet::default(),
-        deferred_path: Deferred::default(),
-        deferred_fuzzy_path: Deferred::default(),
-        regex_doc: query
-            .regex
-            .as_ref()
-            .map(|_| crate::db::repo::DocDecoder::new())
-            .transpose()?,
-        total: 0,
-        limited: false,
-        sink,
-    };
+    let mut cx = Cx::new(conn, query, options, generation, latest_gen, sink)?;
 
     // With no term at all the regex drives its own scans; the path flush
     // still emits the rank-10 hits the name pass sets aside.
@@ -195,10 +179,10 @@ pub fn run(
         if cx.cancelled() {
             return Ok(None);
         }
-        // Stop, but not as truncation: an exactly-full result set also has
-        // `remaining() == 0`, and `flush_pass` sets `limited` only when it
-        // drops rows.
+        // A full set with passes left to run may be missing their matches.
+        // Not probed: finding out costs the scans this break saves.
         if cx.remaining() == 0 {
+            cx.limited = true;
             break;
         }
         let run_pass = match *pass {
@@ -218,14 +202,12 @@ pub fn run(
             Ok(true) => {}
             Ok(false) => return Ok(None), // cancelled mid-pass
             Err(e) => {
-                // A kill from `interrupt()` arrives as an ordinary SQL error,
-                // and SQLite's interrupt flag carries no ordering edge to the
-                // generation counter bumped just before it: without this
-                // fence a weakly-ordered CPU could report routine
-                // cancellation as `Search failed: interrupted`.
-                std::sync::atomic::fence(Ordering::Acquire);
+                // The handler's kill arrives as `SQLITE_INTERRUPT`, an
+                // ordinary SQL error. It read the moved generation on this
+                // thread, so this later read sees it too, and routine
+                // cancellation never reads as `Search failed: interrupted`.
                 if cx.cancelled() {
-                    return Ok(None); // interrupt() killed the statement
+                    return Ok(None);
                 }
                 return Err(e);
             }
@@ -383,6 +365,38 @@ impl FlushClock {
 }
 
 impl<'a> Cx<'a> {
+    fn new(
+        conn: &'a Connection,
+        query: &'a CascadeQuery,
+        options: &'a SearchOptions,
+        generation: u64,
+        latest_gen: &'a AtomicU64,
+        sink: &'a mut dyn FnMut(Vec<SearchHit>),
+    ) -> Result<Cx<'a>, String> {
+        let ignore = IgnoreSet::compile(&options.session_ignores)
+            .map_err(|e| format!("session ignore filter: {}", e))?;
+        Ok(Cx {
+            conn,
+            query,
+            options,
+            positions: crate::db::repo::fts_positions(conn),
+            generation,
+            latest_gen,
+            ignore,
+            emitted: IdSet::default(),
+            deferred_path: Deferred::default(),
+            deferred_fuzzy_path: Deferred::default(),
+            regex_doc: query
+                .regex
+                .as_ref()
+                .map(|_| crate::db::repo::DocDecoder::new())
+                .transpose()?,
+            total: 0,
+            limited: false,
+            sink,
+        })
+    }
+
     fn cancelled(&self) -> bool {
         self.generation != self.latest_gen.load(Ordering::Relaxed)
     }
@@ -392,8 +406,9 @@ impl<'a> Cx<'a> {
     }
 
     /// Headroom so sorting keeps the best candidates, without unbounded growth.
+    /// Saturating, because the CLI's `--limit` has no upper bound.
     fn buffer_cap(&self) -> usize {
-        4096.max(2 * self.remaining())
+        4096.max(self.remaining().saturating_mul(2))
     }
 
     fn params_with_filters(&self, leading: Vec<Value>) -> Vec<Value> {
@@ -471,6 +486,14 @@ impl<'a> Cx<'a> {
         clock.mark_sent();
     }
 
+    /// Sort `buf`, keep what fits under the display limit, and emit it.
+    ///
+    /// Known exception to the "best matches come first" tip: each mid-scan
+    /// flush ([`Cx::flush_if_due`]) spends the limit on the hits found so far,
+    /// so a pass with more than `limit` matches keeps the first `limit` in
+    /// scan order, and an exact name behind `limit` substring matches is not
+    /// shown. Accepted: a query for more of the exact name narrows the pass
+    /// and finds it.
     fn flush_pass(&mut self, mut buf: Vec<SearchHit>, overflowed: bool) {
         buf.sort_by(rank_order);
         let room = self.remaining();
@@ -509,6 +532,7 @@ impl<'a> Cx<'a> {
         }
         let keep = self.remaining();
         if keep > 0 {
+            // In bounds: past the cap, `buf` holds more than `keep` hits.
             buf.select_nth_unstable_by(keep - 1, rank_order);
         }
         buf.truncate(keep);

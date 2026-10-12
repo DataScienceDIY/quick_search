@@ -1,7 +1,7 @@
 //! The Manage Index tab: detailed status, mode controls, indexed roots,
 //! and the content/ignore filter editors.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use quicksearch_core::config::Config;
@@ -40,7 +40,9 @@ pub struct ManageTab {
     ext_filter_text: String,
     new_root: String,
     new_ignore: String,
-    root_error: Option<String>,
+    /// What the last add said: `Err` refused the folder, `Ok` added it with
+    /// a notice.
+    root_note: Option<Result<String, String>>,
     /// The config the draft was last synced from; `None` forces a full resync.
     baseline: Option<Config>,
     draft: Option<Config>,
@@ -145,7 +147,7 @@ impl ManageTab {
         self.baseline = None;
         self.new_root.clear();
         self.new_ignore.clear();
-        self.root_error = None;
+        self.root_note = None;
     }
 
     pub fn ui(
@@ -176,8 +178,7 @@ impl ManageTab {
                 self.filters_section(ui);
                 ui.separator();
                 ui.label(hint(
-                    "Reindex interval, symlinks, hidden files, tokenizer, and size \
-                     limits are on the Settings tab.",
+                    "Reindex interval, hidden files, and size limits are on the Settings tab.",
                 ));
                 ui.add_space(8.0);
                 actions.apply_config = self.apply_row(ui, config);
@@ -271,7 +272,7 @@ impl ManageTab {
         let add_row = ui.horizontal(|ui| {
             if ui.button("Add folder…").tip(&tips::ADD_ROOT).clicked() {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.root_error = add_root(draft, dir.to_string_lossy().into_owned()).err();
+                    self.root_note = add_picked(draft, dir).transpose();
                 }
             }
             ui.add(
@@ -285,7 +286,7 @@ impl ManageTab {
                 if added.is_ok() {
                     self.new_root.clear();
                 }
-                self.root_error = added.err();
+                self.root_note = added.transpose();
             }
         });
         // All three ways to add a folder, as one target for the tour.
@@ -294,10 +295,14 @@ impl ManageTab {
             crate::spotlight::Spot::IndexedFolderAdd,
             add_row.response.rect,
         );
-        crate::ui_util::stable_section(ui, |ui| {
-            if let Some(err) = &self.root_error {
-                ui.colored_label(ui.visuals().error_fg_color, err);
+        crate::ui_util::stable_section(ui, |ui| match &self.root_note {
+            Some(Ok(notice)) => {
+                ui.colored_label(ui.visuals().warn_fg_color, notice);
             }
+            Some(Err(refusal)) => {
+                ui.colored_label(ui.visuals().error_fg_color, refusal);
+            }
+            None => {}
         });
         ui.label(hint(
             "Adding a folder adds to the current index; it does not replace it.",
@@ -558,13 +563,47 @@ fn root_counts_text(state: &IndexerState, root: &str) -> String {
     }
 }
 
-/// Appends a root unless it duplicates or nests with one already listed.
-fn add_root(draft: &mut Config, candidate: String) -> Result<(), String> {
+/// A folder chosen in the picker. One whose name is not valid UTF-8 cannot
+/// be stored without loss, so it is skipped as the walk skips such names,
+/// with only a log line to answer the click.
+fn add_picked(draft: &mut Config, dir: PathBuf) -> Result<Option<String>, String> {
+    match dir.into_os_string().into_string() {
+        Ok(dir) => add_root(draft, dir),
+        Err(dir) => {
+            quicksearch_core::log_warn!(
+                "not indexing {}: its name is not valid UTF-8",
+                Path::new(&dir).display()
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Appends a root unless it duplicates or nests with one already listed or
+/// names something other than a folder, resolved as the walk resolves it. A
+/// path that cannot be reached is added with a notice, since a drive or share
+/// not mounted yet is indexed by the first run after it appears; the notice
+/// is how a typo shows.
+fn add_root(draft: &mut Config, candidate: String) -> Result<Option<String>, String> {
     if draft.paths.indexing_paths.contains(&candidate) {
         return Err(format!("{} is already in the list", candidate));
     }
-    let mut probe = draft.paths.indexing_paths.clone();
-    probe.push(candidate.clone());
+    let notice = match std::fs::metadata(draft.resolve(&candidate)) {
+        Ok(meta) if !meta.is_dir() => {
+            return Err(format!("Not added: {} is not a folder", candidate));
+        }
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!(
+            "{} does not exist yet; it will be indexed by the first run after it appears",
+            candidate
+        )),
+        Err(e) => Some(format!(
+            "{} cannot be read now ({}); it will be indexed by the first run that can read it",
+            candidate, e
+        )),
+    };
+    let mut probe = draft.clone();
+    probe.paths.indexing_paths.push(candidate.clone());
     if let Some((child, parent)) = quicksearch_core::config::nested_roots(&probe).first() {
         return Err(format!(
             "Not added: {} is nested under {}; indexed folders may not overlap",
@@ -572,7 +611,7 @@ fn add_root(draft: &mut Config, candidate: String) -> Result<(), String> {
         ));
     }
     draft.paths.indexing_paths.push(candidate);
-    Ok(())
+    Ok(notice)
 }
 
 fn parse_lines(text: &str) -> Vec<String> {

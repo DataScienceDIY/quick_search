@@ -46,6 +46,14 @@ eframe = { version = "0.32", default-features = false, features = [
 # feature resolution unions the declarations, so naming egui plainly would
 # switch it back on.
 egui = { version = "0.32", default-features = false }
+# Vets a system fallback font before epaint loads it, since epaint panics on
+# a face it cannot parse (`src/fonts.rs`). epaint's own font parser, with
+# its features, so nothing new compiles.
+ab_glyph = "0.2"
+# Maps those system fonts rather than reading them into the heap, so only the
+# pages their glyphs touch cost memory (`src/fonts.rs`). Already in the Linux
+# tree through winit and sctk.
+memmap2 = "0.9"
 # Only `Column`/`TableBuilder` are used; the one default feature is an image
 # loader we never register.
 egui_extras = { version = "0.32", default-features = false }
@@ -84,22 +92,23 @@ wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
-# Console attachment for the GUI binary (which has no stdio when launched from
-# Explorer) and VT mode for the CLI binary. 0.59 matches what eframe and rfd
-# resolve, so no extra crate compiles.
+# NUL stdio for the GUI binary (which has no standard handles when launched
+# from Explorer) and VT mode for the CLI binary. 0.59 matches what eframe and
+# rfd resolve, so no extra crate compiles.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Console",
-    # The `--toggle` named pipe in `activate`. `Win32_System_IO` and
-    # `Win32_Security` only carry the `OVERLAPPED` and `SECURITY_ATTRIBUTES`
-    # types of pointers we pass as null.
+    # The `--toggle` named pipe in `activate`. `Win32_System_IO` carries the
+    # overlapped calls that time out the server's reads; `Win32_Security`
+    # only the `SECURITY_ATTRIBUTES` type of pointers we pass as null.
     "Win32_System_Pipes",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_Security",
     # The foreground handshake (`activate`) and native raise (`activate::raise`):
-    # GetCurrentProcessId, AllowSetForegroundWindow / SetForegroundWindow.
+    # GetCurrentProcessId, AllowSetForegroundWindow / SetForegroundWindow; and
+    # the event the pipe's timed waits use (CreateEventW, WaitForSingleObject).
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

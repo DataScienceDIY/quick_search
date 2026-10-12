@@ -24,6 +24,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, Transaction};
@@ -53,12 +54,15 @@ struct Root {
 /// agree exactly, or every run would re-add what the last prune removed.
 pub struct Scope {
     roots: Vec<Root>,
-    ignore: IgnoreSet,
+    ignore: Arc<IgnoreSet>,
     include_hidden: bool,
 }
 
 impl Scope {
-    pub fn from_config(config: &Config) -> Result<Scope, String> {
+    /// `config`'s scope, filtering by `ignore` rather than by compiling
+    /// `config`'s patterns: the coordinator hands in its last good set, so a
+    /// live edit whose glob does not compile cannot stall its queue.
+    pub fn new(config: &Config, ignore: Arc<IgnoreSet>) -> Scope {
         let roots = config
             .normalized_indexing_paths()
             .into_iter()
@@ -71,12 +75,31 @@ impl Scope {
                 }
             })
             .collect();
-        Ok(Scope {
+        Scope {
             roots,
-            ignore: IgnoreSet::compile(&config.indexing.ignore_patterns)
-                .map_err(|e| format!("ignore patterns: {}", e))?,
+            ignore,
             include_hidden: config.indexing.include_hidden,
-        })
+        }
+    }
+
+    pub fn from_config(config: &Config) -> Result<Scope, String> {
+        let ignore = IgnoreSet::compile(&config.indexing.ignore_patterns)
+            .map_err(|e| format!("ignore patterns: {}", e))?;
+        Ok(Scope::new(config, Arc::new(ignore)))
+    }
+
+    pub fn ignore(&self) -> &IgnoreSet {
+        &self.ignore
+    }
+
+    /// The innermost root containing `path`, by whole components, the root
+    /// itself included ([`crate::platform::split_at_root`]). Roots are held
+    /// canonical, so `path` must be too, in the spelling the index stores: a
+    /// root that is itself a link is reached through its canonical path, and
+    /// so is every file under it.
+    pub fn root_of(&self, path: &Path) -> Option<&Path> {
+        let roots = self.roots.iter().map(|root| root.path.as_path());
+        crate::platform::split_at_root(path, roots).map(|(root, _)| root)
     }
 
     /// Whether the walker would still emit `path` while walking `root`.
@@ -165,7 +188,6 @@ pub struct WorkCursor {
     work: IndexWork,
     scope: Scope,
     drop_idx: usize,
-    dropped_aliases: bool,
     root_idx: usize,
     /// Last `(parent, name)` served by the scan: the keyset cursor. An empty
     /// parent means "start this root's range from its `lo` bound".
@@ -187,7 +209,6 @@ impl WorkCursor {
             work,
             scope: Scope::from_config(config)?,
             drop_idx: 0,
-            dropped_aliases: false,
             root_idx: 0,
             after: (String::new(), String::new()),
             finalized: false,
@@ -264,24 +285,6 @@ pub fn advance(
         return Ok(());
     }
 
-    // After the root deletions and before the scan: the ranges spared here
-    // must already be the final set of roots.
-    if !cursor.dropped_aliases && cursor.work.drop_aliases {
-        let ranges: Vec<(String, String)> = cursor
-            .scope
-            .roots
-            .iter()
-            .map(|r| (r.lo.clone(), r.hi.clone()))
-            .collect();
-        cursor.deleted += delete_in_burst(conn, "drop-alias", |tx| {
-            repo::delete_outside_ranges(tx, &ranges)
-        })?;
-        cursor.dropped_aliases = true;
-        if Instant::now() >= deadline {
-            return Ok(());
-        }
-    }
-
     if cursor.work.scans_rows() {
         if cursor.total.is_none() {
             if cancelled(cancel) {
@@ -317,8 +320,8 @@ fn delete_in_burst(
     let tx = conn
         .transaction()
         .map_err(|e| format!("begin {} transaction: {}", what, e))?;
-    // Removing a root or the aliases can take every posting under it, the same
-    // burst the row scan makes; `advance` restores the threshold and merges.
+    // Removing a root can take every posting under it, the same burst the row
+    // scan makes; `advance` restores the threshold and merges.
     fts_begin_tombstone_burst(&tx);
     let removed = delete(&tx)?;
     tx.commit()
@@ -353,7 +356,7 @@ fn scan_rows(
     if cursor.scan_done() || cancelled(cancel) {
         return Ok(());
     }
-    let page = config.processing.batch_size.max(1) as i64;
+    let page = config.processing.batch() as i64;
     let mut covered = CoverCache::default();
     let mut plan = PagePlan::default();
     let tx = conn
@@ -491,7 +494,10 @@ fn apply_page(
         }
         if work.reconcile_content {
             // The walker's decision, recomputed. Both directions: a
-            // disagreeing row is wrong however it got that way.
+            // disagreeing row is wrong however it got that way. All but
+            // dehydration, which the row does not record: a cloud
+            // placeholder's NA row goes pending here, and `decide_content`
+            // puts it back unread.
             let wants = row.size <= config.processing.maximum_text_file_size
                 && content_extractable(path, row.mime.as_deref(), config, registry);
             if !wants && row.content_state != repo::STATE_NA {
@@ -523,30 +529,67 @@ pub fn stored_config(conn: &Connection, config: &Config) -> Result<Config, Strin
             "ignore_patterns" => stored.indexing.ignore_patterns = lines(&value),
             "content_extensions" => stored.indexing.content_extensions = lines(&value),
             "include_hidden" => stored.indexing.include_hidden = value == "true",
-            "follow_symlinks" => stored.indexing.follow_symlinks = value == "true",
-            // Recorded as the effective layout; a flag that reproduces it
-            // under the recorded tokenizer (see `fts_positions`).
+            // Recorded as the layout: the flag's opposite.
             "fts_positions" => stored.processing.compact_text_index = value == "false",
             "hash_length" => match value.parse() {
                 Ok(n) => stored.processing.hash_length = n,
-                Err(e) => crate::log_warn!("stored hash_length {:?} unreadable: {}", value, e),
+                Err(e) => crate::log_warn!("stored {} {:?} unreadable: {}", key, value, e),
             },
-            "tokenize" => stored.processing.tokenize = value,
-            // A record from a newer build; ignore it.
+            "maximum_text_file_size" => match value.parse() {
+                Ok(n) => stored.processing.maximum_text_file_size = n,
+                Err(e) => crate::log_warn!("stored {} {:?} unreadable: {}", key, value, e),
+            },
+            // A key this build does not record (from a newer build, or the
+            // retired `hash_algorithm` and `tokenize`); ignore it.
             _ => {}
         }
     }
     Ok(stored)
 }
 
+/// While any root of `current` fails to resolve, add every recorded root it
+/// lacks, so diffing against [`stored_config`] drops nothing. An offline root
+/// comes back as spelled: through a link or with a trailing separator, that
+/// differs from the canonical spelling it was recorded under and would read as
+/// a removed root, its rows deleted. Which recorded root it was cannot be
+/// told, so every drop waits; a root removed meanwhile goes, by its recorded
+/// spelling, on the first run where every configured root resolves. Never keyed
+/// on emptiness: a new empty root would hold every drop.
+pub(crate) fn hold_offline_roots(conn: &Connection, current: &mut Config) -> Result<(), String> {
+    let Some(offline) = current
+        .resolved_indexing_paths()
+        .into_iter()
+        .find(|root| root.canonicalize().is_err())
+    else {
+        return Ok(());
+    };
+    let mut held = 0;
+    for root in stored_config(conn, current)?.paths.indexing_paths {
+        if !current.paths.indexing_paths.contains(&root) {
+            current.paths.indexing_paths.push(root);
+            held += 1;
+        }
+    }
+    if held > 0 {
+        crate::log_info!(
+            "{} cannot be reached; keeping {} recorded root(s) until every root resolves",
+            offline.display(),
+            held
+        );
+    }
+    Ok(())
+}
+
 /// The reconciliation the index still owes `config`. Empty is the normal
 /// answer; non-empty means a pass was abandoned or the config was edited
 /// while the app was closed. Roots are canonicalized first, the spelling the
-/// record holds.
+/// record holds. Nothing is owed a drop while a configured root is offline
+/// (see `hold_offline_roots`).
 pub fn outstanding_work(db_path: &str, config: &Config) -> Result<IndexWork, String> {
     let conn = crate::db::open_existing(db_path, false)?;
     let mut current = config.clone();
     current.paths.indexing_paths = config.normalized_indexing_paths().into_iter().collect();
+    hold_offline_roots(&conn, &mut current)?;
     let stored = stored_config(&conn, &current)?;
     Ok(crate::config::diff_actions(&stored, &current).work)
 }

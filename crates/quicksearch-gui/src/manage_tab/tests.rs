@@ -779,7 +779,7 @@ fn the_starting_placeholder_is_gone() {
     }
 }
 
-use quicksearch_core::testutil::scratch_dir;
+use quicksearch_core::testutil::{scratch_dir, Scratch};
 
 fn write_bytes(path: &Path, len: usize) {
     std::fs::write(path, vec![b'x'; len]).expect("write");
@@ -1033,13 +1033,13 @@ fn a_staged_edit_reads_dirty_and_discard_reverts_it() {
         .ignore_patterns
         .push("*.jpg".into());
     tab.new_ignore = "half-typ".into();
-    tab.root_error = Some("bad".into());
+    tab.root_note = Some(Err("bad".into()));
     assert!(tab.is_dirty());
 
     tab.discard();
     assert!(!tab.is_dirty());
     assert!(tab.new_ignore.is_empty(), "scratch boxes are cleared too");
-    assert!(tab.root_error.is_none());
+    assert!(tab.root_note.is_none());
     tab.sync_editors(&cfg);
     assert_eq!(tab.draft.as_ref(), Some(&cfg), "resynced from live");
     assert!(!tab.is_dirty());
@@ -1287,4 +1287,180 @@ fn the_tour_glows_both_content_filter_boxes() {
         ignore.right() < whitelist.left(),
         "the ignore box at {ignore:?} is not left of the whitelist at {whitelist:?}"
     );
+}
+
+/// A config with no roots, so only the candidate can clash, whose file sits
+/// in `dir` for relative paths to resolve against.
+fn rootless_in(dir: &Path) -> Config {
+    let mut cfg = Config::default();
+    cfg.paths.indexing_paths.clear();
+    cfg.source = Some(dir.join("config.toml"));
+    cfg
+}
+
+fn refused_as(result: &Result<Option<String>, String>, why: &str) -> bool {
+    matches!(result, Err(refusal) if refusal.contains(why))
+}
+
+#[test]
+fn adding_a_file_is_refused() {
+    let dir = Scratch::dir("add-root");
+    let file = dir.join("notes.txt");
+    std::fs::write(&file, "x").unwrap();
+    let mut cfg = rootless_in(&dir);
+    let refused = add_root(&mut cfg, file.to_string_lossy().into_owned());
+    assert!(refused_as(&refused, "is not a folder"), "{refused:?}");
+    assert!(cfg.paths.indexing_paths.is_empty());
+}
+
+#[test]
+fn a_picked_folder_is_added_as_picked_without_a_notice() {
+    let dir = Scratch::dir("add-root");
+    let mut cfg = rootless_in(&dir);
+    assert_eq!(add_picked(&mut cfg, dir.to_path_buf()), Ok(None));
+    assert_eq!(
+        cfg.paths.indexing_paths,
+        vec![dir.to_string_lossy().into_owned()]
+    );
+}
+
+/// A drive or share that is not mounted yet is a missing path too, so a
+/// missing path is added, and the notice is what shows a typo.
+#[test]
+fn a_missing_folder_is_added_with_a_notice() {
+    let dir = Scratch::dir("add-root");
+    let mut cfg = rootless_in(&dir);
+    let missing = dir.join("not-mounted").to_string_lossy().into_owned();
+    let added = add_root(&mut cfg, missing.clone());
+    assert!(
+        matches!(&added, Ok(Some(notice)) if notice.contains("does not exist yet")),
+        "{added:?}"
+    );
+    assert_eq!(cfg.paths.indexing_paths, vec![missing]);
+}
+
+/// Unexpanded, `~` would be a relative name beside the config file, which
+/// does not exist there and would draw the missing-folder notice.
+#[test]
+fn a_tilde_path_is_the_home_folder() {
+    let dir = Scratch::dir("add-root");
+    let mut cfg = rootless_in(&dir);
+    assert_eq!(add_root(&mut cfg, "~".into()), Ok(None));
+    assert_eq!(
+        cfg.paths.indexing_paths,
+        vec!["~".to_string()],
+        "stored as typed"
+    );
+}
+
+/// The walk resolves a relative root against the config file's folder, so
+/// the check looks there and not in the working directory.
+#[test]
+fn a_relative_path_resolves_against_the_config_folder() {
+    let dir = Scratch::dir("add-root");
+    std::fs::create_dir(dir.join("qs-docs")).unwrap();
+    std::fs::write(dir.join("qs-notes.txt"), "x").unwrap();
+    let mut cfg = rootless_in(&dir);
+    assert_eq!(
+        add_root(&mut cfg, "qs-docs".into()),
+        Ok(None),
+        "found beside the config"
+    );
+    let refused = add_root(&mut cfg, "qs-notes.txt".into());
+    assert!(refused_as(&refused, "is not a folder"), "{refused:?}");
+    assert_eq!(cfg.paths.indexing_paths, vec!["qs-docs".to_string()]);
+}
+
+#[test]
+fn a_differently_spelled_duplicate_is_still_refused() {
+    let dir = Scratch::dir("add-root");
+    std::fs::create_dir(dir.join("docs")).unwrap();
+    let docs = dir.join("docs").to_string_lossy().into_owned();
+    let missing = dir.join("not-mounted").to_string_lossy().into_owned();
+    let mut cfg = rootless_in(&dir);
+    assert_eq!(add_root(&mut cfg, docs.clone()), Ok(None));
+    assert!(add_root(&mut cfg, missing.clone()).is_ok());
+
+    let exact = add_root(&mut cfg, docs.clone());
+    assert!(refused_as(&exact, "already in the list"), "{exact:?}");
+    let sep = std::path::MAIN_SEPARATOR;
+    for spelling in [
+        format!("{docs}{sep}"),
+        "docs".to_string(),
+        dir.join("docs").join(".").to_string_lossy().into_owned(),
+        // Missing, so compared through the folder it would sit in.
+        format!("{missing}{sep}"),
+    ] {
+        let refused = add_root(&mut cfg, spelling.clone());
+        assert!(
+            refused_as(&refused, "nested under"),
+            "{spelling}: {refused:?}"
+        );
+    }
+    assert_eq!(cfg.paths.indexing_paths, vec![docs, missing]);
+}
+
+/// A lossy spelling of the name must never become a root, and the walk's
+/// silent skip covers the pick too: one log line, nothing on screen.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_picked_folder_whose_name_is_not_utf8_is_not_added() {
+    use std::os::unix::ffi::OsStrExt;
+    let dir = Scratch::dir("add-root");
+    let picked = dir.join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+    std::fs::create_dir(&picked).unwrap();
+    let mut cfg = rootless_in(&dir);
+    assert_eq!(add_picked(&mut cfg, picked), Ok(None), "no note on screen");
+    assert!(cfg.paths.indexing_paths.is_empty());
+    let parent = dir.to_string_lossy().into_owned();
+    assert!(
+        quicksearch_core::log::snapshot()
+            .iter()
+            .any(|line| line.text.contains(&parent) && line.text.contains("not valid UTF-8")),
+        "the skip was not logged"
+    );
+}
+
+/// A missing folder is added and warned about; a file is refused as an
+/// error and stays in the box to be corrected.
+#[test]
+fn the_add_box_warns_of_a_missing_folder_and_refuses_a_file() {
+    let dir = Scratch::dir("add-root");
+    let file = dir.join("notes.txt");
+    std::fs::write(&file, "x").unwrap();
+    let file = file.to_string_lossy().into_owned();
+    let missing = dir.join("not-mounted").to_string_lossy().into_owned();
+    let ctx = crate::test_ui::ctx();
+    let (cfg, state) = (cfg_with_root(), idle_state());
+    let mut tab = synced_tab(&cfg);
+    let visuals = ctx.style().visuals.clone();
+    let add = |tab: &mut ManageTab, typed: &str| {
+        tab.new_root = typed.to_string();
+        let (out, _) = render(&ctx, tab, &cfg, &state, vec![]);
+        let button = crate::test_ui::painted_rect(&out, "Add").center();
+        frame(&ctx, tab, &cfg, &state, click_at(button));
+        let (out, _) = render(&ctx, tab, &cfg, &state, vec![]);
+        crate::test_ui::painted_spans(&out)
+    };
+
+    let spans = add(&mut tab, &missing);
+    assert!(
+        spans.iter().any(|(text, color)| text.starts_with(&missing)
+            && text.contains("does not exist yet")
+            && *color == visuals.warn_fg_color),
+        "{spans:?}"
+    );
+    assert!(draft(&tab).paths.indexing_paths.contains(&missing));
+    assert!(tab.new_root.is_empty(), "an added path leaves the box");
+
+    let spans = add(&mut tab, &file);
+    assert!(
+        spans
+            .iter()
+            .any(|(text, color)| text.contains("is not a folder")
+                && *color == visuals.error_fg_color),
+        "{spans:?}"
+    );
+    assert!(!draft(&tab).paths.indexing_paths.contains(&file));
+    assert_eq!(tab.new_root, file, "a refused path stays to be corrected");
 }

@@ -221,3 +221,300 @@ fn the_display_form_is_the_prefix_and_the_whole_key() {
     assert!(display.starts_with("0x"));
     assert!(display[2..].bytes().all(|b| b.is_ascii_hexdigit()));
 }
+
+/// The Deleting prompt waits only while the coordinator has said nothing;
+/// any answer, a vanished coordinator included, ends the wait.
+#[test]
+fn a_delete_reply_ends_the_wait_and_its_absence_does_not() {
+    assert_eq!(delete_outcome(Err(mpsc::TryRecvError::Empty)), None);
+    assert_eq!(delete_outcome(Ok(Ok(()))), Some(Ok(())));
+    assert_eq!(
+        delete_outcome(Ok(Err("in use".to_string()))),
+        Some(Err("in use".to_string()))
+    );
+    // Nothing confirms a delete from a coordinator that is gone.
+    assert_eq!(
+        delete_outcome(Err(mpsc::TryRecvError::Disconnected)),
+        Some(Err("the indexer stopped".to_string()))
+    );
+}
+
+/// Enabling leaves plaintext behind and a change leaves pages the old
+/// password opens, so both warn; disabling leaves nothing secret.
+#[test]
+fn the_residue_notice_covers_enabling_and_changing_not_disabling() {
+    let (title, enable) = confirm_text(true, false);
+    assert_eq!(title, "Enable password protection?");
+    assert!(
+        enable.is_some_and(|t| t.contains("unencrypted index")),
+        "{enable:?}"
+    );
+    let (title, change) = confirm_text(true, true);
+    assert_eq!(title, "Change password?");
+    assert!(
+        change.is_some_and(|t| t.contains("old password")),
+        "{change:?}"
+    );
+    for protected in [false, true] {
+        assert_eq!(
+            confirm_text(false, protected),
+            ("Disable password protection?", None)
+        );
+    }
+}
+
+#[test]
+fn the_wait_window_paints_its_label() {
+    for label in ["Deriving key…", "Deleting the index…"] {
+        let ctx = crate::test_ui::ctx();
+        let out = two_pass(&ctx, SCREEN, Vec::new(), |ctx| deriving_window(ctx, label));
+        let painted = painted_text(&out);
+        assert!(painted.contains(&label.to_string()), "{painted:?}");
+    }
+}
+
+/// One call [`SecurityEffects`] made, with what it was given.
+#[derive(Debug, PartialEq)]
+enum Call {
+    Save(SecurityConfig),
+    /// Whether a key was remembered until now, and what to hold.
+    Keychain(bool, Option<String>),
+    Install(Option<String>),
+    Rebuild,
+}
+
+/// Records every effect, and fails the ones it is told to.
+#[derive(Default)]
+struct Recorder {
+    calls: Vec<Call>,
+    fail_save: bool,
+    fail_keychain: bool,
+}
+
+impl SecurityEffects for Recorder {
+    fn save_config(&mut self, security: SecurityConfig) -> Result<(), String> {
+        self.calls.push(Call::Save(security));
+        if self.fail_save {
+            return Err("disk full".to_string());
+        }
+        Ok(())
+    }
+
+    fn sync_keychain(&mut self, was_remembered: bool, key_hex: Option<&str>) -> Result<(), String> {
+        self.calls
+            .push(Call::Keychain(was_remembered, key_hex.map(str::to_string)));
+        if self.fail_keychain {
+            return Err("keychain locked".to_string());
+        }
+        Ok(())
+    }
+
+    fn install_key(&mut self, key: Option<IndexKey>) {
+        self.calls.push(Call::Install(key.map(|key| key.to_hex())));
+    }
+
+    fn rebuild(&mut self) {
+        self.calls.push(Call::Rebuild);
+    }
+}
+
+fn new_key() -> IndexKey {
+    IndexKey::from_hex(KEY).unwrap()
+}
+
+fn protected(remember: bool) -> SecurityConfig {
+    SecurityConfig {
+        password_protected: true,
+        salt: Some("ab".repeat(16)),
+        use_keychain: remember,
+    }
+}
+
+/// Config first, because the salt lives only there; the rebuild last, so the
+/// fresh index is created under the key just installed.
+#[test]
+fn a_security_change_commits_in_order() {
+    let mut fx = Recorder::default();
+    apply_security_change(&mut fx, false, protected(true), Some(new_key())).unwrap();
+    assert_eq!(
+        fx.calls,
+        vec![
+            Call::Save(protected(true)),
+            Call::Keychain(false, Some(KEY.to_string())),
+            Call::Install(Some(KEY.to_string())),
+            Call::Rebuild,
+        ]
+    );
+}
+
+/// The old index is already gone by now, so a rebuild is owed either way;
+/// it runs under the settings and key still in force.
+#[test]
+fn a_failed_config_save_keeps_the_old_key_and_rebuilds_under_it() {
+    let mut fx = Recorder {
+        fail_save: true,
+        ..Recorder::default()
+    };
+    let err = apply_security_change(&mut fx, false, protected(true), Some(new_key())).unwrap_err();
+    assert_eq!(err, "disk full");
+    assert_eq!(fx.calls, vec![Call::Save(protected(true)), Call::Rebuild]);
+}
+
+/// Every change syncs the keychain, so whatever it held for the previous
+/// state is replaced or forgotten, never kept.
+#[test]
+fn the_keychain_never_keeps_a_key_for_the_previous_state() {
+    let unprotected_but_remembering = SecurityConfig {
+        use_keychain: true,
+        ..SecurityConfig::default()
+    };
+    for (security, key, synced) in [
+        (protected(true), Some(new_key()), Some(KEY)),
+        (protected(false), Some(new_key()), None),
+        (SecurityConfig::default(), None, None),
+        (unprotected_but_remembering, None, None),
+    ] {
+        let mut fx = Recorder::default();
+        apply_security_change(&mut fx, false, security.clone(), key).unwrap();
+        let keychain: Vec<&Call> = fx
+            .calls
+            .iter()
+            .filter(|call| matches!(call, Call::Keychain(..)))
+            .collect();
+        assert_eq!(
+            keychain,
+            vec![&Call::Keychain(false, synced.map(str::to_string))],
+            "{security:?}"
+        );
+    }
+}
+
+#[test]
+fn disabling_installs_no_key_and_rebuilds() {
+    let mut fx = Recorder::default();
+    apply_security_change(&mut fx, true, SecurityConfig::default(), None).unwrap();
+    assert_eq!(
+        fx.calls,
+        vec![
+            Call::Save(SecurityConfig::default()),
+            Call::Keychain(true, None),
+            Call::Install(None),
+            Call::Rebuild,
+        ]
+    );
+}
+
+/// The config is saved by then, so the index must still be built under it;
+/// the failure is reported, not a reason to stop half-way.
+#[test]
+fn a_failed_keychain_sync_still_installs_the_key_and_rebuilds() {
+    let mut fx = Recorder {
+        fail_keychain: true,
+        ..Recorder::default()
+    };
+    let err = apply_security_change(&mut fx, false, protected(true), Some(new_key())).unwrap_err();
+    assert_eq!(err, "keychain locked");
+    assert_eq!(
+        fx.calls,
+        vec![
+            Call::Save(protected(true)),
+            Call::Keychain(false, Some(KEY.to_string())),
+            Call::Install(Some(KEY.to_string())),
+            Call::Rebuild,
+        ]
+    );
+}
+
+#[test]
+fn a_failed_keychain_sync_leaves_the_preference_unsaved() {
+    let mut fx = Recorder {
+        fail_keychain: true,
+        ..Recorder::default()
+    };
+    let err = set_keychain(&mut fx, protected(false), true, Some(KEY.to_string())).unwrap_err();
+    assert_eq!(err, "keychain locked");
+    assert_eq!(fx.calls, vec![Call::Keychain(false, Some(KEY.to_string()))]);
+}
+
+#[test]
+fn the_keychain_preference_is_saved_once_the_keychain_matches_it() {
+    let mut fx = Recorder::default();
+    set_keychain(&mut fx, protected(false), true, Some(KEY.to_string())).unwrap();
+    assert_eq!(
+        fx.calls,
+        vec![
+            Call::Keychain(false, Some(KEY.to_string())),
+            Call::Save(protected(true)),
+        ]
+    );
+
+    // Forgetting stores nothing, even with a key installed.
+    let mut fx = Recorder::default();
+    set_keychain(&mut fx, protected(true), false, Some(KEY.to_string())).unwrap();
+    assert_eq!(
+        fx.calls,
+        vec![Call::Keychain(true, None), Call::Save(protected(false))]
+    );
+}
+
+/// Failing to forget a key matters only if one was remembered until now, so
+/// the keychain is told the preference being replaced, not the one saved.
+#[test]
+fn the_keychain_is_told_whether_a_key_was_remembered_before() {
+    for was_remembered in [false, true] {
+        let held = (!was_remembered).then(|| KEY.to_string());
+        let change = protected(!was_remembered);
+        let mut fx = Recorder::default();
+        apply_security_change(&mut fx, was_remembered, change, Some(new_key())).unwrap();
+        assert_eq!(fx.calls[1], Call::Keychain(was_remembered, held.clone()));
+
+        let mut fx = Recorder::default();
+        set_keychain(
+            &mut fx,
+            protected(was_remembered),
+            !was_remembered,
+            Some(KEY.to_string()),
+        )
+        .unwrap();
+        assert_eq!(fx.calls[0], Call::Keychain(was_remembered, held));
+    }
+}
+
+#[test]
+fn remembering_without_an_installed_key_touches_nothing() {
+    let mut fx = Recorder::default();
+    let err = set_keychain(&mut fx, protected(false), true, None).unwrap_err();
+    assert!(err.contains("no key to remember"), "{err}");
+    assert!(fx.calls.is_empty());
+}
+
+/// Under the fallback for a config that did not load, every security change
+/// would delete the index, then fail its save: refused before anything
+/// starts. Showing the key writes nothing, so it still may.
+#[test]
+fn a_config_that_did_not_load_refuses_every_change_that_saves() {
+    let saving = [
+        SecurityAction::Enable,
+        SecurityAction::Disable,
+        SecurityAction::ChangePassword,
+        SecurityAction::SetKeychain(true),
+        SecurityAction::SetKeychain(false),
+    ];
+    let fallback = Config::fallback();
+    for action in saving {
+        assert_eq!(
+            refusal(&fallback, action),
+            Some("Not changed: the config file did not load"),
+            "{action:?}"
+        );
+    }
+    assert_eq!(refusal(&fallback, SecurityAction::ShowKey), None);
+
+    let loaded = Config {
+        source: Some(PathBuf::from("config.toml")),
+        ..Config::default()
+    };
+    for action in saving.into_iter().chain([SecurityAction::ShowKey]) {
+        assert_eq!(refusal(&loaded, action), None, "{action:?}");
+    }
+}

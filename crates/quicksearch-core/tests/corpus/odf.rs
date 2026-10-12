@@ -3,7 +3,8 @@
 //! No Rust crate writes ODF, so these are assembled from [`super::zipwriter`]
 //! and `format!`, independent of the `zip` 0.6 and `quick-xml` the reader
 //! uses. The `mimetype` member comes first and uncompressed, as the
-//! packaging spec requires and as LibreOffice writes it.
+//! packaging spec requires and as LibreOffice writes it. LibreOffice's own
+//! `.odt`, `.ods` and `.odp` are committed in [`super::legacy`].
 
 use std::path::Path;
 

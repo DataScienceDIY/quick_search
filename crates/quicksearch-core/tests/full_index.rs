@@ -9,7 +9,7 @@ use quicksearch_core::indexing::{IndexingService, IndexingStatus, RootPhase};
 use quicksearch_core::testutil::Scratch;
 
 mod common;
-use common::touch;
+use common::{clear_marker, touch};
 
 fn index_roots_once(roots: &[&Path], db: &Path, config: &Config) {
     common::IndexOnce {
@@ -106,6 +106,16 @@ fn names(db: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Whether `db` holds the `last_full_index` marker, which only a run that
+/// finished writes.
+fn stamped(db: &Path) -> bool {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    matches!(
+        quicksearch_core::db::repo::get_last_full_index(&conn),
+        Ok(Some(_))
+    )
+}
+
 #[test]
 fn reindexing_an_unchanged_tree_changes_nothing() {
     let root = Scratch::dir("stable");
@@ -173,44 +183,19 @@ fn a_modified_file_is_updated_in_place() {
     assert_eq!(after.len(), 1, "still exactly one row");
     assert_ne!(before[0].1, after[0].1, "mtime was refreshed");
     assert_eq!(before[0].0, after[0].0, "same path");
+    assert_eq!(
+        stored_text(&db, "doc.txt").as_deref(),
+        Some("second body, clearly different"),
+        "the stored body is the new one"
+    );
+    assert_eq!(hits(&db, "clearly"), 1, "the new body is searchable");
+    assert_eq!(hits(&db, "first"), 0, "the old body's tokens are gone");
 }
 
 fn filetime_set(path: &Path, when: SystemTime) {
     let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
     f.set_modified(when).unwrap();
     f.sync_all().unwrap();
-}
-
-#[test]
-#[cfg(unix)]
-fn an_unreadable_directory_does_not_delete_its_rows() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let root = Scratch::dir("blip");
-    let (_db_dir, db) = Scratch::db("blip-db");
-    let config = Config::default();
-
-    touch(&root.join("visible.txt"), b"visible");
-    let vault = root.join("vault");
-    touch(&vault.join("secret.txt"), b"secret");
-    touch(&vault.join("nested/deeper.txt"), b"deeper");
-
-    index_once(&root, &db, &config);
-    assert_eq!(rows(&db).len(), 3, "all three indexed while readable");
-
-    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
-    index_once(&root, &db, &config);
-    let during = rows(&db);
-    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-    assert_eq!(
-        during.len(),
-        3,
-        "rows under an unreadable directory must survive, not be deleted"
-    );
-
-    index_once(&root, &db, &config);
-    assert_eq!(rows(&db).len(), 3);
 }
 
 #[test]
@@ -227,31 +212,39 @@ fn stopping_mid_run_deletes_nothing() {
     let full = rows(&db);
     assert_eq!(full.len(), 1500);
 
-    // Stop only once a snapshot shows a root still in flight, which proves the
+    // One file per writer round, so the walk lasts 1500 rounds on any host.
+    let mut slow = config.clone();
+    slow.processing.batch_size = 1;
+    slow.processing.writer_turn_slice_ms = 0;
+    clear_marker(&db);
+
+    // Stop only once a snapshot shows a root still Walking, which proves the
     // stop landed mid-run.
-    let service = start(&root, &db, &config);
+    let service = start(&root, &db, &slow);
     let deadline = Instant::now() + Duration::from_secs(120);
-    let stopped_in_flight = loop {
+    loop {
         assert!(Instant::now() < deadline, "the run never became observable");
         match service.get_status() {
             IndexingStatus::Error(e) => panic!("indexing failed: {}", e),
             IndexingStatus::Preparing { .. } => {}
             IndexingStatus::Running { roots, .. }
-                if roots.iter().any(|r| r.phase != RootPhase::Done) =>
+                if roots.iter().any(|r| r.phase == RootPhase::Walking) =>
             {
-                break true;
+                break;
             }
-            _ => break false,
+            other => panic!(
+                "the walk ended before a stop could land in it ({:?}); grow the fixture",
+                other
+            ),
         }
         std::thread::sleep(Duration::from_micros(100));
-    };
+    }
+    service.request_stop();
+    run_to_idle(&service, || {});
     assert!(
-        stopped_in_flight,
-        "the run finished before a stop could land mid-run; grow the fixture"
+        !stamped(&db),
+        "the stopped run stamped itself complete: the stop landed after the walk"
     );
-    service.stop_indexing().unwrap();
-    drop(service);
-    std::thread::sleep(Duration::from_millis(250));
 
     let after = rows(&db);
     assert_eq!(
@@ -259,15 +252,6 @@ fn stopping_mid_run_deletes_nothing() {
         1500,
         "an interrupted run must not delete the rows it never got to"
     );
-}
-
-/// Let a started run go for `delay`, stop it, and give its tail time to land:
-/// the stamp lands past the point a stop can still cut the run short.
-fn run_then_stop(service: IndexingService, delay: Duration) {
-    std::thread::sleep(delay);
-    service.stop_indexing().unwrap();
-    drop(service);
-    std::thread::sleep(Duration::from_millis(300));
 }
 
 #[test]
@@ -292,11 +276,6 @@ fn a_stamped_run_has_finished_its_stale_cleanup() {
         std::fs::remove_file(file(i)).unwrap();
     }
 
-    let stamped = |db: &Path| -> bool {
-        let conn = rusqlite::Connection::open(db).unwrap();
-        quicksearch_core::db::repo::get_last_full_index(&conn).is_some()
-    };
-
     // The ladder samples the race. The trailing `None` lets the run finish, so
     // the loop ends stamped however loaded the host: the suite runs in
     // parallel, and under load no stopped run may stamp within 200 ms.
@@ -305,20 +284,17 @@ fn a_stamped_run_has_finished_its_stale_cleanup() {
         .into_iter()
         .chain([None])
     {
-        rusqlite::Connection::open(&db)
-            .unwrap()
-            .execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
-            .unwrap();
+        clear_marker(&db);
         assert!(!stamped(&db), "stamp cleared before the run");
 
+        // To `Idle` either way: the next rung's run must not start beside
+        // this one's tail or optimize pass.
         let service = start(&root, &db, &config);
-        match delay_ms {
-            Some(ms) => run_then_stop(service, Duration::from_millis(ms)),
-            None => {
-                run_to_idle(&service, || {});
-                drop(service);
-            }
+        if let Some(ms) = delay_ms {
+            std::thread::sleep(Duration::from_millis(ms));
+            service.request_stop();
         }
+        run_to_idle(&service, || {});
 
         if stamped(&db) {
             assert_eq!(
@@ -364,9 +340,8 @@ fn starting_a_run_claims_the_status_before_it_returns() {
         .unwrap_err();
     assert!(err.contains("already running"), "got: {}", err);
 
-    service.stop_indexing().unwrap();
-    drop(service);
-    std::thread::sleep(Duration::from_millis(250));
+    service.request_stop();
+    run_to_idle(&service, || {});
 }
 
 #[test]
@@ -436,6 +411,37 @@ fn two_roots_walk_extract_and_clean_independently() {
     );
 }
 
+/// The search cache is sized from the per-root counts a completed run stores
+/// (`tests/search_cache.rs` covers that half), so after every run they must
+/// add up to the rows it left.
+#[test]
+fn a_completed_run_stores_its_exact_file_count() {
+    let root_a = Scratch::dir("stored-count-a");
+    let root_b = Scratch::dir("stored-count-b");
+    let (_db_dir, db) = Scratch::db("stored-count-db");
+    let config = Config::default();
+    for i in 0..40 {
+        touch(&root_a.join(format!("d{}/a{:03}.txt", i % 4, i)), b"alpha");
+    }
+    for i in 0..7 {
+        touch(&root_b.join(format!("b{:03}.txt", i)), b"bravo");
+    }
+    let stored = |db: &Path| {
+        quicksearch_core::db::repo::stored_file_count(&rusqlite::Connection::open(db).unwrap())
+    };
+
+    index_roots_once(&[&root_a, &root_b], &db, &config);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM files"), 47);
+    assert_eq!(stored(&db), 47, "the stored counts must add up to the rows");
+
+    // Ten files go with `d0`, one arrives.
+    std::fs::remove_dir_all(root_a.join("d0")).unwrap();
+    touch(&root_b.join("late.txt"), b"charlie");
+    index_roots_once(&[&root_a, &root_b], &db, &config);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM files"), 38);
+    assert_eq!(stored(&db), 38, "the next run's counts replace the last");
+}
+
 // ---------------------------------------------------------------------------
 // Reconciliation without a global path set: classification and stale
 // detection are per-directory, so these cover the cases a single directory
@@ -460,131 +466,6 @@ fn a_deleted_directory_takes_its_whole_subtree_out_of_the_index() {
     index_once(&root, &db, &config);
 
     assert_eq!(names(&db), vec!["keep.txt"], "the whole subtree is swept");
-}
-
-/// Only the target under the pruned directory exercises the alias exemption:
-/// its parent is in the sweep's range yet legitimately absent from
-/// `seen_dirs`. An out-of-root target is already outside the sweep's range.
-#[test]
-#[cfg(unix)]
-fn a_symlink_target_in_an_unwalked_directory_survives_reindexing() {
-    let root = Scratch::dir("alias-root");
-    let outside = Scratch::dir("alias-outside");
-    let (db_dir, db) = Scratch::db("alias-db");
-    let mut config = Config::default();
-    config.indexing.follow_symlinks = true;
-
-    touch(&root.join("normal.txt"), b"inside the root");
-
-    // In range, but under a hidden directory the walk prunes.
-    let hidden_target = root.join(".pruned/inner.txt");
-    touch(&hidden_target, b"only reachable through the link");
-    std::os::unix::fs::symlink(&hidden_target, root.join("hidden_link.txt")).unwrap();
-
-    // Out of range entirely.
-    let outer_target = outside.join("target.txt");
-    touch(&outer_target, b"outside the root entirely");
-    std::os::unix::fs::symlink(&outer_target, root.join("outside_link.txt")).unwrap();
-
-    index_once(&root, &db, &config);
-    let first = rows(&db);
-    assert_eq!(first.len(), 3, "both targets indexed under their own paths");
-    assert!(
-        first
-            .iter()
-            .any(|(p, _, _)| p.ends_with(".pruned/inner.txt")),
-        "the pruned-directory target is stored under its canonical path"
-    );
-
-    index_once(&root, &db, &config);
-    assert_eq!(rows(&db), first, "an aliased row must survive a re-index");
-
-    // The other half of the setting: with links off, neither target is indexed.
-    let db2 = db_dir.join("links-off.sqlite");
-    index_once(&root, &db2, &Config::default());
-    let off: Vec<String> = rows(&db2).into_iter().map(|(p, _, _)| p).collect();
-    assert_eq!(off.len(), 1, "only the ordinary file: {:?}", off);
-    assert!(off[0].ends_with("normal.txt"));
-}
-
-/// A target inside the root, so the walk reaches it twice: once by reading its
-/// own directory, once by resolving the link. The other symlink tests use
-/// targets the walk never reaches directly, so only this one makes a duplicate
-/// visit.
-///
-/// The writer keeps no duplicate-visit set, which would hold a digest per
-/// walked file and be the largest thing a run keeps: `insert_file` is
-/// `INSERT OR IGNORE` and returns `None` for a row that exists, so a repeat
-/// visit produces neither a second row nor a second FTS entry. This test fails
-/// if `insert_file` ever stops ignoring conflicts.
-#[test]
-#[cfg(unix)]
-fn a_file_reachable_both_directly_and_through_a_link_gets_one_row() {
-    let root = Scratch::dir("alias-dup-root");
-    let db_dir = Scratch::dir("alias-dup-db");
-    let mut config = Config::default();
-    config.indexing.follow_symlinks = true;
-
-    let target = root.join("real/file.txt");
-    touch(&target, b"reachable two ways");
-    std::os::unix::fs::symlink(&target, root.join("link.txt")).unwrap();
-
-    let db = db_dir.join("links-on.sqlite");
-    index_once(&root, &db, &config);
-    let on = rows(&db);
-    assert_eq!(
-        on.len(),
-        1,
-        "one canonical path, one row, however many ways it was reached: {:?}",
-        on
-    );
-    assert!(
-        on[0].0.ends_with("real/file.txt"),
-        "stored under the target"
-    );
-
-    // The link is not a second document: a duplicated visit that reached the
-    // writer twice would tokenize the body twice into a contentless FTS
-    // table, where nothing would later collapse the two.
-    assert_eq!(hits(&db, "reachable"), 1, "the body is indexed once");
-
-    // Links off: the link is never followed, so the same tree yields the one
-    // row.
-    let db2 = db_dir.join("links-off.sqlite");
-    index_once(&root, &db2, &Config::default());
-    let off = rows(&db2);
-    assert_eq!(off.len(), 1, "only the real file: {:?}", off);
-    assert_eq!(off[0].0, on[0].0, "and the same path as with links on");
-}
-
-#[test]
-#[cfg(unix)]
-fn a_modified_symlink_target_is_updated_not_silently_ignored() {
-    let root = Scratch::dir("alias-mod-root");
-    let outside = Scratch::dir("alias-mod-outside");
-    let (_db_dir, db) = Scratch::db("alias-mod-db");
-    let mut config = Config::default();
-    config.indexing.follow_symlinks = true;
-
-    let target = outside.join("target.txt");
-    touch(&target, b"first body");
-    std::os::unix::fs::symlink(&target, root.join("link.txt")).unwrap();
-
-    index_once(&root, &db, &config);
-    let before = rows(&db);
-    assert_eq!(before.len(), 1);
-
-    std::fs::write(&target, b"second body, quite different").unwrap();
-    filetime_set(&target, SystemTime::now() + Duration::from_secs(120));
-
-    index_once(&root, &db, &config);
-    let after = rows(&db);
-    assert_eq!(after.len(), 1, "still exactly one row");
-    assert_eq!(after[0].0, before[0].0, "same path");
-    assert_ne!(
-        after[0].1, before[0].1,
-        "mtime was refreshed, so it was re-read"
-    );
 }
 
 #[test]
@@ -616,11 +497,11 @@ fn overlapping_roots_index_each_file_exactly_once() {
     assert_eq!(rows(&db), all, "a second overlapping run changes nothing");
 }
 
+/// Unix only: a Windows `icacls` deny ACE does not bind the owning process
+/// reliably enough to test against.
 #[test]
 #[cfg(unix)]
 fn a_directory_that_becomes_unreadable_deletes_nothing() {
-    use std::os::unix::fs::PermissionsExt;
-
     let root = Scratch::dir("locked-later");
     let (_db_dir, db) = Scratch::db("locked-later-db");
     let config = Config::default();
@@ -634,12 +515,64 @@ fn a_directory_that_becomes_unreadable_deletes_nothing() {
     let before = rows(&db);
     assert_eq!(before.len(), 3, "all three indexed while readable");
 
-    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Fails, rather than skips, under rights that ignore the mode (root),
+    // which would test a readable directory; CI drops them.
+    quicksearch_core::platform::deny_read(&vault).unwrap();
     index_once(&root, &db, &config);
     let after = rows(&db);
-    std::fs::set_permissions(&vault, std::fs::Permissions::from_mode(0o755)).ok();
-
+    quicksearch_core::platform::restore_read(&vault).ok();
     assert_eq!(after, before, "an unreadable directory is not an empty one");
+
+    index_once(&root, &db, &config);
+    assert_eq!(rows(&db), before, "readable again, nothing changed");
+}
+
+/// The root's recorded file count: one root per test, so the only one.
+fn walk_count(db: &Path) -> i64 {
+    count(
+        db,
+        "SELECT CAST(value AS INTEGER) FROM schema_info WHERE key LIKE 'walk_count:%'",
+    )
+}
+
+/// An unmounted static mountpoint (fstab `nofail`, a backup disk not plugged
+/// in) resolves and lists as empty, the same as a root whose files were all
+/// deleted.
+#[test]
+fn a_root_with_nothing_mounted_keeps_its_entries() {
+    let base = Scratch::canonical("unmounted");
+    let root = base.join("mnt");
+    let (_db_dir, db) = Scratch::db("unmounted-db");
+    let config = Config::default();
+    touch(&root.join("a.txt"), b"alpha");
+    touch(&root.join("sub/b.txt"), b"bravo");
+
+    index_once(&root, &db, &config);
+    let before = rows(&db);
+    assert_eq!(before.len(), 2);
+    assert_eq!(walk_count(&db), 2);
+
+    let disk = base.join("disk");
+    std::fs::rename(&root, &disk).unwrap();
+    std::fs::create_dir(&root).unwrap();
+    index_once(&root, &db, &config);
+    assert_eq!(
+        rows(&db),
+        before,
+        "an empty mountpoint is not an emptied root"
+    );
+    assert_eq!(walk_count(&db), 2, "nor a root of no files");
+
+    // Forgotten, so only the next walk can put it back.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM schema_info WHERE key LIKE 'walk_count:%'", [])
+        .unwrap();
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&disk, &root).unwrap();
+    index_once(&root, &db, &config);
+    assert_eq!(rows(&db), before, "mounted again, nothing changed");
+    assert_eq!(walk_count(&db), 2, "and a clean walk recorded its count");
 }
 
 // ---------------------------------------------------------------------------
@@ -894,6 +827,32 @@ fn extensionless_text_files_are_indexed() {
     );
 }
 
+/// No name to go on: the sniff types it from its bytes (`infer` reads the
+/// first member's name), and that MIME picks the parser.
+#[test]
+fn an_extensionless_docx_is_indexed_with_its_text() {
+    use std::io::Write;
+
+    let root = Scratch::dir("extless-docx");
+    let (_db_dir, db) = Scratch::db("extless-docx-db");
+
+    let mut docx = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    docx.start_file("word/document.xml", zip::write::FileOptions::default())
+        .unwrap();
+    docx.write_all(
+        b"<w:document><w:body><w:p><w:r><w:t>Minutes of the marmot council</w:t></w:r></w:p>\
+          </w:body></w:document>",
+    )
+    .unwrap();
+    touch(&root.join("minutes"), &docx.finish().unwrap().into_inner());
+    index_once(&root, &db, &Config::default());
+
+    assert_eq!(
+        stored_text(&db, "minutes").as_deref(),
+        Some("Minutes of the marmot council\n")
+    );
+}
+
 /// `stored_text` decodes the zstd sidecar with `String::from_utf8`, so a
 /// `Some` result *is* the storage-is-UTF-8 assertion.
 #[test]
@@ -1008,7 +967,6 @@ fn the_extraction_denominator_counts_only_files_that_need_text() {
         (0, 3),
         "extract_total is the searchable set, not the file count"
     );
-    assert_eq!(scope.pending + scope.already_done, 3);
     drop(conn);
 }
 
@@ -1044,13 +1002,12 @@ fn the_content_extension_filter_still_excludes_small_text_files() {
     touch(&root.join("skipped.txt"), b"skipped xylophone body");
     index_once(&root, &db, &config);
 
-    for (path, _, state) in rows(&db) {
-        if path.ends_with("kept.md") {
-            assert_eq!(state, 1, "an allowed extension is extracted");
-        } else {
-            assert_eq!(state, 3, "a filtered extension is NA, never inlined");
-        }
-    }
+    let states: Vec<i64> = rows(&db).into_iter().map(|(_, _, state)| state).collect();
+    assert_eq!(
+        states,
+        [1, 3],
+        "kept.md is extracted; skipped.txt, a filtered extension, is NA, never inlined"
+    );
     assert_eq!(
         stored_text(&db, "skipped.txt"),
         None,
@@ -1135,8 +1092,8 @@ struct Overlap {
 }
 
 /// Watch a two-root run until the heavy root has finished extracting, report
-/// how the two counters moved while both were in flight, then stop the run.
-/// Removing the fixture is the caller's job.
+/// how the two counters moved while both were in flight, then stop the run
+/// and wait for it to end. Removing the fixture is the caller's job.
 ///
 /// The window opens on the first snapshot holding both roots in flight and
 /// closes when the heavy root leaves `Extracting`, not when the light root
@@ -1205,7 +1162,8 @@ fn observe_overlap(service: &IndexingService, heavy_tag: &str, light_tag: &str) 
         // Poll finer than a writer round, or this loop sets the window's edges.
         std::thread::sleep(Duration::from_micros(500));
     }
-    service.stop_indexing().unwrap();
+    service.request_stop();
+    run_to_idle(service, || {});
 
     let Some((light_open, heavy_open)) = opened else {
         panic!(
@@ -1337,12 +1295,14 @@ fn a_heavy_root_does_not_stall_a_light_one() {
     // with the row count, while what the light root drains does not. Sized
     // for the guards: enough that the rows arrive over separate writer
     // rounds, cheap enough that a loaded runner still finishes in seconds.
-    // RTF, because its extractor reads and parses the whole file, where
-    // plaintext stops at twice `maximum_text_size`.
+    // RTF, because its extractor reads the whole file and scans every byte up
+    // to `maximum_text_size` of text, where plaintext stops reading at twice
+    // that: the filler sits in a skipped destination, so it is all scanned
+    // and none of it is text.
     const HEAVY_FILES: usize = 12;
     // ~2 MiB each, 24 MB total.
     let body = format!(
-        "{{\\rtf1\\ansi {}}}",
+        "{{\\rtf1\\ansi {{\\*\\qsfill {}}}sphinx of black quartz judge my vow}}",
         "sphinx of black quartz judge my vow ".repeat(58_000)
     );
 
@@ -1477,10 +1437,7 @@ fn the_wal_stays_bounded_during_a_run() {
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    let idle_by = Instant::now() + Duration::from_secs(120);
-    while Instant::now() < idle_by && !matches!(service.get_status(), IndexingStatus::Idle) {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    run_to_idle(&service, || {});
     let after = wal_bytes(&db);
     drop(service);
 
@@ -1529,6 +1486,7 @@ fn a_stopped_run_is_still_optimized() {
     service.request_stop();
     run_to_idle(&service, || {});
 
+    assert!(!stamped(&db), "the run finished before the stop landed");
     assert_eq!(
         quicksearch_core::db::repo::optimize_count(&dir_key),
         before + 1,
@@ -1656,8 +1614,8 @@ fn the_wal_stays_bounded_through_the_tail_of_a_warm_reindex() {
         .unwrap();
 
     // The cold run is where the mechanism is visible: it fills the log, and
-    // 30-odd MiB against a 512 MiB default cap means the in-loop checkpoint
-    // never fires, so the tail's is the only one there is.
+    // 30-odd MiB is far under the default cap, so the in-loop checkpoint
+    // never fires and the tail's is the only one there is.
     reindex_sampling_the_log(&root, &db, &config);
     let indexed = std::fs::metadata(&db).unwrap().len();
     assert!(

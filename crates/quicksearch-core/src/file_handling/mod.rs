@@ -21,7 +21,8 @@ pub use batch::{
 };
 pub use counting::count_tree_entries_fast;
 pub use paths::{
-    db_key_for_missing_path, filtered_dirs, filtered_walk, split_db_path, UnreadableDirs,
+    db_key_for_missing_path, filtered_dirs, filtered_walk, split_db_path, trim_trailing_separators,
+    UnreadableDirs,
 };
 pub(crate) use paths::{
     dir_to_db_parent, index_file_set, normalize_root_string, path_to_db_string,
@@ -29,9 +30,8 @@ pub(crate) use paths::{
 };
 pub(crate) use records::mtime_secs;
 pub use records::{
-    classify_by_mtime, content_extractable, decide_content,
-    extract_and_store, fts_begin_bulk_write, fts_begin_tombstone_burst, fts_end_tombstone_burst,
-    fts_finalize_after_text_indexing, get_file_hash, hash_failure_counts, outcome_body,
-    prepare_file_record, reset_run_warnings, ContentOutcome, DirRows, FileIndexAction,
-    OwnedNewFile, FTS_DELETEMERGE,
+    classify, content_extractable, decide_content, extract_and_store, fts_begin_bulk_write,
+    fts_begin_tombstone_burst, fts_end_tombstone_burst, fts_finalize_after_text_indexing,
+    get_file_hash, hash_failure_counts, outcome_body, prepare_file_record, reset_run_warnings,
+    ContentOutcome, DirRows, FileIndexAction, OwnedNewFile, Stamp, FTS_DELETEMERGE,
 };

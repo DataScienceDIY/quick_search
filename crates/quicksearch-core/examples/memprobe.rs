@@ -24,8 +24,8 @@
 //! the finished one. Reading the report: quote `VmHWM`, which cannot miss a
 //! spike; the sampled peak only says when. `growth per file` is a ratio, not
 //! a per-file cost. Nothing reported is evictable page cache. `settled RSS`
-//! is what a long-lived process keeps: freed memory stays with the allocator
-//! until `release_free_heap` returns it.
+//! is what a long-lived process keeps: what the allocators still hold after
+//! the run's closing `release_free_heap`.
 //!
 //! Built with `--features probe` the indexer also prints a `census` line
 //! naming what its run-scoped structures hold, which is the half `smaps`
@@ -180,7 +180,10 @@ fn run(mode: &str, roots: &[String], db: &Path, interval: Duration, config_path:
 
         if ticks.is_multiple_of(marker_every) && db.exists() {
             if let Ok(conn) = rusqlite::Connection::open(db) {
-                if quicksearch_core::db::repo::get_last_full_index(&conn).is_some() {
+                if matches!(
+                    quicksearch_core::db::repo::get_last_full_index(&conn),
+                    Ok(Some(_))
+                ) {
                     done = true;
                     break;
                 }
@@ -318,10 +321,7 @@ fn report(
             );
         }
     }
-    eprintln!(
-        "  database on disk  {} (counts toward RSS as page cache)",
-        mib(db_bytes)
-    );
+    eprintln!("  database on disk  {}", mib(db_bytes));
 
     if !at_peak.is_empty() {
         eprintln!("\n  resident bytes at the peak, by mapping:");

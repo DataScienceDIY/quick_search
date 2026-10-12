@@ -24,43 +24,48 @@ pub fn is_wayland() -> bool {
 /// `token` is an xdg-activation token relayed by a `--toggle` sender, the
 /// compositor's permission to take focus; only Wayland consumes it.
 pub fn raise(ctx: &egui::Context, frame: &eframe::Frame, token: Option<&str>) {
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        if x11_activate(frame) {
-            // Belt and braces: EWMH says activating an iconified window
-            // de-iconifies it, but not every window manager does, and a
-            // window left minimised cannot take the caret.
-            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            return;
+    use raw_window_handle::HasWindowHandle;
+
+    match frame.window_handle().map(|handle| handle.as_raw()) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        Ok(raw_window_handle::RawWindowHandle::Xlib(xlib)) => {
+            if x11_activate(xlib.window as u32) {
+                // Belt and braces: EWMH says activating an iconified window
+                // de-iconifies it, but not every window manager does, and a
+                // window left minimised cannot take the caret.
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                return;
+            }
         }
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        Ok(raw_window_handle::RawWindowHandle::Wayland(window)) => {
             // With a token the compositor will move focus itself; the
             // de-iconify still has to be asked for separately.
-            if let Some(token) = token.filter(|t| !t.is_empty()) {
-                if wayland::activate(frame, token) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    return;
-                }
+            let token = token.filter(|t| !t.is_empty());
+            if token.is_some_and(|token| wayland::activate(frame, window.surface, token)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            } else {
+                // No token, or the compositor refused: the one request
+                // honoured from a background client is a bid for attention.
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Informational,
+                ));
             }
-            // No token, or the compositor refused: the one request honoured
-            // from a background client is a bid for attention.
-            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                egui::UserAttentionType::Informational,
-            ));
             return;
         }
-    }
-    #[cfg(windows)]
-    {
-        let _ = token;
-        if win32_activate(frame) {
-            return;
+        #[cfg(windows)]
+        Ok(raw_window_handle::RawWindowHandle::Win32(win32)) => {
+            if win32_activate(win32.hwnd.get() as _) {
+                return;
+            }
         }
+        Ok(_) => {}
+        // Logged, or a shortcut that never raised the window would look like
+        // one that never fired.
+        Err(e) => quicksearch_core::log_warn!("raising the window: no window handle: {}", e),
     }
-    #[cfg(not(any(all(unix, not(target_os = "macos")), windows)))]
-    {
-        let _ = (frame, token);
-    }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    let _ = token;
 
     // A window still minimised cannot take focus.
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -77,26 +82,11 @@ pub fn raise(ctx: &egui::Context, frame: &eframe::Frame, token: Option<&str>) {
 /// one place, immediately, while the `AllowSetForegroundWindow` grant from
 /// the `--toggle` sender is fresh.
 #[cfg(windows)]
-fn win32_activate(frame: &eframe::Frame) -> bool {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+fn win32_activate(hwnd: windows_sys::Win32::Foundation::HWND) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
     };
 
-    let handle = match frame.window_handle() {
-        Ok(handle) => handle,
-        Err(e) => {
-            quicksearch_core::log_warn!("raising the window: no window handle: {}", e);
-            return false;
-        }
-    };
-    let hwnd = match handle.as_raw() {
-        RawWindowHandle::Win32(win32) => win32.hwnd.get() as _,
-        other => {
-            quicksearch_core::log_warn!("raising the window: not a Win32 window: {:?}", other);
-            return false;
-        }
-    };
     // SAFETY: `hwnd` is this process's live window for the whole call; these
     // APIs accept any window handle and merely fail on a bad one.
     unsafe {
@@ -239,29 +229,10 @@ impl X11State {
     }
 }
 
-/// Activates our window, EWMH style. `false` when this is not X11 or the
-/// server would not take it, so the caller can fall back to winit.
+/// Activates our X11 `window`, EWMH style. `false` when the server would not
+/// take it, so the caller can fall back to winit.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn x11_activate(frame: &eframe::Frame) -> bool {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-
-    // Logged, or a shortcut that never raised the window would look like one
-    // that never fired.
-    let handle = match frame.window_handle() {
-        Ok(handle) => handle,
-        Err(e) => {
-            quicksearch_core::log_warn!("raising the window: no window handle: {}", e);
-            return false;
-        }
-    };
-    let window = match handle.as_raw() {
-        RawWindowHandle::Xlib(xlib) => xlib.window as u32,
-        other => {
-            quicksearch_core::log_warn!("raising the window: not an X11 window: {:?}", other);
-            return false;
-        }
-    };
-
+fn x11_activate(window: u32) -> bool {
     let sent = X11.with(|slot| -> Result<(), Box<dyn std::error::Error>> {
         let mut slot = slot.borrow_mut();
         let state = match slot.as_mut() {
@@ -294,10 +265,9 @@ mod wayland {
     use std::cell::RefCell;
     use std::error::Error;
     use std::ffi::c_void;
+    use std::ptr::NonNull;
 
-    use raw_window_handle::{
-        HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
-    };
+    use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
     use wayland_client::backend::{Backend, ObjectId};
     use wayland_client::protocol::{wl_registry, wl_surface::WlSurface};
     use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
@@ -305,7 +275,9 @@ mod wayland {
 
     // Kept open across presses like the X11 state above, and for one more
     // reason: wl_registry has no destructor request, so a fresh connection
-    // per press would leak a server-side registry every time.
+    // per press would leak a server-side registry every time. That is also
+    // why a compositor without xdg_activation_v1 keeps its connection: the
+    // missing global is remembered, not retried with a new registry.
     thread_local! {
         static WAYLAND: RefCell<Option<WaylandState>> = const { RefCell::new(None) };
     }
@@ -367,7 +339,11 @@ mod wayland {
             // a frame) and dispatches only this queue.
             queue.roundtrip(&mut globals)?;
             if globals.activation.is_none() {
-                return Err("the compositor does not support xdg_activation_v1".into());
+                // Once per connection, which is kept: every press after this
+                // one asks for attention without a word.
+                quicksearch_core::log_warn!(
+                    "raising the window: the compositor does not support xdg_activation_v1"
+                );
             }
             Ok(WaylandState {
                 display_ptr,
@@ -377,15 +353,19 @@ mod wayland {
             })
         }
 
-        fn activate(&mut self, surface_ptr: *mut c_void, token: &str) -> Result<(), Box<dyn Error>> {
+        /// `Ok(false)` when the compositor has no `xdg_activation_v1` to ask.
+        fn activate(
+            &mut self,
+            surface_ptr: *mut c_void,
+            token: &str,
+        ) -> Result<bool, Box<dyn Error>> {
             // Drain registry chatter (global add/remove) accumulated since
-            // the last press so the queue buffer cannot grow over a session.
+            // the last press so the queue buffer cannot grow over a session;
+            // this also binds the global should it have arrived since.
             self.queue.dispatch_pending(&mut self.globals)?;
-            let activation = self
-                .globals
-                .activation
-                .as_ref()
-                .ok_or("xdg_activation_v1 disappeared from the registry")?;
+            let Some(activation) = self.globals.activation.as_ref() else {
+                return Ok(false);
+            };
 
             // SAFETY: `surface_ptr` is winit's live wl_surface for the very
             // window we are raising; it outlives this call. `from_ptr`
@@ -399,17 +379,18 @@ mod wayland {
             // press surfaces as an error here (and the cache is dropped)
             // instead of "succeeding" into a closed socket forever.
             self.queue.roundtrip(&mut self.globals)?;
-            Ok(())
+            Ok(true)
         }
     }
 
-    /// Activates our already-mapped window with an xdg-activation token
-    /// minted by the compositor for a real user action. `false` when this is
-    /// not a Wayland window, the compositor lacks `xdg_activation_v1`, or
-    /// anything on the way failed; the caller then falls back to a request
-    /// for attention. Note the compositor may still quietly downgrade a stale
-    /// token to that same attention hint; v1 has no error event to say so.
-    pub(super) fn activate(frame: &eframe::Frame, token: &str) -> bool {
+    /// Activates our already-mapped window, whose wl_surface is `surface`,
+    /// with an xdg-activation token minted by the compositor for a real user
+    /// action. `false` when the compositor lacks `xdg_activation_v1` (the
+    /// connection is kept, see above) or anything on the way failed (it is
+    /// dropped); the caller then falls back to a request for attention. Note
+    /// the compositor may still quietly downgrade a stale token to that same
+    /// attention hint; v1 has no error event to say so.
+    pub(super) fn activate(frame: &eframe::Frame, surface: NonNull<c_void>, token: &str) -> bool {
         let display_ptr = match frame.display_handle().map(|h| h.as_raw()) {
             Ok(RawDisplayHandle::Wayland(w)) => w.display.as_ptr(),
             Ok(other) => {
@@ -421,19 +402,8 @@ mod wayland {
                 return false;
             }
         };
-        let surface_ptr = match frame.window_handle().map(|h| h.as_raw()) {
-            Ok(RawWindowHandle::Wayland(w)) => w.surface.as_ptr(),
-            Ok(other) => {
-                quicksearch_core::log_warn!("raising the window: not a Wayland window: {:?}", other);
-                return false;
-            }
-            Err(e) => {
-                quicksearch_core::log_warn!("raising the window: no window handle: {}", e);
-                return false;
-            }
-        };
 
-        let sent = WAYLAND.with(|slot| -> Result<(), Box<dyn Error>> {
+        let sent = WAYLAND.with(|slot| -> Result<bool, Box<dyn Error>> {
             let mut slot = slot.borrow_mut();
             // A cached connection is only good for the display it wraps.
             if slot.as_ref().is_some_and(|s| s.display_ptr != display_ptr) {
@@ -443,10 +413,10 @@ mod wayland {
                 Some(state) => state,
                 None => slot.insert(WaylandState::connect(display_ptr)?),
             };
-            state.activate(surface_ptr, token)
+            state.activate(surface.as_ptr(), token)
         });
         match sent {
-            Ok(()) => true,
+            Ok(sent) => sent,
             Err(e) => {
                 quicksearch_core::log_warn!("raising the window: {}", e);
                 // Do not reuse a connection that failed mid-way; the next

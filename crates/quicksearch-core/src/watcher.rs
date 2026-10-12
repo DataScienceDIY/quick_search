@@ -8,7 +8,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -49,7 +49,6 @@ pub type EventSink = Arc<dyn Fn(FsEvent) + Send + Sync + 'static>;
 #[derive(Debug, Clone)]
 pub struct WatchFilters {
     pub include_hidden: bool,
-    pub follow_symlinks: bool,
     pub ignore: Arc<IgnoreSet>,
 }
 
@@ -65,12 +64,14 @@ pub enum WatchError {
     KernelLimit {
         registered: usize,
     },
-    /// The kernel's event queue overflowed and events were dropped. A one-shot,
-    /// not a capacity problem like the other reasons: the watcher keeps
-    /// delivering, but the index is out of step by an unknown amount, so a
-    /// full run is owed. Once that is scheduled the reason must be cleared
-    /// ([`Watcher::clear_degraded`]), or it would mask a later, standing
-    /// [`WatchError::KernelLimit`].
+    /// The kernel's event queue (on Windows, the root's change buffer)
+    /// overflowed and events were dropped. A one-shot, not a capacity problem
+    /// like the other reasons, but the index is out of step by an unknown
+    /// amount, and so is the watch set: a lost directory `Create` leaves the
+    /// new directory unwatched, a lost `Delete` keeps the old one registered.
+    /// The coordinator answers with a full run and a fresh registration, from
+    /// which a limit that still stands surfaces as itself; during a storm, at
+    /// most once in a few minutes.
     Overflowed,
     Other(String),
 }
@@ -233,6 +234,8 @@ pub struct Watcher {
     /// other sender, so the channel never closes while the loop runs.
     stop_tx: mpsc::Sender<Option<NotifyEvent>>,
     handle: Option<JoinHandle<()>>,
+    /// The flag [`Self::start`] was handed; [`Self::stop`] sets it.
+    cancel: Arc<AtomicBool>,
     dir_count: Arc<AtomicUsize>,
     degraded: Degraded,
     /// Held so the notify handle drops on stop, releasing every watch.
@@ -242,15 +245,29 @@ pub struct Watcher {
 /// Set when the watcher runs out of budget *after* starting.
 type Degraded = Arc<Mutex<Option<WatchError>>>;
 
+/// `Err` once `cancel` is set. Registration checks it per directory, so a
+/// superseded start stops walking, and the dropped registry releases every
+/// watch it took instead of holding them against the user's quota.
+fn not_cancelled(cancel: &AtomicBool) -> Result<(), WatchError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(WatchError::Other("watch registration cancelled".into()));
+    }
+    Ok(())
+}
+
 impl Watcher {
     /// Register watches for every indexable directory under `roots` and start
     /// the debouncing loop. Registration walks each root, so callers run it
-    /// off their main loop.
+    /// off their main loop, and can abandon it by setting `cancel`: the walk
+    /// stops at its next directory (its next root on a recursive backend)
+    /// and returns `Err`. The running watcher keeps the flag, so setting it
+    /// later also ends the loop at its next event.
     pub fn start(
         roots: Vec<PathBuf>,
         filters: WatchFilters,
         config: WatcherConfig,
         sink: EventSink,
+        cancel: Arc<AtomicBool>,
     ) -> Result<Self, WatchError> {
         let (tx, rx) = mpsc::channel::<Option<NotifyEvent>>();
         let stop_tx = tx.clone();
@@ -259,9 +276,10 @@ impl Watcher {
         let raw = RecommendedWatcher::new(
             move |res: notify::Result<NotifyEvent>| match res {
                 Ok(ev) => {
-                    // Kernel queue overflow arrives on the *Ok* arm, as
-                    // `EventKind::Other` with the rescan flag and no paths, so
-                    // the error arm below never sees it.
+                    // inotify, FSEvents and the patched Windows backend (a
+                    // zero-byte completion; see vendor/notify) report overflow
+                    // on the *Ok* arm, as `EventKind::Other` with the rescan
+                    // flag and no paths, so the error arm never sees it.
                     if ev.need_rescan() {
                         crate::lock_ok(&degraded_cb).get_or_insert(WatchError::Overflowed);
                         return;
@@ -296,24 +314,28 @@ impl Watcher {
             let failures = UnreadableDirs::default();
             let mut reg = crate::lock_ok(&registry);
             for root in &roots {
+                let before = reg.dirs.len();
                 if crate::platform::WATCH_ROOTS_RECURSIVELY {
                     // Ignored and hidden subtrees have nothing registered to
                     // skip; their events are dropped in `is_event_interesting`.
+                    not_cancelled(&cancel)?;
                     add_watch(&mut reg, root)?;
-                    continue;
+                } else {
+                    let Some(root_str) = root.to_str() else {
+                        crate::log_warn!("watcher: skipping non-UTF-8 root {}", root.display());
+                        continue;
+                    };
+                    for entry in
+                        filtered_dirs(root_str, filters.include_hidden, &filters.ignore, &failures)
+                    {
+                        not_cancelled(&cancel)?;
+                        add_watch(&mut reg, entry.path())?;
+                    }
                 }
-                let Some(root_str) = root.to_str() else {
-                    crate::log_warn!("watcher: skipping non-UTF-8 root {}", root.display());
-                    continue;
-                };
-                for entry in filtered_dirs(
-                    root_str,
-                    filters.follow_symlinks,
-                    filters.include_hidden,
-                    &filters.ignore,
-                    &failures,
-                ) {
-                    add_watch(&mut reg, entry.path())?;
+                // Missing, or refused: this root stays silent while the
+                // status reads Active on the other roots' strength.
+                if reg.dirs.len() == before {
+                    crate::log_warn!("watcher: nothing under {} could be watched", root.display());
                 }
             }
             if reg.dirs.is_empty() {
@@ -329,12 +351,14 @@ impl Watcher {
             roots,
             dir_count: dir_count.clone(),
             degraded: degraded.clone(),
+            cancel: cancel.clone(),
         };
         let handle = thread::spawn(move || run_loop(rx, ctx));
 
         Ok(Self {
             stop_tx,
             handle: Some(handle),
+            cancel,
             dir_count,
             degraded,
             _registry: registry,
@@ -346,25 +370,24 @@ impl Watcher {
         self.dir_count.load(Ordering::Relaxed)
     }
 
-    /// Which limit the watcher hit after starting, if any; the coordinator
-    /// polls this and falls back to periodic rescans.
+    /// What went wrong after starting, if anything. The coordinator polls
+    /// this: an overflow re-registers, a limit falls back to periodic rescans.
     pub fn degraded_reason(&self) -> Option<WatchError> {
         crate::lock_ok(&self.degraded).clone()
     }
 
-    /// Whether the watcher ran out of budget after starting.
-    pub fn is_degraded(&self) -> bool {
-        crate::lock_ok(&self.degraded).is_some()
-    }
-
-    /// Forget the recorded reason, so a later one can take its place; for
-    /// [`WatchError::Overflowed`] only (see there).
-    pub fn clear_degraded(&self) {
-        *crate::lock_ok(&self.degraded) = None;
+    /// Record `reason` as if the watcher had hit it after starting.
+    #[cfg(test)]
+    pub(crate) fn force_degraded(&self, reason: WatchError) {
+        *crate::lock_ok(&self.degraded) = Some(reason);
     }
 
     /// Stop the background thread and join it; safe to call multiple times.
+    /// The cancel flag is set first: the `None` queues behind every event
+    /// already sent, and the loop, seeing the flag, ends at the next one
+    /// instead of working through the backlog (or a `register_tree` walk).
     pub fn stop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
         let _ = self.stop_tx.send(None);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -382,7 +405,7 @@ impl std::fmt::Debug for Watcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Watcher")
             .field("watched_dirs", &self.watched_dirs())
-            .field("degraded", &self.is_degraded())
+            .field("degraded", &self.degraded_reason())
             .finish()
     }
 }
@@ -391,11 +414,15 @@ struct LoopCtx {
     sink: EventSink,
     registry: Arc<Mutex<WatchRegistry>>,
     filters: WatchFilters,
-    /// Configured roots; "hidden" is judged relative to them, since a root
-    /// may itself sit under a hidden directory (`~/.config/app`).
+    /// Configured roots, in the spelling events arrive in (through the link,
+    /// for a root that is one). Hidden and ignored names are judged below
+    /// them, since a root may itself sit under one (`~/.config/app`).
     roots: Vec<PathBuf>,
     dir_count: Arc<AtomicUsize>,
     degraded: Degraded,
+    /// The flag [`Watcher::start`] was handed: once set, the loop and any
+    /// [`register_tree`] walk end.
+    cancel: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,19 +433,23 @@ enum Op {
 }
 
 /// Forward each interesting event to the sink as it arrives, blocking in
-/// between; `None` is [`Watcher::stop`]. Nothing is held back here: the
-/// coordinator's queue coalesces by path and waits for `pending_settle`
-/// (at most `pending_max_defer`). A per-directory throttle here used to hold
-/// a directory's second event for 30 s and woke this thread twice a second
-/// while idle.
+/// between; `None` or the cancel flag is [`Watcher::stop`]. Nothing is held
+/// back here: the coordinator's queue coalesces by path and waits for
+/// `pending_settle` (at most `pending_max_defer`). A per-directory throttle
+/// here used to hold a directory's second event for 30 s and woke this
+/// thread twice a second while idle.
 fn run_loop(rx: mpsc::Receiver<Option<NotifyEvent>>, ctx: LoopCtx) {
     while let Ok(Some(ev)) = rx.recv() {
+        if ctx.cancel.load(Ordering::Relaxed) {
+            break;
+        }
         handle_notify_event(&ev, &ctx);
     }
 }
 
 /// Register a directory that appeared after startup, and everything under
-/// it: a whole tree can be moved in with a single event.
+/// it: a whole tree can be moved in with a single event. A stop ends the
+/// walk at the next directory.
 fn register_tree(ctx: &LoopCtx, root: &Path) {
     let Some(root_str) = root.to_str() else {
         return;
@@ -427,11 +458,13 @@ fn register_tree(ctx: &LoopCtx, root: &Path) {
     let mut reg = crate::lock_ok(&ctx.registry);
     for entry in filtered_dirs(
         root_str,
-        ctx.filters.follow_symlinks,
         ctx.filters.include_hidden,
         &ctx.filters.ignore,
         &failures,
     ) {
+        if ctx.cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if let Err(limit) = add_watch(&mut reg, entry.path()) {
             // A partially watched tree would look live while going silently
             // stale; stop and let the coordinator tear us down.
@@ -449,15 +482,13 @@ fn watch_if_new_dir(ctx: &LoopCtx, path: &Path) {
         return;
     }
     // Files are reported through their parent's watch; only directories need
-    // one of their own. A symlink is judged as the link it is: with following
-    // off the walk never descends it, so watching it would spend descriptors
-    // on a subtree that is never indexed.
-    let is_dir = match std::fs::symlink_metadata(path) {
-        Ok(md) if md.file_type().is_symlink() => ctx.filters.follow_symlinks && path.is_dir(),
-        Ok(md) => md.is_dir(),
-        Err(_) => return,
+    // one of their own. A symlink is judged as the link it is, never a
+    // directory: the walk does not descend it, so watching it would spend
+    // descriptors on a subtree that is never indexed.
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return;
     };
-    if is_dir && is_event_interesting(ctx, path) {
+    if md.is_dir() && is_event_interesting(ctx, path) {
         register_tree(ctx, path);
     }
 }
@@ -476,41 +507,64 @@ fn unwatch_tree(ctx: &LoopCtx, path: &Path) {
 }
 
 /// Whether an event for `path` is worth queueing at all: the same predicate
-/// the walk applies. Under a recursive root watch it alone keeps
-/// `node_modules` churn out of the coordinator's queue. A path the index cannot
-/// spell is dropped (see `path_to_db_string`).
+/// the walk applies, names tested only below the root containing `path`, so
+/// a root inside `node_modules` keeps its events. Under a recursive root
+/// watch it alone keeps `node_modules` churn out of the coordinator's queue.
+/// A path the index cannot spell is dropped (see `path_to_db_string`).
 fn is_event_interesting(ctx: &LoopCtx, path: &Path) -> bool {
     path.to_str().is_some()
-        && !ctx.filters.ignore.matches_path(path)
+        && !ctx.filters.ignore.matches_below(path, &ctx.roots)
         && (ctx.filters.include_hidden || !path_has_hidden_component_under(path, &ctx.roots))
 }
 
+/// What `kind` means for `path`, one of its event's paths, or `None` for
+/// nothing to apply. Split renames degrade to Create/Remove; notify 6.x does
+/// not bundle halves by cookie uniformly across backends. A rename that names
+/// no end (FSEvents reports every rename as `Name(Any)`) is judged by the
+/// disk: a path that is there is where the name went, a `Create`, so a
+/// directory moved in is walked; one that is not is where it left.
+fn op_for(kind: &EventKind, path: &Path) -> Option<Op> {
+    match kind {
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            Some(Op::Create)
+        }
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            Some(Op::Remove)
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::Any | RenameMode::Other)) => {
+            Some(match std::fs::symlink_metadata(path) {
+                Ok(_) => Op::Create,
+                Err(_) => Op::Remove,
+            })
+        }
+        EventKind::Modify(_) => Some(Op::Modify),
+        _ => None,
+    }
+}
+
 fn handle_notify_event(ev: &NotifyEvent, ctx: &LoopCtx) {
-    let op = match ev.kind {
-        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) if ev.paths.len() == 2 => {
-            // A rename is only uninteresting when *both* ends are: out of an
-            // ignored directory into a watched one is a real Create.
-            if !is_event_interesting(ctx, &ev.paths[0]) && !is_event_interesting(ctx, &ev.paths[1])
-            {
-                return;
-            }
-            unwatch_tree(ctx, &ev.paths[0]);
-            watch_if_new_dir(ctx, &ev.paths[1]);
-            (ctx.sink)(FsEvent::Rename {
-                from: ev.paths[0].clone(),
-                to: ev.paths[1].clone(),
-            });
+    let both = EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+    if ev.kind == both && ev.paths.len() == 2 {
+        // A rename is only uninteresting when *both* ends are: out of an
+        // ignored directory into a watched one is a real Create.
+        if !is_event_interesting(ctx, &ev.paths[0]) && !is_event_interesting(ctx, &ev.paths[1]) {
             return;
         }
-        // Split renames degrade to Create/Remove; notify 6.x does not bundle
-        // halves by cookie uniformly across backends.
-        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => Op::Create,
-        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => Op::Remove,
-        EventKind::Modify(_) => Op::Modify,
-        _ => return,
-    };
+        unwatch_tree(ctx, &ev.paths[0]);
+        watch_if_new_dir(ctx, &ev.paths[1]);
+        (ctx.sink)(FsEvent::Rename {
+            from: ev.paths[0].clone(),
+            to: ev.paths[1].clone(),
+        });
+        return;
+    }
 
     for p in &ev.paths {
+        // First: for most kinds a match, and for those that mean nothing (a
+        // `Close(Write)` after every write) the end of the event.
+        let Some(op) = op_for(&ev.kind, p) else {
+            return;
+        };
         if !is_event_interesting(ctx, p) {
             continue;
         }

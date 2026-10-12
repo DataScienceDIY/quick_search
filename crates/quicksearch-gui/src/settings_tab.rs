@@ -5,7 +5,8 @@ use crate::format;
 use crate::keychain;
 use crate::tips::{self, tip_row, Tipped};
 use crate::ui_util::{hint, hint_colored};
-use quicksearch_core::config::{ColumnsConfig, Config};
+use quicksearch_core::config::{ColumnsConfig, Config, MAX_BATCH_SIZE};
+use quicksearch_core::search::fuzzy::MAX_FUZZY_EDITS;
 
 /// Who a row is for. `Advanced` rows are ones a typical user never needs to
 /// change or cannot judge without knowing how the indexer works (e.g. byte
@@ -178,14 +179,21 @@ impl SettingsTab {
     }
 
     /// True when the key really is in the OS keychain: the preference is on
-    /// *and* the keychain answers (a dead daemon or locked keyring reads as
-    /// "no"). Probed only when the preference changes, since a keychain read
-    /// is an IPC round trip.
+    /// *and* the keychain answers (a dead daemon reads as "no") with a key
+    /// for the salt in force, not a stale one. Probed only when the
+    /// preference changes, since a keychain read is an IPC round trip on the
+    /// UI thread, and a locked keyring prompts to unlock and blocks the frame
+    /// until the prompt is answered.
     fn keychain_active(&mut self, current: &Config) -> bool {
         if self.keychain_probed_for != Some(current.security.use_keychain) {
             let db_path = current.resolved_database_path();
             self.keychain_active = current.security.use_keychain
-                && matches!(keychain::load_key(&db_path.to_string_lossy()), Ok(Some(_)));
+                && current.security.salt_bytes().is_ok_and(|salt| {
+                    matches!(
+                        keychain::load_entry(&db_path.to_string_lossy()),
+                        Ok(Some(text)) if keychain::remembered_key(&text, &salt).is_ok()
+                    )
+                });
             self.keychain_probed_for = Some(current.security.use_keychain);
         }
         self.keychain_active
@@ -318,13 +326,12 @@ impl SettingsTab {
                 if crate::ui_util::apply_save_row(ui, dirty).clicked() {
                     out.applied = Some(draft.clone());
                 }
-                // The second sentence names two rows that are only on screen
-                // with advanced settings shown.
+                // The second sentence names a row that is only on screen with
+                // advanced settings shown.
                 ui.label(hint(if form.advanced {
                     "Narrowing a filter removes the entries it excludes; widening \
-                     one reindexes to find what it now allows. Only the tokenizer, \
-                     the compact text index and the hash sample size require a \
-                     full rebuild."
+                     one reindexes to find what it now allows. Only the compact \
+                     text index and the hash sample size require a full rebuild."
                 } else {
                     "Narrowing a filter removes the entries it excludes; widening \
                      one reindexes to find what it now allows. Changing the \
@@ -788,14 +795,6 @@ fn config_editor_ui(
                     );
 
                     form.row(
-                        Level::Advanced,
-                        ui,
-                        "Follow symlinks",
-                        &tips::FOLLOW_SYMLINKS,
-                        |ui| ui.checkbox(&mut config.indexing.follow_symlinks, ""),
-                    );
-
-                    form.row(
                         Level::Everyday,
                         ui,
                         "Include hidden files",
@@ -808,32 +807,6 @@ fn config_editor_ui(
             egui::Grid::new("cfg-processing")
                 .num_columns(2)
                 .show(ui, |ui| {
-                    form.row(Level::Advanced, ui, "Tokenizer", &tips::TOKENIZER, |ui| {
-                        egui::ComboBox::from_id_salt("cfg-tokenize")
-                            .selected_text(&config.processing.tokenize)
-                            .show_ui(ui, |ui| {
-                                for opt in ["trigram", "unicode61", "porter"] {
-                                    ui.selectable_value(
-                                        &mut config.processing.tokenize,
-                                        opt.to_string(),
-                                        opt,
-                                    );
-                                }
-                            })
-                            .response
-                    });
-
-                    // Not a row, so it needs its own guard: it documents the
-                    // tokenizer above and makes no sense without it.
-                    if form.advanced {
-                        ui.label("");
-                        ui.hyperlink_to(
-                            "Tokenizer documentation",
-                            "https://www.sqlite.org/fts5.html#tokenizers",
-                        );
-                        ui.end_row();
-                    }
-
                     form.drag_bytes(
                         Level::Advanced,
                         ui,
@@ -867,7 +840,7 @@ fn config_editor_ui(
                         "Batch size",
                         &tips::BATCH_SIZE,
                         &mut config.processing.batch_size,
-                        10..=100_000,
+                        10..=MAX_BATCH_SIZE,
                     );
 
                     form.drag_bytes(
@@ -904,7 +877,7 @@ fn config_editor_ui(
                     "Fuzzy edit distance",
                     &tips::FUZZY_EDITS,
                     &mut config.search.fuzzy_max_edits,
-                    0..=8,
+                    0..=MAX_FUZZY_EDITS,
                 );
 
                 form.drag(

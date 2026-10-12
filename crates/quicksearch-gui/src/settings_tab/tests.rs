@@ -35,6 +35,32 @@ fn live_security_and_mode_changes_are_not_dirty() {
     assert!(!w.is_dirty(&cfg));
 }
 
+/// The watch-cap modal's OK and the tour's dismissal can land while the tab
+/// is open; neither is an edit, and the draft must not carry them back.
+#[test]
+fn a_watch_cap_acknowledgement_does_not_dirty_the_draft() {
+    let mut w = SettingsTab::default();
+    let mut cfg = Config::default();
+    cfg.paths.indexing_paths = vec!["/data".to_string()];
+    w.stage(&cfg);
+
+    cfg.ui.watch_cap_warned_roots.push("/data".to_string());
+    assert!(!w.is_dirty(&cfg), "the OK read as an unsaved edit");
+    cfg.ui.tutorial_seen = Some(true);
+    assert!(
+        !w.is_dirty(&cfg),
+        "the tour's dismissal read as an unsaved edit"
+    );
+
+    // A real edit still counts, with both acknowledgements standing.
+    w.draft.as_mut().unwrap().search.debounce_ms += 100;
+    assert!(w.is_dirty(&cfg));
+    let mut applied = w.draft_config().expect("a draft");
+    crate::app::pin_live_fields(&mut applied, &cfg);
+    assert_eq!(applied.ui.watch_cap_warned_roots, ["/data"]);
+    assert_eq!(applied.ui.tutorial_seen, Some(true));
+}
+
 /// Without the restage, an edit made on Manage Index in between would be
 /// reverted by a later Apply: `pin_live_fields` does not cover the filters.
 #[test]
@@ -238,9 +264,7 @@ fn an_unapplied_shortcut_says_it_is_not_in_force_yet() {
 #[rustfmt::skip]
 const ROWS: &[(Section, &str, &tips::Tip, Level)] = &[
     (Section::Indexing, "Full reindex every", &tips::REINDEX_INTERVAL, Level::Advanced),
-    (Section::Indexing, "Follow symlinks", &tips::FOLLOW_SYMLINKS, Level::Advanced),
     (Section::Indexing, "Include hidden files", &tips::INCLUDE_HIDDEN, Level::Everyday),
-    (Section::Processing, "Tokenizer", &tips::TOKENIZER, Level::Advanced),
     (Section::Processing, "Hash sample size (bytes)", &tips::HASH_LENGTH, Level::Advanced),
     (Section::Processing, "Max stored text (bytes)", &tips::MAX_STORED_TEXT, Level::Advanced),
     (Section::Processing, "Max text file size (bytes)", &tips::MAX_TEXT_FILE_SIZE, Level::Advanced),
@@ -287,7 +311,8 @@ fn every_row_shows_its_own_tip() {
 fn hovering_a_setting_label_explains_it() {
     let ctx = crate::test_ui::ctx();
     instant_tooltips(&ctx);
-    // Tokenizer is an advanced row, so the whole tab has to be showing them.
+    // Hash sample size is an advanced row, so the whole tab has to be
+    // showing them.
     let cfg = Config {
         ui: quicksearch_core::config::UiConfig {
             show_advanced_settings: true,
@@ -302,11 +327,11 @@ fn hovering_a_setting_label_explains_it() {
         })
     };
 
-    let target = painted_text_center(&frame(vec![]), "Tokenizer")
-        .expect("the Tokenizer label was not painted");
+    let target = painted_text_center(&frame(vec![]), "Hash sample size (bytes)")
+        .expect("the Hash sample size label was not painted");
     assert!(
-        hover_shows(&mut frame, target, "cut up so that it can be"),
-        "no tooltip appeared over the Tokenizer label"
+        hover_shows(&mut frame, target, "How many bytes from the start"),
+        "no tooltip appeared over the Hash sample size label"
     );
 }
 

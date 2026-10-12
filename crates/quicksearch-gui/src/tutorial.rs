@@ -3,11 +3,17 @@
 //! it. The Help tab can bring it back afterwards.
 //!
 //! `[bracketed]` words in a page's prose are keywords: the brackets are
-//! stripped, and the n-th keyword is painted in the same pulsing colour as
-//! the glow around the n-th entry of `spots`. The window is not modal or
-//! anchored, so the user can drag it aside and keep using the app.
+//! stripped, and the n-th keyword is painted in the same colour as the glow
+//! around the n-th entry of `spots`. The window is not modal or anchored, so
+//! the user can drag it aside and keep using the app.
+//!
+//! Nothing here animates once a page has settled: the GUI can be
+//! software-rendered, where every repaint of an idle window costs real CPU.
+//! A page asks for one frame as it is entered and, on the page that types,
+//! one per character until the query is typed.
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use egui::text::{LayoutJob, TextFormat};
 
@@ -203,11 +209,8 @@ const PAGES: &[Page] = &[
     },
 ];
 
-/// One glow cycle, seconds.
-const PULSE_PERIOD: f64 = 1.6;
-/// How often the glow and the demonstration typing are stepped.
-const ANIMATION_TICK: std::time::Duration = std::time::Duration::from_millis(50);
-/// Seconds per character on a page that types into the search box.
+/// Seconds per character on a page that types into the search box, and how
+/// often that page repaints until the last one is typed.
 const TYPE_INTERVAL: f64 = 0.07;
 /// The tour's window keeps one id across pages: the title changes on every
 /// Next, and an id derived from it would put the window back in the middle
@@ -217,7 +220,7 @@ const WINDOW_ID: &str = "quicksearch-tutorial";
 /// Whether the home folder is what is being indexed decides how the folders
 /// page opens; a tour re-run from Help can find any set of roots at all.
 fn folders_line(roots: &[String]) -> String {
-    let trim = |p: &str| p.trim_end_matches(['/', '\\']).to_string();
+    let trim = |p: &str| quicksearch_core::file_handling::trim_trailing_separators(p).to_string();
     let home = quicksearch_core::platform::home_dir().map(|h| trim(&h.to_string_lossy()));
     match home {
         Some(home) if roots.iter().any(|root| trim(root) == home) => format!(
@@ -264,11 +267,6 @@ fn runs(text: &str) -> Vec<(&str, bool)> {
     out
 }
 
-/// 0 at the dimmest, 1 at the brightest.
-fn pulse(time: f64) -> f32 {
-    0.5 + 0.5 * (time * std::f64::consts::TAU / PULSE_PERIOD).sin() as f32
-}
-
 /// The n-th keyword's colour, shared with the n-th spot it points at.
 fn accent(n: usize, dark_mode: bool) -> egui::Color32 {
     let p = crate::color::palette(dark_mode);
@@ -277,7 +275,7 @@ fn accent(n: usize, dark_mode: bool) -> egui::Color32 {
 
 /// One paragraph, keywords coloured and tinted. `next_keyword` runs across
 /// the whole page, not the paragraph, so it stays in step with `Page::spots`.
-fn paragraph_job(ui: &egui::Ui, text: &str, next_keyword: &mut usize, pulse: f32) -> LayoutJob {
+fn paragraph_job(ui: &egui::Ui, text: &str, next_keyword: &mut usize) -> LayoutJob {
     let font_id = egui::TextStyle::Body.resolve(ui.style());
     let dark_mode = ui.visuals().dark_mode;
     let mut job = LayoutJob::default();
@@ -288,7 +286,7 @@ fn paragraph_job(ui: &egui::Ui, text: &str, next_keyword: &mut usize, pulse: f32
             TextFormat {
                 font_id: font_id.clone(),
                 color,
-                background: color.gamma_multiply(0.10 + 0.25 * pulse),
+                background: color.gamma_multiply(0.35),
                 ..Default::default()
             }
         } else {
@@ -377,13 +375,12 @@ fn extra_ui(ui: &mut egui::Ui, extra: Extra, live: &mut Live, actions: &mut Tour
 /// Rings around a widget, painted into the *panel* layer: over the widget,
 /// but under the tour's own window, which the user can drag aside rather
 /// than have the glow drawn across.
-fn glow(ctx: &egui::Context, rect: egui::Rect, color: egui::Color32, pulse: f32) {
+fn glow(ctx: &egui::Context, rect: egui::Rect, color: egui::Color32) {
     let painter = ctx.layer_painter(egui::LayerId::background());
-    let strength = 0.45 + 0.55 * pulse;
-    painter.rect_filled(rect.expand(2.0), 4.0, color.gamma_multiply(0.08 * strength));
+    painter.rect_filled(rect.expand(2.0), 4.0, color.gamma_multiply(0.08));
     for ring in 0..3u8 {
         let grow = 2.0 + 3.0 * f32::from(ring);
-        let alpha = (0.65 - 0.18 * f32::from(ring)) * strength;
+        let alpha = 0.65 - 0.18 * f32::from(ring);
         painter.rect_stroke(
             rect.expand(grow),
             4.0 + grow,
@@ -413,6 +410,17 @@ impl Typing {
         self.emitted = due;
         Some(self.text.chars().take(due).collect())
     }
+}
+
+/// Whether the search box holds only what a page typed into it, or the start
+/// of it (a Skip mid-typing). Read from the box itself, so a query the user
+/// typed over the demonstration is theirs, whichever page they leave from.
+fn holds_demo(query: &str) -> bool {
+    !query.is_empty()
+        && PAGES
+            .iter()
+            .filter_map(|p| p.type_query)
+            .any(|demo| demo.starts_with(query))
 }
 
 /// What the tour asks the app to do after this frame.
@@ -457,10 +465,20 @@ pub struct Tutorial {
 }
 
 impl Tutorial {
-    /// Arrival on the current page: its tab, and its typing from empty.
-    fn enter_page(&mut self, page: &Page, now: f64, actions: &mut TourActions) {
+    /// Arrival on the current page: its tab, and its typing from empty. The
+    /// tab switches after this frame's panels are drawn, and its widgets mark
+    /// the spots as they lay out, so one more frame paints both without
+    /// waiting for input.
+    fn enter_page(
+        &mut self,
+        ctx: &egui::Context,
+        page: &Page,
+        now: f64,
+        actions: &mut TourActions,
+    ) {
         self.entered_page = Some(self.page);
         actions.goto_tab = Some(page.tab);
+        ctx.request_repaint();
         self.typing = page.type_query.map(|text| Typing {
             text,
             started: now,
@@ -476,8 +494,15 @@ impl Tutorial {
 
     /// `roots` is the live indexed-folder list, which the folders page reads;
     /// `hotkey` is the shortcut in force, which the shortcut page both shows
-    /// and rebinds.
-    pub fn ui(&mut self, ctx: &egui::Context, roots: &[String], hotkey: &str) -> TourActions {
+    /// and rebinds; `query` is what the search box holds, which a dismissal
+    /// clears only if the tour typed it.
+    pub fn ui(
+        &mut self,
+        ctx: &egui::Context,
+        roots: &[String],
+        hotkey: &str,
+        query: &str,
+    ) -> TourActions {
         let page = &PAGES[self.page.min(PAGES.len() - 1)];
         let (first, last) = (self.page == 0, self.page + 1 == PAGES.len());
         let mut actions = TourActions::default();
@@ -485,7 +510,7 @@ impl Tutorial {
         let now = ctx.input(|i| i.time);
 
         if self.entered_page != Some(self.page) {
-            self.enter_page(page, now, &mut actions);
+            self.enter_page(ctx, page, now, &mut actions);
         }
         if let Some(typing) = &mut self.typing {
             if let Some(typed) = typing.advance(now) {
@@ -493,7 +518,6 @@ impl Tutorial {
             }
         }
 
-        let lit = pulse(now);
         // Read before the window: `set_zoom_factor` stores the new value at
         // once, so the slider reads back what it asked for on the next frame
         // rather than snapping to the old value mid-drag. It also follows an
@@ -514,7 +538,7 @@ impl Tutorial {
             ui.set_max_width(520.0);
             let mut keyword = 0usize;
             for paragraph in paragraphs(page, roots) {
-                let job = paragraph_job(ui, &paragraph, &mut keyword, lit);
+                let job = paragraph_job(ui, &paragraph, &mut keyword);
                 ui.label(job);
                 ui.add_space(6.0);
             }
@@ -572,11 +596,15 @@ impl Tutorial {
         let dark_mode = ctx.style().visuals.dark_mode;
         for (n, spot) in page.spots.iter().enumerate() {
             if let Some(rect) = spotlight::rect(ctx, *spot) {
-                glow(ctx, rect, accent(n, dark_mode), lit);
+                glow(ctx, rect, accent(n, dark_mode));
             }
         }
-        if !page.spots.is_empty() || self.typing.is_some() {
-            ctx.request_repaint_after(ANIMATION_TICK);
+        if self
+            .typing
+            .as_ref()
+            .is_some_and(|t| t.emitted < t.text.chars().count())
+        {
+            ctx.request_repaint_after(Duration::from_secs_f64(TYPE_INTERVAL));
         }
 
         let last_page = PAGES.len() - 1;
@@ -585,10 +613,12 @@ impl Tutorial {
             Some(Nav::Next) => self.page = (self.page + 1).min(last_page),
             Some(Nav::Dismiss) => {
                 // Leave the user on the tab they will actually work in, with a
-                // box holding only what they typed themselves.
+                // box holding only what they typed themselves. Decided here,
+                // over anything typed this frame: a box the user has taken
+                // over must not get the demonstration back.
                 actions.dismissed = true;
                 actions.goto_tab = Some(Tab::Search);
-                actions.set_query = Some(String::new());
+                actions.set_query = holds_demo(query).then(String::new);
             }
             None => {}
         }

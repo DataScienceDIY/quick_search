@@ -14,6 +14,11 @@
 //! Queries run against one held connection, as the worker holds one; each
 //! is timed best-of-N so a scheduling hiccup is not the headline.
 
+// Timed on the allocator the shipped binaries install; see
+// `platform::Allocator`.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
 mod common;
 
 use std::path::PathBuf;

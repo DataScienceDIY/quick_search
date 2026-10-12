@@ -116,17 +116,18 @@ installed_size="$(du -ks "$stage" | cut -f1)"
 
 # ------------------------------------------------------------- control -----
 
-# The dynamic section only names libc, libgcc, libm and libbz2: winit and glutin
-# dlopen the entire display stack, so dpkg-shlibdeps cannot see it and the list
-# below is maintained by hand. Re-derive it with
+# The dynamic section only names libc, libgcc and libm: winit and glutin dlopen
+# the entire display stack, so dpkg-shlibdeps cannot see it and the list below
+# is maintained by hand. Re-derive it with
 #   objdump -p target/release/quicksearch | grep NEEDED
 #   strings -a target/release/quicksearch | grep -oE 'lib[A-Za-z0-9_+-]+\.so(\.[0-9]+)*' | sort -u
-# and map each soname to a package with `dpkg -S`.
+# and map each soname to a package with `dpkg -S`. strings misses one:
+# x11rb builds "libxcb.so.1" from immediates, hence libxcb1.
 glibc_min="$(objdump -T "$primary_binary" | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -1)"
 [ -n "$glibc_min" ] || die "could not determine the glibc version requirement"
 
-depends="libc6 (>= ${glibc_min}), libgcc-s1 (>= 3.0), libbz2-1.0"
-depends="$depends, libx11-6, libxcb1, libxcursor1, libxi6, libxrender1"
+depends="libc6 (>= ${glibc_min}), libgcc-s1 (>= 3.0)"
+depends="$depends, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxrender1"
 depends="$depends, libxkbcommon0, libxkbcommon-x11-0"
 depends="$depends, libwayland-client0, libwayland-egl1"
 depends="$depends, libegl1, libgl1"
@@ -136,14 +137,17 @@ depends="$depends, hicolor-icon-theme"
 
 # desktop-file-utils owns the /usr/share/applications trigger; dbus-bin provides
 # the dbus-send used by "reveal in folder"; xdg-utils provides the xdg-open
-# fallback; xdg-desktop-portal backs the native folder picker. None are needed
-# to search, so none are hard dependencies.
+# fallback; xdg-desktop-portal backs the native folder picker; fontconfig
+# provides the fc-match that finds system fonts for the scripts the bundled
+# fonts lack. None are needed to search, so none are hard dependencies.
+# fonts-noto-cjk is one such font: without a CJK font, CJK names show as boxes.
 #
 # The index-password "remember on this device" feature talks Secret Service
 # over the session bus with a statically linked libdbus (keyring's `vendored`
 # feature), so it adds no library dependency; without a Secret Service
 # provider (gnome-keyring, kwalletd) it simply falls back to prompting.
-recommends="desktop-file-utils, xdg-utils, dbus-bin, xdg-desktop-portal"
+recommends="desktop-file-utils, xdg-utils, dbus-bin, xdg-desktop-portal, fontconfig"
+suggests="fonts-noto-cjk"
 
 install -dm755 "$stage/DEBIAN"
 cat > "$stage/DEBIAN/control" <<EOF
@@ -156,6 +160,7 @@ Maintainer: $maintainer
 Installed-Size: $installed_size
 Depends: $depends
 Recommends: $recommends
+Suggests: $suggests
 Homepage: https://code.karsttech.com/jeremy/quick_search
 Description: fast full-text search across your files
  QuickSearch indexes the folders you choose and searches them by file name

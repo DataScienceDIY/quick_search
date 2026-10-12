@@ -51,15 +51,9 @@ pub fn record(level: Level, message: String) {
     };
     // Almost every line names a path, and an escape sequence in one reaches
     // a terminal three ways (stderr, GUI-from-shell, the Logs tab's Copy
-    // button). Diagnostics are not data, so they are scrubbed unconditionally.
-    // Line breaks are collapsed *first*: `scrub_controls` counts them as
-    // controls and would leave U+FFFD where a space belongs.
-    let text = if text.contains(['\n', '\r']) {
-        text.replace(['\n', '\r'], " ")
-    } else {
-        text
-    };
-    let text = crate::textenc::scrub_controls(&text).into_owned();
+    // button). Diagnostics are not data, so they are scrubbed unconditionally,
+    // after `one_line` (whose doc says why the order matters).
+    let text = crate::textenc::scrub_controls(&crate::textenc::one_line(&text)).into_owned();
     let _ = writeln!(std::io::stderr(), "{}", text);
     lock().push(level, text);
 }
@@ -276,5 +270,20 @@ mod tests {
             "a warning is stored with the prefix it printed with"
         );
         assert!(info.unwrap().at > 0, "timestamped when recorded");
+    }
+
+    /// Spaces where the breaks were, not the scrub's U+FFFD; the escape is
+    /// still scrubbed.
+    #[test]
+    fn a_recorded_line_is_flattened_then_scrubbed() {
+        crate::log_info!("test-marker flat a\nb\r\nc\td\x1b[2J");
+        let lines = snapshot();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.text == "test-marker flat a b  c d\u{fffd}[2J"),
+            "{:?}",
+            lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
     }
 }

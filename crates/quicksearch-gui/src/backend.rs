@@ -1,6 +1,5 @@
-//! Wiring between the egui thread and the core services. All communication
-//! is non-blocking from the UI's point of view; every core thread wakes the
-//! UI through `ctx.request_repaint()`, so polling is enough.
+//! Wiring between the egui thread and the core services. Every core thread
+//! wakes the UI through `ctx.request_repaint()`, so polling is enough.
 //!
 //! The duplicates scan and the verification run on throwaway threads fired
 //! by user actions. The verification can hold a large group's worth of file
@@ -54,27 +53,31 @@ pub struct Backend {
     pub verify_job: Option<VerifyJob>,
     /// Watches the on-screen results; `None` only after [`Backend::shutdown`].
     pub live: Option<LiveWatcher>,
-    pub live_rx: mpsc::Receiver<LiveUpdate>,
+    /// The current watch's updates ([`LiveWatcher::watch`]); `None` while
+    /// nothing is watched. Replaced or taken, it drops whatever the previous
+    /// watch had not delivered, so no update lands on rows it was not for.
+    pub live_rx: Option<mpsc::Receiver<LiveUpdate>>,
 }
 
 impl Backend {
-    /// Releases the search connection, then rebuilds. The search worker holds
-    /// the index open for up to `search::IDLE_RELEASE` (30 min); on Windows
-    /// that makes the delete fail, and the rebuild silently becomes an
-    /// ordinary run against the old index.
+    /// Delete the index and rebuild it. The search connection needs no
+    /// release here: the delete has it let go first (`db::hold_index`). A
+    /// running duplicates scan holds the file too, with nothing to release
+    /// it; on Windows the delete waits for it to finish, within the
+    /// coordinator's stop grace.
     pub fn rebuild_index(&self) {
-        if let Some(search) = &self.search {
-            search.release_connection();
-        }
         self.coordinator.rebuild_index();
     }
 
-    /// [`Backend::rebuild_index`]'s reasoning, for the delete-only path.
+    /// Delete the index without rebuilding; see [`Backend::rebuild_index`].
     pub fn clear_index(&self) {
-        if let Some(search) = &self.search {
-            search.release_connection();
-        }
         self.coordinator.clear_index();
+    }
+
+    /// Delete the index and start nothing until [`Backend::rebuild_index`];
+    /// the receiver gets the outcome. See [`IndexCoordinator::delete_index`].
+    pub fn delete_index(&self) -> mpsc::Receiver<Result<(), String>> {
+        self.coordinator.delete_index()
     }
 
     pub fn start(config: &Config, ctx: egui::Context) -> Result<Backend, String> {
@@ -96,7 +99,7 @@ impl Backend {
         );
 
         let live_ctx = ctx.clone();
-        let (live, live_rx) = LiveWatcher::start(Arc::new(move || live_ctx.request_repaint()));
+        let live = LiveWatcher::start(Arc::new(move || live_ctx.request_repaint()));
 
         Ok(Backend {
             coordinator,
@@ -105,13 +108,13 @@ impl Backend {
             dup_job: None,
             verify_job: None,
             live: Some(live),
-            live_rx,
+            live_rx: None,
         })
     }
 
     /// Point the live watcher at the on-screen rows; empty `targets` clears.
     pub fn watch_live(
-        &self,
+        &mut self,
         query: &str,
         mut targets: Vec<quicksearch_core::live::Target>,
         config: &Config,
@@ -121,11 +124,12 @@ impl Backend {
         // closing a descriptor on it cancels SQLite's locks process-wide. A
         // row for it from an older build can still be on screen.
         targets.retain(|t| !config.is_index_file(std::path::Path::new(&t.path)));
-        if targets.is_empty() {
+        self.live_rx = if targets.is_empty() {
             live.clear();
+            None
         } else {
-            live.watch(query, targets, config);
-        }
+            Some(live.watch(query, targets, config))
+        };
     }
 
     /// Bring the index in line with paths the live watcher just read, so it
@@ -134,7 +138,9 @@ impl Backend {
         self.coordinator.update_paths(paths);
     }
 
-    pub fn clear_live(&self) {
+    /// Drop every watch, and with them every undelivered update.
+    pub fn clear_live(&mut self) {
+        self.live_rx = None;
         if let Some(live) = &self.live {
             live.clear();
         }
@@ -194,6 +200,9 @@ impl Backend {
         }
     }
 
+    /// Stop every core thread. The live watcher and the coordinator each get
+    /// [`shutdown::EXIT_GRACE`] and are then left running, so a stuck thread
+    /// holds the closing window about a second, never indefinitely.
     pub fn shutdown(&mut self) {
         self.cancel_verify();
         if let Some(search) = self.search.take() {

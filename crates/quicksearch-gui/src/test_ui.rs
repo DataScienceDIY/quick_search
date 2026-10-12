@@ -113,12 +113,14 @@ pub fn hover_shows(
     false
 }
 
-/// A context carrying the app's fonts. A default context has *no* faces,
-/// and that does not fail loudly: epaint hands back `row_height` 0.0 and
-/// zero-advance glyphs, so every measurement quietly stops meaning anything.
+/// A context carrying the app's bundled fonts. A default context has *no*
+/// faces, and that does not fail loudly: epaint hands back `row_height` 0.0
+/// and zero-advance glyphs, so every measurement quietly stops meaning
+/// anything. The system fallback faces stay out, so results do not vary by
+/// machine.
 pub fn ctx() -> egui::Context {
     let ctx = egui::Context::default();
-    crate::fonts::install(&ctx);
+    crate::fonts::install_bundled(&ctx);
     // The shipped text greys, so what a test measures is what the app paints.
     crate::color::apply_text_contrast(&ctx);
     ctx

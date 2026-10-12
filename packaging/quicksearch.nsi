@@ -118,22 +118,36 @@ FunctionEnd
 
 ; -------------------------------------------------------------- sections ----
 
+; Windows will not replace or delete a running executable, and the File or
+; Delete commands that follow would stop halfway through with a write error.
+; Opening a running exe for writing fails, which makes FileOpen a plugin-free
+; "is it still running?" probe that changes nothing: mode a keeps the contents
+; (w would truncate them), and the FileExists test keeps it from creating a
+; missing file. Both exes are probed before either is touched, and a failed
+; open leaves the error flag set for the test at the end.
+!macro AbortIfRunning MSG
+    ClearErrors
+    ${If} ${FileExists} "$INSTDIR\quicksearch.exe"
+        FileOpen $0 "$INSTDIR\quicksearch.exe" a
+        ${IfThen} $0 != "" ${|} FileClose $0 ${|}
+    ${EndIf}
+    ${If} ${FileExists} "$INSTDIR\quicksearch-cli.exe"
+        FileOpen $0 "$INSTDIR\quicksearch-cli.exe" a
+        ${IfThen} $0 != "" ${|} FileClose $0 ${|}
+    ${EndIf}
+    ${If} ${Errors}
+        MessageBox MB_OK|MB_ICONSTOP "${MSG}" /SD IDOK
+        Abort
+    ${EndIf}
+!macroend
+
 Section "!${APP}" SecApp
     SectionIn RO
     SetOutPath "$INSTDIR"
 
-    ; Windows will not replace a running executable, and the File commands below
-    ; would stop halfway through with a write error. Delete fails on a mapped
-    ; image and succeeds quietly when there is nothing there, which makes it a
-    ; plugin-free "is it still running?" test.
-    ClearErrors
-    Delete "$INSTDIR\quicksearch.exe"
-    Delete "$INSTDIR\quicksearch-cli.exe"
-    ${If} ${Errors}
-        MessageBox MB_OK|MB_ICONSTOP \
-            "${APP} is still running. Close it and start this installer again." /SD IDOK
-        Abort
-    ${EndIf}
+    ; File overwrites in place, so nothing is deleted first.
+    !insertmacro AbortIfRunning \
+        "${APP} is still running. Close it and start this installer again."
 
     File "${STAGE}/quicksearch.exe"
     File "${STAGE}/quicksearch-cli.exe"
@@ -236,15 +250,10 @@ FunctionEnd
 Section "Uninstall"
     ; Same running-process test as the install side. Stopping here leaves the
     ; installation intact rather than gutted.
-    ClearErrors
+    !insertmacro AbortIfRunning "${APP} is still running. Close it and try again."
+
     Delete "$INSTDIR\quicksearch.exe"
     Delete "$INSTDIR\quicksearch-cli.exe"
-    ${If} ${Errors}
-        MessageBox MB_OK|MB_ICONSTOP \
-            "${APP} is still running. Close it and try again." /SD IDOK
-        Abort
-    ${EndIf}
-
     Delete "$INSTDIR\quicksearch.ico"
     Delete "$INSTDIR\README.md"
     Delete "$INSTDIR\LICENSE.txt"

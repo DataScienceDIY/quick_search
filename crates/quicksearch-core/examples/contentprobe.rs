@@ -53,6 +53,11 @@
 //! `file_handling::fts_begin_tombstone_burst` owns the result and ships it,
 //! so `live` lands far under every stage.
 
+// Timed on the allocator the shipped binaries install; see
+// `platform::Allocator`.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
 mod common;
 
 use std::path::Path;

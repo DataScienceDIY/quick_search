@@ -21,24 +21,16 @@ fn parse_wc_l_stdout(bytes: &[u8]) -> Result<usize, String> {
 #[cfg(unix)]
 const COUNT_POLL_MS: u64 = 50;
 
-/// Wait on every member of the pipeline; returns the status of a member that
-/// failed, or `None` when all succeeded. `terminal_status` is the last
-/// member's, already collected by the caller.
+/// Wait on every member of the pipeline but the last, which the caller
+/// already reaped, so none lives on as a zombie. Their statuses are not read:
+/// GNU `find` exits 1 after one unreadable subdirectory, having listed the
+/// rest of the tree.
 #[cfg(unix)]
-fn reap_all(
-    children: &mut [&mut std::process::Child],
-    terminal_status: std::process::ExitStatus,
-) -> Option<std::process::ExitStatus> {
-    let mut failed = (!terminal_status.success()).then_some(terminal_status);
+fn reap_all(children: &mut [&mut std::process::Child]) {
     let last = children.len().saturating_sub(1);
     for child in &mut children[..last] {
-        if let Ok(status) = child.wait() {
-            if !status.success() && failed.is_none() {
-                failed = Some(status);
-            }
-        }
+        let _ = child.wait();
     }
-    failed
 }
 
 #[cfg(unix)]
@@ -72,13 +64,9 @@ fn wait_pipeline_cancellable(
                     use std::io::Read;
                     let _ = stdout.read_to_end(&mut out);
                 }
-                // Every member, not just the terminal: a failed `find` writes
-                // nothing while `wc -l` prints `0` and exits successfully,
-                // which read through the terminal alone is a tree of zero
-                // files. Reaping also keeps `find` from living on as a zombie.
-                let failed = reap_all(children, status);
-                if let Some(bad) = failed {
-                    return Err(format!("count pipeline exited with {}", bad));
+                reap_all(children);
+                if !status.success() {
+                    return Err(format!("count pipeline exited with {}", status));
                 }
                 return Ok(out);
             }
@@ -125,7 +113,12 @@ fn count_find_pipe_wc(
         }
     };
     let out = wait_pipeline_cancellable(&mut [&mut find, &mut wc], cancel)?;
-    parse_wc_l_stdout(&out)
+    // A zero count is the failure: `find` prints its start point, so 0 lines
+    // means a missing root or a `find` that rejected `-printf`.
+    match parse_wc_l_stdout(&out)? {
+        0 => Err("find listed nothing".to_string()),
+        n => Ok(n),
+    }
 }
 
 /// The oracle [`count_tree_entries_win32`] is tested against. Gated on
@@ -156,7 +149,8 @@ pub(super) fn count_tree_entries_walkdir(
 /// Count tree entries by reading directories in bulk through
 /// `GetFileInformationByHandleEx`: one syscall per 64 KiB of directory data
 /// instead of `read_dir`'s one per entry. Iterative so a deep tree cannot
-/// exhaust the stack.
+/// exhaust the stack. Links (junctions, directory symlinks, mount points) are
+/// counted, not followed, like `find -P` and the walker.
 #[cfg(windows)]
 pub(super) fn count_tree_entries_win32(
     path: &str,
@@ -180,13 +174,20 @@ pub(super) fn count_tree_entries_win32(
         ATTR_DIRECTORY == windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
     );
 
+    /// For a reparse point `EaSize` holds the tag; this is its name-surrogate
+    /// bit, std's `is_symlink` test. OneDrive's `CLOUD_*` tags lack it.
+    const NAME_SURROGATE: u32 = 0x2000_0000;
+
     fn wide(path: &std::path::Path) -> Vec<u16> {
         path.as_os_str().encode_wide().chain(Some(0)).collect()
     }
 
-    let mut pending = vec![std::path::PathBuf::from(path)];
+    // The verbatim (`\\?\`) form, so paths past MAX_PATH and names ending in
+    // a dot or a space open; `join` keeps the prefix.
+    let mut pending = vec![std::fs::canonicalize(path).unwrap_or_else(|_| path.into())];
     let mut count = 0usize;
-    let mut buffer = vec![0u8; BUFFER_BYTES];
+    // `u64` elements for the records' 8-byte alignment.
+    let mut buffer = vec![0u64; BUFFER_BYTES / 8];
 
     while let Some(dir) = pending.pop() {
         if cancel.load(Ordering::Relaxed) {
@@ -218,7 +219,7 @@ pub(super) fn count_tree_entries_win32(
                     handle,
                     FileIdBothDirectoryInfo,
                     buffer.as_mut_ptr().cast(),
-                    buffer.len() as u32,
+                    BUFFER_BYTES as u32,
                 )
             };
             if ok == 0 {
@@ -232,27 +233,50 @@ pub(super) fn count_tree_entries_win32(
                     return Err("count cancelled".to_string());
                 }
                 // SAFETY: the API filled `buffer` with a chain of these
-                // records, each at the offset the previous one gave.
-                let info =
-                    unsafe { &*(buffer.as_ptr().add(offset) as *const FILE_ID_BOTH_DIR_INFO) };
+                // records, each at the offset the previous one gave, and
+                // keeps every record 8-byte aligned, which the `u64` buffer
+                // makes true in memory. The pointer is derived from the whole
+                // buffer, so its provenance covers the name past the
+                // struct's `[u16; 1]`; fields are read through it without
+                // forming a reference.
+                let info = unsafe {
+                    buffer
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(offset)
+                        .cast::<FILE_ID_BOTH_DIR_INFO>()
+                };
+                let (attributes, ea_size, name_bytes, next) = unsafe {
+                    (
+                        (*info).FileAttributes,
+                        (*info).EaSize,
+                        (*info).FileNameLength,
+                        (*info).NextEntryOffset,
+                    )
+                };
 
                 // FileNameLength is in bytes; FileName is UTF-16 and not
                 // NUL-terminated, so the length alone says where it ends.
-                let name_units = (info.FileNameLength as usize) / 2;
-                let name =
-                    unsafe { std::slice::from_raw_parts(info.FileName.as_ptr(), name_units) };
+                let name = unsafe {
+                    std::slice::from_raw_parts(
+                        (&raw const (*info).FileName).cast::<u16>(),
+                        name_bytes as usize / 2,
+                    )
+                };
                 let name = OsString::from_wide(name);
 
                 // "." and ".." are entries of the listing, not of the tree.
                 let is_dot = name == "." || name == "..";
                 if !is_dot {
                     count += 1;
-                    if info.FileAttributes & ATTR_DIRECTORY != 0 {
+                    let link = crate::platform::attributes_are_reparse_point(attributes)
+                        && ea_size & NAME_SURROGATE != 0;
+                    if attributes & ATTR_DIRECTORY != 0 && !link {
                         pending.push(dir.join(&name));
                     }
                 }
 
-                match info.NextEntryOffset {
+                match next {
                     0 => break,
                     next => offset += next as usize,
                 }

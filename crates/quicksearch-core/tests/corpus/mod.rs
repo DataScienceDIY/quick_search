@@ -2,32 +2,39 @@
 //!
 //! The per-extractor unit tests build fixtures with the libraries that read
 //! them back; a writer and reader sharing a wrong assumption agree with each
-//! other. This module is the other half: well-formed documents from
-//! *foreign* producers, where every writer differs from its reader.
+//! other. This module is the other half: well-formed documents whose writer
+//! differs from their reader. Most writers are foreign producers. The
+//! generated pptx, odt, ods, odp and rtf are not: no Rust crate writes those
+//! formats, so they are hand-assembled here from the spec, independent code
+//! by the reader's author. For each of the five, a committed LibreOffice
+//! file adds a foreign producer.
 //!
 //! | format | written by | read by |
 //! |---|---|---|
 //! | docx | `docx-rs` (+ `zip` 8.x) | `zip` 0.6 + `quick-xml` |
 //! | xlsx | `rust_xlsxwriter` | `zip` 0.6 + `quick-xml` |
-//! | pptx, odt, ods, odp | [`zipwriter`] + `format!` | `zip` 0.6 + `quick-xml` |
+//! | pptx, odt, ods, odp | hand-assembled: [`zipwriter`] + `format!` | `zip` 0.6 + `quick-xml` |
 //! | pdf | `pdf-writer` (typst) | `pdf-extract`/`lopdf` |
 //! | mp3 | `id3` over hand-rolled MPEG frames | `lofty` |
 //! | flac | `metaflac` over a committed silent stream | `lofty` |
-//! | rtf | hand-written control words | `rtf-parser` |
+//! | rtf | hand-assembled control words | `extract/rtf.rs` |
 //! | plain text | `std`, plus a hand-rolled cp1252 encoder | `encoding_rs` |
 //! | doc, xls, ppt | LibreOffice, committed — see [`legacy`] | `cfb` |
+//! | odt, ods, odp, pptx | LibreOffice, committed — see [`legacy`] | `zip` 0.6 + `quick-xml` |
+//! | rtf | LibreOffice, committed — see [`legacy`] | `extract/rtf.rs` |
 //!
-//! Two places take committed bytes: the legacy OLE2 binaries (`cfb` is the
-//! only OLE2 writer in Rust, and it is the reader; see
-//! `tests/fixtures/legacy/README.md`) and the `.flac`'s fifty milliseconds
+//! Two places take committed bytes: the LibreOffice files, whose text is
+//! fixed (no Rust crate is a foreign producer of their formats; see
+//! `tests/fixtures/legacy/README.md`), and the `.flac`'s fifty milliseconds
 //! of silence (`lofty` reads a real frame for stream properties; see
-//! [`audio`]). In both the *text* still comes from the generator.
+//! [`audio`]), whose text still comes from the generator.
 //!
 //! Everything on-the-fly comes from one LCG seeded by [`seed`]
 //! (`QUICKSEARCH_CORPUS_SEED` overrides); failing assertions print the seed.
 
-// Only `extraction_corpus.rs` compiles this, and each writer exposes a
-// little more surface than any one test needs.
+// Only `extraction_corpus.rs`, `extract_fuzz.rs` and the `index_alloc` bench
+// compile this, and each writer exposes a little more surface than any one
+// of them needs.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -223,7 +230,8 @@ pub fn build(tag: &str) -> (Scratch, Vec<Sample>) {
     odf::write_all(&dir, &mut lcg, &mut body, &mut samples);
     pdf::write_all(&dir, &mut lcg, &mut body, &mut samples);
     audio::write_all(&dir, &mut lcg, &mut body, &mut samples);
-    // The committed OLE2 fixtures, copied in so the whole corpus is one tree.
+    // The committed LibreOffice fixtures, copied in so the whole corpus is
+    // one tree.
     samples.extend(legacy::copy_into(&dir));
 
     // Every needle must identify exactly one file, or the search proves

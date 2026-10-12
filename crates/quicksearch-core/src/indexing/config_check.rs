@@ -15,7 +15,12 @@ use super::*;
 impl IndexingService {
     /// One list drives [`Self::validate_config`], [`Self::update_config`] and
     /// [`crate::scope::stored_config`], so record, comparison and
-    /// reconstruction cannot drift; `stored_config` parses these back.
+    /// reconstruction cannot drift; `stored_config` parses these back. It
+    /// holds every setting a stored row was decided under: whether the file
+    /// is walked (roots, hidden files, ignore patterns), whether its text is
+    /// read (`content_extensions`, `maximum_text_file_size`), and what its
+    /// hash and postings cover. The code behind those decisions (digest, MIME
+    /// detection, extractors) is versioned by [`db::CURRENT_SCHEMA_VERSION`].
     fn config_validation_entries(config: &Config, roots: &[String]) -> Vec<(&'static str, String)> {
         let sorted_joined = |v: &[String]| {
             let mut v: Vec<String> = v.to_vec();
@@ -24,20 +29,13 @@ impl IndexingService {
         };
         vec![
             ("hash_length", config.processing.hash_length.to_string()),
-            // Bump whenever the digest input changes, so old indexes are offered a rebuild.
-            ("hash_algorithm", "size+head".to_string()),
             ("indexing_path", sorted_joined(roots)),
-            ("tokenize", config.processing.tokenize.clone()),
-            // The effective layout, not the flag: see `fts_positions`.
+            // The layout, as `schema_info` records it: the flag's opposite.
             (
                 "fts_positions",
-                config.processing.fts_positions().to_string(),
+                (!config.processing.compact_text_index).to_string(),
             ),
             ("include_hidden", config.indexing.include_hidden.to_string()),
-            (
-                "follow_symlinks",
-                config.indexing.follow_symlinks.to_string(),
-            ),
             (
                 "ignore_patterns",
                 sorted_joined(&config.indexing.ignore_patterns),
@@ -45,6 +43,10 @@ impl IndexingService {
             (
                 "content_extensions",
                 sorted_joined(&config.indexing.content_extensions),
+            ),
+            (
+                "maximum_text_file_size",
+                config.processing.maximum_text_file_size.to_string(),
             ),
         ]
     }
@@ -61,12 +63,13 @@ impl IndexingService {
             .map_err(|e| format!("read config_validation row: {}", e))
     }
 
-    /// Settings a difference in which cannot be reconciled: the FTS tokenizer
-    /// and position setting are part of the table definition, and hashes
-    /// under a different length or algorithm cannot be compared. Everything
-    /// else reconciles; see [`crate::scope`].
-    const REBUILD_KEYS: [&'static str; 4] =
-        ["hash_length", "hash_algorithm", "tokenize", "fts_positions"];
+    /// Settings a difference in which cannot be reconciled: the FTS position
+    /// setting is part of the table definition, and hashes under a different
+    /// length cannot be compared. Both are enforced at open too:
+    /// [`db::open_or_recreate`] wipes an index built under other values, so a
+    /// declined rebuild happens at the next run. Everything else reconciles;
+    /// see [`crate::scope`].
+    const REBUILD_KEYS: [&'static str; 2] = ["hash_length", "fts_positions"];
 
     /// The unreconcilable settings that no longer match, which a rebuild
     /// prompt shows; `None` when none. A key absent (older index) never counts
@@ -104,8 +107,11 @@ impl IndexingService {
 
     /// Bring the index into line with `config` before a run walks anything.
     /// Runs in slices, so the stop flag is read between statements and
-    /// `interrupt` reaches the one in flight. Returns `false` if cut short,
-    /// when nothing may be recorded as reconciled.
+    /// `interrupt` reaches the one in flight. Returns the roots to stamp:
+    /// `roots`, plus every recorded root while one of them is offline (see
+    /// [`crate::scope::hold_offline_roots`]), so the record keeps an offline
+    /// root's canonical spelling. `None` if cut short, when nothing may be
+    /// recorded as reconciled.
     pub(super) fn reconcile_stored_config(
         status: &Arc<Mutex<IndexingStatus>>,
         interrupt: &db::InterruptSlot,
@@ -113,14 +119,16 @@ impl IndexingService {
         config: &Config,
         roots: &[String],
         stop_flag: &Arc<AtomicBool>,
-    ) -> Result<bool, String> {
+    ) -> Result<Option<Vec<String>>, String> {
         let mut current = config.clone();
         current.paths.indexing_paths = roots.to_vec();
+        crate::scope::hold_offline_roots(conn, &mut current)?;
+        let effective: Vec<String> = current.normalized_indexing_paths().into_iter().collect();
 
         let stored = crate::scope::stored_config(conn, &current)?;
         let work = crate::config::diff_actions(&stored, &current).work;
         if !work.touches_index() {
-            return Ok(true);
+            return Ok(Some(effective));
         }
         crate::log_info!(
             "configuration changed since the last run: reconciling the index ({})",
@@ -134,7 +142,7 @@ impl IndexingService {
                  the next run starts it again",
                 cursor.progress().examined
             );
-            false
+            None
         };
         while !cursor.done() {
             if stop_flag.load(Ordering::Relaxed) {
@@ -169,7 +177,7 @@ impl IndexingService {
                 cursor.recontented
             );
         }
-        Ok(true)
+        Ok(Some(effective))
     }
 
     /// Stamp the index with the settings it's being built under.
@@ -182,7 +190,8 @@ impl IndexingService {
     }
 
     /// Stamp everything except [`Self::REBUILD_KEYS`], which a scan cannot
-    /// satisfy: stamping those would clear a rebuild prompt the user declined.
+    /// satisfy: stamping those would cancel a rebuild the user declined, which
+    /// the next run still owes.
     pub(crate) fn stamp_reconciled(
         conn: &Connection,
         config: &Config,

@@ -86,6 +86,31 @@ fn guard_source(
     }
 }
 
+/// How a tab request goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabRoute {
+    /// Dropped: the tab and the navigation on hold stay as they are.
+    Drop,
+    /// Put on hold for the guard's prompt.
+    Hold,
+    /// Switched to at once.
+    Switch,
+}
+
+/// How a tab request goes: dropped while a navigation is `held`, which wins,
+/// so a second request neither replaces the answer the guard is waiting for
+/// nor switches past it; otherwise held when `guarded` says a dirty draft
+/// must answer first, and switched to when not.
+fn route_tab_request(held: bool, guarded: impl FnOnce() -> bool) -> TabRoute {
+    if held {
+        TabRoute::Drop
+    } else if guarded() {
+        TabRoute::Hold
+    } else {
+        TabRoute::Switch
+    }
+}
+
 /// Whether arriving at `to` should start a duplicates scan. Only the first
 /// visit does: the scan reads every entry in the hash index, and
 /// [`QuickSearchApp::invalidate_duplicates`] makes a later visit pay
@@ -103,7 +128,8 @@ enum DupInvalidation {
     /// A scan is in flight, and its answer predates the change. Redo it when it
     /// lands, rather than racing a second scan against it.
     WhenItLands,
-    /// The listing is on screen; redo it now.
+    /// The tab is on screen; list it now. That includes a tab left empty by
+    /// [`QuickSearchApp::drop_duplicates`], which the end of the run refills.
     Rescan,
     /// Cached but out of sight: drop it and let the next visit pay.
     Drop,
@@ -111,22 +137,11 @@ enum DupInvalidation {
 
 fn dup_invalidation(tab: Tab, state: &DupState) -> DupInvalidation {
     match state {
-        DupState::NotLoaded => DupInvalidation::Nothing,
         DupState::Loading => DupInvalidation::WhenItLands,
         _ if tab == Tab::Duplicates => DupInvalidation::Rescan,
+        DupState::NotLoaded => DupInvalidation::Nothing,
         _ => DupInvalidation::Drop,
     }
-}
-
-/// A navigation already on hold wins: a second intent would replace the
-/// answer the guard is waiting for.
-fn switch_needs_guard(
-    from: Tab,
-    manage_dirty: bool,
-    settings_dirty: bool,
-    nav_pending: bool,
-) -> bool {
-    !nav_pending && dirty_editor(from, manage_dirty, settings_dirty).is_some()
 }
 
 pub struct QuickSearchApp {
@@ -217,7 +232,7 @@ impl QuickSearchApp {
         let reconcile_owed_since = backend.coordinator.state().last_full_index;
         let fuzzy = cfg.search.fuzzy_default;
         // A hand-edited config can nest roots; the coordinator refuses to run.
-        let nested = nested_roots(&cfg.paths.indexing_paths);
+        let nested = nested_roots(&cfg);
         let (tab, nested_prompt) = if nested.is_empty() {
             (Tab::Search, None)
         } else {
@@ -276,11 +291,12 @@ impl QuickSearchApp {
     }
 
     fn start_search(&mut self) {
+        // The single funnel every search goes through: drop old watches here,
+        // and with them any update not yet delivered for the old rows.
+        self.backend.clear_live();
         let Some(search) = self.backend.search() else {
             return;
         };
-        // The single funnel every search goes through: drop old watches here.
-        self.backend.clear_live();
         let generation = search.search(&self.search.query, self.search_options());
         self.search.on_search_started(generation);
     }
@@ -304,6 +320,22 @@ impl QuickSearchApp {
             DupInvalidation::WhenItLands => self.rescan_when_dups_land = true,
             DupInvalidation::Rescan => self.start_duplicates_scan(ctx),
             DupInvalidation::Drop => self.dups.state = DupState::NotLoaded,
+        }
+    }
+
+    /// [`Self::invalidate_duplicates`] for an index about to be deleted (a
+    /// rebuild, a clear, a security change), minus the scan: one started now
+    /// would open the index while the coordinator deletes it (on Windows the
+    /// delete then fails). A visible tab is left empty until the end of the
+    /// run refills it. These two are the only writers of `NotLoaded` after
+    /// construction.
+    fn drop_duplicates(&mut self) {
+        match dup_invalidation(self.tab, &self.dups.state) {
+            DupInvalidation::Nothing => {}
+            DupInvalidation::WhenItLands => self.rescan_when_dups_land = true,
+            DupInvalidation::Rescan | DupInvalidation::Drop => {
+                self.dups.state = DupState::NotLoaded
+            }
         }
     }
 
@@ -331,8 +363,15 @@ impl QuickSearchApp {
     /// Save + route an edited config to the running services. `false` means
     /// nothing was saved and the caller must keep any staged edits alive.
     fn apply_new_config(&mut self, ctx: &egui::Context, mut new: Config) -> bool {
+        // Mid security change, an edit could start the rebuild before the new
+        // key is in, or move the index out from under the delete.
+        if self.security_busy() {
+            self.config_error =
+                Some("Not applied: the index is being deleted for a security change".to_string());
+            return false;
+        }
         pin_live_fields(&mut new, &self.cfg);
-        if let Some((child, parent)) = nested_roots(&new.paths.indexing_paths).first() {
+        if let Some((child, parent)) = nested_roots(&new).first() {
             self.config_error = Some(format!(
                 "Not applied: indexed folder {} is nested under {}",
                 child, parent
@@ -431,18 +470,20 @@ impl QuickSearchApp {
         }
     }
 
-    /// Ask for a tab from code rather than from a click: the same guard, so a
-    /// dirty draft still gets its say.
+    /// Every tab request goes through here, a click or one from code (the
+    /// tour, the search shortcut), so a dirty draft always gets its say. A
+    /// navigation already on hold wins ([`route_tab_request`]).
     pub(crate) fn request_tab(&mut self, ctx: &egui::Context, to: Tab) {
-        if switch_needs_guard(
-            self.tab,
-            self.manage.is_dirty(),
-            self.settings.is_dirty(&self.cfg),
-            self.pending_nav.is_some(),
-        ) {
-            self.pending_nav = Some(NavIntent::SwitchTab(to));
-        } else {
-            self.switch_tab(ctx, to);
+        let intent = NavIntent::SwitchTab(to);
+        let route = route_tab_request(self.pending_nav.is_some(), || {
+            let manage_dirty = self.manage.is_dirty();
+            let settings_dirty = self.settings.is_dirty(&self.cfg);
+            guard_source(intent, self.tab, manage_dirty, settings_dirty).is_some()
+        });
+        match route {
+            TabRoute::Drop => {}
+            TabRoute::Hold => self.pending_nav = Some(intent),
+            TabRoute::Switch => self.switch_tab(ctx, to),
         }
     }
 
@@ -489,15 +530,19 @@ impl QuickSearchApp {
             self.search
                 .apply_update(update, self.cfg.search.display_limit);
         }
-        // Handing live-update paths back to the indexer keeps the index from
-        // drifting away from the rows on screen, even while indexing is stopped.
+        // Handing live-update paths back to the indexer refreshes the rows of
+        // files that changed, even while indexing is stopped. It removes
+        // none: a row shown as gone stays in the index until the index's
+        // watcher or the next run finds the file gone.
         let mut touched: Vec<PathBuf> = Vec::new();
-        while let Ok(update) = self.backend.live_rx.try_recv() {
-            touched.push(PathBuf::from(update.path()));
-            if let quicksearch_core::live::LiveUpdate::Renamed { to, .. } = &update {
-                touched.push(PathBuf::from(to));
+        if let Some(rx) = &self.backend.live_rx {
+            while let Ok(update) = rx.try_recv() {
+                touched.push(PathBuf::from(update.path()));
+                if let quicksearch_core::live::LiveUpdate::Renamed { to, .. } = &update {
+                    touched.push(PathBuf::from(to));
+                }
+                self.search.apply_live(update);
             }
-            self.search.apply_live(update);
         }
         self.backend.reindex_live_paths(touched);
         // Duplicates worker.
@@ -547,6 +592,12 @@ impl QuickSearchApp {
         if let Some(targets) = actions.live_targets {
             self.backend
                 .watch_live(&self.search.query, targets, &self.cfg);
+        }
+        if let Some(path) = actions.open_file {
+            crate::platform::open_file(&path);
+        }
+        if let Some(path) = actions.reveal {
+            crate::platform::reveal_in_folder(&path);
         }
         if actions.rerun {
             self.start_search();
@@ -673,12 +724,16 @@ impl QuickSearchApp {
 
 /// Copies into a draft the fields that are saved the moment they change
 /// (security, index mode, search columns, advanced toggle, duplicates
-/// filters), so applying an older draft cannot revert them.
+/// filters, the watch-cap acknowledgements, the tour's dismissal), so
+/// applying an older draft cannot revert them and changing them never makes
+/// a draft read as dirty.
 pub(crate) fn pin_live_fields(new: &mut Config, live: &Config) {
     new.security = live.security.clone();
     new.indexing.auto_index = live.indexing.auto_index;
     new.search.columns = live.search.columns.clone();
     new.ui.show_advanced_settings = live.ui.show_advanced_settings;
+    new.ui.watch_cap_warned_roots = live.ui.watch_cap_warned_roots.clone();
+    new.ui.tutorial_seen = live.ui.tutorial_seen;
     new.duplicates = live.duplicates.clone();
 }
 
@@ -786,10 +841,8 @@ impl eframe::App for QuickSearchApp {
             let err = err.clone();
             egui::TopBottomPanel::top("config-error").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!("Config problem: {} (using defaults)", err),
-                    );
+                    // Bare: every source of this message says what failed.
+                    ui.colored_label(ui.visuals().error_fg_color, err);
                     if ui.small_button("Dismiss").clicked() {
                         self.config_error = None;
                     }

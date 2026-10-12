@@ -199,19 +199,15 @@ fn search(conn: &rusqlite::Connection, term: &str) -> Vec<String> {
     paths
 }
 
-/// RTF `\uN` escapes survive extraction, through the fixes in
-/// `vendor/rtf-parser` (see the `[patch.crates-io]` note in the workspace
-/// manifest). The unpatched lexer ends a control word at whitespace and trims
-/// leading spaces off what follows, which:
+/// RTF `\uN` escapes survive extraction, in every spelling a producer writes:
 ///
-/// * takes the rest of the word with a `\uN` escape's literal fallback:
-///   `before \u233?after end` lexes `\u233?after` as one control word and
-///   yields "before end";
-/// * drops a space between two escaped words, collapsing every script outside
-///   cp1252 (`Καλημέρα κόσμε` → `Καλημέρακόσμε`).
-///
-/// The parser counts fallback characters off against `\ucN` rather than
-/// guessing at them.
+/// * the fallback after each `\uN` is skipped, whether a literal `?` or a
+///   `\'hh` escape, and the word it sits in is kept: `before \u233?after end`
+///   is "before éafter end";
+/// * `\ucN` sets how many fallback units there are, zero included;
+/// * a space between two fully escaped words is text, so a script outside
+///   the codepage keeps its word breaks (`Καλημέρα κόσμε`);
+/// * a surrogate pair, two `\uN` with a fallback between, is one character.
 #[test]
 fn rtf_unicode_escapes_survive_extraction() {
     let dir = Scratch::dir("rtf-escapes");
@@ -268,7 +264,7 @@ fn rtf_unicode_escapes_survive_extraction() {
     );
 
     // A `\'hh` that is nobody's fallback is still text, and a space after it
-    // is still a space, which the space fix must not overshoot.
+    // is still a space: a control symbol takes no delimiter.
     let text = extract("standalone-hex.rtf", r"{\rtf1\ansi caf\'e9 \'e0 noon}");
     assert!(text.contains("café à noon"), "{text:?}");
 

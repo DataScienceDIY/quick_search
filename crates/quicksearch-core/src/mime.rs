@@ -136,6 +136,11 @@ pub fn guess_mime_from_head(path: &Path, head: &[u8]) -> Option<&'static str> {
         if magic == "application/x-ole-storage" && by_extension.is_some() {
             return by_extension;
         }
+        if magic == "application/zip" && by_extension.is_none() {
+            if let Some(ooxml) = ooxml_by_entries(head) {
+                return Some(ooxml);
+            }
+        }
         return Some(magic);
     }
     if crate::textenc::looks_like_text(head) {
@@ -143,6 +148,42 @@ pub fn guess_mime_from_head(path: &Path, head: &[u8]) -> Option<&'static str> {
     }
     // Only an ambiguous extension still has an answer left to fall back on.
     by_extension
+}
+
+/// The OOXML MIME of a zip whose first part under `word/`, `xl/` or `ppt/`
+/// has its local header in `head`. `infer` decides by the first entry, or
+/// past a `_rels/` or `docProps/` one by the third, where LibreOffice writes
+/// a second `docProps/` part, so an extensionless LibreOffice document would
+/// sniff as a plain zip. The data between headers is skipped by searching
+/// for the next signature: an entry written with a data descriptor records
+/// no size up front.
+fn ooxml_by_entries(head: &[u8]) -> Option<&'static str> {
+    const PARTS: [(&[u8], &str); 3] = [
+        (
+            b"word/",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (
+            b"xl/",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+        (
+            b"ppt/",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+    ];
+    let mut at = 0;
+    while let Some(found) = head.get(at..)?.windows(4).position(|w| w == b"PK\x03\x04") {
+        let header = at + found;
+        let len = head.get(header + 26..header + 28)?;
+        let name_end = header + 30 + usize::from(u16::from_le_bytes([len[0], len[1]]));
+        let name = head.get(header + 30..name_end)?;
+        if let Some((_, mime)) = PARTS.iter().find(|(prefix, _)| name.starts_with(prefix)) {
+            return Some(*mime);
+        }
+        at = name_end;
+    }
+    None
 }
 
 /// The longest MIME any table here holds is 73 bytes; 128 leaves room and
@@ -454,6 +495,31 @@ mod tests {
                 tag
             );
         }
+    }
+
+    /// A LibreOffice deck with no extension: `infer` stops at its
+    /// `docProps/` parts and says zip, so the entries name the format. A zip
+    /// whose entries name no OOXML part stays a zip.
+    #[test]
+    fn an_extensionless_ooxml_file_sniffs_by_its_entries() {
+        let head_bytes = crate::config::ProcessingConfig::default().hash_length;
+        let deck = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/legacy/sample.pptx"
+        ))
+        .unwrap();
+        assert_eq!(
+            guess("deck", &deck[..deck.len().min(head_bytes)]),
+            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        );
+
+        let mut zip = b"PK\x03\x04".to_vec();
+        // Versions, flags, method, time, date, CRC and sizes.
+        zip.extend_from_slice(&[0; 22]);
+        zip.extend_from_slice(&9u16.to_le_bytes()); // name length
+        zip.extend_from_slice(&[0, 0]); // extra length
+        zip.extend_from_slice(b"notes.txt");
+        assert_eq!(guess("archive", &zip), Some("application/zip"));
     }
 
     /// A head starved below `infer`'s longest signature legitimately

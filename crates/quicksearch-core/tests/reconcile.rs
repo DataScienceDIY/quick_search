@@ -1,9 +1,9 @@
 //! End-to-end tests for reconciling a real index against a changed
 //! configuration.
 //!
-//! Every test also pins `schema_info.created_at`, which only a wipe can
-//! change: losing the index file is otherwise silent, because the next run
-//! rebuilds it.
+//! Every test that keeps its index also pins `schema_info.created_at`, which
+//! only a wipe can change: losing the index file is otherwise silent, because
+//! the next run rebuilds it.
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -12,6 +12,7 @@ use std::time::Instant;
 use quicksearch_core::config::{diff_actions, Config};
 use quicksearch_core::db;
 use quicksearch_core::extract::Registry;
+use quicksearch_core::file_handling::get_file_hash;
 use quicksearch_core::scope::{advance, WorkCursor, SLICE};
 use quicksearch_core::testutil::Scratch;
 
@@ -351,80 +352,6 @@ fn turning_hidden_files_off_prunes_whole_hidden_subtrees() {
     assert_eq!(created_at(&db), born, "the index was not rebuilt");
 }
 
-/// A followed symlink's target is stored under its own canonical path, which
-/// can be outside every root: no owning root, no filtering rules to apply.
-/// The patterns here are the hostile half — `**` and `../*` describe the
-/// whole filesystem — and none may reach a row the scan never visits.
-#[cfg(unix)]
-#[test]
-fn a_symlink_target_outside_every_root_survives_a_prune() {
-    let base = Scratch::canonical("alias");
-    let indexed = base.join("indexed");
-    let neighbour = base.join("neighbour");
-    let db_dir = Scratch::canonical("alias-db");
-    let db = db_dir.join("index.sqlite");
-    touch(&indexed.join("a.txt"), b"alpha");
-    touch(&indexed.join("sub/b.log"), b"bravo");
-    touch(&neighbour.join("target.txt"), b"charlie outside");
-    std::os::unix::fs::symlink(neighbour.join("target.txt"), indexed.join("link.txt")).unwrap();
-
-    let mut old = base_config(&indexed, &db);
-    old.indexing.follow_symlinks = true;
-    index_once(&db, &old);
-    let born = created_at(&db);
-    let target = neighbour.join("target.txt").to_string_lossy().into_owned();
-    assert!(
-        paths(&db).contains(&target),
-        "the alias was indexed under the target's own path: {:?}",
-        paths(&db)
-    );
-
-    let mut new = old.clone();
-    new.indexing.ignore_patterns = vec![
-        "*.log".into(),
-        "**".into(),
-        "../*".into(),
-        neighbour.join("*").to_string_lossy().into_owned(),
-    ];
-    reconcile(&db, &old, &new);
-
-    // `**` matches every component, so everything under the configured root
-    // goes, and only that. The target, which lives outside it, stays.
-    assert_eq!(paths(&db), vec![target]);
-    assert_eq!(orphans(&db), 0, "nothing left behind");
-    assert_eq!(created_at(&db), born, "the index was not rebuilt");
-}
-
-/// Rows for out-of-root targets are reached by no walk and no stale sweep, so
-/// only the reconcile can remove them.
-#[cfg(unix)]
-#[test]
-fn turning_symlinks_off_reaches_targets_outside_the_roots() {
-    let base = Scratch::canonical("links-off");
-    let indexed = base.join("indexed");
-    let neighbour = base.join("neighbour");
-    let db_dir = Scratch::canonical("links-off-db");
-    let db = db_dir.join("index.sqlite");
-    touch(&indexed.join("a.txt"), b"alpha");
-    touch(&neighbour.join("target.txt"), b"bravo outside");
-    std::os::unix::fs::symlink(neighbour.join("target.txt"), indexed.join("link.txt")).unwrap();
-
-    let mut on = base_config(&indexed, &db);
-    on.indexing.follow_symlinks = true;
-    index_once(&db, &on);
-    let born = created_at(&db);
-    assert_eq!(paths(&db).len(), 2);
-
-    let mut off = on.clone();
-    off.indexing.follow_symlinks = false;
-    let (deleted, _) = reconcile(&db, &on, &off);
-
-    assert_eq!(deleted, 1);
-    assert_eq!(paths(&db), vec![indexed.join("a.txt").to_string_lossy()]);
-    assert_eq!(orphans(&db), 0);
-    assert_eq!(created_at(&db), born, "the index was not rebuilt");
-}
-
 /// A config changed while the app was not running is reconciled by the next
 /// run, from the `config_validation` record of what the index was built with.
 #[test]
@@ -459,6 +386,83 @@ fn a_run_reconciles_a_config_edited_while_it_was_closed() {
     assert_eq!(created_at(&db), born, "the index was not rebuilt");
 }
 
+/// The size cap is in the record too: raised while the app was closed, it
+/// reaches a file the walk skips as unchanged.
+#[test]
+fn a_cap_raised_while_closed_reads_the_text_it_now_allows() {
+    let root = Scratch::canonical("cap-raised");
+    let db_dir = Scratch::canonical("cap-raised-db");
+    let db = db_dir.join("index.sqlite");
+    touch(&root.join("big.txt"), &b"golf ".repeat(820));
+
+    let mut capped = base_config(&root, &db);
+    capped.processing.maximum_text_file_size = 1024;
+    index_once(&db, &capped);
+    let born = created_at(&db);
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM files WHERE content_state = 3"),
+        1,
+        "4 KiB is over the cap"
+    );
+    assert_eq!(fts_count(&db, "golf"), 0);
+
+    index_once(&db, &base_config(&root, &db));
+    assert_eq!(fts_count(&db, "golf"), 1, "the text is searchable");
+    assert_eq!(created_at(&db), born, "the index was not rebuilt");
+}
+
+/// A `hash_length` edit no run applied, beside a dropped root: the next run
+/// rebuilds rather than stamping the new length over hashes taken under the
+/// old one, and the dropped root's rows go with the wipe. The one test here
+/// whose index is meant to be replaced, so `created_at` is not pinned (it
+/// has whole-second resolution, so it may not even change).
+#[test]
+fn a_hash_length_edited_while_closed_rebuilds_the_index() {
+    let base = Scratch::canonical("rehash");
+    let kept = base.join("kept");
+    let dropped = base.join("dropped");
+    let db_dir = Scratch::canonical("rehash-db");
+    let db = db_dir.join("index.sqlite");
+    // Past both lengths, so the two hashes of it differ.
+    touch(&kept.join("a.txt"), &b"alpha ".repeat(2000));
+    touch(&kept.join("b.txt"), b"bravo");
+    touch(&dropped.join("c.txt"), b"charlie");
+
+    let mut old = base_config(&kept, &db);
+    old.paths.indexing_paths = vec![
+        kept.to_string_lossy().into_owned(),
+        dropped.to_string_lossy().into_owned(),
+    ];
+    index_once(&db, &old);
+    assert_eq!(paths(&db).len(), 3);
+
+    let mut new = base_config(&kept, &db);
+    new.processing.hash_length = old.processing.hash_length / 2;
+    index_once(&db, &new);
+
+    assert_eq!(
+        paths(&db),
+        vec![
+            kept.join("a.txt").to_string_lossy(),
+            kept.join("b.txt").to_string_lossy()
+        ]
+    );
+    assert_eq!(orphans(&db), 0);
+    let c = conn(&db);
+    let mut stmt = c.prepare("SELECT parent || name, hash FROM files").unwrap();
+    let rows: Vec<(String, Vec<u8>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let mut head = Vec::new();
+    for (path, stored) in rows {
+        let (want, _) =
+            get_file_hash(Path::new(&path), new.processing.hash_length, &mut head).unwrap();
+        assert_eq!(stored, want, "{} is hashed at the new length", path);
+    }
+}
+
 /// The run-start pass and the coordinator's pass can both fire for one edit;
 /// a plan that is not idempotent would delete rows the walk just re-added.
 #[test]
@@ -481,4 +485,210 @@ fn reconciling_is_idempotent() {
     let second = reconcile(&db, &old, &new);
     assert_eq!(second, (0, 0), "the second pass found nothing left to do");
     assert_eq!(paths(&db), after_first);
+}
+
+// ---------------------------------------------------------------------------
+// Offline roots: a root that cannot be resolved is spelled as configured, not
+// canonically, and must not read as a removed one.
+// ---------------------------------------------------------------------------
+
+/// The roots the index's record names, in recorded spelling.
+fn recorded_roots(db: &Path) -> Vec<String> {
+    let value: String = conn(db)
+        .query_row(
+            "SELECT value FROM config_validation WHERE key = 'indexing_path'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    value.lines().map(str::to_string).collect()
+}
+
+/// `dir` spelled with a trailing separator, which canonicalizing drops.
+fn with_trailing_separator(dir: &Path) -> String {
+    format!("{}{}", dir.to_string_lossy(), std::path::MAIN_SEPARATOR)
+}
+
+#[cfg(unix)]
+#[test]
+fn an_offline_root_reached_through_a_symlink_keeps_its_entries() {
+    let base = Scratch::canonical("offline-link");
+    let target = base.join("disk");
+    let link = base.join("docs");
+    let db_dir = Scratch::canonical("offline-link-db");
+    let db = db_dir.join("index.sqlite");
+    tree(&target);
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let config = base_config(&link, &db);
+    index_once(&db, &config);
+    let born = created_at(&db);
+    let before = paths(&db);
+    assert_eq!(before.len(), 5);
+    assert!(
+        before.iter().all(|p| Path::new(p).starts_with(&target)),
+        "rows are keyed under the link's target: {:?}",
+        before
+    );
+
+    let away = base.join("disk-away");
+    std::fs::rename(&target, &away).unwrap();
+    index_once(&db, &config);
+    assert_eq!(
+        paths(&db),
+        before,
+        "a dangling link is an offline root, not a removed one"
+    );
+
+    std::fs::rename(&away, &target).unwrap();
+    index_once(&db, &config);
+    assert_eq!(paths(&db), before);
+    assert_eq!(residue(&db), (5, 5), "no text was withdrawn either");
+    assert_eq!(created_at(&db), born, "the index was not rebuilt");
+}
+
+#[test]
+fn an_offline_root_spelled_with_a_trailing_slash_keeps_its_entries() {
+    let base = Scratch::canonical("offline-slash");
+    let root = base.join("disk");
+    let db_dir = Scratch::canonical("offline-slash-db");
+    let db = db_dir.join("index.sqlite");
+    tree(&root);
+
+    let mut config = base_config(&root, &db);
+    config.paths.indexing_paths = vec![with_trailing_separator(&root)];
+    index_once(&db, &config);
+    let born = created_at(&db);
+    let before = paths(&db);
+    assert_eq!(before.len(), 5);
+
+    let away = base.join("disk-away");
+    std::fs::rename(&root, &away).unwrap();
+    index_once(&db, &config);
+    assert_eq!(paths(&db), before, "an unmounted root is not a removed one");
+
+    std::fs::rename(&away, &root).unwrap();
+    index_once(&db, &config);
+    assert_eq!(paths(&db), before);
+    assert_eq!(residue(&db), (5, 5), "no text was withdrawn either");
+    assert_eq!(created_at(&db), born, "the index was not rebuilt");
+}
+
+/// A stamp of only the offline spelling would lose the canonical one, and
+/// with it the rows' owner and the root's progress figure.
+#[test]
+fn an_offline_run_keeps_the_recorded_spelling_in_the_stamp() {
+    let base = Scratch::canonical("offline-stamp");
+    let root = base.join("disk");
+    let db_dir = Scratch::canonical("offline-stamp-db");
+    let db = db_dir.join("index.sqlite");
+    tree(&root);
+
+    let mut config = base_config(&root, &db);
+    config.paths.indexing_paths = vec![with_trailing_separator(&root)];
+    index_once(&db, &config);
+    let recorded = recorded_roots(&db);
+    assert_eq!(recorded.len(), 1, "one canonical root: {:?}", recorded);
+    let walk_count = |db: &Path| db::repo::get_root_walk_count(&conn(db), &recorded[0]);
+    assert_eq!(walk_count(&db), Some(5));
+
+    std::fs::rename(&root, base.join("disk-away")).unwrap();
+    index_once(&db, &config);
+    assert!(
+        recorded_roots(&db).contains(&recorded[0]),
+        "the held run dropped {} from the record: {:?}",
+        recorded[0],
+        recorded_roots(&db)
+    );
+    assert_eq!(walk_count(&db), Some(5), "the figure outlives the outage");
+}
+
+/// The drop waits out every offline run, then goes by the spelling recorded
+/// while the root was online: the link no longer leads there.
+#[cfg(unix)]
+#[test]
+fn a_root_removed_while_offline_is_dropped_by_its_recorded_spelling() {
+    let base = Scratch::canonical("offline-removed");
+    let target = base.join("disk");
+    let link = base.join("docs");
+    let other = base.join("other");
+    let db_dir = Scratch::canonical("offline-removed-db");
+    let db = db_dir.join("index.sqlite");
+    tree(&target);
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    touch(&other.join("o.txt"), b"other");
+
+    let mut both = base_config(&link, &db);
+    both.paths.indexing_paths = vec![
+        link.to_string_lossy().into_owned(),
+        other.to_string_lossy().into_owned(),
+    ];
+    index_once(&db, &both);
+    let born = created_at(&db);
+    assert_eq!(paths(&db).len(), 6);
+
+    std::fs::rename(&target, base.join("disk-away")).unwrap();
+    index_once(&db, &both);
+    assert_eq!(paths(&db).len(), 6, "held while the link dangles");
+
+    // Removed while `other` is offline too: still held.
+    let only_other = base_config(&other, &db);
+    let other_away = base.join("other-away");
+    std::fs::rename(&other, &other_away).unwrap();
+    index_once(&db, &only_other);
+    assert_eq!(
+        paths(&db).len(),
+        6,
+        "a drop waits while any root is offline"
+    );
+
+    std::fs::rename(&other_away, &other).unwrap();
+    index_once(&db, &only_other);
+    assert_eq!(
+        paths(&db),
+        vec![other.join("o.txt").to_string_lossy()],
+        "every configured root resolves, so the removed one goes"
+    );
+    assert_eq!(residue(&db), (1, 1));
+    assert_eq!(orphans(&db), 0);
+    assert_eq!(created_at(&db), born, "the index was not rebuilt");
+}
+
+#[test]
+fn a_removal_waits_while_another_root_is_offline() {
+    let base = Scratch::canonical("offline-wait");
+    let offline = base.join("offline");
+    let removed = base.join("removed");
+    let db_dir = Scratch::canonical("offline-wait-db");
+    let db = db_dir.join("index.sqlite");
+    touch(&offline.join("a.txt"), b"alpha");
+    touch(&removed.join("b.txt"), b"bravo");
+    touch(&removed.join("sub/c.txt"), b"charlie");
+
+    let mut both = base_config(&offline, &db);
+    both.paths.indexing_paths = vec![
+        offline.to_string_lossy().into_owned(),
+        removed.to_string_lossy().into_owned(),
+    ];
+    index_once(&db, &both);
+    let born = created_at(&db);
+    let before = paths(&db);
+    assert_eq!(before.len(), 3);
+
+    let away = base.join("offline-away");
+    std::fs::rename(&offline, &away).unwrap();
+    let narrowed = base_config(&offline, &db);
+    index_once(&db, &narrowed);
+    assert_eq!(
+        paths(&db),
+        before,
+        "the removed root's rows wait for the offline one"
+    );
+
+    std::fs::rename(&away, &offline).unwrap();
+    index_once(&db, &narrowed);
+    assert_eq!(paths(&db), vec![offline.join("a.txt").to_string_lossy()]);
+    assert_eq!(residue(&db), (1, 1));
+    assert_eq!(orphans(&db), 0);
+    assert_eq!(created_at(&db), born, "the index was not rebuilt");
 }

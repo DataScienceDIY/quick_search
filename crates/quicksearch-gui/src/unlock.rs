@@ -2,10 +2,11 @@
 //! renders a full-window unlock screen and starts none of the backend.
 //!
 //! Password hygiene: the typed password moves into a [`Zeroizing`] buffer on
-//! submit, is dropped by the worker that derives the key, and the visible
-//! text-field state (including egui's undo buffer) is purged. Only the
-//! derived key crosses the channel back.
+//! submit and is dropped by the worker that derives the key; egui's undo
+//! history for the field, which copies the text, is removed but not wiped.
+//! Only the derived key crosses the channel back.
 
+use std::path::Path;
 use std::sync::mpsc;
 
 use quicksearch_core::config::{Config, SecurityConfig};
@@ -106,38 +107,54 @@ impl eframe::App for Gate {
     }
 }
 
-/// Try the keychain before any window exists; `true` skips the prompt entirely.
+/// Try the keychain before any window exists; `true` skips the prompt
+/// entirely. Only a key remembered under the config's salt is tried
+/// ([`keychain::remembered_key`]); with no index on disk it is then taken
+/// without a further check (see [`remembered_key_fits`]).
 pub fn try_keychain_unlock(cfg: &Config) -> bool {
-    if !cfg.security.use_keychain || cfg.security.salt_bytes().is_err() {
+    if !cfg.security.use_keychain {
         return false;
     }
+    let Ok(salt) = cfg.security.salt_bytes() else {
+        return false;
+    };
     let db_path = cfg.resolved_database_path();
-    let hex = match keychain::load_key(&db_path.to_string_lossy()) {
-        Ok(Some(hex)) => hex,
+    let text = match keychain::load_entry(&db_path.to_string_lossy()) {
+        Ok(Some(text)) => text,
         Ok(None) => return false,
         Err(e) => {
             eprintln!("warning: {}", e);
             return false;
         }
     };
-    let Ok(key) = IndexKey::from_hex(&hex) else {
+    // A stale entry, such as one an earlier password change failed to
+    // replace, prompts.
+    let Ok(key) = keychain::remembered_key(&text, &salt) else {
         return false;
     };
     db::set_process_key(Some(key));
-    match db::verify_process_key(&db_path.to_string_lossy()) {
-        Ok(()) => true,
-        Err(_) => {
-            // Stale entry or foreign database: fall back to the prompt.
-            db::set_process_key(None);
-            false
-        }
+    if remembered_key_fits(&db_path) {
+        return true;
     }
+    // Stale entry or foreign database: fall back to the prompt.
+    db::set_process_key(None);
+    false
+}
+
+/// Whether the process key may stand for the index at `db_path`. With no
+/// index (after Clear index, say) there is nothing to check it against, and
+/// dropping it would let a mistyped password replace it. It was remembered
+/// under the config's salt, which every password change replaces, so it is
+/// the current password's.
+fn remembered_key_fits(db_path: &Path) -> bool {
+    !db_path.exists() || db::verify_process_key(&db_path.to_string_lossy()).is_ok()
 }
 
 enum Mode {
     Unlock,
-    /// Protection is on but no index exists yet. Not a *new* password: a
-    /// salt already exists, so this re-enters the one chosen previously.
+    /// Protection is on but no index exists yet, so nothing can check the
+    /// password: whatever is typed becomes the key under the existing salt,
+    /// which is why it is asked for twice.
     Create,
     /// The salt is missing or corrupt; only the reset escape hatch applies.
     BrokenSalt(String),
@@ -149,6 +166,8 @@ pub struct UnlockScreen {
     initial_query: Option<String>,
     mode: Mode,
     password: String,
+    /// The second entry [`Mode::Create`] asks for.
+    confirm: String,
     remember: bool,
     error: Option<String>,
     /// Set at startup and after a failed attempt, not every frame: an
@@ -183,6 +202,7 @@ impl UnlockScreen {
             initial_query,
             mode,
             password: String::new(),
+            confirm: String::new(),
             remember,
             error: None,
             focus_password: true,
@@ -260,6 +280,16 @@ impl UnlockScreen {
                             .hint_text("Password")
                             .desired_width(240.0),
                     );
+                    let confirm = matches!(self.mode, Mode::Create).then(|| {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.confirm)
+                                .id(confirm_field_id())
+                                .password(true)
+                                .hint_text("Confirm password")
+                                .desired_width(240.0),
+                        )
+                    });
                     ui.add_space(4.0);
                     ui.checkbox(&mut self.remember, "Remember on this device")
                         .on_hover_text(
@@ -273,9 +303,20 @@ impl UnlockScreen {
                         _ => "Create index",
                     };
                     let clicked = ui.button(label).clicked();
-                    let entered =
-                        field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    submitted = clicked || entered;
+                    // Enter submits from the last field; in the first of two
+                    // it moves on to the second.
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let entered = |field: &egui::Response| field.lost_focus() && enter;
+                    let last = match &confirm {
+                        Some(second) => {
+                            if entered(&field) {
+                                second.request_focus();
+                            }
+                            second
+                        }
+                        None => &field,
+                    };
+                    submitted = clicked || entered(last);
                     if self.focus_password && !busy {
                         field.request_focus();
                         self.focus_password = false;
@@ -331,15 +372,27 @@ impl UnlockScreen {
 
     fn submit(&mut self, ctx: &egui::Context) {
         self.error = None;
-        if matches!(self.mode, Mode::Create) && self.password.is_empty() {
-            self.error = Some("The password may not be empty.".to_string());
-            return;
-        }
         let Ok(salt) = self.cfg.security.salt_bytes() else {
             return; // BrokenSalt mode never reaches submit
         };
         let password = Zeroizing::new(std::mem::take(&mut self.password));
-        purge_text_state(ctx, pw_field_id());
+        let confirm = Zeroizing::new(std::mem::take(&mut self.confirm));
+        purge_text_state(ctx, &[pw_field_id(), confirm_field_id()]);
+        if matches!(self.mode, Mode::Create) {
+            let refused = if password.is_empty() {
+                Some("The password may not be empty.")
+            } else if password != confirm {
+                Some("The passwords do not match.")
+            } else {
+                None
+            };
+            if let Some(why) = refused {
+                self.error = Some(why.to_string());
+                // Both fields were cleared; put the caret back.
+                self.focus_password = true;
+                return;
+            }
+        }
 
         let verify_against = match self.mode {
             Mode::Unlock => Some(self.cfg.resolved_database_path()),
@@ -363,10 +416,19 @@ impl UnlockScreen {
 
     fn unlocked(&mut self, ctx: &egui::Context, key: IndexKey) -> Option<QuickSearchApp> {
         let db_path = self.cfg.resolved_database_path();
-        // Non-fatal: unlock proceeds, but say that the keychain does not
-        // match the preference (or still holds the old key).
-        let remembered = self.remember.then(|| key.to_hex());
-        if let Err(e) = keychain::sync(&db_path.to_string_lossy(), remembered.as_deref()) {
+        // Non-fatal: unlock proceeds, but say that the key could not be
+        // stored, or that a key remembered until now could not be forgotten.
+        // Read before the preference is overwritten below.
+        let was_remembered = self.cfg.security.use_keychain;
+        let salt = self.cfg.security.salt.as_deref().unwrap_or_default();
+        let remembered = self
+            .remember
+            .then(|| keychain::entry_text(salt, &Zeroizing::new(key.to_hex())));
+        if let Err(e) = keychain::sync(
+            &db_path.to_string_lossy(),
+            was_remembered,
+            remembered.as_deref().map(String::as_str),
+        ) {
             self.config_error = Some(e);
         }
         if self.cfg.security.use_keychain != self.remember {
@@ -404,26 +466,31 @@ impl UnlockScreen {
     /// The index is derived data: deleting it and disabling protection
     /// loses nothing but time. `Some(app)` when the reset happened.
     fn confirm_reset_ui(&mut self, ctx: &egui::Context) -> Option<QuickSearchApp> {
+        let db_path = self.cfg.resolved_database_path();
         let result = crate::ui_util::centered_modal(ctx, "Reset the index?", |ui| {
             ui.set_max_width(420.0);
             ui.label(
                 "Without the password the index cannot be read. This deletes \
-                 the index and turns password protection off. Your files are \
-                 not touched; the index is rebuilt by indexing again.",
+                 the index database below and turns password protection off. \
+                 Your files are not touched; the index is rebuilt by indexing \
+                 again.",
             );
+            ui.monospace(db_path.display().to_string());
             ui.horizontal(|ui| {
                 let mut launched = None;
                 let delete = egui::RichText::new("Delete index & disable protection")
                     .color(ui.visuals().error_fg_color);
                 if ui.button(delete).clicked() {
-                    let db_path = self.cfg.resolved_database_path();
                     // No coordinator exists while the gate is locked, so a
                     // plain delete is safe.
                     if let Err(e) = db::remove_index_files(&db_path) {
-                        self.error = Some(format!("Failed to delete {}: {}", db_path.display(), e));
+                        self.error = Some(e);
                     } else {
                         // A surviving keychain entry would point at nothing.
-                        if let Err(e) = keychain::delete_key(&db_path.to_string_lossy()) {
+                        let was_remembered = self.cfg.security.use_keychain;
+                        if let Err(e) =
+                            keychain::sync(&db_path.to_string_lossy(), was_remembered, None)
+                        {
                             self.config_error = Some(e);
                         }
                         db::set_process_key(None);
@@ -450,6 +517,7 @@ impl UnlockScreen {
 impl Drop for UnlockScreen {
     fn drop(&mut self) {
         self.password.zeroize();
+        self.confirm.zeroize();
     }
 }
 
@@ -457,10 +525,18 @@ fn pw_field_id() -> egui::Id {
     egui::Id::new("unlock-password")
 }
 
-/// Drops egui's retained state (text buffer and undo history), so the
-/// plaintext doesn't outlive the submit.
-fn purge_text_state(ctx: &egui::Context, id: egui::Id) {
-    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(id));
+fn confirm_field_id() -> egui::Id {
+    egui::Id::new("unlock-password-confirm")
+}
+
+/// Removes egui's undo history for the fields (copies of the text; freed,
+/// not wiped).
+pub(crate) fn purge_text_state(ctx: &egui::Context, ids: &[egui::Id]) {
+    ctx.data_mut(|d| {
+        for &id in ids {
+            d.remove::<egui::text_edit::TextEditState>(id);
+        }
+    });
 }
 
 #[cfg(test)]
@@ -482,11 +558,29 @@ mod tests {
     }
 
     fn frame(ctx: &egui::Context, screen: &mut UnlockScreen) {
-        let input = crate::test_ui::raw_input(SCREEN, Vec::new());
-        let _ = ctx.run(input, |ctx| {
-            // With nothing submitted the screen stays up.
+        frame_with(ctx, screen, Vec::new());
+    }
+
+    fn frame_with(
+        ctx: &egui::Context,
+        screen: &mut UnlockScreen,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = crate::test_ui::raw_input(SCREEN, events);
+        ctx.run(input, |ctx| {
+            // Nothing here unlocks, so the screen stays up.
             assert!(screen.update(ctx).is_none());
-        });
+        })
+    }
+
+    /// `text` typed into the focused field, then Enter.
+    fn typed(text: &str) -> Vec<egui::Event> {
+        let mut events = vec![egui::Event::Text(text.to_string())];
+        events.extend(crate::test_ui::key_press(
+            egui::Key::Enter,
+            egui::Modifiers::NONE,
+        ));
+        events
     }
 
     /// The caret starts in the password field, then can leave.
@@ -547,5 +641,108 @@ mod tests {
             "{} is not painted on the lock screen",
             crate::version::BUILD_ID
         );
+    }
+
+    /// With no index there is nothing to check a remembered key against, so
+    /// it stands. Answered from the path alone: verifying would fail to open
+    /// the missing file and drop the key, which is the bug this guards.
+    #[test]
+    fn a_remembered_key_fits_when_there_is_no_index() {
+        let missing =
+            std::env::temp_dir().join(format!("qs-unlock-missing-{}.sqlite", std::process::id()));
+        assert!(!missing.exists());
+        assert!(remembered_key_fits(&missing));
+    }
+
+    /// A file at the path is checked, and one the key cannot open refuses it
+    /// (whatever key this process holds: garbage opens under none).
+    #[test]
+    fn a_remembered_key_that_does_not_open_the_index_does_not_fit() {
+        let path =
+            std::env::temp_dir().join(format!("qs-unlock-garbage-{}.sqlite", std::process::id()));
+        std::fs::write(&path, [0xa5u8; 4096]).unwrap();
+        let fits = remembered_key_fits(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(!fits);
+    }
+
+    /// Nothing checks a new index's password, so Create asks for it twice;
+    /// an existing index checks it, so Unlock asks once.
+    #[test]
+    fn only_create_asks_for_the_password_twice() {
+        let ctx = crate::test_ui::ctx();
+        let mut screen = UnlockScreen::new(locked_config(), None, None);
+        assert!(matches!(screen.mode, Mode::Create));
+        let painted = crate::test_ui::painted_text(&frame_with(&ctx, &mut screen, Vec::new()));
+        assert!(
+            painted.contains(&"Confirm password".to_string()),
+            "{painted:?}"
+        );
+
+        screen.mode = Mode::Unlock;
+        let painted = crate::test_ui::painted_text(&frame_with(&ctx, &mut screen, Vec::new()));
+        assert!(
+            !painted.contains(&"Confirm password".to_string()),
+            "{painted:?}"
+        );
+    }
+
+    /// Enter in the first field moves on to the second instead of submitting
+    /// half the form; Enter there submits, and a mismatch is refused.
+    #[test]
+    fn create_takes_enter_through_both_fields() {
+        let ctx = crate::test_ui::ctx();
+        let mut screen = UnlockScreen::new(locked_config(), None, None);
+        frame(&ctx, &mut screen);
+
+        frame_with(&ctx, &mut screen, typed("hunter2"));
+        assert_eq!(screen.password, "hunter2");
+        assert_eq!(screen.error, None, "Enter in the first field submitted");
+        assert!(
+            ctx.memory(|m| m.has_focus(confirm_field_id())),
+            "the caret did not move on to the confirmation"
+        );
+
+        frame_with(&ctx, &mut screen, typed("hunter3"));
+        assert_eq!(screen.error.as_deref(), Some("The passwords do not match."));
+        assert!(screen.job.is_none());
+    }
+
+    /// A typo in either entry would become the key, so they must agree; both
+    /// are cleared for a retry, egui's copies included, and an empty password
+    /// is refused first.
+    #[test]
+    fn create_refuses_passwords_that_differ_or_are_empty() {
+        for (password, confirm, refusal) in [
+            ("hunter2", "hunter3", "The passwords do not match."),
+            ("hunter2", "", "The passwords do not match."),
+            ("", "hunter2", "The password may not be empty."),
+            ("", "", "The password may not be empty."),
+        ] {
+            let ctx = crate::test_ui::ctx();
+            let mut screen = UnlockScreen::new(locked_config(), None, None);
+            screen.password = password.to_string();
+            screen.confirm = confirm.to_string();
+            screen.focus_password = false;
+            let fields = [pw_field_id(), confirm_field_id()];
+            for id in fields {
+                egui::text_edit::TextEditState::default().store(&ctx, id);
+            }
+            screen.submit(&ctx);
+            assert_eq!(
+                screen.error.as_deref(),
+                Some(refusal),
+                "{password:?} {confirm:?}"
+            );
+            assert!(
+                screen.job.is_none(),
+                "{password:?} {confirm:?} went on to derive"
+            );
+            assert!(screen.password.is_empty() && screen.confirm.is_empty());
+            for id in fields {
+                assert!(egui::text_edit::TextEditState::load(&ctx, id).is_none());
+            }
+            assert!(screen.focus_password, "the caret is not put back");
+        }
     }
 }

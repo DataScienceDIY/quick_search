@@ -47,19 +47,66 @@ fn window_rect(ctx: &egui::Context) -> egui::Rect {
         .expect("the tour's window")
 }
 
-/// One pass, and what the tour asked for during it.
+/// One pass with the search box empty, and what the tour asked for during it.
 fn pass(
     ctx: &egui::Context,
     tour: &mut Tutorial,
     events: Vec<egui::Event>,
     time: f64,
 ) -> (egui::FullOutput, TourActions) {
+    pass_holding(ctx, tour, events, time, "")
+}
+
+/// [`pass`] with `query` in the search box.
+fn pass_holding(
+    ctx: &egui::Context,
+    tour: &mut Tutorial,
+    events: Vec<egui::Event>,
+    time: f64,
+    query: &str,
+) -> (egui::FullOutput, TourActions) {
     let roots = roots();
     let mut actions = TourActions::default();
     let out = ctx.run(raw_input_at(SCREEN, events, time), |ctx| {
-        actions = tour.ui(ctx, &roots, HOTKEY);
+        actions = tour.ui(ctx, &roots, HOTKEY, query);
     });
     (out, actions)
+}
+
+/// [`pass`] with `spot` marked at `rect`, as the widget it names would mark
+/// itself while laying out.
+fn marked_pass(
+    ctx: &egui::Context,
+    tour: &mut Tutorial,
+    spot: Spot,
+    rect: egui::Rect,
+    time: f64,
+) -> egui::FullOutput {
+    let roots = roots();
+    ctx.run(raw_input_at(SCREEN, Vec::new(), time), |ctx| {
+        crate::spotlight::set_active(ctx, true);
+        crate::spotlight::mark(ctx, spot, rect);
+        tour.ui(ctx, &roots, HOTKEY, "");
+    })
+}
+
+/// How long the pass asked egui to wait before the next one;
+/// `Duration::MAX` is not at all.
+fn repaint_delay(out: &egui::FullOutput) -> Duration {
+    out.viewport_output
+        .values()
+        .map(|v| v.repaint_delay)
+        .min()
+        .expect("a viewport")
+}
+
+/// Eight passes a quarter second apart from `from`, the last returned:
+/// egui's own work (sizing, placing and fading in the window) is over by then.
+fn settle(ctx: &egui::Context, tour: &mut Tutorial, from: f64) -> egui::FullOutput {
+    (0..8)
+        .map(|n| pass(ctx, tour, Vec::new(), from + f64::from(n) * 0.25).0)
+        .last()
+        .expect("passes ran")
 }
 
 fn merge(a: TourActions, b: TourActions) -> TourActions {
@@ -187,62 +234,129 @@ fn each_keyword_is_painted_in_the_colour_of_the_spot_it_names() {
     );
 }
 
-/// Both halves of the effect move together, and they move at all.
+/// A page that points at a widget rings it and tints its keyword once, then
+/// waits for input. The two used to pulse, asking for a frame every 50 ms for
+/// as long as the tour was up, which a software-rendered desktop pays for in
+/// CPU while nothing on screen needs to change.
 #[test]
-fn the_keyword_and_its_ring_pulse_in_step() {
-    let status = page_titled("The status bar");
+fn a_settled_tour_page_asks_for_no_frames() {
+    let ctx = crate::test_ui::ctx();
+    let mut tour = entering(page_titled("The status bar"));
     let target = egui::Rect::from_min_size(egui::pos2(0.0, 660.0), egui::vec2(1000.0, 24.0));
+    let out = (0..8)
+        .map(|n| {
+            marked_pass(
+                &ctx,
+                &mut tour,
+                Spot::StatusBar,
+                target,
+                f64::from(n) * 0.25,
+            )
+        })
+        .last()
+        .expect("passes ran");
 
-    // The tint behind a keyword and the rings around its widget, at one time.
-    let sample = |time: f64| {
-        let ctx = crate::test_ui::ctx();
-        let mut tour = at(status);
-        let roots = roots();
-        let mut run = || {
-            ctx.run(raw_input_at(SCREEN, Vec::new(), time), |ctx| {
-                crate::spotlight::set_active(ctx, true);
-                crate::spotlight::mark(ctx, Spot::StatusBar, target);
-                tour.ui(ctx, &roots, HOTKEY);
-            })
-        };
-        run();
-        let out = run();
-        let tint = crate::test_ui::painted_backgrounds(&out)
-            .into_iter()
-            .find(|(text, _)| text == "status bar")
-            .map(|(_, color)| color.a())
-            .expect("the keyword is tinted");
-        let rings: Vec<u8> = painted_rects(&out)
-            .into_iter()
-            .filter(|r| r.stroke.width > 0.0 && r.rect.contains_rect(target))
-            .map(|r| r.stroke.color.a())
-            .collect();
-        (tint, rings)
-    };
-
-    // A quarter period apart: the dimmest sample against the brightest.
-    let (dim_tint, dim_rings) = sample(PULSE_PERIOD * 0.75);
-    let (bright_tint, bright_rings) = sample(PULSE_PERIOD * 0.25);
-
+    // Still lit: settled, not switched off.
     assert!(
-        !dim_rings.is_empty(),
-        "the marked widget was not ringed at all"
+        painted_rects(&out)
+            .into_iter()
+            .any(|r| r.stroke.width > 0.0 && r.rect.contains_rect(target)),
+        "the settled page stopped ringing its widget"
+    );
+    assert!(
+        crate::test_ui::painted_backgrounds(&out)
+            .iter()
+            .any(|(text, _)| text == "status bar"),
+        "the settled page stopped tinting its keyword"
     );
     assert_eq!(
-        dim_rings.len(),
-        bright_rings.len(),
-        "the ring count must not depend on the phase"
+        repaint_delay(&out),
+        Duration::MAX,
+        "a settled page repaints"
     );
-    assert!(
-        bright_tint > dim_tint,
-        "the keyword's tint does not pulse ({dim_tint} → {bright_tint})"
+}
+
+/// The tab a page switches to is drawn, and the widgets its rings point at
+/// mark themselves, only on the frame after its arrival, and no input is
+/// coming to bring that frame about. One frame, though, not a stream.
+#[test]
+fn entering_a_page_requests_one_frame() {
+    let ctx = crate::test_ui::ctx();
+    let duplicates = PAGES
+        .iter()
+        .position(|p| p.tab == Tab::Duplicates)
+        .expect("the duplicates page");
+    let mut tour = at(duplicates);
+    let out = settle(&ctx, &mut tour, 0.0);
+    assert_eq!(repaint_delay(&out), Duration::MAX, "the page never settled");
+
+    // Arriving again on the same page, so the window keeps its size and
+    // nothing of egui's own asks for a frame.
+    tour.entered_page = None;
+    let (out, actions) = pass(&ctx, &mut tour, Vec::new(), 3.0);
+    assert_eq!(actions.goto_tab, Some(Tab::Duplicates));
+    assert_eq!(
+        repaint_delay(&out),
+        Duration::ZERO,
+        "the arrival waits for input to be drawn"
     );
-    for (dim, bright) in dim_rings.iter().zip(&bright_rings) {
+    let out = settle(&ctx, &mut tour, 3.25);
+    assert_eq!(
+        repaint_delay(&out),
+        Duration::MAX,
+        "the page went on asking after its arrival"
+    );
+}
+
+/// The typing page asks for a frame per character, since nothing else will
+/// type the next one, and stops asking once the query is typed.
+#[test]
+fn a_typing_page_repaints_only_until_typed() {
+    let input = PAGES
+        .iter()
+        .position(|p| p.type_query.is_some())
+        .expect("a page that types");
+    let chars = PAGES[input]
+        .type_query
+        .expect("checked above")
+        .chars()
+        .count();
+    let ctx = crate::test_ui::ctx();
+    // Settled first, so any frame asked for below is the typing's.
+    let mut tour = at(input);
+    let out = settle(&ctx, &mut tour, 0.0);
+    assert_eq!(repaint_delay(&out), Duration::MAX, "the page never settled");
+
+    tour.entered_page = None;
+    let start = 3.0;
+    let mut time = start;
+    loop {
+        let (out, _) = pass(&ctx, &mut tour, Vec::new(), time);
+        let typed = tour.typing.as_ref().expect("the page is typing").emitted;
+        if typed == chars {
+            assert_eq!(
+                repaint_delay(&out),
+                Duration::MAX,
+                "still asking for frames once the query is typed"
+            );
+            break;
+        }
         assert!(
-            bright > dim,
-            "a ring does not pulse with the keyword ({dim} → {bright})"
+            repaint_delay(&out) <= Duration::from_secs_f64(TYPE_INTERVAL),
+            "{typed} of {chars} typed, and no frame is coming for the next"
+        );
+        time += TYPE_INTERVAL / 2.0;
+        assert!(
+            time < start + TYPE_INTERVAL * (chars as f64 + 4.0),
+            "the typing never finished"
         );
     }
+    let (out, _) = pass(&ctx, &mut tour, Vec::new(), time + 1.0);
+    assert_eq!(
+        repaint_delay(&out),
+        Duration::MAX,
+        "the typed page repaints"
+    );
 }
 
 /// A spot nothing marked this pass (a hidden column, another tab) is not
@@ -656,20 +770,83 @@ fn leaving_the_typing_page_and_returning_types_it_again() {
     assert_eq!(actions.set_query.as_deref(), Some(""), "it starts over");
 }
 
+/// `button` clicked on `page` with `query` in the search box. Every
+/// dismissal returns to the Search tab, whatever the box holds.
+fn dismiss_holding(page: usize, button: &str, query: &str) -> TourActions {
+    let ctx = crate::test_ui::ctx();
+    let mut tour = at(page);
+    pass_holding(&ctx, &mut tour, Vec::new(), 0.0, query);
+    let (out, _) = pass_holding(&ctx, &mut tour, Vec::new(), 0.0, query);
+    let pos = crate::test_ui::painted_text_center(&out, button)
+        .unwrap_or_else(|| panic!("page {page} offers no {button}"));
+    let (_, actions) = pass_holding(&ctx, &mut tour, click_at(pos), 1.0, query);
+    assert!(actions.dismissed, "{button} did not dismiss page {page}");
+    assert_eq!(actions.goto_tab, Some(Tab::Search));
+    actions
+}
+
+/// The box is cleared of what the tour typed into it and nothing else: a
+/// query the user wrote is theirs, whichever page they leave from.
 #[test]
-fn dismissing_returns_to_search_with_an_empty_box() {
-    for page in [0, PAGES.len() - 1] {
+fn dismissing_clears_only_the_query_the_tour_typed() {
+    let demo = PAGES
+        .iter()
+        .find_map(|p| p.type_query)
+        .expect("a page that types");
+    let last = PAGES.len() - 1;
+
+    // The user's own query, an empty box, and the demonstration typed over:
+    // longer than it, or in another case, is no longer the tour's.
+    let longer = format!("{demo} report");
+    let lower = demo.to_lowercase();
+    for query in ["invoice 2024", "", longer.as_str(), lower.as_str()] {
+        for (page, button) in [(0, "Skip"), (last, "Skip"), (last, "Finish")] {
+            assert_eq!(
+                dismiss_holding(page, button, query).set_query,
+                None,
+                "{button} on page {page} rewrote {query:?}"
+            );
+        }
+    }
+
+    // The demonstration, whole or as far as it got.
+    let partial: String = demo.chars().take(5).collect();
+    for query in [demo, partial.as_str()] {
+        for (page, button) in [(0, "Skip"), (last, "Finish")] {
+            assert_eq!(
+                dismiss_holding(page, button, query).set_query.as_deref(),
+                Some(""),
+                "{button} on page {page} left the tour's {query:?} in the box"
+            );
+        }
+    }
+}
+
+/// A Skip while the demonstration is still being typed, with a letter due on
+/// the very frame of the click: the dismissal decides what the box ends up
+/// holding, not the typing.
+#[test]
+fn skipping_mid_typing_clears_only_the_tour_s_text() {
+    let input = PAGES
+        .iter()
+        .position(|p| p.type_query.is_some())
+        .expect("a page that types");
+    let demo = PAGES[input].type_query.expect("checked above");
+    let so_far: String = demo.chars().take(2).collect();
+    for (query, want) in [(so_far.as_str(), Some("")), ("my notes", None)] {
         let ctx = crate::test_ui::ctx();
-        let mut tour = at(page);
-        let (out, _) = frame(&ctx, &mut tour, Vec::new());
+        let mut tour = entering(input);
+        pass(&ctx, &mut tour, Vec::new(), 0.0);
+        let (out, _) = pass(&ctx, &mut tour, Vec::new(), 0.0);
         let skip = crate::test_ui::painted_text_center(&out, "Skip").expect("a Skip button");
-        let (_, actions) = pass(&ctx, &mut tour, click_at(skip), 1.0);
-        assert!(actions.dismissed, "page {page} would not skip");
-        assert_eq!(actions.goto_tab, Some(Tab::Search));
+        // Three letters are due by the click, none emitted yet.
+        let time = TYPE_INTERVAL * 3.5;
+        let (_, actions) = pass_holding(&ctx, &mut tour, click_at(skip), time, query);
+        assert!(actions.dismissed, "Skip did not dismiss the typing page");
         assert_eq!(
             actions.set_query.as_deref(),
-            Some(""),
-            "the demonstration query is not the user's"
+            want,
+            "Skip over {query:?} mid-typing"
         );
     }
 }
@@ -847,7 +1024,7 @@ fn the_window_centres_itself_on_the_window_it_is_in() {
     let roots = roots();
     let mut run = |size: egui::Vec2| {
         let _ = ctx.run(raw_input_at(size, Vec::new(), 0.0), |ctx| {
-            tour.ui(ctx, &roots, HOTKEY);
+            tour.ui(ctx, &roots, HOTKEY, "");
         });
         (
             window_rect(&ctx).center(),

@@ -5,9 +5,9 @@
 //! declares none, so a unit test here would measure the system allocator and
 //! pass no matter what `release_free_heap` did.
 //!
-//! The failure it guards is silent. `mi_collect` is reached through an
-//! `extern "C"` block that `libmimalloc-sys` does not provide a binding for,
-//! so deleting the call, or the declaration drifting from
+//! The failure it guards is silent. `mi_collect` is reached through our own
+//! `extern "C"` block (`libmimalloc-sys` binds it only behind its `extended`
+//! feature), so deleting the call, or the declaration drifting from
 //! `void mi_collect(bool)`, leaves a build that compiles, runs, and keeps
 //! every run's peak resident for the life of the process (under glibc, a
 //! multi-million-file run settled at 985 MB with 871 MB of unreturnable
@@ -59,16 +59,20 @@ fn releasing_the_free_heap_returns_it_to_the_kernel() {
     quicksearch_core::platform::release_free_heap();
     let released = rss_bytes();
 
-    // Loose: it checks order-of-magnitude reclamation, not a figure that
-    // drifts with allocator versions. Measured 454 MiB peak, still 454 MiB
-    // after the frees, 5 MiB after the call.
+    // The call itself must return over half the corpus, so frees that already
+    // gave it back would fail this rather than pass it. Loose: it checks
+    // order-of-magnitude reclamation, not a figure that drifts with allocator
+    // versions. Measured 454 MiB peak, still 454 MiB after the frees, 5 MiB
+    // after the call.
     assert!(
-        released < before + (BLOCKS * BLOCK / 4) as u64,
-        "release_free_heap kept {:.0} MiB resident (started {:.0}, peaked {:.0}, \
-         {:.0} after freeing) — mi_collect is not reaching the allocator",
-        mib(released),
+        freed.saturating_sub(released) > (BLOCKS * BLOCK / 2) as u64,
+        "release_free_heap returned only {:.0} MiB (started {:.0}, peaked {:.0}, \
+         {:.0} after freeing, {:.0} after the call) — mi_collect is not reaching \
+         the allocator, or the frees alone returned the corpus",
+        mib(freed.saturating_sub(released)),
         mib(before),
         mib(peak),
-        mib(freed)
+        mib(freed),
+        mib(released)
     );
 }

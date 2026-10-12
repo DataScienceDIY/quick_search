@@ -14,6 +14,15 @@ pub use quicksearch_core::testutil::{touch, Lcg, BODY_TERM};
 
 const INDEX_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Delete `db`'s `last_full_index` marker, so only the next run to finish
+/// can put it back.
+pub fn clear_marker(db: &Path) {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
+        .unwrap();
+}
+
 /// One full indexing run, awaited until `Idle`, then checked for the
 /// `last_full_index` marker, which is written only on a successful finish.
 ///
@@ -36,9 +45,7 @@ pub struct IndexOnce<'a> {
 impl IndexOnce<'_> {
     pub fn run(mut self) {
         if self.fresh_marker && self.db.exists() {
-            let conn = rusqlite::Connection::open(self.db).unwrap();
-            conn.execute("DELETE FROM schema_info WHERE key = 'last_full_index'", [])
-                .unwrap();
+            clear_marker(self.db);
         }
 
         let service = IndexingService::new();
@@ -74,6 +81,6 @@ impl IndexOnce<'_> {
         } else {
             rusqlite::Connection::open(self.db).unwrap()
         };
-        db::repo::get_last_full_index(&conn).is_some()
+        matches!(db::repo::get_last_full_index(&conn), Ok(Some(_)))
     }
 }

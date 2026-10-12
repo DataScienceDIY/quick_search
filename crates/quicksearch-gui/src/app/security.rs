@@ -6,9 +6,11 @@ use super::*;
 use quicksearch_core::security::SALT_LEN;
 
 use crate::ui_util::{centered_modal, hint};
+use crate::unlock::purge_text_state;
 
-/// Collect a password, derive its key off the UI thread, then confirm the
-/// mandatory rebuild. Disabling skips straight to the confirmation.
+/// Collect a password, derive its key off the UI thread, confirm the
+/// mandatory rebuild, then delete the old index before anything is
+/// committed. Disabling skips straight to the confirmation.
 pub(super) enum SecurityPrompt {
     SetPassword {
         pw1: String,
@@ -21,6 +23,14 @@ pub(super) enum SecurityPrompt {
         new_security: SecurityConfig,
     },
     ConfirmRebuild {
+        new_security: SecurityConfig,
+        new_key: Option<IndexKey>,
+    },
+    /// Waiting on the coordinator to delete the old index. The change is
+    /// committed only once it is gone: a config and key switched over an
+    /// index that survived would leave no password that opens it.
+    Deleting {
+        rx: mpsc::Receiver<Result<(), String>>,
         new_security: SecurityConfig,
         new_key: Option<IndexKey>,
     },
@@ -71,8 +81,11 @@ fn spawn_derive(
     rx
 }
 
-fn deriving_window(ctx: &egui::Context) {
-    egui::Window::new("Deriving key")
+/// A spinner beside `label`, for a wait the user can only sit out: a key
+/// derivation, or the delete ahead of a security change. Repaints itself, so
+/// the caller's poll keeps running.
+fn deriving_window(ctx: &egui::Context, label: &str) {
+    egui::Window::new(label)
         .collapsible(false)
         .resizable(false)
         .title_bar(false)
@@ -80,14 +93,73 @@ fn deriving_window(ctx: &egui::Context) {
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Deriving key…");
+                ui.label(label);
             });
         });
     ctx.request_repaint_after(Duration::from_millis(100));
 }
 
+/// Why `action` must not begin, if it must not. Every action but showing the
+/// key ends in a config save, and a config that did not load cannot save
+/// ([`Config::fallback`]); asked before anything else, since a security
+/// change deletes the index ahead of its save, which would then fail and
+/// leave the index lost for nothing.
+fn refusal(cfg: &Config, action: SecurityAction) -> Option<&'static str> {
+    let saves = !matches!(action, SecurityAction::ShowKey);
+    (saves && !cfg.can_save()).then_some("Not changed: the config file did not load")
+}
+
+/// One poll of the Deleting prompt's reply: `None` while the coordinator is
+/// still at it.
+fn delete_outcome(
+    polled: Result<Result<(), String>, mpsc::TryRecvError>,
+) -> Option<Result<(), String>> {
+    match polled {
+        Ok(deleted) => Some(deleted),
+        Err(mpsc::TryRecvError::Empty) => None,
+        Err(mpsc::TryRecvError::Disconnected) => Some(Err("the indexer stopped".to_string())),
+    }
+}
+
+/// The rebuild confirmation's title, and what the deleted index leaves
+/// behind when that is worth saying. A delete only unlinks, so enabling
+/// leaves plaintext in freed space and a change leaves pages the old
+/// password still opens; disabling replaces nothing secret.
+fn confirm_text(new_key: bool, protected: bool) -> (&'static str, Option<&'static str>) {
+    match (new_key, protected) {
+        (false, _) => ("Disable password protection?", None),
+        (true, false) => (
+            "Enable password protection?",
+            Some(
+                "The unencrypted index is not securely erased; parts \
+                 can remain recoverable in freed disk space.",
+            ),
+        ),
+        (true, true) => (
+            "Change password?",
+            Some(
+                "The old index is not securely erased; recoverable parts \
+                 of it still open with the old password.",
+            ),
+        ),
+    }
+}
+
 impl QuickSearchApp {
+    /// A security change is waiting on the index delete. Until it lands
+    /// nothing else may save the config: the change saves its own copy next.
+    pub(super) fn security_busy(&self) -> bool {
+        matches!(self.security_prompt, Some(SecurityPrompt::Deleting { .. }))
+    }
+
     pub(super) fn handle_security_action(&mut self, action: SecurityAction) {
+        if self.security_busy() {
+            return;
+        }
+        if let Some(why) = refusal(&self.cfg, action) {
+            self.config_error = Some(why.to_string());
+            return;
+        }
         match action {
             SecurityAction::Enable | SecurityAction::ChangePassword => {
                 self.security_prompt = Some(SecurityPrompt::SetPassword {
@@ -110,25 +182,10 @@ impl QuickSearchApp {
                 });
             }
             SecurityAction::SetKeychain(remember) => {
-                let db_path = self.cfg.resolved_database_path();
-                let db_path = db_path.to_string_lossy();
-                let result = if remember {
-                    // Always there while protected: the gate installs a key
-                    // before the app starts.
-                    db::process_key_hex()
-                        .ok_or_else(|| "no key to remember; restart and unlock first".to_string())
-                        .and_then(|hex| keychain::sync(&db_path, Some(&hex)))
-                } else {
-                    keychain::sync(&db_path, None)
-                };
-                // The preference is not saved either: it must never claim
-                // what the keychain does not hold.
-                if let Err(e) = result {
+                let security = self.cfg.security.clone();
+                if let Err(e) = set_keychain(self, security, remember, db::process_key_hex()) {
                     self.config_error = Some(e);
-                    return;
                 }
-                self.cfg.security.use_keychain = remember;
-                self.save_cfg();
             }
         }
     }
@@ -149,18 +206,19 @@ impl QuickSearchApp {
                 } else {
                     "Enable password protection"
                 };
+                let fields = [egui::Id::new("security-pw1"), egui::Id::new("security-pw2")];
                 let buttons = centered_modal(ctx, title, |ui| {
                     ui.set_max_width(360.0);
                     ui.add(
                         egui::TextEdit::singleline(pw1)
-                            .id(egui::Id::new("security-pw1"))
+                            .id(fields[0])
                             .password(true)
                             .hint_text("Password")
                             .desired_width(240.0),
                     );
                     ui.add(
                         egui::TextEdit::singleline(pw2)
-                            .id(egui::Id::new("security-pw2"))
+                            .id(fields[1])
                             .password(true)
                             .hint_text("Confirm password")
                             .desired_width(240.0),
@@ -183,7 +241,7 @@ impl QuickSearchApp {
                 let (submit, cancel) = buttons.unwrap_or((false, false));
                 if cancel {
                     self.security_prompt = None; // Drop impl zeroizes
-                    purge_security_field_state(ctx);
+                    purge_text_state(ctx, &fields);
                 } else if submit {
                     let password = Zeroizing::new(std::mem::take(pw1));
                     pw2.zeroize();
@@ -193,7 +251,7 @@ impl QuickSearchApp {
                         salt: Some(salt_to_hex(&salt)),
                         use_keychain: *remember,
                     };
-                    purge_security_field_state(ctx);
+                    purge_text_state(ctx, &fields);
                     let rx = spawn_derive(ctx, password, salt);
                     self.security_prompt = Some(SecurityPrompt::Deriving { rx, new_security });
                 }
@@ -205,7 +263,7 @@ impl QuickSearchApp {
                         new_key: Some(key),
                     });
                 }
-                Err(mpsc::TryRecvError::Empty) => deriving_window(ctx),
+                Err(mpsc::TryRecvError::Empty) => deriving_window(ctx, "Deriving key…"),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.config_error = Some("key derivation thread died".to_string());
                     self.security_prompt = None;
@@ -215,11 +273,8 @@ impl QuickSearchApp {
                 new_security,
                 new_key,
             } => {
-                let title = match (new_key.is_some(), self.cfg.security.password_protected) {
-                    (false, _) => "Disable password protection?",
-                    (true, false) => "Enable password protection?",
-                    (true, true) => "Change password?",
-                };
+                let (title, residue) =
+                    confirm_text(new_key.is_some(), self.cfg.security.password_protected);
                 let buttons = centered_modal(ctx, title, |ui| {
                     ui.set_max_width(420.0);
                     ui.label(
@@ -228,6 +283,9 @@ impl QuickSearchApp {
                          results until the rebuild finishes. Your files are \
                          not touched.",
                     );
+                    if let Some(residue) = residue {
+                        ui.label(residue);
+                    }
                     ui.horizontal(|ui| {
                         let rebuild = egui::RichText::new("Delete & rebuild index")
                             .color(ui.visuals().error_fg_color);
@@ -239,12 +297,36 @@ impl QuickSearchApp {
                 if cancel {
                     self.security_prompt = None;
                 } else if confirm {
-                    let new_security = new_security.clone();
-                    let new_key = new_key.clone();
-                    self.security_prompt = None;
-                    self.apply_security_change(new_security, new_key);
+                    let rx = self.backend.delete_index();
+                    self.security_prompt = Some(SecurityPrompt::Deleting {
+                        rx,
+                        new_security: new_security.clone(),
+                        new_key: new_key.clone(),
+                    });
                 }
             }
+            SecurityPrompt::Deleting {
+                rx,
+                new_security,
+                new_key,
+            } => match delete_outcome(rx.try_recv()) {
+                None => deriving_window(ctx, "Deleting the index…"),
+                Some(Ok(())) => {
+                    let (new_security, new_key) = (new_security.clone(), new_key.clone());
+                    self.security_prompt = None;
+                    let was_remembered = self.cfg.security.use_keychain;
+                    if let Err(e) =
+                        apply_security_change(self, was_remembered, new_security, new_key)
+                    {
+                        self.config_error = Some(e);
+                    }
+                }
+                // The old index, config and key all stand.
+                Some(Err(e)) => {
+                    self.security_prompt = None;
+                    self.config_error = Some(format!("Not changed: {e}"));
+                }
+            },
         }
     }
 
@@ -259,10 +341,10 @@ impl QuickSearchApp {
                 let (submit, cancel) = confirm_key_modal(ctx, pw, *wrong);
                 if cancel {
                     self.key_prompt = None; // Drop impl zeroizes
-                    purge_security_field_state(ctx);
+                    purge_text_state(ctx, &[egui::Id::new(SHOW_KEY_FIELD)]);
                 } else if submit {
                     let password = Zeroizing::new(std::mem::take(pw));
-                    purge_security_field_state(ctx);
+                    purge_text_state(ctx, &[egui::Id::new(SHOW_KEY_FIELD)]);
                     match self.cfg.security.salt_bytes() {
                         Ok(salt) => {
                             let rx = spawn_derive(ctx, password, salt);
@@ -293,7 +375,7 @@ impl QuickSearchApp {
                         },
                     });
                 }
-                Err(mpsc::TryRecvError::Empty) => deriving_window(ctx),
+                Err(mpsc::TryRecvError::Empty) => deriving_window(ctx, "Deriving key…"),
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.config_error = Some("key derivation thread died".to_string());
                     self.key_prompt = None;
@@ -310,49 +392,110 @@ impl QuickSearchApp {
             }
         }
     }
+}
 
-    /// Config, keychain, process key, in that order and before the rebuild,
-    /// so the fresh index is created under the new key (or none).
-    fn apply_security_change(&mut self, new_security: SecurityConfig, new_key: Option<IndexKey>) {
-        let db_path = self
-            .cfg
-            .resolved_database_path()
-            .to_string_lossy()
-            .into_owned();
-        let previous_security = self.cfg.security.clone();
-        self.cfg.security = new_security;
-        if let Err(e) = self.cfg.save() {
-            // Fail closed: the salt lives only in that file, and carrying on
-            // would rebuild an index encrypted with a salt that reached no
-            // disk, which no password can open afterwards.
-            self.cfg.security = previous_security;
-            self.config_error = Some(e);
-            return;
+/// What a security change does outside its prompt, as four calls whose order
+/// [`apply_security_change`] and [`set_keychain`] decide. The app does them
+/// for real; the tests record them.
+trait SecurityEffects {
+    /// Write the config with `security` in it. On `Err` the settings in force
+    /// are still the previous ones, in memory and on disk.
+    fn save_config(&mut self, security: SecurityConfig) -> Result<(), String>;
+    /// Have the keychain hold `key_hex`, with the salt in force, or nothing.
+    /// Failing to forget is an error only when `was_remembered`
+    /// ([`keychain::sync`]).
+    fn sync_keychain(&mut self, was_remembered: bool, key_hex: Option<&str>) -> Result<(), String>;
+    /// The key every later connection opens the index with.
+    fn install_key(&mut self, key: Option<IndexKey>);
+    /// Delete the index and build it afresh.
+    fn rebuild(&mut self);
+}
+
+impl SecurityEffects for QuickSearchApp {
+    fn save_config(&mut self, security: SecurityConfig) -> Result<(), String> {
+        let previous = std::mem::replace(&mut self.cfg.security, security);
+        let saved = self.cfg.save();
+        if saved.is_err() {
+            self.cfg.security = previous;
         }
-        // No stored key may survive pointing at the previous state.
-        let remembered = new_key
-            .as_ref()
-            .filter(|_| self.cfg.security.use_keychain)
-            .map(|key| key.to_hex());
-        if let Err(e) = keychain::sync(&db_path, remembered.as_deref()) {
-            self.config_error = Some(e);
-        }
-        db::set_process_key(new_key);
+        saved
+    }
+
+    fn sync_keychain(&mut self, was_remembered: bool, key_hex: Option<&str>) -> Result<(), String> {
+        let db_path = self.cfg.resolved_database_path();
+        // The key's own salt: `apply_security_change` saves the new one
+        // before it syncs, and `set_keychain` changes none.
+        let salt = self.cfg.security.salt.as_deref().unwrap_or_default();
+        let remembered = key_hex.map(|key| keychain::entry_text(salt, key));
+        keychain::sync(
+            &db_path.to_string_lossy(),
+            was_remembered,
+            remembered.as_deref().map(String::as_str),
+        )
+    }
+
+    fn install_key(&mut self, key: Option<IndexKey>) {
+        db::set_process_key(key);
+    }
+
+    fn rebuild(&mut self) {
         self.backend.rebuild_index();
-        self.dups.state = DupState::NotLoaded;
+        // The listing describes the index being deleted.
+        self.drop_duplicates();
     }
 }
 
-const SHOW_KEY_FIELD: &str = "show-key-pw";
-
-/// Drops egui's retained state (buffer + undo history) for the password fields.
-fn purge_security_field_state(ctx: &egui::Context) {
-    ctx.data_mut(|d| {
-        d.remove::<egui::text_edit::TextEditState>(egui::Id::new("security-pw1"));
-        d.remove::<egui::text_edit::TextEditState>(egui::Id::new("security-pw2"));
-        d.remove::<egui::text_edit::TextEditState>(egui::Id::new(SHOW_KEY_FIELD));
-    });
+/// Commit a security change. Runs only once the old index is deleted (see
+/// [`SecurityPrompt::Deleting`]), then: config, keychain, process key, and
+/// the rebuild last, so the fresh index is created under the new key (or
+/// none). A failed save rebuilds under the settings still in force and
+/// changes nothing else. `was_remembered` is the keychain preference being
+/// replaced. `Err` is the message to show.
+fn apply_security_change(
+    fx: &mut impl SecurityEffects,
+    was_remembered: bool,
+    new_security: SecurityConfig,
+    new_key: Option<IndexKey>,
+) -> Result<(), String> {
+    let remember = new_security.use_keychain;
+    if let Err(e) = fx.save_config(new_security) {
+        // Fail closed: the salt lives only in that file, and carrying on
+        // would rebuild an index encrypted with a salt that reached no
+        // disk, which no password can open afterwards.
+        fx.rebuild();
+        return Err(e);
+    }
+    // No stored key may survive pointing at the previous state.
+    let remembered = new_key.as_ref().filter(|_| remember).map(IndexKey::to_hex);
+    let synced = fx.sync_keychain(was_remembered, remembered.as_deref());
+    fx.install_key(new_key);
+    fx.rebuild();
+    synced
 }
+
+/// Remember `installed_hex`, the key in use, in the keychain, or forget it,
+/// then save the preference into `security`. A failed sync saves nothing:
+/// the preference must never claim what the keychain does not hold.
+fn set_keychain(
+    fx: &mut impl SecurityEffects,
+    security: SecurityConfig,
+    remember: bool,
+    installed_hex: Option<String>,
+) -> Result<(), String> {
+    let key_hex = installed_hex.filter(|_| remember);
+    // Always there while protected: the gate installs a key before the app
+    // starts.
+    if remember && key_hex.is_none() {
+        return Err("no key to remember; restart and unlock first".to_string());
+    }
+    fx.sync_keychain(security.use_keychain, key_hex.as_deref())?;
+    fx.save_config(SecurityConfig {
+        use_keychain: remember,
+        ..security
+    })
+}
+
+const SHOW_KEY_FIELD: &str = "show-key-pw";
 
 /// `None` when the typed password does not derive the installed key. Both
 /// hexes are lowercase, so a plain comparison is exact; nothing secret is

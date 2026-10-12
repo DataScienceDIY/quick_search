@@ -252,12 +252,11 @@ fn stars_in_words_and_name_values_go_green() {
 
 #[test]
 fn invalid_arguments_go_error_uniformly() {
-    // (`regex:(` is not here: `(` lexes as a paren, so that input is an
-    // *incomplete* filter: bare-key optimism applies, not an error.)
     for input in [
         "type:NotAThing",
         "modified:>=tomorrow",
         "regex:[",
+        "regex:(",
         "type:Doc*",
     ] {
         let all = segs(input);
@@ -283,6 +282,99 @@ fn valid_regex_argument_is_blue_with_green_stars() {
             ("bar", Argument, true),
         ])
     );
+}
+
+#[test]
+fn a_bare_regex_value_chips_whole() {
+    assert_eq!(
+        segs(r"regex:(foo|bar)\d"),
+        owned(vec![
+            ("regex", Keyword, true),
+            (":", Operator, true),
+            (r"(foo|bar)\d", Argument, true),
+        ])
+    );
+}
+
+#[test]
+fn literal_chains_stay_plain_without_wildcards() {
+    for input in ["std::string", "a:::b*", "Re: meeting", "x := 5*", "::1"] {
+        let all = segs(input);
+        assert!(
+            all.iter().all(|(_, c, chip)| *c == Plain && !chip),
+            "{:?}: {:?}",
+            input,
+            all
+        );
+    }
+    // A filter after whitespace still chips.
+    let all = segs("x ::= type:Audio");
+    assert_eq!(all[5], (" ".to_string(), Plain, false));
+    assert_eq!(all[6], ("type".to_string(), Keyword, true));
+}
+
+/// Every input of split.rs's chain tests: the highlighter chips exactly the
+/// filters the engine builds, and the rest reads as the engine's term.
+#[test]
+fn chips_match_the_filters_split_builds() {
+    use quicksearch_core::query::split_for_cascade;
+    for input in [
+        "Re: meeting",
+        "#include <stdio.h>",
+        "std::string",
+        "std::vector<int>",
+        "std::path::Path",
+        "fe80::1",
+        "::1",
+        ":foo",
+        "x := 5",
+        "a:>b",
+        "a:::b",
+        "a:AND",
+        "a: AND b",
+        "Re:\t\tmeeting",
+        "meeting notes: draft",
+        "12:30",
+        "foo:bar:baz",
+        "type:",
+        "type: Audio",
+        "x ::= type:Audio",
+        "Re: type:Document",
+        "Re: type : Audio",
+        ": type:Audio",
+        "Re: type:",
+        "std::",
+        "x:type:Audio",
+        "type:Audio:x",
+        "type:=:x",
+        "type: AND",
+        r"regex:(foo|bar)\d",
+        r"regex:\d+:\d+ budget",
+        r"Re: regex:(a|b)\d",
+        "regex: (a|b)c next",
+        "regex:",
+        "budget modified:>=2024-01-01 type:Document",
+    ] {
+        let q = split_for_cascade(input).unwrap();
+        let filters = q.filter_sql.matches(" AND (").count() + usize::from(q.regex.is_some());
+        let all = segs(input);
+        let chips = all
+            .iter()
+            .filter(|(_, c, chip)| *c == Keyword && *chip)
+            .count();
+        assert_eq!(chips, filters, "{:?}: {:?}", input, all);
+        let rest: String = all
+            .iter()
+            .filter(|(_, _, chip)| !chip)
+            .map(|(s, _, _)| s.as_str())
+            .collect();
+        assert_eq!(
+            rest.split_ascii_whitespace().collect::<Vec<_>>().join(" "),
+            q.term,
+            "{:?}",
+            input
+        );
+    }
 }
 
 #[test]

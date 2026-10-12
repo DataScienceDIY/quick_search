@@ -7,20 +7,24 @@
 // Both bench binaries compile the whole module but each uses only part of it.
 #![allow(dead_code)]
 
+// Timed on the allocator the shipped binaries install; see
+// `platform::Allocator`.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 pub use quicksearch_core::testutil::Lcg;
 
-/// Excludes [`NEEDLE`] and every prefix of it past two characters, so a
-/// "zero hits" corpus really has zero.
+/// No word contains [`NEEDLE`], so a "zero hits" corpus really has zero.
 const WORDS: &[&str] = &[
     "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa",
     "lambda", "sigma", "report", "summary", "meeting", "invoice", "contract", "budget", "revenue",
     "quarter", "planning", "review", "draft", "final", "notes", "appendix", "figure",
 ];
 
-/// Nine bytes, no overlap with [`WORDS`], clears the trigram floor.
+/// Nine bytes, which clears the trigram floor.
 pub const NEEDLE: &str = "quartzite";
 
 /// 1 KiB, 16 KiB and 256 KiB. The last is `maximum_text_size`, the worst

@@ -1,6 +1,6 @@
 use super::{
-    grow_balanced, ignore_pattern_valid, middle_elide, palette, pattern_border, pattern_hint,
-    wipe_mesh, Cow, WIPE_BAND_MIN,
+    dir_ignore_pattern, grow_balanced, ignore_pattern_valid, middle_elide, palette, pattern_border,
+    pattern_hint, wipe_mesh, Cow, IgnoreSet, WIPE_BAND_MIN,
 };
 use crate::test_ui::with_ui;
 
@@ -182,6 +182,35 @@ fn usual_patterns_are_valid() {
     assert!(ignore_pattern_valid("/home/x/docs/*")); // directory
     assert!(ignore_pattern_valid("C:\\Windows\\Temp\\*"));
     assert!(ignore_pattern_valid("cache-??")); // wildcards
+}
+
+/// A folder named like a character class matches only itself, not the
+/// folders its brackets would reach unescaped.
+#[test]
+fn dir_ignore_pattern_escapes_glob_syntax() {
+    use std::path::Path;
+    let under = |dir: &str| IgnoreSet::compile(&[dir_ignore_pattern(Path::new(dir))]).unwrap();
+    let flac = under("/m/Music [FLAC]");
+    assert!(flac.matches_path(Path::new("/m/Music [FLAC]/x.flac")));
+    assert!(!flac.matches_path(Path::new("/m/Music F/x.flac")));
+    let star = under("/m/a*b");
+    assert!(star.matches_path(Path::new("/m/a*b/x")));
+    assert!(!star.matches_path(Path::new("/m/aXb/x")));
+    #[cfg(unix)]
+    {
+        let slash = under(r"/m/back\slash");
+        assert!(slash.matches_path(Path::new(r"/m/back\slash/x")));
+        assert!(!slash.matches_path(Path::new("/m/backslash/x")));
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(dir_ignore_pattern(Path::new(r"C:\")), r"C:\*");
+        assert_eq!(
+            dir_ignore_pattern(Path::new(r"D:\Music [FLAC]")),
+            r"D:\Music [[]FLAC[]]\*"
+        );
+        assert!(under(r"C:\").matches_path(Path::new(r"C:\x\y")));
+    }
 }
 
 #[test]

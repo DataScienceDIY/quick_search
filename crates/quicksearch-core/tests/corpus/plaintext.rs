@@ -17,6 +17,12 @@ use super::{BodyFn, Charset, Lcg, Sample};
 /// `encoding_rs` is the decoder under test. Shared with [`super::pdf`],
 /// whose WinAnsi font is the same repertoire.
 pub fn to_cp1252(s: &str) -> Vec<u8> {
+    s.chars().map(|c| cp1252_byte(c).unwrap_or(b'?')).collect()
+}
+
+/// `c`'s windows-1252 byte, if it has one. Shared with [`super::rtf`], whose
+/// `\'hh` escapes are in that codepage.
+pub fn cp1252_byte(c: char) -> Option<u8> {
     /// The 0x80-0x9F block; `\u{FFFD}` marks the five unassigned slots.
     const C1: [char; 32] = [
         '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
@@ -25,18 +31,13 @@ pub fn to_cp1252(s: &str) -> Vec<u8> {
         '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
         '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
     ];
-    let mut out = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        let code = c as u32;
-        if code < 0x80 || (0xA0..=0xFF).contains(&code) {
-            out.push(code as u8);
-        } else if let Some(i) = C1.iter().position(|&t| t == c && t != '\u{FFFD}') {
-            out.push(0x80 + i as u8);
-        } else {
-            out.push(b'?');
-        }
+    let code = c as u32;
+    if code < 0x80 || (0xA0..=0xFF).contains(&code) {
+        Some(code as u8)
+    } else {
+        let i = C1.iter().position(|&t| t == c && t != '\u{FFFD}')?;
+        Some(0x80 + i as u8)
     }
-    out
 }
 
 /// Extensions exercising distinct routes through `guess_mime_from_head`,
@@ -186,15 +187,15 @@ pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec
 }
 
 fn write_encodings(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
-    // UTF-8 with a BOM: `Encoding::for_bom` classifies it before the binary guard.
+    // UTF-8 with a BOM: the binary guard runs on what follows it.
     let b = body(lcg, Charset::Unicode);
     let mut bytes = vec![0xEF, 0xBB, 0xBF];
     bytes.extend_from_slice(b.sentences.join("\n").as_bytes());
     let path = super::write_file(dir, "encoding-utf8-bom.txt", &bytes);
     out.push(Sample::prose(path, "utf-8 + BOM", &b, true));
 
-    // UTF-16, both endiannesses: full of NUL, exactly why the BOM check
-    // precedes the binary guard.
+    // UTF-16, both endiannesses: full of NUL bytes, exactly why a UTF-16
+    // BOM trades the byte guard for a check of whole code units.
     for (label, name, big_endian) in [
         ("utf-16le + BOM", "encoding-utf16le.txt", false),
         ("utf-16be + BOM", "encoding-utf16be.txt", true),
@@ -227,6 +228,16 @@ fn write_encodings(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut V
         &to_cp1252(&b.sentences.join("\n")),
     );
     out.push(Sample::prose(path, "windows-1252", &b, true));
+
+    // Damaged UTF-8: one stray byte on a line of its own. `.txt` decides it
+    // is text; the accents and the Greek outvote the byte, so it decodes as
+    // UTF-8 with one U+FFFD rather than as a legacy charset.
+    let b = body(lcg, Charset::Unicode);
+    let mut bytes = b.sentences[..3].join("\n").into_bytes();
+    bytes.extend_from_slice(b"\n\xFF\n");
+    bytes.extend_from_slice(b.sentences[3..].join("\n").as_bytes());
+    let path = super::write_file(dir, "encoding-mostly-utf8.txt", &bytes);
+    out.push(Sample::prose(path, "damaged utf-8", &b, true));
 }
 
 /// Past the default `hash_length` of 8 KiB, so the content pass runs the

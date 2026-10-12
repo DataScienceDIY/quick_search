@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use quicksearch_core::config::{DuplicatesConfig, IgnoreSet};
+use quicksearch_core::config::{glob_literal, DuplicatesConfig, IgnoreSet};
 use quicksearch_core::search::DuplicateGroup;
 
 use crate::format::{group_thousands, human_size};
@@ -167,7 +167,7 @@ fn no_exclusions() -> IgnoreSet {
 // --- The loaded listing ----------------------------------------------------
 
 /// One group as listed: which of its members survived the exclusions, and the
-/// totals recomputed from them.
+/// totals priced from them.
 struct Row {
     group: usize,
     /// Indices into the group's members, path-ordered.
@@ -397,9 +397,9 @@ impl DuplicatesTab {
 
         let mut picked: Option<Pick> = None;
         match &self.state {
-            // `NotLoaded` survives at most the one frame before the app starts
-            // the scan (`switch_tab`), and `Loading` has its spinner and label
-            // in the header row above.
+            // `NotLoaded` paints nothing: arriving (`switch_tab`), Refresh, or
+            // the end of the next run starts the scan; `Loading` has its
+            // spinner and label in the header row above.
             DupState::NotLoaded | DupState::Loading => {}
             DupState::Error(e) => {
                 ui.colored_label(ui.visuals().error_fg_color, e);
@@ -693,7 +693,7 @@ fn exclude_entries(ui: &mut egui::Ui, path: &str) -> Option<String> {
     let path = std::path::Path::new(path);
     let mut chosen: Option<String> = None;
     if let Some(ext) = path.extension() {
-        let pattern = format!("*.{}", ext.to_string_lossy());
+        let pattern = format!("*.{}", glob_literal(&ext.to_string_lossy()));
         if ui
             .button(format!("Exclude {pattern} from duplicates"))
             .on_hover_text("Files of this type are left out of the listing; they stay indexed.")

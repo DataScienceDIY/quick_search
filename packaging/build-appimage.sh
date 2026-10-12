@@ -13,7 +13,7 @@
 # dynamic section names only libgcc_s, libm and libc, because SQLCipher, OpenSSL
 # and libdbus are linked statically, and winit and glutin dlopen the whole
 # display stack at runtime. Those dlopened libraries - libGL, libEGL, libX11,
-# libxcb, libXcursor, libXi, libXrender, libxkbcommon{,-x11} and
+# libX11-xcb, libxcb, libXcursor, libXi, libXrender, libxkbcommon{,-x11} and
 # libwayland-{client,egl} - are exactly the ones an AppImage must take from the
 # host, since they have to match the user's graphics driver and compositor.
 # Bundling them is how AppImages break on other people's machines.
@@ -55,6 +55,12 @@ readonly RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/downloa
 # /releases/latest/download/<asset> form is not implemented and 404s. The .zsync
 # name therefore carries no version, while the AppImage it points at does; zsync
 # resolves that from the sidecar's own headers, relative to this URL.
+#
+# Both are the forge's behaviour, which neither this script nor CI checks, and
+# which cannot be checked offline: after publishing a release,
+# `curl -fsSIL -o /dev/null "$UPDATE_URL"` must succeed. Nor may a tag ever be
+# named `latest`: the lookup would then hinge on which of the two the forge
+# prefers.
 readonly UPDATE_URL="https://code.karsttech.com/jeremy/quick_search/releases/download/latest/$PKG-x86_64.AppImage.zsync"
 
 # zsyncmake comes from the zsync package. appimagetool looks it up in PATH

@@ -3,14 +3,19 @@
 //! Everything that isn't a recognized `key:value` filter joins the *term*;
 //! recognized filters become SQL fragments ANDed onto every cascade stage.
 //!
-//! Search-as-you-type robustness: a lex error degrades to "whole input is the
-//! term", because incremental typing must never surface an error; an
-//! unrecognized `key:value` (`12:30`) reassembles verbatim; `AND`/`OR` pass
-//! through as words, and parens are dropped.
+//! The term keeps the text as typed: whitespace runs become one space, quotes
+//! are stripped, parens are dropped and `AND`/`OR` are plain words. Operators
+//! glue their neighbours into one literal (`std::string`, `Re: meeting`,
+//! `x := 5`), and a filter after whitespace still counts
+//! (`Re: type:Document`). A lex error degrades to "the whole input is the
+//! term". A recognized key with an invalid value is an error, which the
+//! search box marks as you type.
 
-use super::lexer::{tokenize, Token};
+use std::ops::Range;
+
+use super::lexer::{tokenize_spanned, Token};
 use super::pattern::{RegexQuery, TermPart, TermPattern};
-use super::translator::{build_filter, is_filter_key, TranslateError};
+use super::translator::{build_filter, is_filter_key, is_regex_key, TranslateError};
 use super::Op;
 
 /// The cascade's parsed input: one term string plus composable filter SQL.
@@ -48,36 +53,80 @@ impl CascadeQuery {
     }
 }
 
-/// The filter starting at `tokens[i]`, if one is there:
+/// The recognized filter starting at `tokens[i]`, if one is there:
 /// `Word(key) Op [Op] (Word|Quoted)`, since the lexer emits `modified:>=x` as
-/// `Word Op(:) Op(>=) Word`. Returns the effective operator, the value,
-/// whether the value is an unquoted word (quoted values keep `*` literal), and
-/// the index after the value.
-fn filter_at(tokens: &[Token], i: usize) -> Option<(Op, &str, bool, usize)> {
-    let Some(Token::Op(op1)) = tokens.get(i + 1) else {
+/// `Word Op(:) Op(>=) Word`. Returns the key, the effective operator, the
+/// value, whether the value is an unquoted word (quoted values keep `*`
+/// literal), and the index after the value.
+fn filter_at(tokens: &[(Token, Range<usize>)], i: usize) -> Option<(&str, Op, &str, bool, usize)> {
+    let (Token::Word(key), Some((Token::Op(op1), _))) = (&tokens[i].0, tokens.get(i + 1)) else {
         return None;
     };
+    if !is_filter_key(key) && !is_regex_key(key) {
+        return None;
+    }
     let (op, value_idx) = match tokens.get(i + 2) {
-        Some(Token::Op(op2)) => (*op2, i + 3),
+        Some((Token::Op(op2), _)) => (*op2, i + 3),
         _ => (*op1, i + 2),
     };
-    match tokens.get(value_idx)? {
-        Token::Word(value) => Some((op, value, true, value_idx + 1)),
-        Token::Quoted(value) => Some((op, value, false, value_idx + 1)),
+    match &tokens.get(value_idx)?.0 {
+        Token::Word(value) => Some((key, op, value, true, value_idx + 1)),
+        Token::Quoted(value) => Some((key, op, value, false, value_idx + 1)),
         _ => None,
     }
+}
+
+/// The literal chain starting at `tokens[i]`, if one starts there: its text
+/// and the index after it. Operators glue their neighbours, across whitespace
+/// too, so a chain is a run of words, quoted phrases, operators and `AND`/`OR`
+/// in which every adjacent pair has an operator. The text joins the tokens'
+/// texts with one space wherever the input had whitespace. A chain stops
+/// before a word that follows whitespace and starts a recognized filter, so
+/// `x ::= type:Audio` keeps its filter and `std::path::Path` gains none.
+/// The search box's highlighter takes its plain runs from here too.
+pub fn literal_chain(tokens: &[(Token, Range<usize>)], i: usize) -> Option<(String, usize)> {
+    let is_op = |j: usize| matches!(tokens.get(j), Some((Token::Op(_), _)));
+    // A recognized key and an operator: a filter, complete or still typed.
+    let starts_filter = |j: usize| {
+        matches!(&tokens[j].0, Token::Word(w) if is_filter_key(w) || is_regex_key(w))
+            && is_op(j + 1)
+    };
+    let text_of = |j: usize| match &tokens.get(j)?.0 {
+        Token::Word(w) | Token::Quoted(w) => Some(w.as_str()),
+        Token::Op(op) => Some(op.as_str()),
+        Token::And => Some("AND"),
+        Token::Or => Some("OR"),
+        Token::LParen | Token::RParen => None,
+    };
+    let first = text_of(i)?;
+    if !is_op(i) && !is_op(i + 1) {
+        return None;
+    }
+    let mut text = first.to_string();
+    let mut j = i + 1;
+    while let Some(piece) = text_of(j) {
+        let gap = tokens[j - 1].1.end < tokens[j].1.start;
+        if !(is_op(j - 1) || is_op(j)) || (gap && starts_filter(j)) {
+            break;
+        }
+        if gap {
+            text.push(' ');
+        }
+        text.push_str(piece);
+        j += 1;
+    }
+    Some((text, j))
 }
 
 pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
     // NULs break SQLite text binding and the FTS5 query parser, so strip them.
     let input = input.replace('\0', "");
     let input = input.as_str();
-    let tokens = match tokenize(input) {
-        Ok(t) => t,
-        // Half-typed input: the whole raw string is the term, never an error
-        // mid-keystroke.
-        Err(_) => return Ok(CascadeQuery::term_only(input)),
-    };
+    let (tokens, err) = tokenize_spanned(input);
+    if err.is_some() {
+        // Half-typed input: the whole raw string is the term.
+        return Ok(CascadeQuery::term_only(input));
+    }
 
     let mut out = CascadeQuery::default();
     let mut term_parts: Vec<TermPart> = Vec::new();
@@ -89,62 +138,45 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
     };
 
     while i < tokens.len() {
-        match &tokens[i] {
-            Token::Word(word) => {
-                if let Some((op, value, value_is_word, next)) = filter_at(&tokens, i) {
-                    i = next;
-                    if word.eq_ignore_ascii_case("regex") {
-                        // Not a SQL filter: matched in Rust.
-                        if op != Op::Contains {
-                            return Err(TranslateError::UnsupportedOp {
-                                key: word.clone(),
-                                op,
-                            });
-                        }
-                        if out.regex.is_some() {
-                            return Err(TranslateError::BadRegex(
-                                "only one regex: per query".into(),
-                            ));
-                        }
-                        out.regex = Some(RegexQuery::new(value)?);
-                    } else if is_filter_key(word) {
-                        let frag = build_filter(word, op, value, value_is_word)?;
-                        out.filter_sql.push_str(" AND (");
-                        out.filter_sql.push_str(&frag.sql);
-                        out.filter_sql.push(')');
-                        out.filter_params.extend(frag.params);
-                    } else {
-                        // Unrecognized key: reassemble verbatim, gluing any
-                        // further `:value` chains (`foo:bar:baz`).
-                        let mut glued = format!("{}{}{}", word, op.as_str(), value);
-                        while let Some(Token::Op(next_op)) = tokens.get(i) {
-                            glued.push_str(next_op.as_str());
-                            i += 1;
-                            if let Some(Token::Word(v) | Token::Quoted(v)) = tokens.get(i) {
-                                glued.push_str(v);
-                                i += 1;
-                            }
-                        }
-                        term_parts.push(literal(&glued));
-                    }
-                    continue;
+        if let Some((key, op, value, value_is_word, next)) = filter_at(&tokens, i) {
+            i = next;
+            if is_regex_key(key) {
+                // Not a SQL filter: matched in Rust.
+                if op != Op::Contains {
+                    return Err(TranslateError::UnsupportedOp {
+                        key: key.to_string(),
+                        op,
+                    });
                 }
-                if let Some(Token::Op(op)) = tokens.get(i + 1) {
-                    // Key and operator with no value yet (mid-typing "type:").
-                    term_parts.push(literal(&format!("{}{}", word, op.as_str())));
-                    i += 2;
-                    continue;
+                if out.regex.is_some() {
+                    return Err(TranslateError::BadRegex("only one regex: per query".into()));
                 }
-                term_parts.push(TermPart {
-                    text: word.clone(),
-                    glob: word.contains('*'),
-                });
+                out.regex = Some(RegexQuery::new(value)?);
+            } else {
+                let frag = build_filter(key, op, value, value_is_word)?;
+                out.filter_sql.push_str(" AND (");
+                out.filter_sql.push_str(&frag.sql);
+                out.filter_sql.push(')');
+                out.filter_params.extend(frag.params);
             }
+            continue;
+        }
+        if let Some((text, next)) = literal_chain(&tokens, i) {
+            // Stars in a chain stay literal (`a:::b*`).
+            term_parts.push(literal(&text));
+            i = next;
+            continue;
+        }
+        match &tokens[i].0 {
+            Token::Word(word) => term_parts.push(TermPart {
+                text: word.clone(),
+                glob: word.contains('*'),
+            }),
             Token::Quoted(q) => term_parts.push(literal(q)),
             Token::And => term_parts.push(literal("AND")),
             Token::Or => term_parts.push(literal("OR")),
-            Token::LParen | Token::RParen => {}
-            Token::Op(op) => term_parts.push(literal(op.as_str())),
+            // An operator always starts a chain.
+            Token::LParen | Token::RParen | Token::Op(_) => {}
         }
         i += 1;
     }
@@ -162,6 +194,14 @@ pub fn split_for_cascade(input: &str) -> Result<CascadeQuery, TranslateError> {
 mod tests {
     use super::*;
     use rusqlite::types::Value;
+
+    /// The `path:` param for `dir` in the stored spelling: Windows respells
+    /// `/` as `\`.
+    fn subtree_param(dir: &str) -> Value {
+        Value::Text(crate::query::translator::like_subtree_pattern(
+            &dir.replace('/', std::path::MAIN_SEPARATOR_STR),
+        ))
+    }
 
     #[test]
     fn plain_words_join_in_order() {
@@ -274,11 +314,17 @@ mod tests {
     fn quoted_value_for_filter() {
         let q = split_for_cascade("path:\"/home/me/My Documents\"").unwrap();
         assert_eq!(q.term, "");
+        assert_eq!(q.filter_params[0], subtree_param("/home/me/My Documents"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_forward_slash_drive_path_reaches_the_filter_as_stored() {
+        let q = split_for_cascade("path:D:/data").unwrap();
+        assert_eq!(q.term, "", "the whole input is a filter");
         assert_eq!(
             q.filter_params[0],
-            Value::Text(crate::query::translator::like_subtree_pattern(
-                "/home/me/My Documents"
-            ))
+            Value::Text(crate::query::translator::like_subtree_pattern(r"D:\data"))
         );
     }
 
@@ -408,10 +454,7 @@ mod tests {
 
         // path: values never glob; the star reaches the pattern as a literal.
         let q = split_for_cascade("path:/da*ta").unwrap();
-        assert_eq!(
-            q.filter_params[0],
-            Value::Text(crate::query::translator::like_subtree_pattern("/da*ta"))
-        );
+        assert_eq!(q.filter_params[0], subtree_param("/da*ta"));
     }
 
     #[test]
@@ -422,5 +465,112 @@ mod tests {
         let long = "x".repeat(10_240);
         let q = split_for_cascade(&long).unwrap();
         assert_eq!(q.term.len(), 10_240);
+    }
+
+    #[test]
+    fn a_bare_regex_value_keeps_its_operators() {
+        let q = split_for_cascade(r"regex:(foo|bar)\d").unwrap();
+        assert_eq!(q.term, "");
+        assert!(q.regex.unwrap().is_match("BAR7"));
+
+        let q = split_for_cascade(r"regex:\d+:\d+ budget").unwrap();
+        assert_eq!(q.term, "budget");
+        assert!(q.regex.unwrap().is_match("at 12:30"));
+
+        let q = split_for_cascade(r"regex:café\d").unwrap();
+        assert!(q.regex.unwrap().is_match("Café9"));
+
+        // Whitespace behind the colon is skipped, as for every key.
+        let q = split_for_cascade("regex: (a|b)c next").unwrap();
+        assert_eq!(q.term, "next");
+        assert!(q.regex.unwrap().is_match("bc"));
+    }
+
+    #[test]
+    fn a_broken_bare_regex_is_an_error() {
+        let deep = format!("regex:{}", "(".repeat(2000));
+        for input in ["regex:(", "(regex:foo)", deep.as_str()] {
+            assert!(
+                matches!(split_for_cascade(input), Err(TranslateError::BadRegex(_))),
+                "{:?}",
+                &input[..input.len().min(20)]
+            );
+        }
+        assert!(matches!(
+            split_for_cascade("regex<a"),
+            Err(TranslateError::UnsupportedOp { .. })
+        ));
+    }
+
+    #[test]
+    fn operator_chains_keep_the_text_as_typed() {
+        for input in [
+            "Re: meeting",
+            "#include <stdio.h>",
+            "std::string",
+            "std::vector<int>",
+            "std::path::Path",
+            "fe80::1",
+            "::1",
+            ":foo",
+            "x := 5",
+            "a:>b",
+            "a:::b",
+            "a:AND",
+            "a: AND b",
+            "meeting notes: draft",
+            "12:30",
+            "foo:bar:baz",
+            "type:",
+            "std::",
+            "x:type:Audio",
+        ] {
+            let q = split_for_cascade(input).unwrap();
+            assert_eq!(q.term, input);
+            assert_eq!(q.pattern.literal(), Some(input), "{:?}", input);
+            assert!(q.filter_sql.is_empty(), "{:?}: {}", input, q.filter_sql);
+            assert!(q.regex.is_none(), "{:?}", input);
+        }
+    }
+
+    #[test]
+    fn chains_collapse_whitespace_and_strip_quotes() {
+        for (input, term) in [
+            ("Re:\t\tmeeting", "Re: meeting"),
+            ("foo: \"a b\"", "foo: a b"),
+            ("\"a b\":c", "a b:c"),
+            ("x  :=   5", "x := 5"),
+            ("foo:(bar)", "foo: bar"),
+        ] {
+            assert_eq!(split_for_cascade(input).unwrap().term, term, "{:?}", input);
+        }
+    }
+
+    #[test]
+    fn a_chain_is_never_a_wildcard() {
+        let q = split_for_cascade("a:::b*").unwrap();
+        assert_eq!(q.pattern.literal(), Some("a:::b*"));
+        let q = split_for_cascade("x:y b*").unwrap();
+        assert!(q.pattern.is_wildcard(), "a lone word still globs");
+    }
+
+    #[test]
+    fn a_filter_after_whitespace_ends_a_chain() {
+        for (input, term) in [
+            ("x ::= type:Audio", "x ::="),
+            ("Re: type:Document", "Re:"),
+            ("Re: type : Audio", "Re:"),
+            ("type: Audio", ""),
+            (": type:Audio", ":"),
+        ] {
+            let q = split_for_cascade(input).unwrap();
+            assert_eq!(q.term, term, "{:?}", input);
+            assert_eq!(q.filter_sql.matches(" AND (").count(), 1, "{:?}", input);
+        }
+        let q = split_for_cascade(r"Re: regex:(a|b)\d").unwrap();
+        assert_eq!(q.term, "Re:");
+        assert!(q.regex.unwrap().is_match("a1"));
+        // A key still being typed after the chain stays text.
+        assert_eq!(split_for_cascade("Re: type:").unwrap().term, "Re: type:");
     }
 }

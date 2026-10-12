@@ -175,7 +175,10 @@ where curl >nul 2>&1 || goto rust_manual
 echo ==^> Installing the Rust toolchain ^(rustup^)
 curl -sSfLo "%TEMP%\rustup-init.exe" https://win.rustup.rs/x86_64
 if errorlevel 1 goto rust_manual
-"%TEMP%\rustup-init.exe" -y --profile minimal --default-toolchain stable-x86_64-pc-windows-msvc
+rem --default-toolchain none, as in CI: the build below installs the one
+rem rust-toolchain.toml pins, so a default would be a second download. Other
+rem projects then have no default; "rustup default stable" sets one.
+"%TEMP%\rustup-init.exe" -y --profile minimal --default-host x86_64-pc-windows-msvc --default-toolchain none
 if errorlevel 1 goto rust_manual
 del "%TEMP%\rustup-init.exe" >nul 2>&1
 if not exist "%USERPROFILE%\.cargo\bin\cargo.exe" goto rust_manual
@@ -189,7 +192,16 @@ echo build: could not install Rust automatically; get it from https://rustup.rs/
 exit /b 1
 
 :cargo_ok
-if "%MODE%"=="check" for /f "tokens=*" %%v in ('cargo --version') do echo     Rust: %%v
+if not "%MODE%"=="check" goto cargo_done
+rem Asked in the repo, so it names the toolchain the build would use.
+rem RUSTUP_AUTO_INSTALL=0 stops rustup downloading that pinned toolchain to
+rem answer, since --check installs nothing. setlocal keeps it out of the shell.
+set "RUSTUP_AUTO_INSTALL=0"
+set "RUST_VERSION=present; the build installs the pinned toolchain"
+pushd "%ROOT%"
+for /f "tokens=*" %%v in ('cargo --version 2^>nul') do set "RUST_VERSION=%%v"
+popd
+echo     Rust: %RUST_VERSION%
 :cargo_done
 
 rem ------------------------------------------------------------ build ------

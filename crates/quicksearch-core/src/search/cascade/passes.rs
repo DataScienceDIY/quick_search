@@ -152,8 +152,6 @@ impl<'a> Cx<'a> {
         let mut deferred = Deferred::default();
         let mut scanned = 0usize;
         let mut clock = FlushClock::new();
-        // Set when the loop stops on the display limit: the result set is cut.
-        let mut cut_short = false;
         // One path buffer per scan; a local because classifiers take `&mut Self`.
         let mut path = String::new();
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
@@ -184,10 +182,12 @@ impl<'a> Cx<'a> {
                     // every `batch` rows, so only deferred hits accumulate.
                     buf.push(hit);
                     self.flush_if_due(&mut buf, &mut clock);
-                    // Stop once the display limit is full. Recorded, not
-                    // turned into `limited` here: `flush_pass` owns that call.
+                    // Stop once the display limit is full, with rows left
+                    // unexamined, so the set may be cut. What it keeps is the
+                    // first `limit` found, not the best: the known exception
+                    // on [`Cx::flush_pass`].
                     if self.remaining() == 0 {
-                        cut_short = true;
+                        self.limited = true;
                         break;
                     }
                 }
@@ -206,9 +206,6 @@ impl<'a> Cx<'a> {
             None => debug_assert!(deferred.hits.is_empty(), "deferred hits with no slot"),
         }
         self.flush_pass(buf, false);
-        // After the flush, so it cannot be undone by one that truncated nothing;
-        // without this a cut set can report itself complete.
-        self.limited |= cut_short;
         Ok(true)
     }
 
@@ -222,18 +219,22 @@ impl<'a> Cx<'a> {
         // (see `search/prefilter.rs`). With the path tiers on it checks both
         // columns for the [`anchor_segment`], which is the whole term unless
         // the term straddles a separator or a star; a straddling pattern
-        // (`rep*rt` is ordinary typing) must not fall back to `1=1`.
+        // (`rep*rt` is ordinary typing) must not fall back to `1=1`. A
+        // wildcard's classifier folds Unicode case, so its text gets
+        // [`prefilter::like_text`]'s `_`s; a literal's folds ASCII only, as
+        // `LIKE` does.
+        let unicode_case = pattern.is_wildcard();
         let (predicate, terms) = if with_paths {
             anchor_segment(pattern)
                 .and_then(|anchor| prefilter::Required::new(vec![anchor.to_string()]))
-                .and_then(|required| required.like_predicate())
+                .and_then(|required| required.like_predicate(unicode_case))
                 .unwrap_or_else(|| ("1=1".to_string(), Vec::new()))
         } else {
             // Each star becomes an unescaped `%`; user `%`/`_` stay escaped.
             let like = pattern
                 .segments()
                 .iter()
-                .map(|s| escape_like(s))
+                .map(|s| prefilter::like_text(s, unicode_case))
                 .collect::<Vec<_>>()
                 .join("%");
             (
@@ -265,7 +266,8 @@ impl<'a> Cx<'a> {
                 } else if let Some(r) = pattern.find_first(path, true) {
                     (10.0, (r.start, r.end))
                 } else {
-                    // LIKE folds ASCII case only; this row is a non-ASCII near-miss.
+                    // A near-miss the superset prefilter let through: the
+                    // anchor segment occurs, the pattern does not.
                     return Ok(RowHit::Skip);
                 };
                 if !cx.regex_accepts(file_id, path, None)? {
@@ -349,8 +351,8 @@ impl<'a> Cx<'a> {
     /// survives `≤k` edits verbatim ([`pigeonhole_chunks`]), and a
     /// separator-free chunk cannot span `parent‖name`, so
     /// `(name LIKE OR parent LIKE)` per chunk is a superset of both tiers
-    /// ([`prefilter::Required::like_predicate`]); `LIKE` folds ASCII case, a
-    /// superset of the matcher's folding. Terms too short to split (under 9
+    /// ([`prefilter::Required::like_predicate`]); `LIKE` folds ASCII case,
+    /// as the matcher does. Terms too short to split (under 9
     /// characters at the default `k = 2`) scan the whole table.
     ///
     /// Measured (`benches/search_perf.rs`, fuzzy pairing, 200k rows, warm):
@@ -368,7 +370,7 @@ impl<'a> Cx<'a> {
             .and_then(|chunks| {
                 prefilter::Required::new(chunks.iter().map(|c| c.to_string()).collect())
             })
-            .and_then(|req| req.like_predicate())
+            .and_then(|req| req.like_predicate(false))
             .unwrap_or_else(|| ("1=1".to_string(), Vec::new()));
 
         let sql = files_scan_sql(&predicate, &query.filter_sql);
@@ -396,10 +398,7 @@ impl<'a> Cx<'a> {
                 // the contract that ranges index the field.
                 let snip = Some(snippet::whole_field(field, range));
                 let is_path_tier = rank >= 11.0;
-                // The stage is stamped, not truncated from `rank`: a distance
-                // of 10 makes rank 8.0, and truncating would file a filename
-                // hit under stage 8, the fuzzy full-text tier.
-                let stage = if is_path_tier { 11 } else { 7 };
+                let stage = rank as u8;
                 row_hit(row, file_id, path, name, rank, stage, snip, is_path_tier)
             },
         )
@@ -449,14 +448,17 @@ impl<'a> Cx<'a> {
     /// Regex-only pass over `files`: name hits reuse rank 4, path hits defer
     /// to rank 10, so stage-based rendering needs no new cases. Narrowed by
     /// the pattern's required literals
-    /// ([`crate::search::prefilter::Required::like_predicate`]); a pattern
-    /// with no literal (`\d+`) still scans every name and path per keystroke.
+    /// ([`crate::search::prefilter::Required::like_predicate`]), with every
+    /// character the regex's Unicode folding could match beyond ASCII case
+    /// left as `_`. A pattern with no literal (`\d+`) still scans every name
+    /// and path per keystroke, and so, nearly, does a Cyrillic or Greek
+    /// literal, which keeps no character.
     pub(super) fn pass_regex_name(&mut self) -> Result<bool, String> {
         let query = self.query;
         let re = query.regex.as_ref().expect("regex-only pass list");
         let (predicate, terms) = re
             .required()
-            .and_then(|r| r.like_predicate())
+            .and_then(|r| r.like_predicate(true))
             .unwrap_or_else(|| ("1=1".to_string(), Vec::new()));
         let sql = files_scan_sql(&predicate, &query.filter_sql);
         let params = self.params_with_filters(terms);

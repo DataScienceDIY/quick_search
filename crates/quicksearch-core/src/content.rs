@@ -20,7 +20,7 @@ use crate::walk::{try_recv_next, TryNext, WorkerStats};
 
 /// Finished rows waiting for the writer. Far shallower than the walk's 4096:
 /// a row carries up to `maximum_text_size` of text, so that depth would put
-/// gigabytes in flight; at 32 the ceiling is ~8 MiB per root.
+/// gigabytes in flight; at 32 the channel holds ~8 MiB at the default.
 const READY_CAP: usize = 32;
 
 /// Rows fetched but not yet claimed; bounds how far the feeder runs ahead.
@@ -245,7 +245,9 @@ fn worker(
     stats: &WorkerStats,
 ) {
     // One per worker for the whole pass: every extraction stages through its
-    // container and stream buffers.
+    // container and stream buffers. Made before the first stop check, so a
+    // stop that lands after any check still kills this worker's next sandbox
+    // child (`extract::sandbox::KillMark`).
     let mut scratch = crate::extract::Scratch::new(config);
     while let Some(row) = shared.take() {
         let _busy = stats.enter();
@@ -581,6 +583,82 @@ mod tests {
             store_extracted(&conn_mutex, &rows, &stop, far, &mut encoder()).unwrap(),
             Stored::default()
         );
+    }
+
+    /// Two rows stored while every insert into `table` fails, as a full disk
+    /// or a corrupt page would fail it, then again once the fault clears.
+    /// Every content write starts with its claim, so committed past the error
+    /// a row would read done or failed with half its content: the turn rolls
+    /// back instead, leaving both rows pending with nothing written, and the
+    /// error is returned to end the run.
+    fn failed_insert_rolls_back(tag: &str, table: &str, failed: bool) {
+        let s = seed(tag, &[("r1", 2)]);
+        let conn_mutex = writer(&s);
+        let mut pass = pass_for(&s, "r1", 2);
+        let mut rows = drain(&mut pass);
+        assert!(pass.finish());
+        assert_eq!(rows.len(), 2);
+        if failed {
+            for row in &mut rows {
+                row.outcome = ContentOutcome::Failed("unreadable".into());
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let far = Instant::now() + Duration::from_secs(60);
+        let count = |sql: &str| -> i64 {
+            conn_mutex
+                .lock()
+                .unwrap()
+                .query_row(sql, [], |r| r.get(0))
+                .unwrap()
+        };
+        let trigger = format!(
+            "CREATE TRIGGER boom BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'boom'); END;"
+        );
+        conn_mutex.lock().unwrap().execute_batch(&trigger).unwrap();
+
+        let err = store_extracted(&conn_mutex, &rows, &stop, far, &mut encoder()).unwrap_err();
+        assert!(err.starts_with("content indexing for "), "{err}");
+        assert!(err.contains("boom"), "{err}");
+        assert_eq!(
+            count("SELECT COUNT(*) FROM files WHERE content_state = 0"),
+            2
+        );
+        let hits = crate::testutil::fts_count(&conn_mutex.lock().unwrap(), "sphinx");
+        assert_eq!(hits, 0, "no posting outlives the rollback");
+        assert_eq!(count("SELECT COUNT(*) FROM documents_text"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM failed_files"), 0);
+
+        conn_mutex
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER boom;")
+            .unwrap();
+        assert_eq!(
+            store_extracted(&conn_mutex, &rows, &stop, far, &mut encoder()).unwrap(),
+            Stored {
+                consumed: 2,
+                written: 2
+            }
+        );
+        let state = if failed {
+            repo::STATE_FAILED
+        } else {
+            repo::STATE_DONE
+        };
+        let landed = format!("SELECT COUNT(*) FROM files WHERE content_state = {state}");
+        assert_eq!(count(&landed), 2);
+        assert_eq!(count(&format!("SELECT COUNT(*) FROM {table}")), 2);
+    }
+
+    #[test]
+    fn a_failed_text_write_rolls_back_the_turn() {
+        failed_insert_rolls_back("text-write-fails", "documents_text", false);
+    }
+
+    #[test]
+    fn a_failed_failure_record_rolls_back_the_turn() {
+        failed_insert_rolls_back("failure-write-fails", "failed_files", true);
     }
 
     #[test]

@@ -745,6 +745,487 @@ fn rows_respond_over_selectable_label_text() {
     assert!(egui::Popup::is_any_open(&ctx));
 }
 
+// --- Acting on the row the user chose -------------------------------------
+
+use crate::test_ui::key_press;
+
+/// A settled tab sorted by name, with `names` arriving in the order given
+/// and ranked in that order, so the display order is not the arrival order.
+fn name_sorted(names: &[&str]) -> SearchTab {
+    let mut tab = streaming_tab();
+    tab.sort = (SortKey::Name, true);
+    let hits = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| hit(i as i64 + 1, name, 1.0 + i as f64, 10))
+        .collect();
+    batch(&mut tab, hits);
+    tab
+}
+
+/// The name on the selected row.
+fn selected_name(tab: &SearchTab) -> Option<&str> {
+    tab.selected
+        .map(|ix| tab.results[ix as usize].name.as_str())
+}
+
+/// What this frame put on the clipboard.
+fn copied(out: &egui::FullOutput) -> Vec<&str> {
+    out.platform_output
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Right-clicks the row showing `name`; the frame after has the menu on it.
+fn open_menu(ctx: &egui::Context, tab: &mut SearchTab, name: &str) {
+    let out = run_frame(ctx, tab, vec![]);
+    let pos = painted_text_center(&out, name).unwrap_or_else(|| panic!("no {name} row"));
+    run_frame(ctx, tab, click_with(pos, egui::PointerButton::Secondary));
+}
+
+/// Clicks the open menu's `item`.
+fn click_menu_item(
+    ctx: &egui::Context,
+    tab: &mut SearchTab,
+    item: &str,
+) -> (egui::FullOutput, SearchActions) {
+    let out = run_frame(ctx, tab, vec![]);
+    let pos = painted_text_center(&out, item).unwrap_or_else(|| panic!("no {item} in the menu"));
+    run_frame_actions(ctx, tab, click_at(pos))
+}
+
+/// egui_extras ids a row by its slot, so a batch that re-sorts the rows under
+/// an open menu would otherwise hand the menu to the file that moved there.
+#[test]
+fn a_context_menu_acts_on_the_file_it_was_opened_on() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = name_sorted(&["b.txt", "c.txt"]);
+    open_menu(&ctx, &mut tab, "b.txt");
+
+    batch(&mut tab, vec![hit(9, "a.txt", 0.5, 10)]);
+    assert_eq!(
+        displayed(&tab),
+        ["a.txt", "b.txt", "c.txt"],
+        "a.txt took row 0"
+    );
+
+    let (out, _) = click_menu_item(&ctx, &mut tab, "Copy path");
+    assert_eq!(copied(&out), ["/d/b.txt"]);
+}
+
+/// The menu asks the app to open or reveal, which is what keeps these tests
+/// from launching anything.
+#[test]
+fn the_menu_hands_open_and_reveal_to_the_app() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = name_sorted(&["b.txt", "c.txt"]);
+
+    open_menu(&ctx, &mut tab, "c.txt");
+    let (_, actions) = click_menu_item(&ctx, &mut tab, "Open File");
+    assert_eq!(actions.open_file.as_deref(), Some("/d/c.txt"));
+    assert_eq!(actions.reveal, None);
+
+    open_menu(&ctx, &mut tab, "b.txt");
+    let (_, actions) = click_menu_item(&ctx, &mut tab, "Open containing folder");
+    assert_eq!(actions.reveal.as_deref(), Some("/d/b.txt"));
+    assert_eq!(actions.open_file, None);
+}
+
+/// egui counts a double-click by slot too: its second click must not open a
+/// file that a batch moved under the pointer after the first.
+#[test]
+fn a_double_click_across_a_reorder_opens_nothing() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = name_sorted(&["b.txt", "c.txt"]);
+    let out = run_frame(&ctx, &mut tab, vec![]);
+    let row0 = painted_text_center(&out, "b.txt").expect("no b.txt row");
+    run_frame(&ctx, &mut tab, click_at(row0));
+    assert_eq!(selected_name(&tab), Some("b.txt"));
+
+    batch(&mut tab, vec![hit(9, "a.txt", 0.5, 10)]);
+    let (_, actions) = run_frame_actions(&ctx, &mut tab, click_at(row0));
+    assert_eq!(
+        actions.open_file, None,
+        "opened a file nobody clicked twice"
+    );
+    assert_eq!(
+        selected_name(&tab),
+        Some("a.txt"),
+        "the click still selects"
+    );
+}
+
+#[test]
+fn a_plain_double_click_opens_the_row() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = name_sorted(&["b.txt", "c.txt"]);
+    let out = run_frame(&ctx, &mut tab, vec![]);
+    let row1 = painted_text_center(&out, "c.txt").expect("no c.txt row");
+    let (_, first) = run_frame_actions(&ctx, &mut tab, click_at(row1));
+    assert_eq!(first.open_file, None, "a single click opens nothing");
+    let (_, second) = run_frame_actions(&ctx, &mut tab, click_at(row1));
+    assert_eq!(second.open_file.as_deref(), Some("/d/c.txt"));
+}
+
+/// A user scrolled far down a long list lands on the next search's best
+/// hits, not at the bottom of its first batch.
+#[test]
+fn a_new_result_set_starts_at_the_top() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = tab_with_results(1000);
+    let out = run_frame(&ctx, &mut tab, vec![]);
+    let over = painted_text_center(&out, "alpha_widget_2.txt").expect("no row 2");
+    let wheel = egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, -3000.0),
+        modifiers: egui::Modifiers::NONE,
+    };
+    run_frame(&ctx, &mut tab, vec![egui::Event::PointerMoved(over), wheel]);
+    // egui spreads a wheel turn over frames.
+    let mut out = run_frame(&ctx, &mut tab, vec![]);
+    for _ in 0..120 {
+        out = run_frame(&ctx, &mut tab, vec![]);
+    }
+    let shows = |out: &egui::FullOutput, name: &str| painted_text(out).iter().any(|t| t == name);
+    assert!(
+        !shows(&out, "alpha_widget_0.txt"),
+        "the wheel never scrolled"
+    );
+
+    tab.on_search_started(1);
+    let hits = (0..300)
+        .map(|i| hit(i, &format!("beta_{i}.txt"), 3.0, 116))
+        .collect();
+    send_hits(&mut tab, 1, hits, 1000);
+    swap_in(&ctx, &mut tab);
+    let out = reveal_to(&ctx, &mut tab, 0.0);
+    assert!(
+        shows(&out, "beta_0.txt"),
+        "the new set opened scrolled down: {:?}",
+        painted_text(&out)
+    );
+}
+
+/// `tab` with the query box focused, as the app hands it over. Two frames:
+/// egui claims the arrows for a text box only from its second focused frame,
+/// and before that an arrow moves focus to the widget below.
+fn focused(ctx: &egui::Context, mut tab: SearchTab) -> SearchTab {
+    tab.focus_query = true;
+    run_frame(ctx, &mut tab, vec![]);
+    run_frame(ctx, &mut tab, vec![]);
+    assert!(query_box_focused(ctx, &tab));
+    tab
+}
+
+fn query_box_focused(ctx: &egui::Context, tab: &SearchTab) -> bool {
+    tab.query_id
+        .is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
+}
+
+fn press(key: egui::Key) -> Vec<egui::Event> {
+    key_press(key, egui::Modifiers::NONE)
+}
+
+/// egui's singleline Enter ends the edit, after which typing goes nowhere
+/// until a click. Typing is the assertion that matters.
+#[test]
+fn enter_keeps_the_query_box_focused() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = focused(&ctx, tab_with_results(3));
+    run_frame(&ctx, &mut tab, press(egui::Key::Enter));
+    run_frame(&ctx, &mut tab, vec![egui::Event::Text("x".into())]);
+    assert!(tab.query.ends_with('x'), "typing was lost: {:?}", tab.query);
+
+    // The box itself keeps Enter too, for a frame the table keys miss.
+    tab.query_id = None;
+    run_frame(&ctx, &mut tab, press(egui::Key::Enter));
+    run_frame(&ctx, &mut tab, vec![egui::Event::Text("y".into())]);
+    assert!(
+        tab.query.ends_with("xy"),
+        "typing was lost: {:?}",
+        tab.query
+    );
+}
+
+#[test]
+fn arrow_down_selects_the_first_row_then_the_next() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = focused(&ctx, name_sorted(&["c.txt", "a.txt", "b.txt"]));
+    let query = tab.query.clone();
+
+    // Display order, not arrival order.
+    run_frame(&ctx, &mut tab, press(egui::Key::ArrowDown));
+    assert_eq!(selected_name(&tab), Some("a.txt"));
+    run_frame(&ctx, &mut tab, press(egui::Key::ArrowDown));
+    assert_eq!(selected_name(&tab), Some("b.txt"));
+
+    // The ends hold.
+    run_frame(
+        &ctx,
+        &mut tab,
+        [press(egui::Key::ArrowDown), press(egui::Key::ArrowDown)].concat(),
+    );
+    assert_eq!(selected_name(&tab), Some("c.txt"));
+    run_frame(&ctx, &mut tab, press(egui::Key::ArrowUp));
+    assert_eq!(selected_name(&tab), Some("b.txt"));
+    run_frame(
+        &ctx,
+        &mut tab,
+        [press(egui::Key::ArrowUp), press(egui::Key::ArrowUp)].concat(),
+    );
+    assert_eq!(selected_name(&tab), Some("a.txt"));
+
+    assert_eq!(tab.query, query, "the keys reached the query text");
+    assert!(
+        query_box_focused(&ctx, &tab),
+        "the keys took focus from the box"
+    );
+
+    // Up from no selection starts at the top as well.
+    tab.selected = None;
+    run_frame(&ctx, &mut tab, press(egui::Key::ArrowUp));
+    assert_eq!(selected_name(&tab), Some("a.txt"));
+}
+
+/// A batch can land between frames and reorder `results` before the table
+/// re-sorts; a key must move through the order about to be painted.
+#[test]
+fn the_keys_follow_the_order_a_batch_just_changed() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = streaming_tab();
+    tab.sort = (SortKey::Name, false);
+    batch_capped(
+        &mut tab,
+        vec![hit(1, "b.txt", 1.0, 10), hit(2, "c.txt", 2.0, 10)],
+        2,
+    );
+    let mut tab = focused(&ctx, tab);
+    run_frame(&ctx, &mut tab, press(egui::Key::ArrowDown));
+    run_frame(&ctx, &mut tab, press(egui::Key::ArrowDown));
+    assert_eq!(selected_name(&tab), Some("b.txt"));
+
+    // At the cap, d.txt displaces c.txt and goes above b.txt.
+    send_hits(&mut tab, 0, vec![hit(3, "d.txt", 0.5, 10)], 2);
+    run_frame(&ctx, &mut tab, press(egui::Key::ArrowUp));
+    assert_eq!(displayed(&tab), ["d.txt", "b.txt"]);
+    assert_eq!(selected_name(&tab), Some("d.txt"));
+}
+
+#[test]
+fn page_down_scrolls_the_selection_into_view() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = focused(&ctx, tab_with_results(1000));
+    let page = tab.page_rows;
+    assert!(page > 1 && page < 100, "a page of {page} rows");
+    let shown_at = |tab: &SearchTab| tab.order.iter().position(|&ix| Some(ix) == tab.selected);
+    let settle = |tab: &mut SearchTab| {
+        let mut out = run_frame(&ctx, tab, vec![]);
+        // The scroll animates.
+        for _ in 0..60 {
+            out = run_frame(&ctx, tab, vec![]);
+        }
+        painted_text(&out)
+    };
+
+    for _ in 0..3 {
+        run_frame(&ctx, &mut tab, press(egui::Key::PageDown));
+    }
+    // The first page lands on the last whole row on screen.
+    assert_eq!(shown_at(&tab), Some(3 * page - 1));
+    let painted = settle(&mut tab);
+    let name = selected_name(&tab).expect("selected").to_string();
+    assert!(painted.contains(&name), "{name} is off screen: {painted:?}");
+    assert!(!painted.iter().any(|t| t == "alpha_widget_0.txt"));
+
+    for _ in 0..3 {
+        run_frame(&ctx, &mut tab, press(egui::Key::PageUp));
+    }
+    assert_eq!(shown_at(&tab), Some(0));
+    let painted = settle(&mut tab);
+    assert!(painted.iter().any(|t| t == "alpha_widget_0.txt"));
+}
+
+#[test]
+fn enter_asks_to_open_the_selected_row() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = focused(&ctx, name_sorted(&["c.txt", "a.txt", "b.txt"]));
+
+    let (_, actions) = run_frame_actions(&ctx, &mut tab, press(egui::Key::Enter));
+    assert_eq!(
+        actions.open_file.as_deref(),
+        Some("/d/a.txt"),
+        "with nothing selected, the top row"
+    );
+
+    run_frame(
+        &ctx,
+        &mut tab,
+        [press(egui::Key::ArrowDown), press(egui::Key::ArrowDown)].concat(),
+    );
+    let (_, actions) = run_frame_actions(&ctx, &mut tab, press(egui::Key::Enter));
+    assert_eq!(actions.open_file.as_deref(), Some("/d/b.txt"));
+}
+
+/// Rows that answer the old text in the box are not the user's choice: not
+/// while an edit waits on the debounce, nor while they fade out.
+#[test]
+fn the_keys_wait_for_rows_that_answer_the_query() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = focused(&ctx, tab_with_results(3));
+    let keys = || [press(egui::Key::ArrowDown), press(egui::Key::Enter)].concat();
+
+    tab.pending_edit = Some(Instant::now());
+    let (_, actions) = run_frame_actions(&ctx, &mut tab, keys());
+    assert_eq!(
+        (tab.selected, actions.open_file),
+        (None, None),
+        "before the search"
+    );
+
+    tab.pending_edit = None;
+    tab.on_search_started(1);
+    let (_, actions) = run_frame_actions(&ctx, &mut tab, keys());
+    assert_eq!(
+        (tab.selected, actions.open_file),
+        (None, None),
+        "during the fade"
+    );
+
+    // And once the new search has found nothing, there is nothing to open.
+    complete(&mut tab, 1, 0);
+    swap_in(&ctx, &mut tab);
+    let (_, actions) = run_frame_actions(&ctx, &mut tab, keys());
+    assert_eq!(
+        (tab.selected, actions.open_file),
+        (None, None),
+        "with no rows"
+    );
+    assert!(query_box_focused(&ctx, &tab));
+}
+
+/// Elsewhere the keys are someone else's: a focused button takes Enter.
+#[test]
+fn the_keys_need_the_query_box_focused() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = tab_with_results(3);
+    run_frame(&ctx, &mut tab, vec![]);
+    let keys = [press(egui::Key::ArrowDown), press(egui::Key::Enter)].concat();
+    let (_, actions) = run_frame_actions(&ctx, &mut tab, keys);
+    assert_eq!((tab.selected, actions.open_file), (None, None));
+}
+
+/// One frame of `key` with `modifiers` held, as the platform reports them:
+/// on the frame's input and on the key event.
+fn held_frame(
+    ctx: &egui::Context,
+    tab: &mut SearchTab,
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+) -> SearchActions {
+    let mut input = crate::test_ui::raw_input(egui::vec2(1000.0, 700.0), key_press(key, modifiers));
+    input.modifiers = modifiers;
+    let mut actions = SearchActions::default();
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| actions = tab.ui(ui));
+    });
+    actions
+}
+
+/// egui matches keys ignoring Shift and Alt, but Shift+arrows select text in
+/// the box and Shift+Enter is not Enter: the table takes unmodified keys only.
+#[test]
+fn modified_keys_stay_with_the_query_box() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = focused(&ctx, name_sorted(&["c.txt", "a.txt", "b.txt"]));
+    let query = tab.query.clone();
+    for modifiers in [egui::Modifiers::SHIFT, egui::Modifiers::ALT] {
+        for key in [
+            egui::Key::ArrowDown,
+            egui::Key::ArrowUp,
+            egui::Key::PageDown,
+            egui::Key::Enter,
+        ] {
+            let actions = held_frame(&ctx, &mut tab, modifiers, key);
+            assert_eq!(
+                (tab.selected, actions.open_file),
+                (None, None),
+                "{modifiers:?} {key:?} reached the table"
+            );
+        }
+    }
+    assert_eq!(tab.query, query);
+    assert!(query_box_focused(&ctx, &tab));
+
+    run_frame(&ctx, &mut tab, press(egui::Key::ArrowDown));
+    assert_eq!(selected_name(&tab), Some("a.txt"), "plain keys still do");
+}
+
+/// Both clicks of a double-click can arrive in one slow frame, before either
+/// has selected the row.
+#[test]
+fn a_double_click_within_one_frame_opens_the_row() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = name_sorted(&["b.txt", "c.txt"]);
+    let out = run_frame(&ctx, &mut tab, vec![]);
+    let row1 = painted_text_center(&out, "c.txt").expect("no c.txt row");
+    let both = [click_at(row1), click_at(row1)].concat();
+    let (_, actions) = run_frame_actions(&ctx, &mut tab, both);
+    assert_eq!(actions.open_file.as_deref(), Some("/d/c.txt"));
+    assert_eq!(selected_name(&tab), Some("c.txt"));
+}
+
+/// A click on a row hands focus back to the query box, so the arrows go on
+/// moving the selection and typing goes on editing the query.
+#[test]
+fn a_click_on_a_row_keeps_the_keys_in_the_query_box() {
+    let ctx = crate::test_ui::ctx();
+    let mut tab = focused(&ctx, name_sorted(&["c.txt", "a.txt", "b.txt"]));
+    let out = run_frame(&ctx, &mut tab, vec![]);
+    let row = painted_text_center(&out, "a.txt").expect("no a.txt row");
+    let out = run_frame(&ctx, &mut tab, click_at(row));
+    assert_eq!(selected_name(&tab), Some("a.txt"));
+    assert!(query_box_focused(&ctx, &tab), "the click kept focus");
+    // The box claims the arrows from its next focused frame (see `focused`),
+    // which egui runs at once after any input.
+    let root = &out.viewport_output[&egui::ViewportId::ROOT];
+    assert_eq!(root.repaint_delay, std::time::Duration::ZERO);
+    run_frame(&ctx, &mut tab, vec![]);
+
+    run_frame(&ctx, &mut tab, press(egui::Key::ArrowDown));
+    assert_eq!(selected_name(&tab), Some("b.txt"));
+    run_frame(&ctx, &mut tab, vec![egui::Event::Text("x".into())]);
+    assert!(tab.query.ends_with('x'), "typing was lost: {:?}", tab.query);
+}
+
+/// A name's glob syntax is escaped, so every prefilled pattern compiles and
+/// matches the hit it came from; `*.[x` unescaped would not even compile.
+#[test]
+fn the_ignore_dialog_prefills_patterns_that_compile() {
+    use quicksearch_core::config::IgnoreSet;
+    use std::path::Path;
+    let hit = SearchHit {
+        path: "/d/Music [FLAC]/x.[x".to_string(),
+        ..hit(1, "x.[x", 1.0, 1)
+    };
+    let dialog = IgnoreDialog::for_hit(&hit);
+    let ext = dialog.ext_pattern.clone().expect("x.[x has an extension");
+    for pattern in [&ext, &dialog.name_pattern, &dialog.dir_pattern] {
+        assert!(crate::ui_util::ignore_pattern_valid(pattern), "{pattern:?}");
+        let set = IgnoreSet::compile(&[pattern.clone()]).unwrap();
+        assert!(set.matches_path(Path::new(&hit.path)), "{pattern:?}");
+    }
+    let dir = IgnoreSet::compile(&[dialog.dir_pattern]).unwrap();
+    assert!(!dir.matches_path(Path::new("/d/Music F/x.[x")));
+    let ext = IgnoreSet::compile(&[ext]).unwrap();
+    assert!(ext.matches_component("y.[x"), "not an extension pattern");
+    assert!(!ext.matches_component("x.x"), "the bracket became a class");
+}
+
 /// A drive root must not become the never-matching `C:\/*`.
 #[test]
 fn dir_ignore_patterns_use_the_platform_separator() {
@@ -1562,6 +2043,42 @@ fn a_name_snippet_that_is_not_the_name_paints_no_highlight() {
     assert!(painted_text(&out)
         .iter()
         .any(|t| t == "a_very_long_quarterly_budget_report.txt"));
+}
+
+/// epaint starts a row at every `\n`, even in a truncated one-row cell, and
+/// draws `\r` as nothing: the rest of such a name or path must still show.
+#[test]
+fn a_line_break_in_a_name_or_path_does_not_hide_the_rest() {
+    let ctx = crate::test_ui::ctx();
+    for brk in ["\n", "\r", "\t", "\r\n"] {
+        let mut tab = tab_with_results(1);
+        let name = format!("a.pdf{brk}b.sh");
+        tab.results[0] = name_hit(&name, (name.len() - 4, name.len()));
+
+        let out = run_frame(&ctx, &mut tab, vec![]);
+        let shown = format!("a.pdf{}b.sh", " ".repeat(brk.len()));
+        let rows = painted_rows(&out);
+        assert!(rows.contains(&shown), "{brk:?}: {rows:?}");
+        assert!(
+            rows.contains(&format!("/qs-test/{shown}")),
+            "{brk:?}: {rows:?}"
+        );
+        assert_eq!(highlight_runs(&out, &ctx), vec!["b.sh"], "{brk:?}");
+    }
+
+    // Too long for either column: the Name cell truncates past the break,
+    // and the Path cell's middle elision keeps the file's end.
+    let mut tab = tab_with_results(1);
+    let name = format!("a.pdf\n{}b.sh", "x_".repeat(80));
+    tab.results[0] = name_hit(&name, (name.len() - 4, name.len()));
+    let rows = painted_rows(&run_frame(&ctx, &mut tab, vec![]));
+    assert!(rows.iter().any(|r| r.starts_with("a.pdf x_x_")), "{rows:?}");
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("/qs-test/") && r.contains('…') && r.ends_with("x_b.sh")),
+        "{rows:?}"
+    );
+    assert!(!rows.iter().any(|r| r.contains('\n')), "{rows:?}");
 }
 
 #[test]

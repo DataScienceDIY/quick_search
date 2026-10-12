@@ -1,7 +1,7 @@
 //! Integration tests for the ranked search cascade and the streaming search
 //! service, against real temp databases.
 
-use std::path::Path;
+use std::path::{Path, MAIN_SEPARATOR, MAIN_SEPARATOR_STR};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -38,13 +38,24 @@ impl Seeder {
     /// Insert a file; `text: Some(..)` also content-indexes it. `dir` has no
     /// trailing separator; the stored parent always carries one.
     fn add(&mut self, name: &str, dir: &str, mtime: u64, text: Option<&str>) -> i64 {
-        let parent = format!("{}/", dir);
+        self.insert(name, &format!("{}/", dir), mtime, text)
+    }
+
+    /// [`Seeder::add`] with `dir` stored in the platform's spelling, as the
+    /// indexer stores it: for the tests whose `path:` and `folder:` filters
+    /// the translator respells so (`/` is `\` on Windows).
+    fn add_native(&mut self, name: &str, dir: &str, mtime: u64, text: Option<&str>) -> i64 {
+        let parent = format!("{}{}", native(dir), MAIN_SEPARATOR);
+        self.insert(name, &parent, mtime, text)
+    }
+
+    fn insert(&mut self, name: &str, parent: &str, mtime: u64, text: Option<&str>) -> i64 {
         let tx = self.conn.transaction().unwrap();
         let id = insert_file(
             &tx,
             &NewFile {
                 name,
-                parent: &parent,
+                parent,
                 size: 42,
                 mtime,
                 mime: Some("text/plain"),
@@ -65,6 +76,11 @@ impl Seeder {
     fn done(self) -> rusqlite::Connection {
         self.conn
     }
+}
+
+/// `dir`, written with `/`, in the platform's separator.
+fn native(dir: &str) -> String {
+    dir.replace('/', MAIN_SEPARATOR_STR)
 }
 
 /// Run a search and return its hits in rank order; arrival order is scan
@@ -321,29 +337,28 @@ fn fuzzy_max_edits_widens_and_narrows_the_budget() {
     assert!(off.is_empty(), "a cap of 0 disables the fuzzy stages");
 }
 
-/// `7.0 + 0.1 * distance` reaches 8.0, the fuzzy full-text tier's rank, at ten
-/// edits; the stage still says a distant filename hit matched the name.
 #[test]
-fn a_distant_fuzzy_filename_hit_stays_a_name_hit() {
-    let (_dir, p) = Scratch::db("fuzzystage");
+fn the_fuzzy_budget_stops_at_the_hard_cap() {
+    use quicksearch_core::search::fuzzy::MAX_FUZZY_EDITS;
+
+    let (_dir, p) = Scratch::db("fuzzycap");
     let mut s = Seeder::new(&p);
-    // Ten substitutions against a 30-character term, whose budget is ten.
-    let far = s.add("abcdefghijklmnopqrst##########", "/d", 1, None);
+    // Against a 30-character term, whose length alone earns ten edits.
+    let at_cap = s.add("abcdefghijklmnopqrstuv########", "/d", 1, None);
+    s.add("abcdefghijklmnopqrstu#########", "/d", 2, None);
     let conn = s.done();
 
-    let (hits, _) = run_collect(
-        &conn,
-        "abcdefghijklmnopqrstuvwxyz0123",
-        &fuzzy_options_with_edits(10),
-    );
-    assert_eq!(ids(&hits), vec![far]);
-    assert!(
-        (hits[0].rank - 8.0).abs() < 1e-9,
-        "rank {} is not the 8.0 that used to truncate into the next stage",
-        hits[0].rank
-    );
-    assert_eq!(hits[0].stage, 7, "the name tier is stage 7 at any distance");
-    assert_eq!(hits[0].match_field(), MatchField::Name);
+    for setting in [MAX_FUZZY_EDITS, 10, usize::MAX] {
+        let (hits, _) = run_collect(
+            &conn,
+            "abcdefghijklmnopqrstuvwxyz0123",
+            &fuzzy_options_with_edits(setting),
+        );
+        assert_eq!(ids(&hits), vec![at_cap], "setting {setting}");
+        assert!((hits[0].rank - 7.8).abs() < 1e-9, "rank {}", hits[0].rank);
+        assert_eq!(hits[0].stage, 7);
+        assert_eq!(hits[0].match_field(), MatchField::Name);
+    }
 }
 
 #[test]
@@ -497,14 +512,14 @@ fn both_index_layouts_answer_every_query_shape_alike() {
 fn filters_apply_to_every_stage() {
     let (_dir, p) = Scratch::db("filters");
     let mut s = Seeder::new(&p);
-    let keep_name = s.add("alpha.txt", "/keep", 1, None);
-    let _skip_name = s.add("alpha.txt", "/skip", 1, None);
-    let keep_text = s.add("k.txt", "/keep", 2, Some("alpha body"));
-    let _skip_text = s.add("s.txt", "/skip", 2, Some("alpha body"));
-    let keep_fuzzy = s.add("alpah.txt", "/keep", 3, None);
-    let _skip_fuzzy = s.add("alpah.txt", "/skip", 3, None);
-    let keep_path = s.add("p.bin", "/keep/alpha-sub", 4, None);
-    let _skip_path = s.add("p.bin", "/skip/alpha-sub", 4, None);
+    let keep_name = s.add_native("alpha.txt", "/keep", 1, None);
+    let _skip_name = s.add_native("alpha.txt", "/skip", 1, None);
+    let keep_text = s.add_native("k.txt", "/keep", 2, Some("alpha body"));
+    let _skip_text = s.add_native("s.txt", "/skip", 2, Some("alpha body"));
+    let keep_fuzzy = s.add_native("alpah.txt", "/keep", 3, None);
+    let _skip_fuzzy = s.add_native("alpah.txt", "/skip", 3, None);
+    let keep_path = s.add_native("p.bin", "/keep/alpha-sub", 4, None);
+    let _skip_path = s.add_native("p.bin", "/skip/alpha-sub", 4, None);
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "alpha path:/keep", &fuzzy_options());
@@ -515,14 +530,12 @@ fn filters_apply_to_every_stage() {
     );
 }
 
-/// `flush_pass` owns `limited`: it sets the flag only when it truncates.
-/// `remaining()` reaches zero at a pass boundary whether or not anything was
-/// dropped, so setting it there would report "(truncated…)" over a complete set.
-///
-/// The mid-pass boundary is not fixed: a limit filled by the first hits of a
-/// pass breaks the scan with rows unexamined, and `cut_short` reports "there
-/// may be more", which may not be so. Telling the two apart costs a row
-/// scanned past the limit in every pass that fills it, on every keystroke.
+/// `limited` means "there may be more". `flush_pass` sets it when it
+/// truncates, and so does a limit filled with rows or passes left: a scan
+/// breaking with rows unexamined, or the cascade stopping before its later
+/// passes. Those two can report "(truncated…)" over a complete set, which
+/// "limit-exact" and "limit-one" pin: telling them apart costs a row scanned
+/// past the limit, or the unrun passes, on every keystroke.
 ///
 /// The break sits after classification: the filename pass's SQL is a superset
 /// feeding two rank tiers, so a scanned row is not yet a match, and breaking on
@@ -534,12 +547,16 @@ fn the_limit_truncates_flags_and_keeps_the_best_hits() {
     let cases = [
         // 10 matches under a limit of 3 is a cut set.
         (("limit", 10, false, 3), (3, true, "zz-match-00.txt")),
-        // Exactly `limit` results is a complete answer: nothing truncated.
-        (("limit-exact", 3, false, 3), (3, false, "zz-match-00.txt")),
-        // The not-fixed boundary: the scan breaks with rows unexamined and
-        // `cut_short` says "there may be more".
+        // Exactly `limit` results with passes left to run: those passes
+        // could have found more, so the set says "there may be more".
+        (("limit-exact", 3, false, 3), (3, true, "zz-match-00.txt")),
+        // The scan breaks with rows unexamined and says the same.
         (("limit-one", 1, false, 1), (1, true, "zz-match-00.txt")),
-        // The exact match, seeded last, survives the break.
+        // The exact match, seeded last, is scanned last too. It is kept only
+        // because the hits after the first, which goes out on its own, fit
+        // one flush buffer, ranked before the cut. Past a buffer the scan
+        // stops at the limit and keeps the first found (the known exception
+        // on `Cx::flush_pass`).
         (("limit-break", 20, true, 2), (2, true, "match")),
     ];
 
@@ -564,6 +581,75 @@ fn the_limit_truncates_flags_and_keeps_the_best_hits() {
         assert_eq!(outcome.limited, limited, "{}", tag);
         assert_eq!(hits[0].name, first, "{}", tag);
     }
+}
+
+/// The name pass fills the limit exactly, and the full-text pass, which
+/// would have found one more, never runs: the set is cut and says so.
+#[test]
+fn a_full_set_with_a_body_match_left_is_limited() {
+    let (_dir, p) = Scratch::db("limit-body");
+    let mut s = Seeder::new(&p);
+    let names: Vec<i64> = (0..3)
+        .map(|i| s.add(&format!("match-{}.txt", i), "/d", 1, None))
+        .collect();
+    let _body = s.add("notes.txt", "/d", 1, Some("a match in the text"));
+    let conn = s.done();
+
+    let options = SearchOptions {
+        limit: 3,
+        ..SearchOptions::default()
+    };
+    let (hits, outcome) = run_collect(&conn, "match", &options);
+    assert_eq!(sorted(ids(&hits)), names, "the name hits fill the set");
+    assert_eq!(outcome.total, 3);
+    assert!(
+        outcome.limited,
+        "the full-text pass never ran, so there may be more"
+    );
+}
+
+/// One short of the limit, every pass runs: the set is complete.
+#[test]
+fn a_set_one_short_of_the_limit_is_complete() {
+    let (_dir, p) = Scratch::db("limit-short");
+    let mut s = Seeder::new(&p);
+    let name = s.add("match.txt", "/d", 1, None);
+    let body = s.add("notes.txt", "/d", 1, Some("a match in the text"));
+    let conn = s.done();
+
+    let options = SearchOptions {
+        limit: 3,
+        ..SearchOptions::default()
+    };
+    let (hits, outcome) = run_collect(&conn, "match", &options);
+    assert_eq!(ids(&hits), vec![name, body], "a name hit, then a body hit");
+    assert_eq!(outcome.total, 2);
+    assert!(!outcome.limited, "nothing was dropped and every pass ran");
+}
+
+/// The CLI's `--limit` has no upper bound. The deferred path tier's cap is
+/// twice the room left, so past `usize::MAX / 2` it must saturate: wrapped,
+/// it fell to the 4,096 floor and the cut indexed past the buffer.
+#[test]
+fn a_limit_past_half_of_usize_does_not_panic() {
+    let (_dir, p) = Scratch::db("limit-huge");
+    let mut s = Seeder::new(&p);
+    // Path-tier hits only: the parent holds the term, the name does not.
+    // More than the floor, so the cap is checked.
+    let rows = 4200;
+    for i in 0..rows {
+        s.add(&format!("f{:04}.bin", i), "/d/needle-sub", 1, None);
+    }
+    let conn = s.done();
+
+    let options = SearchOptions {
+        limit: usize::MAX / 2 + 1,
+        ..SearchOptions::default()
+    };
+    let (hits, outcome) = run_collect(&conn, "needle", &options);
+    assert_eq!(hits.len(), rows, "every path hit comes back");
+    assert_eq!(outcome.total, rows);
+    assert!(!outcome.limited, "nothing was dropped and every pass ran");
 }
 
 #[test]
@@ -669,6 +755,32 @@ fn wildcard_name_ranks_through_the_same_tiers() {
         !ordered.iter().any(|h| h.name == "2024report.pdf"),
         "segments must match in order"
     );
+}
+
+/// A wildcard's classifier folds Unicode case, so pass A's `LIKE` must admit
+/// every case partner it accepts, in both branches: the anchor segment (path
+/// tiers on) and the joined name pattern (under the trigram floor).
+#[test]
+fn a_wildcard_finds_unicode_case_variants_by_name() {
+    let (_dir, p) = Scratch::db("wildunicode");
+    let mut s = Seeder::new(&p);
+    let resume = s.add("RÉSUMÉ 2024.pdf", "/d", 1, None);
+    let e_acute = s.add("É.txt", "/d", 2, None);
+    // U+212A KELVIN SIGN, a case partner of `k`.
+    let kelvin = s.add("\u{212A}ILOWATT.txt", "/d", 3, None);
+    let report = s.add("Отчёт.docx", "/d", 4, None);
+    let conn = s.done();
+
+    for (query, want) in [
+        ("résumé*", vec![(resume, 2)]),
+        // One character: the name-only branch. RÉSUMÉ holds an É too.
+        ("é*", vec![(e_acute, 2), (resume, 4)]),
+        ("kilo*", vec![(kelvin, 2)]),
+        ("отч*", vec![(report, 2)]),
+    ] {
+        let (hits, _) = run_collect(&conn, query, &SearchOptions::default());
+        assert_eq!(staged(&hits), want, "{query}");
+    }
 }
 
 #[test]
@@ -894,8 +1006,8 @@ fn a_wildcard_with_only_separator_segments_still_scans_and_matches() {
 fn wildcard_path_tier_and_filters() {
     let (_dir, p) = Scratch::db("wildpath");
     let mut s = Seeder::new(&p);
-    let dir_hit = s.add("a.bin", "/Vacation-2024", 1, None);
-    let filtered = s.add("b.bin", "/elsewhere/Vacation-2023", 2, None);
+    let dir_hit = s.add_native("a.bin", "/Vacation-2024", 1, None);
+    let filtered = s.add_native("b.bin", "/elsewhere/Vacation-2023", 2, None);
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "Vac*tion", &SearchOptions::default());
@@ -956,15 +1068,98 @@ fn regex_only_query_hits_name_content_and_path() {
 fn regex_is_case_insensitive_by_default_and_respects_filters() {
     let (_dir, p) = Scratch::db("regexci");
     let mut s = Seeder::new(&p);
-    let keep = s.add("QZ1.txt", "/keep", 1, None);
-    let _skip = s.add("qz2.txt", "/skip", 2, None);
+    let keep = s.add_native("QZ1.txt", "/keep", 1, None);
+    let skip = s.add_native("qz2.txt", "/skip", 2, None);
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, r"regex:qz\d path:/keep", &SearchOptions::default());
     assert_eq!(ids(&hits), vec![keep]);
 
+    // Unquoted: the parens and the colon belong to the pattern.
     let (cs, _) = run_collect(&conn, r"regex:(?-i:qz)\d", &SearchOptions::default());
-    assert!(!cs.iter().any(|h| h.file_id == keep));
+    assert_eq!(ids(&cs), vec![skip]);
+}
+
+/// Operators in plain text are searched as typed, spaces included.
+#[test]
+fn operator_text_is_searched_as_typed() {
+    let (_dir, p) = Scratch::db("optext");
+    let mut s = Seeder::new(&p);
+    let code = s.add("main.cpp", "/src", 1, Some("using std::string here"));
+    let _glued = s.add("other.cpp", "/src", 2, Some("std:string is a typo"));
+    let mail = s.add("Re: meeting.eml", "/mail", 3, None);
+    let _joined = s.add("Re:meeting.eml", "/mail", 4, None);
+    let conn = s.done();
+
+    let (hits, _) = run_collect(&conn, "std::string", &SearchOptions::default());
+    assert_eq!(staged(&hits), vec![(code, 5)]);
+
+    let (hits, _) = run_collect(&conn, "Re: meeting", &SearchOptions::default());
+    assert_eq!(staged(&hits), vec![(mail, 3)]);
+}
+
+/// `regex:` folds Unicode case, so the name pass's `LIKE` must admit every
+/// case partner of its literals, in names (rank 4) and in paths (rank 10).
+#[test]
+fn regex_name_pass_finds_unicode_case_variants() {
+    let (_dir, p) = Scratch::db("regexunicode");
+    let mut s = Seeder::new(&p);
+    let cafe = (
+        s.add("CAFÉ.txt", "/d", 1, None),
+        s.add("x.bin", "/CAFÉ", 2, None),
+    );
+    let kilo = (
+        s.add("\u{212A}ILO.txt", "/d", 3, None),
+        s.add("y.bin", "/\u{212A}ILO", 4, None),
+    );
+    let report = (
+        s.add("ОТЧЁТ.txt", "/d", 5, None),
+        s.add("z.bin", "/ОТЧЁТ", 6, None),
+    );
+    let conn = s.done();
+
+    for (query, (by_name, by_path)) in [
+        ("regex:café", cafe),
+        ("regex:kilo", kilo),
+        ("regex:отчёт", report),
+    ] {
+        let (hits, _) = run_collect(&conn, query, &SearchOptions::default());
+        assert_eq!(staged(&hits), vec![(by_name, 4), (by_path, 10)], "{query}");
+    }
+}
+
+/// Pins the accepted limit in `search/prefilter.rs`: FTS5 folds case with
+/// SQLite's own, older table, so a body holding only a case partner added
+/// since (Georgian Mtavruli capitals, Unicode 11) is no FTS candidate for a
+/// `*` pattern or `regex:`, though both matchers accept it. A failure here
+/// means SQLite's table caught up and the documented limit can go. The
+/// Cyrillic body is the control, inside both tables.
+#[test]
+fn content_matching_folds_case_only_as_far_as_the_fts_table() {
+    const MTAVRULI: &str = "ᲥᲐᲠᲗᲣᲚᲘ";
+    let (_dir, p) = Scratch::db("ftsfold");
+    let mut s = Seeder::new(&p);
+    let georgian = s.add("a.txt", "/d", 1, Some(&format!("{MTAVRULI} ენა")));
+    let cyrillic = s.add("b.txt", "/d", 2, Some("ОТЧЁТ за год"));
+    let conn = s.done();
+
+    for query in ["ქართ*ული", "regex:ქართ"] {
+        let split = split_for_cascade(query).unwrap();
+        let accepted = match &split.regex {
+            Some(re) => re.is_match(MTAVRULI),
+            None => split.pattern.find_first(MTAVRULI, true).is_some(),
+        };
+        assert!(accepted, "{query}: the matcher folds the pair");
+        let (hits, _) = run_collect(&conn, query, &SearchOptions::default());
+        assert!(
+            !ids(&hits).contains(&georgian),
+            "{query}: {:?}",
+            staged(&hits)
+        );
+    }
+
+    let (hits, _) = run_collect(&conn, "regex:отчёт", &SearchOptions::default());
+    assert_eq!(staged(&hits), vec![(cyrillic, 6)]);
 }
 
 #[test]
@@ -1127,7 +1322,10 @@ fn search_names(
                 message,
             }) if g == generation => return Err(message),
             Ok(_) => {}
-            Err(_) => break,
+            // A quiet stretch is a loaded machine, not a lost search: only
+            // the deadline gives up.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     panic!("search {:?} never completed", query);
@@ -1236,6 +1434,19 @@ fn a_failed_search_does_not_wedge_the_next_one() {
     service.shutdown();
 }
 
+/// Whether this process holds a descriptor on `p`, read from
+/// `/proc/self/fd`.
+#[cfg(target_os = "linux")]
+fn holds_fd_on(p: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return false;
+    };
+    entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .any(|target| target == p)
+}
+
 /// The connection is released once a search session goes quiet: a deleted
 /// index keeps its blocks until the last handle closes, and an open reader
 /// stops SQLite from resetting the WAL. Checked through `/proc/self/fd`;
@@ -1248,15 +1459,7 @@ fn the_connection_is_released_once_searching_stops() {
     s.add("held.txt", "/d", 1, Some("shared body"));
     drop(s.done());
 
-    let holds_index = || {
-        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
-            return false;
-        };
-        entries
-            .filter_map(|e| e.ok())
-            .filter_map(|e| std::fs::read_link(e.path()).ok())
-            .any(|target| target == p)
-    };
+    let holds_index = || holds_fd_on(&p);
 
     let (service, updates) = SearchService::new_with_idle_release(
         p.clone(),
@@ -1283,6 +1486,94 @@ fn the_connection_is_released_once_searching_stops() {
         vec!["held.txt"]
     );
     service.shutdown();
+}
+
+/// A removal has the search worker let go before it deletes: on Windows a
+/// held connection fails the delete, and the worker keeps one for
+/// `IDLE_RELEASE`. Observed from a holder registered after the service's,
+/// which runs after it and before the delete.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_removal_releases_the_search_connection_first() {
+    let (_dir, p) = Scratch::db("relremove");
+    let mut s = Seeder::new(&p);
+    s.add("held.txt", "/d", 1, Some("shared body"));
+    drop(s.done());
+
+    let (service, updates) = SearchService::new(p.clone(), Arc::new(|| {}));
+    assert_eq!(
+        search_names(&service, &updates, "shared").unwrap(),
+        vec!["held.txt"]
+    );
+    assert!(
+        holds_fd_on(&p),
+        "the connection should be held across requests"
+    );
+
+    let held_at_delete = Arc::new(std::sync::Mutex::new(None));
+    let observer = {
+        let (held, target) = (held_at_delete.clone(), p.clone());
+        quicksearch_core::db::hold_index(move |path| {
+            if path == target {
+                *held.lock().unwrap() = Some(holds_fd_on(path));
+            }
+        })
+    };
+    quicksearch_core::db::remove_index_files(&p).unwrap();
+    drop(observer);
+    assert_eq!(
+        *held_at_delete.lock().unwrap(),
+        Some(false),
+        "the search connection was still open when the delete began"
+    );
+    service.shutdown();
+}
+
+/// The removal's own window: a search that reopens the index after the
+/// worker let go and before the unlink would serve the deleted file for as
+/// long as the connection lives, unless the epoch moves after the delete.
+/// The search is run from a holder registered after the service's, so it
+/// lands exactly there. Unix only: Windows fails the delete instead.
+#[cfg(unix)]
+#[test]
+fn a_reader_reopened_inside_the_removal_window_is_dropped() {
+    let (_dir, p) = Scratch::db("relwindow");
+    let mut s = Seeder::new(&p);
+    s.add("before.txt", "/d", 1, Some("shared body"));
+    drop(s.done());
+    // Built apart and closed, so the file is whole without its WAL.
+    let (_dir2, replacement) = Scratch::db("relwindow2");
+    let mut s = Seeder::new(&replacement);
+    s.add("after.txt", "/d", 1, Some("shared body"));
+    drop(s.done());
+
+    let (service, updates) = SearchService::new(p.clone(), Arc::new(|| {}));
+    let (service, updates) = (Arc::new(service), Arc::new(std::sync::Mutex::new(updates)));
+    let names = |service: &SearchService, updates: &std::sync::Mutex<_>| {
+        search_names(service, &updates.lock().unwrap(), "shared").unwrap()
+    };
+    assert_eq!(names(&service, &updates), vec!["before.txt"]);
+
+    let reopen = {
+        let (service, updates, target) = (service.clone(), updates.clone(), p.clone());
+        quicksearch_core::db::hold_index(move |path| {
+            if path == target {
+                assert_eq!(names(&service, &updates), vec!["before.txt"]);
+            }
+        })
+    };
+    quicksearch_core::db::remove_index_files(&p).unwrap();
+    drop(reopen);
+    // Not through a removal, so nothing bumps the epoch from here on.
+    std::fs::copy(&replacement, &p).unwrap();
+
+    assert_eq!(
+        names(&service, &updates),
+        vec!["after.txt"],
+        "a reader reopened during the removal kept serving the deleted index"
+    );
+    // Dropped, not shut down: a removal elsewhere in this binary may hold the
+    // withdrawn hook, and its clone of the service, a moment longer.
 }
 
 /// An explicit release must leave the file closed even when a search was
@@ -1565,10 +1856,10 @@ fn a_wildcard_spanning_the_directory_boundary_is_still_found() {
 fn the_folder_filter_covers_the_folder_itself_and_its_subtree() {
     let (_dir, p) = Scratch::db("folderself");
     let mut s = Seeder::new(&p);
-    let own = s.add("top.txt", "/srv/data", 1, None);
-    let nested = s.add("deep.txt", "/srv/data/2024", 2, None);
-    let _sibling = s.add("other.txt", "/srv/data-archive", 3, None);
-    let _outside = s.add("far.txt", "/srv", 4, None);
+    let own = s.add_native("top.txt", "/srv/data", 1, None);
+    let nested = s.add_native("deep.txt", "/srv/data/2024", 2, None);
+    let _sibling = s.add_native("other.txt", "/srv/data-archive", 3, None);
+    let _outside = s.add_native("far.txt", "/srv", 4, None);
     let conn = s.done();
 
     let (hits, _) = run_collect(&conn, "txt folder:/srv/data", &SearchOptions::default());

@@ -9,10 +9,10 @@ use quicksearch_core::config::ColumnsConfig;
 use quicksearch_core::live::{LiveUpdate, Target, WindowUpdate};
 use quicksearch_core::search::{MatchField, SearchHit, SearchUpdate};
 use quicksearch_core::snippet::Snippet;
+use quicksearch_core::textenc::one_line;
 
 use crate::color::rank_tier_color;
 use crate::format::{fmt_mtime, fmt_search_times, human_size};
-use crate::platform;
 use crate::spotlight::{Spot, Spotlit};
 
 mod help_window;
@@ -85,6 +85,21 @@ pub struct SearchActions {
     /// Replace the live-result watch set. `Some(vec![])` clears it; `None`
     /// leaves whatever is registered alone.
     pub live_targets: Option<Vec<Target>>,
+    /// Open this file with the desktop's default application. Opening and
+    /// revealing are the app's to do, so a test never launches anything.
+    pub open_file: Option<String>,
+    /// Show this file selected in the file manager.
+    pub reveal: Option<String>,
+}
+
+/// Where the results table scrolls on its next frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollTo {
+    /// A new result set: its best hits are at the top, wherever the last
+    /// one was scrolled to.
+    Top,
+    /// The keyboard moved the selection: its row comes into view.
+    Selection,
 }
 
 /// Whether to point the live watchers at the visible rows this frame:
@@ -410,6 +425,10 @@ pub struct SearchTab {
     sort: (SortKey, bool),
     sort_dirty: bool,
     pub selected: Option<u32>,
+    /// Applied once, by the next frame's table.
+    scroll: Option<ScrollTo>,
+    /// Whole rows the table showed last frame: a PageUp/PageDown step.
+    page_rows: usize,
     pub running: bool,
     search_started: Option<Instant>,
     /// Time from the search starting to its first hit arriving. Taken when the
@@ -436,6 +455,9 @@ pub struct SearchTab {
     /// .hovered()` is false whenever a selectable label wins the hit-test.
     hovered_row: Option<usize>,
     focus_query: bool,
+    /// The query box's id as of last frame. The table keys are taken before
+    /// the box is laid out, so this is how they know it has focus.
+    query_id: Option<egui::Id>,
     highlight: crate::query_highlight::HighlightCache,
     /// Last frame's Content Match cell rects, the capture driver's targets.
     #[cfg(feature = "capture")]
@@ -464,6 +486,8 @@ impl SearchTab {
             sort: (SortKey::Rank, true),
             sort_dirty: false,
             selected: None,
+            scroll: None,
+            page_rows: 1,
             running: false,
             search_started: None,
             first_hit: None,
@@ -478,6 +502,7 @@ impl SearchTab {
             dragged_col: None,
             hovered_row: None,
             focus_query: true,
+            query_id: None,
             highlight: Default::default(),
             #[cfg(feature = "capture")]
             capture_match_rects: Vec::new(),
@@ -710,8 +735,8 @@ impl SearchTab {
 
     /// One column header: label, sort indicator, sort click, and the
     /// column-picker context menu (`key` is `None` for a non-sorting header).
-    /// The indicator is a painter-drawn triangle, since the fonts have no ▲/▼
-    /// glyphs.
+    /// The indicator is a painter-drawn triangle, since the bundled fonts have
+    /// no ▲/▼ glyphs.
     fn header_cell(
         &mut self,
         ui: &mut egui::Ui,
@@ -796,6 +821,7 @@ impl SearchTab {
         if self.swap_pending && self.opacity <= 0.0 {
             self.results = std::mem::take(&mut self.staging);
             self.selected = None;
+            self.scroll = Some(ScrollTo::Top);
             self.swap_pending = false;
             self.cover = 1.0;
             self.sort_dirty = true;
@@ -930,6 +956,7 @@ impl SearchTab {
                             }
                         },
                     );
+                    self.table_keys(ui, actions);
                     let width = ui.available_width();
                     let highlight = &mut self.highlight;
                     let mut layouter =
@@ -949,8 +976,13 @@ impl SearchTab {
                             .hint_text(
                                 "Search names and contents…  (type:Document regex:… budget*)",
                             )
+                            // egui's Enter ends the edit, and every keystroke
+                            // after it is lost until a click. Enter opens a
+                            // result instead (see `table_keys`).
+                            .return_key(None)
                             .layouter(&mut layouter),
                     );
+                    self.query_id = Some(response.id);
                     let response = response.spot(Spot::SearchBar);
                     if self.focus_query {
                         response.request_focus();
@@ -1005,6 +1037,61 @@ impl SearchTab {
                 },
             );
         });
+    }
+
+    /// Up/Down and PageUp/PageDown move the selection through the rows in
+    /// display order and Enter opens it, or the top row, while focus stays in
+    /// the query box. Taken before the box is laid out, since it would move
+    /// its cursor on the arrows. Unmodified keys only: egui's key matching
+    /// ignores Shift and Alt, and Shift+arrows select text in the box.
+    fn table_keys(&mut self, ui: &mut egui::Ui, actions: &mut SearchActions) {
+        if !self
+            .query_id
+            .is_some_and(|id| ui.memory(|m| m.has_focus(id)))
+        {
+            return;
+        }
+        let page = self.page_rows.max(1) as isize;
+        let (step, enter) = ui.input_mut(|i| {
+            if !i.modifiers.is_none() {
+                return (0, false);
+            }
+            let mut step = 0;
+            for (key, by) in [
+                (egui::Key::ArrowUp, -1),
+                (egui::Key::ArrowDown, 1),
+                (egui::Key::PageUp, -page),
+                (egui::Key::PageDown, page),
+            ] {
+                step += by * i.count_and_consume_key(egui::Modifiers::NONE, key) as isize;
+            }
+            (step, i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        });
+        // Rows that do not answer the text in the box yet are nobody's choice.
+        if self.swap_pending || self.pending_edit.is_some() {
+            return;
+        }
+        // A batch since the last frame may have reordered `results`.
+        if self.sort_dirty {
+            self.resort();
+        }
+        if step != 0 && !self.order.is_empty() {
+            // No selection sits just above the first row.
+            let at = self
+                .selected
+                .and_then(|s| self.order.iter().position(|&ix| ix == s))
+                .map_or(-1, |at| at as isize);
+            let to = (at + step).clamp(0, self.order.len() as isize - 1);
+            self.selected = Some(self.order[to as usize]);
+            self.scroll = Some(ScrollTo::Selection);
+        }
+        if enter {
+            actions.open_file = self
+                .selected
+                .or_else(|| self.order.first().copied())
+                .and_then(|ix| self.results.get(ix as usize))
+                .map(|hit| hit.path.clone());
+        }
     }
 
     /// The session-ignore chips, then one line: an error, the display limit,
@@ -1131,6 +1218,19 @@ impl SearchTab {
         self.col_requested = targets;
 
         let mut measured: Vec<f32> = Vec::with_capacity(plans.len());
+        let both_clicks_now = ui.input(|i| {
+            let release = |e: &&egui::Event| {
+                matches!(
+                    e,
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    }
+                )
+            };
+            i.events.iter().filter(release).count() >= 2
+        });
         let table_scroll = ui
             .push_id("results", |ui| {
                 // Changing the column count makes egui_extras drop dragged
@@ -1148,6 +1248,18 @@ impl SearchTab {
                             .at_most(hi)
                             .clip(true),
                     );
+                }
+                match self.scroll.take() {
+                    Some(ScrollTo::Top) => table = table.vertical_scroll_offset(0.0),
+                    Some(ScrollTo::Selection) => {
+                        let row = self
+                            .selected
+                            .and_then(|s| order.iter().position(|&ix| ix == s));
+                        if let Some(row) = row {
+                            table = table.scroll_to_row(row, None);
+                        }
+                    }
+                    None => {}
                 }
 
                 table
@@ -1202,32 +1314,48 @@ impl SearchTab {
                             if response.contains_pointer() {
                                 hovered_now = Some(display_ix);
                             }
+                            // egui_extras ids a row by its slot, not its file,
+                            // and a batch can re-sort the rows between two
+                            // clicks or under an open menu. So a double-click
+                            // opens only the file its first click chose, and
+                            // the menu is keyed to the file it was opened on.
+                            // Both clicks in one slow frame landed on this
+                            // frame's rows, before either could select.
+                            let chosen = self.selected == Some(result_ix as u32) || both_clicks_now;
                             if response.clicked() || response.secondary_clicked() {
                                 self.selected = Some(result_ix as u32);
                             }
-                            if response.double_clicked() {
-                                platform::open_file(&self.results[result_ix].path);
+                            // Focus goes back to the query box, caret where it
+                            // was, so the arrows go on moving the selection
+                            // and typing goes on editing the query.
+                            if let Some(id) = self.query_id.filter(|_| response.clicked()) {
+                                response.ctx.memory_mut(|m| m.request_focus(id));
                             }
-                            response.context_menu(|ui| {
-                                let path = self.results[result_ix].path.clone();
-                                if ui.button("Open containing folder").clicked() {
-                                    platform::reveal_in_folder(&path);
-                                    ui.close();
-                                }
-                                if ui.button("Open File").clicked() {
-                                    platform::open_file(&path);
-                                    ui.close();
-                                }
-                                if ui.button("Copy path").clicked() {
-                                    ui.ctx().copy_text(path.clone());
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if ui.button("Build ignore filter…").clicked() {
-                                    open_ignore_dialog = Some(result_ix);
-                                    ui.close();
-                                }
-                            });
+                            let hit = &self.results[result_ix];
+                            if response.double_clicked() && chosen {
+                                actions.open_file = Some(hit.path.clone());
+                            }
+                            egui::Popup::context_menu(&response)
+                                .id(egui::Id::new(("result-menu", hit.file_id)))
+                                .show(|ui| {
+                                    if ui.button("Open containing folder").clicked() {
+                                        actions.reveal = Some(hit.path.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("Open File").clicked() {
+                                        actions.open_file = Some(hit.path.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("Copy path").clicked() {
+                                        ui.ctx().copy_text(hit.path.clone());
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button("Build ignore filter…").clicked() {
+                                        open_ignore_dialog = Some(result_ix);
+                                        ui.close();
+                                    }
+                                });
                         });
                     })
             })
@@ -1238,6 +1366,8 @@ impl SearchTab {
         }
         self.order = order;
         actions.save_columns = picked;
+        let row_pitch = text_height + ui.spacing().item_spacing.y;
+        self.page_rows = ((table_scroll.inner_rect.height() / row_pitch) as usize).max(1);
         crate::ui_util::more_below_hint(ui, &table_scroll);
         self.hovered_row = hovered_now;
         #[cfg(feature = "capture")]
@@ -1310,7 +1440,8 @@ fn cell(
                 .then(|| whole_field_ranges(hit.snippet.as_ref(), &hit.name))
                 .flatten()
                 .unwrap_or(&[]);
-            let mut job = marked_field_job(ui, &hit.name, marks);
+            // The marks index the flattened name too: `one_line` keeps bytes.
+            let mut job = marked_field_job(ui, &one_line(&hit.name), marks);
             if missing {
                 mark_missing_job(ui, &mut job, true);
             }
@@ -1323,13 +1454,14 @@ fn cell(
                 .then(|| whole_field_ranges(hit.snippet.as_ref(), &hit.path))
                 .flatten()
                 .unwrap_or(&[]);
+            let path = one_line(&hit.path);
             let (mut job, elided) = if ui.is_sizing_pass() {
                 // Sizing-pass rects are not final: don't elide.
-                (marked_field_job(ui, &hit.path, marks), false)
+                (marked_field_job(ui, &path, marks), false)
             } else {
                 path_cell_job(
                     ui,
-                    &hit.path,
+                    &path,
                     marks,
                     // Slack against egui layout rounding.
                     ui.available_width() - 1.0,
@@ -1343,7 +1475,7 @@ fn cell(
             // galley.
             let response = ui.add(egui::Label::new(job).show_tooltip_when_elided(false));
             if elided {
-                response.on_hover_text(&hit.path)
+                response.on_hover_text(&*path)
             } else {
                 response
             }

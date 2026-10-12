@@ -1,6 +1,10 @@
 //! Syntax highlighting for the search box. [`classify`] mirrors
 //! `split_for_cascade` branch for branch: it must never claim something is a
-//! filter (or a wildcard) that the engine treats as plain text.
+//! filter (or a wildcard) that the engine treats as plain text. Literal
+//! chains (`std::string`, `Re: meeting`) take their extent from the engine's
+//! own `literal_chain`, so a filter after whitespace chips in both. A
+//! recognized key with an invalid value is marked as an error, as the engine
+//! rejects it.
 //!
 //! Colors: keywords red, arguments blue, syntax characters green, invalid
 //! arguments error-colored; a complete recognized filter gets a chip tint.
@@ -12,7 +16,8 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, Galley, Stroke};
 use quicksearch_core::query::lexer::{tokenize_spanned, Token};
 use quicksearch_core::query::pattern::RegexQuery;
-use quicksearch_core::query::translator::{build_filter, is_filter_key};
+use quicksearch_core::query::split::literal_chain;
+use quicksearch_core::query::translator::{check_filter, is_filter_key, is_regex_key};
 use quicksearch_core::query::Op;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,74 +58,53 @@ pub fn classify(text: &str) -> Vec<Seg> {
     let mut regex_seen = false;
 
     while i < tokens.len() {
-        match &tokens[i].0 {
-            Token::Word(word) => {
-                let Some((op, op_end, value_idx)) = filter_shape(&tokens, i) else {
-                    em.emit_word(span(i), Class::Plain, false, false);
-                    i += 1;
-                    continue;
-                };
-                let is_regex = word.eq_ignore_ascii_case("regex");
-                let known = is_regex || is_filter_key(word);
-                let value = match tok(value_idx) {
-                    Some(Token::Word(v) | Token::Quoted(v)) => Some(v),
-                    _ => None,
-                };
-                match value {
-                    // A complete recognized filter.
-                    Some(value) if known => {
-                        let value_is_word = matches!(tok(value_idx), Some(Token::Word(_)));
-                        let valid = if is_regex {
-                            let first = !regex_seen;
-                            regex_seen = true;
-                            first && op == Op::Contains && RegexQuery::new(value).is_ok()
-                        } else {
-                            build_filter(word, op, value, value_is_word).is_ok()
-                        };
-                        em.emit(span(i), Class::Keyword, true, false);
-                        em.emit_all(&tokens, i + 1..=op_end, Class::Operator, true);
-                        let vspan = span(value_idx);
-                        if !valid {
-                            em.emit(vspan, Class::InvalidArg, true, true);
-                        } else if !value_is_word {
-                            em.emit_quoted(vspan, Class::Argument, true);
-                        } else if glob_value_key(word) {
-                            em.emit_word(vspan, Class::Argument, true, true);
-                        } else {
-                            em.emit(vspan, Class::Argument, true, true);
-                        }
-                        i = value_idx + 1;
+        if let Some((key, op, op_end, value_idx)) = filter_shape(&tokens, i) {
+            let is_regex = is_regex_key(key);
+            match tok(value_idx) {
+                // A complete recognized filter.
+                Some(Token::Word(value) | Token::Quoted(value)) => {
+                    let value_is_word = matches!(tok(value_idx), Some(Token::Word(_)));
+                    let valid = if is_regex {
+                        let first = !regex_seen;
+                        regex_seen = true;
+                        first && op == Op::Contains && RegexQuery::new(value).is_ok()
+                    } else {
+                        check_filter(key, op, value, value_is_word).is_ok()
+                    };
+                    em.emit(span(i), Class::Keyword, true, false);
+                    em.emit_all(&tokens, i + 1..=op_end, Class::Operator, true);
+                    let vspan = span(value_idx);
+                    if !valid {
+                        em.emit(vspan, Class::InvalidArg, true, true);
+                    } else if !value_is_word {
+                        em.emit_quoted(vspan, Class::Argument, true);
+                    } else if glob_value_key(key) {
+                        em.emit_word(vspan, Class::Argument, true, true);
+                    } else {
+                        em.emit(vspan, Class::Argument, true, true);
                     }
-                    // Unrecognized key: the engine reassembles the chain
-                    // verbatim (stars stay literal); render plain.
-                    Some(_) => {
-                        em.emit_all(&tokens, i..=op_end, Class::Plain, false);
-                        em.emit_glued_value(span(value_idx), tok(value_idx));
-                        i = value_idx + 1;
-                        while let Some(Token::Op(_)) = tok(i) {
-                            em.emit(span(i), Class::Plain, false, false);
-                            i += 1;
-                            if let Some(Token::Word(_) | Token::Quoted(_)) = tok(i) {
-                                em.emit_glued_value(span(i), tok(i));
-                                i += 1;
-                            }
-                        }
-                    }
-                    // Mid-typing `type:`: recognized keys color
-                    // optimistically but earn no chip until complete.
-                    None => {
-                        let (key_class, op_class) = if known {
-                            (Class::Keyword, Class::Operator)
-                        } else {
-                            (Class::Plain, Class::Plain)
-                        };
-                        em.emit(span(i), key_class, false, false);
-                        em.emit_all(&tokens, i + 1..=op_end, op_class, false);
-                        i = op_end + 1;
-                    }
+                    i = value_idx + 1;
                 }
-                continue;
+                // Mid-typing `type:`: recognized keys color optimistically
+                // but earn no chip until complete.
+                _ => {
+                    em.emit(span(i), Class::Keyword, false, false);
+                    em.emit_all(&tokens, i + 1..=op_end, Class::Operator, false);
+                    i = op_end + 1;
+                }
             }
+            continue;
+        }
+        // The engine searches a chain as one literal (stars included).
+        if let Some((_, end)) = literal_chain(&tokens, i) {
+            for j in i..end {
+                em.emit_glued_value(span(j), tok(j));
+            }
+            i = end;
+            continue;
+        }
+        match &tokens[i].0 {
+            Token::Word(_) => em.emit_word(span(i), Class::Plain, false, false),
             Token::Quoted(_) => em.emit_quoted(span(i), Class::Plain, false),
             Token::And | Token::Or | Token::LParen | Token::RParen | Token::Op(_) => {
                 em.emit(span(i), Class::Plain, false, false);
@@ -138,15 +122,19 @@ pub fn classify(text: &str) -> Vec<Seg> {
     em.finish(text.len())
 }
 
-/// The `Word(key) Op [Op]` shape at `i`, as `split_for_cascade` sees it: the
-/// operator, the index of its last token, and where the value would be.
-fn filter_shape(tokens: &[Spanned], i: usize) -> Option<(Op, usize, usize)> {
-    let Some((Token::Op(op1), _)) = tokens.get(i + 1) else {
+/// The `Word(key) Op [Op]` shape of a recognized key at `i`, as
+/// `split_for_cascade` sees it: the key, the operator, the index of its last
+/// token, and where the value would be.
+fn filter_shape(tokens: &[Spanned], i: usize) -> Option<(&str, Op, usize, usize)> {
+    let (Token::Word(key), Some((Token::Op(op1), _))) = (&tokens[i].0, tokens.get(i + 1)) else {
         return None;
     };
+    if !is_filter_key(key) && !is_regex_key(key) {
+        return None;
+    }
     Some(match tokens.get(i + 2) {
-        Some((Token::Op(op2), _)) => (*op2, i + 2, i + 3),
-        _ => (*op1, i + 1, i + 2),
+        Some((Token::Op(op2), _)) => (key, *op2, i + 2, i + 3),
+        _ => (key, *op1, i + 1, i + 2),
     })
 }
 

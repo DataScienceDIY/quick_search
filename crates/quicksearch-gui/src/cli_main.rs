@@ -16,10 +16,14 @@ mod keychain;
 #[allow(dead_code)]
 mod version;
 
+use std::io::Write;
+
 fn main() {
-    // `None` means "no query given"; this binary has no GUI to fall back to.
-    let code = cli::maybe_run_cli().unwrap_or_else(|| {
-        eprintln!("{}", cli::USAGE);
+    // `None` means "no arguments"; this binary has no GUI to fall back to.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let code = cli::maybe_run_cli(&args).unwrap_or_else(|| {
+        // Not `eprintln!`, which panics on a closed stderr (`src/cli.rs`).
+        let _ = writeln!(std::io::stderr(), "{}", cli::USAGE);
         2
     });
     std::process::exit(code);

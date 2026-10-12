@@ -16,6 +16,11 @@
 //! [`indexprobe`](indexprobe.rs) prices the read cost of a sample size. The
 //! traversal walks the default [`IgnoreSet`]; `--ignore` adds to it.
 
+// Timed on the allocator the shipped binaries install; see
+// `platform::Allocator`.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
 mod common;
 
 use std::collections::HashMap;
@@ -180,10 +185,11 @@ fn scan(
         for root in roots {
             for entry in filtered_walk(
                 root,
-                config.indexing.follow_symlinks,
                 config.indexing.include_hidden,
                 &ignore,
                 &failures,
+                None,
+                false,
             ) {
                 if !entry.file_type().is_file() {
                     errors.irregular += 1;
@@ -422,7 +428,7 @@ fn collide(roots: &[String], workers: usize, ignore: &[String], verify_budget: O
         io.syscr,
     );
     eprintln!(
-        "skipped {} empty, {} irregular (symlink/FIFO/device), {} unreadable",
+        "skipped {} empty, {} irregular (FIFO/device/socket), {} unreadable",
         errors.empty, errors.irregular, errors.unreadable,
     );
     eprintln!(

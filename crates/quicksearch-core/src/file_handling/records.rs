@@ -16,8 +16,8 @@ use crate::db::repo::{self, NewFile};
 use crate::extract::{Registry, Scratch};
 use crate::mime::{guess_mime_from_head, mime_to_type, FileType};
 
-/// One directory's indexed files, as `name -> mtime`.
-pub type DirRows = HashMap<String, u64>;
+/// One directory's indexed files, as `name -> stamp`.
+pub type DirRows = HashMap<String, Stamp>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileIndexAction {
@@ -26,15 +26,53 @@ pub enum FileIndexAction {
     Insert,
 }
 
-/// Decide what Phase 1 should do with a file from its stored mtime, `None`
-/// when it has no row. For a resolved symlink target that is the row under
-/// the target's own path: its link's directory rows would read it as
-/// `Insert`, and `INSERT OR IGNORE` would silently not update it.
-pub fn classify_by_mtime(stored: Option<u64>, mtime: u64) -> FileIndexAction {
+/// What [`classify`] compares: a file's whole-second mtime, its size, and
+/// whether its head was hashed. Sub-second times are not stored; DESIGN.md
+/// lists that under its deliberate omissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    pub mtime: u64,
+    pub size: u64,
+    /// For a row, whether it was stored with a hash: `false` only for a
+    /// dehydrated cloud file, indexed unread. For a file on disk, whether it
+    /// can be hashed without recalling it.
+    pub hashed: bool,
+}
+
+impl Stamp {
+    /// What a `stat` says about the file now.
+    pub fn of(meta: &std::fs::Metadata) -> Stamp {
+        Stamp {
+            mtime: mtime_secs(meta),
+            size: meta.len(),
+            hashed: !crate::platform::is_cloud_placeholder(meta),
+        }
+    }
+
+    /// What a prepared record describes: the file as it was opened.
+    pub fn of_record(rec: &OwnedNewFile) -> Stamp {
+        Stamp {
+            mtime: rec.mtime,
+            size: rec.size,
+            hashed: rec.hash.is_some(),
+        }
+    }
+}
+
+/// Decide what Phase 1 should do with a file: `stored` is its row's stamp,
+/// `None` when it has no row, and `seen` the disk's. Unchanged means the same
+/// mtime and size and no hash still owed: a row stored unhashed is read again
+/// once its file can be hashed, while a hashed row whose file has since
+/// dehydrated stays as it is.
+pub fn classify(stored: Option<Stamp>, seen: Stamp) -> FileIndexAction {
     match stored {
-        Some(known) if known == mtime => FileIndexAction::Skip,
-        Some(_) => FileIndexAction::Update,
         None => FileIndexAction::Insert,
+        Some(row)
+            if row.mtime == seen.mtime && row.size == seen.size && (row.hashed || !seen.hashed) =>
+        {
+            FileIndexAction::Skip
+        }
+        Some(_) => FileIndexAction::Update,
     }
 }
 
@@ -50,12 +88,14 @@ pub(crate) fn safe_truncate(s: &mut String, max_bytes: usize) {
 }
 
 /// A file's modified time in whole seconds, the unit `files.mtime` stores and
-/// every unchanged-file check compares; `None` when the platform has none.
-pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> Option<u64> {
+/// [`classify`] compares. A time before 1970, or none at all (a zero
+/// `FILETIME`), clamps to 0: such a file is still indexed, though a change
+/// between two pre-1970 times shows only if the size moves too.
+pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
     meta.modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A SHA-256 digest, held inline rather than as a `Vec` so hashing allocates
@@ -65,20 +105,25 @@ pub type FileHash = [u8; 32];
 /// Identify a file as `sha256(size || first hash_length bytes)`, leaving the
 /// head bytes in `head` for MIME sniffing. The cost is a collision class:
 /// same-size files with identical heads read as duplicates
-/// (`examples/hashprobe.rs` has the study); `crate::verify` is the way out.
+/// (`examples/hashprobe.rs` measures it); `crate::verify` is the way out.
+///
+/// Returned with the opened handle's metadata, which is where the hashed size
+/// comes from: a record built from it describes the file that was read, not
+/// the one an earlier `stat` saw.
 ///
 /// `head` is the caller's buffer, reused file after file; it is resized to
 /// the bytes actually read and its previous contents are discarded.
 pub fn get_file_hash(
-    size: u64,
     path: &Path,
     hash_length: usize,
     head: &mut Vec<u8>,
-) -> Result<FileHash, std::io::Error> {
+) -> Result<(FileHash, std::fs::Metadata), std::io::Error> {
     // The caller's `is_file()` came from a `stat` taken before this open; a
     // FIFO renamed over the name in between would block this walk worker
-    // forever and park the pool behind it. See `platform::open_regular_file`.
-    let mut f: File = crate::platform::open_regular_file(path)?;
+    // forever and park the pool behind it. See `platform::open_regular_file`,
+    // whose `fstat` also answers for the size.
+    let (mut f, meta): (File, _) = crate::platform::open_regular_file(path)?;
+    let size = meta.len();
     head.clear();
     head.resize(size.min(hash_length as u64) as usize, 0);
     f.read_exact(head)?;
@@ -86,7 +131,7 @@ pub fn get_file_hash(
     let mut hasher = Sha256::new();
     hasher.update(size.to_le_bytes());
     hasher.update(&*head);
-    Ok(hasher.finalize().into())
+    Ok((hasher.finalize().into(), meta))
 }
 
 /// Run the FTS5 special command `cmd` with `value`. Best-effort: failure is
@@ -315,9 +360,13 @@ pub fn hash_failure_counts() -> (u64, u64) {
     (HASH_FAILURES.seen(), HASH_FAILURES.suppressed())
 }
 
-/// Build the `files` row for one on-disk file from a `stat` the caller
-/// already holds. Returns `None` for anything that isn't a readable regular
-/// file.
+/// Build the `files` row for one on-disk file. Returns `None` for anything
+/// that isn't a readable regular file.
+///
+/// `meta` is the caller's `stat`, which decides only whether to open the
+/// file: the row's size and mtime come from the opened handle, so its stamp
+/// is the one its hash was read under. A dehydrated cloud file, which is
+/// never opened, is the exception.
 ///
 /// `path` must be canonical, in stored spelling, and must still name the file
 /// once parsed back into a [`Path`], since this opens it by that string; a
@@ -335,26 +384,24 @@ pub fn prepare_file_record(
         return None;
     }
 
-    let size = meta.len();
-    let mtime = mtime_secs(meta)?;
-
-    // A dehydrated cloud file is indexed from its metadata alone: reading
-    // even the first byte would block on downloading the whole file.
+    // A dehydrated cloud file is indexed from the caller's `stat` alone:
+    // opening it, let alone reading a byte, could recall the whole file. Its
+    // row is born NA, but other routes can make it pending again, so the
+    // content pass (`decide_content`) and the live view re-check.
     let dehydrated = crate::platform::is_cloud_placeholder(meta);
 
-    let hash = if dehydrated {
+    let (size, mtime, hash) = if dehydrated {
         // No head either: an empty buffer sniffs to the extension's answer,
         // which is all a placeholder can be classified by.
         scratch.head_buffer().clear();
-        None
+        (meta.len(), mtime_secs(meta), None)
     } else {
         match get_file_hash(
-            size,
             Path::new(path),
             config.processing.hash_length,
             scratch.head_buffer(),
         ) {
-            Ok(hash) => Some(hash),
+            Ok((hash, opened)) => (opened.len(), mtime_secs(&opened), Some(hash)),
             Err(e) => {
                 // Throttled: on Windows a file another process holds open
                 // fails here as a matter of course.
@@ -408,7 +455,8 @@ pub fn prepare_file_record(
 /// Extract content for one pending file and record the outcome on its row
 /// ([`repo::complete_pending`]). `mime` is authoritative, including when it
 /// is `None`: the head was already sniffed by [`prepare_file_record`], and
-/// re-sniffing gives the same answer.
+/// re-sniffing gives the same answer. `scratch` is the caller's, the one
+/// that sniffed the head.
 pub fn extract_and_store(
     tx: &rusqlite::Transaction<'_>,
     file_id: i64,
@@ -416,11 +464,9 @@ pub fn extract_and_store(
     mime: Option<&str>,
     registry: &Registry,
     config: &Config,
+    scratch: &mut Scratch,
 ) -> Result<(), String> {
-    // One file, from the watcher or the CLI: no loop for a reused scratch to
-    // amortize over.
-    let mut scratch = Scratch::new(config);
-    let outcome = decide_content(path, mime, registry, config, &mut scratch);
+    let outcome = decide_content(path, mime, registry, config, scratch);
     let zstd = match outcome_body(&outcome) {
         Some(text) => repo::encode_one(text)?,
         None => None,
@@ -438,6 +484,9 @@ pub enum ContentOutcome {
     },
     NotApplicable,
     Failed(String),
+    /// A stop cut the extraction short ([`crate::extract::CANCELLED`]): the
+    /// row stays pending for the next run.
+    Cancelled,
 }
 
 /// Whether extraction will produce anything for this file. The single
@@ -469,6 +518,17 @@ pub fn decide_content(
     let Some(m) = mime.filter(|_| content_extractable(p, mime, config, registry)) else {
         return ContentOutcome::NotApplicable;
     };
+    // Asked of the disk, not the row: a placeholder's row is born NA, but a
+    // content reconcile, `retry_failed_files` or an interrupted run can make
+    // it pending again. One stat per extracted file, on Windows only; the
+    // link-level stat reads the placeholder's own attributes without
+    // following its reparse point.
+    if cfg!(windows)
+        && std::fs::symlink_metadata(p)
+            .is_ok_and(|meta| crate::platform::is_cloud_placeholder(&meta))
+    {
+        return ContentOutcome::NotApplicable;
+    }
     let mut text = String::new();
     // A panicking parser is contained by the registry and arrives as `Err`,
     // which becomes this row's recorded failure reason, not a dead worker.
@@ -480,6 +540,7 @@ pub fn decide_content(
             ContentOutcome::Done { text }
         }
         Ok(false) => ContentOutcome::NotApplicable,
+        Err(reason) if reason == crate::extract::CANCELLED => ContentOutcome::Cancelled,
         Err(reason) => ContentOutcome::Failed(reason),
     }
 }

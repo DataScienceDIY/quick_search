@@ -2,12 +2,15 @@
 
 use quicksearch_core::indexing::{MaintenanceStep, PrepStep};
 
-/// Human-readable byte size: `999 B`, `1.2 KB`, `4.7 MB`, `1.3 GB`.
+/// Human-readable byte size in decimal units (1 KB = 1000 bytes): `999 B`,
+/// `1.2 KB`, `4.7 MB`, `1.3 GB`.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
+    // 999.95 is the smallest value `{:.1}` rounds to 1000.0, so the unit
+    // moves up before the rounding could print `1000.0 KB`.
+    while value >= 999.95 && unit < UNITS.len() - 1 {
         value /= 1000.0;
         unit += 1;
     }
@@ -230,6 +233,25 @@ mod tests {
         assert_eq!(human_size(1200), "1.2 KB");
         assert_eq!(human_size(4_700_000), "4.7 MB");
         assert_eq!(human_size(1_300_000_000), "1.3 GB");
+    }
+
+    /// The unit is chosen after the rounding, so no size reads `1000.0 KB`.
+    #[test]
+    fn sizes_change_unit_where_the_rounding_reaches_1000() {
+        assert_eq!(human_size(1_000), "1.0 KB");
+        assert_eq!(human_size(1_000_000), "1.0 MB");
+        // 999.95 of a unit is the first amount that rounds to 1000.0.
+        for (scale, unit, next) in [
+            (1, "KB", "MB"),
+            (1_000, "MB", "GB"),
+            (1_000_000, "GB", "TB"),
+        ] {
+            assert_eq!(human_size(999_950 * scale - 1), format!("999.9 {unit}"));
+            assert_eq!(human_size(999_950 * scale), format!("1.0 {next}"));
+            assert_eq!(human_size(1_000_000 * scale - 1), format!("1.0 {next}"));
+        }
+        // TB is the last unit, so it alone may pass 1000.
+        assert_eq!(human_size(u64::MAX), "18446744.1 TB");
     }
 
     #[test]

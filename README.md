@@ -29,8 +29,8 @@ tracking: https://github.com/DataScienceDIY/quick_search
 - **Query filters**: narrow a search by kind, date or location, e.g.
   `budget type:Document modified:>=2024-01-01`, plus wildcards and regular
   expressions. The in-app "?" window lists the syntax.
-- **Live results**: results on screen pick up renames, edits and deletions
-  within a second, even while indexing is paused.
+- **Live results**: results on screen pick up renames, edits and deletions,
+  even while indexing is paused.
 - **Duplicate finder**: groups files that look identical and verifies a group
   byte for byte on request. It never deletes.
 - **Always fresh**: folders are watched and periodically reindexed, or, in
@@ -59,7 +59,8 @@ build.bat           # Windows
 ```
 
 These take a fresh machine to a running app: they install missing build
-dependencies (with your permission), build a release binary, and launch it.
+dependencies (via sudo or winget, and Rust via rustup), build a release binary,
+and launch it. `--check` lists what is missing and installs nothing.
 
 ```sh
 cargo build --release -p quicksearch-gui   # binaries: target/release/quicksearch{,-cli}
@@ -82,8 +83,9 @@ cargo test --release --workspace           # test suite (release: debug Argon2 t
 Settings live in `~/.config/quicksearch/config.toml` (Windows:
 `%APPDATA%\quicksearch\config.toml`), created on first run and edited live
 by the GUI. [config_example.toml](config_example.toml) is the full
-reference for every key. A `config.toml` placed next to the binary enables
-portable mode.
+reference for every key. A QuickSearch `config.toml` placed next to the
+binary (or the `.AppImage`) enables portable mode; another program's file of
+that name is ignored.
 
 ## More
 

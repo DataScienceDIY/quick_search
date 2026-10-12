@@ -29,17 +29,68 @@ pub fn redirect_null_stdio() {
     }
 }
 
-/// Opens a file with the desktop's default application, detached.
+/// Opens a file with the desktop's default application. On unix the first
+/// launcher that starts is reaped ([`spawn_reaped`]); Windows starts its
+/// launcher detached, which leaves no zombie there.
 pub fn open_file(path: &str) {
+    #[cfg(unix)]
+    {
+        // The next launcher only when this one could not start, never on its
+        // exit status: xdg-open runs the app in the foreground and returns
+        // the app's status, so falling through on one would open it twice.
+        let mut failure = None;
+        for mut launcher in open::commands(path) {
+            match spawn_reaped(&mut launcher) {
+                Ok(_) => return,
+                Err(e) => failure = Some(e),
+            }
+        }
+        if let Some(e) = failure {
+            quicksearch_core::log_warn!("open {}: {}", path, e);
+        }
+    }
+    #[cfg(not(unix))]
     if let Err(e) = open::that_detached(path) {
         quicksearch_core::log_warn!("open {}: {}", path, e);
     }
 }
 
+/// `cmd` with no stdio and a process group of its own: what it launches
+/// neither writes to the terminal we were started from nor receives its
+/// Ctrl+C or Ctrl+Z.
+#[cfg(unix)]
+fn detached(cmd: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+}
+
+/// Starts `cmd` [`detached`] and waits for it on a thread of its own, for as
+/// long as it runs: a child nobody waits for stays a zombie for the life of
+/// the app. Gives the child's pid. Should the thread not start, the child is
+/// dropped unwaited.
+#[cfg(unix)]
+fn spawn_reaped(cmd: &mut Command) -> std::io::Result<u32> {
+    let mut child = detached(cmd).spawn()?;
+    let pid = child.id();
+    let _ = std::thread::Builder::new()
+        .name("quicksearch-reap".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(pid)
+}
+
 /// Reveals a file in the system file manager with the file selected.
 ///
 /// Linux goes through `dbus-send` (no D-Bus library for one call), falling
-/// back to opening the parent directory.
+/// back to opening the parent directory, both on a thread of their own: a
+/// file manager that D-Bus has to start replies only once it is up, which
+/// the UI thread must not wait for.
 pub fn reveal_in_folder(path: &str) {
     #[cfg(target_os = "windows")]
     {
@@ -61,30 +112,38 @@ pub fn reveal_in_folder(path: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open").arg("-R").arg(path).spawn();
+        let _ = spawn_reaped(Command::new("open").arg("-R").arg(path));
         return;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         use std::path::Path;
-        let uri = format!("file://{}", uri_escape_path(path));
-        let ok = Command::new("dbus-send")
-            .args([
-                "--session",
-                "--print-reply",
-                "--dest=org.freedesktop.FileManager1",
-                "/org/freedesktop/FileManager1",
-                "org.freedesktop.FileManager1.ShowItems",
-                &format!("array:string:{}", uri),
-                "string:",
-            ])
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
-        if !ok {
-            let parent = Path::new(path).parent().unwrap_or(Path::new("/"));
-            let _ = Command::new("xdg-open").arg(parent).spawn();
-        }
+        let items = format!("array:string:file://{}", uri_escape_path(path));
+        let parent = Path::new(path)
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .to_owned();
+        // `status` waits for each, so both are reaped where they ran.
+        let _ = std::thread::Builder::new()
+            .name("quicksearch-reveal".to_string())
+            .spawn(move || {
+                // `--print-reply` makes the exit status the reply's; its
+                // printout goes nowhere.
+                let shown = detached(Command::new("dbus-send").args([
+                    "--session",
+                    "--print-reply",
+                    "--dest=org.freedesktop.FileManager1",
+                    "/org/freedesktop/FileManager1",
+                    "org.freedesktop.FileManager1.ShowItems",
+                    &items,
+                    "string:",
+                ]))
+                .status()
+                .is_ok_and(|status| status.success());
+                if !shown {
+                    let _ = detached(Command::new("xdg-open").arg(parent)).status();
+                }
+            });
     }
 }
 
@@ -174,12 +233,12 @@ fn which(program: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
 }
 
-/// Open the desktop's keyboard settings, detached, so the user can bind
-/// `quicksearch --toggle` without hunting for the page.
+/// Open the desktop's keyboard settings, reaped ([`spawn_reaped`]), so the
+/// user can bind `quicksearch --toggle` without hunting for the page.
 pub fn open_keyboard_settings() {
     #[cfg(all(unix, not(target_os = "macos")))]
     if let Some(settings) = keyboard_settings_command() {
-        if let Err(e) = Command::new(settings.program).args(settings.args).spawn() {
+        if let Err(e) = spawn_reaped(Command::new(settings.program).args(settings.args)) {
             quicksearch_core::log_warn!("opening {}: {}", settings.program, e);
         }
     }
@@ -226,5 +285,46 @@ mod tests {
     fn an_unknown_desktop_offers_nothing() {
         assert!(super::keyboard_settings_for("").is_none());
         assert!(super::keyboard_settings_for("i3:sway").is_none());
+    }
+
+    /// Whether `/proc/<pid>` is gone within `secs`: a zombie keeps its entry
+    /// until it is waited for.
+    #[cfg(target_os = "linux")]
+    fn reaped_within(pid: u32, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// An exited launcher is waited for, not left a zombie for the life of
+    /// the app.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_reaped_leaves_no_zombie() {
+        let pid = super::spawn_reaped(&mut std::process::Command::new("true")).expect("spawn");
+        assert!(reaped_within(pid, 2), "pid {} was never reaped", pid);
+    }
+
+    /// A launched app has no stdio of ours and leads its own process group,
+    /// so the terminal's Ctrl+C never reaches it; it is reaped all the same
+    /// once it exits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launched_app_has_no_terminal_and_its_own_group() {
+        let pid = super::spawn_reaped(std::process::Command::new("sleep").arg("1")).expect("spawn");
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).expect("stat");
+        // `pid (comm) state ppid pgrp ...`; comm is `sleep`, free of spaces.
+        let pgrp = stat.split_whitespace().nth(4).expect("pgrp");
+        assert_eq!(pgrp, pid.to_string(), "not its own process group");
+        for fd in 0..3 {
+            let target = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)).expect("fd");
+            assert_eq!(target, std::path::Path::new("/dev/null"), "fd {}", fd);
+        }
+        assert!(reaped_within(pid, 5), "pid {} was never reaped", pid);
     }
 }

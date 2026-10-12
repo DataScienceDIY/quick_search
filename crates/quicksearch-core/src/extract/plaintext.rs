@@ -82,11 +82,13 @@ impl Extractor for PlaintextExtractor {
         mime.starts_with("text/") || EXTRA_TEXT_MIMES.contains(&mime)
     }
 
-    /// A file that shrank since the `fstat` keeps its prefix; one that grew is
-    /// read to the sized length; its mtime moved, so the next run re-extracts.
+    /// A file over the read cap fails; one that shrank since the `fstat`
+    /// keeps its prefix; one that grew is read to the sized length; its mtime
+    /// moved, so the next run re-extracts.
     fn extract(
         &self,
         path: &Path,
+        _mime: &str,
         out: &mut String,
         scratch: &mut Scratch,
     ) -> Result<(), ExtractError> {
@@ -96,12 +98,8 @@ impl Extractor for PlaintextExtractor {
         // whole to keep 256 KiB of it was the content pass's peak memory.
         let limits = scratch.limits();
         let cap = limits.read.min(limits.text.saturating_mul(2));
-        let mut f =
-            File::open(path).map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
-        let size = f
-            .metadata()
-            .map_err(|e| format!("plaintext read {}: {}", path.display(), e))?
-            .len() as usize;
+        let (mut f, meta) = super::open_for_extract(path, limits.read)?;
+        let size = meta.len() as usize;
 
         // procfs/sysfs/some FUSE mounts report zero size for files with content;
         // only they pay the read-to-EOF probe, capped against endless streams.

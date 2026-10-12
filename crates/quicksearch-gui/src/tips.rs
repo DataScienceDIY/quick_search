@@ -112,21 +112,6 @@ pub static REINDEX_INTERVAL: Tip = Tip {
     caution: None,
 };
 
-pub static FOLLOW_SYMLINKS: Tip = Tip {
-    title: "Follow symlinks",
-    body: "A symlink stands in for a file or folder stored somewhere else. \
-           Off, QuickSearch skips them, so nothing is indexed twice under two \
-           names. On, it indexes what they point at, under the real location \
-           rather than the link's.\n\n\
-           Turning this off removes the entries now out of reach; turning it \
-           on indexes what it now reaches. Neither rebuilds the index.",
-    examples: &[
-        "on when a folder you search lives outside your indexed folders and is reached \
-         through a link.",
-    ],
-    caution: None,
-};
-
 pub static INCLUDE_HIDDEN: Tip = Tip {
     title: "Include hidden files",
     body: "Files and folders the system keeps out of sight: names starting \
@@ -142,22 +127,6 @@ pub static INCLUDE_HIDDEN: Tip = Tip {
 };
 
 // --- Settings: Processing -------------------------------------------------
-
-pub static TOKENIZER: Tip = Tip {
-    title: "Tokenizer",
-    body: "How the text inside your files is cut up so that it can be \
-           searched.\n\n\
-           trigram indexes every run of three characters, so \"port\" also \
-           finds \"airport\", and it works for languages written without \
-           spaces. The other two index whole words: a smaller, faster index, \
-           but a search matches only from the start of a word.",
-    examples: &[
-        "trigram, the default, for finding a fragment anywhere inside a word.",
-        "unicode61 when you only search whole words and want the smallest, fastest index.",
-        "porter to also match English word endings, so \"running\" finds \"run\".",
-    ],
-    caution: Some("Changing this rebuilds the index from scratch."),
-};
 
 pub static HASH_LENGTH: Tip = Tip {
     title: "Hash sample size",
@@ -185,8 +154,8 @@ pub static MAX_STORED_TEXT: Tip = Tip {
            With the two settings below it, this has the most effect on how \
            big the index grows.",
     examples: &[
-        "262144, 256 KB, covers the whole of most documents.",
-        "65536, 64 KB, to shrink the index when you mostly search the opening pages.",
+        "262144, 256 KiB, covers the whole of most documents.",
+        "65536, 64 KiB, to shrink the index when you mostly search the opening pages.",
         "higher for long books, transcripts or logs you expect to search to the end.",
     ],
     caution: None,
@@ -198,9 +167,9 @@ pub static MAX_TEXT_FILE_SIZE: Tip = Tip {
            huge file cannot hold up an indexing run. They are still found by \
            name, size or date.",
     examples: &[
-        "52428800, 50 MB, the default, reads inside large logs, scanned PDFs and \
+        "52428800, 50 MiB, the default, reads inside large logs, scanned PDFs and \
          presentations that are mostly pictures.",
-        "2097152, 2 MB, to read ordinary documents only and leave anything larger \
+        "2097152, 2 MiB, to read ordinary documents only and leave anything larger \
          to be found by name.",
     ],
     caution: None,
@@ -228,9 +197,9 @@ pub static MAX_WAL_SIZE: Tip = Tip {
            A larger value makes indexing faster and searching during it \
            slower.",
     examples: &[
-        "2147483648, 2 GB, the default.",
-        "67108864, 64 MB, to favour searching while indexing runs.",
-        "0 to leave it to the database. Other values under 16 MB count as 16 MB.",
+        "2147483648, 2 GiB, the default.",
+        "67108864, 64 MiB, to favour searching while indexing runs.",
+        "0 to leave it to the database. Other values under 16 MiB count as 16 MiB.",
     ],
     caution: None,
 };
@@ -241,11 +210,9 @@ pub static COMPACT_INDEX: Tip = Tip {
            each file every word sits, which makes it several times smaller \
            and quicker to build.\n\n\
            Searches find exactly the same files either way, this simply trades \
-           reduced index size and faster indexing speed for slower searches. \
-           Only the trigram tokenizer can use this feature. Other tokenizers always \
-           record positions.",
+           reduced index size and faster indexing speed for slower searches.",
     examples: &[
-        "on, the default: 1.1 GB of text documents went from a 1.3 GB index to 219 MB, built 30% faster.",
+        "on, the default: 1.1 GiB of text documents went from a 1.3 GiB index to 219 MiB, built in a third less time.",
         "off when disk space is plentiful and you often search for phrases of common words.",
     ],
     caution: Some("Changing this rebuilds the index from scratch."),
@@ -268,12 +235,18 @@ pub static FUZZY_EDITS: Tip = Tip {
            Fuzzy is on. One edit is one letter added, removed or changed, so \
            \"repot\" is one edit from \"report\".\n\n\
            The allowance grows with what you type, one edit per three \
-           characters, up to this value, so short searches stay strict and \
-           three letters do not match half the index.",
+           letters (bytes, for non-ASCII text), up to this value. Short \
+           searches still match loosely: letters may drop off either end, so \
+           \"report\" also matches \"port\", and a three-letter search \
+           matches any two of its letters.\n\n\
+           At the default of 2, fuzzy content search reads every stored \
+           document for searches under 9 letters, and each edit above 2 adds \
+           three letters to that.",
     examples: &[
         "2, the default: one edit for words of three to five letters, two for longer ones.",
         "0 turns typo matching off, even with the Fuzzy box ticked.",
-        "3 or more is allowed, but searches slow down and pull in many unrelated files.",
+        "3 up to the maximum of 8 is allowed, but searches slow down and pull in many \
+         unrelated files.",
     ],
     caution: None,
 };
@@ -339,10 +312,10 @@ pub static DEBOUNCE: Tip = Tip {
 pub static LIVE_RESULTS: Tip = Tip {
     title: "Live results",
     body: "Keeps the rows on screen current as their files change. A rename, \
-           edit or deletion made elsewhere shows here within a second, read \
-           from the file itself rather than from the index. Each row is also \
-           checked against the disk as it scrolls into view, which corrects a \
-           stale index; on a network share that check is all you get.\n\n\
+           edit or deletion made elsewhere shows here, read from the file \
+           itself rather than from the index. Each row is also checked \
+           against the disk as it scrolls into view, which corrects a stale \
+           index; on a network share that check is all you get.\n\n\
            Only visible rows are watched, and only until you change the \
            search. Nothing is added, removed or re-sorted while you read.",
     examples: &[
@@ -416,7 +389,9 @@ pub static ENABLE_PASSWORD: Tip = Tip {
            let it remember.",
     examples: &[],
     caution: Some(
-        "Turning protection on deletes and rebuilds the index. Your files are not touched.",
+        "Turning protection on deletes and rebuilds the index. Your files are not touched. \
+         The unencrypted index is not securely erased; parts can remain recoverable in \
+         freed disk space.",
     ),
 };
 
@@ -426,7 +401,9 @@ pub static CHANGE_PASSWORD: Tip = Tip {
            index is encrypted again with it.",
     examples: &[],
     caution: Some(
-        "Changing the password deletes and rebuilds the index. Your files are not touched.",
+        "Changing the password deletes and rebuilds the index. Your files are not touched. \
+         The old index is not securely erased; recoverable parts of it still open with the \
+         old password.",
     ),
 };
 
@@ -450,7 +427,9 @@ pub static SHOW_KEY: Tip = Tip {
            The key is derived from your password and the salt in the config \
            file, so it stays the same until the password changes. Anyone \
            holding it can read the index without the password, so guard a \
-           copy as you would the password itself.",
+           copy as you would the password itself. Changing the password \
+           does not retire it: copies of the index made before the change \
+           still open with it.",
     examples: &[],
     caution: None,
 };
@@ -533,7 +512,11 @@ pub static ADD_ROOT: Tip = Tip {
            An indexing pass adds the new folder to the current index; the \
            rest of the index is left alone and nothing is rebuilt.\n\n\
            Indexed folders may not overlap, so a folder inside another \
-           indexed folder, or containing one, is refused.",
+           indexed folder, or containing one, is refused, and so is a file. \
+           A typed relative path starts from the config file's folder. A \
+           path that does not exist yet, such as a drive not plugged in, is \
+           added with a notice, and the first indexing run after it \
+           appears indexes it.",
     examples: &["a second drive, or a network share you search often."],
     caution: None,
 };
@@ -554,8 +537,9 @@ pub static ROOT_WORKERS: Tip = Tip {
            folder. More workers finish sooner on fast storage and network \
            shares, but compete for the same disk and can slow your \
            system.\n\n\
-           auto means 4 on local storage and 16 on a network mount. Takes \
-           effect on the next indexing run.",
+           auto means 4 on local storage and 16 on a network mount. Some \
+           Linux shares (WebDAV, rclone, GVfs) look local to auto; set a \
+           number for those. Takes effect on the next indexing run.",
     examples: &["1 or 2 to keep indexing low-priority."],
     caution: None,
 };
@@ -617,9 +601,10 @@ pub static APPLY_SAVE: Tip = Tip {
     body: "Saves these settings to the configuration file and applies them at \
            once. Until then, your edits are only staged.\n\n\
            Narrowing a setting removes the entries it now excludes; widening \
-           one indexes what it now allows. Only the tokenizer, the hash \
-           sample size and password protection rebuild the index from \
-           scratch, and those ask first.",
+           one indexes what it now allows. Only the compact text index and \
+           the hash sample size rebuild the index from scratch: at once in \
+           automatic mode, otherwise after you confirm, or at the next run if \
+           you choose Later.",
     examples: &[],
     caution: None,
 };
@@ -634,9 +619,7 @@ mod tests {
         &SHOW_ADVANCED,
         &DATABASE_PATH,
         &REINDEX_INTERVAL,
-        &FOLLOW_SYMLINKS,
         &INCLUDE_HIDDEN,
-        &TOKENIZER,
         &HASH_LENGTH,
         &MAX_STORED_TEXT,
         &MAX_TEXT_FILE_SIZE,
@@ -771,14 +754,14 @@ mod tests {
     fn show_paints_every_part() {
         let ctx = crate::test_ui::ctx();
         let full = crate::test_ui::run_panel(&ctx, egui::vec2(800.0, 600.0), vec![], |ui| {
-            TOKENIZER.show(ui)
+            HASH_LENGTH.show(ui)
         });
         let painted = crate::test_ui::painted_text(&full).join("\n");
-        assert!(painted.contains(TOKENIZER.title), "no title: {painted}");
-        assert!(painted.contains("trigram indexes every run"), "no body");
-        assert!(painted.contains("•  trigram, the default"), "no examples");
+        assert!(painted.contains(HASH_LENGTH.title), "no title: {painted}");
+        assert!(painted.contains("How many bytes from the start"), "no body");
+        assert!(painted.contains("•  8192, the default"), "no examples");
         assert!(
-            painted.contains(TOKENIZER.caution.unwrap()),
+            painted.contains(HASH_LENGTH.caution.unwrap()),
             "no caution line"
         );
     }

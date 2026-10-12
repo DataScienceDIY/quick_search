@@ -12,29 +12,28 @@ pub(super) struct Queue {
     /// that discovered them, which the attribute cache rewards.
     pub(super) jobs: Vec<Job>,
     pub(super) needs_rows: Vec<PathBuf>,
-    pub(super) needs_alias: Vec<PathBuf>,
     /// Prefetcher mid-query, holding work in neither list; part of the
-    /// end-of-walk proof in [`Shared::take`].
+    /// end-of-walk proof in [`Shared::take`]. A prefetcher that exits early
+    /// leaves it set, and its [`EndWalk`] ends the walk instead.
     pub(super) prefetching: bool,
     /// What [`PREFETCH_AHEAD`] bounds. Not `jobs.len()`: that also counts
     /// `Job::Files` chunks, which hold no directory's rows and would starve
     /// prefetching.
     pub(super) dirs_ready: usize,
     pub(super) active: usize,
-    /// Canonical directories already queued: collapses overlapping roots,
-    /// breaks symlink cycles (a cycle must revisit a canonical path), and
-    /// records which directories the walk reached for the vanished sweep.
+    /// Canonical directories already queued: collapses overlapping roots and
+    /// tells the vanished sweep which directories the walk reached. Queued,
+    /// not read: only an [`exhausted`](Queue::exhausted) walk read them all.
     pub(super) seen_dirs: HashSet<PathBuf>,
     pub(super) done: bool,
+    /// Set only by the idle proof, never by a stop or a shutdown: the walk ran
+    /// out of work, so every queued directory was read or recorded unreadable.
+    pub(super) exhausted: bool,
 }
 
 impl Queue {
     pub(super) fn idle(&self) -> bool {
-        self.jobs.is_empty()
-            && self.needs_rows.is_empty()
-            && self.needs_alias.is_empty()
-            && !self.prefetching
-            && self.active == 0
+        self.jobs.is_empty() && self.needs_rows.is_empty() && !self.prefetching && self.active == 0
     }
 }
 
@@ -111,6 +110,7 @@ impl Shared {
             // the full idle() test.
             if q.idle() {
                 q.done = true;
+                q.exhausted = true;
                 self.idle.notify_all();
                 return None;
             }
@@ -118,27 +118,23 @@ impl Shared {
         }
     }
 
-    /// Claim one unit of prefetch work, or `None` once the walk is over.
-    /// Parks while the runnable queue is already `PREFETCH_AHEAD` deep.
-    pub(super) fn take_prefetch(&self) -> Option<PrefetchWork> {
+    /// Claim a directory whose rows to fetch, or `None` once the walk is
+    /// over. Parks while the runnable queue is already `PREFETCH_AHEAD` deep.
+    pub(super) fn take_prefetch(&self) -> Option<PathBuf> {
         let mut q = crate::lock_ok(&self.queue);
         loop {
             if q.done {
                 return None;
             }
-            // Aliases carry a single mtime, not rows: never throttled.
-            if let Some(path) = q.needs_alias.pop() {
-                q.prefetching = true;
-                return Some(PrefetchWork::Alias(path));
-            }
             if q.dirs_ready < PREFETCH_AHEAD {
                 if let Some(dir) = q.needs_rows.pop() {
                     q.prefetching = true;
-                    return Some(PrefetchWork::Dir(dir));
+                    return Some(dir);
                 }
             }
             if q.idle() {
                 q.done = true;
+                q.exhausted = true;
                 self.idle.notify_all();
                 return None;
             }
@@ -146,34 +142,20 @@ impl Shared {
         }
     }
 
-    /// Publish a prefetched job and clear the in-flight flag under one lock,
-    /// keeping the idle test in [`Shared::take`] race-free.
-    pub(super) fn finish_prefetch(&self, job: Job) {
+    /// Publish a prefetched directory and clear the in-flight flag under one
+    /// lock, keeping the idle test in [`Shared::take`] race-free.
+    pub(super) fn finish_prefetch(&self, dir: PathBuf, rows: DirRows) {
         let mut q = crate::lock_ok(&self.queue);
-        if matches!(job, Job::Dir(..)) {
-            q.dirs_ready += 1;
-        }
-        q.jobs.push(job);
+        q.dirs_ready += 1;
+        q.jobs.push(Job::Dir(dir, rows));
         q.prefetching = false;
         self.idle.notify_all();
     }
-
-    pub(super) fn abandon_prefetch(&self) {
-        let mut q = crate::lock_ok(&self.queue);
-        q.prefetching = false;
-        self.idle.notify_all();
-    }
-}
-
-pub(super) enum PrefetchWork {
-    Dir(PathBuf),
-    Alias(PathBuf),
 }
 
 /// What a worker discovered while reading a directory.
 pub(super) enum Found {
     Dir(PathBuf),
-    Alias(PathBuf),
     /// Overflow files from the directory just read, each carrying its row.
     Files(Vec<PendingFile>),
 }
@@ -192,7 +174,6 @@ impl Shared {
                         q.needs_rows.push(dir);
                     }
                 }
-                Found::Alias(path) => q.needs_alias.push(path),
                 Found::Files(files) => q.jobs.push(Job::Files(files)),
             }
         }
@@ -204,6 +185,18 @@ impl Shared {
         let mut q = crate::lock_ok(&self.queue);
         q.done = true;
         self.idle.notify_all();
+    }
+}
+
+/// Held by the prefetcher for its whole life: however it leaves, a failure,
+/// an early return or a panic, the walk ends there and the parked workers are
+/// released. A no-op at a normal end, where the idle proof has already set
+/// `done`.
+pub(super) struct EndWalk<'a>(pub(super) &'a Shared);
+
+impl Drop for EndWalk<'_> {
+    fn drop(&mut self) {
+        self.0.shutdown();
     }
 }
 

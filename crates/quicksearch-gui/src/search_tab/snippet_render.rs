@@ -162,13 +162,8 @@ pub(super) fn snippet_job(ui: &egui::Ui, snip: &Snippet, max_rows: usize) -> Lay
 pub(super) fn centered_match_job(ui: &egui::Ui, snip: &Snippet, width_px: f32) -> LayoutJob {
     let fmt = snippet_formats(ui);
 
-    // Newlines force breaks even in a one-row LayoutJob; flatten them to
-    // spaces, byte for byte, so the match ranges stay valid.
-    let flattened: Option<String> = snip
-        .window
-        .contains(['\n', '\r', '\t'])
-        .then(|| snip.window.replace(['\n', '\r', '\t'], " "));
-    let window = flattened.as_deref().unwrap_or(&snip.window);
+    let flat = one_line(&snip.window);
+    let window: &str = &flat;
 
     // The budget is in pixels: the centered layout puts egui in Extend mode
     // (infinite width), and `Column::clip` then silently trims a centered

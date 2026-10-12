@@ -26,6 +26,11 @@
 //!
 //! `QSB_KEY=<64 hex digits>` measures an encrypted index; a `warm` run over
 //! one needs the same key (see `probe_open`).
+//!
+//! `QSB_SANDBOX=<path to a built quicksearch binary>` parses PDFs, audio and
+//! legacy Office files in its sandbox children, as the app does, pricing one
+//! spawn per such file; without it they parse in-process (see
+//! `extract::sandbox`).
 
 mod common;
 
@@ -364,11 +369,11 @@ fn install_key() -> bool {
 
 /// Open the index the way this run's key demands.
 ///
-/// A plain open cannot read an encrypted index, and
+/// A plain open cannot read an encrypted index: every
 /// [`get_last_full_index`](quicksearch_core::db::repo::get_last_full_index)
-/// reports that failure as `None`, the same as "not finished yet". Polling
-/// through a plain open would wait out the deadline and read as a slowdown of
-/// several orders of magnitude.
+/// through it fails, and the poll reads a failure as "not finished yet".
+/// Polling through a plain open would wait out the deadline and read as a
+/// slowdown of several orders of magnitude.
 fn probe_open(db: &Path, keyed: bool) -> Option<rusqlite::Connection> {
     if keyed {
         quicksearch_core::db::open_existing(&db.to_string_lossy(), false).ok()
@@ -384,6 +389,9 @@ fn run(mode: &str, tree: &Path, db: &Path) {
     }
     let hash_length = config.processing.hash_length;
     let keyed = install_key();
+    if let Some(exe) = std::env::var_os("QSB_SANDBOX") {
+        quicksearch_core::extract::sandbox::enable_sandbox(PathBuf::from(exe));
+    }
 
     // The marker is the one unambiguous completion signal; polling the
     // status enum races on a small tree.
@@ -423,7 +431,10 @@ fn run(mode: &str, tree: &Path, db: &Path) {
         }
         if db.exists() {
             if let Some(conn) = probe_open(db, keyed) {
-                if quicksearch_core::db::repo::get_last_full_index(&conn).is_some() {
+                if matches!(
+                    quicksearch_core::db::repo::get_last_full_index(&conn),
+                    Ok(Some(_))
+                ) {
                     done = true;
                     break;
                 }

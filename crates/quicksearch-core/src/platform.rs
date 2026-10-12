@@ -18,6 +18,41 @@ pub fn home_dir() -> Option<OsString> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
 }
 
+/// The file the user launched: the `.AppImage` when this process runs from
+/// inside one, else the running executable. An AppImage's runtime mounts the
+/// image (`/tmp/.mount_…`, or unpacks it under `APPIMAGE_EXTRACT_AND_RUN`) and
+/// runs the binary from there, a path that vanishes with the process; it
+/// exports the image's own path as `$APPIMAGE` and the mount as `$APPDIR`.
+pub fn launched_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let image = appimage_of(
+        &exe,
+        std::env::var_os("APPIMAGE"),
+        std::env::var_os("APPDIR"),
+    );
+    Some(image.unwrap_or(exe))
+}
+
+/// `appimage` when both paths are absolute and `exe` runs from inside
+/// `appdir`, else `None`. That includes an inherited pair: a program started
+/// from another AppImage (a file opened from it) carries that image's pair,
+/// whose mount this binary is not in.
+fn appimage_of(
+    exe: &Path,
+    appimage: Option<OsString>,
+    appdir: Option<OsString>,
+) -> Option<PathBuf> {
+    let (appimage, appdir) = (PathBuf::from(appimage?), PathBuf::from(appdir?));
+    if !appimage.is_absolute() || !appdir.is_absolute() {
+        return None;
+    }
+    // The runtime mounts or unpacks under `$TMPDIR` and spells `APPDIR`
+    // through any link in it; `current_exe`, read from `/proc/self/exe`,
+    // never does.
+    let appdir = appdir.canonicalize().unwrap_or(appdir);
+    exe.starts_with(&appdir).then_some(appimage)
+}
+
 /// Spelled out so this compiles and tests on Linux; checked against the real header below.
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 
@@ -141,6 +176,10 @@ pub(crate) fn attributes_are_reparse_point(attributes: u32) -> bool {
 /// `DirEntry::metadata` is a copy of that buffer; `fs::metadata(path)` is a
 /// whole extra open/stat/close through every antivirus minifilter.
 /// Uninhabited elsewhere, so `Option<CachedMetadata>` is zero-sized off Windows.
+///
+/// NTFS may lag it for a file open for writing or written through another
+/// hard link. The walk trusts it only to say "unchanged" (such a change waits
+/// for the next run) and takes a changed stamp from the opened handle.
 #[cfg(windows)]
 pub(crate) type CachedMetadata = std::fs::Metadata;
 #[cfg(not(windows))]
@@ -149,10 +188,9 @@ pub(crate) type CachedMetadata = std::convert::Infallible;
 #[cfg(not(windows))]
 const _: () = assert!(std::mem::size_of::<Option<CachedMetadata>>() == 0);
 
-/// Cached entry metadata, but only where trusting it is indistinguishable
-/// from a fresh `stat`. `None` for any reparse point, and that is the whole
-/// subtlety: `fs::metadata` *follows* a reparse point while the cached buffer
-/// describes the link itself, and the tags std does not classify as symlinks
+/// Cached entry metadata, or `None` for any reparse point: `fs::metadata`
+/// *follows* a reparse point while the cached buffer describes the link
+/// itself, and the tags std does not classify as symlinks
 /// (`IO_REPARSE_TAG_APPEXECLINK`, OneDrive's `IO_REPARSE_TAG_CLOUD_*`) reach
 /// the walk's ordinary file arm where the two answers differ. Hence the raw
 /// `FILE_ATTRIBUTE_REPARSE_POINT` test, not `is_symlink`, which also wants
@@ -194,20 +232,33 @@ pub(crate) fn metadata_or_stat(
     std::fs::metadata(path)
 }
 
+/// The innermost of `roots` containing `path`, and what lies below it.
+/// Containment is by whole components (`/a/bc` is not under `/a/b`), and a
+/// root contains itself. Innermost wins: with both `/data` and `/data/.cache`
+/// configured, a file under the latter is judged only below `.cache`.
+///
+/// Compared as spelled, so `path` and `roots` must share a spelling: both
+/// canonical, or both as configured, the spelling watcher events arrive in
+/// (through the link, for a root that is one).
+pub(crate) fn split_at_root<'r, 'p>(
+    path: &'p Path,
+    roots: impl IntoIterator<Item = &'r Path>,
+) -> Option<(&'r Path, &'p Path)> {
+    roots
+        .into_iter()
+        .filter_map(|root| Some((root, path.strip_prefix(root).ok()?)))
+        .max_by_key(|(root, _)| root.components().count())
+}
+
 /// Whether `path` has a hidden component *below* the root that contains it.
 /// Components at or above a root are exempt because the walkers exempt their
 /// root too; the two must agree or the index churns, a certainty on Windows,
-/// where `AppData` is Hidden and roots under it are routine. `roots` match by
-/// whole components; a path under no known root is checked in full.
+/// where `AppData` is Hidden and roots under it are routine. The root is
+/// found by [`split_at_root`]; a path under no known root is checked in full.
 pub fn path_has_hidden_component_under(path: &Path, roots: &[PathBuf]) -> bool {
-    // Innermost containing root wins: with both `/data` and `/data/.cache`
-    // configured, a file under the latter is only judged below `.cache`.
-    let (mut current, tail) = roots
-        .iter()
-        .filter(|r| path.starts_with(r))
-        .max_by_key(|r| r.components().count())
-        .and_then(|root| Some((root.clone(), path.strip_prefix(root).ok()?)))
-        .unwrap_or((PathBuf::new(), path));
+    let (root, tail) =
+        split_at_root(path, roots.iter().map(PathBuf::as_path)).unwrap_or((Path::new(""), path));
+    let mut current = root.to_path_buf();
 
     tail.components().any(|component| {
         current.push(component);
@@ -228,6 +279,16 @@ pub(crate) fn is_unc_string(s: &str) -> bool {
     s.starts_with(r"\\?\UNC\") || (s.starts_with(r"\\") && !s.starts_with(r"\\?\"))
 }
 
+/// `/proc/mounts` types whose every read is a round trip. A FUSE mount is
+/// matched by its subtype (`fuse.sshfs`): bare `fuse` and `fuseblk` are any
+/// userspace filesystem, local ones included. davfs2 mounts as bare `fuse`,
+/// so a WebDAV share is undetectable; `indexing.root_workers` covers it.
+///
+/// Not listed: `fuse.rclone`, `fuse.gvfsd-fuse`, `ceph` and
+/// `fuse.glusterfs`. The worker count is only a speed choice, so a type joins
+/// once `walkprobe` shows 16 workers beating 4 on it, and none has been
+/// measured (2026-10-11: no such mount on the dev box). gvfs also serves
+/// local phones and cameras from the same mount.
 #[cfg(target_os = "linux")]
 const NETWORK_FS_TYPES: [&str; 8] = [
     "cifs",
@@ -240,15 +301,24 @@ const NETWORK_FS_TYPES: [&str; 8] = [
     "9p",
 ];
 
-/// The longest `/proc/mounts` mount point that is a prefix of `path` is the
-/// one that actually serves it.
 #[cfg(target_os = "linux")]
 pub(crate) fn is_network_path(path: &Path) -> bool {
     let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
         return false;
     };
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    mounts_say_network(&mounts, &target)
+}
 
+/// Whether the mount serving `target` is a network one, by the
+/// `/proc/mounts` text `mounts`. That mount is at the longest mount point
+/// that is a prefix of `target` and, of the mounts there, the last one
+/// listed, which is the mount on top: an automount lists its `autofs`
+/// trigger before the share stacked on it. A root that is itself an
+/// untriggered automount point reads as `autofs`, so local; triggering it
+/// here would block on a hung share.
+#[cfg(target_os = "linux")]
+fn mounts_say_network(mounts: &str, target: &Path) -> bool {
     let mut best: Option<(usize, bool)> = None;
     for line in mounts.lines() {
         let mut fields = line.split_whitespace();
@@ -256,19 +326,46 @@ pub(crate) fn is_network_path(path: &Path) -> bool {
         else {
             continue;
         };
-        // `/proc/mounts` octal-escapes spaces and a few other characters.
-        let point = point.replace("\\040", " ");
+        let point = unescape_mount_field(point);
         let point = Path::new(&point);
         if !target.starts_with(point) {
             continue;
         }
         let depth = point.components().count();
         let is_network = NETWORK_FS_TYPES.contains(&fstype);
-        if best.is_none_or(|(d, _)| depth > d) {
+        if best.is_none_or(|(d, _)| depth >= d) {
             best = Some((depth, is_network));
         }
     }
     best.is_some_and(|(_, is_network)| is_network)
+}
+
+/// A `/proc/mounts` field with every `\ooo` escape decoded to its byte. The
+/// kernel writes space, tab, newline and backslash that way (`\040`, `\011`,
+/// `\012`, `\134`), three octal digits for one byte, so `\4xx` and up are no
+/// escape and stay as written.
+#[cfg(target_os = "linux")]
+fn unescape_mount_field(field: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let src = field.as_bytes();
+    let mut out = Vec::with_capacity(src.len());
+    let mut i = 0;
+    while i < src.len() {
+        let escape = src.get(i + 1..i + 4).filter(|d| {
+            src[i] == b'\\' && d[0] <= b'3' && d.iter().all(|b| (b'0'..=b'7').contains(b))
+        });
+        match escape {
+            Some(d) => {
+                out.push(d.iter().fold(0u8, |n, b| n * 8 + (b - b'0')));
+                i += 4;
+            }
+            None => {
+                out.push(src[i]);
+                i += 1;
+            }
+        }
+    }
+    std::ffi::OsString::from_vec(out)
 }
 
 /// UNC needs no syscall; a *mapped drive letter* is indistinguishable from a
@@ -309,7 +406,10 @@ pub(crate) fn is_network_path(_path: &Path) -> bool {
 /// hidden subtrees. `true` (`ReadDirectoryChangesW`): one handle covers the
 /// subtree, and notify allocates a 16 KiB buffer *inline per watch*, so
 /// per-directory registration would ask for gigabytes; pruning moves to the
-/// event path. macOS FSEvents is also recursive but stays per-directory.
+/// event path. All churn under a root then shares that one buffer, and a
+/// burst that outgrows it arrives as a rescan (patched in `vendor/notify`),
+/// which the coordinator answers with a full run. macOS FSEvents is also
+/// recursive but stays per-directory.
 pub const WATCH_ROOTS_RECURSIVELY: bool = cfg!(windows);
 
 /// What ignore patterns compile against: on Windows and macOS `node_modules`
@@ -324,8 +424,9 @@ pub const PATHS_ARE_CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "maco
 pub fn set_background_priority() {
     #[cfg(target_os = "linux")]
     {
-        // Linux schedules per task, so `nice` moves this thread alone.
-        unsafe { libc::nice(10) };
+        // Per thread on Linux, and absolute: spawned threads inherit their
+        // spawner's niceness, so a relative `nice(10)` would stack to 19.
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
     }
     #[cfg(windows)]
     {
@@ -354,11 +455,11 @@ pub fn preserving_sighup<T>(f: impl FnOnce() -> T) -> T {
     }
 }
 
-/// Stack size for [`spawn_worker`] threads. 512 KiB is ample, and glibc
-/// caches freed thread stacks (`stack_cache_maxsize`, 40 MiB default) with
-/// their dirty pages for the life of the process. Document parsing recurses
-/// on untrusted input; if a malformed document ever overflows this, raise it
-/// and add a depth limit.
+/// Stack size for [`spawn_worker`] threads. Kept small because glibc caches
+/// freed thread stacks (`stack_cache_maxsize`, 40 MiB default) with their
+/// dirty pages for the life of the process, so every worker pays for a
+/// larger one. The PDF interpreter's deepest bounded recursion fits it:
+/// `extract::pdf`'s `pdf_recursion_bounds_fit_the_worker_stack`.
 const WORKER_STACK_SIZE: usize = 512 * 1024;
 
 /// Spawn a named worker thread with [`WORKER_STACK_SIZE`]; panics like
@@ -375,13 +476,187 @@ where
         .expect("spawn worker thread")
 }
 
-/// The allocator every binary in this workspace installs.
+/// What a [`spawn_limited`] child maps beyond the heap it asked for, which
+/// `RLIMIT_AS` counts too: the binary, the libraries, the thread stacks and
+/// mimalloc's segment reservations around its live heap. Measured with
+/// `prlimit --as` on a release sandbox child parsing a PDF
+/// (`extract::sandbox`): a small file runs in 48 MiB, and a 16 MB PDF
+/// holding 150 MB of heap needs between 192 and 256 MiB, so the overhead
+/// above the heap is under this. mimalloc wants a 1 GiB arena but falls
+/// back to smaller mappings when the limit refuses one, which is why this is
+/// not a gigabyte.
+#[cfg(unix)]
+const RESERVED_ADDRESS_SPACE: u64 = 256 << 20;
+
+/// What keeps a [`spawn_limited`] child's limits in force: on Windows its job
+/// object, which kills the child once closed. Hold it until the child has
+/// been waited for.
+pub struct ChildLimits {
+    #[cfg(windows)]
+    job: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl Drop for ChildLimits {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.job) };
+    }
+}
+
+/// Spawn `command` with its CPU time capped at `cpu` and the memory it may
+/// allocate at `memory`, writing no core file: for a child that parses
+/// untrusted input ([`crate::extract::sandbox`]). Past the CPU limit
+/// the OS kills it; past the memory limit its allocations fail, which aborts
+/// it.
+///
+/// Unix: `setrlimit` between fork and exec, so the limits hold from the
+/// child's first instruction, each lowered to the hard limit already in
+/// force. Memory is `RLIMIT_AS`: `RLIMIT_DATA` would count mimalloc's arena
+/// reservation the same way (it is mapped writable up front) and miss
+/// nothing more. On Linux the child also dies with the thread that spawned
+/// it (`PR_SET_PDEATHSIG`), so no parse outlives the process.
+///
+/// Windows: a job object of the child's own, with per-process memory
+/// (commit) and user-time limits, killing the child when [`ChildLimits`]
+/// closes it or this process exits. The child runs before it can be put in
+/// the job, so its stdin is replaced by a pipe closed only once it is in:
+/// the child must read stdin to EOF before anything else. It runs at below
+/// normal priority.
+pub fn spawn_limited(
+    command: &mut std::process::Command,
+    cpu: std::time::Duration,
+    memory: u64,
+) -> std::io::Result<(std::process::Child, ChildLimits)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let limits = [
+            (libc::RLIMIT_CPU, cpu.as_secs().max(1)),
+            (libc::RLIMIT_CORE, 0),
+            (
+                libc::RLIMIT_AS,
+                memory.saturating_add(RESERVED_ADDRESS_SPACE),
+            ),
+        ]
+        .map(|(resource, value)| {
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let hard = if unsafe { libc::getrlimit(resource, &mut current) } == 0 {
+                current.rlim_max
+            } else {
+                libc::RLIM_INFINITY
+            };
+            let value = (value as libc::rlim_t).min(hard);
+            (
+                resource,
+                libc::rlimit {
+                    rlim_cur: value,
+                    rlim_max: value,
+                },
+            )
+        });
+        #[cfg(target_os = "linux")]
+        let parent = std::process::id();
+        // SAFETY: only `setrlimit`, `prctl` and `getppid` run between fork
+        // and exec, and each is async-signal-safe.
+        unsafe {
+            command.pre_exec(move || {
+                for (resource, limit) in &limits {
+                    if libc::setrlimit(*resource, limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                // Killed with the thread that spawned it, which waits on it
+                // until it exits, so an indexer that dies or is killed leaves
+                // no parse running. A parent gone before this call is caught
+                // by the check after it.
+                #[cfg(target_os = "linux")]
+                {
+                    let signal = libc::SIGKILL as libc::c_ulong;
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, signal) != 0
+                        || libc::getppid() as u32 != parent
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        Ok((command.spawn()?, ChildLimits {}))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            JOB_OBJECT_LIMIT_PROCESS_TIME,
+        };
+        use windows_sys::Win32::System::Threading::{
+            BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW,
+        };
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let limits = ChildLimits { job };
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            | JOB_OBJECT_LIMIT_PROCESS_TIME
+            | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // In 100 ns units.
+        info.BasicLimitInformation.PerProcessUserTimeLimit =
+            i64::try_from(cpu.as_nanos() / 100).unwrap_or(i64::MAX);
+        info.ProcessMemoryLimit = usize::try_from(memory).unwrap_or(usize::MAX);
+        let set = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if set == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Below normal, as the content workers parsed in-process
+        // ([`set_background_priority`]); on Linux the child inherits the
+        // spawning thread's `nice`.
+        let mut child = command
+            .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        if unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as isize) } == 0 {
+            let e = std::io::Error::last_os_error();
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        // In the job: the child may start.
+        drop(child.stdin.take());
+        Ok((child, limits))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (cpu, memory);
+        Ok((command.spawn()?, ChildLimits {}))
+    }
+}
+
+/// The allocator every shipped binary, bench and timing probe installs.
 ///
 /// Re-exported because `#[global_allocator]` only takes effect in the crate
 /// that *declares* it: a library cannot choose one for its dependents. So
-/// each binary names this type, and they must all name the same one: a
-/// measurement harness left on the system allocator would report numbers for
-/// a build nobody ships.
+/// each of them names this type (the counting harnesses wrap it), and they
+/// must all name the same one: a measurement harness left on the system
+/// allocator would report numbers for a build nobody ships.
 ///
 /// ```ignore
 /// #[global_allocator]
@@ -396,16 +671,22 @@ where
 /// Capping arenas at 2 cut the floor to 146 MB but made indexing dramatically
 /// slower, because two arenas serialise every worker. mimalloc has
 /// per-thread heaps with no lock on the fast path and decommits freed
-/// segments, so it gives both.
+/// segments.
+///
+/// It serves Rust allocations only. It is built without `override`, so the C
+/// libraries (SQLite's page cache, OpenSSL, zstd) still allocate from the
+/// system `malloc`.
 pub use mimalloc::MiMalloc as Allocator;
 
 /// Return freed heap to the OS. Costs milliseconds, so call it only at idle
 /// points such as the end of a run, whose freed peak would otherwise stay
 /// resident.
 pub fn release_free_heap() {
-    // `libmimalloc-sys` binds only the allocation entry points, so this one
-    // is declared here. The symbol is in the static library that crate
-    // already links; depending on it puts it there.
+    // `libmimalloc-sys` binds this only behind its `extended` feature, which
+    // adds the `cty` crate for one declaration, so it is declared here. The
+    // symbol is in the static library that crate links for `mimalloc`. It
+    // reaches only what mimalloc holds, not the system `malloc` the C
+    // libraries use (see `Allocator`).
     extern "C" {
         /// `void mi_collect(bool force)`. C `_Bool` and Rust `bool` are the
         /// same one byte.
@@ -438,11 +719,45 @@ pub fn create_dir_private(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Narrow `path` to owner-only access, best effort. SQLite creates its
-/// database 0644 and copies that mode to the `-wal`/`-shm` it derives, so
-/// narrowing the main file before anything else opens covers all three; the
-/// index is a strictly larger secret than any single file it was read from.
-/// Failure is ignored: a FAT stick or share has no permissions to set.
+/// `parent/<prefix>-<euid>`, made `0700` when missing, and returned only
+/// when it is a directory this user owns with no group or other access. For
+/// a `parent` other users can write to, such as the temporary directory:
+/// whoever takes the name first decides what is there, and another user's
+/// directory, an open one or a symlink would let them answer in our place or
+/// aim our writes at a file of their choosing. Each of those is
+/// `PermissionDenied`. Named by the effective uid, so it needs no `$USER`.
+#[cfg(unix)]
+pub fn private_dir_under(parent: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    // SAFETY: no arguments, and the call cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let dir = parent.join(format!("{}-{}", prefix, uid));
+    match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    // Not followed: a link is refused for being one, whatever it points at.
+    let meta = std::fs::symlink_metadata(&dir)?;
+    if meta.file_type().is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0 {
+        Ok(dir)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not a private directory of this user's",
+                dir.display()
+            ),
+        ))
+    }
+}
+
+/// Narrow `path` to owner-only access, best effort; the index is a strictly
+/// larger secret than any single file it was read from. Only `path` itself:
+/// SQLite copies the database's mode to a `-wal`/`-shm` it creates later, but
+/// not to one that already exists, so `db::open::narrow_index_files` narrows
+/// those explicitly. Failure is ignored: a FAT stick or share has no
+/// permissions to set, and a sidecar may not exist.
 pub fn restrict_to_owner(path: &Path) {
     #[cfg(unix)]
     {
@@ -455,13 +770,14 @@ pub fn restrict_to_owner(path: &Path) {
     }
 }
 
-/// Open `path` for reading, refusing anything that is not a regular file. A
-/// rename since the caller's `stat` can put a FIFO or device there, and
-/// `open` on one blocks in the kernel until a writer appears, uninterruptibly
-/// and past any stop flag, stranding a walk worker and the pool behind it.
-/// `O_NONBLOCK` makes the open return; `fstat` on the descriptor then answers
-/// un-swappably. Both are free on a regular file.
-pub fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
+/// Open `path` for reading, refusing anything that is not a regular file, and
+/// return the handle with its `fstat`. A rename since the caller's `stat` can
+/// put a FIFO or device there, and `open` on one blocks in the kernel until a
+/// writer appears, uninterruptibly and past any stop flag, stranding a walk
+/// worker and the pool behind it. `O_NONBLOCK` makes the open return; `fstat`
+/// on the descriptor then answers un-swappably, for the file the handle
+/// reads. Both are free on a regular file.
+pub fn open_regular_file(path: &Path) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -470,13 +786,61 @@ pub fn open_regular_file(path: &Path) -> std::io::Result<std::fs::File> {
         opts.custom_flags(libc::O_NONBLOCK);
     }
     let file = opts.open(path)?;
-    if !file.metadata()?.file_type().is_file() {
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, meta))
+}
+
+/// What one `stat` of a shown row's path says ([`presence`]).
+#[derive(Debug)]
+pub(crate) enum Presence {
+    /// A regular file, links followed.
+    File(std::fs::Metadata),
+    /// Nothing there, or no longer a regular file.
+    Gone,
+    /// The `stat` failed (permissions, I/O, a stale network handle), which
+    /// is no evidence either way: a dropped share must not read as deleted.
+    Unknown,
+}
+
+/// One `stat` of `path`; only [`says_gone`] errors say the file left.
+pub(crate) fn presence(path: &Path) -> Presence {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Presence::File(meta),
+        Ok(_) => Presence::Gone,
+        Err(e) if says_gone(&e) => Presence::Gone,
+        Err(_) => Presence::Unknown,
+    }
+}
+
+/// Whether a failed `stat` says the file left: `NotFound`, or
+/// `NotADirectory` (an ancestor is now a file). Windows reads a missing drive
+/// and an unreachable share as `NotFound` too (ERROR_INVALID_DRIVE,
+/// ERROR_BAD_NETPATH, ERROR_BAD_NET_NAME), and those say only that the
+/// volume is out of reach.
+fn says_gone(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            ERROR_BAD_NETPATH, ERROR_BAD_NET_NAME, ERROR_INVALID_DRIVE,
+        };
+        let code = e.raw_os_error().map(|code| code as u32);
+        if matches!(
+            code,
+            Some(ERROR_INVALID_DRIVE | ERROR_BAD_NETPATH | ERROR_BAD_NET_NAME)
+        ) {
+            return false;
+        }
+    }
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Why [`IndexLock::acquire`] did not hand back a lock.
@@ -682,10 +1046,11 @@ fn lock_exclusive_nonblocking(file: &std::fs::File) -> Result<(), LockAttempt> {
 }
 
 /// Bytes free to this user on the filesystem holding `path`. `None` is
-/// "unknown", never "zero". The nearest existing ancestor is asked.
+/// "unknown", never "zero". The nearest existing directory is asked, since
+/// `GetDiskFreeSpaceExW` refuses a file: a file answers for its directory.
 pub fn available_space(path: &Path) -> Option<u64> {
     let mut probe = path;
-    while !probe.exists() {
+    while !probe.is_dir() {
         probe = probe.parent()?;
     }
     available_space_of_existing(probe)
@@ -764,31 +1129,40 @@ pub fn remove_file_retrying(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Deny read access to `dir`, for tests (exposed: `tests/full_index.rs` is a
-/// separate crate). Windows uses `icacls`: a deny ACE binds even the owner
-/// until [`restore_read`] rewrites it; neither call needs elevation.
+/// Deny read access to `dir`, for tests (exposed: `tests/full_index.rs`, a
+/// separate crate, calls it). Windows uses `icacls`: a deny ACE binds even the
+/// owner until [`restore_read`] rewrites it; neither call needs elevation.
+///
+/// Fails with [`std::io::ErrorKind::Unsupported`], read access restored, when
+/// `dir` still lists afterwards: rights that ignore permission bits (root with
+/// its DAC capabilities) would hand the caller a readable tree to test an
+/// unreadable one with.
 #[doc(hidden)]
 pub fn deny_read(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
-    {
+    let denied = {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000))
-    }
+    };
     #[cfg(windows)]
-    {
-        icacls(
-            dir,
-            &["/deny", &format!("{}:(OI)(CI)(RD)", current_user()?)],
-        )
-    }
+    let denied = icacls(
+        dir,
+        &["/deny", &format!("{}:(OI)(CI)(RD)", current_user()?)],
+    );
     #[cfg(not(any(unix, windows)))]
-    {
-        let _ = dir;
-        Err(std::io::Error::new(
+    let denied: std::io::Result<()> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "deny_read is not supported on this target",
+    ));
+    denied?;
+    if std::fs::read_dir(dir).is_ok() {
+        restore_read(dir).ok();
+        return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "deny_read is not supported on this target",
-        ))
+            "still readable: this process ignores permission bits",
+        ));
     }
+    Ok(())
 }
 
 /// Undo [`deny_read`] so the directory can be cleaned up.

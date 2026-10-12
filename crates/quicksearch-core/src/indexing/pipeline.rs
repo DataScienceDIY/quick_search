@@ -25,15 +25,16 @@ use super::*;
 
 /// Append to `out` the rows under stored parents the walk never reached (a
 /// deleted or newly excluded directory is never read, so no per-directory
-/// diff sees them), except under unreadable directories or at `aliased`
-/// paths. Uses a read connection so extracting roots keep the writer; every
-/// walk batch is already committed.
+/// diff sees them), except under unreadable directories. Sound only after a
+/// clean walk, one that read every queued directory in full or recorded it
+/// unreadable: `seen_dirs` holds queued directories, not read ones. Uses a
+/// read connection so extracting roots keep the writer; every walk batch is
+/// already committed.
 fn sweep_unvisited_parents(
     conn: &Connection,
     root: &str,
     seen_dirs: &HashSet<String>,
     unreadable: &crate::file_handling::UnreadableDirs,
-    aliased: &HashSet<String>,
     out: &mut Vec<String>,
 ) -> Result<(), String> {
     let mut unvisited: Vec<String> = Vec::new();
@@ -44,11 +45,7 @@ fn sweep_unvisited_parents(
     })?;
 
     for parent in unvisited {
-        for path in repo::paths_in_dir(conn, &parent)? {
-            if !aliased.contains(&path) {
-                out.push(path);
-            }
-        }
+        out.extend(repo::paths_in_dir(conn, &parent)?);
     }
     Ok(())
 }
@@ -217,17 +214,12 @@ mod census {
     pub(super) fn report(cx: &RunCx<'_>, pipelines: &[RootPipeline], started: Instant) {
         let at = started.elapsed().as_secs_f64();
         crate::log_info!(
-            "census t={:.1}s  stale {} ({})  aliased {} ({})",
+            "census t={:.1}s  stale {} ({})",
             at,
             cx.stale_candidates.len(),
             mib(strings_bytes(
                 cx.stale_candidates.iter(),
                 cx.stale_candidates.len()
-            )),
-            cx.aliased_paths.len(),
-            mib(strings_bytes(
-                cx.aliased_paths.iter(),
-                cx.aliased_paths.len()
             )),
         );
         for p in pipelines {
@@ -378,8 +370,7 @@ impl RootPipeline {
     fn accept(&mut self, event: WalkEvent, cx: &mut RunCx<'_>) -> Result<(), String> {
         let file = match event {
             // Applied at run end: deleting mid-walk would break "a stopped
-            // run deletes nothing", and an exempting aliased sighting may
-            // still be ahead.
+            // run deletes nothing".
             WalkEvent::Stale(paths) => {
                 cx.stale_candidates.extend(paths);
                 return Ok(());
@@ -389,11 +380,6 @@ impl RootPipeline {
         self.walked += 1;
         if self.walked.is_multiple_of(64) {
             self.current_file = Some(file.path.clone());
-        }
-        if file.aliased {
-            // The vanished-directory sweep must not read its parent's
-            // absence as proof the file is gone.
-            cx.aliased_paths.insert(file.path.clone());
         }
         let Some(rec) = file.record else {
             return Ok(());
@@ -428,16 +414,17 @@ impl RootPipeline {
             self.workers
         );
 
-        if !walk_clean {
-            crate::log_warn!(
-                "a walk worker for {} terminated abnormally; skipping stale cleanup",
-                self.root
-            );
-            cx.stale_cleanup_ok = false;
+        // A stop ends every walk early; only an unasked-for end is news.
+        if cx.stop_flag.load(Ordering::Relaxed) {
             self.phase = RootPhase::Done;
             return Ok(());
         }
-        if cx.stop_flag.load(Ordering::Relaxed) {
+        if !walk_clean {
+            crate::log_warn!(
+                "the walk for {} ended early; skipping stale cleanup",
+                self.root
+            );
+            cx.stale_cleanup_ok = false;
             self.phase = RootPhase::Done;
             return Ok(());
         }
@@ -534,10 +521,12 @@ impl RootPipeline {
             }
         }
         if finished && ready.is_empty() {
-            *totals = totals.or_else(|| pass.totals());
+            // After the join: the feeder counts behind its last page, so the
+            // workers can finish before the count lands.
             if !pass.finish() {
                 crate::log_warn!("a content worker for {} terminated abnormally", self.root);
             }
+            *totals = totals.or_else(|| pass.totals());
             self.content = None;
             self.phase = RootPhase::Done;
             let extract_time = self.phase_elapsed();
@@ -562,7 +551,7 @@ pub(super) struct RunCx<'a> {
     pub(super) status: Arc<Mutex<IndexingStatus>>,
     /// Walk workers use it to finish small text files without the content pass.
     pub(super) registry: Arc<Registry>,
-    /// Rows per write batch: `batch_size`, at least 1.
+    /// Rows per write batch ([`crate::config::ProcessingConfig::batch`]).
     pub(super) batch: usize,
     /// Writer time one root's turn may take before the round moves on
     /// ([`crate::config::ProcessingConfig::writer_turn_slice_ms`]).
@@ -571,8 +560,6 @@ pub(super) struct RunCx<'a> {
     pub(super) encoder: crate::db::repo::DocEncoder,
     /// Rows with no file behind them, per-directory plus the vanished sweep.
     pub(super) stale_candidates: Vec<String>,
-    /// Paths reached via symlink; their rows may live outside every root.
-    pub(super) aliased_paths: HashSet<String>,
     pub(super) stale_cleanup_ok: bool,
 }
 
@@ -591,11 +578,10 @@ impl<'a> RunCx<'a> {
             stop_flag,
             status,
             registry: Arc::new(Registry::default_set()),
-            batch: config.processing.batch_size.max(1),
+            batch: config.processing.batch(),
             slice: Duration::from_millis(config.processing.writer_turn_slice_ms),
             encoder: crate::db::repo::DocEncoder::new()?,
             stale_candidates: Vec::new(),
-            aliased_paths: HashSet::new(),
             stale_cleanup_ok: true,
         })
     }
@@ -668,7 +654,6 @@ fn build_pipeline(
         .clamp(1, 64);
     let walk = walk_indexable_files(
         &roots,
-        cx.config.indexing.follow_symlinks,
         cx.config.indexing.include_hidden,
         ignore,
         cx.db_path,
@@ -727,10 +712,9 @@ fn build_pipeline(
     })
 }
 
-/// Reconcile deletions once every walk has ended, globally, because a file
-/// may be reachable through more than one root's symlinks. A no-op for a
-/// stopped or abnormally terminated run.
-fn cleanup_stale(pipelines: &[RootPipeline], cx: &mut RunCx<'_>) -> Result<(), String> {
+/// Reconcile deletions once every walk has ended, every root's in one pass.
+/// A no-op for a stopped run, or one with a walk that ended early.
+pub(super) fn cleanup_stale(pipelines: &[RootPipeline], cx: &mut RunCx<'_>) -> Result<(), String> {
     let stopped = cx.stop_flag.load(Ordering::Relaxed);
     if !cx.stale_cleanup_ok || stopped {
         return Ok(());
@@ -748,19 +732,11 @@ fn cleanup_stale(pipelines: &[RootPipeline], cx: &mut RunCx<'_>) -> Result<(), S
             &p.root,
             &p.walk.seen_dirs(),
             p.walk.unreadable(),
-            &cx.aliased_paths,
             &mut cx.stale_candidates,
         )?;
     }
     drop(sweep_conn);
-    // The aliased filter applies to both sources: per-directory
-    // reconciliation can flag a symlink target as stale while the alias route
-    // inserted it, and the row would be written and deleted on every run.
-    let stale_paths: Vec<String> = cx
-        .stale_candidates
-        .drain(..)
-        .filter(|p| !cx.aliased_paths.contains(p))
-        .collect();
+    let stale_paths = std::mem::take(&mut cx.stale_candidates);
     let unreadable_count: usize = pipelines
         .iter()
         .map(|p| p.walk.unreadable().paths().len())
@@ -874,7 +850,9 @@ impl WalGuard {
 impl IndexingService {
     /// Open the index and ready it for `roots`: reconcile it against the
     /// settings it was last written under, stamp the new ones, queue failed
-    /// files for a retry and apply the write-side FTS settings. `None` when a
+    /// files for a retry and apply the write-side FTS settings. Returns the
+    /// connection and the roots stamped, which hold recorded ones while a
+    /// root is offline (see [`Self::reconcile_stored_config`]). `None` when a
     /// stop cut the reconcile short.
     fn prologue(
         status: &Arc<Mutex<IndexingStatus>>,
@@ -883,7 +861,7 @@ impl IndexingService {
         config: &Config,
         roots: &[String],
         stop_flag: &Arc<AtomicBool>,
-    ) -> Result<Option<Connection>, String> {
+    ) -> Result<Option<(Connection, Vec<String>)>, String> {
         // A large WAL recovery happens here; announced before attempted.
         Self::set_prep_step(status, PrepStep::OpeningIndex);
         let mut conn = db::open_or_recreate(db_path, &config.processing)?;
@@ -893,13 +871,15 @@ impl IndexingService {
         // that knows a root was dropped. Against `roots`, not the config's
         // paths, which could name a different tree. Stamping is conditional
         // on the reconcile *finishing*: a cut-short stamp orphans the rows.
-        if !Self::reconcile_stored_config(status, interrupt, &mut conn, config, roots, stop_flag)? {
+        let Some(effective) =
+            Self::reconcile_stored_config(status, interrupt, &mut conn, config, roots, stop_flag)?
+        else {
             return Ok(None);
-        }
+        };
         // Everything from here to the first walk is database work of its own;
         // leaving the step on `Reconciling` reads as a reconcile that hung.
         Self::set_prep_step(status, PrepStep::Starting);
-        Self::update_config(&conn, config, roots)?;
+        Self::update_config(&conn, config, &effective)?;
 
         // Failed files are retried once per run; only a retry can tell.
         {
@@ -926,7 +906,7 @@ impl IndexingService {
         if let Err(e) = conn.execute_batch("PRAGMA wal_autocheckpoint = 0;") {
             crate::log_warn!("could not disable autocheckpoint (non-fatal): {}", e);
         }
-        Ok(Some(conn))
+        Ok(Some((conn, effective)))
     }
 
     pub(super) fn run_indexing(
@@ -960,7 +940,10 @@ impl IndexingService {
 
         let run_start = Self::run_start(status);
 
-        let Some(conn) = Self::prologue(status, interrupt, db_path, config, &roots, stop_flag)?
+        // The walks take `roots`; the record keeps `effective`, which holds
+        // an offline root's recorded spelling and figures.
+        let Some((conn, effective)) =
+            Self::prologue(status, interrupt, db_path, config, &roots, stop_flag)?
         else {
             return Ok(());
         };
@@ -977,7 +960,7 @@ impl IndexingService {
 
         let stored_counts: Vec<Option<usize>> = {
             let conn = crate::lock_ok(&cx.conn_mutex);
-            let _ = crate::db::repo::prune_root_stats(&conn, &roots);
+            let _ = crate::db::repo::prune_root_stats(&conn, &effective);
             roots
                 .iter()
                 .map(|r| crate::db::repo::get_root_walk_count(&conn, r))
@@ -1063,11 +1046,10 @@ impl IndexingService {
 
         // The tail's readers, released before any of its writing. Every
         // per-root walk prefetcher and content feeder lives in `pipelines`, and
-        // a read mark held by any one of them turns a TRUNCATE checkpoint into
-        // a silent PASSIVE one that truncates nothing (see
-        // [`repo::checkpoint_truncate`]). Nothing below reads `pipelines`: the
-        // stale cleanup and every status publish are inside the loop, and the
-        // counts iterate `roots`.
+        // a TRUNCATE waits out `busy_timeout` for any of them still holding a
+        // snapshot, then fails (see [`repo::checkpoint_truncate`]). Nothing
+        // below reads `pipelines`: the stale cleanup and every status publish
+        // are inside the loop, and the counts iterate `roots`.
         let tail_started = Instant::now();
         drop(pipelines);
         census::tail("dropping the readers", db_path, tail_started);

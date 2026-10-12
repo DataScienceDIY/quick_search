@@ -16,8 +16,8 @@ use std::thread::JoinHandle;
 use crate::config::{Config, IgnoreSet};
 use crate::extract::Registry;
 use crate::file_handling::{
-    classify_by_mtime, dir_to_db_parent, path_to_db_string, prepare_file_record, DirRows,
-    FileIndexAction, OwnedNewFile, UnreadableDirs,
+    classify, dir_to_db_parent, path_to_db_string, prepare_file_record, DirRows, FileIndexAction,
+    OwnedNewFile, Stamp, UnreadableDirs,
 };
 
 mod pool;
@@ -25,7 +25,7 @@ mod pool;
 mod tests;
 
 pub(crate) use pool::WorkerStats;
-use pool::{Found, PrefetchWork, Queue, Shared};
+use pool::{EndWalk, Found, Queue, Shared};
 
 /// Files one worker takes for itself before handing the rest to the pool.
 const FILES_PER_JOB: usize = 128;
@@ -36,9 +36,9 @@ const FILES_PER_JOB: usize = 128;
 /// against 293–309 MiB here and the walk no faster. Measured and rejected.
 const CHANNEL_CAP: usize = 4096;
 
-const LOCAL_THREADS: usize = 4;
+pub(crate) const LOCAL_THREADS: usize = 4;
 
-const NETWORK_THREADS: usize = 16;
+pub(crate) const NETWORK_THREADS: usize = 16;
 
 /// One file the walk found, with everything the DB writer needs.
 #[derive(Debug)]
@@ -48,20 +48,15 @@ pub struct WalkedFile {
     pub path: String,
     pub action: FileIndexAction,
     pub record: Option<OwnedNewFile>,
-    /// True when this file was reached by resolving a symlink. Its row is
-    /// invisible to its real parent's reconciliation, so the caller must
-    /// exempt it from the vanished-directory sweep.
-    pub aliased: bool,
 }
 
 impl WalkedFile {
     /// Seen, but with nothing to write: the row stays.
-    fn skipped(path: String, aliased: bool) -> Self {
+    fn skipped(path: String) -> Self {
         WalkedFile {
             path,
             action: FileIndexAction::Skip,
             record: None,
-            aliased,
         }
     }
 }
@@ -71,7 +66,8 @@ impl WalkedFile {
 pub enum WalkEvent {
     File(WalkedFile),
     /// Paths whose row should be deleted: in one directory's index rows,
-    /// absent from its listing. Emitted only for successfully read dirs.
+    /// absent from its listing. Emitted only for a directory read in full,
+    /// or one deleted before its read (see `read_directory`).
     Stale(Vec<String>),
 }
 
@@ -81,16 +77,14 @@ pub enum WalkEvent {
 struct PendingFile {
     path: PathBuf,
     cached: Option<crate::platform::CachedMetadata>,
-    /// The stored mtime, taken out of the directory's rows as it was listed;
+    /// The stored stamp, taken out of the directory's rows as it was listed;
     /// `None` when the file has no row yet.
-    stored: Option<u64>,
+    stored: Option<Stamp>,
 }
 
 enum Job {
     Dir(PathBuf, DirRows),
     Files(Vec<PendingFile>),
-    /// A resolved symlink target, with the stored mtime for its own path.
-    Alias(PathBuf, Option<u64>),
 }
 
 /// How many entries each filter rejected. A pruned *directory* is one
@@ -125,7 +119,6 @@ impl PruneCounts {
 }
 
 struct Ctx {
-    follow_symlinks: bool,
     include_hidden: bool,
     ignore: IgnoreSet,
     /// The index's own files, which this walk must never open; see
@@ -136,6 +129,10 @@ struct Ctx {
     registry: Arc<Registry>,
     unreadable: UnreadableDirs,
     stop_flag: Arc<AtomicBool>,
+    /// The roots this walk was seeded with. A root that vanishes before its
+    /// read (an unplugged drive, an autofs expiry) is recorded, never swept,
+    /// whether or not its parent resolves.
+    roots: Vec<PathBuf>,
 }
 
 /// Unreadable-directory warnings allowed per run.
@@ -151,10 +148,13 @@ pub fn reset_run_warnings() {
 
 /// Read one directory: subdirectories and overflow file chunks go to `found`
 /// for the pool, the remaining files come back for this worker, `stale` gets
-/// the paths whose row has no file behind it. A directory that cannot be read
-/// returns before reconciling: it must not read as an empty one.
+/// the paths whose row has no file behind it. Any failure to read it, or one
+/// of its entries, is recorded in `ctx.unreadable` and reconciles nothing: it
+/// must not read as an empty directory. The exception is a `NotFound` under a
+/// parent that still resolves, below a root, which is a deletion: every row
+/// is stale.
 ///
-/// Each listed file takes its row out of `rows`, carrying the stored mtime
+/// Each listed file takes its row out of `rows`, carrying the stored stamp
 /// with it, so what is left afterwards is exactly the stale set.
 fn read_directory(
     dir: &Path,
@@ -165,16 +165,24 @@ fn read_directory(
 ) -> Vec<PendingFile> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
+        // NotFound under a parent that still resolves is a deletion; anything
+        // else is recorded unreadable. A pulled drive or a dropped share fails
+        // the parent too; a build or cache directory deleted mid-walk does
+        // not. One `lstat`, on the failure path only. A root is never a
+        // deletion: its parent outlives an unmount.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && !ctx.roots.iter().any(|root| root == dir)
+                && dir.parent().is_some_and(|p| p.symlink_metadata().is_ok()) =>
+        {
+            stale.extend(rows.into_keys().map(|n| path_to_db_string(&dir.join(n))));
+            return Vec::new();
+        }
         Err(e) => {
             if UNREADABLE_WARNINGS.allow() {
                 crate::log_warn!("cannot read {}: {}", dir.display(), e);
             }
-            // "Gone" is not "could not look": a directory deleted mid-walk
-            // should fall to the stale sweep. Only `NotFound` is unambiguous,
-            // the same distinction `verb_for` draws.
-            if e.kind() != std::io::ErrorKind::NotFound {
-                ctx.unreadable.record(dir.to_path_buf());
-            }
+            ctx.unreadable.record(dir.to_path_buf());
             return Vec::new();
         }
     };
@@ -194,7 +202,6 @@ fn read_directory(
                 if UNREADABLE_WARNINGS.allow() {
                     crate::log_warn!("cannot read an entry of {}: {}", dir.display(), e);
                 }
-                ctx.unreadable.record(dir.to_path_buf());
                 // An incomplete listing cannot decide what is missing: an
                 // entry we failed to read looks identical to a deleted one.
                 unreadable_entry = true;
@@ -267,17 +274,10 @@ fn read_directory(
             // Row left in `rows`: a name that was a file last run and is a
             // directory now should lose its row.
             Ok(ft) if ft.is_dir() => found.push(Found::Dir(path)),
-            // Directory and file targets gate together, or the walkers
-            // disagree: `filtered_walk` follows neither kind, so a file target
-            // followed only here would never update between runs. Row left
-            // in `rows`: the target's row belongs to its own directory.
-            Ok(ft) if ft.is_symlink() => {
-                if ctx.follow_symlinks {
-                    if let Some(target) = resolve_link(&path, ctx) {
-                        found.push(target);
-                    }
-                }
-            }
+            // Never followed, to a file or a directory (on Windows a junction
+            // is one too). Row left in `rows`: a name that was a file last
+            // run and is a link now should lose its row.
+            Ok(ft) if ft.is_symlink() => {}
             Ok(_) => {
                 let stored = rows.remove(name);
                 // `None` on Unix and on any reparse point.
@@ -295,7 +295,11 @@ fn read_directory(
         }
     }
 
-    if !unreadable_entry {
+    // Once per directory, however many entries failed: the run reports a
+    // count of directories.
+    if unreadable_entry {
+        ctx.unreadable.record(dir.to_path_buf());
+    } else {
         stale.extend(rows.into_keys().map(|name| path_to_db_string(&dir.join(name))));
     }
 
@@ -308,63 +312,24 @@ fn read_directory(
     files
 }
 
-/// Where a followed symlink leads, in stored spelling: a directory to walk or
-/// a file to classify by exact path. `None` for a dangling link, a target the
-/// index cannot spell, or one of the index's own files.
-fn resolve_link(path: &Path, ctx: &Ctx) -> Option<Found> {
-    // Normalized like the roots, or on Windows the target keeps
-    // `canonicalize`'s `\\?\` prefix, under which ignore patterns never match
-    // and `seen_dirs` cannot dedup.
-    let target = path.canonicalize().ok()?;
-    // The target is a different path from the screened link, so it needs its
-    // own screen.
-    if target.to_str().is_none() {
-        if UNREPRESENTABLE_WARNINGS.allow() {
-            crate::log_warn!(
-                "Skipping {} (its target {:?} is not valid UTF-8, so it cannot \
-                 be stored, hashed or text-indexed)",
-                path.display(),
-                target
-            );
-        }
-        return None;
-    }
-    let target = PathBuf::from(path_to_db_string(&target));
-    // A symlink pointing at the index would otherwise walk straight into an
-    // `open`.
-    if ctx.index_files.contains(&target) {
-        ctx.pruned.ignored.fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    match fs::metadata(&target) {
-        Ok(m) if m.is_dir() => Some(Found::Dir(target)),
-        Ok(_) => Some(Found::Alias(target)),
-        Err(_) => None,
-    }
-}
-
 /// At most one `stat`, then classify; only files that will be written get
 /// opened, and small text files are finished outright. "At most": on Windows
-/// [`PendingFile::cached`] may already hold the answer.
+/// [`PendingFile::cached`] may already hold the answer, but it can lag the
+/// file, so a change it reports is confirmed against the opened handle
+/// before anything is written.
 ///
-/// `aliased`: reached by resolving a symlink, so its row lives under a
-/// different parent than the link's. `scratch` is this worker's, carrying the
-/// head buffer every hash and MIME sniff reads into.
-fn prepare(
-    file: PendingFile,
-    aliased: bool,
-    ctx: &Ctx,
-    scratch: &mut crate::extract::Scratch,
-) -> WalkedFile {
+/// `scratch` is this worker's, carrying the head buffer every hash and MIME
+/// sniff reads into.
+fn prepare(file: PendingFile, ctx: &Ctx, scratch: &mut crate::extract::Scratch) -> WalkedFile {
     let PendingFile {
         path,
         cached,
         stored,
     } = file;
     // Every route here has already screened the path for UTF-8, and every
-    // walk path is a normalized root or link target with names joined on, so
-    // it already is its stored spelling: the buffer becomes the `String`
-    // without a copy (see `path_to_db_string`).
+    // walk path is a normalized root with names joined on, so it already is
+    // its stored spelling: the buffer becomes the `String` without a copy
+    // (see `path_to_db_string`).
     let db_path = path.into_os_string().into_string().unwrap_or_else(|path| {
         debug_assert!(false, "an unrepresentable path reached prepare(): {:?}", path);
         path_to_db_string(Path::new(&path))
@@ -374,13 +339,10 @@ fn prepare(
     let Ok(meta) = crate::platform::metadata_or_stat(Path::new(&db_path), cached) else {
         // Seen but unreadable: a transient stat failure must not read as
         // "deleted".
-        return WalkedFile::skipped(db_path, aliased);
-    };
-    let Some(mtime) = crate::file_handling::mtime_secs(&meta) else {
-        return WalkedFile::skipped(db_path, aliased);
+        return WalkedFile::skipped(db_path);
     };
 
-    let action = classify_by_mtime(stored, mtime);
+    let action = classify(stored, Stamp::of(&meta));
     let record = match action {
         // Unchanged: never opened or hashed, so it stays at one syscall.
         FileIndexAction::Skip => None,
@@ -388,12 +350,21 @@ fn prepare(
         // opening a FIFO, an uninterruptible forever-block.
         _ => prepare_file_record(&db_path, &meta, &ctx.config, &ctx.registry, scratch),
     };
+    // The record's stamp is the opened handle's. One that matches the row
+    // after all (a lagging Windows directory entry) was never a change, and
+    // rewriting the row would clear its extracted content for nothing.
+    if action == FileIndexAction::Update
+        && record
+            .as_ref()
+            .is_some_and(|rec| classify(stored, Stamp::of_record(rec)) == FileIndexAction::Skip)
+    {
+        return WalkedFile::skipped(db_path);
+    }
 
     WalkedFile {
         path: db_path,
         action,
         record,
-        aliased,
     }
 }
 
@@ -421,16 +392,6 @@ fn worker(shared: &Shared, ctx: &Ctx, tx: &mpsc::SyncSender<WalkEvent>) {
                 slot.finish(Vec::new());
                 deliver(files, Vec::new(), ctx, tx, &mut scratch)
             }
-            Job::Alias(path, stored) => {
-                slot.finish(Vec::new());
-                let file = PendingFile {
-                    path,
-                    cached: None,
-                    stored,
-                };
-                let walked = prepare(file, true, ctx, &mut scratch);
-                tx.send(WalkEvent::File(walked)).is_ok()
-            }
         };
         if !delivered {
             shared.shutdown();
@@ -456,39 +417,31 @@ fn deliver(
         if ctx.stop_flag.load(Ordering::Relaxed) {
             return false;
         }
-        let walked = prepare(file, false, ctx, scratch);
+        let walked = prepare(file, ctx, scratch);
         tx.send(WalkEvent::File(walked)).is_ok()
     })
 }
 
-/// Serves the pool's directory-row and symlink-mtime lookups from one
-/// read-only connection. A failed query abandons the job: the directory goes
-/// unwalked, which reconciliation reads as "not seen" and deletes nothing.
+/// Serves the pool's directory-row lookups from one read-only connection. A
+/// failed open or row query, or a panic, ends the walk unclean, so the run
+/// skips stale cleanup: without its rows a directory cannot be reconciled,
+/// and left unread its subtree would look deleted.
 fn prefetcher(shared: &Shared, db_path: &str) {
+    let _end = EndWalk(shared);
     let conn = match crate::db::open::open_walk_reader(db_path) {
         Ok(conn) => conn,
         Err(e) => {
-            // Without rows, every file looks new and every row stale.
             crate::log_warn!("walk reader: {}", e);
-            shared.shutdown();
             return;
         }
     };
 
-    while let Some(work) = shared.take_prefetch() {
-        let job = match work {
-            PrefetchWork::Dir(dir) => crate::db::repo::dir_rows(&conn, &dir_to_db_parent(&dir))
-                .map(|rows| Job::Dir(dir, rows)),
-            PrefetchWork::Alias(path) => {
-                crate::db::repo::mtime_for_path(&conn, &path_to_db_string(&path))
-                    .map(|stored| Job::Alias(path, stored))
-            }
-        };
-        match job {
-            Ok(job) => shared.finish_prefetch(job),
+    while let Some(dir) = shared.take_prefetch() {
+        match crate::db::repo::dir_rows(&conn, &dir_to_db_parent(&dir)) {
+            Ok(rows) => shared.finish_prefetch(dir, rows),
             Err(e) => {
                 crate::log_warn!("{}", e);
-                shared.abandon_prefetch();
+                return;
             }
         }
     }
@@ -551,10 +504,11 @@ impl ParallelWalk {
         (q.seen_dirs.len(), bytes)
     }
 
-    /// Join the workers and report whether every one finished cleanly. A dead
-    /// worker and a finished one look identical from the receiving end, and
-    /// treating a panicked walk as complete would hand stale cleanup a
-    /// partial file set.
+    /// Join the workers and report whether the walk was clean: it ran to its
+    /// end, every queued directory read or recorded unreadable, with no
+    /// thread panicking. Only then does "not seen" mean "gone". A stopped,
+    /// dropped or failed walk ends early, and a dead worker looks like a
+    /// finished one from the receiving end.
     pub fn finish(&mut self) -> bool {
         // Dropping the receiver first releases any worker parked in `send`.
         self.rx = None;
@@ -565,7 +519,7 @@ impl ParallelWalk {
             self.shared.shutdown();
             clean &= handle.join().is_ok();
         }
-        clean
+        clean && crate::lock_ok(&self.shared.queue).exhausted
     }
 }
 
@@ -639,12 +593,13 @@ impl Drop for ParallelWalk {
 }
 
 /// Walk `roots` in parallel, yielding every indexable file exactly once per
-/// canonical path. `workers` (clamped to 1..=64) is explicit for per-root
-/// overrides; `db_path` is opened read-only by the row prefetcher.
+/// canonical path. Links inside a root are never followed; a root that is
+/// itself one is walked at its target. `workers` (clamped to 1..=64) is
+/// explicit for per-root overrides; `db_path` is opened read-only by the row
+/// prefetcher.
 #[allow(clippy::too_many_arguments)]
 pub fn walk_indexable_files(
     roots: &[String],
-    follow_symlinks: bool,
     include_hidden: bool,
     ignore: IgnoreSet,
     db_path: &str,
@@ -671,6 +626,16 @@ pub fn walk_indexable_files(
                 );
                 unresolvable.push(PathBuf::from(root));
             }
+            // A mountpoint with nothing mounted on it lists as empty; walking
+            // it would read every row under it as deleted. The cost: a root
+            // emptied on purpose keeps its rows until it holds an entry again.
+            Ok(dir) if fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_none()) => {
+                crate::log_warn!(
+                    "root {} is empty; keeping its index entries in case nothing is mounted there",
+                    root
+                );
+                unresolvable.push(PathBuf::from(path_to_db_string(&dir)));
+            }
             Ok(dir) => {
                 let dir = PathBuf::from(path_to_db_string(&dir));
                 if queue.seen_dirs.insert(dir.clone()) {
@@ -680,20 +645,24 @@ pub fn walk_indexable_files(
             Err(e) => {
                 crate::log_warn!("cannot resolve indexing root {}: {}", root, e);
                 // An unmounted root is indistinguishable from "everything
-                // was deleted"; recorded so stale cleanup leaves it alone.
+                // was deleted"; recorded so stale cleanup leaves it alone, as
+                // the empty arm above does for an empty mountpoint. A
+                // mountpoint nested below a root is not covered: unmounted,
+                // it reads as a directory whose files were all deleted.
                 unresolvable.push(PathBuf::from(root));
             }
         }
     }
 
     let threads = workers.clamp(1, 64);
+    // Nothing but the roots is queued yet.
+    let roots = queue.needs_rows.clone();
     let shared = Arc::new(Shared {
         queue: Mutex::new(queue),
         idle: Condvar::new(),
         stats: WorkerStats::new(threads),
     });
     let ctx = Arc::new(Ctx {
-        follow_symlinks,
         include_hidden,
         ignore,
         index_files: crate::file_handling::index_file_set(Path::new(db_path)),
@@ -702,6 +671,7 @@ pub fn walk_indexable_files(
         registry,
         unreadable: UnreadableDirs::default(),
         stop_flag,
+        roots,
     });
 
     for root in unresolvable {

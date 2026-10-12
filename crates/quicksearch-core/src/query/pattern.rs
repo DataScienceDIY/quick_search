@@ -3,6 +3,13 @@
 //! A term with an unquoted `*` compiles to a small regex; star-free terms
 //! stay on the [`Literal`](TermPattern::Literal) path.
 //!
+//! The two fold case differently. A literal folds ASCII case only: `cafe`
+//! finds `CAFE`, and `café` never finds `CAFÉ`. A `*` pattern and `regex:`
+//! fold Unicode case by the regex crate's simple folds, so `résumé*` finds
+//! `RÉSUMÉ` and `kilo*` a name spelled with U+212A KELVIN SIGN. Every
+//! prefilter in front of them must fold at least as much; see
+//! [`crate::search::prefilter`], and its exception for file contents.
+//!
 //! `.` never matches `\n`, so a star cannot span lines of extracted text; a
 //! `*` bridging a whole document would produce page-sized snippets.
 
@@ -274,9 +281,12 @@ pub struct RegexQuery {
 /// Extract a set of literals at least one of which occurs in every match.
 /// Sound because every match begins (prefix set) or ends (suffix set) with
 /// one of the literals; an unbounded set yields `None`. Parsed
-/// case-sensitively because case-insensitive extraction explodes
-/// combinatorially, and both consumers fold anyway, so a case-sensitive set
-/// stays sound: `(?i)` yields `None`, a lost optimisation, never a lost row.
+/// case-sensitively, because case-insensitive extraction explodes
+/// combinatorially. Sound because FTS folds case (up to the exception in
+/// [`crate::search::prefilter`]) and `like_predicate(true)` turns every
+/// character with a non-ASCII case partner into `_`. An explicit `(?i)` in
+/// the pattern still yields literals: the extractor expands classes of 10
+/// characters or fewer, so `(?i)abc` gives its 8 case variants.
 fn required_literals(source: &str) -> Option<Required> {
     use regex_syntax::hir::literal::{ExtractKind, Extractor};
 
@@ -565,6 +575,19 @@ mod tests {
         let r = RegexQuery::new("(a+)+$").unwrap();
         let hay = format!("{}b", "a".repeat(10_000));
         assert!(!r.is_match(&hay));
+    }
+
+    #[test]
+    fn an_explicit_case_flag_still_yields_literals() {
+        let r = RegexQuery::new("(?i)abc").unwrap();
+        let mut literals = r.required().expect("a bounded set").literals().to_vec();
+        literals.sort();
+        assert_eq!(literals.len(), 8, "{literals:?}");
+        assert_eq!((literals[0].as_str(), literals[7].as_str()), ("ABC", "abc"));
+        // Without the flag the set is the literal as typed; the folding is
+        // the consumers' job.
+        let r = RegexQuery::new("Café").unwrap();
+        assert_eq!(r.required().unwrap().literals(), ["Café"]);
     }
 
     #[test]

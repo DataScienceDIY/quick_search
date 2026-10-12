@@ -141,7 +141,7 @@ pub fn index_size_breakdown(db_path: &str) -> Result<SizeReport, String> {
     };
     let dt_row_count: i64 = count("documents_text")?;
     // The uncompressed length lives in each zstd frame header (at most 18
-    // bytes); projecting the prefix keeps this off the document bodies.
+    // bytes), so nothing is decompressed.
     let mut stmt = conn
         .prepare("SELECT substr(text_zstd, 1, 18), LENGTH(text_zstd) FROM documents_text")
         .map_err(|e| format!("documents_text size sum prepare: {}", e))?;
@@ -357,16 +357,16 @@ mod tests {
     }
 
     #[test]
-    fn clear_path_on_nondefault_tokenizer_db_removes_only_target() {
+    fn clear_path_on_nondefault_layout_db_removes_only_target() {
         // Must never trigger the owner's schema-mismatch wipe.
         let (_dir, p) = Scratch::db("cli");
         let dbp = p.to_str().unwrap();
         {
-            let unicode61 = crate::config::ProcessingConfig {
-                tokenize: "unicode61".into(),
+            let positions = crate::config::ProcessingConfig {
+                compact_text_index: false,
                 ..Default::default()
             };
-            let mut conn = open_or_recreate(dbp, &unicode61).unwrap();
+            let mut conn = open_or_recreate(dbp, &positions).unwrap();
             let tx = conn.transaction().unwrap();
             for name in ["a.txt", "b.txt"] {
                 row(&tx, name, true);

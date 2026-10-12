@@ -30,11 +30,9 @@ use crate::db;
 #[derive(Debug, Clone, PartialEq)]
 pub struct DuplicateGroup {
     pub hash: Vec<u8>,
-    pub count: i64,
-    pub total_size: i64,
-    /// Bytes reclaimable by deduplicating: `size × (count - 1)`; the sort key.
-    pub redundant_size: i64,
-    /// `(file_id, name, path, size, mtime)` per member, path-ordered.
+    /// `(file_id, name, path, size, mtime)` per member, path-ordered. Price a
+    /// group from these: the counts it was ranked by came from an earlier
+    /// statement, with no transaction holding the two together.
     pub members: Vec<(i64, String, String, u64, i64)>,
 }
 
@@ -53,8 +51,6 @@ impl DuplicateGroup {
 #[derive(Debug, PartialEq, Eq)]
 struct Ranked {
     redundant: i64,
-    count: i64,
-    size: i64,
     rowid: i64,
 }
 
@@ -74,6 +70,11 @@ impl PartialOrd for Ranked {
 
 /// The `limit` hash groups with the most reclaimable bytes, largest first.
 /// Groups of one, NULL-hash rows and zero-size files are excluded.
+///
+/// Grouping is by hash alone, so hard links and bind-mounted copies of one
+/// file are listed as copies, and deleting one frees nothing. That is
+/// documented rather than detected: they really are byte-identical, which
+/// is all verification claims.
 pub fn find_duplicate_groups(db_path: &str, limit: u32) -> Result<Vec<DuplicateGroup>, String> {
     if limit == 0 {
         return Ok(Vec::new());
@@ -134,11 +135,8 @@ fn rank_candidates(
         };
         // Saturating, not wrapping: a corrupt row must mis-rank one group, not
         // panic the scan in a debug build.
-        let redundant = size.saturating_mul(count - 1);
         let ranked = Ranked {
-            redundant,
-            count,
-            size,
+            redundant: size.saturating_mul(count - 1),
             rowid,
         };
         if best.len() < limit as usize {
@@ -198,13 +196,7 @@ fn hydrate(conn: &Connection, winners: Vec<Ranked>) -> Result<Vec<DuplicateGroup
         if members.is_empty() {
             continue;
         }
-        groups.push(DuplicateGroup {
-            hash,
-            count: winner.count,
-            total_size: winner.size.saturating_mul(winner.count),
-            redundant_size: winner.redundant,
-            members,
-        });
+        groups.push(DuplicateGroup { hash, members });
     }
     Ok(groups)
 }
@@ -269,23 +261,30 @@ mod tests {
         )
     }
 
+    /// Each group as `(first member's name, member count)`, in listed order.
+    fn shape(groups: &[DuplicateGroup]) -> Vec<(&str, usize)> {
+        groups
+            .iter()
+            .map(|g| (g.members[0].1.as_str(), g.members.len()))
+            .collect()
+    }
+
     #[test]
     fn groups_ordered_by_redundant_size_zero_size_excluded() {
         let (_dir, p) = seed_db();
         let groups = find_duplicate_groups(&p, 10).unwrap();
         assert_eq!(
-            groups.len(),
-            2,
-            "singletons, NULL hashes, and zero-size groups excluded"
+            shape(&groups),
+            [("b1.txt", 2), ("a1.txt", 3)],
+            "singletons, NULL hashes, and zero-size groups excluded; \
+             100 reclaimable bytes before 20"
         );
-        assert_eq!(groups[0].count, 2);
-        assert_eq!(groups[0].total_size, 200);
-        assert_eq!(groups[0].redundant_size, 100);
-        assert_eq!(groups[1].count, 3);
-        assert_eq!(groups[1].total_size, 30);
-        assert_eq!(groups[1].redundant_size, 20);
-        assert_eq!(groups[1].members.len(), 3);
-        assert_eq!(groups[1].members[0].1, "a1.txt", "members path-ordered");
+        let names: Vec<&str> = groups[1].members.iter().map(|m| m.1.as_str()).collect();
+        assert_eq!(
+            names,
+            ["a1.txt", "a2.txt", "a3.txt"],
+            "members path-ordered"
+        );
     }
 
     /// A fresh index has no hash index until its first run's maintenance
@@ -373,12 +372,11 @@ mod tests {
             .collect();
         let (_dir, p) = seed("dups_many", &rows);
         let groups = find_duplicate_groups(&p, 10).unwrap();
-        assert_eq!(groups[0].count, 20);
         assert_eq!(
-            groups[0].redundant_size, 1900,
-            "ranked on reclaimable bytes, not on file size"
+            shape(&groups),
+            [("small00.txt", 20), ("big1.bin", 2)],
+            "ranked on reclaimable bytes (1900 before 1000), not on file size"
         );
-        assert_eq!(groups[1].redundant_size, 1000);
     }
 
     #[test]
@@ -395,8 +393,11 @@ mod tests {
             ],
         );
         let first = find_duplicate_groups(&p, 10).unwrap();
-        assert_eq!(first.len(), 3);
-        assert!(first.iter().all(|g| g.redundant_size == 50), "all tied");
+        assert_eq!(
+            shape(&first),
+            [("t1.txt", 2), ("u1.txt", 2), ("v1.txt", 2)],
+            "all tied on 50 bytes, so the lower rowid lists first"
+        );
         let again = find_duplicate_groups(&p, 10).unwrap();
         assert_eq!(first, again, "an unchanged index lists the same order");
         // And the tie-break must survive truncation: the top 2 of a tied set are
@@ -415,32 +416,43 @@ mod tests {
     fn malformed_group_does_not_panic() {
         let (_dir, p) = seed(
             "dups_malformed",
-            &[("m1.txt", 10, Some(b"MMM")), ("m2.txt", 999, Some(b"MMM"))],
+            &[
+                ("m1.txt", 10, Some(b"MMM")),
+                ("m2.txt", 999, Some(b"MMM")),
+                ("p1.txt", 50, Some(b"PPP")),
+                ("p2.txt", 50, Some(b"PPP")),
+            ],
         );
         let groups = find_duplicate_groups(&p, 10).unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].count, 2);
         assert_eq!(
-            groups[0].redundant_size, 10,
-            "totals come from the lowest rowid's size"
+            shape(&groups),
+            [("p1.txt", 2), ("m1.txt", 2)],
+            "priced by the lowest rowid's size, 10, not the 999 beside it"
         );
-        assert_eq!(groups[0].members.len(), 2);
+        let sizes: Vec<u64> = groups[1].members.iter().map(|m| m.3).collect();
+        assert_eq!(sizes, [10, 999], "each member reports its own size");
     }
 
+    /// `size × (count - 1)` past `i64::MAX` would panic a debug build.
     #[test]
-    fn absurd_sizes_saturate_instead_of_overflowing() {
+    fn absurd_sizes_rank_without_panicking() {
         let huge = i64::MAX as u64;
         let (_dir, p) = seed(
             "dups_overflow",
             &[
+                ("s1.txt", 10, Some(b"SSS")),
+                ("s2.txt", 10, Some(b"SSS")),
                 ("h1.bin", huge, Some(b"HHH")),
                 ("h2.bin", huge, Some(b"HHH")),
+                ("h3.bin", huge, Some(b"HHH")),
             ],
         );
         let groups = find_duplicate_groups(&p, 10).unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].redundant_size, i64::MAX);
-        assert_eq!(groups[0].total_size, i64::MAX, "saturated, not wrapped");
+        assert_eq!(
+            shape(&groups),
+            [("h1.bin", 3), ("s1.txt", 2)],
+            "saturated, not wrapped to a negative that sorts last"
+        );
     }
 
     /// Guards the module's reason to exist: a candidate scan that reads a table

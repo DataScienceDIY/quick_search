@@ -3,7 +3,7 @@
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 
-use crate::file_handling::{ContentOutcome, ExtractCursor, RootRange};
+use crate::file_handling::{ContentOutcome, DirRows, ExtractCursor, RootRange, Stamp};
 use crate::mime::FileType;
 
 pub const STATE_PENDING: i64 = 0;
@@ -165,7 +165,8 @@ fn claim_pending(tx: &Transaction<'_>, file_id: i64, state: i64) -> Result<bool,
 /// [`STATE_FAILED`]), so nothing is cleared first. A row that stopped being
 /// pending while its extraction was in flight (stored by another route, or
 /// deleted by stale cleanup) is left alone: writing it anyway would leave a
-/// posting with no `files` row behind it, which a reused rowid inherits.
+/// posting with no `files` row behind it, which a reused rowid inherits. So
+/// is a [`ContentOutcome::Cancelled`] row, which the next run extracts.
 pub fn complete_pending(
     tx: &Transaction<'_>,
     file_id: i64,
@@ -175,6 +176,7 @@ pub fn complete_pending(
     match outcome {
         ContentOutcome::Done { text } => store_pending_text(tx, file_id, text, text_zstd),
         ContentOutcome::NotApplicable => claim_pending(tx, file_id, STATE_NA),
+        ContentOutcome::Cancelled => Ok(false),
         ContentOutcome::Failed(reason) => {
             if !claim_pending(tx, file_id, STATE_FAILED)? {
                 return Ok(false);
@@ -400,29 +402,7 @@ fn delete_files_matching(
     })
 }
 
-/// Delete every row whose parent falls in none of `ranges`. A full scan of
-/// `files`, for the one transition that needs it: once `follow_symlinks` is
-/// off, rows a followed symlink left fall outside every root's range and no
-/// walk visits them again.
-pub fn delete_outside_ranges(
-    tx: &Transaction<'_>,
-    ranges: &[(String, String)],
-) -> Result<usize, String> {
-    if ranges.is_empty() {
-        return Ok(0);
-    }
-    let predicate = (0..ranges.len())
-        .map(|i| format!("NOT (parent >= ?{} AND parent < ?{})", i * 2 + 1, i * 2 + 2))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    let bounds: Vec<&dyn rusqlite::ToSql> = ranges
-        .iter()
-        .flat_map(|(lo, hi)| [lo as &dyn rusqlite::ToSql, hi as &dyn rusqlite::ToSql])
-        .collect();
-    delete_files_matching(tx, &predicate, &bounds, "outside the roots")
-}
-
-/// Fixed chunk size so `prepare_cached` sees a bounded set of SQL texts.
+/// Fixed chunk size, so every full chunk reuses one cached statement.
 const DELETE_IDS_CHUNK: usize = 512;
 
 fn placeholders(n: usize) -> String {
@@ -533,19 +513,30 @@ pub fn clear_failed_for_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<(), Str
     .map(|_| ())
 }
 
-/// Every indexed file directly inside `parent`, as `name -> mtime`. `parent`
+/// The walk prefetcher's query, one directory's rows by `idx_files_parent`.
+const DIR_ROWS_SQL: &str =
+    "SELECT name, mtime, size, hash IS NOT NULL FROM files WHERE parent = ?1";
+
+/// A row's [`Stamp`] from the columns `mtime, size, hash IS NOT NULL`, read
+/// from `at` on. A negative stored value reads as 0, as no file has one.
+fn stamp_at(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Stamp> {
+    Ok(Stamp {
+        mtime: r.get::<_, i64>(at)?.max(0) as u64,
+        size: r.get::<_, i64>(at + 1)?.max(0) as u64,
+        hashed: r.get(at + 2)?,
+    })
+}
+
+/// Every indexed file directly inside `parent`, as `name -> stamp`. `parent`
 /// must be in stored spelling, trailing separator included; build it with
 /// [`crate::file_handling::dir_to_db_parent`].
-pub fn dir_rows(
-    conn: &Connection,
-    parent: &str,
-) -> Result<std::collections::HashMap<String, u64>, String> {
+pub fn dir_rows(conn: &Connection, parent: &str) -> Result<DirRows, String> {
     let mut stmt = conn
-        .prepare_cached("SELECT name, mtime FROM files WHERE parent = ?1")
+        .prepare_cached(DIR_ROWS_SQL)
         .map_err(|e| format!("prepare dir rows for {}: {}", parent, e))?;
     let rows = stmt
         .query_map(params![parent], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+            Ok((r.get::<_, String>(0)?, stamp_at(r, 1)?))
         })
         .map_err(|e| format!("query dir rows for {}: {}", parent, e))?;
     rows.collect::<Result<_, _>>()
@@ -752,18 +743,19 @@ pub fn retry_failed_files(tx: &Transaction<'_>) -> Result<usize, String> {
     Ok(reset)
 }
 
-/// The stored mtime for one exact path, or `None` if it isn't indexed.
-pub fn mtime_for_path(conn: &Connection, path: &str) -> Result<Option<u64>, String> {
+/// The stored stamp for one exact path, or `None` if it isn't indexed.
+pub fn stamp_for_path(conn: &Connection, path: &str) -> Result<Option<Stamp>, String> {
     let Some((parent, name)) = crate::file_handling::split_db_path(path) else {
         return Ok(None);
     };
     let mut stmt = conn
-        .prepare_cached("SELECT mtime FROM files WHERE parent = ?1 AND name = ?2")
-        .map_err(|e| format!("prepare mtime lookup for {}: {}", path, e))?;
-    stmt.query_row(params![parent, name], |r| r.get::<_, i64>(0))
+        .prepare_cached(
+            "SELECT mtime, size, hash IS NOT NULL FROM files WHERE parent = ?1 AND name = ?2",
+        )
+        .map_err(|e| format!("prepare stamp lookup for {}: {}", path, e))?;
+    stmt.query_row(params![parent, name], |r| stamp_at(r, 0))
         .optional()
-        .map(|o| o.map(|m| m.max(0) as u64))
-        .map_err(|e| format!("mtime lookup for {}: {}", path, e))
+        .map_err(|e| format!("stamp lookup for {}: {}", path, e))
 }
 
 /// Distinct `parent` values within `range`, streamed to `f`. The root's own
@@ -830,17 +822,17 @@ const VACUUM_MIN_SLACK_PERCENT: i64 = 20;
 /// bytes. `Err` means the log was *not* emptied.
 ///
 /// Only the pragma's result row reports that a checkpoint gave up;
-/// `execute`/`execute_batch` discard it. The signal is the *log* column, not
-/// `busy`: a TRUNCATE that cannot take the writer lock downgrades itself to
-/// PASSIVE and still reports `busy = 0` with the log untouched. A database not
-/// in WAL mode reports -1, hence `<= 0`.
+/// `execute`/`execute_batch` discard it. A TRUNCATE that a reader holds back
+/// waits out `busy_timeout` and reports `busy = 1`, as does one that cannot
+/// take the checkpoint lock, whose log reads -1. A database not in WAL mode
+/// reports a log of -1, hence `<= 0`.
 pub fn checkpoint_truncate(conn: &Connection) -> Result<(), String> {
     let (busy, log): (i64, i64) = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
         .map_err(|e| format!("wal checkpoint: {}", e))?;
-    if log <= 0 {
+    if busy == 0 && log <= 0 {
         Ok(())
     } else {
         Err(format!(
@@ -877,32 +869,21 @@ pub(super) fn pragma_number(conn: &Connection, pragma: &str) -> Result<i64, Stri
     .ok_or_else(|| format!("read {}: not a number", pragma))
 }
 
-/// The row count ANALYZE last recorded for `files`, or `None` if it never ran.
-///
-/// Read from `sqlite_stat1` (populated by [`maintain`]'s `PRAGMA optimize`),
-/// not a `COUNT(*)` scan; each `stat` string starts with the estimated row
-/// count. Takes the maximum across the table's indexes: the partial
-/// `idx_files_content_pending` counts only pending rows.
-pub fn analyzed_file_count(conn: &Connection) -> Option<i64> {
-    let mut stmt = conn
-        .prepare("SELECT stat FROM sqlite_stat1 WHERE tbl = 'files'")
-        .ok()?;
-    let rows = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|stat| stat.split_whitespace().next()?.parse::<i64>().ok());
-    rows.max()
-}
-
 /// Create `idx_files_hash` if it is missing: after a fresh index's first run,
 /// in one sorted build. It is not in [`crate::db::schema::SCHEMA_CURRENT`]:
 /// a SHA-256 key lands on a random leaf, so kept up through a bulk load, every
 /// walk commit rewrote hundreds of the index's pages. Measured (`memprobe
 /// cold`): bytes written 4.77 → 2.87 GB over `/usr` (373k files), 938 → 855
-/// MiB over the cargo registry (41k), CPU within noise, and about 10 MiB more
-/// peak for the sort. Only [`crate::search::find_duplicate_groups`] reads it,
-/// and until the build it sorts the table instead.
+/// MiB over the cargo registry (41k), CPU within noise. Only
+/// [`crate::search::find_duplicate_groups`] reads it, and until the build it
+/// sorts the table instead.
+///
+/// The sort runs in memory, since a spill would be a plaintext file on a
+/// protected index (see [`maintain`]), so its cost scales with the file count.
+/// Measured (`memprobe cold`, `/usr`, 408k files, 2026-10-11): 20–23 MiB
+/// above the pass's starting RSS, against 4–6 MiB when the sort spilled past
+/// the 8 MiB cache, and under a second either way; the run's peak (280–350
+/// MiB, set by extraction) and its settled RSS did not move.
 pub fn build_hash_index(conn: &Connection) -> Result<(), String> {
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);")
         .map_err(|e| format!("build hash index: {}", e))
@@ -910,13 +891,16 @@ pub fn build_hash_index(conn: &Connection) -> Result<(), String> {
 
 /// Checkpoint, [`build_hash_index`], VACUUM, `PRAGMA optimize`, checkpoint;
 /// the trailing checkpoint empties what VACUUM's copy-back and `optimize`
-/// wrote to the log. Returns whether it vacuumed.
+/// wrote to the log. Returns whether it vacuumed. A failed step after the
+/// first checkpoint ends the pass on purpose: one
+/// [`crate::indexing::IndexingService::cancel_db_work`] interrupts only the
+/// statement running then, and the next run's pass tries again.
 ///
-/// Run on a connection from [`crate::db::open::open_maintenance`], never the
-/// indexer's. VACUUM's temporary database goes in the directory of `db_path`,
-/// since default temp resolution can land on a RAM-backed `/tmp`; peak
-/// transient space is about three times the index. Taking the index path, not
-/// a directory, keeps that directory the index's and lets it read the log.
+/// Run on a writer from [`crate::db::open_existing`], whose temporaries are in
+/// memory; only VACUUM's go to disk, in the directory of `db_path`, since
+/// default temp resolution can land on a RAM-backed `/tmp`. Peak transient
+/// space is about three times the index. Taking the index path, not a
+/// directory, keeps that directory the index's and lets it read the log.
 pub fn maintain(conn: &Connection, db_path: &str) -> Result<bool, String> {
     let db_dir = std::path::Path::new(db_path)
         .parent()
@@ -943,32 +927,39 @@ pub fn maintain(conn: &Connection, db_path: &str) -> Result<bool, String> {
     let worth_it = freelist * 100 >= page_count * VACUUM_MIN_SLACK_PERCENT;
     // A full filesystem turns `-shm` writes into SIGBUS; see
     // `indexing::pipeline::DISK_FLOOR`.
-    let page_size = pragma_number(conn, "page_size")?;
-    let needed = (page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64) * 3;
-    let room = match crate::platform::available_space(std::path::Path::new(db_dir)) {
-        Some(free) if free < needed => {
-            crate::log_warn!(
-                "skipping VACUUM: it needs about {} MiB free in {} and there is {} MiB",
-                needed / (1024 * 1024),
-                db_dir,
-                free / (1024 * 1024)
-            );
-            false
+    let vacuumed = worth_it && {
+        let page_size = pragma_number(conn, "page_size")?;
+        let needed = (page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64) * 3;
+        match crate::platform::available_space(std::path::Path::new(db_dir)) {
+            Some(free) if free < needed => {
+                crate::log_warn!(
+                    "skipping VACUUM: it needs about {} MiB free in {} and there is {} MiB",
+                    needed / (1024 * 1024),
+                    db_dir,
+                    free / (1024 * 1024)
+                );
+                false
+            }
+            _ => true,
         }
-        _ => true,
     };
-
-    let vacuumed = worth_it && room;
     if vacuumed {
+        // SQLCipher is compiled `-DSQLITE_TEMP_STORE=2`, under which anything
+        // but an explicit `FILE` keeps temporary databases in memory, and
+        // VACUUM builds its replacement there: a multi-gigabyte index in RAM.
+        // Only that temporary database is keyed from the main one. A sorter
+        // spill is a raw OS file, plaintext on a protected index, so `FILE`
+        // covers the VACUUM alone and the hash index's sort stays in memory.
         // `temp_store_directory` is a deprecated pragma that writes a
-        // process-wide global, so it is cleared straight after the VACUUM.
+        // process-wide global, so both are restored straight after.
         let escaped = db_dir.replace('\'', "''");
-        conn.execute_batch(&format!("PRAGMA temp_store_directory = '{}';", escaped))
-            .map_err(|e| format!("set temp dir for vacuum: {}", e))?;
         let outcome = conn
-            .execute_batch("VACUUM;")
+            .execute_batch(&format!(
+                "PRAGMA temp_store = FILE; PRAGMA temp_store_directory = '{}'; VACUUM;",
+                escaped
+            ))
             .map_err(|e| format!("vacuum: {}", e));
-        let _ = conn.execute_batch("PRAGMA temp_store_directory = '';");
+        let _ = conn.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA temp_store_directory = '';");
         outcome?;
     }
     #[cfg(feature = "probe")]
@@ -1057,15 +1048,13 @@ fn wal_bytes(db_path: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn get_info(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM schema_info WHERE key = ?1",
-        params![key],
-        |r| r.get::<_, String>(0),
-    )
+/// `schema_info.{key}`, or `None` when the row is absent.
+pub(super) fn get_info(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    conn.query_row("SELECT value FROM schema_info WHERE key = ?1", [key], |r| {
+        r.get(0)
+    })
     .optional()
-    .ok()
-    .flatten()
+    .map_err(|e| format!("read schema_info.{}: {}", key, e))
 }
 
 fn set_info(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<usize> {
@@ -1081,13 +1070,17 @@ fn set_info(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<usize
 /// other layout before the rebuild that brings it. An index that never
 /// recorded it predates the compact layout, so kept positions.
 pub fn fts_positions(conn: &Connection) -> bool {
-    get_info(conn, "fts_positions").is_none_or(|v| v != "false")
+    get_info(conn, "fts_positions")
+        .ok()
+        .flatten()
+        .is_none_or(|v| v != "false")
 }
 
-/// Unix seconds of the last *successful* full indexing run; `None` means
-/// "never".
-pub fn get_last_full_index(conn: &Connection) -> Option<u64> {
-    get_info(conn, "last_full_index").and_then(|v| v.parse().ok())
+/// Unix seconds of the last *successful* full indexing run. `Ok(None)` means
+/// never; `Err` means the stamp could not be read, which is not the same:
+/// read as "never", it would start an unrequested full run.
+pub fn get_last_full_index(conn: &Connection) -> Result<Option<u64>, String> {
+    Ok(get_info(conn, "last_full_index")?.and_then(|v| v.parse().ok()))
 }
 
 /// Stamp `last_full_index` with `ts` (unix seconds).
@@ -1115,7 +1108,10 @@ fn root_key(prefix: &str, root: &str) -> String {
 /// denominator. Absent means the root has never been walked to completion.
 /// See [`crate::indexing::RootProgress::walk_denominator`].
 pub fn get_root_walk_count(conn: &Connection, root: &str) -> Option<usize> {
-    get_info(conn, &root_key(WALK_COUNT, root)).and_then(|v| v.parse().ok())
+    get_info(conn, &root_key(WALK_COUNT, root))
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
 }
 
 /// Record `n` as `root`'s file count, for the next run's progress bar.
@@ -1130,7 +1126,37 @@ pub fn set_root_walk_count(conn: &Connection, root: &str, n: usize) -> Result<()
 /// What the last completed run counted under `root`, if one has finished
 /// since the root was configured.
 pub fn get_root_counts(conn: &Connection, root: &str) -> Option<RootCounts> {
-    let stored = get_info(conn, &root_key(COUNTS, root))?;
+    get_info(conn, &root_key(COUNTS, root))
+        .ok()
+        .flatten()
+        .as_deref()
+        .and_then(parse_counts)
+}
+
+/// How many files the stored per-root counts add up to: exact after each
+/// completed run, which writes them ([`set_root_counts`]), and 0 before the
+/// first. Configured roots never nest ([`crate::config::nested_roots`]), so no
+/// row is counted twice. Sizes the search cache
+/// ([`crate::db::open::open_search_reader`]): a value this build cannot parse
+/// adds nothing, and a failed read gives 0, the floor.
+pub fn stored_file_count(conn: &Connection) -> i64 {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT value FROM schema_info WHERE substr(key, 1, length(?1)) = ?1")
+    else {
+        return 0;
+    };
+    let Ok(values) = stmt.query_map([COUNTS], |r| r.get::<_, String>(0)) else {
+        return 0;
+    };
+    values
+        .filter_map(Result::ok)
+        .filter_map(|v| parse_counts(&v))
+        .fold(0, |sum, c| sum.saturating_add(c.files.max(0)))
+}
+
+/// A stored `counts:` value, `files,fts`; `None` for one this build cannot
+/// parse, which reads like a missing one.
+fn parse_counts(stored: &str) -> Option<RootCounts> {
     let (files, fts) = stored.split_once(',')?;
     Some(RootCounts {
         files: files.parse().ok()?,
@@ -1138,9 +1164,9 @@ pub fn get_root_counts(conn: &Connection, root: &str) -> Option<RootCounts> {
     })
 }
 
-/// Record what `root` holds, for the folder list. Written only at the end of
-/// a run that completed: a stopped run's partial count is worse than the
-/// previous figure.
+/// Record what `root` holds, for the folder list and the search cache's size
+/// ([`stored_file_count`]). Written only at the end of a run that completed:
+/// a stopped run's partial count is worse than the previous figure.
 pub fn set_root_counts(conn: &Connection, root: &str, counts: RootCounts) -> Result<(), String> {
     set_info(
         conn,

@@ -2,9 +2,12 @@
 #
 # The live config is created at ~/.config/quicksearch/config.toml
 # (Windows: %APPDATA%\quicksearch\config.toml). A config.toml next to the
-# quicksearch binary overrides it entirely (portable mode). Relative paths
-# resolve against the config file's directory, so a portable folder can be
-# moved wholesale.
+# quicksearch binary, or the .AppImage, overrides it entirely (portable mode),
+# unless it holds a top-level table not listed below: another program's
+# config.toml in the same folder is passed over, with a warning in the log.
+# One that fails to parse is still taken, and shows its error in the app.
+# Relative paths resolve against the config file's directory, so a portable
+# folder can be moved wholesale.
 #
 # Every key is optional; missing keys take the defaults shown here.
 
@@ -13,7 +16,9 @@
 # folder or nested one inside the other: indexing pauses until the overlap is
 # removed. Adding a folder reindexes to pick it up; removing one deletes only
 # its entries. Order and spelling do not matter: "~/docs", "/home/you/docs"
-# and "/home/you/docs/" are one folder.
+# and "/home/you/docs/" are one folder. A folder listed here may itself be a
+# symbolic link, but links inside it are never followed: to index what one
+# points at, list the target as a folder of its own.
 indexing_paths = ["~"]
 # The index file. Default: ~/.local/share/quicksearch/index.sqlite (Windows:
 # %LOCALAPPDATA%\quicksearch\index.sqlite). Write Windows paths as TOML
@@ -31,10 +36,6 @@ database_path = "~/.local/share/quicksearch/index.sqlite"
 # so the app starts in the mode you left it in.
 auto_index = true
 reindex_interval_minutes = 60
-# Follow symbolic links, to files and to directories. Off, a link is not
-# resolved at all, so a target outside every root is never indexed. A
-# resolved target is stored under its own real path, not the link's.
-follow_symlinks = false
 # Index hidden files and directories: dot-files everywhere, plus anything with
 # the Hidden attribute on Windows (AppData, $RECYCLE.BIN, System Volume
 # Information ...). The System attribute alone does not count: cloud sync
@@ -62,15 +63,17 @@ ignore_patterns = [".git", "node_modules", "*.tmp", ".venv", "venv"]
 
 # Walker threads per root, keyed by the exact root string from
 # indexing_paths. Absent or 0 = auto (4 on local storage, 16 on network
-# mounts, detected per root). Applies from the next run.
+# mounts, detected per root). Applies from the next run. Set it for a share
+# that auto reads as local: on Linux, WebDAV (davfs2), rclone, GVfs, Ceph and
+# GlusterFS mounts, and a root that is an automount point not yet mounted.
 # root_workers = { "/media/share" = 24 }
 
 [processing]
 # Bytes read from the start of each file to hash it (with its size) for
 # duplicate detection and to detect its type. Files of equal size with
 # identical heads are reported as duplicates even if they differ later;
-# verify on the Duplicates tab before deleting. 8192 is tuned; 16384 is
-# reasonable, lower is not. Changing it rebuilds the index. Clamped to
+# verify on the Duplicates tab before deleting. 8192 is the default; 16384
+# is also reasonable. Changing it rebuilds the index. Clamped to
 # 262..1048576.
 hash_length = 8192
 # Most extracted text stored per file (bytes). Clamped to 1..16777216.
@@ -78,8 +81,8 @@ maximum_text_size = 262144
 # Files larger than this skip text extraction entirely (bytes). Clamped to
 # 1..4294967296.
 maximum_text_file_size = 52428800
-# Rows per database write batch when indexing, reconciling and applying live
-# changes.
+# Rows per database write batch when indexing and reconciling. Clamped to
+# 1..100000.
 batch_size = 500
 # Longest one root may hold the index writer per turn (ms), so a root
 # extracting large documents cannot stall another root's walk. 0 = one batch
@@ -94,19 +97,13 @@ writer_turn_slice_ms = 100
 # searches that run alongside indexing and lengthens crash recovery. The
 # default favours faster runs.
 maximum_wal_size = 2147483648
-# FTS5 tokenizer: 'trigram' (substring matching, the default), 'unicode61',
-# 'porter', or a full FTS5 option string. See
-# https://www.sqlite.org/fts5.html#tokenizers. Matching is exact apart from
-# ASCII case: "cafe" does not find "café". Changing it rebuilds the index.
-tokenize = "trigram"
 # Build the full-text index without word positions. Several times smaller
-# and faster to build (1.1 GB of source code: a 219 MiB index instead of
-# 1.3 GB, built a third faster), and searches return exactly the same files,
-# because every candidate is checked against the stored text. The cost is
-# more candidates to check: searching contents for a word can take up to
-# twice as long, for a phrase of common words up to three times. Only the
-# trigram tokenizer can use it; other tokenizers always record positions.
-# Changing it rebuilds the index.
+# and faster to build (1.1 GiB of source code: a 219 MiB index instead of
+# 1.3 GiB, built in a third less time), and searches return exactly the same
+# files, because every candidate is checked against the stored text. The cost
+# is more candidates to check: searching contents for a word can take up to
+# twice as long, for a phrase of common words up to three times. Changing it
+# rebuilds the index.
 compact_text_index = true
 
 [security]
@@ -142,24 +139,30 @@ search_hotkey = "Ctrl+Shift+F"
 # changed on the Settings tab.
 color_scheme = "dark"
 # Written by QuickSearch: whether the Settings tab shows the technical
-# settings (byte budgets, the tokenizer, the database path and the like)
-# alongside the everyday ones. The checkbox at the top of that tab writes it
-# at once, without an Apply.
+# settings (byte budgets, the database path and the like) alongside the
+# everyday ones. The checkbox at the top of that tab writes it at once,
+# without an Apply.
 show_advanced_settings = false
 # Written by QuickSearch: whether the introduction shown on a new installation
 # has been dismissed. Absent means the config predates it, so an upgraded
 # installation is not offered it. The Help tab can show it again at any time.
 tutorial_seen = false
 
+# How a search folds case. Plain words match exactly apart from ASCII case:
+# "cafe" does not find "café", and "café" does not find "CAFÉ". '*' patterns
+# and regex: fold Unicode case ("résumé*" finds "RÉSUMÉ"), in file contents
+# only as far as SQLite's full-text case table, which predates some newer
+# case pairs (Georgian Mtavruli capitals, for one).
 [search]
 # Whether the Fuzzy box on the Search tab starts ticked. Off by default: the
 # fuzzy passes cost noticeable time on every keystroke, and most searches do
 # not need them.
 fuzzy_default = false
-# Most typos the fuzzy stages allow: one edit per three characters of the
-# search term, up to this value, so 2 means 1 edit for 3-5 character terms
-# and 2 for longer ones. 0 turns the fuzzy stages off. Above 3 is allowed but
-# not recommended: matches become coincidence and every fuzzy pass slows.
+# Most typos the fuzzy stages allow: one edit per three letters (bytes, for
+# non-ASCII text) of the search term, up to this value and never more than 8,
+# so 2 means 1 edit for 3-5 letter terms and 2 for longer ones. 0 turns the
+# fuzzy stages off. Above 3 is allowed but not recommended: matches become
+# coincidence and every fuzzy pass slows.
 fuzzy_max_edits = 2
 # Most results per search (the length of the GUI's list). Clamped to
 # 1..1000000: at zero every search would return nothing.
@@ -170,8 +173,8 @@ results_per_page = 100
 debounce_ms = 150
 # Watch the visible results and show renames, deletions and content changes as
 # they happen. A row's details are read from the file itself, so this works
-# whether or not indexing is running, and the index is updated for those
-# files. Editing the query drops the watches.
+# whether or not indexing is running, and files that changed are refreshed in
+# the index. Editing the query drops the watches.
 live_results = true
 # Memory, in MiB, the search connection keeps index pages in, held while
 # searching and released after a long idle. 0 (recommended) sizes it from the

@@ -139,7 +139,7 @@ pub fn cleanup_stale_index_entries(
     if stale_paths.is_empty() {
         return Ok(0);
     }
-    let chunk = config.processing.batch_size.max(1);
+    let chunk = config.processing.batch();
     let mut deleted_count = 0usize;
 
     {
@@ -201,9 +201,10 @@ impl RootRange {
     /// The range covering everything under `root`.
     pub fn for_root(root: &str) -> RootRange {
         const SEP: char = std::path::MAIN_SEPARATOR;
-        // Both separators are trimmed, not just the platform's: a config or
-        // watcher event may spell a directory either way.
-        let base = root.trim_end_matches(['/', '\\']);
+        // `/` and the platform separator are trimmed; on Unix `\` is a name
+        // byte (see `dir_to_db_parent`), and trimming it would bracket the
+        // file `notes\`'s sibling directory `notes/`.
+        let base = trim_trailing_separators(root);
         let next = char::from_u32(SEP as u32 + 1).expect("separator successor is a valid char");
         RootRange {
             lo: format!("{}{}", base, SEP),
@@ -301,8 +302,10 @@ pub struct Stored {
 /// until `deadline`, in one transaction. FTS5 tokenization happens here: the
 /// writer thread's dominant cost. A turn overruns the deadline by at most one
 /// document; at least one row is always consumed unless the run is stopped,
-/// so a caller looping on this cannot spin. A row whose write fails is
-/// logged and consumed; its `content_state` stays pending for the next run.
+/// so a caller looping on this cannot spin. A write error rolls back the
+/// turn and is returned; its rows stay pending. A row whose text fails to
+/// compress is logged and consumed unwritten; it stays pending for the next
+/// run.
 ///
 /// `enc` is the run's one encoder, compressing each body as its row is
 /// written: a zstd context per call is wasted CPU (`benches/index.rs`,
@@ -338,7 +341,9 @@ pub fn store_extracted(
                     Ok(true) => done.written += 1,
                     // No longer pending: stored or deleted since it was paged.
                     Ok(false) => {}
-                    Err(e) => crate::log_warn!("content indexing for {}: {}", row.path(), e),
+                    // Every write starts with its claim: committed past an
+                    // error, the claim would stand without the rest of the row.
+                    Err(e) => return Err(format!("content indexing for {}: {}", row.path(), e)),
                 }
             }
         }

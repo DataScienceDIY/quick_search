@@ -3,7 +3,8 @@
 //! `docx-rs` and `rust_xlsxwriter` are complete independent implementations,
 //! container included (`docx-rs` carries `zip` 8.x against the 0.6 the
 //! reader uses). No comparable crate exists for PowerPoint, so the `.pptx`
-//! is assembled from [`super::zipwriter`] and `format!`.
+//! is assembled from [`super::zipwriter`] and `format!`; LibreOffice's is
+//! committed in [`super::legacy`].
 
 use std::path::Path;
 
@@ -16,36 +17,87 @@ pub fn write_all(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec
     pptx(dir, lcg, body, out);
 }
 
+/// The last body paragraph is split by a tab and a line break, which must
+/// reach the text as whitespace; the last two sentences are a footnote and a
+/// comment, parts of their own that are read after the body.
 fn docx(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
     use docx_rs::*;
 
     let b = body(lcg, Charset::Unicode);
+    let [prose @ .., broken, footnote, comment] = b.sentences.as_slice() else {
+        unreachable!("a body has six sentences");
+    };
     let mut docx = Docx::new();
-    for sentence in &b.sentences {
+    for sentence in prose {
         docx = docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(sentence)));
     }
+    // "a b c<tab>d e<break>f g", read back as "a b c d e\nf g".
+    let words: Vec<&str> = broken.split(' ').collect();
+    let [head, middle, tail] = [&words[..3], &words[3..5], &words[5..]].map(|w| w.join(" "));
+    let run = Run::new()
+        .add_text(&head)
+        .add_tab()
+        .add_text(&middle)
+        .add_break(BreakType::TextWrapping)
+        .add_text(&tail);
+    let note = Footnote::new().add_content(Paragraph::new().add_run(Run::new().add_text(footnote)));
+    let remark = Comment::new(1)
+        .author("corpus")
+        .add_paragraph(Paragraph::new().add_run(Run::new().add_text(comment)));
+    docx = docx.add_paragraph(
+        Paragraph::new()
+            .add_comment_start(remark)
+            .add_run(run)
+            .add_run(Run::new().add_footnote_reference(note))
+            .add_comment_end(1),
+    );
     let path = dir.join("prose.docx");
     let file = std::fs::File::create(&path).expect("create docx");
     docx.build().pack(file).expect("pack docx");
-    out.push(Sample::prose(path, "docx", &b, false));
+
+    let mut must_contain = prose.to_vec();
+    must_contain.push(format!("{head} {middle}\n{tail}"));
+    must_contain.extend([footnote.clone(), comment.clone()]);
+    out.push(Sample {
+        path,
+        label: "docx",
+        must_contain,
+        needle: b.needle.clone(),
+        head_path: false,
+    });
 }
 
 /// `rust_xlsxwriter` uses a real `xl/sharedStrings.xml` table — the path
 /// `extract_xlsx` exists for; an inline-string writer would leave it untested.
+/// A rich string, two runs in one table entry, comes before the sentences: a
+/// reader counting it as two entries shows every later cell another's text.
 fn xlsx(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
-    use rust_xlsxwriter::Workbook;
+    use rust_xlsxwriter::{Format, Workbook};
 
     let b = body(lcg, Charset::Unicode);
     let mut workbook = Workbook::new();
     let sheet = workbook.add_worksheet();
+    let bold = Format::new().set_bold();
+    sheet
+        .write_rich_string(0, 0, &[(&bold, "rich "), (&Format::default(), "string")])
+        .expect("write rich cell");
     for (row, sentence) in b.sentences.iter().enumerate() {
         sheet
-            .write_string(row as u32, 0, sentence)
+            .write_string(row as u32 + 1, 0, sentence)
             .expect("write cell");
     }
     let path = dir.join("sheet.xlsx");
     workbook.save(&path).expect("save xlsx");
-    out.push(Sample::prose(path, "xlsx", &b, false));
+
+    let mut must_contain = vec!["rich string".to_string()];
+    must_contain.extend(b.sentences.iter().cloned());
+    out.push(Sample {
+        path,
+        label: "xlsx",
+        must_contain,
+        needle: b.needle.clone(),
+        head_path: false,
+    });
 }
 
 /// Dealt across three slides: the per-slide loop and its `--- New Slide ---` marker.

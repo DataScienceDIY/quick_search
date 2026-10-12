@@ -2,8 +2,8 @@ name: CI
 
 # Forgejo reads .forgejo/workflows before .github/workflows. Actions referenced
 # bare (actions/checkout, actions/cache, ...) resolve through the instance's
-# DEFAULT_ACTIONS_URL, which points at data.forgejo.org, so nothing here reaches
-# out to github.com.
+# DEFAULT_ACTIONS_URL, which points at data.forgejo.org, so no action is fetched
+# from github.com.
 
 # Release branches and tags only. Master is deliberately not a trigger: nothing
 # runs on a push to it or on a pull request against it, so a merge is unverified
@@ -69,6 +69,10 @@ jobs:
       MAX_GLIBC: '2.35'
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The job token can create releases and tags; left in .git/config,
+          # it would be readable by every build script the steps below run.
+          persist-credentials: false
 
       - name: Check the tag matches the workspace version
         # Asset names come from [workspace.package] version, not from the tag, so
@@ -110,10 +114,13 @@ jobs:
           # writing nothing when it is absent, so the script checks for it up
           # front. appstream provides the appstreamcli that validates the
           # metainfo both packages ship.
-          apt-get install -y --no-install-recommends \
+          # tzdata holds the zone rules local_days_follow_real_zone_rules
+          # checks modified: days against; without them it fails. Its
+          # postinst asks for a zone unless the frontend is noninteractive.
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential perl pkg-config \
             binutils dpkg-dev desktop-file-utils gzip libcap2-bin \
-            zsync appstream jq
+            zsync appstream jq tzdata
 
       - name: Check the release tag is free
         # The other half of the guard above, for the path that actually cuts
@@ -154,7 +161,8 @@ jobs:
 
       - name: Trust the workspace
         # checkout writes as root into a directory git then considers dubiously
-        # owned; build-deb.sh and the version scrape both shell out to git.
+        # owned; build.rs (git rev-parse), the lockfile sync (git show) and
+        # the packaging steps' SOURCE_DATE_EPOCH (git log -1) all run git.
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Install Rust
@@ -182,12 +190,18 @@ jobs:
       - name: Sync the lockfile to the workspace version
         # Bumping [workspace.package] version leaves Cargo.lock pinning the old
         # member versions, and --locked then refuses to build. `cargo update -w`
-        # re-resolves only the workspace members and leaves every third-party pin
-        # alone - it reports the others as "unchanged dependencies behind latest"
-        # rather than bumping them. So --locked below still catches the case that
-        # actually matters: a dependency added or bumped without committing the
-        # lockfile, which this cannot and should not paper over.
-        run: cargo update -w
+        # fixes the member versions but also resolves any dependency the lock
+        # lacks, so the diff fails on anything else: a dependency added or
+        # bumped without committing the lockfile.
+        shell: bash -e {0}
+        run: |
+          cargo update -w
+          m='/^name = "quicksearch-/{n;d}'
+          if ! diff <(git show HEAD:Cargo.lock | sed "$m") <(sed "$m" Cargo.lock); then
+              echo "ERROR: Cargo.lock is out of date beyond the workspace version." >&2
+              echo "Run cargo build locally and commit the updated Cargo.lock." >&2
+              exit 1
+          fi
 
       - name: Build
         run: cargo build --release --locked -p quicksearch-gui
@@ -199,10 +213,10 @@ jobs:
         #
         # capsh drops CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH from the bounding
         # set before exec. Without that, uid 0 reads a mode-000 file or directory
-        # regardless of its permissions, and the tests that build one with
-        # platform::deny_read see a perfectly readable tree: they assert an
-        # unreadable directory is *reported* rather than looking empty, because an
-        # empty listing deletes index rows. Dropping from the bounding set is what
+        # regardless of its permissions, so platform::deny_read refuses and the
+        # tests that build one with it fail or skip. They assert an unreadable
+        # directory is *reported* rather than looking empty, because an empty
+        # listing deletes index rows. Dropping from the bounding set is what
         # makes it stick - a root process re-derives its permitted set from the
         # bounding set on execve, so the test binaries cannot regain them.
         run: |
@@ -210,6 +224,12 @@ jobs:
           capsh --drop=cap_dac_override,cap_dac_read_search -- -c '
             echo "capabilities in test shell: $(grep CapEff /proc/self/status | tr -d "\t")"
             cargo test --release --locked --workspace'
+
+      - name: Compile the benches
+        # cargo test never builds the [[bench]] targets, so this is the only
+        # thing that notices one has stopped compiling. Release, like Test, so
+        # the build scripts' compiled SQLCipher and OpenSSL are reused.
+        run: cargo check --release --locked -p quicksearch-core --benches
 
       # Everything from here down produces release assets, so it runs only
       # where a release can actually come out: a v* tag or a Release* branch.
@@ -231,21 +251,23 @@ jobs:
           || startsWith(github.ref, 'refs/heads/Release')
           || startsWith(github.ref, 'refs/heads/release')
         # --no-build reuses the binaries from the Build step rather than
-        # recompiling. SOURCE_DATE_EPOCH pins the generated changelog date so
-        # repeat builds of the same commit are byte-identical.
+        # recompiling. SOURCE_DATE_EPOCH pins the generated changelog date.
         run: |
           SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)" \
             ./packaging/build-deb.sh --no-build
 
-      - name: Check the glibc floor
+      - name: Check the .deb
         if: >-
           startsWith(github.ref, 'refs/tags/v')
           || startsWith(github.ref, 'refs/heads/Release')
           || startsWith(github.ref, 'refs/heads/release')
-        # The whole point of pinning the container. If someone bumps the image,
-        # this fails loudly instead of quietly shipping an uninstallable package.
-        # Gated with the .deb it inspects — there is no package to read without
-        # the step above.
+        # The glibc floor is the whole point of pinning the container. If
+        # someone bumps the image, this fails loudly instead of quietly shipping
+        # an uninstallable package. The dry-run install then resolves every
+        # Depends against the 22.04 archive, so a mistyped or unavailable
+        # package name fails here too (apt exits 100); the ./ is what makes apt
+        # read the argument as a file. Gated with the .deb it inspects — there
+        # is no package to read without the step above.
         run: |
           deb=$(ls dist/*.deb)
           depends=$(dpkg-deb -f "$deb" Depends)
@@ -259,13 +281,14 @@ jobs:
               exit 1
           fi
           echo "OK: glibc floor $floor <= $MAX_GLIBC"
+          apt-get install -s --no-install-recommends "./$deb"
 
       - name: Build the AppImage
         if: >-
           startsWith(github.ref, 'refs/tags/v')
           || startsWith(github.ref, 'refs/heads/Release')
           || startsWith(github.ref, 'refs/heads/release')
-        # After the glibc gate, so the cheaper check still fails first. --no-build
+        # After the .deb check, so the cheaper check still fails first. --no-build
         # reuses the binaries from the Build step, as the .deb step does, and
         # SOURCE_DATE_EPOCH pins the date substituted into the AppStream release
         # entry the same way it pins the .deb changelog.
@@ -347,6 +370,8 @@ jobs:
       AR_x86_64_pc_windows_gnu: x86_64-w64-mingw32-ar
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # As in the linux job.
 
       - name: Install build dependencies
         run: |
@@ -381,8 +406,8 @@ jobs:
           restore-keys: ${{ github.job }}-cargo-
 
       - name: Sync the lockfile to the workspace version
-        # Same reasoning as the linux job: workspace members only, third-party
-        # pins untouched, so --locked keeps its teeth.
+        # Same sync as the linux job, whose diff fails the run on any other
+        # lockfile change.
         run: cargo update -w
 
       - name: Build
@@ -404,11 +429,18 @@ jobs:
               fi
           done
 
+      - name: Compile the Windows tests
+        # Compiled, never run: nothing here can execute a Windows binary. This
+        # still catches cfg(windows) test code that no longer builds. Release,
+        # like Build, so the build scripts' cross-compiled SQLCipher and OpenSSL
+        # are reused.
+        run: cargo check --release --locked --workspace --tests --target "$TARGET"
+
       # As in the linux job, the asset-producing steps run only where a release
-      # can come out. The DLL check above deliberately stays ungated: it
-      # validates the .exe itself rather than packaging it, costs an objdump,
-      # and is exactly the kind of regression worth catching on a hand-run
-      # master build rather than at release time.
+      # can come out. The two checks above deliberately stay ungated: they
+      # validate the .exe and the code rather than packaging anything, and
+      # catch exactly the kind of regression worth finding on a hand-run master
+      # build rather than at release time.
       - name: Build the installer
         if: >-
           startsWith(github.ref, 'refs/tags/v')
@@ -482,6 +514,8 @@ jobs:
     steps:
       # Only needed to read the workspace version on a Release* branch push.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # As in the linux job.
 
       # Must match the uploader's major version - see the note on the upload steps.
       - uses: actions/download-artifact@v3-node20
@@ -512,9 +546,8 @@ jobs:
           esac
           echo "release tag: $tag   commit: $GITHUB_SHA"
 
-          # A published version is immutable. If the tag already exists at some
-          # other commit, stop rather than ship two different builds under one
-          # version - the usual cause is forgetting to bump Cargo.toml.
+          # One version, one commit: if the tag already exists at another
+          # commit, stop - the usual cause is forgetting to bump Cargo.toml.
           at=$(curl -sS -H "$auth" "$api/repos/$repo/tags/$tag" | jq -r '.commit.sha // empty')
           if [ -n "$at" ] && [ "$at" != "$GITHUB_SHA" ]; then
               echo "ERROR: tag $tag already exists at $at, not $GITHUB_SHA." >&2

@@ -2,9 +2,11 @@
 
 use super::*;
 
+use quicksearch_core::config::glob_literal;
+
 pub struct IgnoreDialog {
     pub source_path: String,
-    /// `*.{ext}`, when the file has an extension.
+    /// `*.{ext}`, the extension escaped, when the file has one.
     pub ext_pattern: Option<String>,
     pub name_pattern: String,
     pub dir_pattern: String,
@@ -13,15 +15,15 @@ pub struct IgnoreDialog {
 
 impl IgnoreDialog {
     /// The dialog's starting patterns for one hit: its extension, its name
-    /// and its folder.
+    /// and its folder, each escaped so it matches only what it was built from.
     pub(super) fn for_hit(hit: &SearchHit) -> IgnoreDialog {
         IgnoreDialog {
             source_path: hit.path.clone(),
             ext_pattern: std::path::Path::new(&hit.name)
                 .extension()
                 .and_then(|e| e.to_str())
-                .map(|e| format!("*.{}", e)),
-            name_pattern: hit.name.clone(),
+                .map(|e| format!("*.{}", glob_literal(e))),
+            name_pattern: glob_literal(&hit.name),
             dir_pattern: std::path::Path::new(&hit.path)
                 .parent()
                 .map(crate::ui_util::dir_ignore_pattern)

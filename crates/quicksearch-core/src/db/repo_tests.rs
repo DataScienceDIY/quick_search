@@ -172,6 +172,21 @@ fn a_pending_write_leaves_exactly_one_fts_row() {
     assert_eq!(matches(&conn, "onyx"), 1);
 }
 
+/// An extraction a stop cut short says nothing about the file: its row
+/// stays pending, with no failure on record, for the next run to extract.
+#[test]
+fn a_cancelled_outcome_leaves_the_row_pending() {
+    let (_dir, _path, mut conn) = fresh();
+    let (id, written) = with_tx(&mut conn, |tx| {
+        let id = insert_at(tx, "/a/doc.pdf", true);
+        (id, complete_pending(tx, id, &ContentOutcome::Cancelled, None).unwrap())
+    });
+    assert!(!written, "a cancelled outcome wrote the row");
+    assert_eq!(state(&conn, id), STATE_PENDING);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM failed_files"), 0);
+    assert_eq!(fts_rows(&conn), 0);
+}
+
 /// Stale cleanup can delete a pending row while its extraction is in flight.
 /// Writing the outcome anyway would leave a posting with no `files` row,
 /// matching searches forever and inherited by whichever file reuses the id.
@@ -388,52 +403,6 @@ fn delete_subtree_clears_every_dependent_table() {
     assert_eq!(survivors(&conn), vec!["/tree2/keep.txt", "/treeX/keep.txt"]);
 }
 
-/// The out-of-root sweep must take a path that merely *starts* with a root's
-/// name: a different folder.
-#[test]
-fn delete_outside_ranges_keeps_exactly_the_configured_roots() {
-    let (_dir, _path, mut conn) = fresh();
-    seeded(
-        &mut conn,
-        &[
-            "/roots/one/a.txt",
-            "/roots/one/deep/b.txt",
-            "/roots/two/c.txt",
-            "/roots/onefold/d.txt",
-            "/elsewhere/target.txt",
-        ],
-    );
-
-    let ranges: Vec<(String, String)> = ["/roots/one", "/roots/two"]
-        .iter()
-        .map(|r| {
-            let range = RootRange::for_root(r);
-            (range.lo, range.hi)
-        })
-        .collect();
-    let removed = with_tx(&mut conn, |tx| delete_outside_ranges(tx, &ranges).unwrap());
-    assert_eq!(removed, 2, "the name-prefix sibling and the outsider");
-
-    assert_eq!(
-        survivors(&conn),
-        vec![
-            "/roots/one/a.txt",
-            "/roots/one/deep/b.txt",
-            "/roots/two/c.txt"
-        ]
-    );
-    assert_eq!(fts_rows(&conn), 3);
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents_text"), 3);
-
-    // No roots configured is a half-written config, not an instruction to
-    // delete the entire index.
-    assert_eq!(
-        with_tx(&mut conn, |tx| delete_outside_ranges(tx, &[]).unwrap()),
-        0
-    );
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 3);
-}
-
 /// A survivor in any dependent table keeps the file findable.
 #[test]
 fn delete_ids_clears_every_dependent_table() {
@@ -628,7 +597,7 @@ fn dir_rows_seeks_the_parent_index() {
     let (_dir, _path, conn) = fresh();
     let plan: String = conn
         .query_row(
-            "EXPLAIN QUERY PLAN SELECT name, mtime FROM files WHERE parent = ?1",
+            &format!("EXPLAIN QUERY PLAN {DIR_ROWS_SQL}"),
             params!["/some/dir/"],
             |r| r.get(3),
         )
@@ -638,6 +607,55 @@ fn dir_rows_seeks_the_parent_index() {
         "dir_rows must seek the parent index, got: {}",
         plan
     );
+}
+
+/// [`dir_rows`] and [`stamp_for_path`] read the same stamp: mtime, size, and
+/// whether the row holds a hash. A negative stored value, which no file has,
+/// reads as 0 rather than wrapping.
+#[test]
+fn a_row_reads_back_as_its_stamp() {
+    let (_dir, _path, mut conn) = fresh();
+    let parent = format!("{0}d{0}", std::path::MAIN_SEPARATOR);
+    let hash = [7u8; 32];
+    with_tx(&mut conn, |tx| {
+        let hashed = NewFile {
+            size: 7,
+            mtime: 5,
+            hash: Some(&hash),
+            ..text_row(&parent, "hashed.txt")
+        };
+        insert_file(tx, &hashed).unwrap().expect("unique path");
+        insert_file(tx, &text_row(&parent, "unhashed.txt"))
+            .unwrap()
+            .expect("unique path");
+        tx.execute(
+            "UPDATE files SET mtime = -3, size = -1 WHERE name = 'unhashed.txt'",
+            [],
+        )
+        .unwrap();
+    });
+
+    let hashed = Stamp {
+        mtime: 5,
+        size: 7,
+        hashed: true,
+    };
+    let unhashed = Stamp {
+        mtime: 0,
+        size: 0,
+        hashed: false,
+    };
+    assert_eq!(
+        dir_rows(&conn, &parent).unwrap(),
+        DirRows::from([
+            ("hashed.txt".to_string(), hashed),
+            ("unhashed.txt".to_string(), unhashed),
+        ])
+    );
+    let stamp = |name: &str| stamp_for_path(&conn, &format!("{parent}{name}")).unwrap();
+    assert_eq!(stamp("hashed.txt"), Some(hashed));
+    assert_eq!(stamp("unhashed.txt"), Some(unhashed));
+    assert_eq!(stamp("missing.txt"), None);
 }
 
 /// The range form is an index seek; `LIKE … ESCAPE` cannot be (SQLite
@@ -694,12 +712,33 @@ fn the_reconcile_page_seeks_and_does_not_sort() {
 #[test]
 fn last_full_index_round_trip() {
     let (_dir, _path, conn) = fresh();
-    assert_eq!(get_last_full_index(&conn), None, "fresh DB has no marker");
+    assert_eq!(
+        get_last_full_index(&conn),
+        Ok(None),
+        "fresh DB has no marker"
+    );
     set_last_full_index(&conn, 1_700_000_123).unwrap();
-    assert_eq!(get_last_full_index(&conn), Some(1_700_000_123));
+    assert_eq!(get_last_full_index(&conn), Ok(Some(1_700_000_123)));
     // Overwrite, not accumulate.
     set_last_full_index(&conn, 1_700_000_999).unwrap();
-    assert_eq!(get_last_full_index(&conn), Some(1_700_000_999));
+    assert_eq!(get_last_full_index(&conn), Ok(Some(1_700_000_999)));
+}
+
+/// A stamp that cannot be read is not "never indexed": the coordinator would
+/// start an unrequested full run on it.
+#[test]
+fn an_unreadable_stamp_is_an_error_not_never() {
+    let (_dir, _path, conn) = fresh();
+    set_last_full_index(&conn, 1_700_000_123).unwrap();
+    set_root_counts(&conn, "/tree", RootCounts { files: 12, fts: 5 }).unwrap();
+    conn.execute_batch("DROP TABLE schema_info;").unwrap();
+
+    assert!(
+        get_last_full_index(&conn).is_err(),
+        "a failed read must not pass for a missing stamp"
+    );
+    // The cache sizing has no error to report; it falls back to the floor.
+    assert_eq!(stored_file_count(&conn), 0);
 }
 
 #[test]
@@ -754,7 +793,15 @@ fn checkpoint_truncate_reports_an_incomplete_checkpoint() {
 
     let err = checkpoint_truncate(&writer).expect_err("a reader holds the log open");
     assert!(err.contains("incomplete"), "unexpected message: {}", err);
+    assert!(err.contains("busy=1"), "the row reports it busy: {}", err);
     assert!(wal_bytes(&p) > 0, "and the log is still there");
+}
+
+/// Outside WAL mode the pragma answers (0, -1, -1): there is no log to empty.
+#[test]
+fn checkpoint_truncate_accepts_a_database_without_a_log() {
+    let conn = Connection::open_in_memory().unwrap();
+    checkpoint_truncate(&conn).expect("no log is an empty log");
 }
 
 /// `journal_size_limit` gives the space back after a TRUNCATE that could not
@@ -907,34 +954,54 @@ fn a_busy_reader_defeats_the_autocheckpoint_but_not_a_forced_one() {
     );
 }
 
-/// Sizing the search cache reads the row count from `sqlite_stat1` rather than
-/// counting, so it has to survive the two states that table is really in.
+/// Sizing the search cache sums the counts each completed run stores per
+/// root, rather than counting rows.
 #[test]
-fn the_analyzed_file_count_ignores_the_partial_index_and_missing_stats() {
-    let (_dir, _path, mut conn) = fresh();
-    assert_eq!(
-        analyzed_file_count(&conn),
-        None,
-        "a never-analyzed index must say so, not report zero files"
-    );
+fn stored_file_count_sums_the_counted_roots() {
+    let (_dir, _path, conn) = fresh();
+    assert_eq!(stored_file_count(&conn), 0, "no completed run, no files");
 
-    seed_rows(&mut conn, 0..2000);
-    // All 2000 rows land content_state = 0, so `idx_files_content_pending`
-    // covers every one; mark most done so the partial index is smaller than
-    // the table, which is the trap being tested.
-    conn.execute("UPDATE files SET content_state = 1 WHERE id % 100 != 0", [])
-        .unwrap();
-    conn.execute_batch("ANALYZE;").unwrap();
+    set_root_counts(&conn, "/a", RootCounts { files: 120, fts: 7 }).unwrap();
+    set_root_counts(&conn, "/b", RootCounts { files: 30, fts: 30 }).unwrap();
+    // The progress bar's figure is a walk count, not a row count.
+    set_root_walk_count(&conn, "/a", 9_999).unwrap();
+    assert_eq!(stored_file_count(&conn), 150);
 
-    assert!(
-        count(&conn, "SELECT COUNT(*) FROM files WHERE content_state = 0") < 2000,
-        "the partial index must be smaller than the table for this to test anything"
-    );
+    prune_root_stats(&conn, &["/a".to_string()]).unwrap();
     assert_eq!(
-        analyzed_file_count(&conn),
-        Some(2000),
-        "the partial index's smaller count must not win"
+        stored_file_count(&conn),
+        120,
+        "a dropped root leaves the sum"
     );
+}
+
+#[test]
+fn stored_file_count_skips_what_it_cannot_parse_and_never_goes_negative() {
+    let (_dir, _path, conn) = fresh();
+    set_root_counts(&conn, "/good", RootCounts { files: 40, fts: 0 }).unwrap();
+    for (root, bad) in [("/x", "x,1"), ("/five", "5"), ("/empty", "")] {
+        set_info(&conn, &root_key(COUNTS, root), bad).unwrap();
+    }
+    assert_eq!(stored_file_count(&conn), 40, "malformed values add nothing");
+
+    let negative = RootCounts {
+        files: -500,
+        fts: 0,
+    };
+    set_root_counts(&conn, "/neg", negative).unwrap();
+    assert_eq!(stored_file_count(&conn), 40, "negative counts add nothing");
+}
+
+#[test]
+fn stored_file_count_saturates() {
+    let (_dir, _path, conn) = fresh();
+    let huge = RootCounts {
+        files: i64::MAX,
+        fts: 0,
+    };
+    set_root_counts(&conn, "/a", huge).unwrap();
+    set_root_counts(&conn, "/b", huge).unwrap();
+    assert_eq!(stored_file_count(&conn), i64::MAX);
 }
 
 #[test]
@@ -951,7 +1018,7 @@ fn maintain_vacuums_when_slack_is_significant() {
     });
     drop(conn);
 
-    let conn = crate::db::open::open_maintenance(&p).unwrap();
+    let conn = crate::db::open_existing(&p, true).unwrap();
     assert!(
         count(&conn, "PRAGMA freelist_count") > 0,
         "the deletions should have freed pages"
@@ -984,7 +1051,7 @@ fn maintain_skips_vacuum_on_a_tight_file() {
     seed_rows(&mut conn, 0..200);
     drop(conn);
 
-    let conn = crate::db::open::open_maintenance(&p).unwrap();
+    let conn = crate::db::open_existing(&p, true).unwrap();
     assert!(
         !maintain(&conn, &p).unwrap(),
         "a file with no slack is not worth rewriting"
@@ -1157,7 +1224,7 @@ fn prune_root_stats_drops_every_figure_of_a_dropped_root() {
     assert_eq!(get_root_walk_count(&conn, "/dropped"), None);
     assert_eq!(get_root_counts(&conn, "/dropped"), None);
     // The sweep reads every `schema_info` key; unrelated ones must survive it.
-    assert_eq!(get_last_full_index(&conn), Some(1_700_000_000));
+    assert_eq!(get_last_full_index(&conn), Ok(Some(1_700_000_000)));
 }
 
 /// The parent-scan range must include the root's own directory, or files

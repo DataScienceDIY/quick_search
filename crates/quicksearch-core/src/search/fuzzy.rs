@@ -10,8 +10,9 @@ use std::ops::ControlFlow;
 
 use crate::query::split::CascadeQuery;
 
-/// Registers: one per error count `0..=k`. [`edit_budget`]'s ladder against a
-/// 64-byte pattern caps `k` at 21; [`Bitap::new`] rejects more.
+/// Registers: one per error count `0..=k`; [`Bitap::new`] rejects more. Room
+/// for the 21 edits a 64-byte pattern's length would earn; [`edit_budget`]
+/// stops at [`MAX_FUZZY_EDITS`], and shrinking this would only save stack.
 const MAX_REGISTERS: usize = 22;
 
 /// [`Bitap::step`]'s register count, taken from `k` at run time rather than
@@ -254,14 +255,20 @@ pub fn pigeonhole_chunks(term: &str, k: usize) -> Option<Vec<&str>> {
     Some(out)
 }
 
-/// The cascade's edit-distance budget for a folded term: one edit per three
-/// characters, capped by `[search].fuzzy_max_edits`. Terms outside 3..=64
-/// bytes skip the fuzzy stages entirely; a cap of 0 disables them.
+/// The most edits [`edit_budget`] grants, whatever `[search].fuzzy_max_edits`
+/// says, and the top of the settings form's range. It keeps a fuzzy filename
+/// hit's rank (`7.0 + 0.1` per edit) below pass D's 8.0, which ten would reach.
+pub const MAX_FUZZY_EDITS: usize = 8;
+
+/// The cascade's edit-distance budget for a term of `term_len` bytes: one edit
+/// per three bytes (bitap edits are byte edits), capped by
+/// `[search].fuzzy_max_edits` and then by [`MAX_FUZZY_EDITS`]. Terms outside
+/// 3..=64 bytes skip the fuzzy stages entirely; a cap of 0 disables them.
 pub fn edit_budget(term_len: usize, max_edits: usize) -> Option<usize> {
     if !(3..=64).contains(&term_len) || max_edits == 0 {
         return None;
     }
-    Some((term_len / 3).min(max_edits))
+    Some((term_len / 3).min(max_edits).min(MAX_FUZZY_EDITS))
 }
 
 /// The fuzzy stages' edit budget and matcher for `query`, built from the term
@@ -523,8 +530,31 @@ mod tests {
     fn edit_budget_stays_within_the_bitap_word_size() {
         for len in 3..=64 {
             let k = edit_budget(len, usize::MAX).unwrap();
-            assert!(k <= 21, "len={} gave k={}", len, k);
+            assert!(k <= MAX_FUZZY_EDITS, "len={} gave k={}", len, k);
             assert!(Bitap::new(&vec![b'a'; len], k).is_some());
+        }
+    }
+
+    #[test]
+    fn edit_budget_never_passes_the_hard_cap() {
+        assert_eq!(edit_budget(64, usize::MAX), Some(MAX_FUZZY_EDITS));
+        assert_eq!(edit_budget(64, MAX_FUZZY_EDITS + 1), Some(MAX_FUZZY_EDITS));
+        assert_eq!(edit_budget(26, usize::MAX), Some(8), "length still rules");
+        assert_eq!(edit_budget(23, usize::MAX), Some(7));
+    }
+
+    /// Pass C ranks a name hit `7.0 + 0.1 * k` at worst, and the stage is
+    /// truncated from the rank, so it must stay below pass D's 8.0.
+    #[test]
+    fn a_fuzzy_name_rank_stays_below_the_full_text_tier() {
+        for len in 3..=64 {
+            for cap in (0..=64).chain([usize::MAX - 1, usize::MAX]) {
+                if let Some(k) = edit_budget(len, cap) {
+                    let worst = 7.0 + 0.1 * k as f64;
+                    assert!(worst < 8.0, "len={len} cap={cap} gave k={k}");
+                    assert_eq!(worst as u8, 7);
+                }
+            }
         }
     }
 

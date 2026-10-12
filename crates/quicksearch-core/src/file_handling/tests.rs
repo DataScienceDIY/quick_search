@@ -21,23 +21,23 @@ fn names(entries: impl Iterator<Item = walkdir::DirEntry>) -> Vec<String> {
 }
 
 /// The sorted names of the files [`filtered_walk`] yields under `root`.
-fn walked_names(root: &Path, follow: bool, hidden: bool, ignore: &IgnoreSet) -> Vec<String> {
+fn walked_names(root: &Path, hidden: bool, ignore: &IgnoreSet) -> Vec<String> {
     let failures = UnreadableDirs::default();
     names(filtered_walk(
         root.to_str().unwrap(),
-        follow,
         hidden,
         ignore,
         &failures,
+        None,
+        false,
     ))
 }
 
 /// The sorted names of the directories [`filtered_dirs`] yields under `root`.
-fn walked_dir_names(root: &Path, follow: bool, hidden: bool, ignore: &IgnoreSet) -> Vec<String> {
+fn walked_dir_names(root: &Path, hidden: bool, ignore: &IgnoreSet) -> Vec<String> {
     let failures = UnreadableDirs::default();
     names(filtered_dirs(
         root.to_str().unwrap(),
-        follow,
         hidden,
         ignore,
         &failures,
@@ -82,11 +82,11 @@ fn filtered_walk_prunes_hidden_and_ignored() {
     .unwrap();
 
     assert_eq!(
-        walked_names(&root, false, false, &ignore),
+        walked_names(&root, false, &ignore),
         vec!["keep.txt", "keep2.txt"]
     );
     assert_eq!(
-        walked_names(&root, false, true, &ignore),
+        walked_names(&root, true, &ignore),
         vec![".dotfile", "inside.txt", "keep.txt", "keep2.txt"]
     );
 
@@ -109,9 +109,9 @@ fn filtered_dirs_yields_only_kept_directories() {
     let root_name = root.file_name().unwrap().to_string_lossy().into_owned();
     let mut want = vec![root_name, "nested".to_string(), "sub".to_string()];
     want.sort();
-    assert_eq!(walked_dir_names(&root, false, false, &ignore), want);
+    assert_eq!(walked_dir_names(&root, false, &ignore), want);
 
-    let names = walked_dir_names(&root, false, true, &ignore);
+    let names = walked_dir_names(&root, true, &ignore);
     assert!(names.contains(&".hidden".to_string()));
     assert!(
         !names.contains(&"node_modules".to_string()),
@@ -132,15 +132,15 @@ fn filtered_dirs_and_filtered_walk_do_not_overlap() {
     let files: Vec<_> = filtered_walk(
         root.to_str().unwrap(),
         false,
-        false,
         &ignore,
         &UnreadableDirs::default(),
+        None,
+        false,
     )
     .map(|e| e.path().to_path_buf())
     .collect();
     let dirs: Vec<_> = filtered_dirs(
         root.to_str().unwrap(),
-        false,
         false,
         &ignore,
         &UnreadableDirs::default(),
@@ -165,16 +165,130 @@ fn filtered_walk_hidden_root_still_walked() {
     let root = base.join(".config");
     touch(&root.join("app.conf"), b"x");
     let ignore = IgnoreSet::compile(&[]).unwrap();
-    assert_eq!(walked_names(&root, false, false, &ignore), vec!["app.conf"]);
+    assert_eq!(walked_names(&root, false, &ignore), vec!["app.conf"]);
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// Files come in `Path` order, and resuming after any one of them yields
+/// exactly the rest: nothing at or before it, nothing after it skipped. As a
+/// string `a-b/y` sorts before `a/x` (`-` is below `/`); as components it
+/// comes after everything under `a`.
 #[test]
-fn classify_uses_mtime_against_the_stored_row() {
-    // No row: new. Same mtime: nothing to do. Changed: re-read.
-    assert_eq!(classify_by_mtime(None, 100), FileIndexAction::Insert);
-    assert_eq!(classify_by_mtime(Some(100), 100), FileIndexAction::Skip);
-    assert_eq!(classify_by_mtime(Some(99), 100), FileIndexAction::Update);
+fn filtered_walk_resumes_after_any_entry_in_path_order() {
+    let root = tmp_tree();
+    for name in ["a.b", "a/x", "a/y/z", "a-b/y", "b", "c/d/e/f"] {
+        touch(&root.join(name), b"x");
+    }
+    let ignore = IgnoreSet::compile(&[]).unwrap();
+    let failures = UnreadableDirs::default();
+    let walk = |after: Option<&Path>| -> Vec<std::path::PathBuf> {
+        filtered_walk(
+            root.to_str().unwrap(),
+            false,
+            &ignore,
+            &failures,
+            after,
+            true,
+        )
+        .map(|e| e.into_path())
+        .collect()
+    };
+
+    let all = walk(None);
+    assert_eq!(all.len(), 6);
+    let mut sorted = all.clone();
+    sorted.sort();
+    assert_eq!(all, sorted, "not in Path order");
+    for (i, after) in all.iter().enumerate() {
+        assert_eq!(walk(Some(after)), all[i + 1..], "after {}", after.display());
+    }
+    // A resume point that has become a directory is descended, not pruned.
+    assert_eq!(walk(Some(&root.join("a").join("y"))), all[1..]);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn classify_compares_the_whole_stamp() {
+    let stamp = |mtime, size, hashed| Stamp {
+        mtime,
+        size,
+        hashed,
+    };
+    let seen = stamp(100, 10, true);
+    let cases = [
+        (None, seen, FileIndexAction::Insert, "no row"),
+        (Some(seen), seen, FileIndexAction::Skip, "the same stamp"),
+        (
+            Some(stamp(99, 10, true)),
+            seen,
+            FileIndexAction::Update,
+            "a different mtime",
+        ),
+        (
+            Some(stamp(100, 11, true)),
+            seen,
+            FileIndexAction::Update,
+            "a different size",
+        ),
+        (
+            Some(stamp(100, 10, false)),
+            seen,
+            FileIndexAction::Update,
+            "an unhashed row whose file can now be hashed",
+        ),
+        (
+            Some(seen),
+            stamp(100, 10, false),
+            FileIndexAction::Skip,
+            "a hashed row whose file has since dehydrated",
+        ),
+        (
+            Some(stamp(100, 10, false)),
+            stamp(100, 10, false),
+            FileIndexAction::Skip,
+            "both unhashed",
+        ),
+    ];
+    for (stored, seen, want, case) in cases {
+        assert_eq!(classify(stored, seen), want, "{case}");
+    }
+}
+
+/// The record is built from the opened handle, not the caller's `stat`: one
+/// taken before the file grew must not pair the old size with the new hash.
+#[test]
+fn the_record_describes_the_opened_file() {
+    use std::io::Write;
+
+    let root = tmp_tree();
+    let p = root.join("growing.txt");
+    touch(&p, b"before");
+    let stale = std::fs::metadata(&p).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&p)
+        .unwrap()
+        .write_all(b" and after")
+        .unwrap();
+    let later = stale.modified().unwrap() + std::time::Duration::from_secs(10);
+    crate::testutil::set_mtime(&p, later).unwrap();
+
+    let config = crate::config::Config::default();
+    let registry = crate::extract::Registry::default_set();
+    let mut scratch = crate::extract::Scratch::new(&config);
+    let key = path_to_db_string(&p.canonicalize().unwrap());
+    let rec =
+        prepare_file_record(&key, &stale, &config, &registry, &mut scratch).expect("a record");
+
+    let mut head = Vec::new();
+    let (hash, opened) = get_file_hash(&p, config.processing.hash_length, &mut head).unwrap();
+    assert_eq!(rec.size, b"before and after".len() as u64);
+    assert_eq!(rec.size, opened.len());
+    assert_eq!(rec.mtime, mtime_secs(&opened));
+    assert_eq!(rec.hash, Some(hash));
+    assert_eq!(rec.inline_text.as_deref(), Some("before and after"));
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
@@ -227,10 +341,33 @@ fn root_range_brackets_paths_under_its_root() {
         root
     );
 
-    for spelled in [format!("{}/", root), format!("{}\\", root)] {
+    // `/` is a separator everywhere, `\` only on Windows.
+    let mut spellings = vec![format!("{}/", root), format!("{}//", root)];
+    if cfg!(windows) {
+        spellings.extend([format!("{}\\", root), format!("{}/\\", root)]);
+    }
+    for spelled in spellings {
         let c2 = RootRange::for_root(&spelled);
         assert_eq!((&c2.lo, &c2.hi), (&c.lo, &c.hi), "spelled {:?}", spelled);
     }
+}
+
+/// On Unix `notes\` is a file's name, not `notes` respelled: its range must
+/// not bracket the sibling directory `notes/`, or a Remove for the file
+/// deletes that directory's rows.
+#[test]
+#[cfg(unix)]
+fn a_trailing_backslash_is_part_of_the_name() {
+    let c = RootRange::for_root(r"/r/notes\");
+    assert_eq!(c.lo, r"/r/notes\/");
+    let sibling = "/r/notes/a.txt";
+    assert!(
+        !(sibling >= c.lo.as_str() && sibling < c.hi.as_str()),
+        "{:?} is under the directory notes/, not {:?}",
+        sibling,
+        c
+    );
+    assert_eq!(trim_trailing_separators(r"/r/notes\/"), r"/r/notes\");
 }
 
 fn root_prefix() -> String {
@@ -262,6 +399,33 @@ fn db_key_for_a_vanished_path_canonicalizes_what_remains() {
         "unexpected `.` component in {}",
         odd_key
     );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A link that has appeared where a removed path was is keyed by its own
+/// name, never its target's: the key is deleted with everything beneath it,
+/// and a link to `/` would key every row.
+#[cfg(unix)]
+#[test]
+fn db_key_for_a_path_now_a_symlink_is_not_resolved() {
+    let root = tmp_tree();
+    std::fs::create_dir_all(root.join("sibling")).unwrap();
+    let parent = path_to_db_string(&root.canonicalize().unwrap());
+
+    for (name, target) in [
+        ("to-sibling", root.join("sibling")),
+        ("to-slash", "/".into()),
+    ] {
+        let link = root.join(name);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            db_key_for_missing_path(&link),
+            format!("{}/{}", parent, name),
+            "the link to {} was resolved",
+            target.display()
+        );
+    }
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -300,6 +464,19 @@ fn db_key_for_an_entirely_missing_path_falls_back_to_the_raw_spelling() {
     assert_eq!(db_key_for_missing_path(nowhere), path_to_db_string(nowhere));
 }
 
+/// A filesystem root and a trailing `..` name no entry of their own, so
+/// there is no proper ancestor to resolve them through.
+#[test]
+fn db_key_for_a_path_without_a_final_name_is_its_raw_spelling() {
+    let top = root_prefix();
+    assert_eq!(db_key_for_missing_path(Path::new(&top)), top);
+
+    let root = tmp_tree();
+    let up = root.join("sub").join("..");
+    assert_eq!(db_key_for_missing_path(&up), path_to_db_string(&up));
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn unreadable_dirs_match_by_component_not_string_prefix() {
     let u = UnreadableDirs::default();
@@ -331,9 +508,10 @@ fn unreadable_directory_is_reported_rather_than_yielded_as_empty() {
     let names = names(filtered_walk(
         root.to_str().unwrap(),
         false,
-        false,
         &ignore,
         &failures,
+        None,
+        false,
     ));
 
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
@@ -367,7 +545,7 @@ fn hash_covers_size_and_head_only() {
 
     let h = |p: &Path| {
         let mut head = Vec::new();
-        get_file_hash(std::fs::metadata(p).unwrap().len(), p, 8, &mut head).unwrap()
+        get_file_hash(p, 8, &mut head).unwrap().0
     };
     assert_eq!(h(&a), h(&b), "tail differences are invisible by design");
     assert_ne!(h(&a), h(&c), "head differences are caught");
@@ -378,9 +556,10 @@ fn hash_covers_size_and_head_only() {
     assert_ne!(h(&a), h(&short));
 
     let mut head = Vec::new();
-    get_file_hash(72, &a, 8, &mut head).unwrap();
+    let (_, meta) = get_file_hash(&a, 8, &mut head).unwrap();
     assert_eq!(head, b"HEAD\0\0\0\0", "exactly hash_length bytes");
-    get_file_hash(4, &short, 8, &mut head).unwrap();
+    assert_eq!(meta.len(), 72, "the opened file's metadata comes back");
+    get_file_hash(&short, 8, &mut head).unwrap();
     assert_eq!(head, b"HEAD", "a short file hashes whole, and the buffer is reused");
 
     std::fs::remove_dir_all(&root).ok();
@@ -471,12 +650,11 @@ fn a_backslash_is_just_a_character_on_unix() {
     );
 }
 
-/// walkdir defaults `follow_root_links` to true, independently of
-/// `follow_links`, which would descend a symlinked root even with following
-/// off and land rows where no sweep range reaches.
+/// A root that is itself a link is walked at its target, as the indexer's
+/// walk does: the user chose it.
 #[test]
 #[cfg(unix)]
-fn a_symlinked_root_is_not_descended_when_following_is_off() {
+fn a_symlinked_root_is_descended() {
     let base = tmp_tree();
     let real = base.join("real");
     touch(&real.join("inside.txt"), b"x");
@@ -484,23 +662,16 @@ fn a_symlinked_root_is_not_descended_when_following_is_off() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
     let ignore = IgnoreSet::compile(&[]).unwrap();
-    let names = walked_names(&link, false, false, &ignore);
-    assert!(
-        names.is_empty(),
-        "a symlinked root must not be descended: {names:?}"
-    );
-    assert_eq!(
-        walked_names(&link, true, false, &ignore),
-        vec!["inside.txt"]
-    );
+    assert_eq!(walked_names(&link, false, &ignore), vec!["inside.txt"]);
 
     std::fs::remove_dir_all(&base).ok();
 }
 
-/// A symlink *inside* a root is the same hazard one level down.
+/// Below the root no link is followed, to a file or a directory: `upsert_file`
+/// canonicalizes, so either would land rows under the target's real path.
 #[test]
 #[cfg(unix)]
-fn a_symlink_inside_a_root_is_skipped_when_following_is_off() {
+fn a_symlink_inside_a_root_is_skipped() {
     let base = tmp_tree();
     let root = base.join("root");
     touch(&root.join("real.txt"), b"x");
@@ -511,23 +682,24 @@ fn a_symlink_inside_a_root_is_skipped_when_following_is_off() {
 
     let ignore = IgnoreSet::compile(&[]).unwrap();
     assert_eq!(
-        walked_names(&root, false, false, &ignore),
+        walked_names(&root, false, &ignore),
         vec!["real.txt"],
         "only the real file may be walked"
     );
     assert_eq!(
-        walked_names(&root, true, false, &ignore),
-        vec!["link.txt", "real.txt", "target.txt"]
+        walked_dir_names(&root, false, &ignore),
+        vec!["root"],
+        "and no linked directory is"
     );
 
     std::fs::remove_dir_all(&base).ok();
 }
 
-/// The watcher's directory walk must not spend descriptors on a subtree
-/// the indexer will discard.
+/// The watcher registers what this yields, so a symlinked root is watched
+/// as it is indexed.
 #[test]
 #[cfg(unix)]
-fn a_symlinked_root_yields_no_directories_when_following_is_off() {
+fn a_symlinked_root_yields_its_directories() {
     let base = tmp_tree();
     let real = base.join("real");
     touch(&real.join("sub/inside.txt"), b"x");
@@ -535,11 +707,7 @@ fn a_symlinked_root_yields_no_directories_when_following_is_off() {
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
     let ignore = IgnoreSet::compile(&[]).unwrap();
-    let dirs = walked_dir_names(&link, false, false, &ignore);
-    assert!(
-        dirs.is_empty(),
-        "a symlinked root must yield no directories: {dirs:?}"
-    );
+    assert_eq!(walked_dir_names(&link, false, &ignore), vec!["link", "sub"]);
 
     std::fs::remove_dir_all(&base).ok();
 }

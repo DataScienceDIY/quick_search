@@ -1,7 +1,7 @@
 //! Shared UI helpers: bordered widgets, ignore-pattern validation, text
 //! eliding, and the "more content below" scroll hint.
 
-use quicksearch_core::config::IgnoreSet;
+use quicksearch_core::config::{glob_literal, IgnoreSet};
 use std::borrow::Cow;
 
 use crate::color::palette;
@@ -24,12 +24,17 @@ pub fn stable_section<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)
 }
 
 /// Glob matching everything under `dir`, spelled with the platform
-/// separator. `Path::join` inserts a separator only where one is needed, so
-/// a drive root yields `C:\*` rather than the never-matching `C:\/*` a
-/// `format!("{}/*")` would produce. Shared by the search tab's ignore dialog
-/// and the duplicates tab's exclusions, which speak the same glob syntax.
+/// separator. The directory is escaped ([`glob_literal`]), so `Music [FLAC]`
+/// matches only itself. `Path::join` inserts a separator only where one is
+/// needed, so a drive root yields `C:\*` rather than the never-matching
+/// `C:\/*` a `format!("{}/*")` would produce. Shared by the search tab's
+/// ignore dialog and the duplicates tab's exclusions, which speak the same
+/// glob syntax.
 pub fn dir_ignore_pattern(dir: &std::path::Path) -> String {
-    dir.join("*").to_string_lossy().into_owned()
+    std::path::Path::new(&glob_literal(&dir.to_string_lossy()))
+        .join("*")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// `IgnoreSet::compile` silently *skips* patterns that trim to nothing, so
@@ -196,7 +201,7 @@ pub fn middle_elide<'a>(
 }
 
 /// A semitransparent down-arrow while more content lies below the fold.
-/// Painter-only, so it never swallows clicks; the fonts have no ▼ glyph.
+/// Painter-only, so it never swallows clicks; the bundled fonts have no ▼.
 ///
 /// Static on purpose. It used to pulse, which needed a repaint every 50 ms
 /// for as long as it showed: on an idle Search tab with more results than

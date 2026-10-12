@@ -1,11 +1,17 @@
 //! Audio tag extraction via [`lofty`]: title, artist, album, genre, and
 //! comment concatenate into the searchable `text`.
+//!
+//! The registry parses audio in a sandbox child once a binary enables one
+//! ([`super::sandbox`]): lofty sizes a Vorbis comment list from the count
+//! the file declares, past its own allocation limit, and a refused
+//! allocation aborts the process.
 
+use std::io::BufReader;
 use std::path::Path;
 
 use lofty::{
     config::ParseOptions,
-    file::TaggedFileExt,
+    file::{FileType, TaggedFileExt},
     probe::Probe,
     tag::{Accessor, ItemKey},
 };
@@ -22,17 +28,29 @@ impl Extractor for AudioExtractor {
     fn extract(
         &self,
         path: &Path,
+        _mime: &str,
         out: &mut String,
-        _scratch: &mut Scratch,
+        scratch: &mut Scratch,
     ) -> Result<(), ExtractError> {
+        let (file, _) = super::open_for_extract(path, scratch.limits().read)?;
         // Tags only: the audio properties (duration, bitrate) cost a seek to
         // the end and, in an MP3 without a Xing header, a frame-sync search
         // back from it, and fail a file whose audio is cut short. Measured
         // (`extractprobe`, 18 generated 3-minute MP3s and 40 Ogg sounds):
         // `lseek` + `read` calls 2,567 → 790, cached throughput 1.4–2.3x.
-        let tagged = Probe::open(path)
-            .map_err(|e| format!("lofty probe {}: {}", path.display(), e))?
-            .options(ParseOptions::new().read_properties(false))
+        let probe =
+            Probe::new(BufReader::new(file)).options(ParseOptions::new().read_properties(false));
+        // The format from the extension when lofty knows it, as
+        // `Probe::open` takes it; from the bytes otherwise, which is how the
+        // sniff typed an extensionless or misnamed file (`track`,
+        // `track.bin`) and the one way to read a name lofty lacks (`.oga`).
+        let probe = match FileType::from_path(path) {
+            Some(format) => probe.set_file_type(format),
+            None => probe
+                .guess_file_type()
+                .map_err(|e| format!("lofty probe {}: {}", path.display(), e))?,
+        };
+        let tagged = probe
             .read()
             .map_err(|e| format!("lofty read {}: {}", path.display(), e))?;
 
@@ -79,8 +97,8 @@ mod tests {
     }
 
     /// An ID3v2.3 tag carrying `frames`, then silent MPEG frames so the probe
-    /// recognizes the format from content.
-    fn write_mp3(tag: &str, frames: &[(&str, &str)]) -> std::path::PathBuf {
+    /// recognizes the format from content, written as `name`.
+    fn write_mp3(tag: &str, name: &str, frames: &[(&str, &str)]) -> std::path::PathBuf {
         let mut body = Vec::new();
         for (id, value) in frames {
             let mut payload = vec![0x00]; // ISO-8859-1
@@ -112,30 +130,61 @@ mod tests {
             out.resize(out.len() + 413, 0);
         }
 
-        let path = crate::testutil::scratch_dir(tag).join("track.mp3");
+        let path = crate::testutil::scratch_dir(tag).join(name);
         std::fs::write(&path, &out).expect("write fixture mp3");
         path
     }
 
+    const BLUE_MONDAY: &[(&str, &str)] = &[
+        ("TIT2", "Blue Monday"),
+        ("TPE1", "New Order"),
+        ("TALB", "Power Corruption"),
+        ("TCON", "Synthpop"),
+    ];
+
     #[test]
     fn tag_values_become_searchable_text() {
-        let path = write_mp3(
-            "audio-tags",
-            &[
-                ("TIT2", "Blue Monday"),
-                ("TPE1", "New Order"),
-                ("TALB", "Power Corruption"),
-                ("TCON", "Synthpop"),
-            ],
-        );
+        let path = write_mp3("audio-tags", "track.mp3", BLUE_MONDAY);
         let out = extract(&path).expect("extract");
         assert_eq!(out, "Blue Monday New Order Power Corruption Synthpop");
+    }
+
+    /// The sniff types these from their bytes, and so must lofty: the name
+    /// says nothing it knows.
+    #[test]
+    fn an_mp3_named_without_its_extension_is_typed_from_its_bytes() {
+        for name in ["track", "track.bin"] {
+            let path = write_mp3(&format!("audio-named-{name}"), name, BLUE_MONDAY);
+            let head = std::fs::read(&path).unwrap();
+            let mime = crate::mime::guess_mime_from_head(&path, &head);
+            assert_eq!(mime, Some("audio/mpeg"), "{name}");
+            let out = extract(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(out, "Blue Monday New Order Power Corruption Synthpop");
+        }
+    }
+
+    /// A file the sniff calls audio in a format lofty does not read (MIDI),
+    /// named nothing lofty knows: no format from the name or the bytes.
+    #[test]
+    fn a_file_lofty_cannot_type_is_an_error() {
+        let path = crate::testutil::scratch_dir("audio-midi").join("song");
+        // A header chunk, then one track holding only its end-of-track event.
+        std::fs::write(
+            &path,
+            b"MThd\0\0\0\x06\0\0\0\x01\0\x60MTrk\0\0\0\x04\0\xff\x2f\0",
+        )
+        .unwrap();
+        let head = std::fs::read(&path).unwrap();
+        let mime = crate::mime::guess_mime_from_head(&path, &head).unwrap();
+        assert!(mime.starts_with("audio/"), "{mime}");
+        let err = extract(&path).expect_err("no format to read");
+        assert!(err.contains("lofty read"), "{err}");
     }
 
     /// A download cut short keeps its tag: the audio after it is never read.
     #[test]
     fn a_truncated_stream_still_yields_its_tags() {
-        let path = write_mp3("audio-truncated", &[("TIT2", "Half Written")]);
+        let path = write_mp3("audio-truncated", "track.mp3", &[("TIT2", "Half Written")]);
         let bytes = std::fs::read(&path).unwrap();
         // The tag, the first frame's header and a few bytes of its body.
         let tag_end = bytes.len() - 4 * 417;
@@ -145,7 +194,7 @@ mod tests {
 
     #[test]
     fn an_untagged_file_yields_empty_text() {
-        let path = write_mp3("audio-untagged", &[]);
+        let path = write_mp3("audio-untagged", "track.mp3", &[]);
         let out = extract(&path).expect("extract");
         assert!(out.is_empty(), "unexpected text {:?}", out);
     }

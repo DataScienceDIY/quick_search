@@ -5,6 +5,11 @@
 // Each bench binary uses only part of it.
 #![allow(dead_code)]
 
+// Timed on the allocator the shipped binaries install; see
+// `platform::Allocator`.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
 use std::time::{Duration, Instant};
 
 use quicksearch_core::db;
@@ -19,11 +24,13 @@ pub const CONTENT_EVERY: usize = 8;
 /// the box, which is the honest figure for a comparison.
 pub const RUNS: u32 = 5;
 
-/// The workloads, in report order. A common word from `testutil::WORDS`
-/// leads: its posting lists are long, where the rare terms stop at the
-/// display limit having touched very little.
+/// The workloads, in report order. A phrase of two common words from
+/// `testutil::WORDS` leads: no file name holds it (names join words with
+/// `-`), so the cascade reaches the full-text pass, where its posting lists
+/// are long and the rare terms stop at the display limit having touched very
+/// little.
 pub const WORKLOADS: [(&str, &str, bool); 6] = [
-    ("body (common)", "planning", false),
+    ("body (phrase)", "planning review", false),
     ("body (rare)", BODY_TERM, false),
     ("name", NEEDLE, false),
     ("fuzzy", "quartzlte", true),
@@ -50,9 +57,8 @@ pub fn mib(bytes: u64) -> f64 {
 }
 
 /// Warn when `TMPDIR` is unset, finishing the sentence with `consequence`.
-/// Scratch then goes to `std::env::temp_dir()`, and a tmpfs there cannot
-/// produce a page fetch that was not already in RAM: every cold figure would
-/// price RAM, and a 1M-file arm would not fit besides.
+/// Scratch then goes to `std::env::temp_dir()`, often a tmpfs too small for
+/// the large arms.
 pub fn warn_if_tmpdir_unset(consequence: &str) {
     if std::env::var_os("TMPDIR").is_none() {
         eprintln!(
@@ -73,28 +79,21 @@ pub fn banner(tier: &str, files: usize) {
     );
 }
 
-/// Print an arm's size, FTS page counts and write rate; returns its FTS
+/// Print an arm's size, FTS page counts and seed time; returns its FTS
 /// overflow page count.
 pub fn header(arm: &Arm) -> i64 {
     let (leaf, overflow) = arm.fts_pages();
     println!(
         "\n=== {} ===  {:.1} MiB on disk, files table {:.1} MiB, \
-         fts {} leaf / {} overflow, written in {:.1?} ({:.0} rows/s)",
+         fts {} leaf / {} overflow, written in {:.1?}",
         arm.what,
         mib(arm.size_bytes()),
         mib(arm.table_bytes("files")),
         leaf,
         overflow,
         arm.seeded_in,
-        seeded_rows(arm) as f64 / arm.seeded_in.as_secs_f64(),
     );
     overflow
-}
-
-fn seeded_rows(arm: &Arm) -> i64 {
-    let conn = arm.open_search();
-    conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-        .unwrap_or(0)
 }
 
 /// Print where the page fetches go. Each shape runs on its own fresh
@@ -214,8 +213,11 @@ fn cold(arm: &Arm, query: &str, options: &SearchOptions) -> (Duration, i64, usiz
     (best, misses, hits)
 }
 
-/// Best of [`RUNS`] on one connection after a priming run: the steady state
-/// of a typing session, which almost every real search is.
+/// Best of [`RUNS`] on one connection after a priming run, at the cache
+/// ceiling the arm ships with: the steady state of a typing session, which
+/// almost every real search is. A plain arm's flat 16 MiB can sit below its
+/// `files` table; its warm runs then re-read pages from the OS cache, as a
+/// plain index in use does.
 fn warm(conn: &Connection, query: &str, options: &SearchOptions) -> Duration {
     run_cascade(conn, query, options);
     let mut best = Duration::MAX;

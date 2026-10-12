@@ -1,5 +1,5 @@
-//! Process-global SQLCipher key, resolved once at startup before any
-//! connection exists.
+//! Process-global state every later database open reads: the SQLCipher key
+//! and the layout and cache overrides.
 
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::RwLock;
@@ -12,8 +12,8 @@ static PROCESS_KEY: RwLock<Option<IndexKey>> = RwLock::new(None);
 /// Install (or clear, with `None`) the key used by every subsequent
 /// database open in this process.
 pub fn set_process_key(key: Option<IndexKey>) {
-    // Poison recovery matches `crate::lock_ok`'s policy: whole-value
-    // replacement, so a panicked writer leaves the last fully-written value.
+    // As in `crate::lock_ok`; this value is only ever replaced whole, so a
+    // panicked writer leaves the last one.
     *PROCESS_KEY.write().unwrap_or_else(|e| e.into_inner()) = key;
 }
 

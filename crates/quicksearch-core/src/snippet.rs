@@ -1,7 +1,10 @@
 //! Snippet extraction for search results; contentless FTS5 has no
 //! `snippet()`. Output is structural (window text plus byte ranges), never
-//! markup. Matching folds ASCII case only, as full-text verification does:
-//! `cafe` neither finds nor marks `café`.
+//! markup. Only literal terms are matched here ([`extract_folded`]), folding
+//! ASCII case only, as their full-text verification does: `cafe` neither
+//! finds nor marks `café`. A `*` pattern or `regex:` finds its own match,
+//! folding Unicode case, and hands the range to [`window_around`] or
+//! [`whole_field`].
 
 /// A context window from a document plus the match positions inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]

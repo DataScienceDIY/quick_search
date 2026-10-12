@@ -13,10 +13,16 @@
 //!     ./target/release/examples/walkprobe <root> parallel
 //! ```
 //!
-//! Expect about one `statx` per unchanged file, open/read/close for new or
-//! modified ones, and `readlink` only for the roots; a per-file `readlink`
-//! means something calls `canonicalize`. Inline extraction is CPU, visible in
-//! files/sec, not the trace. Compare each mode's second pass.
+//! Expect about one `statx` and an open/read/close per file (all are new
+//! against the scratch index; `indexprobe warm` prices unchanged ones), and
+//! `readlink` only for the roots; a per-file `readlink` means something calls
+//! `canonicalize`. Inline extraction is CPU, visible in files/sec, not the
+//! trace.
+
+// Timed on the allocator the shipped binaries install; see
+// `platform::Allocator`.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -55,14 +61,21 @@ fn main() {
     );
 }
 
-/// Against the same empty index, so every file is new and gets prepared.
+/// Prepares every file, as the parallel walk does against the empty index.
 fn serial(root: &str, config: &Config) -> (usize, usize) {
     let ignore = IgnoreSet::compile(&[]).unwrap();
     let registry = Registry::default_set();
     // One for the whole walk, as a walk worker holds one.
     let mut scratch = quicksearch_core::extract::Scratch::new(config);
     let (mut seen, mut prepared) = (0, 0);
-    for entry in filtered_walk(root, false, false, &ignore, &UnreadableDirs::default()) {
+    for entry in filtered_walk(
+        root,
+        false,
+        &ignore,
+        &UnreadableDirs::default(),
+        None,
+        false,
+    ) {
         seen += 1;
         // As the real walk: a non-UTF-8 name is skipped; seen, never prepared.
         let Some(path) = entry.path().to_str().map(str::to_owned) else {
@@ -82,7 +95,6 @@ fn parallel(root: &str, config: &Config, db_path: &str) -> (usize, usize) {
     let (mut seen, mut prepared) = (0, 0);
     for event in walk_indexable_files(
         &[root.to_string()],
-        false,
         false,
         IgnoreSet::compile(&[]).unwrap(),
         db_path,

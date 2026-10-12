@@ -88,8 +88,13 @@ pub fn ui(ui: &mut egui::Ui) -> bool {
                  Match column, with more on hover.",
             );
             ui.label(
-                "•  Right-click a result to open it or its folder, copy its path, \
-                 or hide files like it from the results.",
+                "•  Double-click a result to open it. Right-click it to open it or \
+                 its folder, copy its path, or hide files like it from the results.",
+            );
+            ui.label(
+                "•  While you type, Up and Down (or Page Up and Page Down) move \
+                 through the results, and Enter opens the selected one, or the top \
+                 one if none is selected.",
             );
             ui.label(
                 "•  Click a column header to sort by it; right-click any header to \
@@ -252,8 +257,8 @@ fn ranking_section(ui: &mut egui::Ui) {
          this order aside until you sort by Rank again.",
     );
     ui.label(hint(
-        "Results stream in while a search runs and are only added at the end, \
-         so the list never reshuffles as you read.",
+        "Results stream in while a search runs, so a better match can still \
+         appear above ones already shown.",
     ));
 }
 
@@ -355,6 +360,16 @@ fn duplicates_section(ui: &mut egui::Ui) {
          difference in the first few hundred bytes is almost always that \
          bookkeeping; one deep inside a large file is not.",
     ));
+
+    ui.add_space(8.0);
+    ui.strong("Deleted a copy, but no space came back?");
+    ui.add_space(4.0);
+    ui.label(
+        "Hard links and bind-mounted folders show one file under several \
+         paths. They group as copies and verify as identical, because they \
+         are the same bytes, but only one file is on disk, so deleting a \
+         path frees nothing.",
+    );
 
     ui.add_space(8.0);
     ui.strong("Groups you never want to see again");
@@ -544,6 +559,7 @@ mod tests {
             // and the tab has room for the caution but not the reasoning.
             "Verify copies are identical",
             "revision number",
+            "Hard links",
         ] {
             assert!(painted.contains(expected), "no {:?}: {}", expected, painted);
         }

@@ -17,7 +17,6 @@ fn walked(config: &Config, db: &Path) -> HashSet<PathBuf> {
     let root = config.paths.indexing_paths[0].clone();
     walk_indexable_files(
         &[root],
-        config.indexing.follow_symlinks,
         config.indexing.include_hidden,
         IgnoreSet::compile(&config.indexing.ignore_patterns).unwrap(),
         db.to_str().unwrap(),
@@ -198,6 +197,41 @@ fn a_root_is_never_filtered_but_its_children_still_are() {
     assert!(!scope.covers(&root, &root.join("keep.txt")));
 }
 
+/// Containment as `upsert_path` asks it: by whole components, innermost root
+/// first, a root containing itself.
+#[test]
+fn root_of_finds_the_innermost_root_by_whole_components() {
+    let scratch = Scratch::canonical("root-of");
+    // The spelling roots are held in: on Windows, without the `\\?\`.
+    let base = PathBuf::from(crate::file_handling::path_to_db_string(&scratch));
+    let (outer, inner) = (base.join("b"), base.join("b").join("deep"));
+    std::fs::create_dir_all(&inner).unwrap();
+    let mut config = Config::default();
+    config.paths.indexing_paths = vec![
+        outer.to_string_lossy().into_owned(),
+        inner.to_string_lossy().into_owned(),
+    ];
+    let scope = Scope::from_config(&config).unwrap();
+
+    assert_eq!(scope.root_of(&outer.join("x.txt")), Some(outer.as_path()));
+    assert_eq!(
+        scope.root_of(&inner.join("y.txt")),
+        Some(inner.as_path()),
+        "the innermost root wins"
+    );
+    assert_eq!(
+        scope.root_of(&outer),
+        Some(outer.as_path()),
+        "a root itself"
+    );
+    assert_eq!(
+        scope.root_of(&base.join("bc").join("z.txt")),
+        None,
+        "a sibling with the root's name as a prefix"
+    );
+    assert_eq!(scope.root_of(&base), None, "an ancestor of every root");
+}
+
 /// A scan that reports nothing is indistinguishable from a hang.
 #[test]
 fn the_scan_reports_its_way_through_every_row() {
@@ -321,4 +355,202 @@ fn cancelling_stops_the_scan_without_finishing_it() {
         part_way,
         "the cancelled slice did more work"
     );
+}
+
+/// An index whose record names `roots`. The connection comes first, so it
+/// closes before the directory goes.
+fn stamped(tag: &str, roots: &[String]) -> (Connection, Scratch) {
+    let dir = Scratch::dir(tag);
+    let db = empty_db(&dir);
+    let conn = crate::db::open_existing(db.to_str().unwrap(), true).unwrap();
+    crate::indexing::IndexingService::stamp_reconciled(&conn, &Config::default(), roots).unwrap();
+    (conn, dir)
+}
+
+fn with_roots(roots: &[&String]) -> Config {
+    let mut config = Config::default();
+    config.paths.indexing_paths = roots.iter().map(|r| r.to_string()).collect();
+    config
+}
+
+/// While one root is offline, every recorded root is kept, and each only once.
+#[test]
+fn an_offline_root_holds_every_recorded_root_once() {
+    let base = Scratch::canonical("hold-offline");
+    let online = base.join("online").to_string_lossy().into_owned();
+    std::fs::create_dir_all(&online).unwrap();
+    let offline = base.join("unmounted").to_string_lossy().into_owned();
+    let removed = base.join("removed").to_string_lossy().into_owned();
+    let (conn, _db) = stamped(
+        "hold-offline-db",
+        &[online.clone(), offline.clone(), removed.clone()],
+    );
+
+    let mut current = with_roots(&[&offline, &online]);
+    hold_offline_roots(&conn, &mut current).unwrap();
+    let want = vec![offline, online, removed];
+    assert_eq!(current.paths.indexing_paths, want);
+
+    hold_offline_roots(&conn, &mut current).unwrap();
+    assert_eq!(
+        current.paths.indexing_paths, want,
+        "a second hold adds nothing"
+    );
+}
+
+#[test]
+fn hold_offline_roots_changes_nothing_while_every_root_resolves() {
+    let root = Scratch::canonical("hold-online");
+    let online = root.to_string_lossy().into_owned();
+    let removed = root.join("removed").to_string_lossy().into_owned();
+    let (conn, _db) = stamped("hold-online-db", &[online.clone(), removed]);
+
+    let mut current = with_roots(&[&online]);
+    hold_offline_roots(&conn, &mut current).unwrap();
+    assert_eq!(current.paths.indexing_paths, vec![online]);
+}
+
+/// Neither an index with no record nor one recording no roots has anything
+/// to hold.
+#[test]
+fn hold_offline_roots_changes_nothing_without_recorded_roots() {
+    let dir = Scratch::dir("hold-unrecorded");
+    let db = empty_db(&dir);
+    let conn = crate::db::open_existing(db.to_str().unwrap(), true).unwrap();
+    let offline = dir.join("unmounted").to_string_lossy().into_owned();
+
+    let mut current = with_roots(&[&offline]);
+    hold_offline_roots(&conn, &mut current).unwrap();
+    assert_eq!(current.paths.indexing_paths, vec![offline.clone()]);
+    drop(conn);
+
+    let (conn, _db) = stamped("hold-empty-db", &[]);
+    hold_offline_roots(&conn, &mut current).unwrap();
+    assert_eq!(current.paths.indexing_paths, vec![offline]);
+}
+
+/// What [`outstanding_work`] owes the default config over one root, against
+/// a record of that same config except `maximum_text_file_size`, recorded as
+/// `cap` (no row for `None`).
+fn owed_with_recorded_cap(tag: &str, cap: Option<&str>) -> IndexWork {
+    let dir = Scratch::canonical(tag);
+    let db_path = empty_db(&dir);
+    let db = db_path.to_str().unwrap();
+    let root = dir.to_string_lossy().into_owned();
+    let config = with_roots(&[&root]);
+    let roots: Vec<String> = config.normalized_indexing_paths().into_iter().collect();
+    let conn = crate::db::open_existing(db, true).unwrap();
+    crate::indexing::IndexingService::stamp_reconciled(&conn, &config, &roots).unwrap();
+    let changed = match cap {
+        Some(cap) => conn.execute(
+            "UPDATE config_validation SET value = ?1 WHERE key = 'maximum_text_file_size'",
+            [cap],
+        ),
+        None => conn.execute(
+            "DELETE FROM config_validation WHERE key = 'maximum_text_file_size'",
+            [],
+        ),
+    };
+    assert_eq!(changed.unwrap(), 1, "the stamp records the cap");
+    drop(conn);
+    outstanding_work(db, &config).unwrap()
+}
+
+/// The cap decides whose text is read, and a walk skips a row whose file is
+/// unchanged: a cap raised while the app was closed is owed a content pass
+/// from the record alone.
+#[test]
+fn a_recorded_cap_below_the_config_is_owed_a_content_pass() {
+    let owed = owed_with_recorded_cap("cap-raised", Some("1024"));
+    assert!(owed.reconcile_content, "{:?}", owed);
+    assert!(owed.touches_index());
+}
+
+/// An index from before the cap was recorded has nothing to differ from.
+#[test]
+fn an_unrecorded_cap_reads_as_unchanged() {
+    let owed = owed_with_recorded_cap("cap-unrecorded", None);
+    assert!(owed.is_empty(), "{:?}", owed);
+}
+
+/// Garbage in the record keeps the configured cap rather than reading as
+/// some other one and restating rows.
+#[test]
+fn a_non_numeric_recorded_cap_is_ignored() {
+    for garbage in ["x", "-1", "", "1e6"] {
+        let owed = owed_with_recorded_cap("cap-garbage", Some(garbage));
+        assert!(owed.is_empty(), "{:?} read as {:?}", garbage, owed);
+    }
+}
+
+/// A cloud placeholder's NA row records nothing that tells it from a file
+/// the old filter excluded, so a content edit, even a narrowing one, makes it
+/// pending; the content pass is what keeps it unread. Windows-only, and not
+/// run in CI.
+#[cfg(windows)]
+#[test]
+fn a_reconciled_offline_file_goes_pending_and_the_content_pass_leaves_it_unread() {
+    use crate::file_handling::{store_extracted, ContentOutcome, ExtractCursor};
+    use crate::walk::TryNext;
+
+    let root = Scratch::canonical("offline-reconcile");
+    let file = root.join("notes.txt");
+    touch(&file, b"sphinx of black quartz");
+    crate::testutil::mark_offline(&file).unwrap();
+    let db_dir = Scratch::dir("offline-reconcile-db");
+    let db = empty_db(&db_dir);
+    let db = db.to_str().unwrap();
+    let mut conn = crate::db::open_existing(db, true).unwrap();
+    // NA and unhashed, as the walk writes a placeholder.
+    seed(&mut conn, std::slice::from_ref(&file));
+    let state = |conn: &Connection| -> i64 {
+        conn.query_row("SELECT content_state FROM files", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(state(&conn), repo::STATE_NA);
+
+    let mut config = Config::default();
+    config.paths.indexing_paths = vec![root.to_string_lossy().into_owned()];
+    let mut narrowed = config.clone();
+    narrowed.indexing.content_extensions = vec!["txt".into()];
+    let work = crate::config::diff_actions(&config, &narrowed).work;
+    assert!(work.reconcile_content, "{:?}", work);
+    let registry = Arc::new(Registry::default_set());
+    let run = AtomicBool::new(false);
+    let far = Instant::now() + Duration::from_secs(60);
+    let mut cursor = WorkCursor::new(work, &narrowed).unwrap();
+    while !cursor.done() {
+        advance(&mut conn, &narrowed, &registry, &mut cursor, far, &run).unwrap();
+    }
+    assert_eq!(state(&conn), repo::STATE_PENDING, "the row wants content");
+    drop(conn);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut pass = crate::content::extract_content(
+        db,
+        &ExtractCursor::for_root(&root.to_string_lossy()),
+        registry,
+        narrowed,
+        stop.clone(),
+        1,
+    );
+    let mut rows = Vec::new();
+    loop {
+        match pass.try_next() {
+            TryNext::Item(row) => rows.push(row),
+            TryNext::Empty => std::thread::sleep(Duration::from_millis(1)),
+            TryNext::Finished => break,
+        }
+    }
+    assert!(pass.finish());
+    assert_eq!(rows.len(), 1, "the pass took the pending row");
+    // The bytes are local and readable: anything but NotApplicable means the
+    // file was read.
+    assert_eq!(rows[0].outcome, ContentOutcome::NotApplicable);
+
+    let writer = std::sync::Mutex::new(crate::db::open_existing(db, true).unwrap());
+    let writer = Arc::new(writer);
+    let mut encoder = repo::DocEncoder::new().unwrap();
+    store_extracted(&writer, &rows, &stop, far, &mut encoder).unwrap();
+    assert_eq!(state(&crate::lock_ok(&writer)), repo::STATE_NA);
 }

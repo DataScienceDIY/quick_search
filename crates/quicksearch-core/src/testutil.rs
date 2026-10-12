@@ -15,12 +15,14 @@ pub fn zstd_of(text: &str) -> Option<Vec<u8>> {
 /// Old enough that a failure investigated the next morning has its tree.
 const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(12 * 60 * 60);
 
-/// Whether `name` is one of [`scratch_dir`]'s own directories, matched on the
-/// shape `quicksearch-{tag}-{pid}-{seq}` rather than the prefix alone:
-/// `packaging/capture.sh` keeps its output in `quicksearch-capture` in the
-/// same directory, and a prefix match would eat a capture run's screenshots.
+/// The marker every [`scratch_dir`] name starts with.
+const SCRATCH_PREFIX: &str = "quicksearch-scratch-";
+
+/// Whether `name` is one of [`scratch_dir`]'s own directories: the marked
+/// shape `quicksearch-scratch-{tag}-{pid}-{seq}`, never just `quicksearch-`,
+/// which a user's backup or `packaging/capture.sh`'s output can carry too.
 fn is_scratch_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("quicksearch-") else {
+    let Some(rest) = name.strip_prefix(SCRATCH_PREFIX) else {
         return false;
     };
     let numeric = |part: Option<&str>| {
@@ -67,7 +69,7 @@ pub fn scratch_dir(tag: &str) -> PathBuf {
 
     let mut p = std::env::temp_dir();
     p.push(format!(
-        "quicksearch-{}-{}-{}",
+        "{SCRATCH_PREFIX}{}-{}-{}",
         tag,
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
@@ -90,6 +92,77 @@ pub fn touch(path: &std::path::Path, body: &[u8]) {
         std::fs::create_dir_all(parent).expect("create parent dir");
     }
     std::fs::write(path, body).expect("write file");
+}
+
+/// Poll `check` until it holds or `timeout` passes; whether it held. For a
+/// state another thread reaches: a fixed sleep wastes time when the state
+/// comes early and, on a loaded machine, looks before it comes. The first
+/// polls are close together for events that land in milliseconds, then back
+/// off to 100 ms.
+#[doc(hidden)]
+pub fn eventually(timeout: std::time::Duration, check: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut nap = std::time::Duration::from_millis(5);
+    loop {
+        if check() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(std::time::Duration::from_millis(100));
+    }
+}
+
+/// [`eventually`], failing the test with `what` once `timeout` passes.
+#[doc(hidden)]
+pub fn wait_for(what: &str, timeout: std::time::Duration, check: impl Fn() -> bool) {
+    assert!(eventually(timeout, check), "timed out waiting for {}", what);
+}
+
+/// Set `path`'s modified time.
+#[doc(hidden)]
+pub fn set_mtime(path: &std::path::Path, time: std::time::SystemTime) -> std::io::Result<()> {
+    std::fs::File::options()
+        .write(true)
+        .open(path)?
+        .set_modified(time)
+}
+
+/// Date `path` a day before 1970, and say whether the filesystem kept that:
+/// some refuse a pre-epoch time or clamp it, and tests must tolerate that.
+#[doc(hidden)]
+pub fn backdate_before_1970(path: &std::path::Path) -> bool {
+    let day = std::time::Duration::from_secs(86_400);
+    set_mtime(path, std::time::UNIX_EPOCH - day).is_ok()
+        && std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t < std::time::UNIX_EPOCH)
+}
+
+/// Mark `path` `FILE_ATTRIBUTE_OFFLINE`, so it reads as a dehydrated cloud
+/// placeholder (`platform::is_cloud_placeholder`). The `RECALL_*` bits belong
+/// to the cloud filter driver; this is the one a test can set. The bytes stay
+/// local and readable, so only the placeholder check keeps them unread.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn mark_offline(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_OFFLINE};
+
+    let attributes = std::fs::metadata(path)?.file_attributes() | FILE_ATTRIBUTE_OFFLINE;
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    if unsafe { SetFileAttributesW(wide.as_ptr(), attributes) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// A filename that is legal on disk but cannot round-trip through the index:
@@ -335,10 +408,17 @@ impl Default for SeedSpec {
     }
 }
 
-/// Seed an index with synthetic rows, in one transaction. Shared by the
-/// measurement harnesses so they all describe the same corpus.
+/// Seed an index with synthetic rows. Shared by the measurement harnesses so
+/// they all describe the same corpus.
+///
+/// Written under a run's write regime: FTS5's write settings before the first
+/// row, autocheckpoint off, the run's finalize merge after the last commit.
+/// It records the root counts a completed run would, under `/seed`, so a
+/// search connection opens at the cache ceiling it ships with for this
+/// many files.
 pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
-    use crate::db::repo::{insert_file, store_pending_text, NewFile};
+    use crate::db::repo::{insert_file, store_pending_text, NewFile, RootCounts};
+    use crate::file_handling::{fts_begin_bulk_write, fts_finalize_after_text_indexing};
     use crate::mime::mime_to_type;
 
     // Before the open: the profile decides how the file is created, and on a
@@ -359,6 +439,11 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
         )
         .unwrap();
     }
+    fts_begin_bulk_write(&conn);
+    // As a run's writer has it. The WAL then grows until the closing
+    // checkpoint, since nothing here caps it the way a run's writer does.
+    conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
+        .unwrap();
     let mut rng = Lcg::new(0x5eed);
     let ext_mix = if spec.ext_mix.is_empty() {
         EXT_PLAIN
@@ -379,6 +464,7 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
     // `unchecked_transaction` borrows the connection shared, so
     // `commit_every` can end one and start the next inside the loop.
     let mut tx = conn.unchecked_transaction().unwrap();
+    let mut fts = 0i64;
     for i in 0..spec.files {
         let w1 = rng.pick(WORDS);
         let w2 = rng.pick(WORDS);
@@ -445,6 +531,7 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
             }
             let body = body.join(" ");
             store_pending_text(&tx, id, &body, zstd_of(&body).as_deref()).unwrap();
+            fts += 1;
         }
         if spec.commit_every > 0 && (i + 1) % spec.commit_every == 0 {
             tx.commit().unwrap();
@@ -452,7 +539,19 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
         }
     }
     tx.commit().unwrap();
-    // As a finished run's maintenance leaves it.
+    fts_finalize_after_text_indexing(&conn);
+    let files = spec.files as i64;
+    crate::db::repo::set_root_counts(&conn, "/seed", RootCounts { files, fts }).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        crate::db::repo::stored_file_count(&conn),
+        rows,
+        "the recorded counts must size the search cache for the rows seeded"
+    );
+    // The hash index and the checkpoint a run's tail leaves; no optimize or
+    // VACUUM.
     crate::db::repo::build_hash_index(&conn).unwrap();
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
 }
@@ -469,20 +568,24 @@ pub fn measurement_key() -> crate::security::IndexKey {
     crate::security::IndexKey::from_hex(MEASUREMENT_KEY_HEX).expect("a 64-hex-digit key")
 }
 
-/// Run one cascade query to completion on `conn`; returns the time the
-/// cascade took (the split is not timed) and how many hits it streamed.
+/// Run one cascade query to completion on `conn`, armed for cancellation as
+/// the search worker arms it (`search::arm_cancel`), so the time includes the
+/// progress handler; returns the time the cascade took (the split is not
+/// timed) and how many hits it streamed.
 pub fn run_cascade(
     conn: &rusqlite::Connection,
     query: &str,
     options: &crate::search::SearchOptions,
 ) -> (std::time::Duration, usize) {
     let split = crate::query::split_for_cascade(query).expect("query parses");
-    let latest = std::sync::atomic::AtomicU64::new(1);
+    let latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
     let mut hits = 0usize;
     let mut sink = |batch: Vec<crate::search::SearchHit>| hits += batch.len();
     let start = std::time::Instant::now();
+    crate::search::arm_cancel(conn, 1, latest.clone()).expect("arm the progress handler");
     crate::search::cascade::run(conn, &split, options, 1, &latest, &mut sink)
         .expect("cascade runs");
+    crate::search::disarm_cancel(conn).expect("disarm the progress handler");
     (start.elapsed(), hits)
 }
 
@@ -601,7 +704,7 @@ const ARM_SHAPES: [(&str, bool, Option<i64>, &str); 4] = [
     ("keyed, as shipped", true, None, "keyed"),
 ];
 
-/// One seeded index in a plain-vs-keyed comparison: `tests/encrypted_perf.rs`
+/// One seeded index in a plain-vs-keyed comparison: `tests/encrypted_size.rs`
 /// gates four of them on size, and `benches/page_geometry.rs` sweeps page
 /// sizes across them. Defined once so the harnesses report on the same shape.
 pub struct Arm {
@@ -619,9 +722,10 @@ pub struct Arm {
     /// reserve, which the header cannot be read without.
     pub hmac: Option<crate::db::schema::HmacMode>,
     pub path: PathBuf,
-    /// How long seeding spent writing it: the database-write half of indexing
-    /// (rows, zstd bodies, FTS postings), the half a page geometry can change.
-    /// The walk and the extractors are not in it.
+    /// How long [`seed_index`] took: rows, zstd bodies and FTS postings, then
+    /// the merge, counts, hash index and checkpoint. Not an indexing rate: it
+    /// has no walk or extraction, its WAL grows uncapped until the closing
+    /// checkpoint, and each arm is one sample taken in sweep order.
     pub seeded_in: std::time::Duration,
 }
 
@@ -672,7 +776,8 @@ impl Arm {
         }
     }
 
-    /// A search connection on this arm, at the production pragma profile.
+    /// A search connection on this arm, at the production pragma profile and
+    /// the cache ceiling the counts [`seed_index`] records give it.
     pub fn open_search(&self) -> rusqlite::Connection {
         self.with_key(|| {
             crate::db::open::open_search_reader(&self.path.to_string_lossy()).expect("open arm")
@@ -681,6 +786,22 @@ impl Arm {
 
     pub fn size_bytes(&self) -> u64 {
         std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// [`Self::size_bytes`] less the freelist: the pages that hold data. A
+    /// merge frees its input segments' pages only once its output is written,
+    /// so how many are free when the seed ends records whose last merge
+    /// finished, not what the arm's geometry costs.
+    pub fn used_bytes(&self) -> u64 {
+        let conn = self.open_search();
+        let pragma = |name: &str| -> i64 {
+            conn.query_row(&format!("PRAGMA {}", name), [], |r| r.get(0))
+                .expect(name)
+        };
+        let pages = pragma("page_count") - pragma("freelist_count");
+        // The arm's own profile: a keyed connection answers `page_size` as
+        // SQLCipher's `cipher_page_size`, in text.
+        (pages * self.page_size.unwrap_or(crate::db::schema::PAGE_SIZE)) as u64
     }
 
     /// Bytes `dbstat` attributes to one table: the number to compare a cache
@@ -738,6 +859,28 @@ mod tests {
     }
 
     #[test]
+    fn eventually_says_whether_the_check_came_true_in_time() {
+        let calls = std::cell::Cell::new(0);
+        let third = || {
+            calls.set(calls.get() + 1);
+            calls.get() == 3
+        };
+        assert!(eventually(std::time::Duration::from_secs(30), third));
+        assert_eq!(calls.get(), 3, "polled past the first true");
+
+        let started = std::time::Instant::now();
+        let patience = std::time::Duration::from_millis(50);
+        assert!(!eventually(patience, || false));
+        assert!(started.elapsed() >= patience, "gave up early");
+    }
+
+    #[test]
+    #[should_panic(expected = "timed out waiting for the impossible")]
+    fn wait_for_fails_the_test_on_a_timeout() {
+        wait_for("the impossible", std::time::Duration::ZERO, || false);
+    }
+
+    #[test]
     fn touch_creates_missing_parents() {
         let dir = scratch_dir("selftest-touch");
         let deep = dir.join("a/b/c.txt");
@@ -774,61 +917,79 @@ mod tests {
     #[test]
     fn only_scratch_directories_are_swept() {
         for ours in [
-            "quicksearch-coord-1234-0",
-            "quicksearch-stall-heavy-1001402-7",
-            "quicksearch-a-0-0",
+            "quicksearch-scratch-coord-1234-0",
+            "quicksearch-scratch-stall-heavy-1001402-7",
+            "quicksearch-scratch-a-0-0",
             // Tags contain dashes of their own.
-            "quicksearch-sniff-binary-db-2621744-1",
+            "quicksearch-scratch-sniff-binary-db-2621744-1",
         ] {
             assert!(is_scratch_name(ours), "{ours} should be swept");
         }
 
         for theirs in [
-            // The capture output directory, the reason this is a shape match.
+            // Unmarked names of the same shape: a user's backup, the GUI's
+            // socket fallback for a user called runner-1001-2, and an
+            // old-style scratch tree, which is left for a manual cleanup.
+            "quicksearch-backup-2024-05",
+            "quicksearch-runner-1001-2",
+            "quicksearch-coord-1234-0",
             "quicksearch-capture",
             "quicksearch",
-            "quicksearch-",
-            "quicksearch-coord",
-            "quicksearch-coord-1234",
+            "quicksearch-scratch",
+            "quicksearch-scratch-",
+            "quicksearch-scratch-coord",
+            "quicksearch-scratch-coord-1234",
             // Numbers, but nothing in front of them to be a tag.
-            "quicksearch-1234-0",
+            "quicksearch-scratch-1234-0",
             "cargo-install-abc-1-2",
-            "tmp-quicksearch-coord-1-2",
+            "tmp-quicksearch-scratch-coord-1-2",
         ] {
             assert!(!is_scratch_name(theirs), "{theirs} must not be swept");
         }
     }
 
-    /// Fresh directories survive; only long-dead runs are collected.
+    /// Fresh directories survive; only long-dead runs are collected, and only
+    /// directories the harness named.
     #[test]
     fn the_sweep_keeps_recent_trees_and_takes_old_ones() {
         let fresh = scratch_dir("sweep-fresh");
         touch(&fresh.join("evidence.txt"), b"kept");
 
-        // Same shape, but back-dated past the threshold.
-        let old = std::env::temp_dir().join(format!(
-            "quicksearch-sweep-old-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&old).expect("create the aged directory");
         let long_ago =
             std::time::SystemTime::now() - STALE_AFTER - std::time::Duration::from_secs(60);
-        std::fs::File::open(&old)
-            .and_then(|d| {
-                d.set_times(
-                    std::fs::FileTimes::new()
-                        .set_accessed(long_ago)
-                        .set_modified(long_ago),
-                )
-            })
-            .expect("back-date the aged directory");
+        let aged = |name: &str| {
+            let dir = std::env::temp_dir().join(format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).expect("create an aged directory");
+            std::fs::File::open(&dir)
+                .and_then(|d| {
+                    d.set_times(
+                        std::fs::FileTimes::new()
+                            .set_accessed(long_ago)
+                            .set_modified(long_ago),
+                    )
+                })
+                .expect("back-date an aged directory");
+            dir
+        };
+        // Same shape as the fresh one, but back-dated past the threshold.
+        let old = aged(&format!("{SCRATCH_PREFIX}sweep-old"));
+        // Just as old and of the pre-marker shape, so not ours to take.
+        let theirs = aged("quicksearch-backup");
 
         sweep_stale();
 
         assert!(fresh.exists(), "a fresh scratch tree was swept away");
         assert!(!old.exists(), "a long-dead scratch tree survived the sweep");
+        assert!(
+            theirs.exists(),
+            "the sweep took a directory it did not name"
+        );
 
         std::fs::remove_dir_all(&fresh).ok();
+        std::fs::remove_dir_all(&theirs).ok();
     }
 }

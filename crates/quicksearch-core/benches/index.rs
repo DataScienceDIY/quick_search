@@ -237,19 +237,28 @@ mod update_narrowing {
 /// transaction as the coordinator applies a slice of its queue.
 mod directory_event {
     use super::*;
-    use quicksearch_core::config::{Config, IgnoreSet};
+    use quicksearch_core::config::Config;
+    use quicksearch_core::extract::sandbox::KillMark;
     use quicksearch_core::extract::Registry;
-    use quicksearch_core::incremental::{apply_fs_event, Budget};
+    use quicksearch_core::incremental::{upsert_path, Budget};
+    use quicksearch_core::scope::Scope;
     use quicksearch_core::testutil::Scratch;
-    use quicksearch_core::watcher::FsEvent;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
 
     const FILES: usize = 500;
 
-    /// Every file unchanged: a re-sent `Create`, a `chmod -R`, the live view
-    /// re-checking what it shows. Nothing is written, so the cost is whatever
-    /// it reads to learn that; the full walk's answer is one `stat` per file.
+    /// The default config with `tree` as its only root: an event outside
+    /// every root writes nothing.
+    fn scoped_to(tree: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        config.paths.indexing_paths = vec![tree.to_string_lossy().into_owned()];
+        config
+    }
+
+    /// Every file unchanged: a re-sent `Create`, the live view re-checking
+    /// what it shows. Nothing is written, so the cost is whatever it reads to
+    /// learn that; the full walk's answer is one `stat` per file.
     #[divan::bench]
     fn unchanged(bencher: Bencher) {
         let (dir, db) = Scratch::db("bench-unchanged-event");
@@ -265,27 +274,72 @@ mod directory_event {
         let mut conn =
             quicksearch_core::db::open_or_recreate(db.to_str().unwrap(), &Default::default())
                 .unwrap();
-        let config = Config::default();
-        let ignore = IgnoreSet::compile(&config.indexing.ignore_patterns).unwrap();
+        let config = scoped_to(&tree);
+        let scope = Scope::from_config(&config).unwrap();
         let registry = Registry::default_set();
-        let event = FsEvent::Create(tree.clone());
         let cancel = AtomicBool::new(false);
         let mut apply = move || {
             let budget = Budget {
                 deadline: Instant::now() + Duration::from_secs(3600),
                 cancel: &cancel,
-                resume_from: 0,
+                kills: KillMark::now(),
+                resumed: false,
+                after: None,
             };
             // One transaction per event, as the coordinator's apply slice is.
             let tx = conn.transaction().unwrap();
             let applied =
-                apply_fs_event(&tx, &event, &config, &ignore, &registry, &budget).unwrap();
+                upsert_path(&tx, &tree, true, &config, &scope, &registry, &budget).unwrap();
             tx.commit().unwrap();
             applied
         };
         // Indexed once; every timed run finds it unchanged.
         apply();
         bencher.bench_local(apply);
+        drop(dir);
+    }
+
+    /// The same directory's own `Modify`: a `chmod`, a `touch`, an xattr, one
+    /// of the directory events a `chmod -R` sends, and on Windows any change
+    /// among its entries. Its files report their own changes, so it walks
+    /// nothing. Measured: 1.16 ms → 1.13 µs median; before, it walked the
+    /// tree as a `Create` does, at `unchanged`'s cost.
+    #[divan::bench]
+    fn modified(bencher: Bencher) {
+        let (dir, db) = Scratch::db("bench-modified-event");
+        let tree = db.with_file_name("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        for i in 0..FILES {
+            std::fs::write(
+                tree.join(format!("f{:04}.txt", i)),
+                corpus::text(1 << 10, 4),
+            )
+            .unwrap();
+        }
+        let mut conn =
+            quicksearch_core::db::open_or_recreate(db.to_str().unwrap(), &Default::default())
+                .unwrap();
+        let config = scoped_to(&tree);
+        let scope = Scope::from_config(&config).unwrap();
+        let registry = Registry::default_set();
+        let cancel = AtomicBool::new(false);
+        let mut apply = move |walk| {
+            let budget = Budget {
+                deadline: Instant::now() + Duration::from_secs(3600),
+                cancel: &cancel,
+                kills: KillMark::now(),
+                resumed: false,
+                after: None,
+            };
+            let tx = conn.transaction().unwrap();
+            let applied =
+                upsert_path(&tx, &tree, walk, &config, &scope, &registry, &budget).unwrap();
+            tx.commit().unwrap();
+            applied
+        };
+        // Indexed once by its `Create`; every timed run is the `Modify`.
+        apply(true);
+        bencher.bench_local(move || apply(false));
         drop(dir);
     }
 
@@ -305,21 +359,22 @@ mod directory_event {
         let mut conn =
             quicksearch_core::db::open_or_recreate(db.to_str().unwrap(), &Default::default())
                 .unwrap();
-        let config = Config::default();
-        let ignore = IgnoreSet::compile(&config.indexing.ignore_patterns).unwrap();
+        let config = scoped_to(&tree);
+        let scope = Scope::from_config(&config).unwrap();
         let registry = Registry::default_set();
-        let event = FsEvent::Create(tree.clone());
         let cancel = AtomicBool::new(false);
         let mut apply = move || {
             let budget = Budget {
                 deadline: Instant::now() + Duration::from_secs(3600),
                 cancel: &cancel,
-                resume_from: 0,
+                kills: KillMark::now(),
+                resumed: false,
+                after: None,
             };
             // One transaction per event, as the coordinator's apply slice is.
             let tx = conn.transaction().unwrap();
             let applied =
-                apply_fs_event(&tx, &event, &config, &ignore, &registry, &budget).unwrap();
+                upsert_path(&tx, &tree, true, &config, &scope, &registry, &budget).unwrap();
             tx.commit().unwrap();
             applied
         };

@@ -3,10 +3,10 @@
 //! [`split_for_cascade`] splits raw input into one search phrase and zero or
 //! more `key:value` filters; there is no boolean grammar by design.
 //!
-//! Recognized filters: `type:`, `modified:`/`mtime:` (`=` matches the whole
-//! day), `path:`/`folder:`/`includefolder:` (the directory and everything
-//! beneath it), `name:`/`filename:` (substring, `*` globs), `mime:` (exact),
-//! and `regex:` (matched in Rust, never in SQL).
+//! Recognized filters: `type:`, `modified:`/`mtime:` (every operator compares
+//! whole days in the local time zone), `path:`/`folder:`/`includefolder:` (the
+//! directory and everything beneath it), `name:`/`filename:` (substring, `*`
+//! globs), `mime:` (exact), and `regex:` (matched in Rust, never in SQL).
 
 pub mod lexer;
 pub mod pattern;
@@ -32,7 +32,7 @@ pub enum Op {
 }
 
 impl Op {
-    /// The operator as typed, which for the comparisons is also its SQL.
+    /// The operator as typed.
     pub fn as_str(self) -> &'static str {
         match self {
             Op::Contains => ":",

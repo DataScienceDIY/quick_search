@@ -1,5 +1,11 @@
 //! Tokenizer for the query grammar.
+//!
+//! A `regex:` value runs raw: after the colon and any whitespace behind it,
+//! everything up to the next whitespace is one word, so `regex:(a|b)\d` and
+//! `regex:\d\d:\d\d` stay whole patterns. A pattern that holds spaces or
+//! starts with a quote is quoted.
 
+use super::translator::is_regex_key;
 use super::Op;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,16 +44,8 @@ fn is_drive_letter_colon(bytes: &[u8], start: usize, colon: usize) -> bool {
         && matches!(bytes.get(colon + 1), Some(b'\\') | Some(b'/'))
 }
 
-pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
-    let (tokens, err) = tokenize_spanned(input);
-    match err {
-        Some(e) => Err(e),
-        None => Ok(tokens.into_iter().map(|(t, _)| t).collect()),
-    }
-}
-
-/// [`tokenize`], but each token carries its byte range and a trailing error
-/// is returned alongside the tokens lexed before it, so the GUI's highlighter
+/// The only entry point: each token carries its byte range, and an error is
+/// returned alongside the tokens lexed before it, so the GUI's highlighter
 /// can color the intact prefix of a half-typed query. `Quoted` spans include
 /// both quote characters.
 pub fn tokenize_spanned(input: &str) -> (Vec<(Token, std::ops::Range<usize>)>, Option<LexError>) {
@@ -62,11 +60,28 @@ pub fn tokenize_spanned(input: &str) -> (Vec<(Token, std::ops::Range<usize>)>, O
             continue;
         }
         match b {
-            b'(' | b')' | b':' | b'=' => {
+            b':' => {
+                // A `regex:` value runs raw (see the module doc).
+                let raw = matches!(out.last(), Some((Token::Word(w), _)) if is_regex_key(w));
+                out.push((Token::Op(Op::Contains), i..i + 1));
+                i += 1;
+                if raw {
+                    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if i < bytes.len() && bytes[i] != b'"' {
+                        let start = i;
+                        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                            i += 1;
+                        }
+                        out.push((Token::Word(input[start..i].to_string()), start..i));
+                    }
+                }
+            }
+            b'(' | b')' | b'=' => {
                 let token = match b {
                     b'(' => Token::LParen,
                     b')' => Token::RParen,
-                    b':' => Token::Op(Op::Contains),
                     _ => Token::Op(Op::Eq),
                 };
                 out.push((token, i..i + 1));
@@ -154,6 +169,14 @@ pub fn tokenize_spanned(input: &str) -> (Vec<(Token, std::ops::Range<usize>)>, O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tokens alone, or the error.
+    fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
+        match tokenize_spanned(input) {
+            (_, Some(e)) => Err(e),
+            (tokens, None) => Ok(tokens.into_iter().map(|(t, _)| t).collect()),
+        }
+    }
 
     #[test]
     fn simple_words() {
@@ -335,17 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn tokenize_matches_span_stripped_tokenize_spanned() {
-        for input in ["a AND (b:c)", r#""q" x>=2"#, "path:C:\\U foo*"] {
-            let plain = tokenize(input).unwrap();
-            let (spanned, err) = tokenize_spanned(input);
-            assert!(err.is_none());
-            let stripped: Vec<Token> = spanned.into_iter().map(|(t, _)| t).collect();
-            assert_eq!(plain, stripped, "input {:?}", input);
-        }
-    }
-
-    #[test]
     fn the_drive_letter_rule_stays_narrow() {
         // Two digits before the colon: still a time, not a drive.
         assert_eq!(
@@ -370,6 +382,90 @@ mod tests {
                 Token::Word("type".into()),
                 Token::Op(Op::Contains),
                 Token::Word("/Audio".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_regex_value_runs_raw_to_the_next_whitespace() {
+        for (input, value) in [
+            (r"regex:(foo|bar)\d", r"(foo|bar)\d"),
+            ("regex: (a|b)", "(a|b)"),
+            (r"regex:\d\d:\d\d", r"\d\d:\d\d"),
+            ("REGEX:a=b<c>", "a=b<c>"),
+        ] {
+            let (toks, err) = tokenize_spanned(input);
+            assert!(err.is_none(), "{:?}", input);
+            let key = &input[..5];
+            assert_eq!(
+                toks.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+                vec![
+                    Token::Word(key.into()),
+                    Token::Op(Op::Contains),
+                    Token::Word(value.into()),
+                ],
+                "{:?}",
+                input
+            );
+            assert_eq!(&input[toks[2].1.clone()], value, "{:?}", input);
+        }
+        // The value ends at whitespace; what follows lexes as usual.
+        assert_eq!(
+            tokenize("regex:a(b type:Audio").unwrap(),
+            vec![
+                Token::Word("regex".into()),
+                Token::Op(Op::Contains),
+                Token::Word("a(b".into()),
+                Token::Word("type".into()),
+                Token::Op(Op::Contains),
+                Token::Word("Audio".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_quoted_or_missing_regex_value_lexes_as_usual() {
+        assert_eq!(
+            tokenize(r#"regex:"a b""#).unwrap(),
+            vec![
+                Token::Word("regex".into()),
+                Token::Op(Op::Contains),
+                Token::Quoted("a b".into()),
+            ]
+        );
+        assert_eq!(
+            tokenize(r#"regex:  "a b""#).unwrap()[2],
+            Token::Quoted("a b".into())
+        );
+        assert_eq!(
+            tokenize("regex: ").unwrap(),
+            vec![Token::Word("regex".into()), Token::Op(Op::Contains)]
+        );
+        // Only `:` starts a raw value; `=` and `<` stay operators.
+        assert_eq!(
+            tokenize("regex=(a)").unwrap(),
+            vec![
+                Token::Word("regex".into()),
+                Token::Op(Op::Eq),
+                Token::LParen,
+                Token::Word("a".into()),
+                Token::RParen,
+            ]
+        );
+        // A quoted key is not the regex key.
+        assert_eq!(tokenize(r#""regex":(a)"#).unwrap()[2], Token::LParen);
+    }
+
+    #[test]
+    fn other_keys_keep_their_operators() {
+        assert_eq!(
+            tokenize("foo:(bar)").unwrap(),
+            vec![
+                Token::Word("foo".into()),
+                Token::Op(Op::Contains),
+                Token::LParen,
+                Token::Word("bar".into()),
+                Token::RParen,
             ]
         );
     }

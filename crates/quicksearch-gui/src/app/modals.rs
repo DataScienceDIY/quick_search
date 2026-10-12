@@ -18,6 +18,7 @@ impl QuickSearchApp {
             return;
         };
         let changes = changes.clone();
+        let db_path = self.cfg.resolved_database_path();
         let mut close = false;
         // Not `centered_modal`: the columns below need `default_width`.
         egui::Window::new("Rebuild index?")
@@ -43,9 +44,11 @@ impl QuickSearchApp {
                 }
                 ui.label(hint(
                     "These settings cannot be applied to the existing index, so it \
-                     must be rebuilt. Until then, existing entries keep the old \
-                     settings.",
+                     must be rebuilt, which deletes the index database below. With \
+                     Later, the next indexing run rebuilds it; until then, existing \
+                     entries keep the old settings.",
                 ));
+                ui.monospace(db_path.display().to_string());
                 ui.horizontal(|ui| {
                     if ui.button("Rebuild now").clicked() {
                         self.backend.rebuild_index();
@@ -102,7 +105,7 @@ impl QuickSearchApp {
                 self.backend.rebuild_index();
             }
             // Either way the index is being replaced under the tab.
-            self.dups.state = DupState::NotLoaded;
+            self.drop_duplicates();
         }
     }
 
@@ -203,7 +206,7 @@ impl QuickSearchApp {
         };
         let roots = self.cfg.paths.indexing_paths.clone();
         let hotkey = self.cfg.ui.search_hotkey.clone();
-        let actions = tour.ui(ctx, &roots, &hotkey);
+        let actions = tour.ui(ctx, &roots, &hotkey, &self.search.query);
         // Through the same path a keystroke takes: `seed` arms the debounce,
         // so the demonstration search runs once the typing stops.
         if let Some(query) = actions.set_query {
@@ -248,8 +251,10 @@ impl QuickSearchApp {
         if !self.clear_prompt {
             return;
         }
+        let db_path = self.cfg.resolved_database_path();
         let close = centered_modal(ctx, "Clear index?", |ui| {
-            ui.label("This deletes the search index database. Your files are not touched.");
+            ui.label("This deletes the search index database below. Your files are not touched.");
+            ui.monospace(db_path.display().to_string());
             ui.label(hint(
                 "Indexing switches to manual until you start it again or return \
                  to automatic mode.",
@@ -261,7 +266,7 @@ impl QuickSearchApp {
                     // resurrect what was just deleted.
                     self.set_index_mode(false);
                     self.backend.clear_index();
-                    self.dups.state = DupState::NotLoaded;
+                    self.drop_duplicates();
                     return true;
                 }
                 ui.button("Cancel").clicked()

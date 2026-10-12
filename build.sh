@@ -70,8 +70,11 @@ ensure_rust() {
     if have_cargo; then return 0; fi
     need_cmd curl || die "curl is needed to fetch rustup"
     say "Installing the Rust toolchain (rustup, into ~/.rustup and ~/.cargo)"
+    # --default-toolchain none, as in CI: the build below installs the one
+    # rust-toolchain.toml pins, so a default would be a second download. Other
+    # projects then have no default; `rustup default stable` sets one.
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain stable
+        | sh -s -- -y --profile minimal --default-toolchain none
     if [ -r "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
     need_cmd cargo || die "rustup finished but cargo is still not on PATH"
 }
@@ -249,7 +252,14 @@ esac
 
 if [ "$mode" = check ]; then
     if have_cargo; then
-        printf '    %s\n' "cargo: $(cargo --version)"
+        # Asked in the repo, so it names the toolchain the build would use.
+        # RUSTUP_AUTO_INSTALL=0 stops rustup downloading that pinned toolchain
+        # to answer, since --check installs nothing.
+        if v="$(cd "$REPO_ROOT" && RUSTUP_AUTO_INSTALL=0 cargo --version 2>/dev/null)"; then
+            printf '    %s\n' "cargo: $v"
+        else
+            printf '    %s\n' "cargo: present; the build installs the pinned toolchain"
+        fi
     else
         printf '    %s\n' "cargo: MISSING (rustup would install it)"
     fi

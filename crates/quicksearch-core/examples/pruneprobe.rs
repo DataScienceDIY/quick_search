@@ -48,6 +48,11 @@
 //! rows, deleted by path. Its stages are probe code, fixed like the stages
 //! above; its `live` row is the shipped function.
 
+// Timed on the allocator the shipped binaries install; see
+// `platform::Allocator`.
+#[global_allocator]
+static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+
 mod common;
 
 use std::path::{Path, PathBuf};
@@ -60,7 +65,7 @@ use quicksearch_core::db::{self, repo};
 use quicksearch_core::extract::Registry;
 use quicksearch_core::file_handling::{
     cleanup_stale_index_entries, fts_begin_tombstone_burst, fts_end_tombstone_burst,
-    fts_finalize_after_text_indexing, split_db_path, RootRange,
+    fts_finalize_after_text_indexing, split_db_path, trim_trailing_separators, RootRange,
 };
 use quicksearch_core::scope::{self, Scope, WorkCursor};
 use quicksearch_core::testutil::{self, Arm, SeedSpec};
@@ -179,8 +184,7 @@ struct Timing {
 /// separator every stored parent carries goes first, or the leaf component
 /// would be empty.
 fn dir_covered(scope: &Scope, root: &Path, parent: &str) -> bool {
-    let trimmed = parent.trim_end_matches(['/', '\\']);
-    scope.covers(root, Path::new(trimmed))
+    scope.covers(root, Path::new(trim_trailing_separators(parent)))
 }
 
 /// Page the index as `scope::advance` does, doing `stage`'s share of the work
@@ -245,8 +249,7 @@ fn run_stage(conn: &Connection, config: &Config, stage: Stage, commit: Commit) -
             }
             t.cover += at.elapsed();
             if let Some(i) = doomed_at {
-                let dir = rows[i].parent.trim_end_matches(['/', '\\']).to_string();
-                let sub = RootRange::for_root(&dir);
+                let sub = RootRange::for_root(&rows[i].parent);
                 let (removed, fts, files) = delete_range(&tx, &sub.lo, &sub.hi);
                 t.fts += fts;
                 t.files += files;

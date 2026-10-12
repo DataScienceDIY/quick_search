@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
@@ -65,7 +65,7 @@ pub fn evict(tree: &Path, db: Option<&Path>) -> (usize, u64) {
     walk(tree, &mut files, &mut bytes);
     if let Some(db) = db {
         for suffix in ["", "-wal", "-shm"] {
-            let p = PathBuf::from(format!("{}{}", db.display(), suffix));
+            let p = std::path::PathBuf::from(format!("{}{}", db.display(), suffix));
             if let Some(len) = drop_one(&p) {
                 files += 1;
                 bytes += len;

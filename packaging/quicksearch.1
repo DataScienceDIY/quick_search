@@ -11,17 +11,19 @@ quicksearch, quicksearch\-cli \- fast full\-text search across your files
 .br
 .B quicksearch
 .RI [ FLAGS ]
+.RB [ \-\- ]
 .IR "query terms" ...
 .br
 .B quicksearch\-cli
 .RI [ FLAGS ]
+.RB [ \-\- ]
 .IR "query terms" ...
 .SH DESCRIPTION
 .B quicksearch
 maintains a SQLite/FTS5 index of the folders in its configuration and searches
 it by file name and content.
 .PP
-With no query it opens the desktop application, which owns the indexer: it
+With no arguments it opens the desktop application, which owns the indexer: it
 walks the configured folders, watches them for changes and reindexes
 periodically.
 .PP
@@ -65,7 +67,9 @@ in the configuration.
 .BI \-\-limit " N"
 Return at most
 .I N
-results. Defaults to
+results, where
+.I N
+is a positive integer. Defaults to
 .I [search].display_limit
 in the configuration.
 .B \-\-limit=N
@@ -75,6 +79,11 @@ also works.
 Print rank, size, modification time and a matching snippet for each hit instead
 of bare paths, with the match in bold when stdout is a terminal.
 .TP
+.B \-\-
+End the options: every later argument is a query term, even one that starts
+with
+.BR \- .
+.TP
 .BR \-h ", " \-\-help
 Print usage and exit.
 .TP
@@ -82,8 +91,13 @@ Print usage and exit.
 Print the version and the commit it was built from, then exit. Quote this in
 bug reports.
 .PP
-An unrecognised option given without query terms is passed through and the
-application opens, since the option may be meant for the windowing backend.
+Options come before the query terms. From the first term on, every argument is
+part of the query, so a
+.B \-h
+after a term is searched for. An unrecognised option, a
+.B \-\-limit
+that is not a positive integer, or options with no query terms are a usage
+error.
 .SH QUERY SYNTAX
 Plain words form a single phrase, matched against names, contents and paths.
 Filters combine with it:
@@ -103,11 +117,11 @@ are always literal.
 .TP
 .B regex:\fIpattern\fR
 Match a regular expression against names, contents and paths, for example
-.BR regex:\(dq(foo|bar)\ed+\(dq .
+.BR regex:(foo|bar)\ed+ .
 Case\-insensitive by default;
-.B (?\-i:\(dq\(dq)
-overrides. Quote patterns containing spaces or
-.BR "( ) : = < > \(dq" .
+.BI (?\-i: pattern )
+overrides. Quote patterns containing spaces or a leading
+.BR \(dq .
 .TP
 .B type:\fIName\fR
 Match a file class: one of
@@ -121,6 +135,11 @@ Also
 .BR < ", " <= ", " > " and " = ;
 dates are
 .IR yyyy-mm-dd .
+Every operator compares whole days in the local time zone:
+.I >2024-01-01
+starts on January 2, and
+.I <=2024-01-01
+includes all of January 1.
 .B mtime:
 is an alias.
 .TP
@@ -165,9 +184,9 @@ keychain, and only on request.
 .SH ENVIRONMENT
 .TP
 .B QUICKSEARCH_PASSWORD
-Password for a protected index, for scripted terminal search. Other processes
-of the same user can read environment variables; prefer the keychain where
-possible.
+Password for a protected index, for scripted terminal search. Set but empty,
+it counts as unset. Other processes of the same user can read environment
+variables; prefer the keychain where possible.
 .SH FILES
 .TP
 .I ~/.config/quicksearch/config.toml
@@ -187,16 +206,25 @@ connects to, where
 .I <key>
 is a hash of the configuration file's path (not the index's, which can change
 while running). Present only while the application runs; a leftover one is
-inert and is replaced at the next start. Falls back to a private directory
+inert and is replaced at the next start. Falls back to
+.RI quicksearch\- <uid>
 under the temporary directory when
 .I XDG_RUNTIME_DIR
-is unset.
+is unset. That directory must be the user's own with mode 0700; one that is
+not is refused, and
+.B \-\-toggle
+then cannot reach the running instance.
 .TP
 .I ./config.toml
 A configuration file next to the
 .B quicksearch
-executable selects portable mode and overrides the per\-user configuration
-entirely. The packaged build installs no such file.
+executable, or the AppImage, selects portable mode and overrides the
+per\-user configuration entirely, unless it has a top\-level table that is
+not one of QuickSearch's own: another program's
+.I config.toml
+there is ignored, with a warning in the log. One that fails to parse still
+counts, and the program reports the error. The packaged build installs no
+such file.
 .PP
 .I XDG_CONFIG_HOME
 and
@@ -205,16 +233,21 @@ are honoured when set to absolute paths.
 .SH EXIT STATUS
 .TP
 .B 0
-The search completed, or
+The search completed (also when the reader of a pipe stops early, as
+.B head
+does), or
 .B \-\-help
+or
+.B \-\-version
 was requested.
 .TP
 .B 1
 The application failed to start.
 .TP
 .B 2
-The configuration could not be read, the index could not be opened or
-unlocked, the query was rejected, or
+A usage error, the configuration could not be read, the index could not be
+opened or unlocked, the query was rejected, the results could not be written,
+or
 .B quicksearch\-cli
 was given no query.
 .SH EXAMPLES

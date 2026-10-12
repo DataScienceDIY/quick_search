@@ -12,8 +12,9 @@
 //! ```
 //!
 //! Point `TMPDIR` at real storage; see `arms::warn_if_tmpdir_unset`. The
-//! matrix wants ~2 GB of scratch at a time, since each arm is dropped once
-//! measured.
+//! matrix wanted ~2 GB of scratch at a time, since each arm is dropped once
+//! measured; that predates the seed's uncapped WAL (`testutil::seed_index`),
+//! which needs room on top.
 //!
 //! # Settled: FTS5 record size
 //!
@@ -36,7 +37,7 @@
 //!
 //! A disk-space fix (1.089x → 1.011x encrypted-over-plain), not a speed fix:
 //! both indexing and search moved less than the harness's own noise floor.
-//! `tests/encrypted_perf.rs` gates the size half, so this bench does not
+//! `tests/encrypted_size.rs` gates the size half, so this bench does not
 //! re-measure it.
 //!
 //! # Settled: database page size
@@ -45,13 +46,13 @@
 //!
 //! # Reading it
 //!
-//! The plain arm is the noise floor. At the 200k tier a just-seeded index is
-//! small enough that the OS page cache serves nearly all of it, so those
-//! figures price decrypt work with little I/O in them. The 1M tier exceeds
-//! what stays cached, and real reads enter there: storage reads in ≥4 KiB
-//! blocks whatever the page size, so a sub-4K page cuts decryption but not
-//! I/O. The tiers are reported separately for that reason; do not average
-//! them.
+//! The plain arm is the noise floor. Cold is SQLite-cold: a fresh
+//! connection, so its cache starts empty. Nothing evicts the OS cache, so no
+//! tier is storage-cold. Warm runs at the cache ceiling each arm ships with;
+//! the sweep on `db::schema::PAGE_SIZE` predates that and ran at the 16 MiB
+//! floor, below the `files` table, so its warm ranking prices per-page work,
+//! not a warm keystroke at the shipped ceiling. Report the tiers separately;
+//! do not average them.
 
 mod arms;
 
@@ -86,7 +87,7 @@ fn shape_only() -> bool {
 /// The shape tier: every page size, cheap enough to run them all.
 const SHAPE_FILES: usize = 200_000;
 /// The confirmation tiers, run only for the baseline and the shape tier's
-/// winner. 1M is where the working set stops fitting in the OS cache.
+/// winner.
 const SCALE_FILES: [usize; 2] = [600_000, 1_000_000];
 
 fn enabled() -> bool {
@@ -105,7 +106,7 @@ fn main() {
         eprintln!("skipping: set QSB_PGSZ=1 to run");
         return;
     }
-    arms::warn_if_tmpdir_unset("every 'cold' figure below is RAM and the large tiers may not fit");
+    arms::warn_if_tmpdir_unset("the large tiers may not fit");
 
     let best = shape_tier();
     if shape_only() {

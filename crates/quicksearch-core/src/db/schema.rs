@@ -3,27 +3,27 @@
 //! # Pragma profiles
 //!
 //! A negative `cache_size` is KiB; a positive one would be a page count. A
-//! filled cache is glibc arena memory that outlives the connection; see
-//! [`crate::platform::release_free_heap`].
+//! filled cache is the system `malloc`'s heap, not mimalloc's; see
+//! [`crate::platform::Allocator`].
 //!
 //! | Profile | Connection | Lifetime | Cache |
 //! |---|---|---|---|
-//! | [`PRAGMAS_FAST`] | bulk indexer writer | one run | 8 MiB |
+//! | [`PRAGMAS_FAST`] | bulk indexer writer, then post-run maintenance | one run | 8 MiB |
 //! | [`PRAGMAS_INCREMENTAL`] | coordinator's writer | released when idle | 4 MiB |
 //! | [`pragmas_search`] | search worker | held across a typing session | [`recommended_search_cache_mib`] |
 //! | [`PRAGMAS_READONLY`] | one-shot readers | a single query | 4 MiB |
-//! | [`PRAGMAS_MAINTENANCE`] | VACUUM | one bulk copy | 8 MiB |
 //! | [`PRAGMAS_WALK_READER`] | per-root walk prefetch and content feeder | the run | 1 MiB |
 //!
 //! `PRAGMA mmap_size` is absent from all of them: it would make memory
 //! behaviour differ between protected and unprotected installs.
 //!
-//! The three *writing* profiles set `PRAGMA journal_size_limit`; readers
+//! The two *writing* profiles set `PRAGMA journal_size_limit`; readers
 //! cannot. Without it the `-wal` keeps its high-water size after any
-//! checkpoint that is not a successful TRUNCATE, and TRUNCATE silently
-//! downgrades when it cannot take the reset lock
-//! ([`crate::db::repo::checkpoint_truncate`]). SQLite applies the limit at the
-//! first commit after the log restarts, so the next writer reclaims the space.
+//! checkpoint that is not a successful TRUNCATE, and a TRUNCATE held back by
+//! a reader or by the checkpoint lock fails with `busy = 1` and leaves the
+//! log at its size ([`crate::db::repo::checkpoint_truncate`]). SQLite applies
+//! the limit at the first commit after the log restarts, so the next writer
+//! reclaims the space.
 //! Each profile spells the value out because pragma strings cannot
 //! interpolate; the tests keep them equal to
 //! [`crate::config::MINIMUM_WAL_SIZE`].
@@ -37,21 +37,6 @@ pub const PRAGMAS_FAST: &str = "
     PRAGMA busy_timeout = 5000;
     PRAGMA cache_size = -8192;
     PRAGMA temp_store = MEMORY;
-    PRAGMA foreign_keys = ON;
-    PRAGMA journal_size_limit = 16777216;
-";
-
-/// [`PRAGMAS_FAST`] but with `temp_store = FILE`. SQLCipher is compiled
-/// `-DSQLITE_TEMP_STORE=2`, under which anything but an explicit `FILE` puts
-/// temporary databases in memory, and VACUUM builds its replacement database
-/// there: under the indexer's profile it would hold a multi-gigabyte index in
-/// RAM.
-pub const PRAGMAS_MAINTENANCE: &str = "
-    PRAGMA journal_mode = WAL;
-    PRAGMA synchronous = NORMAL;
-    PRAGMA busy_timeout = 5000;
-    PRAGMA cache_size = -8192;
-    PRAGMA temp_store = FILE;
     PRAGMA foreign_keys = ON;
     PRAGMA journal_size_limit = 16777216;
 ";
@@ -158,12 +143,13 @@ pub const PRAGMAS_WALK_READER: &str = "
 /// `documents_text`, zstd-compressed.
 ///
 /// `idx_files_parent` is row identity and the only index `parent` needs. It
-/// does not cover `mtime`: the walk prefetcher's `SELECT name, mtime … WHERE
-/// parent = ?` then fetches each row, which it can afford because it runs
-/// ahead of the walk workers and a directory's rows are rowid-adjacent.
-/// `mtime` cannot join the key, because `UNIQUE(parent, name, mtime)` would
-/// admit the same file twice. If the prefetcher falls behind, raise
-/// [`PRAGMAS_WALK_READER`] rather than adding a covering index.
+/// does not cover the change-detection stamp: the walk prefetcher's
+/// `SELECT name, mtime, size, hash IS NOT NULL … WHERE parent = ?` then
+/// fetches each row, which it can afford because it runs ahead of the walk
+/// workers and a directory's rows are rowid-adjacent. `mtime` cannot join the
+/// key, because `UNIQUE(parent, name, mtime)` would admit the same file
+/// twice. If the prefetcher falls behind, raise [`PRAGMAS_WALK_READER`]
+/// rather than adding a covering index.
 ///
 /// `type` has no index: the kind filter's `(f.type & ?) != 0`
 /// (`crate::query::translator`) is not sargable, so nothing could seek one.
@@ -228,23 +214,24 @@ CREATE TABLE config_validation (
 /// The database page size, applied at creation and fixed for the file's life.
 ///
 /// 8192 rather than the SQLite and SQLCipher default of 4096:
-/// `benches/page_geometry.rs` swept 1024→65536 on a keyed 200k-file index, and
-/// this balances two opposing costs:
+/// `benches/page_geometry.rs` swept 1024→65536 on a keyed 200k-file index,
+/// with every search connection at the 16 MiB cache floor (`seed_index`
+/// recorded no root counts then), and this balances two opposing costs:
 ///
-/// | page | size | index rows/s | `files` scan | scattered rows | cold name |
-/// |---|---|---|---|---|---|
-/// | 1024 | 179.9 MiB | 1194 | 221 ms | 51 ms | 79.4 ms |
-/// | 4096 | 154.8 MiB | 3289 | 100 ms | 43 ms | 44.4 ms |
-/// | **8192** | **151.4 MiB** | **4955** | **55 ms** | **45 ms** | **35.7 ms** |
-/// | 16384 | 151.4 MiB | 5592 | 37 ms | 58 ms | 34.2 ms |
-/// | 65536 | 158.4 MiB | 7712 | 23 ms | 61 ms | 38.1 ms |
+/// | page | size | `files` scan | scattered rows | cold name |
+/// |---|---|---|---|---|
+/// | 1024 | 179.9 MiB | 221 ms | 51 ms | 79.4 ms |
+/// | 4096 | 154.8 MiB | 100 ms | 43 ms | 44.4 ms |
+/// | **8192** | **151.4 MiB** | **55 ms** | **45 ms** | **35.7 ms** |
+/// | 16384 | 151.4 MiB | 37 ms | 58 ms | 34.2 ms |
+/// | 65536 | 158.4 MiB | 23 ms | 61 ms | 38.1 ms |
 ///
 /// A scattered row fetch decrypts a whole page to read one ~130-byte row, so
 /// it wants a small page and degrades past 8192 (43 ms → 73 ms by 32768). The
 /// sequential `files` scan behind every filename query wants a large one: the
 /// bytes decrypted stay ~9 MiB either way while per-page codec and pager work
 /// falls. 8192 keeps scattered reads within 3% of their optimum, halves the
-/// scan, ties for the smallest file, and indexes 1.5x faster than 4096.
+/// scan, and ties for the smallest file.
 ///
 /// The keyed columns predate `HMAC_MODE = Off` (see [`HMAC_MODE`]). Both costs
 /// are per-page work, so dropping the authenticator scales them together, and
@@ -317,21 +304,22 @@ impl HmacMode {
 
 /// The per-page authenticator this build writes: none.
 ///
-/// # Why it is safe to drop
+/// # Why it is off
 ///
-/// The index holds text read from files the same user can already read, so
-/// anything positioned to tamper with the index could read the originals
-/// instead; the HMAC defends almost nothing, yet costs every page read and
-/// write. An unprotected index has never had per-page authentication, so this
-/// makes the two alike rather than putting the protected one behind. SQLite's
-/// page-header and cell checks still catch structural damage in both key
-/// states, and the index is re-derivable from disk. The encryption is
-/// unchanged: pages stay AES-256-CBC.
+/// Encryption here is for confidentiality at rest and to prevent a faster way for
+/// non-authorized users or apps from scanning for sensitive files. The HMAC adds
+/// integrity, not secrecy, and tampering is out of scope since whoever can write
+/// the index can disrupt far more than a search tool. Since HMAC costs significant
+/// performance it is left disabled.
 ///
 /// # What it buys
 ///
-/// `benches/cipher_hmac.rs`, 200k files, all four arms in one process. Warm
-/// total is six cascade shapes summed, the steady state of a typing session:
+/// `benches/cipher_hmac.rs`, 200k files, all four arms in one process, every
+/// search connection at the 16 MiB cache floor (`seed_index` recorded no root
+/// counts then), below the `files` table. Warm total is six cascade shapes
+/// summed, so it prices per-page work, not a keystroke at the shipped
+/// ceiling; its "body (common)" shape filled the display limit from file
+/// names and never reached the full-text pass:
 ///
 /// | arm | seed | warm total | duplicates | size |
 /// |---|---|---|---|---|
@@ -358,10 +346,10 @@ impl HmacMode {
 /// # Figures taken under HMAC-SHA512
 ///
 /// [`PAGE_SIZE`]'s sweep, [`SEARCH_CACHE_BYTES_PER_FILE`], and the keyed
-/// figures in `benches/search_perf.rs`, `benches/page_geometry.rs`,
-/// `tests/encrypted_perf.rs` and `search::IDLE_RELEASE` were measured under
-/// HMAC-SHA512 and not re-swept. A keyed page miss is now cheaper, so those
-/// keyed costs are overstated and the cache sizing errs large.
+/// figures in `benches/search_perf.rs`, `benches/page_geometry.rs` and
+/// `search::IDLE_RELEASE` were measured under HMAC-SHA512 and not re-swept.
+/// A keyed page miss is now cheaper, so those keyed costs are overstated and
+/// the cache sizing errs large.
 ///
 /// # Changing it is not a free edit
 ///
@@ -478,7 +466,8 @@ pub fn fts_set_pgsz(
 /// FTS5's own default `pgsz`, from `FTS5_DEFAULT_PAGE_SIZE` in the amalgamation.
 pub const FTS5_DEFAULT_PGSZ: i64 = 4050;
 
-/// FTS5 virtual table DDL. Separate because the tokenizer is config-driven.
+/// FTS5 virtual table DDL. Separate because the position setting is
+/// config-driven.
 ///
 /// Contentless FTS5 (`content=''`): column values are not stored.
 /// `contentless_delete=1` (SQLite 3.43+) allows `DELETE FROM … WHERE rowid=?`
@@ -489,13 +478,14 @@ pub const FTS5_DEFAULT_PGSZ: i64 = 4050;
 /// One column: only document bodies are ever MATCHed, and a `name` column
 /// would cost (len − 2) postings per file.
 ///
-/// `positions` is [`crate::config::ProcessingConfig::fts_positions`]. Without
-/// them (`detail=none`, the default through `compact_text_index`) the table
-/// answers only single-token phrases, so the search side asks for a term as
-/// the AND of its trigrams (`search::prefilter::fts_literal`) and the
-/// full-text pass drops the documents where they are not adjacent, which it
-/// can because text is always stored. Measured on 1.1 GB of crate sources
-/// (`indexprobe cold`, then `searchtime`), identical results either way:
+/// `positions` is the opposite of
+/// [`crate::config::ProcessingConfig::compact_text_index`]. Without them
+/// (`detail=none`, the default) the table answers only single-token phrases,
+/// so the search side asks for a term as the AND of its trigrams
+/// (`search::prefilter::fts_literal`) and the full-text pass drops the
+/// documents where they are not adjacent, which it can because text is always
+/// stored. Measured on 1.1 GB of crate sources (`indexprobe cold`, then
+/// `searchtime`), identical results either way:
 ///
 /// | | positions | none |
 /// |---|---|---|
@@ -508,20 +498,22 @@ pub const FTS5_DEFAULT_PGSZ: i64 = 4050;
 /// The slowest was a phrase of common words (`impl Iterator for`, 24 → 67
 /// ms), whose trigrams occur in many documents that lack the phrase.
 ///
-/// The configured tokenizer is applied as written. Plain `trigram` once got
-/// `remove_diacritics 1` appended, but full-text verification folds ASCII
-/// only (`tests/cascade.rs`, `diacritic_fts_candidates_are_dropped`), so the
+/// The tokenizer is always plain `trigram`: every full-text query is built
+/// from case-folded character triples, so a word tokenizer would drop the
+/// substring, wildcard, fuzzy and regex candidates the verifier accepts, and
+/// `case_sensitive 1` the case variants. It once got `remove_diacritics 1`
+/// appended, but full-text verification folds ASCII only
+/// (`tests/cascade.rs`, `diacritic_fts_candidates_are_dropped`), so the
 /// extra candidates it matched were always dropped again. Dropping it measured
 /// neutral on indexing time (`indexprobe cold`, 5k accented documents).
-pub fn fts_create_sql(tokenizer: &str, positions: bool) -> String {
+pub fn fts_create_sql(positions: bool) -> String {
     format!(
         "CREATE VIRTUAL TABLE searchabletext USING fts5(\
             text, \
-            tokenize='{}', \
+            tokenize='trigram', \
             content='', \
             contentless_delete=1{}\
         );",
-        tokenizer.trim().replace('\'', "''"),
         if positions { "" } else { ", detail=none" }
     )
 }
@@ -544,7 +536,6 @@ mod tests {
         );
         for (name, pragmas) in [
             ("PRAGMAS_FAST", PRAGMAS_FAST),
-            ("PRAGMAS_MAINTENANCE", PRAGMAS_MAINTENANCE),
             ("PRAGMAS_INCREMENTAL", PRAGMAS_INCREMENTAL),
         ] {
             assert!(pragmas.contains(&want), "{} is missing {}", name, want);
@@ -606,15 +597,15 @@ mod tests {
         assert!(large <= SEARCH_CACHE_MAX_MIB);
     }
 
-    /// The three corpora `benches/search_perf.rs` measured, against the knee
-    /// it found for each. Below the knee a keyed search runs 3.4–3.9x slower,
-    /// so the recommendation must reach it.
+    /// The two corpora `benches/search_perf.rs` measured under the automatic
+    /// cap, against the knee it found for each. Below the knee a keyed search
+    /// ran 3.4–3.9x slower (HMAC-SHA512), so the recommendation must reach it.
     #[test]
     fn the_recommendation_clears_every_measured_knee() {
-        for (files, knee_mib) in [(200_000, 32), (600_000, 96), (1_000_000, 128)] {
+        for (files, knee_mib) in [(200_000, 32), (600_000, 96)] {
             let got = recommended_search_cache_mib(files, true);
             assert!(
-                got >= knee_mib.min(SEARCH_CACHE_MAX_MIB),
+                got >= knee_mib,
                 "{} files: recommending {} MiB, under the measured knee of {} MiB",
                 files,
                 got,
@@ -650,19 +641,15 @@ mod tests {
     }
 
     #[test]
-    fn the_tokenizer_is_applied_as_written() {
-        assert!(fts_create_sql("  trigram  ", true).contains("tokenize='trigram',"));
-        assert!(fts_create_sql("unicode61", true).contains("tokenize='unicode61',"));
-        assert!(
-            fts_create_sql("trigram remove_diacritics 1", true)
-                .contains("tokenize='trigram remove_diacritics 1',"),
-            "an explicit option string still passes through"
-        );
+    fn the_tokenizer_is_plain_trigram() {
+        for positions in [true, false] {
+            assert!(fts_create_sql(positions).contains("tokenize='trigram',"));
+        }
     }
 
     #[test]
     fn positions_decide_the_detail_option() {
-        assert!(!fts_create_sql("trigram", true).contains("detail"));
-        assert!(fts_create_sql("trigram", false).contains(", detail=none)"));
+        assert!(!fts_create_sql(true).contains("detail"));
+        assert!(fts_create_sql(false).contains(", detail=none)"));
     }
 }

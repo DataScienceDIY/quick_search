@@ -9,9 +9,6 @@ const HASH_LENGTH: usize = 8192;
 fn group(paths: &[&str]) -> DuplicateGroup {
     DuplicateGroup {
         hash: vec![0xab; 32],
-        count: paths.len() as i64,
-        total_size: 100 * paths.len() as i64,
-        redundant_size: 100 * (paths.len() as i64 - 1),
         members: paths
             .iter()
             .enumerate()
@@ -224,9 +221,7 @@ fn an_empty_result_says_so_rather_than_showing_an_empty_list() {
 fn sized_group(name: &str, redundant: i64) -> DuplicateGroup {
     let mut group = group(&[&format!("/a/{name}"), &format!("/b/{name}")]);
     group.hash = name.as_bytes().to_vec();
-    group.redundant_size = redundant;
-    // The title is priced from the members, so the size has to agree with the
-    // waste the ordering is being tested on: two copies, one reclaimable.
+    // The tab prices a group from its members: two copies, one reclaimable.
     for member in group.members.iter_mut() {
         member.3 = redundant.max(0) as u64;
     }
@@ -490,6 +485,33 @@ fn a_member_row_offers_the_two_exclusions_it_stands_for() {
     assert_eq!(
         actions.save_filters.map(|f| f.exclude_patterns),
         Some(vec!["*.raw".to_string()])
+    );
+}
+
+/// The folder's glob syntax is escaped: unescaped, `[FLAC]` is a character
+/// class that excludes `Music F` and `Music L` and keeps the folder itself.
+#[test]
+fn excluding_a_bracketed_folder_excludes_only_it() {
+    const BRACKETED: [&str; 3] = [
+        "/m/Music [FLAC]/a.flac",
+        "/m/Music F/a.flac",
+        "/m/Music L/a.flac",
+    ];
+    let ctx = crate::test_ui::ctx();
+    let mut tab = loaded(&BRACKETED);
+    expand(&ctx, &mut tab);
+
+    context_menu_on(&ctx, &mut tab, false, BRACKETED[0]);
+    let actions = click_menu_entry(&ctx, &mut tab, "Exclude this folder from duplicates");
+    let folder = std::path::Path::new(BRACKETED[0]).parent().unwrap();
+    assert_eq!(
+        actions.save_filters.map(|f| f.exclude_patterns),
+        Some(vec![crate::ui_util::dir_ignore_pattern(folder)])
+    );
+    let header = header_of(&ctx, &mut tab);
+    assert!(
+        header.starts_with("2 × a.flac:"),
+        "the wrong copies were excluded: {header:?}"
     );
 }
 

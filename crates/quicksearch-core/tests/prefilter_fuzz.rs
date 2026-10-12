@@ -727,6 +727,186 @@ fn a_corrupted_path_substring_still_finds_the_file_it_came_from() {
 }
 
 // ---------------------------------------------------------------------------
+// Unicode case: the wildcard and regex matchers fold it, `LIKE` does not
+// ---------------------------------------------------------------------------
+
+/// Words with letters whose case partners go beyond ASCII: `k` and `s` (also
+/// U+212A KELVIN SIGN and U+017F LONG S), accented Latin, Cyrillic, Greek
+/// with its three sigmas, a titlecase digraph; beside uncased CJK, `LIKE`'s
+/// own metacharacters and plain ASCII.
+const CASED_WORDS: [&str; 14] = [
+    "kilowatt",
+    "Kelvin",
+    "summary",
+    "SUMMARY",
+    "café",
+    "résumé",
+    "naïve",
+    "Ünicode",
+    "отчёт",
+    "Σοφίας",
+    "ǆungla",
+    "日本語テキスト",
+    "100%_done",
+    "budget",
+];
+
+/// `s` with about half its characters swapped for another member of their
+/// simple case-fold class: the 1:1 folds a Unicode case-insensitive regex
+/// matches by, so the result matches wherever `s` did. Drawn from the same
+/// tables the regex crate folds with.
+fn swap_case(s: &str, lcg: &mut Lcg) -> String {
+    use regex_syntax::hir::{ClassUnicode, ClassUnicodeRange};
+
+    s.chars()
+        .map(|c| {
+            if lcg.next_u64().is_multiple_of(2) {
+                return c;
+            }
+            let mut class = ClassUnicode::new([ClassUnicodeRange::new(c, c)]);
+            class.case_fold_simple();
+            let partners: Vec<char> = class.iter().flat_map(|r| r.start()..=r.end()).collect();
+            partners[lcg.next_u64() as usize % partners.len()]
+        })
+        .collect()
+}
+
+/// Whether `term` holds a character ASCII `LIKE` cannot fold for a Unicode
+/// matcher: anything non-ASCII, or a `k` or `s`.
+fn folds_past_ascii(term: &str) -> bool {
+    term.chars()
+        .any(|c| !c.is_ascii() || matches!(c.to_ascii_lowercase(), 'k' | 's'))
+}
+
+/// [`file_paths`] from [`CASED_WORDS`], every word stored case-swapped.
+fn cased_paths() -> Vec<(String, String)> {
+    let mut lcg = Lcg::new(0xca5e);
+    let word = |lcg: &mut Lcg| {
+        let w = CASED_WORDS[lcg.next_u64() as usize % CASED_WORDS.len()];
+        swap_case(w, lcg)
+    };
+    let mut out = Vec::new();
+    for i in 0..DOCS {
+        let depth = 1 + (lcg.next_u64() as usize % 3);
+        let mut parent = String::from("/fz");
+        for _ in 0..depth {
+            parent.push('/');
+            parent.push_str(&word(&mut lcg));
+        }
+        parent.push('/');
+        let name = format!("{}-{}-{:03}.txt", word(&mut lcg), word(&mut lcg), i);
+        out.push((parent, name));
+    }
+    out
+}
+
+/// A `*` pattern's classifier folds Unicode case, so pass A's `LIKE` must
+/// admit every case partner it accepts, in both of its branches (the anchor
+/// segment, and the joined name pattern under the trigram floor). Cut a
+/// substring from a stored name or path, insert a star, swap case along
+/// simple folds, and every row the compiled pattern accepts must be found.
+/// The oracle is the [`TermPattern`](quicksearch_core::query::pattern::TermPattern)
+/// itself, applied as pass A applies it: to the name always, to the path at
+/// three characters of literal.
+#[test]
+fn a_wildcard_cut_from_a_name_finds_the_file() {
+    let rows = cased_paths();
+    let (_dir, db) = Scratch::db("prefilter-wildcase");
+    let ids = seed_files(&db, &rows);
+    let conn = quicksearch_core::db::open::open_search_reader(&db.to_string_lossy())
+        .expect("open the seeded index");
+
+    let mut lcg = Lcg::new(0x5ca5e);
+    let mut checked = 0usize;
+    let mut unicode = 0usize;
+    let mut source_expected = 0usize;
+
+    for len in sweep_lengths() {
+        for _ in 0..iters_per_len().min(40) {
+            let at = lcg.next_u64() as usize % rows.len();
+            let (parent, name) = &rows[at];
+            let full = format!("{}{}", parent, name);
+            let source: &str = if lcg.next_u64().is_multiple_of(2) {
+                name
+            } else {
+                &full
+            };
+            let Some(cut) = substring_of(source, len, &mut lcg) else {
+                continue;
+            };
+            let mut chars: Vec<char> = cut.chars().collect();
+            let star = lcg.next_u64() as usize % (chars.len() + 1);
+            chars.insert(star, '*');
+            let term = swap_case(&chars.into_iter().collect::<String>(), &mut lcg);
+
+            // The parsed pattern decides, as in the fuzzy sweeps above.
+            let Ok(split) = split_for_cascade(&term) else {
+                continue;
+            };
+            if !split.pattern.is_wildcard() || split.regex.is_some() || !split.filter_sql.is_empty()
+            {
+                continue;
+            }
+            let pattern = &split.pattern;
+            let tiers = pattern.literal_char_count() >= TRIGRAM_FLOOR;
+            let want: Vec<i64> = rows
+                .iter()
+                .zip(&ids)
+                .filter(|((parent, name), _)| {
+                    pattern.find_first(name, true).is_some()
+                        || (tiers
+                            && pattern
+                                .find_first(&format!("{parent}{name}"), true)
+                                .is_some())
+                })
+                .map(|(_, &id)| id)
+                .collect();
+
+            let found: Vec<i64> = search_hits(&conn, &term, None)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let lost: Vec<&(String, String)> = want
+                .iter()
+                .filter(|id| !found.contains(id))
+                .map(|id| &rows[ids.iter().position(|seeded| seeded == id).unwrap()])
+                .collect();
+            assert!(
+                lost.is_empty(),
+                "lost files the pattern accepts\n  term     {:?}\n  segments {:?}\n  \
+                 cut from {:?}\n  lost     {:?}",
+                term,
+                pattern.segments(),
+                cut,
+                lost,
+            );
+            checked += 1;
+            unicode += usize::from(folds_past_ascii(&term));
+            source_expected += usize::from(want.contains(&ids[at]));
+        }
+    }
+
+    eprintln!(
+        "wildcard case fuzz: {} patterns, {} with a non-ASCII fold, {} expecting their source",
+        checked, unicode, source_expected
+    );
+    assert!(checked > 200, "only {} patterns compared", checked);
+    assert!(
+        unicode > checked / 2,
+        "only {} of {} patterns needed a non-ASCII fold; the generator is not \
+         reaching the path under test",
+        unicode,
+        checked
+    );
+    assert!(
+        source_expected > checked / 2,
+        "only {} of {} patterns expected the row they were cut from",
+        source_expected,
+        checked
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The regex prefilter
 // ---------------------------------------------------------------------------
 
@@ -761,22 +941,36 @@ fn regexify(sub: &str, lcg: &mut Lcg) -> String {
 /// equality pins the prefilter from both sides: it may not lose a row, and
 /// the rows it lets through must still be verified rather than admitted on
 /// the strength of holding a literal.
+///
+/// Names hold case-swapped [`CASED_WORDS`] and the regex is cut from a body
+/// or from a name as it was before the swap, so the name pass's `LIKE` meets
+/// the case partners its regex folds to: Kelvin sign, long s, `É`, Cyrillic.
 #[test]
 fn a_regex_finds_exactly_the_documents_it_matches() {
     let bodies = bodies();
+    let mut lcg = Lcg::new(0xb0a7);
+    let plain: Vec<String> = (0..bodies.len())
+        .map(|i| {
+            let word = CASED_WORDS[lcg.next_u64() as usize % CASED_WORDS.len()];
+            format!("{}-{:04}.bin", word, i)
+        })
+        .collect();
+    let names: Vec<String> = plain.iter().map(|n| swap_case(n, &mut lcg)).collect();
     let (_dir, db) = Scratch::db("prefilter-regex");
-    let ids = seed(&db, &bodies);
+    let ids = seed_named(&db, &bodies, &names);
     let conn = quicksearch_core::db::open::open_search_reader(&db.to_string_lossy())
         .expect("open the seeded index");
 
-    let mut lcg = Lcg::new(0xb0a7);
     let mut checked = 0usize;
     let mut with_prefilter = 0usize;
+    let mut from_names = 0usize;
 
     for len in sweep_lengths() {
         for _ in 0..iters_per_len().min(40) {
             let doc = lcg.next_u64() as usize % bodies.len();
-            let Some(sub) = substring_of(&bodies[doc], len, &mut lcg) else {
+            let by_name = lcg.next_u64().is_multiple_of(2);
+            let source = if by_name { &plain[doc] } else { &bodies[doc] };
+            let Some(sub) = substring_of(source, len, &mut lcg) else {
                 continue;
             };
             let pattern = regexify(sub, &mut lcg);
@@ -798,10 +992,9 @@ fn a_regex_finds_exactly_the_documents_it_matches() {
 
             // The oracle: the pattern may match any of the three fields.
             let mut want: Vec<i64> = Vec::new();
-            for (i, body) in bodies.iter().enumerate() {
-                let name = format!("row{:04}.bin", i);
+            for (i, (body, name)) in bodies.iter().zip(&names).enumerate() {
                 let path = format!("/fuzz/{}", name);
-                if re.is_match(body) || re.is_match(&name) || re.is_match(&path) {
+                if re.is_match(body) || re.is_match(name) || re.is_match(&path) {
                     want.push(ids[i]);
                 }
             }
@@ -821,14 +1014,22 @@ fn a_regex_finds_exactly_the_documents_it_matches() {
                 re.required().map(|r| r.literals().to_vec()),
             );
             checked += 1;
+            from_names += usize::from(by_name);
         }
     }
 
     eprintln!(
-        "regex prefilter: {} patterns compared corpus-wide, {} of them prefiltered",
-        checked, with_prefilter
+        "regex prefilter: {} patterns compared corpus-wide, {} of them prefiltered, \
+         {} cut from names",
+        checked, with_prefilter, from_names
     );
     assert!(checked > 100, "only {} patterns compared", checked);
+    assert!(
+        from_names > checked / 4,
+        "only {} of {} patterns came from names",
+        from_names,
+        checked
+    );
     assert!(
         with_prefilter > checked / 4,
         "only {} of {} patterns produced a prefilter; the generator is not \
@@ -838,7 +1039,17 @@ fn a_regex_finds_exactly_the_documents_it_matches() {
     );
 }
 
+/// Seed `bodies` under names that share nothing with them, so a hit can only
+/// come from the full-text pass.
 fn seed(path: &std::path::Path, bodies: &[String]) -> Vec<i64> {
+    let names: Vec<String> = (0..bodies.len())
+        .map(|i| format!("row{:04}.bin", i))
+        .collect();
+    seed_named(path, bodies, &names)
+}
+
+/// Seed one `/fuzz/` file per body, named by `names`.
+fn seed_named(path: &std::path::Path, bodies: &[String], names: &[String]) -> Vec<i64> {
     use quicksearch_core::db::repo::{insert_file, store_pending_text, NewFile};
     use quicksearch_core::mime::FileType;
     use quicksearch_core::testutil::zstd_of;
@@ -848,13 +1059,11 @@ fn seed(path: &std::path::Path, bodies: &[String]) -> Vec<i64> {
             .unwrap();
     let tx = conn.transaction().unwrap();
     let mut ids = Vec::with_capacity(bodies.len());
-    for (i, body) in bodies.iter().enumerate() {
+    for (body, name) in bodies.iter().zip(names) {
         let id = insert_file(
             &tx,
             &NewFile {
-                // Names share nothing with the bodies, so a hit
-                // can only come from the full-text pass.
-                name: &format!("row{:04}.bin", i),
+                name,
                 parent: "/fuzz/",
                 size: body.len() as u64,
                 mtime: 1_700_000_000,
