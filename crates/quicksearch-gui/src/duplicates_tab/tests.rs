@@ -1,5 +1,11 @@
 use super::*;
 
+use std::sync::atomic::AtomicBool;
+
+use quicksearch_core::config::Config;
+use quicksearch_core::search::{split_by_tail, HeadGroup};
+use quicksearch_core::testutil::Scratch;
+
 use crate::test_ui::{click_at, click_with, painted_text, painted_text_center, run_panel};
 
 const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
@@ -9,6 +15,7 @@ const HASH_LENGTH: usize = 8192;
 fn group(paths: &[&str]) -> DuplicateGroup {
     DuplicateGroup {
         hash: vec![0xab; 32],
+        tail: [0xcd; 32],
         members: paths
             .iter()
             .enumerate()
@@ -22,8 +29,7 @@ fn group(paths: &[&str]) -> DuplicateGroup {
 
 fn tab(groups: Vec<DuplicateGroup>, filters: DuplicatesConfig) -> DuplicatesTab {
     let mut tab = DuplicatesTab::new(&filters);
-    tab.scan_limit = crate::backend::DUP_SCAN_LIMIT;
-    tab.state = DupState::Loaded(LoadedGroups::new(groups));
+    tab.state = DupState::Loaded(LoadedGroups::new(groups, None));
     tab
 }
 
@@ -214,6 +220,22 @@ fn an_empty_result_says_so_rather_than_showing_an_empty_list() {
     );
 }
 
+/// Whether the listing was cut short is the fetch's to say: the tail check
+/// can leave a full fetch listing fewer groups than it asked for.
+#[test]
+fn a_full_fetch_says_it_was_limited_however_many_are_listed() {
+    let ctx = crate::test_ui::ctx();
+    let limited = |limited_to: Option<u32>| {
+        let mut tab = DuplicatesTab::new(&DuplicatesConfig::default());
+        tab.state = DupState::Loaded(LoadedGroups::new(vec![group(&PATHS)], limited_to));
+        painted_text(&frame(&ctx, &mut tab, false, Vec::new()).0)
+            .iter()
+            .any(|t| t.contains("Limited to the 500 largest groups"))
+    };
+    assert!(limited(Some(500)), "one group left of a full fetch");
+    assert!(!limited(None), "a fetch short of its limit was everything");
+}
+
 // --- Ordering ---------------------------------------------------------------
 
 /// A group named by its first member, with the waste that decides the
@@ -240,7 +262,7 @@ fn names(loaded: &LoadedGroups) -> Vec<String> {
 /// The names of the groups, in the order the tab would list them.
 fn listed(groups: Vec<DuplicateGroup>, sort: DupSort) -> Vec<String> {
     let filters = DupFilters::new(&DuplicatesConfig::default());
-    let mut loaded = LoadedGroups::new(groups);
+    let mut loaded = LoadedGroups::new(groups, None);
     loaded.rebuild(sort, &filters, false);
     names(&loaded)
 }
@@ -312,7 +334,7 @@ fn the_order_returns_when_the_choice_does() {
         sized_group("middling.txt", 100),
     ];
     let filters = DupFilters::new(&DuplicatesConfig::default());
-    let mut loaded = LoadedGroups::new(groups);
+    let mut loaded = LoadedGroups::new(groups, None);
     loaded.rebuild(DupSort::Extension, &filters, false);
     loaded.rebuild(DupSort::Reclaimable, &filters, false);
     assert_eq!(names(&loaded), ["big.txt", "small.jpg", "middling.txt"]);
@@ -541,15 +563,15 @@ fn an_unparseable_pattern_is_reported_rather_than_silently_dropped() {
 fn hiding_a_group_takes_it_off_the_list_and_is_persisted() {
     let ctx = crate::test_ui::ctx();
     let mut tab = loaded(&PATHS);
-    let hash = group(&PATHS).hash_hex();
+    let identity = group(&PATHS).identity();
     let header = header_of(&ctx, &mut tab);
     context_menu_on(&ctx, &mut tab, false, &header);
     let actions = click_menu_entry(&ctx, &mut tab, HIDE_LABEL);
 
     assert_eq!(
         actions.save_filters.map(|f| f.hidden_groups),
-        Some(vec![hash]),
-        "hiding is not remembered by content hash"
+        Some(vec![identity]),
+        "hiding is not remembered by head and tail"
     );
     let painted = painted_text(&frame(&ctx, &mut tab, false, Vec::new()).0);
     assert!(painted.contains(&ALL_FILTERED.to_string()), "{painted:?}");
@@ -566,7 +588,7 @@ fn a_group_hidden_in_the_config_is_not_listed() {
     let ctx = crate::test_ui::ctx();
     let mut tab = tab(
         vec![group(&PATHS), sized_group("keep.txt", 40)],
-        hiding(&[group(&PATHS).hash_hex()]),
+        hiding(&[group(&PATHS).identity()]),
     );
     let out = frame(&ctx, &mut tab, false, Vec::new()).0;
     let listed = headers(&out);
@@ -584,7 +606,7 @@ fn a_group_hidden_in_the_config_is_not_listed() {
 #[test]
 fn show_hidden_lists_them_again_and_offers_the_way_back() {
     let ctx = crate::test_ui::ctx();
-    let mut tab = tab(vec![group(&PATHS)], hiding(&[group(&PATHS).hash_hex()]));
+    let mut tab = tab(vec![group(&PATHS)], hiding(&[group(&PATHS).identity()]));
     let (out, _) = frame(&ctx, &mut tab, false, Vec::new());
     let toggle = painted_text_center(&out, "Show hidden").expect("no Show hidden control");
     let (out, _) = frame(&ctx, &mut tab, false, click_at(toggle));
@@ -610,7 +632,7 @@ fn clear_empties_the_hidden_list() {
     let ctx = crate::test_ui::ctx();
     let mut tab = tab(
         vec![group(&PATHS)],
-        hiding(&[group(&PATHS).hash_hex(), "00".repeat(32)]),
+        hiding(&[group(&PATHS).identity(), "00".repeat(64)]),
     );
     let (out, _) = frame(&ctx, &mut tab, false, Vec::new());
     let clear = painted_text_center(&out, "Clear").expect("no Clear button");
@@ -622,16 +644,106 @@ fn clear_empties_the_hidden_list() {
     assert_eq!(headers(&out).len(), 1, "the group did not come back");
 }
 
-/// A hash spelled in capitals by a hand-edited config still means that group.
+/// An identity spelled in capitals by a hand-edited config still means that
+/// group.
 #[test]
-fn hidden_hashes_are_matched_case_insensitively() {
+fn hidden_identities_are_matched_case_insensitively() {
     let ctx = crate::test_ui::ctx();
     let mut tab = tab(
         vec![group(&PATHS)],
-        hiding(&[group(&PATHS).hash_hex().to_uppercase()]),
+        hiding(&[group(&PATHS).identity().to_uppercase()]),
     );
     let painted = painted_text(&frame(&ctx, &mut tab, false, Vec::new()).0);
     assert!(painted.contains(&ALL_FILTERED.to_string()), "{painted:?}");
+}
+
+/// A head hash alone, as earlier versions saved a hidden group, names no
+/// group now: every listed group is a head and a tail.
+#[test]
+fn a_head_only_entry_hides_nothing() {
+    let ctx = crate::test_ui::ctx();
+    let head_only = group(&PATHS).identity()[..64].to_string();
+    let mut tab = tab(vec![group(&PATHS)], hiding(&[head_only]));
+    let out = frame(&ctx, &mut tab, false, Vec::new()).0;
+    assert_eq!(headers(&out).len(), 1, "an old entry hid a group");
+}
+
+/// The head the files below were "indexed" with.
+const TAIL: usize = 16;
+
+/// Two sets of copies under `dir` that start alike and end apart, as the tail
+/// check lists them: `a1.bin` and `a2.bin`, then `b1.bin` and `b2.bin`.
+fn sharing_a_head(dir: &std::path::Path) -> Vec<DuplicateGroup> {
+    let members = ["a1.bin", "a2.bin", "b1.bin", "b2.bin"]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let mut body = vec![b'h'; 3 * TAIL];
+            body[3 * TAIL - 1] = name.as_bytes()[0];
+            let path = dir.join(name);
+            std::fs::write(&path, &body).unwrap();
+            let path = path.to_str().unwrap().to_string();
+            let size = body.len() as u64;
+            (i as i64, name.to_string(), path, size, 1_700_000_000)
+        })
+        .collect();
+    let head = HeadGroup {
+        hash: vec![0xab; 32],
+        members,
+    };
+    split_by_tail(vec![head], TAIL, |_| false, &AtomicBool::new(false))
+}
+
+/// Hides whichever group is listed first; what the tab hands back to save.
+fn hide_the_first(ctx: &egui::Context, tab: &mut DuplicatesTab) -> DuplicatesConfig {
+    let header = header_of(ctx, tab);
+    context_menu_on(ctx, tab, false, &header);
+    click_menu_entry(ctx, tab, HIDE_LABEL)
+        .save_filters
+        .expect("the hide was not handed back to be saved")
+}
+
+/// One head hash, two real sets of copies: hiding one leaves the other.
+#[test]
+fn hiding_one_of_two_groups_sharing_a_head_leaves_the_other() {
+    let ctx = crate::test_ui::ctx();
+    let dir = Scratch::dir("dup-tab-shared-head");
+    let groups = sharing_a_head(&dir);
+    assert_eq!(groups.len(), 2, "the tail check did not split them");
+    let mut tab = tab(groups.clone(), DuplicatesConfig::default());
+
+    let saved = hide_the_first(&ctx, &mut tab);
+    assert_eq!(saved.hidden_groups, [groups[0].identity()]);
+    let listed = headers(&frame(&ctx, &mut tab, false, Vec::new()).0);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(
+        listed[0].contains("b1.bin"),
+        "the wrong one is listed: {listed:?}"
+    );
+}
+
+/// The hidden set is written to the config and read back at the next start,
+/// where the identity it holds must still name that group, and only it.
+#[test]
+fn a_hidden_group_stays_hidden_through_a_saved_config() {
+    let ctx = crate::test_ui::ctx();
+    let dir = Scratch::dir("dup-tab-hidden-config");
+    let groups = sharing_a_head(&dir);
+    let mut before = tab(groups.clone(), DuplicatesConfig::default());
+    let path = dir.join("config.toml");
+    let config = Config {
+        duplicates: hide_the_first(&ctx, &mut before),
+        source: Some(path.clone()),
+        ..Config::default()
+    };
+    config.save().unwrap();
+
+    let loaded = Config::load_from(&path).unwrap();
+    assert_eq!(loaded.duplicates.hidden_groups, [groups[0].identity()]);
+    let mut after = tab(groups, loaded.duplicates);
+    let listed = headers(&frame(&ctx, &mut after, false, Vec::new()).0);
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(listed[0].contains("b1.bin"), "{listed:?}");
 }
 
 // --- The two together -------------------------------------------------------
@@ -654,7 +766,7 @@ fn the_extension_order_follows_the_recomputed_waste() {
     );
 
     let filters = DupFilters::new(&excluding(&["/keep-out/*"]));
-    let mut loaded = LoadedGroups::new(vec![big, small]);
+    let mut loaded = LoadedGroups::new(vec![big, small], None);
     loaded.rebuild(DupSort::Extension, &filters, false);
     assert_eq!(
         names(&loaded),
@@ -672,7 +784,7 @@ fn the_extension_order_follows_the_recomputed_waste() {
 #[test]
 fn an_unchanged_listing_is_not_rebuilt() {
     let filters = DupFilters::new(&DuplicatesConfig::default());
-    let mut loaded = LoadedGroups::new(vec![group(&PATHS)]);
+    let mut loaded = LoadedGroups::new(vec![group(&PATHS)], None);
     loaded.rebuild(DupSort::Reclaimable, &filters, false);
     let built = loaded.built_for;
     loaded.rows.clear();

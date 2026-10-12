@@ -1,14 +1,17 @@
 //! The Duplicates tab: groups of files sharing a content hash.
 //!
 //! Grouping is a suspicion, not a verdict: the hash covers each file's size
-//! and its first `processing.hash_length` bytes and nothing else. The tab says
+//! and its first `processing.hash_length` bytes, and the scan then splits
+//! groups whose members end differently and leaves out any member it cannot
+//! read (`search::split_by_tail`); nothing in between is read. The tab says
 //! so where someone about to delete something will read it, and offers the
 //! byte-for-byte verification that settles it.
 //!
 //! Two ways to stop seeing a group again: exclude paths by glob (a folder that
-//! is *meant* to hold copies), or hide one group by its hash (a head-hash
-//! false positive). Both are persisted, and both are applied to the listing
-//! already in hand rather than by going back to the database.
+//! is *meant* to hold copies), or hide one group by its identity, head hash
+//! and tail digest (a false positive that differs only in between). Both are
+//! persisted, and both are applied to the listing already in hand rather than
+//! by going back to the database.
 
 use std::collections::HashSet;
 
@@ -55,18 +58,24 @@ fn extension_of(name: &str) -> String {
 }
 
 /// What [`LoadedGroups::rebuild`] orders an extension listing by: no extension
-/// last, then the extension, then the biggest waste, then the hash to settle
-/// whatever is left.
-type ExtensionKey<'a> = (bool, &'a str, std::cmp::Reverse<i64>, &'a [u8]);
+/// last, then the extension, then the biggest waste, then the identity to
+/// settle whatever is left.
+type ExtensionKey<'a> = (
+    bool,
+    &'a str,
+    std::cmp::Reverse<i64>,
+    (&'a [u8], &'a [u8; 32]),
+);
 
 fn extension_key<'a>(row: &'a Row, groups: &'a [DuplicateGroup]) -> ExtensionKey<'a> {
+    let group = &groups[row.group];
     (
         // Extensionless groups last: a category of their own, and not an
         // interesting one.
         row.extension.is_empty(),
         row.extension.as_str(),
         std::cmp::Reverse(row.redundant),
-        groups[row.group].hash.as_slice(),
+        (group.hash.as_slice(), &group.tail),
     )
 }
 
@@ -131,18 +140,18 @@ impl DupFilters {
         }
     }
 
-    fn hide(&mut self, hash_hex: String) {
-        if self.hidden.contains(&hash_hex) {
+    fn hide(&mut self, identity: String) {
+        if self.hidden.contains(&identity) {
             return;
         }
-        self.config.hidden_groups.push(hash_hex);
+        self.config.hidden_groups.push(identity);
         self.recompile();
     }
 
-    fn unhide(&mut self, hash_hex: &str) {
+    fn unhide(&mut self, identity: &str) {
         self.config
             .hidden_groups
-            .retain(|h| !h.trim().eq_ignore_ascii_case(hash_hex));
+            .retain(|h| !h.trim().eq_ignore_ascii_case(identity));
         self.recompile();
     }
 
@@ -156,7 +165,7 @@ impl DupFilters {
     }
 
     fn is_hidden(&self, group: &DuplicateGroup) -> bool {
-        !self.hidden.is_empty() && self.hidden.contains(&group.hash_hex())
+        !self.hidden.is_empty() && self.hidden.contains(&group.identity())
     }
 }
 
@@ -200,6 +209,9 @@ fn totals(group: &DuplicateGroup, members: &[usize]) -> (i64, i64, i64) {
 /// frame, on a list that repaints at 20 Hz for as long as the tab is open.
 pub struct LoadedGroups {
     groups: Vec<DuplicateGroup>,
+    /// The scan's fetch came back full at this many groups: there may be
+    /// more. See [`crate::backend::DupScan`].
+    limited_to: Option<u32>,
     /// The visible groups, in display order.
     rows: Vec<Row>,
     /// Groups the filters kept off screen, for the line that says so.
@@ -209,9 +221,10 @@ pub struct LoadedGroups {
 }
 
 impl LoadedGroups {
-    pub fn new(groups: Vec<DuplicateGroup>) -> LoadedGroups {
+    pub fn new(groups: Vec<DuplicateGroup>, limited_to: Option<u32>) -> LoadedGroups {
         LoadedGroups {
             groups,
+            limited_to,
             rows: Vec::new(),
             filtered_out: 0,
             built_for: None,
@@ -287,9 +300,6 @@ pub struct DuplicatesTab {
     pub filters: DupFilters,
     /// List the groups the filters hid, so hiding one is reversible.
     show_hidden: bool,
-    /// What the last scan was asked for; a result of exactly this many groups
-    /// is a truncated one. See [`crate::backend::Backend::start_duplicates`].
-    pub scan_limit: u32,
     /// The exclusion being typed.
     draft: String,
 }
@@ -307,7 +317,8 @@ pub struct DuplicatesActions {
 
 const VERIFY_LABEL: &str = "Verify copies are identical…";
 const VERIFY_TIP: &str = "Reads every file in the group in full and compares them byte for \
-                          byte. Grouping only reads each file's size and how it begins.";
+                          byte. Grouping only reads each file's size and how it begins \
+                          and ends.";
 const HIDE_LABEL: &str = "Hide this group";
 const UNHIDE_LABEL: &str = "Unhide this group";
 const NO_GROUPS: &str = "No duplicate files found.";
@@ -331,7 +342,6 @@ impl DuplicatesTab {
             sort: DupSort::default(),
             filters: DupFilters::new(filters),
             show_hidden: false,
-            scan_limit: 0,
             draft: String::new(),
         }
     }
@@ -415,19 +425,19 @@ impl DuplicatesTab {
             }
             DupState::Loaded(loaded) => {
                 // "Limited to", not "showing": the scan asks for extra to
-                // cover the hidden set, so the number it found is not always
-                // the number on screen. The filtered-out line below accounts
-                // for the difference.
-                if loaded.groups.len() as u32 >= self.scan_limit && self.scan_limit > 0 {
+                // cover the hidden set, and the tail check dissolves some of
+                // what it found, so the number is not the number on screen.
+                // The filtered-out line below accounts for the hidden ones.
+                if let Some(limit) = loaded.limited_to {
                     ui.label(hint(match self.sort {
                         DupSort::Reclaimable => {
-                            format!("Limited to the {} largest groups.", self.scan_limit)
+                            format!("Limited to the {} largest groups.", limit)
                         }
                         // Said plainly: this is not every .raw file you own,
                         // it is the biggest groups put in that order.
                         DupSort::Extension => format!(
                             "Limited to the {} largest groups, then ordered by extension.",
-                            self.scan_limit
+                            limit
                         ),
                     }));
                 }
@@ -443,8 +453,10 @@ impl DuplicatesTab {
                     .show(ui, |ui| {
                         for row in &loaded.rows {
                             let group = &loaded.groups[row.group];
+                            // Keyed by identity, so a group stays open
+                            // through a rescan that lists it elsewhere.
                             let header = egui::CollapsingHeader::new(&row.title)
-                                .id_salt(row.group)
+                                .id_salt((&group.hash, &group.tail))
                                 .show(ui, |ui| {
                                     for &j in &row.members {
                                         member_row(ui, group, row, j, verify_open, &mut picked);
@@ -463,12 +475,12 @@ impl DuplicatesTab {
 
         match picked {
             Some(Pick::Verify(paths)) => actions.verify = Some(paths),
-            Some(Pick::Hide(hex)) => {
-                self.filters.hide(hex);
+            Some(Pick::Hide(identity)) => {
+                self.filters.hide(identity);
                 edited = true;
             }
-            Some(Pick::Unhide(hex)) => {
-                self.filters.unhide(&hex);
+            Some(Pick::Unhide(identity)) => {
+                self.filters.unhide(&identity);
                 edited = true;
             }
             Some(Pick::Exclude(pattern)) => {
@@ -585,10 +597,10 @@ fn caution_banner(ui: &mut egui::Ui, hash_length: usize) {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.label(egui::RichText::new("These are suspected duplicates. ").color(p.orange));
                 ui.label(format!(
-                    "Files are grouped by their size and their first {}, which is all \
-                     indexing reads. That is not proof that they are identical: \
-                     right-click a group and choose \"{}\" to compare every byte before \
-                     you delete anything.",
+                    "Files are grouped by their size and their first {0}, which is all \
+                     indexing reads, then split apart where their last {0} differ. That \
+                     is not proof that they are identical: right-click a group and \
+                     choose \"{1}\" to compare every byte before you delete anything.",
                     human_size(hash_length as u64),
                     VERIFY_LABEL.trim_end_matches('…'),
                 ));
@@ -646,11 +658,11 @@ fn group_menu(
     }
     ui.separator();
     if hide_entry(ui, row.hidden) {
-        let hex = group.hash_hex();
+        let identity = group.identity();
         *picked = Some(if row.hidden {
-            Pick::Unhide(hex)
+            Pick::Unhide(identity)
         } else {
-            Pick::Hide(hex)
+            Pick::Hide(identity)
         });
     }
 }

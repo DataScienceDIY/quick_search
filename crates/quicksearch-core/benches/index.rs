@@ -103,9 +103,9 @@ mod text_pipeline {
     }
 }
 
-/// The MIME sniff, once per new or changed file: ~180 ns on a text head
-/// against ~2.2 µs for the `classify` next to it, so its allocations are not
-/// worth removing. This group keeps that ratio visible.
+/// The MIME sniff, once per new or changed file: ~120 ns on a text head
+/// against ~2.5–3.3 µs for the `classify` next to it, so its allocations are
+/// not worth removing. This group keeps that ratio visible.
 mod mime_sniff {
     use super::*;
     use std::path::Path;
@@ -302,8 +302,8 @@ mod directory_event {
     /// The same directory's own `Modify`: a `chmod`, a `touch`, an xattr, one
     /// of the directory events a `chmod -R` sends, and on Windows any change
     /// among its entries. Its files report their own changes, so it walks
-    /// nothing. Measured: 1.16 ms → 1.13 µs median; before, it walked the
-    /// tree as a `Create` does, at `unchanged`'s cost.
+    /// nothing. Measured: 1.16 ms → about 761 ns median; before, it walked
+    /// the tree as a `Create` does, at `unchanged`'s cost.
     #[divan::bench]
     fn modified(bencher: Bencher) {
         let (dir, db) = Scratch::db("bench-modified-event");

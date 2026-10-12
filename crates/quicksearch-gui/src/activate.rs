@@ -228,11 +228,23 @@ mod imp {
             return Signal::Unanswered;
         }
         // The reply distinguishes "delivered" from "wrote into a
-        // socket nobody reads". EOF means the peer went away.
+        // socket nobody reads". EOF means the peer went away. A read cut
+        // short by a signal is retried for the rest of the timeout: with
+        // SO_RCVTIMEO set, Linux fails it with EINTR after a stop and
+        // continue even when no handler is installed.
+        let deadline = std::time::Instant::now() + IO_TIMEOUT;
         let mut ack = [0u8; 1];
-        match stream.read(&mut ack) {
-            Ok(1) => Signal::Delivered,
-            _ => Signal::Unanswered,
+        loop {
+            match stream.read(&mut ack) {
+                Ok(1) => return Signal::Delivered,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+                        return Signal::Unanswered;
+                    }
+                }
+                _ => return Signal::Unanswered,
+            }
         }
     }
 

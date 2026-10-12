@@ -11,10 +11,11 @@
 //!   cargo bench -p quicksearch-core --bench page_geometry
 //! ```
 //!
-//! Point `TMPDIR` at real storage; see `arms::warn_if_tmpdir_unset`. The
-//! matrix wanted ~2 GB of scratch at a time, since each arm is dropped once
-//! measured; that predates the seed's uncapped WAL (`testutil::seed_index`),
-//! which needs room on top.
+//! Point `TMPDIR` at real storage; see `arms::warn_if_tmpdir_unset`. Each
+//! arm is dropped once measured, so scratch peaks at one 1M-file arm, about
+//! 2.4 GB: its ~300 MiB database plus a WAL that `testutil::seed_index`
+//! checkpoints as a default-config run does, at `maximum_wal_size` (2 GiB;
+//! less on a volume with under ~8 GiB free).
 //!
 //! # Settled: FTS5 record size
 //!
@@ -48,11 +49,8 @@
 //!
 //! The plain arm is the noise floor. Cold is SQLite-cold: a fresh
 //! connection, so its cache starts empty. Nothing evicts the OS cache, so no
-//! tier is storage-cold. Warm runs at the cache ceiling each arm ships with;
-//! the sweep on `db::schema::PAGE_SIZE` predates that and ran at the 16 MiB
-//! floor, below the `files` table, so its warm ranking prices per-page work,
-//! not a warm keystroke at the shipped ceiling. Report the tiers separately;
-//! do not average them.
+//! tier is storage-cold. Warm runs at the cache ceiling each arm ships with.
+//! Report the tiers separately; do not average them.
 
 mod arms;
 
@@ -66,9 +64,9 @@ use quicksearch_core::testutil::{Arm, SeedSpec};
 /// room.
 const SWEPT: [i64; 7] = [1024, 2048, 4096, 8192, 16384, 32768, 65536];
 
-/// `QSB_PGSZ_SIZES=8192,16384` narrows the sweep. A full run takes ~45
-/// minutes, nearly all of it seeding, so re-asking one question should not
-/// re-ask all of them.
+/// `QSB_PGSZ_SIZES=8192,16384` narrows the sweep. A full run takes about 5
+/// minutes, most of it seeding, so re-asking one question should not re-ask
+/// all of them.
 fn swept() -> Vec<i64> {
     match std::env::var("QSB_PGSZ_SIZES") {
         Ok(list) => list

@@ -111,6 +111,45 @@ fn reopen_is_idempotent() {
     assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
 }
 
+/// Rebuild warnings in the process log that name `p`. Every scratch path is
+/// unique, so lines other tests log at the same time cannot match.
+fn rebuild_warnings(p: &str) -> usize {
+    crate::log::snapshot()
+        .iter()
+        .filter(|line| {
+            line.level == crate::log::Level::Warn
+                && line.text.contains(p)
+                && line.text.contains("rebuilding")
+        })
+        .count()
+}
+
+/// A new index has nothing to rebuild, so creating one must not warn of a
+/// schema mismatch, as it did in every CI run and on the GUI's first launch.
+/// A real mismatch still warns.
+#[test]
+fn only_a_real_schema_mismatch_warns_of_a_rebuild() {
+    let (_dir, fresh) = db();
+    drop(open_or_recreate(&fresh, &Default::default()).unwrap());
+    assert_eq!(rebuild_warnings(&fresh), 0, "a path that did not exist");
+
+    let (_dir, keyed) = db();
+    drop(open_or_recreate_keyed(&keyed, &Default::default(), Some(&test_key(0xa3))).unwrap());
+    assert_eq!(rebuild_warnings(&keyed), 0, "a new encrypted index");
+
+    let (_dir, empty) = db();
+    std::fs::write(&empty, b"").unwrap();
+    let conn = open_or_recreate(&empty, &Default::default()).unwrap();
+    assert_eq!(info(&conn, "version"), CURRENT_SCHEMA_VERSION.to_string());
+    assert_eq!(rebuild_warnings(&empty), 0, "an empty file");
+
+    let (_dir, old) = db();
+    write_v1_index(&old, "a.txt");
+    let conn = open_or_recreate(&old, &Default::default()).unwrap();
+    assert_eq!(file_count(&conn), 0, "the mismatch is still rebuilt");
+    assert_eq!(rebuild_warnings(&old), 1, "a real schema mismatch");
+}
+
 #[test]
 fn older_versioned_db_is_wiped_and_recreated() {
     let (_dir, p) = db();
@@ -391,8 +430,13 @@ type Fixture = fn(&str);
 /// announces a wipe that is not happening.
 #[test]
 fn index_needs_rebuild_only_when_the_schema_really_differs() {
-    let cases: [(Fixture, bool, &str); 7] = [
+    let cases: [(Fixture, bool, &str); 8] = [
         (|_| {}, false, "no file yet is a fresh install, not a reset"),
+        (
+            |p| std::fs::write(p, b"").unwrap(),
+            false,
+            "an empty file holds nothing to reset",
+        ),
         (
             |p| drop(open_or_recreate(p, &Default::default()).unwrap()),
             false,

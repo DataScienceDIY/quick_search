@@ -781,8 +781,9 @@ fn rotated<T>(v: &mut [T], round: usize) -> impl Iterator<Item = &mut T> {
 /// holds a read mark, and a run keeps a reader per root from start to
 /// finish; an explicit checkpoint retries that lock under `busy_timeout` and
 /// wins. So the writer forces one each time the log grows by `cap`, and
-/// stops the run when the volume nears [`DISK_FLOOR`].
-struct WalGuard {
+/// stops the run when the volume nears [`DISK_FLOOR`]. `testutil::seed_index`
+/// holds one too, so a seeded index's log is bounded as a run's is.
+pub(crate) struct WalGuard {
     path: String,
     /// 0 when the log is unbounded.
     cap: u64,
@@ -791,8 +792,8 @@ struct WalGuard {
 }
 
 impl WalGuard {
-    fn new(config: &Config, db_path: &str) -> WalGuard {
-        let configured = match config.processing.maximum_wal_size {
+    pub(crate) fn new(processing: &crate::config::ProcessingConfig, db_path: &str) -> WalGuard {
+        let configured = match processing.maximum_wal_size {
             0 => 0,
             n => n.max(crate::config::MINIMUM_WAL_SIZE),
         };
@@ -804,25 +805,32 @@ impl WalGuard {
         }
     }
 
-    /// Checkpoint if a round that made progress left the log past `next_at`,
-    /// then stop the run if the disk is nearly full.
+    /// Whether the log has grown past `next_at`.
+    pub(crate) fn due(&self) -> bool {
+        self.cap != 0 && wal_len(&self.path) >= self.next_at
+    }
+
+    /// Checkpoint now, then re-arm from what is on disk: a lost race costs
+    /// one attempt per further `cap` of growth, not one per round.
+    pub(crate) fn checkpoint(&mut self, conn: &Connection) {
+        if let Err(e) = crate::db::repo::checkpoint_truncate(conn) {
+            crate::log_warn!("{}", e);
+        }
+        self.next_at = wal_len(&self.path) + self.cap;
+    }
+
+    /// [`Self::checkpoint`] if a round that made progress left the log past
+    /// `next_at`, then stop the run if the disk is nearly full.
     fn after_round(&mut self, cx: &RunCx<'_>, progressed: bool) -> Result<(), String> {
         // Called after `publish_status`: the checkpoint may block for
         // `busy_timeout`, and it must not sit in front of `stop_indexing`,
         // hence the stop-flag check.
-        if self.cap == 0
-            || !progressed
-            || cx.stop_flag.load(Ordering::Relaxed)
-            || wal_len(&self.path) < self.next_at
-        {
+        if !progressed || cx.stop_flag.load(Ordering::Relaxed) || !self.due() {
             return Ok(());
         }
         {
             let _maintaining = cx.maintaining(MaintenanceStep::Checkpoint);
-            let conn = crate::lock_ok(&cx.conn_mutex);
-            if let Err(e) = crate::db::repo::checkpoint_truncate(&conn) {
-                crate::log_warn!("{}", e);
-            }
+            self.checkpoint(&crate::lock_ok(&cx.conn_mutex));
         }
         // Only here, not every round: the log is at its largest, and the
         // checkpoint above has just returned whatever it could, so what is
@@ -840,9 +848,6 @@ impl WalGuard {
                 ));
             }
         }
-        // Re-armed from what is on disk: a lost race costs one attempt per
-        // further `cap` of growth, not one per round.
-        self.next_at = wal_len(&self.path) + self.cap;
         Ok(())
     }
 }
@@ -980,7 +985,7 @@ impl IndexingService {
         let mut cleanup_done = false;
         let mut round = 0usize;
         let mut last_census = Instant::now();
-        let mut wal = WalGuard::new(config, db_path);
+        let mut wal = WalGuard::new(&config.processing, db_path);
 
         // Each round serves every walking root one slice, then one extracting
         // root one slice. Walk workers stall once their channel fills, so

@@ -103,9 +103,12 @@ pub(crate) fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
 pub type FileHash = [u8; 32];
 
 /// Identify a file as `sha256(size || first hash_length bytes)`, leaving the
-/// head bytes in `head` for MIME sniffing. The cost is a collision class:
-/// same-size files with identical heads read as duplicates
-/// (`examples/hashprobe.rs` measures it); `crate::verify` is the way out.
+/// head bytes in `head` for MIME sniffing. Head only, for indexing speed: the
+/// walk reads these bytes anyway. The cost is a collision class: same-size
+/// files with identical heads hash alike, 3.44% of 86k real files at 8 KiB
+/// (`examples/hashprobe.rs` measures it). The Duplicates tab's tail check
+/// ([`crate::search::split_by_tail`]) brings that to 0.10%, and
+/// `crate::verify` is the byte-exact way out.
 ///
 /// Returned with the opened handle's metadata, which is where the hashed size
 /// comes from: a record built from it describes the file that was read, not

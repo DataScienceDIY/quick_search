@@ -86,8 +86,9 @@ regex = "1"
 # regex passes ever see. Transitive already (regex).
 regex-syntax = "0.8"
 # SIMD substring search for the full-text passes: std's Two-Way searcher has
-# no vector prefilter (`benches/search.rs`, `substring`). Transitive already
-# (regex, globset, chardetng).
+# no vector prefilter (`benches/search.rs`, `substring`). `memchr2` also finds
+# the filename pass's case-insensitive candidates (`filename_ladder`).
+# Transitive already (regex, globset, chardetng).
 memchr = "2"
 # `Local`, for the user's calendar days in `modified:`: the OS zone rules
 # (tzdata on Unix, the Win32 API on Windows) place midnight, DST gaps and

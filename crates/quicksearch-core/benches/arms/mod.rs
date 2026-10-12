@@ -107,7 +107,13 @@ pub fn header(arm: &Arm) -> i64 {
 /// produced it. The middle two rows separate those.
 pub fn attribution(arm: &Arm) {
     let like = format!("%{}%", BODY_TERM);
-    let match_expr = format!("text: \"{}\"", BODY_TERM);
+    // Built the way the cascade builds it: a quoted phrase is refused by the
+    // default `detail=none` index, so it is an AND of trigrams there.
+    let match_expr = quicksearch_core::search::prefilter::fts_literal(
+        BODY_TERM,
+        db::repo::fts_positions(&arm.open_search()),
+    )
+    .expect("BODY_TERM clears the trigram floor");
 
     let shapes: [(&str, &str, &str); 4] = [
         (

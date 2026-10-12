@@ -78,22 +78,28 @@ pub(crate) fn open_or_recreate_keyed(
         // Neither the page size nor the page reserve changes in place, so a
         // file that opened only under an older profile is rebuilt whatever
         // its schema says.
-        ProfileMatch::Previous(found) => {
-            format!("was built with {} and this build uses {}", found, want)
-        }
+        ProfileMatch::Previous(found) => Some(format!(
+            "was built with {} and this build uses {}",
+            found, want
+        )),
         ProfileMatch::Current if db_matches_current(&conn, processing)? => {
             narrow_index_files(&path);
             conn.execute_batch(PRAGMAS_FAST)
                 .map_err(|e| format!("Failed to apply pragmas: {}", e))?;
             return Ok(conn);
         }
-        ProfileMatch::Current => "does not match current schema".to_string(),
+        // A path just created, or an empty file: nothing is rebuilt, so
+        // creating the schema is not worth a warning.
+        ProfileMatch::Current if holds_no_schema(&conn)? => None,
+        ProfileMatch::Current => Some("does not match current schema".to_string()),
     };
-    crate::log_warn!(
-        "database at {} {}; rebuilding. Existing rows will be re-scanned on next indexing run.",
-        db_path,
-        why
-    );
+    if let Some(why) = why {
+        crate::log_warn!(
+            "database at {} {}; rebuilding. Existing rows will be re-scanned on next indexing run.",
+            db_path,
+            why
+        );
+    }
     let conn = wipe_and_reopen(conn, &path, key, want)?;
     apply_current_schema(&conn, processing, key, want)?;
     Ok(conn)
@@ -269,9 +275,11 @@ pub fn index_needs_rebuild(db_path: &str) -> bool {
     if matched != ProfileMatch::Current {
         return true;
     }
-    // Only `Ok` answers count: an `Err` means we could not tell.
+    // Only `Ok` answers count: an `Err` means we could not tell. An empty
+    // file is only given the schema, which is no reset.
     matches!(schema_version_current(&conn), Ok(false))
         && matches!(is_ours_or_empty(&conn), Ok(true))
+        && matches!(holds_no_schema(&conn), Ok(false))
 }
 
 /// Serialises SQLCipher's process-wide `cipher_default_*` settings, which
@@ -473,6 +481,17 @@ fn is_ours_or_empty(conn: &Connection) -> Result<bool, String> {
         }
     }
     Ok(!any)
+}
+
+/// Whether the file holds no schema at all: a path just created, or an empty
+/// file. `sqlite_%` names are excluded, as in [`is_ours_or_empty`].
+fn holds_no_schema(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT NOT EXISTS (SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%')",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(|e| format!("read sqlite_master: {}", e))
 }
 
 /// The refusal message, naming a few of the tables in the way.

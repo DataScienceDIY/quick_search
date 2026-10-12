@@ -166,7 +166,7 @@ fn only_an_empty_duplicates_tab_scans_on_arrival() {
     ));
     for held in [
         DupState::Loading,
-        DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(Vec::new())),
+        DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(Vec::new(), None)),
         DupState::Error("boom".into()),
     ] {
         assert!(
@@ -190,7 +190,7 @@ fn only_an_empty_duplicates_tab_scans_on_arrival() {
 /// index can change out from under it has to reach the tab.
 #[test]
 fn an_index_that_changed_invalidates_what_the_tab_holds() {
-    let loaded = || DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(Vec::new()));
+    let loaded = || DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(Vec::new(), None));
 
     // On screen: the user is looking at it, so redo it now.
     assert_eq!(

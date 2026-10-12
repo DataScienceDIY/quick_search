@@ -735,13 +735,14 @@ fn search_cache_hint(config: &Config, indexed_files: Option<i64>) -> Option<Stri
     let mib = recommended_search_cache_mib(files, keyed);
     if !keyed {
         return Some(format!(
-            "Automatic: {} MiB. An unencrypted index reads a cache miss \
-             straight from the operating system, so a larger cache is no faster.",
+            "Automatic: {} MiB, kept small to save memory. An unencrypted index \
+             reads a cache miss straight from the operating system, so a larger \
+             cache is at most about a quarter faster.",
             mib
         ));
     }
     let counted = crate::format::group_thousands(files.max(0) as u64);
-    // Past ~800k files the automatic value is capped below what the index
+    // Past ~1.3M files the automatic value is capped below what the index
     // wants; saying so makes the override discoverable.
     let wanted = files.max(0).saturating_mul(SEARCH_CACHE_BYTES_PER_FILE) / (1024 * 1024);
     if wanted > SEARCH_CACHE_MAX_MIB {

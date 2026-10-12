@@ -19,7 +19,7 @@ use quicksearch_core::db::schema::{
 use quicksearch_core::testutil::{measurement_key, seed_index, Scratch, SeedSpec};
 
 /// Enough files that the recommendation clears the floor and is derived rather
-/// than clamped: at 168 B/file, 16 MiB is reached around 100k. `seed_index`
+/// than clamped: at 150 B/file, 16 MiB is reached around 112k. `seed_index`
 /// stores that count, as a run over the index would. Seeded without content:
 /// the FTS write is the slow part and this measures nothing about it.
 const FILES: usize = 150_000;
@@ -128,8 +128,8 @@ fn the_search_connection_opens_at_the_ceiling_it_was_sized_for() {
     db::set_search_cache_override(None);
 
     // --- plain, automatic -------------------------------------------------
-    // Same corpus, no key: the sweep found no knee unencrypted, so this must
-    // be flat regardless of how large the index is.
+    // Same corpus, no key: an unencrypted index has no cliff and is held at a
+    // flat ceiling by choice, for memory, however large the index is.
     let (_plain_dir, plain) = Scratch::db("searchcache-plain");
     let plain_path = plain.to_string_lossy().into_owned();
     db::set_process_key(None);

@@ -15,8 +15,6 @@
 //! characters, unpredicated below that). So the working set scales with file
 //! count, not document volume, and the corpus dimension below shows it.
 //!
-//! Keyed figures predate `HMAC_MODE = Off`; see `db::schema::HMAC_MODE`.
-//!
 //! Printed rather than asserted: shared-box timings are not stable enough for
 //! a pass/fail gate, and a flaky perf gate gets muted rather than fixed.
 //!
@@ -25,47 +23,47 @@
 //!   cargo bench -p quicksearch-core --bench search_perf
 //! ```
 //!
-//! Point `TMPDIR` at real storage (see `arms::warn_if_tmpdir_unset`); the
-//! 1M-file arms were ~580 MB each, before the seed's uncapped WAL
-//! (`testutil::seed_index`), which needs room on top. Budget ~20 minutes,
-//! nearly all of it seeding.
+//! Point `TMPDIR` at real storage (see `arms::warn_if_tmpdir_unset`). One arm
+//! is held at a time, and a 1M-file arm peaks at about 2.5 GB of scratch: its
+//! 344 MiB database plus a WAL that `testutil::seed_index` checkpoints as a
+//! default-config run does, at `maximum_wal_size` (2 GiB; less on a volume
+//! with under ~8 GiB free). Budget about 2 minutes, most of it seeding.
 //!
 //! # What it found
 //!
-//! Warm search, the mean keystroke of one settled pass,
-//! `schema::PAGE_SIZE` = 8192, rows at a realistic width (139 B; see
-//! [`spec`]), on the earlier fixed grid of 1–256 MiB (powers of two plus 24,
-//! 48 and 96):
+//! Warm search, the mean keystroke of one settled pass, medians of 3 runs,
+//! `schema::PAGE_SIZE` = 8192, `HMAC_MODE = Off`, rows at a realistic width
+//! (137 B; see [`spec`]), on [`cache_sizes`]'s grid (2026-10-11):
 //!
 //! | corpus | `files` table | keyed, under knee | keyed, at knee | knee | ratio |
 //! |---|---|---|---|---|---|
-//! | 200k | 26.5 MiB | 41.4 ms (≤24 MiB) | **10.7 ms** | 32 MiB | ≤1.21x |
-//! | 600k | 79.5 MiB | 121.2 ms (≤64 MiB) | **33.7 ms** | 96 MiB | ≤1.21x |
-//! | 1M | 132.4 MiB | 199.6 ms (≤128 MiB) | **58.3 ms** | 256 MiB | ≤1.93x |
+//! | 200k | 26.1 MiB | 18.1–18.4 ms (≤1.0x) | **12.1 ms** | 27.4 MiB | 1.05x |
+//! | 600k | 78.3 MiB | 57.8–61.3 ms (≤1.0x) | **35.6 ms** | 82.2 MiB | 1.05x |
+//! | 1M | 130.4 MiB | 85.3–99.0 ms (≤1.0x) | **60.0 ms** | 136.9 MiB | 1.05x |
 //!
-//! 1. The knee is at most 1.21x the `files` table: the grid brackets it in
-//!    (24, 32] MiB at 200k and (64, 96] at 600k, and the two agree by
-//!    construction, since corpus and grid both step by 3. 1M's lies in
-//!    (128, 256], where 1.21x predicts 160. Hence 139 B/row × 1.21 = 168 B,
-//!    `schema::SEARCH_CACHE_BYTES_PER_FILE`, which errs large.
-//! 2. Below the knee an encrypted index is 3.4–3.9x slower, and the step is a
-//!    cliff, not a slope: 600k keyed ran 121–130 ms at every ceiling up to
-//!    64 MiB and 33.7 ms at 96.
-//! 3. Plain has no knee. Its widest spread was 1.35x and it is not monotonic
-//!    (32 and 48 MiB measured slower than 1 MiB at 600k): run-to-run noise,
-//!    not a curve. A miss on a plain index is a `memcpy` from the OS cache; on
-//!    a keyed one it is an AES-CBC decrypt. Hence
-//!    `schema::SEARCH_CACHE_PLAIN_MIB`, flat.
+//! 1. The knee is at 1.05x the `files` table on every corpus: the table
+//!    itself is under it. Hence 137 B/row × 1.05 = 144 B, plus about 4% of
+//!    margin: 150 B, `schema::SEARCH_CACHE_BYTES_PER_FILE`.
+//! 2. Below the knee an encrypted index is 1.5–1.7x slower (3.4–3.9x under
+//!    HMAC-SHA512), and the step is a cliff, not a slope: 600k keyed ran
+//!    58–61 ms at every ceiling up to the table and 35.6 ms at 1.05x.
+//! 3. Plain has no cliff, but it runs 10–25% faster once the cache holds the
+//!    `files` table: 13.0 → 10.7–12.1 ms at 200k, 43.0 → 34.3–36.6 ms at
+//!    600k, 63.6 → 57.5–59.2 ms at 1M, from its flat 16 MiB to 1.05x the
+//!    table and up. A miss on a plain index is a `memcpy` from the OS cache;
+//!    on a keyed one it is an AES-CBC decrypt. `schema::SEARCH_CACHE_PLAIN_MIB`
+//!    stays flat by choice, for memory.
 //!
 //! Row width is half the answer. The default seed's narrow rows (`hash` NULL,
 //! a 16-character `/seed/NNN/` parent) measure 69.5 B, half of a realistic
 //! 139 B; calibrating on them would under-size every cache by two and put
 //! every user back under the knee.
 //!
-//! The 128 MiB automatic cap (`schema::SEARCH_CACHE_MAX_MIB`) binds at ~800k
-//! files. At 1M the index wants ~160 MiB and gets 128: 205 ms per keystroke
-//! against the 58 ms available at 256. `[search] cache_size_mib` is how a
-//! user trades memory for that speed.
+//! The 192 MiB automatic cap (`schema::SEARCH_CACHE_MAX_MIB`) binds at
+//! ~1.34M files, and the knee passes it at ~1.4M. The cap was 128 MiB, under
+//! 1M's knee: 99.0 ms per keystroke there, against 58.9 ms at the 143 MiB it
+//! now derives. Past ~1.4M, `[search] cache_size_mib` is how a user trades
+//! memory for that speed.
 
 mod arms;
 
@@ -75,9 +73,9 @@ use quicksearch_core::db::schema::recommended_search_cache_mib;
 use quicksearch_core::search::SearchOptions;
 use quicksearch_core::testutil::{run_cascade, Arm, SeedSpec};
 
-/// Two corpora under the automatic cap and one past it
-/// (`schema::SEARCH_CACHE_MAX_MIB` binds at ~800k files). If the working set
-/// is `files`, the knee moves with the corpus.
+/// Three corpora under the automatic cap (`schema::SEARCH_CACHE_MAX_MIB`
+/// binds at ~1.34M files). If the working set is `files`, the knee moves with
+/// the corpus.
 const CORPORA: [usize; 3] = [200_000, 600_000, 1_000_000];
 
 /// Cache ceilings to sweep, as multiples of the arm's own `files` table. The
@@ -122,9 +120,13 @@ const SEQUENCE: [&str; 4] = ["quar", "quart", "quartz", "quartzi"];
 const KNEE_TOLERANCE: f64 = 1.10;
 
 /// How much worse the worst ceiling must be than the best before the curve
-/// counts as a knee. A real one is a 4x step (keyed at 200k: 41.4 ms below
-/// 32 MiB, 10.7 ms at or above). [`KNEE_TOLERANCE`] alone would find a knee
-/// in a plain arm's ~1.3x run-to-run noise, so this gate sits well above it.
+/// counts as a knee. A real one was a 3.4–3.9x step under HMAC-SHA512 and is
+/// 1.5–1.7x with `HMAC_MODE = Off` (keyed at 200k: 18.1 ms at the table,
+/// 12.1 ms at 1.05x), right at this gate. A plain arm's spread, its 10–25%
+/// gain once the table fits plus noise, measured 1.13–1.65x, so the two
+/// overlap: across the 2026-10-11 runs one keyed arm missed its knee at 1.50x
+/// and two plain arms reported one. Read a knee off several runs, not one.
+/// [`KNEE_TOLERANCE`] alone would find a knee in every plain arm.
 const KNEE_MIN_SPREAD: f64 = 1.5;
 
 fn enabled() -> bool {

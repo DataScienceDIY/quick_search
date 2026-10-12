@@ -71,10 +71,13 @@ ignore_patterns = [".git", "node_modules", "*.tmp", ".venv", "venv"]
 [processing]
 # Bytes read from the start of each file to hash it (with its size) for
 # duplicate detection and to detect its type. Files of equal size with
-# identical heads are reported as duplicates even if they differ later;
-# verify on the Duplicates tab before deleting. 8192 is the default; 16384
-# is also reasonable. Changing it rebuilds the index. Clamped to
-# 262..1048576.
+# identical heads hash alike: 3.4% of the files on a measured disk at 8192,
+# 1.6% at 16384. The Duplicates tab also reads this many bytes from the end
+# of each file it lists and splits apart files whose ends differ, which
+# brings those to 0.1% and 0.06%. Files that differ only in between are
+# still listed together, so verify on the Duplicates tab before deleting.
+# 8192 is the default; 16384 is also reasonable. Changing it rebuilds the
+# index. Clamped to 262..1048576.
 hash_length = 8192
 # Most extracted text stored per file (bytes). Clamped to 1..16777216.
 maximum_text_size = 262144
@@ -178,15 +181,15 @@ debounce_ms = 150
 live_results = true
 # Memory, in MiB, the search connection keeps index pages in, held while
 # searching and released after a long idle. 0 (recommended) sizes it from the
-# index: about 168 bytes per indexed file, capped at 128 MiB.
+# index: about 150 bytes per indexed file, capped at 192 MiB.
 #
 # It matters for an encrypted index, which must decrypt every page the cache
-# misses (at 600k files: 127 ms per keystroke with too small a cache, 34 ms
-# with enough). An unencrypted index gets a flat 16 MiB; more measured no
-# faster.
+# misses (at 1M files: 99 ms per keystroke with too small a cache, 59 ms with
+# enough). An unencrypted index gets a flat 16 MiB to save memory, though one
+# large enough to hold its file list measured 10 to 25% faster.
 #
 # Set it by hand only for deeply nested folders (wider rows) or indexes over
-# ~800k files, where the automatic cap is too low. Clamped to 16..1024.
+# ~1.3M files, where the automatic cap is too low. Clamped to 16..1024.
 cache_size_mib = 0
 
 # Which columns the Search tab shows; the right-click menu of any column
@@ -219,9 +222,11 @@ rank = true
 # copies, this is the key to use.
 exclude_patterns = []
 # Groups dismissed with "Hide this group", for groups that only look like
-# duplicates, since grouping reads just each file's size and first
-# processing.hash_length bytes. Stored by content hash (lowercase hex), so a
-# hidden group stays hidden when its files move and returns if their contents
-# change. Changing processing.hash_length rebuilds the index and strands these
-# entries; the tab's Clear button empties the list.
+# duplicates, since grouping reads just each file's size and its first and
+# last processing.hash_length bytes. Stored by content (the head hash, then
+# the tail digest, in lowercase hex), so a hidden group stays hidden when its
+# files move and returns if their contents change. Entries saved by earlier
+# versions hold the head hash alone and no longer match any group. Changing
+# processing.hash_length rebuilds the index and strands these entries; the
+# tab's Clear button empties the list.
 hidden_groups = []

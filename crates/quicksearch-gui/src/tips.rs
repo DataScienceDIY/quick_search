@@ -133,7 +133,9 @@ pub static HASH_LENGTH: Tip = Tip {
     body: "How many bytes from the start of each file QuickSearch reads to \
            recognise it. They make the fingerprint the Duplicates tab groups \
            files by, tell what kind of file it is, and for a small text file \
-           are the whole text.\n\n\
+           are the whole text. The Duplicates tab also reads as many bytes \
+           from the end of each file it lists, and splits apart files that \
+           only start alike.\n\n\
            Reading more is more reliable but slower, especially over a \
            network.",
     examples: &[
@@ -268,13 +270,13 @@ pub static DISPLAY_LIMIT: Tip = Tip {
 pub static SEARCH_CACHE: Tip = Tip {
     title: "Search cache",
     body: "Memory, in MiB, that searching keeps index pages in. 0 sizes it \
-           for your index automatically, up to 128 MiB; the value it picks is \
+           for your index automatically, up to 192 MiB; the value it picks is \
            shown below.\n\n\
            It matters on an encrypted index, which must decrypt every page the \
            cache misses: a cache smaller than the one shown can make searches \
-           about four times slower. An unencrypted index gets a small fixed \
-           cache, because a larger one measures no faster. The memory is \
-           released after a long idle.",
+           about one and a half times slower. An unencrypted index gets a small fixed \
+           cache to save memory; a larger one makes its searches at most about a \
+           quarter faster. The memory is released after a long idle.",
     examples: &[
         "0, the default, is right unless your folders are nested unusually deep.",
         "a fixed value to cap the memory QuickSearch holds, at the cost of slower \

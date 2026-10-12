@@ -759,7 +759,9 @@ fn limited_child() {
         return;
     }
     let bytes = ask.parse::<usize>().expect("MiB") << 20;
-    let held = vec![1u8; bytes];
+    // `black_box`, or a release build drops the unread allocation and the
+    // over-limit child exits cleanly.
+    let held = std::hint::black_box(vec![1u8; bytes]);
     assert_eq!(held.len(), bytes);
 }
 

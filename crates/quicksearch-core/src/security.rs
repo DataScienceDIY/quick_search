@@ -77,8 +77,8 @@ pub fn derive_key(password: &str, salt: &[u8; SALT_LEN]) -> IndexKey {
     IndexKey(out)
 }
 
-/// The crate's only hex encoder, also how a duplicate group spells its hash
-/// ([`crate::search::DuplicateGroup::hash_hex`]).
+/// The crate's only hex encoder, also how a duplicate group spells its
+/// identity ([`crate::search::DuplicateGroup::identity`]).
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {

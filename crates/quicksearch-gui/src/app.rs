@@ -304,11 +304,7 @@ impl QuickSearchApp {
     fn start_duplicates_scan(&mut self, ctx: &egui::Context) {
         self.dups.state = DupState::Loading;
         let cfg = self.cfg.clone();
-        let limit = self.backend.start_duplicates(&cfg, ctx.clone());
-        // 0 means a scan was already running, whose limit still stands.
-        if limit > 0 {
-            self.dups.scan_limit = limit;
-        }
+        self.backend.start_duplicates(&cfg, ctx.clone());
     }
 
     /// Drops a duplicate listing the index has moved out from under (a finished
@@ -317,7 +313,7 @@ impl QuickSearchApp {
     fn invalidate_duplicates(&mut self, ctx: &egui::Context) {
         match dup_invalidation(self.tab, &self.dups.state) {
             DupInvalidation::Nothing => {}
-            DupInvalidation::WhenItLands => self.rescan_when_dups_land = true,
+            DupInvalidation::WhenItLands => self.rescan_after_dup_scan(),
             DupInvalidation::Rescan => self.start_duplicates_scan(ctx),
             DupInvalidation::Drop => self.dups.state = DupState::NotLoaded,
         }
@@ -332,11 +328,18 @@ impl QuickSearchApp {
     fn drop_duplicates(&mut self) {
         match dup_invalidation(self.tab, &self.dups.state) {
             DupInvalidation::Nothing => {}
-            DupInvalidation::WhenItLands => self.rescan_when_dups_land = true,
+            DupInvalidation::WhenItLands => self.rescan_after_dup_scan(),
             DupInvalidation::Rescan | DupInvalidation::Drop => {
                 self.dups.state = DupState::NotLoaded
             }
         }
+    }
+
+    /// The running scan's answer is stale: cut its tail check short, and scan
+    /// again once it lands.
+    fn rescan_after_dup_scan(&mut self) {
+        self.rescan_when_dups_land = true;
+        self.backend.cancel_duplicates();
     }
 
     /// Every switch goes through here, including guard-delayed ones.
@@ -546,11 +549,12 @@ impl QuickSearchApp {
         }
         self.backend.reindex_live_paths(touched);
         // Duplicates worker.
-        if let Some(rx) = &self.backend.dup_job {
+        if let Some(job) = &self.backend.dup_job {
             use std::sync::mpsc::TryRecvError;
-            let done = match rx.try_recv() {
-                Ok(Ok(groups)) => Some(DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(
-                    groups,
+            let done = match job.rx.try_recv() {
+                Ok(Ok(scan)) => Some(DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(
+                    scan.groups,
+                    scan.limited_to,
                 ))),
                 Ok(Err(e)) => Some(DupState::Error(e)),
                 Err(TryRecvError::Empty) => None,

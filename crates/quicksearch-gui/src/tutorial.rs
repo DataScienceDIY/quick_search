@@ -179,8 +179,8 @@ const PAGES: &[Page] = &[
              extension if you prefer.",
             "It is a quick way to find the same download sitting in three \
              places. It only shows the groups; deleting is up to you.",
-            "For speed, files are matched on size and their first few \
-             kilobytes, so a group is a strong suspicion, not a certainty. \
+            "For speed, files are matched on size and their first and last \
+             few kilobytes, so a group is a strong suspicion, not a certainty. \
              Right-click a group and choose \"Verify copies are identical\" to \
              compare every byte before you delete anything.",
         ],

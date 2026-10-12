@@ -236,20 +236,29 @@ impl TermPattern {
     }
 
     /// ASCII-case-insensitive [`str::find`] without folding the haystack;
-    /// `needle` must already be lowercased. The returned index is always a
-    /// `char` boundary: a `&str`'s first byte is never a continuation byte,
-    /// and ASCII-only case differences keep the end a boundary too.
+    /// `needle` must already be lowercased. `memchr2` jumps to each spelling
+    /// of the needle's first byte, and only those candidates are compared:
+    /// 1.18x faster than testing every byte (`benches/search.rs`,
+    /// `filename_ladder`). The returned index is always a `char` boundary: a
+    /// `&str`'s first byte is never a continuation byte, and ASCII-only case
+    /// differences keep the end a boundary too.
     fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
-        if needle.is_empty() {
-            return Some(0);
-        }
         let (h, n) = (hay.as_bytes(), needle.as_bytes());
-        let first = n[0];
-        h.len().checked_sub(n.len()).and_then(|last| {
-            (0..=last).find(|&i| {
-                h[i].to_ascii_lowercase() == first && h[i..i + n.len()].eq_ignore_ascii_case(n)
-            })
-        })
+        let Some(&first) = n.first() else {
+            return Some(0);
+        };
+        // Equal to `first` when it has no ASCII case partner.
+        let upper = first.to_ascii_uppercase();
+        let last = h.len().checked_sub(n.len())?;
+        let mut at = 0;
+        while at <= last {
+            let i = at + memchr::memchr2(first, upper, &h[at..=last])?;
+            if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+                return Some(i);
+            }
+            at = i + 1;
+        }
+        None
     }
 
     /// Leftmost match as a byte range; folded offsets are valid in the original.
@@ -526,6 +535,162 @@ mod tests {
         assert_eq!(p.find_first("my Report.pdf", false), Some(3..9));
         assert_eq!(p.find_first("my report.pdf", true), Some(3..9));
         assert_eq!(p.find_first("my report.pdf", false), None);
+    }
+
+    /// What a literal's `find_first(text, true)` must return: the leftmost
+    /// match in the ASCII-folded haystack. Folding keeps byte length, so the
+    /// offsets carry over.
+    fn folded_reference(folded_hay: &str, folded_needle: &str) -> Option<Range<usize>> {
+        folded_hay
+            .find(folded_needle)
+            .map(|at| at..at + folded_needle.len())
+    }
+
+    fn literal(term: &str) -> TermPattern {
+        TermPattern::build(&[part(term, false)]).unwrap()
+    }
+
+    /// Every string of up to `max` characters over `alphabet`.
+    fn strings_over(alphabet: &[char], max: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..max {
+            level = level
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            all.extend(level.iter().cloned());
+        }
+        all
+    }
+
+    /// The candidate scan against the reference over every short string: both
+    /// cases of letters, separators, `é`/`É` (one lead byte, different
+    /// continuations), and KELVIN SIGN and long s, which fold to `k` and `s`
+    /// under Unicode rules only and so must not match here.
+    #[test]
+    fn ascii_fold_find_agrees_with_a_folded_reference() {
+        const ALPHABET: [char; 12] = [
+            'a', 'A', 'b', 'B', 'k', 's', '-', '/', 'é', 'É', '\u{212A}', 'ſ',
+        ];
+        let patterns: Vec<(TermPattern, String)> = strings_over(&ALPHABET, 2)
+            .into_iter()
+            .skip(1)
+            .map(|n| (literal(&n), n.to_ascii_lowercase()))
+            .collect();
+        for hay in strings_over(&ALPHABET, 4) {
+            let folded = hay.to_ascii_lowercase();
+            for (p, needle) in &patterns {
+                assert_eq!(
+                    p.find_first(&hay, true),
+                    folded_reference(&folded, needle),
+                    "{needle:?} in {hay:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_fold_find_edges() {
+        let find = |term: &str, hay: &str| literal(term).find_first(hay, true);
+        // An empty field, and a term longer than the field.
+        assert_eq!(find("a", ""), None);
+        assert_eq!(find("quartzite", "QUARTZ"), None);
+        assert_eq!(find("quartz", "QuArTz"), Some(0..6));
+        // The last start a scan may take.
+        assert_eq!(find("txt", "notes.TXT"), Some(6..9));
+        assert_eq!(find("ab", "aaaa"), None);
+        // A failed candidate resumes one byte on, inside the repeat.
+        assert_eq!(find("aab", "aaaab"), Some(2..5));
+        assert_eq!(find("AAB", "aAaAb"), Some(2..5));
+        // The leftmost of several spellings.
+        assert_eq!(find("Report", "x-REPORT-report"), Some(2..8));
+        // First bytes with no case partner.
+        assert_eq!(find("-01", "x-A-01"), Some(3..6));
+        assert_eq!(find(".txt", "a.TXT"), Some(1..5));
+        assert_eq!(find("/q", r"C:\Users/Q"), Some(8..10));
+        // ASCII folding only: `É` is not `é`, and KELVIN SIGN is not `k`.
+        assert_eq!(find("été", "ÉTÉ été"), Some(6..11));
+        assert_eq!(find("café", "CAFÉ"), None);
+        assert_eq!(find("café", "CAFé"), Some(0..5));
+        assert_eq!(find("kilo", "\u{212A}ILO"), None);
+        assert_eq!(find("é", "aÉé"), Some(3..5));
+        assert_eq!(find("b", "éB"), Some(2..3));
+        // Unreachable through `find_first` (an empty term is `Empty`).
+        assert_eq!(TermPattern::find_ascii_ci("abc", ""), Some(0));
+    }
+
+    /// The ladder in `search/cascade/passes.rs` `pass_filename` (ranks 1–4 on
+    /// the name, 9–10 on the path), with the case-insensitive find swappable.
+    fn ladder(
+        p: &TermPattern,
+        name: &str,
+        path: &str,
+        find_ci: &dyn Fn(&str) -> Option<Range<usize>>,
+    ) -> Option<(u8, Range<usize>)> {
+        let with_paths = p.literal_char_count() >= crate::search::prefilter::TRIGRAM_FLOOR;
+        if p.whole_match(name, false) {
+            Some((1, 0..name.len()))
+        } else if p.whole_match(name, true) {
+            Some((2, 0..name.len()))
+        } else if let Some(r) = p.find_first(name, false) {
+            Some((3, r))
+        } else if let Some(r) = find_ci(name) {
+            Some((4, r))
+        } else if !with_paths {
+            None
+        } else if let Some(r) = p.find_first(path, false) {
+            Some((9, r))
+        } else {
+            find_ci(path).map(|r| (10, r))
+        }
+    }
+
+    #[test]
+    fn filename_tiers_agree_with_a_folded_reference() {
+        let rows = [
+            ("report.txt", "/home/u/report.txt"),
+            ("REPORT.TXT", "/home/u/REPORT.TXT"),
+            ("Report", "/home/u/Report"),
+            ("my-report-2024.pdf", "/data/my-report-2024.pdf"),
+            ("MY_REPORT.pdf", "/data/MY_REPORT.pdf"),
+            ("notes.txt", "/srv/Report/notes.txt"),
+            ("notes.txt", "/srv/REPORT/notes.txt"),
+            ("notes.txt", r"C:\Users\u\Report\notes.txt"),
+            ("résumé-report.odt", "/home/u/résumé-report.odt"),
+            ("RÉSUMÉ.odt", "/home/u/RÉSUMÉ.odt"),
+            ("rrreport", "/x/rrreport"),
+            ("rep", "/rep"),
+            ("", "/"),
+        ];
+        let terms = [
+            "report",
+            "Report",
+            "REPORT",
+            "rep",
+            "rrep",
+            "résumé",
+            "Résumé",
+            "RÉSUMÉ",
+            "report/notes",
+            r"Report\notes",
+            ".txt",
+            "t",
+        ];
+        let mut ranks = std::collections::BTreeSet::new();
+        for term in terms {
+            let p = literal(term);
+            let needle = term.to_ascii_lowercase();
+            for (name, path) in rows {
+                let shipped = ladder(&p, name, path, &|f| p.find_first(f, true));
+                let reference = ladder(&p, name, path, &|f| {
+                    folded_reference(&f.to_ascii_lowercase(), &needle)
+                });
+                assert_eq!(shipped, reference, "{term:?} against {path:?}");
+                ranks.extend(shipped.map(|(rank, _)| rank));
+            }
+        }
+        assert_eq!(ranks.into_iter().collect::<Vec<_>>(), [1, 2, 3, 4, 9, 10]);
     }
 
     #[test]

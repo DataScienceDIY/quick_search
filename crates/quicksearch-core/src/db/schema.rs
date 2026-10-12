@@ -55,22 +55,25 @@ pub const PRAGMAS_INCREMENTAL: &str = "
 
 /// Cache ceiling for an unencrypted index, whatever its size.
 ///
-/// `benches/search_perf.rs` swept 1–256 MiB on 200k–1M files and found no
-/// knee on a plain index, where a page-cache miss is a `memcpy` from the OS
-/// cache. Only SQLCipher makes a miss expensive: it caches pages decrypted,
-/// so a miss pays the AES-CBC again.
+/// `benches/search_perf.rs` swept 1–256 MiB on 200k–1M files. A plain index,
+/// where a page-cache miss is a `memcpy` from the OS cache, has no cliff, but
+/// it runs 10–25% faster once the cache holds the `files` table (600k: 43.0 ms
+/// per keystroke at 16 MiB, 34.4 ms at 1.2x the table). It is kept at a flat
+/// 16 MiB by choice, for memory. Only SQLCipher makes a miss expensive: it
+/// caches pages decrypted, so a miss pays the AES-CBC again.
 pub const SEARCH_CACHE_PLAIN_MIB: i64 = 16;
 
 /// Floor and ceiling for the derived value. The floor is the smallest the
 /// sweep found sufficient.
 ///
-/// The cap limits resident memory and binds at about 800k files, beyond which
-/// an encrypted index sits under its knee: at 1M files (a 132 MiB `files`
-/// table) a keystroke costs 205 ms at 128 MiB against 58 ms at 256. Trading a
-/// third of a gigabyte for a 3.5x faster session is the user's call, through
-/// [`SEARCH_CACHE_OVERRIDE_MAX_MIB`].
+/// The cap limits resident memory. It binds at about 1.34M files, and the knee
+/// (1.05x the `files` table, about 144 B per file) passes it at about 1.4M,
+/// beyond which an encrypted index sits under its knee and runs 1.5–1.7x
+/// slower. Trading memory for that speed is the user's call, through
+/// [`SEARCH_CACHE_OVERRIDE_MAX_MIB`]. The cap was 128 MiB, which left 1M files
+/// under their knee; the figures are at [`SEARCH_CACHE_BYTES_PER_FILE`].
 pub const SEARCH_CACHE_MIN_MIB: i64 = 16;
-pub const SEARCH_CACHE_MAX_MIB: i64 = 128;
+pub const SEARCH_CACHE_MAX_MIB: i64 = 192;
 
 /// Ceiling on an explicit `[search] cache_size_mib`, well above the automatic
 /// cap: the override exists for a large encrypted index whose knee is past
@@ -82,17 +85,25 @@ pub const SEARCH_CACHE_OVERRIDE_MAX_MIB: i64 = 1024;
 const _: () = assert!(SEARCH_CACHE_OVERRIDE_MAX_MIB > SEARCH_CACHE_MAX_MIB);
 const _: () = assert!(SEARCH_CACHE_MIN_MIB <= SEARCH_CACHE_MAX_MIB);
 
-/// Cache bytes to allow per indexed file: 139 bytes per `files` row times the
-/// 1.21x headroom the sweep found sufficient.
+/// Cache bytes to allow per indexed file: 137 bytes per `files` row times
+/// 1.05, where the knee sits, is 144 B; about 4% of margin makes 150.
 ///
 /// Every keystroke rescans the `files` table (filename queries are a `LIKE`
 /// scan with no FTS), so the working set is that table and the warm curve's
-/// knee sits at the first ceiling that holds it. The sweep, the knee per
-/// corpus and the row-width caveat are in `benches/search_perf.rs`. The
-/// figures predate `HMAC_MODE = Off` (see [`HMAC_MODE`]), which makes this
-/// conservative. 139 B/row assumes ordinary path lengths; a much deeper tree
-/// wants more, which `[search] cache_size_mib` covers.
-pub const SEARCH_CACHE_BYTES_PER_FILE: i64 = 168;
+/// knee sits at the first ceiling that holds it. Keyed warm keystroke,
+/// `HMAC_MODE = Off`, medians of 3 (`benches/search_perf.rs`, 2026-10-11):
+///
+/// | files | `files` table | knee | 168 B, 128 MiB cap | 150 B, 192 MiB cap |
+/// |---|---|---|---|---|
+/// | 200k | 26.1 MiB | 27.4 MiB | 14.0 ms at 32 MiB | 12.0 ms at 28 MiB |
+/// | 1M | 130.4 MiB | 136.9 MiB | 99.0 ms at 128 MiB | 58.9 ms at 143 MiB |
+///
+/// Both 200k ceilings are past the knee, so their difference is noise. At 1M
+/// the ceilings from the knee to 256 MiB measured 56–64 ms. The sweep, the
+/// knee per corpus and the row-width caveat are in `benches/search_perf.rs`.
+/// 137 B/row assumes ordinary path lengths; rows over ~4% wider, as in a much
+/// deeper tree, sit under the knee, which `[search] cache_size_mib` covers.
+pub const SEARCH_CACHE_BYTES_PER_FILE: i64 = 150;
 
 /// The cache ceiling this index wants, in MiB.
 pub fn recommended_search_cache_mib(files: i64, keyed: bool) -> i64 {
@@ -215,27 +226,26 @@ CREATE TABLE config_validation (
 ///
 /// 8192 rather than the SQLite and SQLCipher default of 4096:
 /// `benches/page_geometry.rs` swept 1024→65536 on a keyed 200k-file index,
-/// with every search connection at the 16 MiB cache floor (`seed_index`
-/// recorded no root counts then), and this balances two opposing costs:
+/// `HMAC_MODE = Off`, each search connection at its shipped ceiling, medians
+/// of 3 runs (2026-10-11):
 ///
-/// | page | size | `files` scan | scattered rows | cold name |
-/// |---|---|---|---|---|
-/// | 1024 | 179.9 MiB | 221 ms | 51 ms | 79.4 ms |
-/// | 4096 | 154.8 MiB | 100 ms | 43 ms | 44.4 ms |
-/// | **8192** | **151.4 MiB** | **55 ms** | **45 ms** | **35.7 ms** |
-/// | 16384 | 151.4 MiB | 37 ms | 58 ms | 34.2 ms |
-/// | 65536 | 158.4 MiB | 23 ms | 61 ms | 38.1 ms |
+/// | page | size | seed rows/s | `files` scan | scattered rows | cold name | warm total |
+/// |---|---|---|---|---|---|---|
+/// | 1024 | 72.3 MiB | 54,054 | 21.1 ms | 1.12 ms | 39.3 ms | 154.3 ms |
+/// | 2048 | 61.5 MiB | 60,606 | 13.7 ms | 0.93 ms | 24.9 ms | 133.9 ms |
+/// | 4096 | 60.9 MiB | 62,500 | 11.6 ms | 1.08 ms | 20.6 ms | 121.4 ms |
+/// | **8192** | **59.2 MiB** | **66,667** | **12.7 ms** | **1.44 ms** | **18.5 ms** | **117.4 ms** |
+/// | 16384 | 58.6 MiB | 66,667 | 10.4 ms | 2.22 ms | 19.8 ms | 110.2 ms |
+/// | 32768 | 58.7 MiB | 58,824 | 10.0 ms | 3.74 ms | 18.4 ms | 118.6 ms |
+/// | 65536 | 59.1 MiB | 54,054 | 9.1 ms | 4.51 ms | 18.7 ms | 114.5 ms |
 ///
 /// A scattered row fetch decrypts a whole page to read one ~130-byte row, so
-/// it wants a small page and degrades past 8192 (43 ms → 73 ms by 32768). The
-/// sequential `files` scan behind every filename query wants a large one: the
-/// bytes decrypted stay ~9 MiB either way while per-page codec and pager work
-/// falls. 8192 keeps scattered reads within 3% of their optimum, halves the
-/// scan, and ties for the smallest file.
-///
-/// The keyed columns predate `HMAC_MODE = Off` (see [`HMAC_MODE`]). Both costs
-/// are per-page work, so dropping the authenticator scales them together, and
-/// the plain arm picked 8192 too.
+/// it wants a small page and degrades from 2048 up (0.93 ms → 4.51 ms by
+/// 65536). The sequential `files` scan behind every filename query wants a
+/// large one: the bytes decrypted stay ~9 MiB either way while per-page codec
+/// and pager work falls. Below 4096 the file grows and the scan and both
+/// query totals slow; from 4096 up the curve is flat. 8192 seeds fastest
+/// (tied with 16384) and ties for the best cold name.
 ///
 /// **Changing this is not a free edit**; see [`PROFILES_PREVIOUS`].
 pub const PAGE_SIZE: i64 = 8192;
@@ -314,42 +324,51 @@ impl HmacMode {
 ///
 /// # What it buys
 ///
-/// `benches/cipher_hmac.rs`, 200k files, all four arms in one process, every
-/// search connection at the 16 MiB cache floor (`seed_index` recorded no root
-/// counts then), below the `files` table. Warm total is six cascade shapes
-/// summed, so it prices per-page work, not a keystroke at the shipped
-/// ceiling; its "body (common)" shape filled the display limit from file
-/// names and never reached the full-text pass:
+/// `benches/cipher_hmac.rs`, 200k files, all four arms in one process,
+/// medians of 3 runs (2026-10-11). Each search connection ran at its arm's
+/// shipped ceiling: 16 MiB plain, and 32 MiB keyed, which like today's 28 MiB
+/// holds the 19.3 MiB `files` table. Cold and warm totals are six cascade
+/// shapes summed, cold on a fresh connection:
 ///
-/// | arm | seed | warm total | duplicates | size |
-/// |---|---|---|---|---|
-/// | plain (no password) | 30.9 s | 125.6 ms | 206 ms | 151.5 MiB |
-/// | **keyed, HMAC off** | **37.7 s** | **146.2 ms** | **221 ms** | **151.5 MiB** |
-/// | keyed, HMAC_SHA256 | 40.0 s | 209.0 ms | 250 ms | 150.6 MiB |
-/// | keyed, HMAC_SHA512 | 41.3 s | 259.5 ms | 262 ms | 151.4 MiB |
+/// | arm | seed | cold total | warm total | duplicates | size |
+/// |---|---|---|---|---|---|
+/// | plain (no password) | 2.9 s | 142.1 ms | 125.5 ms | 52 ms | 59.1 MiB |
+/// | **keyed, HMAC off** | **2.9 s** | **165.1 ms** | **110.6 ms** | **58 ms** | **59.2 MiB** |
+/// | keyed, HMAC_SHA256 | 3.2 s | 237.3 ms | 110.6 ms | 74 ms | 59.4 MiB |
+/// | keyed, HMAC_SHA512 | 3.4 s | 290.9 ms | 115.9 ms | 84 ms | 59.6 MiB |
 ///
-/// Against SQLCipher's default that is 1.78x on warm search, and it takes
-/// encrypted-over-plain from 2.07x to 1.16x, 84% of the cost of having a
-/// password. A filename query went 32.6 ms → 13.8 ms and a rare body term
-/// 39.8 → 18.6.
+/// Cold is the case that matters: QuickSearch is usually launched fresh from
+/// its shortcut, searched and closed, so nearly every search starts on a cold
+/// connection. That is where the HMAC is paid, on every page decrypted, as it
+/// is in the duplicate scan and the seed. Cold, encrypted over plain is 1.16x
+/// with the HMAC off against 2.05x under SHA-512, so `Off` removes 85% of the
+/// cold cost of having a password: a cold filename query went 38.7 ms →
+/// 18.3 ms (plain 14.1) and a cold rare body term 49.5 → 24.3 (plain 20.2).
+/// Only in a long-running session, once the cache holds what a keystroke
+/// reads, are the keyed arms within noise of each other (the plain arm's flat
+/// 16 MiB sits under its table, so it re-reads pages from the OS cache).
 ///
-/// SHA-256 recovers only 1.24x of the 2.07x despite halving the digest,
+/// At 1M files, with the keyed arms capped at 128 MiB (above their 97 MiB
+/// `files` table), the shape holds: cold total 825 ms off against 1428 ms
+/// under SHA-512 (plain 627), duplicates 292 against 432 ms, seed 27.3 against
+/// 41.8 s, and warm 535–569 ms on every keyed arm.
+///
+/// SHA-256 recovers only 1.23x of the 2.05x despite halving the digest,
 /// because the digest is not the cost: `sqlcipher_openssl_hmac` calls
 /// `EVP_MAC_fetch(NULL, "HMAC", NULL)`, `EVP_MAC_CTX_new` and an
 /// `EVP_MAC_init` that fetches the digest by name, two OpenSSL 3 provider
 /// lookups per page whichever digest is chosen. Only `Off` removes them.
 ///
-/// Size is unmoved (151.5 against 151.4 MiB): [`fts_pgsz_for`] re-derives the
+/// Size barely moves (59.2 against 59.6 MiB): [`fts_pgsz_for`] re-derives the
 /// record size from the new reserve, so the 64 bytes handed back per page go
 /// into leaves.
 ///
 /// # Figures taken under HMAC-SHA512
 ///
-/// [`PAGE_SIZE`]'s sweep, [`SEARCH_CACHE_BYTES_PER_FILE`], and the keyed
-/// figures in `benches/search_perf.rs`, `benches/page_geometry.rs` and
-/// `search::IDLE_RELEASE` were measured under HMAC-SHA512 and not re-swept.
-/// A keyed page miss is now cheaper, so those keyed costs are overstated and
-/// the cache sizing errs large.
+/// Only the FTS5 record-size table in `benches/page_geometry.rs`, whose keyed
+/// columns predate `Off`. [`PAGE_SIZE`]'s sweep, the search cache sizing
+/// ([`SEARCH_CACHE_BYTES_PER_FILE`], [`SEARCH_CACHE_MAX_MIB`]) and
+/// `search::IDLE_RELEASE` were re-measured under `Off`.
 ///
 /// # Changing it is not a free edit
 ///
@@ -553,8 +572,8 @@ mod tests {
         }
     }
 
-    /// The sweep found no knee on a plain index at any corpus size, so this
-    /// must not grow with one.
+    /// A plain index has no cliff to stay above, and its ceiling is held flat
+    /// by choice, for memory, so this must not grow with the corpus.
     #[test]
     fn a_plain_index_gets_the_same_ceiling_at_every_size() {
         for files in [0, 1_000, 200_000, 1_000_000, 50_000_000] {
@@ -597,12 +616,13 @@ mod tests {
         assert!(large <= SEARCH_CACHE_MAX_MIB);
     }
 
-    /// The two corpora `benches/search_perf.rs` measured under the automatic
-    /// cap, against the knee it found for each. Below the knee a keyed search
-    /// ran 3.4–3.9x slower (HMAC-SHA512), so the recommendation must reach it.
+    /// The corpora `benches/search_perf.rs` measured, against the knee it
+    /// found for each: 1.05x the `files` table, in whole MiB rounded up. Below
+    /// the knee a keyed search ran 1.5–1.7x slower, so the recommendation must
+    /// reach it.
     #[test]
     fn the_recommendation_clears_every_measured_knee() {
-        for (files, knee_mib) in [(200_000, 32), (600_000, 96)] {
+        for (files, knee_mib) in [(200_000, 28), (600_000, 83), (1_000_000, 137)] {
             let got = recommended_search_cache_mib(files, true);
             assert!(
                 got >= knee_mib,
@@ -627,7 +647,7 @@ mod tests {
         );
     }
 
-    /// An explicit setting must be able to exceed the automatic cap: past ~800k
+    /// An explicit setting must be able to exceed the automatic cap: past ~1.4M
     /// files the derived value is capped below the measured knee, and the
     /// override is the only way to reach it.
     #[test]

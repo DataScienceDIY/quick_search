@@ -4,7 +4,9 @@
 //! so one number decides both. Collisions are measured over `1..32 KiB`
 //! against the 32 KiB baseline, which is right by definition; `--verify`
 //! reads the baseline's groups byte for byte and reports how many of those
-//! were wrong too.
+//! were wrong too. The `+tail` columns apply the Duplicates tab's tail check
+//! (`search::split_by_tail`) at each sample size, the tail as long as the
+//! head.
 //!
 //! ```text
 //! cargo build -p quicksearch-core --example hashprobe --release
@@ -25,7 +27,7 @@ mod common;
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -68,6 +70,10 @@ struct Scan {
     size: u64,
     /// `sha256(size ‖ head[..n])` for each `n` in [`SWEEP`].
     digests: [Sha; SWEEP.len()],
+    /// For each `n`, `sha256` of the bytes `search::split_by_tail` reads
+    /// with a tail of `n`: from `max(n, size - n)` to the end. Zero for a
+    /// file no larger than `n`, which the head hashed whole.
+    tails: [Sha; SWEEP.len()],
     /// Bit `i`: the MIME guessed from `SWEEP[i]` bytes differs from the
     /// baseline's, since a short sample also classifies on less evidence.
     mime_differs: u8,
@@ -87,22 +93,43 @@ struct ScanErrors {
     irregular: u64,
 }
 
-/// Read one file's head (`min(size, 32 KiB)`) once and derive every sample
-/// size's answer from it, so the six answers are consistent with each other
-/// as six separate runs could not be.
+/// Read one file's head (`min(size, 32 KiB)`) and the tail past it (at most
+/// the last 32 KiB) once, and derive every sample size's answer from them, so
+/// the six answers are consistent with each other as six separate runs could
+/// not be.
 fn scan_one(path: &Path, size: u64, config: &Config, registry: &Registry) -> Option<Scan> {
-    let mut head = vec![0u8; size.min(SWEEP[BASE] as u64) as usize];
+    let base = SWEEP[BASE] as u64;
+    let mut head = vec![0u8; size.min(base) as usize];
     let mut file = File::open(path).ok()?;
     // `read_exact`, like the indexer: a file that shrank between the stat and
     // this read is not a file we know the size of, so it is not scanned.
     file.read_exact(&mut head).ok()?;
+    // Every smaller sample's tail lies inside this one or the head: below
+    // `2 × base` the two are the whole file, and above it every tail is a
+    // suffix of this one.
+    let rest_start = base.max(size.saturating_sub(base));
+    let mut rest = vec![0u8; size.saturating_sub(rest_start) as usize];
+    if !rest.is_empty() {
+        file.seek(SeekFrom::Start(rest_start)).ok()?;
+        file.read_exact(&mut rest).ok()?;
+    }
 
     let mut digests = [[0u8; 32]; SWEEP.len()];
-    for (slot, n) in digests.iter_mut().zip(SWEEP) {
+    let mut tails = [[0u8; 32]; SWEEP.len()];
+    for ((slot, tail), n) in digests.iter_mut().zip(&mut tails).zip(SWEEP) {
         let mut hasher = Sha256::new();
         hasher.update(size.to_le_bytes());
         hasher.update(&head[..head.len().min(n)]);
         slot.copy_from_slice(&hasher.finalize());
+
+        let n = n as u64;
+        if size > n {
+            let start = n.max(size - n);
+            let mut hasher = Sha256::new();
+            hasher.update(&head[head.len().min(start as usize)..]);
+            hasher.update(&rest[start.saturating_sub(rest_start) as usize..]);
+            tail.copy_from_slice(&hasher.finalize());
+        }
     }
 
     let base_mime = guess_mime_from_head(path, &head);
@@ -124,6 +151,7 @@ fn scan_one(path: &Path, size: u64, config: &Config, registry: &Registry) -> Opt
     Some(Scan {
         size,
         digests,
+        tails,
         mime_differs,
         text_differs,
         extractable,
@@ -322,6 +350,20 @@ fn partition(scans: &[Scan], which: usize) -> Vec<Vec<u32>> {
     by_digest.into_values().collect()
 }
 
+/// [`partition`], each group then split by its members' tails as
+/// `search::split_by_tail` splits it with `tail_len = SWEEP[which]`. The
+/// size is already in the head digest.
+fn partition_with_tail(scans: &[Scan], which: usize) -> Vec<Vec<u32>> {
+    let mut by_digest: HashMap<(Sha, Sha), Vec<u32>> = HashMap::new();
+    for (i, scan) in scans.iter().enumerate() {
+        by_digest
+            .entry((scan.digests[which], scan.tails[which]))
+            .or_default()
+            .push(i as u32);
+    }
+    by_digest.into_values().collect()
+}
+
 fn baseline_ids(scans: &[Scan]) -> Vec<u32> {
     let mut ids = vec![0u32; scans.len()];
     let mut next: HashMap<Sha, u32> = HashMap::new();
@@ -334,21 +376,41 @@ fn baseline_ids(scans: &[Scan]) -> Vec<u32> {
 
 struct Sweep {
     rows: Vec<Collisions>,
+    /// The same, after the tail check.
+    tailed: Vec<Collisions>,
 }
 
 impl Sweep {
     /// Assert the invariants that hold by construction: the baseline's
     /// false-positive columns are zero, and every "wrong" column is
-    /// non-increasing as the sample widens. A probe that reports a plausible
-    /// wrong number is worse than none.
+    /// non-increasing as the sample widens. The tail check only splits, so
+    /// its rows obey the same and never report more than the head alone
+    /// (head and tail at `2n` cover what they cover at `n`). A probe that
+    /// reports a plausible wrong number is worse than none.
     fn check_invariants(&self) {
-        let base = &self.rows[BASE];
+        Sweep::check_rows(&self.rows);
+        Sweep::check_rows(&self.tailed);
+        for (head, tailed) in self.rows.iter().zip(&self.tailed) {
+            assert!(tailed.files <= head.files, "the tail check only splits");
+            assert!(
+                tailed.fp_files <= head.fp_files,
+                "the tail check only splits"
+            );
+            assert!(
+                tailed.fp_pairs <= head.fp_pairs,
+                "the tail check only splits"
+            );
+        }
+    }
+
+    fn check_rows(rows: &[Collisions]) {
+        let base = &rows[BASE];
         assert_eq!(base.fp_groups, 0, "the baseline defines truth");
         assert_eq!(base.fp_files, 0, "the baseline defines truth");
         assert_eq!(base.fp_pairs, 0, "the baseline defines truth");
         assert_eq!(base.overstated_bytes, 0, "the baseline defines truth");
 
-        for pair in self.rows.windows(2) {
+        for pair in rows.windows(2) {
             let (small, large) = (&pair[0], &pair[1]);
             assert!(
                 large.files <= small.files,
@@ -441,6 +503,9 @@ fn collide(roots: &[String], workers: usize, ignore: &[String], verify_budget: O
         rows: (0..SWEEP.len())
             .map(|i| tally(&partition(&scans, i), &base, &sizes))
             .collect(),
+        tailed: (0..SWEEP.len())
+            .map(|i| tally(&partition_with_tail(&scans, i), &base, &sizes))
+            .collect(),
     };
     sweep.check_invariants();
 
@@ -450,12 +515,12 @@ fn collide(roots: &[String], workers: usize, ignore: &[String], verify_budget: O
         sample_name(SWEEP[BASE])
     );
     println!(
-        "| sample | dup groups | dup files | reported pairs | FP groups | FP files | FP pairs | FP rate (pairs) | FP rate (files) | overstated |"
+        "| sample | dup groups | dup files | reported pairs | FP groups | FP files | FP pairs | FP rate (pairs) | FP rate (files) | overstated | FP files +tail | FP rate (files) +tail | overstated +tail |"
     );
-    println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
-    for (i, row) in sweep.rows.iter().enumerate() {
+    println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for (i, (row, tailed)) in sweep.rows.iter().zip(&sweep.tailed).enumerate() {
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             sample_name(SWEEP[i]),
             row.groups,
             row.files,
@@ -466,6 +531,9 @@ fn collide(roots: &[String], workers: usize, ignore: &[String], verify_budget: O
             pct(row.fp_pairs, row.reported_pairs),
             pct(row.fp_files, files),
             mib(row.overstated_bytes),
+            tailed.fp_files,
+            pct(tailed.fp_files, files),
+            mib(tailed.overstated_bytes),
         );
     }
 
@@ -831,6 +899,41 @@ mod tests {
         );
         assert_eq!(total.fp_pairs, 2);
         assert_eq!(total.overstated_bytes, 20);
+    }
+
+    /// Each sample's tail digest covers the bytes `split_by_tail` reads,
+    /// wherever the size falls against the head and the 32 KiB read past it.
+    #[test]
+    fn tail_digests_cover_what_the_tail_check_reads() {
+        let dir = quicksearch_core::testutil::scratch_dir("hashprobe-tails");
+        let (config, registry) = (Config::default(), Registry::default_set());
+        let base = SWEEP[BASE];
+        for size in [
+            1,
+            1024,
+            1025,
+            3000,
+            base,
+            base + 1,
+            base + 5000,
+            2 * base,
+            2 * base + 1,
+            5 * base + 7,
+        ] {
+            let body: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+            let path = dir.join(format!("{size}.bin"));
+            std::fs::write(&path, &body).unwrap();
+            let scan = scan_one(&path, size as u64, &config, &registry).expect("scanned");
+            for (tail, n) in scan.tails.iter().zip(SWEEP) {
+                let want: Sha = if size > n {
+                    Sha256::digest(&body[n.max(size - n)..]).into()
+                } else {
+                    [0; 32]
+                };
+                assert_eq!(*tail, want, "size {size}, tail {n}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The hardlink-farm case: the pair count is quadratic, so it must be

@@ -36,6 +36,33 @@ fn fresh_install_defaults_to_home_as_only_root() {
     assert_eq!(partial.paths.indexing_paths, cfg.paths.indexing_paths);
 }
 
+/// Only head and tail identities survive a load: the head hash alone that
+/// earlier versions saved, and anything malformed, would match no group yet
+/// still count as hidden.
+#[test]
+fn hidden_groups_that_are_not_identities_are_dropped_on_load() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
+    let identity = "ab".repeat(32) + &"cd".repeat(32);
+    let stale = [
+        "ab".repeat(32),       // head hash alone, as saved before
+        "AB".repeat(64),       // uppercase
+        "zz".repeat(64),       // not hex
+        "ab".repeat(64) + "a", // one digit too many
+        String::new(),
+    ];
+    let mut entries: Vec<String> = stale.to_vec();
+    entries.insert(2, identity.clone());
+    let list = entries
+        .iter()
+        .map(|e| format!("\"{e}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    fs::write(&path, format!("[duplicates]\nhidden_groups = [{list}]\n")).unwrap();
+    let cfg = Config::load_from(&path).unwrap();
+    assert_eq!(cfg.duplicates.hidden_groups, [identity]);
+}
+
 #[test]
 fn missing_file_created_with_defaults() {
     let dir = tmp_dir();
@@ -1232,7 +1259,7 @@ fn ui_bookkeeping_fields_are_soft_knobs() {
             c.duplicates.exclude_patterns = vec!["*.iso".to_string()]
         }),
         ("duplicates.hidden_groups", |c| {
-            c.duplicates.hidden_groups = vec!["ab".repeat(32)]
+            c.duplicates.hidden_groups = vec!["ab".repeat(64)]
         }),
     ];
     for (label, mutate) in cases {
@@ -1255,7 +1282,8 @@ fn newer_fields_round_trip() {
     cfg.ui.color_scheme = "light".to_string();
     cfg.search.fuzzy_max_edits = 4;
     cfg.duplicates.exclude_patterns = vec!["*.iso".to_string()];
-    cfg.duplicates.hidden_groups = vec!["ab".repeat(32)];
+    // A group's identity: its head hash, then its tail digest.
+    cfg.duplicates.hidden_groups = vec!["ab".repeat(32) + &"cd".repeat(32)];
     cfg.save().unwrap();
     let loaded = Config::load_from(&path).unwrap();
     assert_eq!(

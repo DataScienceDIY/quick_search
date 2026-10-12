@@ -411,11 +411,17 @@ impl Default for SeedSpec {
 /// Seed an index with synthetic rows. Shared by the measurement harnesses so
 /// they all describe the same corpus.
 ///
-/// Written under a run's write regime: FTS5's write settings before the first
-/// row, autocheckpoint off, the run's finalize merge after the last commit.
-/// It records the root counts a completed run would, under `/seed`, so a
-/// search connection opens at the cache ceiling it ships with for this
-/// many files.
+/// Written under a default-config run's write regime: FTS5's write settings
+/// before the first row, autocheckpoint off, the run's WAL cap between
+/// commits (`indexing::WalGuard`: the default `maximum_wal_size`, lowered as
+/// a run lowers it on a volume short of space), the run's tail checkpoint
+/// after the last commit, then its finalize merge. It records the root counts a completed run would,
+/// under `/seed`, so a search connection opens at the cache ceiling it ships
+/// with for this many files.
+///
+/// Scratch therefore peaks near the cap plus the database, not at every
+/// commit's pages piled into one log; `commit_every = 0` is one transaction,
+/// which no checkpoint can split.
 pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
     use crate::db::repo::{insert_file, store_pending_text, NewFile, RootCounts};
     use crate::file_handling::{fts_begin_bulk_write, fts_finalize_after_text_indexing};
@@ -429,7 +435,9 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
     if let Some(hmac) = spec.hmac {
         crate::db::set_hmac_mode_override(hmac);
     }
-    let conn = crate::db::open_or_recreate(path.to_str().unwrap(), &Default::default()).unwrap();
+    let processing = crate::config::ProcessingConfig::default();
+    let db_path = path.to_str().unwrap();
+    let conn = crate::db::open_or_recreate(db_path, &processing).unwrap();
     // Before the first row: `pgsz` decides how leaves are built, so setting it
     // afterwards would only affect segments merged later.
     if let Some(pgsz) = spec.pgsz {
@@ -440,10 +448,11 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
         .unwrap();
     }
     fts_begin_bulk_write(&conn);
-    // As a run's writer has it. The WAL then grows until the closing
-    // checkpoint, since nothing here caps it the way a run's writer does.
+    // As a run's writer has it, which is safe only with the run's own bound
+    // on the log beside it.
     conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
         .unwrap();
+    let mut wal = crate::indexing::WalGuard::new(&processing, db_path);
     let mut rng = Lcg::new(0x5eed);
     let ext_mix = if spec.ext_mix.is_empty() {
         EXT_PLAIN
@@ -535,10 +544,17 @@ pub fn seed_index(path: &std::path::Path, spec: &SeedSpec) {
         }
         if spec.commit_every > 0 && (i + 1) % spec.commit_every == 0 {
             tx.commit().unwrap();
+            // Where a run's writer checks, between its rounds' commits.
+            if wal.due() {
+                wal.checkpoint(&conn);
+            }
             tx = conn.unchecked_transaction().unwrap();
         }
     }
     tx.commit().unwrap();
+    // The run's first tail checkpoint (`checkpoint_tail`), so the merge
+    // writes onto an empty log.
+    wal.checkpoint(&conn);
     fts_finalize_after_text_indexing(&conn);
     let files = spec.files as i64;
     crate::db::repo::set_root_counts(&conn, "/seed", RootCounts { files, fts }).unwrap();
@@ -722,10 +738,10 @@ pub struct Arm {
     /// reserve, which the header cannot be read without.
     pub hmac: Option<crate::db::schema::HmacMode>,
     pub path: PathBuf,
-    /// How long [`seed_index`] took: rows, zstd bodies and FTS postings, then
-    /// the merge, counts, hash index and checkpoint. Not an indexing rate: it
-    /// has no walk or extraction, its WAL grows uncapped until the closing
-    /// checkpoint, and each arm is one sample taken in sweep order.
+    /// How long [`seed_index`] took: rows, zstd bodies and FTS postings with
+    /// the run's WAL checkpoints among them, then the merge, counts, hash
+    /// index and closing checkpoint. Not an indexing rate: it has no walk or
+    /// extraction, and each arm is one sample taken in sweep order.
     pub seeded_in: std::time::Duration,
 }
 

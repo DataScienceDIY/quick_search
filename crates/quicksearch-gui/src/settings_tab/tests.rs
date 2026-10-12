@@ -524,14 +524,14 @@ fn the_search_cache_hint_explains_the_automatic_value() {
     // came from.
     cfg.security.password_protected = true;
     let keyed = search_cache_hint(&cfg, Some(200_000)).expect("a hint");
-    assert!(keyed.contains("32 MiB"), "{}", keyed);
+    assert!(keyed.contains("28 MiB"), "{}", keyed);
     assert!(keyed.contains("200,000"), "{}", keyed);
 
     // Encrypted and past it: says so, and says what the index actually wants,
     // or the override cannot be found by the people who need it.
     let capped = search_cache_hint(&cfg, Some(2_000_000)).expect("a hint");
     assert!(
-        capped.contains("128 MiB") && capped.contains("320 MiB"),
+        capped.contains("192 MiB") && capped.contains("286 MiB"),
         "the capped hint must name both the cap and the want: {}",
         capped
     );

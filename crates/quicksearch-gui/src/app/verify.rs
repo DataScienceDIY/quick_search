@@ -1,6 +1,6 @@
 //! Byte-for-byte verification of one duplicate group, and the modal that
-//! reports it. Grouping only hashes each file's size and head, so this is the
-//! second opinion, asked for before what usually follows it: deletion.
+//! reports it. Grouping only hashes each file's size, head and tail, so this
+//! is the second opinion, asked for before what usually follows it: deletion.
 
 use super::*;
 
@@ -173,8 +173,8 @@ pub(crate) fn verify_modal(ctx: &egui::Context, modal: &VerifyModal) -> bool {
                 ui.colored_label(color, summary_line(report));
                 if !identical {
                     ui.label(
-                        "Grouping only reads each file's size and how it begins; \
-                         this read every byte.",
+                        "Grouping only reads each file's size and how it begins and \
+                         ends; this read every byte.",
                     );
                     // Answers the next question: the files look the same when
                     // opened, so how can they differ? Named formats, because

@@ -341,9 +341,11 @@ fn duplicates_section(ui: &mut egui::Ui) {
     ui.add_space(4.0);
     ui.label(
         "A group is a strong suspicion, not a verdict: files are grouped by \
-         their size and a hash of their first few kilobytes, and the rest is \
-         never read. Before deleting anything, right-click the group and choose \
-         Verify copies are identical to compare every byte.",
+         their size and a hash of their first few kilobytes, then split apart \
+         where their last few kilobytes differ, and the rest is never read. \
+         A file whose end cannot be read is left out. Before deleting \
+         anything, right-click the group and choose Verify copies are \
+         identical to compare every byte.",
     );
 
     ui.add_space(8.0);

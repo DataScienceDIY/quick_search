@@ -17,6 +17,7 @@ mod progress;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use pipeline::WalGuard;
 pub use progress::{
     overall_progress, MaintenanceStep, OverallProgress, ReconcileProgress, RootPhase, RootProgress,
 };

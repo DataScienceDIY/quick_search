@@ -23,16 +23,16 @@ use crate::query::split::split_for_cascade;
 use crate::snippet::Snippet;
 
 pub use cascade::Outcome;
-pub use duplicates::{find_duplicate_groups, DuplicateGroup};
+pub use duplicates::{find_duplicate_groups, split_by_tail, DuplicateGroup, HeadGroup};
 
 /// Idle window before the connection is released.
 ///
-/// Long, because a release drops the search cache
-/// ([`db::schema::pragmas_search`]) and the next keystroke pays to refill it:
-/// on a 200k-file index the first query after a release costs 129 ms
-/// unencrypted and 192 ms encrypted, against ~10 ms warm, because a keyed
-/// refill decrypts every page. (The keyed figure predates `HMAC_MODE = Off`;
-/// see [`db::schema::HMAC_MODE`].)
+/// Long, so a pause in a typing session never pays to refill the search cache
+/// ([`db::schema::pragmas_search`]) that a release drops. The refill is
+/// modest: the first keystroke on a fresh connection costs about 15 ms
+/// unencrypted and 23 ms encrypted on a 200k-file index, against 12–14 ms
+/// warm, and 71 against 36 ms encrypted at 600k, where a refill decrypts
+/// every page it reads (`benches/search_perf.rs`, 2026-10-11).
 ///
 /// Removals do not wait on it: the service registers with [`db::hold_index`],
 /// so [`db::remove_index_files`] has it send [`WorkerMsg::ReleaseConnection`]

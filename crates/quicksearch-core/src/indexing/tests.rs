@@ -1134,3 +1134,50 @@ fn the_wal_cap_is_bounded_by_the_volume() {
         "disabled checkpoints on a roomy disk are effectively never"
     );
 }
+
+/// `testutil::seed_index` bounds its log through [`WalGuard`]'s two halves
+/// rather than through a run's `after_round`, so they are checked on their
+/// own: not due under the cap, due past it, and re-armed a cap of growth
+/// later once the checkpoint has emptied the log.
+#[test]
+fn the_wal_guard_checkpoints_once_the_log_passes_its_cap() {
+    let (_dir, db) = crate::testutil::Scratch::db("walguard");
+    let db = db.to_str().unwrap();
+    let processing = crate::config::ProcessingConfig {
+        // Raised to the floor, which no amount of free space lowers.
+        maximum_wal_size: 1,
+        ..Default::default()
+    };
+    let conn = db::open_or_recreate(db, &processing).unwrap();
+    conn.execute_batch("PRAGMA wal_autocheckpoint = 0; CREATE TABLE ballast(b BLOB);")
+        .unwrap();
+    let wal_bytes = || std::fs::metadata(format!("{}-wal", db)).map_or(0, |m| m.len());
+    // One commit of about a MiB each.
+    let grow = |mib: usize| {
+        for _ in 0..mib {
+            conn.execute("INSERT INTO ballast VALUES (zeroblob(1048576))", [])
+                .unwrap();
+        }
+    };
+
+    let mut wal = WalGuard::new(&processing, db);
+    assert!(!wal.due(), "a fresh log is not due");
+    grow(8);
+    assert!(!wal.due(), "half the cap is not due");
+    grow(12);
+    assert!(
+        wal_bytes() > crate::config::MINIMUM_WAL_SIZE,
+        "the fixture must pass the cap"
+    );
+    assert!(wal.due(), "a log past the cap is due");
+
+    wal.checkpoint(&conn);
+    assert_eq!(
+        wal_bytes(),
+        0,
+        "with no reader, the checkpoint empties the log"
+    );
+    assert!(!wal.due(), "re-armed from the emptied log");
+    grow(8);
+    assert!(!wal.due(), "the next cap is counted from the checkpoint");
+}
