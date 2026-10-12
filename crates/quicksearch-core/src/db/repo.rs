@@ -3,10 +3,16 @@
 
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
 
+use crate::file_handling::{ContentOutcome, DirRows, ExtractCursor, RootRange, Stamp};
 use crate::mime::FileType;
 
 pub const STATE_PENDING: i64 = 0;
+/// Content extracted. A file has a `searchabletext` row exactly when it is in
+/// this state, across every transition; [`count_root`], [`delete_ids`] and the
+/// reconciler's batched clears rely on it.
 pub const STATE_DONE: i64 = 1;
+/// Extraction failed. A file has a `failed_files` row exactly when it is in
+/// this state.
 pub const STATE_FAILED: i64 = 2;
 pub const STATE_NA: i64 = 3;
 
@@ -19,30 +25,6 @@ fn exec(
     conn.prepare_cached(sql)
         .and_then(|mut stmt| stmt.execute(params))
         .map_err(|e| format!("{}: {}", what(), e))
-}
-
-/// Set a file's content state and clear any failure record with it:
-/// `list-failed` reads `failed_files` directly, so a stale entry keeps
-/// reporting a file broken. [`set_content_failed`] does not route through here.
-fn set_state_clearing_failure(
-    tx: &Transaction<'_>,
-    file_id: i64,
-    state: i64,
-    transition: &'static str,
-) -> Result<(), String> {
-    exec(
-        tx,
-        "UPDATE files SET content_state = ?1 WHERE id = ?2",
-        params![state, file_id],
-        || format!("{} content_state {}", transition, file_id),
-    )?;
-    exec(
-        tx,
-        "DELETE FROM failed_files WHERE file_id = ?1",
-        params![file_id],
-        || format!("clear failed_files {}", file_id),
-    )?;
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -87,10 +69,7 @@ pub fn insert_file(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option<i64>,
             ])
         })
         .map_err(|e| format!("insert file {}: {}", f.path(), e))?;
-    if rows == 0 {
-        return Ok(None);
-    }
-    Ok(Some(tx.last_insert_rowid()))
+    Ok((rows > 0).then(|| tx.last_insert_rowid()))
 }
 
 fn initial_content_state(f: &NewFile<'_>) -> i64 {
@@ -103,14 +82,19 @@ fn initial_content_state(f: &NewFile<'_>) -> i64 {
 
 /// Update a file's metadata in place and reset its content state, clearing
 /// any extracted content. `None` if no row matches.
+///
+/// Clearing depends on the *stored* state: only [`STATE_DONE`] holds content
+/// and only [`STATE_FAILED`] a failure record, so other states cost one
+/// statement instead of four (1.24x on NA→NA, `benches/index.rs`
+/// `update_narrowing`). `content_state` is not in the `SET` list because
+/// `RETURNING` reports the post-update row, which would hide the old state.
 pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option<i64>, String> {
-    let id: Option<i64> = tx
+    let row: Option<(i64, i64)> = tx
         .prepare_cached(
             "UPDATE files
-                SET size = ?1, mtime = ?2, hash = ?3, mime = ?4, type = ?5,
-                    content_state = ?6
-              WHERE parent = ?7 AND name = ?8
-          RETURNING id",
+                SET size = ?1, mtime = ?2, hash = ?3, mime = ?4, type = ?5
+              WHERE parent = ?6 AND name = ?7
+          RETURNING id, content_state",
         )
         .and_then(|mut stmt| {
             stmt.query_row(
@@ -120,66 +104,112 @@ pub fn update_file_basic(tx: &Transaction<'_>, f: &NewFile<'_>) -> Result<Option
                     f.hash,
                     f.mime,
                     f.ftype.bits() as i64,
-                    initial_content_state(f),
                     f.parent,
                     f.name,
                 ],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
         })
         .map_err(|e| format!("update file {}: {}", f.path(), e))?;
-    let Some(id) = id else {
+    let Some((id, old_state)) = row else {
         return Ok(None);
     };
-    remove_content_for_id(tx, id)?;
-    // Without this, a changed file that stops needing content keeps reading
-    // as "failed" in `list-failed` forever.
-    exec(
-        tx,
-        "DELETE FROM failed_files WHERE file_id = ?1",
-        params![id],
-        || format!("clear failed_files {}", id),
-    )?;
+    match old_state {
+        STATE_DONE => remove_content_for_id(tx, id)?,
+        // Without this, a changed file that stops needing content keeps
+        // reading as "failed" in `list-failed` forever.
+        STATE_FAILED => exec(
+            tx,
+            "DELETE FROM failed_files WHERE file_id = ?1",
+            params![id],
+            || format!("clear failed_files {}", id),
+        )
+        .map(|_| ())?,
+        _ => {}
+    }
+    let new_state = initial_content_state(f);
+    if old_state != new_state {
+        // The FAILED arm above already took the failure record, and no
+        // other state can hold one.
+        exec(
+            tx,
+            "UPDATE files SET content_state = ?1 WHERE id = ?2",
+            params![new_state, id],
+            || format!("update reset content_state {}", id),
+        )?;
+    }
     Ok(Some(id))
 }
 
-/// Mark a file's content indexing as complete and write the extracted text
-/// atomically. `text_zstd` is the pre-compressed `documents_text` sidecar
-/// body, or `None` for no sidecar. Compression is the caller's job: this runs
-/// inside the writer's transaction, so compress before taking the lock.
-pub fn set_content_done(
-    tx: &Transaction<'_>,
-    file_id: i64,
-    text: &str,
-    text_zstd: Option<&[u8]>,
-) -> Result<(), String> {
-    remove_content_for_id(tx, file_id)?;
-    set_content_done_fresh(tx, file_id, text, text_zstd)
+/// Move a [`STATE_PENDING`] row to `state`; `false`, writing nothing, when
+/// the row is no longer pending (or no longer exists).
+fn claim_pending(tx: &Transaction<'_>, file_id: i64, state: i64) -> Result<bool, String> {
+    let changed = exec(
+        tx,
+        "UPDATE files SET content_state = ?1 WHERE id = ?2 AND content_state = ?3",
+        params![state, file_id, STATE_PENDING],
+        || format!("set content_state {} on {}", state, file_id),
+    )?;
+    Ok(changed > 0)
 }
 
-/// [`set_content_done`] for a row that **provably holds no content yet**,
-/// skipping the pre-delete.
+/// Record the outcome of extracting a pending row: the one way content state
+/// leaves [`STATE_PENDING`]. `text_zstd` is the pre-compressed
+/// `documents_text` body for a `Done` outcome, or `None` for no sidecar;
+/// compress before taking the writer's lock. Returns whether the row was
+/// still pending, and so whether anything was written.
 ///
-/// Use [`set_content_done`] wherever the row's prior state is not known.
-/// Getting this wrong leaves a duplicate FTS entry rather than a visible
-/// error, so the rule is: skip the delete only where the *same transaction*
-/// has already established there is nothing there.
-pub fn set_content_done_fresh(
+/// Pending is also what makes it cheap: a pending row provably holds no
+/// posting, stored body or failure record (see [`STATE_DONE`] and
+/// [`STATE_FAILED`]), so nothing is cleared first. A row that stopped being
+/// pending while its extraction was in flight (stored by another route, or
+/// deleted by stale cleanup) is left alone: writing it anyway would leave a
+/// posting with no `files` row behind it, which a reused rowid inherits. So
+/// is a [`ContentOutcome::Cancelled`] row, which the next run extracts.
+pub fn complete_pending(
+    tx: &Transaction<'_>,
+    file_id: i64,
+    outcome: &ContentOutcome,
+    text_zstd: Option<&[u8]>,
+) -> Result<bool, String> {
+    match outcome {
+        ContentOutcome::Done { text } => store_pending_text(tx, file_id, text, text_zstd),
+        ContentOutcome::NotApplicable => claim_pending(tx, file_id, STATE_NA),
+        ContentOutcome::Cancelled => Ok(false),
+        ContentOutcome::Failed(reason) => {
+            if !claim_pending(tx, file_id, STATE_FAILED)? {
+                return Ok(false);
+            }
+            exec(
+                tx,
+                "INSERT INTO failed_files(file_id, reason, ts) VALUES (?1, ?2, ?3)",
+                params![file_id, reason, crate::log::now_unix() as i64],
+                || format!("insert failed_files {}", file_id),
+            )?;
+            Ok(true)
+        }
+    }
+}
+
+/// [`complete_pending`] with extracted text, for callers holding it borrowed.
+pub fn store_pending_text(
     tx: &Transaction<'_>,
     file_id: i64,
     text: &str,
     text_zstd: Option<&[u8]>,
-) -> Result<(), String> {
-    // Contentless FTS5 accepts values on INSERT — the tokenizer needs them —
-    // it simply doesn't persist them.
+) -> Result<bool, String> {
+    if !claim_pending(tx, file_id, STATE_DONE)? {
+        return Ok(false);
+    }
+    // Contentless FTS5 takes the text on INSERT for the tokenizer and does
+    // not store it.
     exec(
         tx,
         "INSERT INTO searchabletext(rowid, text) VALUES (?1, ?2)",
         params![file_id, text],
         || format!("insert FTS row {}", file_id),
     )?;
-
     if let Some(compressed) = text_zstd {
         exec(
             tx,
@@ -188,13 +218,12 @@ pub fn set_content_done_fresh(
             || format!("insert documents_text {}", file_id),
         )?;
     }
-
-    set_state_clearing_failure(tx, file_id, STATE_DONE, "update DONE")
+    Ok(true)
 }
 
-/// Reusable decode buffer and context for the readers of `documents_text` —
-/// the read side's mirror of [`DocEncoder`]. Measured; don't swap in
-/// `zstd::decode_all` (per-row context + `Vec`).
+/// Reusable decode buffer and context for the readers of `documents_text`;
+/// the read side's mirror of [`DocEncoder`]. Measured: `zstd::decode_all`
+/// builds a context and a `Vec` per row.
 pub struct DocDecoder {
     dctx: zstd::bulk::Decompressor<'static>,
     buf: Vec<u8>,
@@ -202,8 +231,8 @@ pub struct DocDecoder {
 
 const INITIAL_DOC_CAPACITY: usize = 64 * 1024;
 
-/// Where the doubling stops: far above any legitimate document — past it, a
-/// failure is a corrupt frame rather than a buffer that is too small.
+/// Where the doubling stops. Far above any legitimate document, so a failure
+/// past it is a corrupt frame, not a buffer that is too small.
 const MAX_DOC_CAPACITY: usize = 64 * 1024 * 1024;
 
 impl DocDecoder {
@@ -219,32 +248,26 @@ impl DocDecoder {
     pub fn decode(&mut self, blob: &[u8]) -> Option<&str> {
         self.buf.clear();
         // `decompress_to_buffer` writes into spare capacity and fails rather
-        // than growing, so the room has to be there first. A frame carrying no
-        // content size (any stream-based encoder's) MUST take the growth loop
-        // below — do not fall back to `zstd::decode_all` for it, which
-        // rebuilds a decoder and output buffer per row and once dominated a
-        // fuzzy search's allocator traffic.
+        // than growing, so the room has to be there first. A frame with no
+        // content size (any stream encoder's) takes the growth loop below;
+        // `zstd::decode_all` would rebuild a decoder and buffer per row.
         if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(blob) {
-            // Clamped: `size` comes straight out of the frame header, so a
-            // hostile blob can ask for terabytes and `reserve` answers an
-            // impossible request by aborting the process, not by failing.
+            // Clamped: a hostile header can ask for terabytes, and `reserve`
+            // answers that by aborting the process.
             self.buf
                 .reserve(usize::try_from(size).ok()?.min(MAX_DOC_CAPACITY));
         }
-        loop {
-            if self.buf.capacity() == 0 {
-                self.buf.reserve(INITIAL_DOC_CAPACITY);
+        if self.buf.capacity() == 0 {
+            self.buf.reserve(INITIAL_DOC_CAPACITY);
+        }
+        // Too small, or corrupt: the bulk API cannot say which.
+        while self.dctx.decompress_to_buffer(blob, &mut self.buf).is_err() {
+            if self.buf.capacity() >= MAX_DOC_CAPACITY {
+                return None;
             }
-            match self.dctx.decompress_to_buffer(blob, &mut self.buf) {
-                Ok(_) => break,
-                // Too small, or corrupt — the bulk API cannot tell us which.
-                Err(_) if self.buf.capacity() < MAX_DOC_CAPACITY => {
-                    let bigger = self.buf.capacity().saturating_mul(2);
-                    self.buf.clear();
-                    self.buf.reserve(bigger);
-                }
-                Err(_) => return None,
-            }
+            let bigger = self.buf.capacity().saturating_mul(2);
+            self.buf.clear();
+            self.buf.reserve(bigger);
         }
         std::str::from_utf8(&self.buf).ok()
     }
@@ -254,14 +277,11 @@ impl DocDecoder {
 const ZSTD_LEVEL: i32 = 3;
 
 /// Reusable compression context for the `documents_text` sidecar; one per
-/// batch. Measured (`benches/index.rs`, group `zstd_encode`).
+/// indexing run. Measured (`benches/index.rs`, group `zstd_encode`).
 pub struct DocEncoder {
     ctx: zstd::bulk::Compressor<'static>,
-    /// One row's compressed output, reused. **`zstd`'s `WriteBuf` for `Vec`
-    /// writes from offset 0 and sets the length** — it overwrites rather
-    /// than appends — so a body cannot be compressed straight into a shared
-    /// arena. It lands here and is copied across, which still costs no
-    /// allocation once both buffers have grown.
+    /// The last row's compressed output, reused, so the writer allocates
+    /// nothing per document once it has grown.
     row: Vec<u8>,
 }
 
@@ -280,16 +300,12 @@ impl DocEncoder {
             .map_err(|e| format!("zstd encode: {}", e))
     }
 
-    /// Append the compressed form of `text` to `arena`, returning where it
-    /// landed. The mirror of [`DocDecoder`]'s reused buffer on the write
-    /// side: a whole batch's bodies share one allocation instead of taking
-    /// one `Vec` each, which at a chunk per commit was an allocation per
-    /// indexed document.
-    pub fn encode_into(
-        &mut self,
-        text: &str,
-        arena: &mut Vec<u8>,
-    ) -> Result<std::ops::Range<usize>, String> {
+    /// The compressed form of `text`, valid until the next call; `None` for an
+    /// empty body, which gets no `documents_text` row.
+    pub fn body(&mut self, text: &str) -> Result<Option<&[u8]>, String> {
+        if text.is_empty() {
+            return Ok(None);
+        }
         self.row.clear();
         // `compress_to_buffer` writes into the buffer's capacity and fails
         // rather than growing it, so the room has to be there first.
@@ -297,15 +313,14 @@ impl DocEncoder {
         self.ctx
             .compress_to_buffer(text.as_bytes(), &mut self.row)
             .map_err(|e| format!("zstd encode: {}", e))?;
-        let start = arena.len();
-        arena.extend_from_slice(&self.row);
-        Ok(start..arena.len())
+        Ok(Some(&self.row))
     }
 }
 
-/// Compress one body, for the writers that handle a single row.
-pub fn encode_one(text: &str, store_text: bool) -> Result<Option<Vec<u8>>, String> {
-    if !store_text || text.is_empty() {
+/// Compress one body, for the writers that handle a single row; `None` for
+/// an empty one, which gets no `documents_text` row.
+pub fn encode_one(text: &str) -> Result<Option<Vec<u8>>, String> {
+    if text.is_empty() {
         return Ok(None);
     }
     DocEncoder::new()?.encode(text).map(Some)
@@ -315,30 +330,6 @@ pub fn encode_one(text: &str, store_text: bool) -> Result<Option<Vec<u8>>, Strin
 /// frame header. Only the *header* is read, so `blob` may be a prefix.
 pub fn raw_text_len(blob: &[u8]) -> Option<u64> {
     zstd::zstd_safe::get_frame_content_size(blob).ok().flatten()
-}
-
-/// Mark a file's content extraction as failed. Keeps the basic row in place.
-pub fn set_content_failed(tx: &Transaction<'_>, file_id: i64, reason: &str) -> Result<(), String> {
-    let now = crate::log::now_unix() as i64;
-    exec(
-        tx,
-        "UPDATE files SET content_state = ?1 WHERE id = ?2",
-        params![STATE_FAILED, file_id],
-        || format!("update content_state FAILED {}", file_id),
-    )?;
-    exec(
-        tx,
-        "INSERT OR REPLACE INTO failed_files(file_id, reason, ts) VALUES (?1, ?2, ?3)",
-        params![file_id, reason, now],
-        || format!("insert failed_files {}", file_id),
-    )?;
-    Ok(())
-}
-
-/// Mark content extraction as not applicable; the row still serves filename
-/// search.
-pub fn set_content_na(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
-    set_state_clearing_failure(tx, file_id, STATE_NA, "update NA")
 }
 
 /// Delete a file row by path, keeping FTS in sync; returns whether a row went.
@@ -358,28 +349,40 @@ pub fn delete_file_by_path(tx: &Transaction<'_>, path: &str) -> Result<bool, Str
     Ok(true)
 }
 
-/// Delete every row whose parent falls in `[lo, hi)`. Build the bounds with
-/// [`crate::file_handling::ExtractCursor::for_root`], which makes them
-/// separator-correct — the range covers the root's *own* files only because
-/// every stored parent ends in a separator.
-pub fn delete_subtree(tx: &Transaction<'_>, lo: &str, hi: &str) -> Result<usize, String> {
+/// The stored id and `content_state` for one exact path, or `None` if the
+/// path is not indexed. Read it in the transaction whose [`delete_ids`] call
+/// it feeds, so `with_postings` reflects the state at delete time.
+pub fn id_and_state_for_path(conn: &Connection, path: &str) -> Result<Option<(i64, i64)>, String> {
+    let Some((parent, name)) = crate::file_handling::split_db_path(path) else {
+        return Ok(None);
+    };
+    conn.prepare_cached("SELECT id, content_state FROM files WHERE parent = ?1 AND name = ?2")
+        .and_then(|mut stmt| {
+            stmt.query_row(params![parent, name], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()
+        })
+        .map_err(|e| format!("look up {}: {}", path, e))
+}
+
+/// Delete every row in `range`, the root's own files included.
+pub fn delete_subtree(tx: &Transaction<'_>, range: &RootRange) -> Result<usize, String> {
     delete_files_matching(
         tx,
         "parent >= ?1 AND parent < ?2",
-        &[&lo, &hi],
-        &format!("under {}", lo),
+        &[&range.lo, &range.hi],
+        &format!("under {}", range.lo),
     )
 }
 
-/// Delete the `files` rows matching `files_where`, first tombstoning their
-/// `searchabletext` rows. Returns how many `files` rows went.
+/// Delete the `files` rows matching `files_where`, tombstoning their
+/// `searchabletext` rows first; returns how many `files` rows went.
 ///
-/// `documents_text` and `failed_files` are left to `ON DELETE CASCADE`:
-/// every connection profile sets `PRAGMA foreign_keys = ON` (`db::schema`),
-/// kept honest by `repo_tests::deleting_a_file_row_cascades_the_fk_tables`
-/// and reconcile's `orphans()` sweep. `searchabletext` cannot cascade — an
-/// FTS5 virtual table takes no foreign key — so its contentless delete must
-/// stay explicit.
+/// `documents_text` and `failed_files` go by `ON DELETE CASCADE` (every
+/// profile sets `foreign_keys = ON`); FTS5 cannot cascade, so that delete
+/// stays explicit. Not narrowed to [`STATE_DONE`] as [`delete_ids`] is: from
+/// a range, reading `content_state` would mean a second pass over every
+/// candidate to save one small `%_docsize` seek each. Re-measure with
+/// `examples/pruneprobe.rs` before changing this.
 fn delete_files_matching(
     tx: &Transaction<'_>,
     files_where: &str,
@@ -399,100 +402,159 @@ fn delete_files_matching(
     })
 }
 
-/// Delete every row whose parent falls in *none* of `ranges` — a full scan of
-/// `files`, reserved for the one transition that needs it: with
-/// `follow_symlinks` off, rows left by a followed symlink fall outside every
-/// root's range and no walk will ever visit them again.
-pub fn delete_outside_ranges(
-    tx: &Transaction<'_>,
-    ranges: &[(String, String)],
-) -> Result<usize, String> {
-    if ranges.is_empty() {
-        return Ok(0);
-    }
-    let mut predicate = String::new();
-    for i in 0..ranges.len() {
-        if i > 0 {
-            predicate.push_str(" AND ");
-        }
-        predicate.push_str(&format!(
-            "NOT (parent >= ?{} AND parent < ?{})",
-            i * 2 + 1,
-            i * 2 + 2
-        ));
-    }
-    let bounds: Vec<&dyn rusqlite::ToSql> = ranges
-        .iter()
-        .flat_map(|(lo, hi)| [lo as &dyn rusqlite::ToSql, hi as &dyn rusqlite::ToSql])
-        .collect();
-    delete_files_matching(tx, &predicate, &bounds, "outside the roots")
-}
-
-/// Fixed chunk size so `prepare_cached` sees a bounded set of SQL texts.
+/// Fixed chunk size, so every full chunk reuses one cached statement.
 const DELETE_IDS_CHUNK: usize = 512;
 
 fn placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
 }
 
-/// Delete the given file ids and everything keyed to them. Returns how many
-/// `files` rows went. Dependent tables: see `delete_files_matching`.
-pub fn delete_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<usize, String> {
-    let mut removed = 0;
+/// Run `prefix` plus `?,…,?)` once per [`DELETE_IDS_CHUNK`] of `ids`,
+/// returning the rows changed in total. `prefix` ends in `IN (`; `what` names
+/// a failed chunk from its length.
+fn exec_chunked(
+    tx: &Transaction<'_>,
+    prefix: &str,
+    ids: &[i64],
+    what: impl Fn(usize) -> String,
+) -> Result<usize, String> {
+    let mut changed = 0;
     for chunk in ids.chunks(DELETE_IDS_CHUNK) {
-        let placeholders = placeholders(chunk.len());
-        let sql = format!(
-            "DELETE FROM searchabletext WHERE rowid IN ({})",
-            placeholders
-        );
-        exec(tx, &sql, params_from_iter(chunk.iter()), || {
-            format!("delete searchabletext for {} ids", chunk.len())
-        })?;
-        let sql = format!("DELETE FROM files WHERE id IN ({})", placeholders);
-        removed += exec(tx, &sql, params_from_iter(chunk.iter()), || {
-            format!("delete {} file rows", chunk.len())
+        let sql = format!("{}{})", prefix, placeholders(chunk.len()));
+        changed += exec(tx, &sql, params_from_iter(chunk.iter()), || {
+            what(chunk.len())
         })?;
     }
-    Ok(removed)
+    Ok(changed)
 }
 
-/// Every indexed file directly inside `parent`, as `name -> mtime`. `parent`
-/// must be in stored spelling — trailing separator and all; build it with
+/// Delete `ids` and everything keyed to them; returns how many `files` rows
+/// went.
+///
+/// `with_postings` must be the subset of `ids` whose stored state is
+/// [`STATE_DONE`], the only rows with an FTS entry to tombstone. The caller
+/// already knows `content_state` from the page it read; looking it up here
+/// would cost a row fetch per id, and tombstoning every id a `%_docsize` seek
+/// per id. An id missing from `with_postings` keeps its posting, so the
+/// deleted file keeps appearing in results.
+pub fn delete_ids(
+    tx: &Transaction<'_>,
+    ids: &[i64],
+    with_postings: &[i64],
+) -> Result<usize, String> {
+    exec_chunked(
+        tx,
+        "DELETE FROM searchabletext WHERE rowid IN (",
+        with_postings,
+        |n| format!("delete searchabletext for {} ids", n),
+    )?;
+    exec_chunked(tx, "DELETE FROM files WHERE id IN (", ids, |n| {
+        format!("delete {} file rows", n)
+    })
+}
+
+/// Set `content_state` on many rows at once, leaving everything else alone.
+///
+/// No `failed_files` sweep: a caller that knows the stored states clears the
+/// few [`STATE_FAILED`] rows with [`clear_failed_for_ids`], and their content
+/// with [`clear_content_for_ids`].
+pub fn set_content_state(tx: &Transaction<'_>, ids: &[i64], state: i64) -> Result<usize, String> {
+    let mut changed = 0;
+    for chunk in ids.chunks(DELETE_IDS_CHUNK) {
+        let sql = format!(
+            "UPDATE files SET content_state = ?1 WHERE id IN ({})",
+            placeholders(chunk.len())
+        );
+        let params = params_from_iter(
+            std::iter::once(&state as &dyn rusqlite::ToSql)
+                .chain(chunk.iter().map(|id| id as &dyn rusqlite::ToSql)),
+        );
+        changed += exec(tx, &sql, params, || {
+            format!("set content_state {} on {} rows", state, chunk.len())
+        })?;
+    }
+    Ok(changed)
+}
+
+/// Drop the FTS posting and the stored body of many rows at once, leaving
+/// their `files` rows in place: the batch form of [`remove_content_for_id`].
+/// Pass only [`STATE_DONE`] ids; the others have neither, and asking costs a
+/// seek each.
+pub fn clear_content_for_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<(), String> {
+    for chunk in ids.chunks(DELETE_IDS_CHUNK) {
+        let list = placeholders(chunk.len());
+        for (what, sql) in [
+            (
+                "searchabletext",
+                format!("DELETE FROM searchabletext WHERE rowid IN ({})", list),
+            ),
+            (
+                "documents_text",
+                format!("DELETE FROM documents_text WHERE file_id IN ({})", list),
+            ),
+        ] {
+            exec(tx, &sql, params_from_iter(chunk.iter()), || {
+                format!("clear {} for {} ids", what, chunk.len())
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Forget the failure records of many rows at once. Pass only
+/// [`STATE_FAILED`] ids; nothing else holds a record.
+pub fn clear_failed_for_ids(tx: &Transaction<'_>, ids: &[i64]) -> Result<(), String> {
+    exec_chunked(
+        tx,
+        "DELETE FROM failed_files WHERE file_id IN (",
+        ids,
+        |n| format!("clear failed_files for {} ids", n),
+    )
+    .map(|_| ())
+}
+
+/// The walk prefetcher's query, one directory's rows by `idx_files_parent`.
+const DIR_ROWS_SQL: &str =
+    "SELECT name, mtime, size, hash IS NOT NULL FROM files WHERE parent = ?1";
+
+/// A row's [`Stamp`] from the columns `mtime, size, hash IS NOT NULL`, read
+/// from `at` on. A negative stored value reads as 0, as no file has one.
+fn stamp_at(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Stamp> {
+    Ok(Stamp {
+        mtime: r.get::<_, i64>(at)?.max(0) as u64,
+        size: r.get::<_, i64>(at + 1)?.max(0) as u64,
+        hashed: r.get(at + 2)?,
+    })
+}
+
+/// Every indexed file directly inside `parent`, as `name -> stamp`. `parent`
+/// must be in stored spelling, trailing separator included; build it with
 /// [`crate::file_handling::dir_to_db_parent`].
-pub fn dir_rows(
-    conn: &Connection,
-    parent: &str,
-) -> Result<std::collections::HashMap<String, u64>, String> {
+pub fn dir_rows(conn: &Connection, parent: &str) -> Result<DirRows, String> {
     let mut stmt = conn
-        .prepare_cached("SELECT name, mtime FROM files WHERE parent = ?1")
+        .prepare_cached(DIR_ROWS_SQL)
         .map_err(|e| format!("prepare dir rows for {}: {}", parent, e))?;
     let rows = stmt
         .query_map(params![parent], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+            Ok((r.get::<_, String>(0)?, stamp_at(r, 1)?))
         })
         .map_err(|e| format!("query dir rows for {}: {}", parent, e))?;
-    let mut out = std::collections::HashMap::new();
-    for row in rows {
-        let (name, mtime) = row.map_err(|e| format!("read dir row under {}: {}", parent, e))?;
-        out.insert(name, mtime);
-    }
-    Ok(out)
+    rows.collect::<Result<_, _>>()
+        .map_err(|e| format!("read dir row under {}: {}", parent, e))
 }
 
-/// A stored path that remembers where its `name` begins — the whole
-/// `parent + name` in **one** buffer rather than the two or three strings
-/// carrying both halves would cost. The content pass moves one of these per
-/// file from the feeder to the writer, so the saving is per indexed file.
-#[derive(Debug)]
+/// A stored path that remembers where its `name` begins: `parent + name` in
+/// one buffer instead of two or three strings. The content pass moves one per
+/// file from the feeder to the writer.
+#[derive(Debug, Clone)]
 pub struct RowPath {
     path: String,
     name_at: usize,
 }
 
 impl RowPath {
-    /// Join the two halves the index stores into one buffer. The pending-page
-    /// query builds its own in place; this is for everyone assembling a row
-    /// from parts they already hold.
+    /// Join the two halves the index stores into one buffer, for callers
+    /// that hold both parts.
     pub fn new(parent: &str, name: &str) -> RowPath {
         let mut path = String::with_capacity(parent.len() + name.len());
         path.push_str(parent);
@@ -507,9 +569,13 @@ impl RowPath {
 
     /// The `files.name` half.
     pub fn name(&self) -> &str {
-        // `name_at` is the parent's length, taken as the buffer was built; a
-        // stored parent is by construction a prefix of the path.
+        // `name_at` is the parent's length, so it is a char boundary.
         &self.path[self.name_at..]
+    }
+
+    /// The `files.parent` half, trailing separator included.
+    pub fn parent(&self) -> &str {
+        &self.path[..self.name_at]
     }
 }
 
@@ -522,11 +588,11 @@ pub struct PendingRow {
 }
 
 /// One page of rows still awaiting content extraction under `cursor`'s range,
-/// ordered by id. Keyset paging: a row is served exactly once even though the
-/// writer is concurrently flipping `content_state` behind the reader.
+/// ordered by id. Keyset paging serves each row once while the writer flips
+/// `content_state` behind the reader.
 pub fn pending_content_page(
     conn: &Connection,
-    cursor: &crate::file_handling::ExtractCursor,
+    cursor: &ExtractCursor,
     max_size: i64,
     limit: i64,
 ) -> Result<Vec<PendingRow>, String> {
@@ -534,9 +600,9 @@ pub fn pending_content_page(
         .prepare_cached(
             // `INDEXED BY`: left to itself the planner takes
             // `idx_files_parent` for the range and sorts the survivors per
-            // page — quadratic over a run. The partial index is id-ordered
-            // and holds only pending rows, and the planner never prefers it
-            // before ANALYZE has run, so this cannot be left to statistics.
+            // page, quadratic over a run. The partial index is id-ordered and
+            // holds only pending rows, and the planner never prefers it before
+            // ANALYZE has run.
             "SELECT id, parent, name, mime FROM files INDEXED BY idx_files_content_pending
               WHERE content_state = 0 AND size <= ?1 AND id > ?2
                 AND parent >= ?3 AND parent < ?4
@@ -546,7 +612,7 @@ pub fn pending_content_page(
         .map_err(|e| format!("prepare pending content query: {}", e))?;
     let rows = stmt
         .query_map(
-            params![max_size, cursor.last_id, cursor.lo, cursor.hi, limit],
+            params![max_size, cursor.last_id, cursor.range.lo, cursor.range.hi, limit],
             |row| {
                 // The parent is grown into the path in place rather than
                 // `format!`ed with the name into a third buffer.
@@ -594,38 +660,34 @@ pub struct RootCounts {
     pub fts: i64,
 }
 
-/// Count the rows in the half-open parent range `[lo, hi)` and, in the same
-/// pass, how many of them have a full-text row.
+/// Count the rows in `range` and, in the same pass, how many of them have a
+/// full-text row (see [`STATE_DONE`]).
 ///
-/// `content_state = STATE_DONE` *is* "has a `searchabletext` row":
-/// [`set_content_done`] holds the only insert into that table, and
-/// [`remove_content_for_id`] clears the two together.
-///
-/// Not cheap — every row in the range is fetched. Call it where a run has
-/// just read those rows anyway, not on a cadence.
-pub fn count_root(conn: &Connection, lo: &str, hi: &str) -> Result<RootCounts, String> {
+/// Fetches every row in the range: call it where a run has just read those
+/// rows anyway, not on a cadence.
+pub fn count_root(conn: &Connection, range: &RootRange) -> Result<RootCounts, String> {
     conn.prepare_cached(
         "SELECT COUNT(*), COALESCE(SUM(content_state = ?3), 0) FROM files
           WHERE parent >= ?1 AND parent < ?2",
     )
     .and_then(|mut stmt| {
-        stmt.query_row(params![lo, hi, STATE_DONE], |r| {
+        stmt.query_row(params![range.lo, range.hi, STATE_DONE], |r| {
             Ok(RootCounts {
                 files: r.get(0)?,
                 fts: r.get(1)?,
             })
         })
     })
-    .map_err(|e| format!("count root {}: {}", lo, e))
+    .map_err(|e| format!("count root {}: {}", range.lo, e))
 }
 
 /// One page of rows sorting after `(after_parent, after_name)` and inside the
 /// parent range ending at `hi`, in `(parent, name)` order. A row is served at
-/// most once even though the caller is deleting behind the reader. Seed the
-/// cursor with `(lo, "")`.
+/// most once while the caller deletes behind the reader. Seed the cursor with
+/// `(lo, "")`.
 ///
-/// The row-value comparison is what keeps it one seek; spelled out as
-/// `parent > ? OR (parent = ? AND name > ?)` the planner is free to scan.
+/// The row-value comparison keeps it one seek; spelled out as
+/// `parent > ? OR (parent = ? AND name > ?)` the planner may scan.
 pub fn rows_in_range_page(
     conn: &Connection,
     after_parent: &str,
@@ -660,36 +722,18 @@ pub fn rows_in_range_page(
         .map_err(|e| format!("read range page row: {}", e))
 }
 
-/// Drop the stored text of the given file ids, leaving their FTS row and
-/// `files` row intact: full-text search keeps working, only the snippet
-/// source goes away.
-pub fn drop_stored_text(tx: &Transaction<'_>, ids: &[i64]) -> Result<usize, String> {
-    let mut removed = 0;
-    for chunk in ids.chunks(DELETE_IDS_CHUNK) {
-        let sql = format!(
-            "DELETE FROM documents_text WHERE file_id IN ({})",
-            placeholders(chunk.len())
-        );
-        removed += exec(tx, &sql, params_from_iter(chunk.iter()), || {
-            format!("drop stored text for {} ids", chunk.len())
-        })?;
-    }
-    Ok(removed)
-}
-
-/// Put a file's content back in the pending queue without touching its row's
-/// metadata.
-pub fn reset_content_pending(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
-    remove_content_for_id(tx, file_id)?;
-    set_state_clearing_failure(tx, file_id, STATE_PENDING, "reset pending")
-}
-
 /// Reset every failed file to pending and drop the failure records, so the
 /// coming run re-attempts them. Returns how many rows were reset.
+///
+/// Found through `failed_files`, which holds exactly the failed rows (see
+/// [`STATE_FAILED`]): no index covers `content_state = 2`, so asking `files`
+/// scanned the table every run. Measured at 373k rows, 287 failed: 16 →
+/// 0.3 ms with the table cached.
 pub fn retry_failed_files(tx: &Transaction<'_>) -> Result<usize, String> {
     let reset = exec(
         tx,
-        "UPDATE files SET content_state = ?1 WHERE content_state = ?2",
+        "UPDATE files SET content_state = ?1 \
+         WHERE id IN (SELECT file_id FROM failed_files) AND content_state = ?2",
         params![STATE_PENDING, STATE_FAILED],
         || "reset failed files to pending".to_string(),
     )?;
@@ -699,34 +743,33 @@ pub fn retry_failed_files(tx: &Transaction<'_>) -> Result<usize, String> {
     Ok(reset)
 }
 
-/// The stored mtime for one exact path, or `None` if it isn't indexed.
-pub fn mtime_for_path(conn: &Connection, path: &str) -> Result<Option<u64>, String> {
+/// The stored stamp for one exact path, or `None` if it isn't indexed.
+pub fn stamp_for_path(conn: &Connection, path: &str) -> Result<Option<Stamp>, String> {
     let Some((parent, name)) = crate::file_handling::split_db_path(path) else {
         return Ok(None);
     };
     let mut stmt = conn
-        .prepare_cached("SELECT mtime FROM files WHERE parent = ?1 AND name = ?2")
-        .map_err(|e| format!("prepare mtime lookup for {}: {}", path, e))?;
-    stmt.query_row(params![parent, name], |r| r.get::<_, i64>(0))
+        .prepare_cached(
+            "SELECT mtime, size, hash IS NOT NULL FROM files WHERE parent = ?1 AND name = ?2",
+        )
+        .map_err(|e| format!("prepare stamp lookup for {}: {}", path, e))?;
+    stmt.query_row(params![parent, name], |r| stamp_at(r, 0))
         .optional()
-        .map(|o| o.map(|m| m.max(0) as u64))
-        .map_err(|e| format!("mtime lookup for {}: {}", path, e))
+        .map_err(|e| format!("stamp lookup for {}: {}", path, e))
 }
 
-/// Distinct `parent` values within the half-open range `[lo, hi)`, streamed
-/// to `f`. The root's own directory is included: its stored parent is
-/// `root + SEP`, which is exactly `lo`.
+/// Distinct `parent` values within `range`, streamed to `f`. The root's own
+/// directory is included: its stored parent, `root + SEP`, is `range.lo`.
 pub fn for_each_parent_in_range<F: FnMut(String)>(
     conn: &Connection,
-    lo: &str,
-    hi: &str,
+    range: &RootRange,
     mut f: F,
 ) -> Result<(), String> {
     let mut stmt = conn
         .prepare("SELECT DISTINCT parent FROM files WHERE parent >= ?1 AND parent < ?2")
         .map_err(|e| format!("prepare parent scan: {}", e))?;
     let rows = stmt
-        .query_map(params![lo, hi], |r| r.get::<_, String>(0))
+        .query_map(params![range.lo, range.hi], |r| r.get::<_, String>(0))
         .map_err(|e| format!("parent scan: {}", e))?;
     for row in rows {
         f(row.map_err(|e| format!("read parent row: {}", e))?);
@@ -750,11 +793,10 @@ pub fn paths_in_dir(conn: &Connection, parent: &str) -> Result<Vec<String>, Stri
         .map_err(|e| format!("read path under {}: {}", parent, e))
 }
 
-/// Remove the FTS row and the compressed text blob for a given file id. Does
-/// not touch the `files` row itself. Idempotent — a missing row is fine.
+/// Remove the FTS row and the compressed text blob for a given file id,
+/// leaving the `files` row. Idempotent: a missing row is fine.
 pub fn remove_content_for_id(tx: &Transaction<'_>, file_id: i64) -> Result<(), String> {
-    // `contentless_delete=1` on the FTS5 table makes this work without
-    // re-supplying the old column values (it tombstones the rowid).
+    // `contentless_delete=1` tombstones the rowid without the old text.
     for (what, sql) in [
         (
             "searchabletext",
@@ -779,18 +821,18 @@ const VACUUM_MIN_SLACK_PERCENT: i64 = 20;
 /// Flush the whole WAL into the main database and truncate the log to zero
 /// bytes. `Err` means the log was *not* emptied.
 ///
-/// The pragma's result row is the only place SQLite reports that a checkpoint
-/// gave up — `execute`/`execute_batch` discard it. The signal is the *log*
-/// column, not `busy`: a TRUNCATE that cannot take the writer lock silently
-/// downgrades itself to PASSIVE and still reports `busy = 0` with the log
-/// untouched. A database not in WAL mode reports -1, hence `<= 0`.
+/// Only the pragma's result row reports that a checkpoint gave up;
+/// `execute`/`execute_batch` discard it. A TRUNCATE that a reader holds back
+/// waits out `busy_timeout` and reports `busy = 1`, as does one that cannot
+/// take the checkpoint lock, whose log reads -1. A database not in WAL mode
+/// reports a log of -1, hence `<= 0`.
 pub fn checkpoint_truncate(conn: &Connection) -> Result<(), String> {
     let (busy, log): (i64, i64) = conn
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
         .map_err(|e| format!("wal checkpoint: {}", e))?;
-    if log <= 0 {
+    if busy == 0 && log <= 0 {
         Ok(())
     } else {
         Err(format!(
@@ -809,12 +851,9 @@ pub fn checkpoint_and_close(conn: Connection) {
     drop(conn);
 }
 
-/// Read a `PRAGMA` that reports a number.
-///
-/// Not simply `r.get::<i64>(0)`: on a **keyed** connection SQLCipher
-/// intercepts `PRAGMA page_size`, answers with `cipher_page_size` instead,
-/// and returns it as TEXT — so asking for an integer fails with a type error.
-/// Unencrypted it is an INTEGER as usual.
+/// Read a `PRAGMA` that reports a number. Not `r.get::<i64>(0)`: on a keyed
+/// connection SQLCipher answers `PRAGMA page_size` with `cipher_page_size` as
+/// TEXT.
 pub(super) fn pragma_number(conn: &Connection, pragma: &str) -> Result<i64, String> {
     use rusqlite::types::ValueRef;
     conn.query_row(&format!("PRAGMA {}", pragma), [], |r| {
@@ -830,39 +869,38 @@ pub(super) fn pragma_number(conn: &Connection, pragma: &str) -> Result<i64, Stri
     .ok_or_else(|| format!("read {}: not a number", pragma))
 }
 
-/// The row count ANALYZE last recorded for `files`, or `None` if it never ran.
+/// Create `idx_files_hash` if it is missing: after a fresh index's first run,
+/// in one sorted build. It is not in [`crate::db::schema::SCHEMA_CURRENT`]:
+/// a SHA-256 key lands on a random leaf, so kept up through a bulk load, every
+/// walk commit rewrote hundreds of the index's pages. Measured (`memprobe
+/// cold`): bytes written 4.77 → 2.87 GB over `/usr` (373k files), 938 → 855
+/// MiB over the cargo registry (41k), CPU within noise. Only
+/// [`crate::search::find_duplicate_groups`] reads it, and until the build it
+/// sorts the table instead.
 ///
-/// Read from `sqlite_stat1`, which the `PRAGMA optimize` in [`maintain`]
-/// populates — a handful of rows, not the `COUNT(*)` full scan that sizing a
-/// cache to avoid full scans has no business paying. The first token of each
-/// `stat` string is the estimated row count.
-///
-/// **The maximum**, not the first row: `idx_files_content_pending` is partial
-/// (`WHERE content_state = 0`), so it reports only the pending files and would
-/// size the cache for a fraction of the table.
-pub fn analyzed_file_count(conn: &Connection) -> Option<i64> {
-    let mut stmt = conn
-        .prepare("SELECT stat FROM sqlite_stat1 WHERE tbl = 'files'")
-        .ok()?;
-    let rows = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .ok()?
-        .filter_map(Result::ok)
-        .filter_map(|stat| stat.split_whitespace().next()?.parse::<i64>().ok());
-    rows.max()
+/// The sort runs in memory, since a spill would be a plaintext file on a
+/// protected index (see [`maintain`]), so its cost scales with the file count.
+/// Measured (`memprobe cold`, `/usr`, 408k files, 2026-10-11): 20–23 MiB
+/// above the pass's starting RSS, against 4–6 MiB when the sort spilled past
+/// the 8 MiB cache, and under a second either way; the run's peak (280–350
+/// MiB, set by extraction) and its settled RSS did not move.
+pub fn build_hash_index(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash);")
+        .map_err(|e| format!("build hash index: {}", e))
 }
 
-/// Checkpoint → VACUUM → `PRAGMA optimize` → checkpoint — the trailing
-/// checkpoint matters because VACUUM's copy-back and `optimize` refill the
-/// log. Returns whether it vacuumed.
+/// Checkpoint, [`build_hash_index`], VACUUM, `PRAGMA optimize`, checkpoint;
+/// the trailing checkpoint empties what VACUUM's copy-back and `optimize`
+/// wrote to the log. Returns whether it vacuumed. A failed step after the
+/// first checkpoint ends the pass on purpose: one
+/// [`crate::indexing::IndexingService::cancel_db_work`] interrupts only the
+/// statement running then, and the next run's pass tries again.
 ///
-/// Run on a connection from [`crate::db::open::open_maintenance`], never the
-/// indexer's. VACUUM's temporary database goes in the index's own directory,
-/// taken from `db_path` — default temp resolution can land on a RAM-backed
-/// `/tmp`. Peak transient space is roughly three times the index.
-///
-/// The path rather than the directory, so the caller cannot pass one that is
-/// not the index's, and so the readings below can see the log.
+/// Run on a writer from [`crate::db::open_existing`], whose temporaries are in
+/// memory; only VACUUM's go to disk, in the directory of `db_path`, since
+/// default temp resolution can land on a RAM-backed `/tmp`. Peak transient
+/// space is about three times the index. Taking the index path, not a
+/// directory, keeps that directory the index's and lets it read the log.
 pub fn maintain(conn: &Connection, db_path: &str) -> Result<bool, String> {
     let db_dir = std::path::Path::new(db_path)
         .parent()
@@ -881,39 +919,47 @@ pub fn maintain(conn: &Connection, db_path: &str) -> Result<bool, String> {
     #[cfg(feature = "probe")]
     probe.step("maintain checkpoint");
 
+    build_hash_index(conn)?;
+
     let page_count = pragma_number(conn, "page_count")?;
     let freelist = pragma_number(conn, "freelist_count")?;
 
     let worth_it = freelist * 100 >= page_count * VACUUM_MIN_SLACK_PERCENT;
-    // Check space first: on a full filesystem, writes to the `-shm` mmap come
-    // back as SIGBUS rather than as an error — see
+    // A full filesystem turns `-shm` writes into SIGBUS; see
     // `indexing::pipeline::DISK_FLOOR`.
-    let page_size = pragma_number(conn, "page_size")?;
-    let needed = (page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64) * 3;
-    let room = match crate::platform::available_space(std::path::Path::new(db_dir)) {
-        Some(free) if free < needed => {
-            crate::log_warn!(
-                "skipping VACUUM: it needs about {} MiB free in {} and there is {} MiB",
-                needed / (1024 * 1024),
-                db_dir,
-                free / (1024 * 1024)
-            );
-            false
+    let vacuumed = worth_it && {
+        let page_size = pragma_number(conn, "page_size")?;
+        let needed = (page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64) * 3;
+        match crate::platform::available_space(std::path::Path::new(db_dir)) {
+            Some(free) if free < needed => {
+                crate::log_warn!(
+                    "skipping VACUUM: it needs about {} MiB free in {} and there is {} MiB",
+                    needed / (1024 * 1024),
+                    db_dir,
+                    free / (1024 * 1024)
+                );
+                false
+            }
+            _ => true,
         }
-        _ => true,
     };
-
-    let vacuumed = worth_it && room;
     if vacuumed {
+        // SQLCipher is compiled `-DSQLITE_TEMP_STORE=2`, under which anything
+        // but an explicit `FILE` keeps temporary databases in memory, and
+        // VACUUM builds its replacement there: a multi-gigabyte index in RAM.
+        // Only that temporary database is keyed from the main one. A sorter
+        // spill is a raw OS file, plaintext on a protected index, so `FILE`
+        // covers the VACUUM alone and the hash index's sort stays in memory.
         // `temp_store_directory` is a deprecated pragma that writes a
-        // process-wide global, so it is cleared straight after the VACUUM.
+        // process-wide global, so both are restored straight after.
         let escaped = db_dir.replace('\'', "''");
-        conn.execute_batch(&format!("PRAGMA temp_store_directory = '{}';", escaped))
-            .map_err(|e| format!("set temp dir for vacuum: {}", e))?;
         let outcome = conn
-            .execute_batch("VACUUM;")
+            .execute_batch(&format!(
+                "PRAGMA temp_store = FILE; PRAGMA temp_store_directory = '{}'; VACUUM;",
+                escaped
+            ))
             .map_err(|e| format!("vacuum: {}", e));
-        let _ = conn.execute_batch("PRAGMA temp_store_directory = '';");
+        let _ = conn.execute_batch("PRAGMA temp_store = MEMORY; PRAGMA temp_store_directory = '';");
         outcome?;
     }
     #[cfg(feature = "probe")]
@@ -931,13 +977,11 @@ pub fn maintain(conn: &Connection, db_path: &str) -> Result<bool, String> {
     Ok(vacuumed)
 }
 
-/// Per-step log size and elapsed time through [`maintain`], for `probe` builds.
-///
-/// The pass runs on its own connection after the indexer's has gone, so its
-/// cost is invisible from the run's own instrumentation — and VACUUM's
-/// copy-back is the single largest thing that writes to the log in a whole
-/// run. Matches `indexing::pipeline`'s `tail` lines, which cover the half
-/// before this one.
+/// Per-step log size and elapsed time through [`maintain`], for `probe`
+/// builds. The pass runs on its own connection after the indexer's has gone,
+/// so the run's instrumentation cannot see it, and VACUUM's copy-back is the
+/// largest single write to the log in a run. The lines match
+/// `indexing::pipeline`'s `tail` lines.
 #[cfg(feature = "probe")]
 struct MaintainProbe {
     db_path: String,
@@ -961,12 +1005,10 @@ impl MaintainProbe {
             what
         );
     }
-
 }
 
-/// `PRAGMA optimize` acceptances, per index directory — per directory so
-/// concurrent tests against separate scratch indexes cannot satisfy each
-/// other's assertions.
+/// `PRAGMA optimize` acceptances, per index directory, so concurrent tests
+/// on separate scratch indexes cannot satisfy each other's assertions.
 static OPTIMIZED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -976,9 +1018,8 @@ fn note_optimized(db_dir: &str) {
         .or_insert(0) += 1;
 }
 
-/// How many times the index in `db_dir` has had `PRAGMA optimize` run against
-/// it in this process — exists for the stop-optimize integration test. It
-/// records that the statement was accepted, not what SQLite did.
+/// How many times `PRAGMA optimize` was accepted against the index in
+/// `db_dir` in this process, for the stop-optimize integration test.
 pub fn optimize_count(db_dir: &str) -> u64 {
     crate::lock_ok(&OPTIMIZED).get(db_dir).copied().unwrap_or(0)
 }
@@ -993,13 +1034,9 @@ fn note_log_on_entry(db_dir: &str, bytes: u64) {
 }
 
 /// How large the log was when [`maintain`] last started on the index in
-/// `db_dir`; `None` if it has not run there in this process.
-///
-/// A latch in the same shape as [`optimize_count`], and for the same reason:
-/// the value is gone by the time a test could sample it. It exists to pin the
-/// invariant the indexer's tail checkpoints establish — `maintain` is handed
-/// an *empty* log, so its VACUUM's copy-back is the only thing in it rather
-/// than a second layer over a whole run's writing.
+/// `db_dir`; `None` if it has not run there in this process. A latch like
+/// [`optimize_count`], for tests pinning that the indexer's tail checkpoint
+/// hands `maintain` an empty log.
 pub fn log_on_entry_to_maintain(db_dir: &str) -> Option<u64> {
     crate::lock_ok(&LOG_ON_ENTRY).get(db_dir).copied()
 }
@@ -1011,15 +1048,13 @@ fn wal_bytes(db_path: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn get_info(conn: &Connection, key: &str) -> Option<String> {
-    conn.query_row(
-        "SELECT value FROM schema_info WHERE key = ?1",
-        params![key],
-        |r| r.get::<_, String>(0),
-    )
+/// `schema_info.{key}`, or `None` when the row is absent.
+pub(super) fn get_info(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    conn.query_row("SELECT value FROM schema_info WHERE key = ?1", [key], |r| {
+        r.get(0)
+    })
     .optional()
-    .ok()
-    .flatten()
+    .map_err(|e| format!("read schema_info.{}: {}", key, e))
 }
 
 fn set_info(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<usize> {
@@ -1029,10 +1064,23 @@ fn set_info(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<usize
     )
 }
 
-/// Unix seconds of the last *successful* full indexing run; `None` means
-/// "never".
-pub fn get_last_full_index(conn: &Connection) -> Option<u64> {
-    get_info(conn, "last_full_index").and_then(|v| v.parse().ok())
+/// Whether the full-text index was built with positions, which decides how
+/// a search may phrase its `MATCH` (`search::prefilter::fts_literal`). Read
+/// from the index rather than the config, which may already ask for the
+/// other layout before the rebuild that brings it. An index that never
+/// recorded it predates the compact layout, so kept positions.
+pub fn fts_positions(conn: &Connection) -> bool {
+    get_info(conn, "fts_positions")
+        .ok()
+        .flatten()
+        .is_none_or(|v| v != "false")
+}
+
+/// Unix seconds of the last *successful* full indexing run. `Ok(None)` means
+/// never; `Err` means the stamp could not be read, which is not the same:
+/// read as "never", it would start an unrequested full run.
+pub fn get_last_full_index(conn: &Connection) -> Result<Option<u64>, String> {
+    Ok(get_info(conn, "last_full_index")?.and_then(|v| v.parse().ok()))
 }
 
 /// Stamp `last_full_index` with `ts` (unix seconds).
@@ -1042,35 +1090,35 @@ pub fn set_last_full_index(conn: &Connection, ts: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// The `schema_info` key prefixes holding per-root figures. Every one of them
-/// is swept by [`prune_root_stats`], so a new prefix belongs in this list or a
-/// de-configured root leaves it behind forever.
-const ROOT_STAT_PREFIXES: [&str; 2] = ["walk_count:", "counts:"];
+/// `schema_info` key prefix for [`get_root_walk_count`].
+const WALK_COUNT: &str = "walk_count:";
+/// `schema_info` key prefix for [`get_root_counts`].
+const COUNTS: &str = "counts:";
+
+/// The `schema_info` key prefixes holding per-root figures. [`prune_root_stats`]
+/// sweeps only these, so a new prefix belongs here or a de-configured root
+/// leaves it behind.
+const ROOT_STAT_PREFIXES: [&str; 2] = [WALK_COUNT, COUNTS];
 
 fn root_key(prefix: &str, root: &str) -> String {
     format!("{}{}", prefix, root)
 }
 
-fn walk_count_key(root: &str) -> String {
-    root_key(ROOT_STAT_PREFIXES[0], root)
-}
-
-fn counts_key(root: &str) -> String {
-    root_key(ROOT_STAT_PREFIXES[1], root)
-}
-
-/// How many files the last clean walk of `root` reported — the progress bar's
+/// How many files the last clean walk of `root` reported: the progress bar's
 /// denominator. Absent means the root has never been walked to completion.
 /// See [`crate::indexing::RootProgress::walk_denominator`].
 pub fn get_root_walk_count(conn: &Connection, root: &str) -> Option<usize> {
-    get_info(conn, &walk_count_key(root)).and_then(|v| v.parse().ok())
+    get_info(conn, &root_key(WALK_COUNT, root))
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse().ok())
 }
 
 /// Record `n` as `root`'s file count, for the next run's progress bar.
 /// Written only after a walk that finished cleanly: a partial walk's count
 /// would leave every later run dividing by a number that is too small.
 pub fn set_root_walk_count(conn: &Connection, root: &str, n: usize) -> Result<(), String> {
-    set_info(conn, &walk_count_key(root), &n.to_string())
+    set_info(conn, &root_key(WALK_COUNT, root), &n.to_string())
         .map_err(|e| format!("write walk count for {}: {}", root, e))?;
     Ok(())
 }
@@ -1078,7 +1126,37 @@ pub fn set_root_walk_count(conn: &Connection, root: &str, n: usize) -> Result<()
 /// What the last completed run counted under `root`, if one has finished
 /// since the root was configured.
 pub fn get_root_counts(conn: &Connection, root: &str) -> Option<RootCounts> {
-    let stored = get_info(conn, &counts_key(root))?;
+    get_info(conn, &root_key(COUNTS, root))
+        .ok()
+        .flatten()
+        .as_deref()
+        .and_then(parse_counts)
+}
+
+/// How many files the stored per-root counts add up to: exact after each
+/// completed run, which writes them ([`set_root_counts`]), and 0 before the
+/// first. Configured roots never nest ([`crate::config::nested_roots`]), so no
+/// row is counted twice. Sizes the search cache
+/// ([`crate::db::open::open_search_reader`]): a value this build cannot parse
+/// adds nothing, and a failed read gives 0, the floor.
+pub fn stored_file_count(conn: &Connection) -> i64 {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT value FROM schema_info WHERE substr(key, 1, length(?1)) = ?1")
+    else {
+        return 0;
+    };
+    let Ok(values) = stmt.query_map([COUNTS], |r| r.get::<_, String>(0)) else {
+        return 0;
+    };
+    values
+        .filter_map(Result::ok)
+        .filter_map(|v| parse_counts(&v))
+        .fold(0, |sum, c| sum.saturating_add(c.files.max(0)))
+}
+
+/// A stored `counts:` value, `files,fts`; `None` for one this build cannot
+/// parse, which reads like a missing one.
+fn parse_counts(stored: &str) -> Option<RootCounts> {
     let (files, fts) = stored.split_once(',')?;
     Some(RootCounts {
         files: files.parse().ok()?,
@@ -1086,13 +1164,13 @@ pub fn get_root_counts(conn: &Connection, root: &str) -> Option<RootCounts> {
     })
 }
 
-/// Record what `root` holds, for the folder list. Written only at the end of
-/// a run that completed: a stopped run's partial count is worse than the
-/// previous figure.
+/// Record what `root` holds, for the folder list and the search cache's size
+/// ([`stored_file_count`]). Written only at the end of a run that completed:
+/// a stopped run's partial count is worse than the previous figure.
 pub fn set_root_counts(conn: &Connection, root: &str, counts: RootCounts) -> Result<(), String> {
     set_info(
         conn,
-        &counts_key(root),
+        &root_key(COUNTS, root),
         &format!("{},{}", counts.files, counts.fts),
     )
     .map_err(|e| format!("write counts for {}: {}", root, e))?;

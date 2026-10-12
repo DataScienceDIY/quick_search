@@ -1,9 +1,10 @@
 //! The three OpenDocument corpus files: `.odt`, `.ods`, `.odp`.
 //!
 //! No Rust crate writes ODF, so these are assembled from [`super::zipwriter`]
-//! and `format!` — independent of the `zip` 0.6 and `quick-xml` the reader
+//! and `format!`, independent of the `zip` 0.6 and `quick-xml` the reader
 //! uses. The `mimetype` member comes first and uncompressed, as the
-//! packaging spec requires and as LibreOffice writes it.
+//! packaging spec requires and as LibreOffice writes it. LibreOffice's own
+//! `.odt`, `.ods` and `.odp` are committed in [`super::legacy`].
 
 use std::path::Path;
 
@@ -38,8 +39,8 @@ fn package(dir: &Path, name: &str, mime: &str, content: &str) -> std::path::Path
 }
 
 /// Prose alternating `<text:h>` and `<text:p>`, with one sentence in a
-/// `<text:span>` — text-bearing but *not* paragraph-breaking, which is what
-/// distinguishes counting open text elements from flagging them.
+/// `<text:span>`: text-bearing but not paragraph-breaking, which tells counting
+/// open text elements apart from flagging them.
 fn odt(dir: &Path, lcg: &mut Lcg, body: &mut BodyFn<'_>, out: &mut Vec<Sample>) {
     let b = body(lcg, Charset::Unicode);
     let mut xml = String::new();

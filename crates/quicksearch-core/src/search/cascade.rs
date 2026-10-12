@@ -20,96 +20,130 @@
 //! MATCH verified against the text; passes C/D (opt-in) bitap-scan the table.
 //! Path tiers are buffered and flushed last.
 //!
-//! Batches are ordered within themselves, not against each other — do not
-//! assume arrival order is rank order.
+//! Batches are ordered within themselves, not against each other: arrival
+//! order is not rank order.
 
 use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
-
-use rusqlite::OptionalExtension;
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::config::IgnoreSet;
 use crate::query::pattern::clamp_match_range;
 use crate::query::split::CascadeQuery;
-use crate::query::translator::{escape_like, quote_phrase};
 use crate::snippet;
 
-use super::fuzzy::{edit_budget, pigeonhole_chunks, Bitap};
-use super::{SearchHit, SearchOptions};
+use super::fuzzy::{matcher_for, pigeonhole_chunks, Bitap};
+use super::{prefilter, SearchHit, SearchOptions};
 
 mod passes;
+#[cfg(test)]
+mod tests;
 
 /// Cancellation check stride for row-cheap passes; decompression-heavy passes check every row.
 const CANCEL_CHECK_ROWS: usize = 256;
 
 /// Snippet window budget: the GUI trims to column width; mouseover shows the rest.
-const SNIPPET_WINDOW_CHARS: usize = 600;
+const SNIPPET_WINDOW_BYTES: usize = 600;
 
-/// The Content Match snippet for one document body, cut exactly as the
-/// full-text passes cut it; shared with [`crate::live`] so a re-cut matches.
-/// `folded` must be `text` ASCII-lowercased — byte-length preserving, which
-/// is the whole reason offsets found in it can slice `text`.
-pub fn text_snippet(
+/// How one document body matched the term: stage 5 when it occurs exactly
+/// as typed, 6 when only in another case; `count` is what the stage ranks
+/// on, `snippet` the window around the first occurrence.
+#[derive(Debug, Clone)]
+pub struct BodyMatch {
+    pub stage: u8,
+    pub count: usize,
+    pub snippet: snippet::Snippet,
+}
+
+/// The term's match in one document body, verified and cut exactly as the
+/// full-text pass does; `None` when it does not occur. Shared with
+/// [`crate::live`], so a re-cut matches. `lower` is reused scratch for the
+/// folded body a literal is searched in.
+///
+/// One sweep per body where there were three: a literal counts both cases in
+/// its one folded scan, and a wildcard is never folded, its exact-case regex
+/// giving the count and the first match together. Measured against folding
+/// every body, then a folded scan, a case-sensitive recount and, for a
+/// wildcard, a third scan for the window (`searchtime`, cargo registry, 41k
+/// files): `Hash*Map` 103.5–104.2 → 97.4–98.0 ms, `Serial*ize` 56–59 → 53.5;
+/// literals within ±2% (`serialize` 38.6–39.2 → 38.7–39.2).
+pub fn body_match(
     pattern: &crate::query::pattern::TermPattern,
     text: &str,
-    folded: &str,
-) -> Option<snippet::Snippet> {
-    let opts = snippet::Options {
-        approx_chars: SNIPPET_WINDOW_CHARS,
-    };
-    match text_snippet_counted(pattern, text, folded) {
-        Some((snip, _)) => Some(snip),
-        None => pattern.find_first_folded(folded).map(|r| {
+    lower: &mut String,
+) -> Option<BodyMatch> {
+    use crate::query::pattern::TermPattern;
+    match pattern {
+        TermPattern::Empty => None,
+        TermPattern::Literal(_) => {
+            let (typed, term) = (pattern.literal()?, pattern.literal_folded()?);
+            fold_into(lower, text);
+            let found = snippet::extract_folded(text, lower, term, typed, SNIPPET_WINDOW_BYTES)?;
+            let (stage, count) = match found.exact {
+                0 => (6, found.count),
+                exact => (5, exact),
+            };
+            Some(BodyMatch {
+                stage,
+                count,
+                snippet: found.snippet,
+            })
+        }
+        TermPattern::Wildcard(w) => {
+            let (stage, (count, first)) = match w.count_and_first(text, false) {
+                (0, _) => (6, w.count_and_first(text, true)),
+                exact => (5, exact),
+            };
             // A greedy pattern can match megabytes; clamp before the window.
-            let r = clamp_match_range(text, r, SNIPPET_WINDOW_CHARS);
-            snippet::window_around(text, (r.start, r.end), &opts)
-        }),
+            let r = clamp_match_range(text, first?, SNIPPET_WINDOW_BYTES);
+            Some(BodyMatch {
+                stage,
+                count,
+                snippet: snippet::window_around(text, (r.start, r.end), SNIPPET_WINDOW_BYTES),
+            })
+        }
     }
 }
 
-/// [`text_snippet`] for a literal pattern, plus the case-insensitive
-/// occurrence count found on the way. `None` when the pattern is not literal.
-pub fn text_snippet_counted(
-    pattern: &crate::query::pattern::TermPattern,
-    text: &str,
-    folded: &str,
-) -> Option<(snippet::Snippet, usize)> {
-    let opts = snippet::Options {
-        approx_chars: SNIPPET_WINDOW_CHARS,
-    };
-    let term = pattern.literal_folded()?;
-    Some(snippet::extract_folded(text, folded, &[term], &opts))
+/// Fold `text` into `dst`, reusing its allocation. The ASCII fold is
+/// byte-length preserving, so folded offsets are valid in the original.
+fn fold_into(dst: &mut String, text: &str) {
+    dst.clear();
+    dst.push_str(text);
+    dst.make_ascii_lowercase();
 }
 
 /// The fuzzy full-text match in one document body: occurrence count within
 /// the edit budget and the window around the first occurrence; `None` when
-/// absent. Shared with [`crate::live`]; no folded copy — the matcher folds
-/// in its mask table.
+/// absent. Shared with [`crate::live`]. No folded copy: the matcher folds in
+/// its mask table.
 pub fn fuzzy_snippet(
     bitap: &crate::search::fuzzy::Bitap,
     text: &str,
 ) -> Option<(usize, snippet::Snippet)> {
-    let opts = snippet::Options {
-        approx_chars: SNIPPET_WINDOW_CHARS,
-    };
     let (count, first) = bitap.count_and_first(text.as_bytes());
-    first.map(|range| (count, snippet::window_around(text, range, &opts)))
+    first.map(|range| (count, snippet::window_around(text, range, SNIPPET_WINDOW_BYTES)))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outcome {
     pub total: usize,
+    /// Set when a hit was dropped or the cascade stopped before every pass
+    /// ran to its end, so more may match than were returned. An exactly full
+    /// set whose unrun passes would have found nothing reads as limited too:
+    /// telling the two apart means running them.
     pub limited: bool,
 }
 
-/// Run the cascade, streaming rank-ordered batches into `sink`. `Ok(None)`
-/// means cancelled (generation moved on) — the caller sends no completion.
-/// SQL errors are returned as strings *unless* already cancelled (an
-/// interrupted statement is normal cancellation, not an error).
+/// Run the cascade, streaming batches into `sink`, each sorted by rank
+/// within itself. `Ok(None)` means cancelled (the generation moved on), and
+/// the caller sends no completion. SQL errors come back as strings unless the
+/// search was already cancelled: a statement the worker's progress handler
+/// killed (`search::arm_cancel`) is normal cancellation.
 pub fn run(
     conn: &Connection,
     query: &CascadeQuery,
@@ -119,67 +153,47 @@ pub fn run(
     sink: &mut dyn FnMut(Vec<SearchHit>),
 ) -> Result<Option<Outcome>, String> {
     if query.is_empty() {
-        return Ok(Some(Outcome {
-            total: 0,
-            limited: false,
-        }));
+        return Ok(Some(Outcome::default()));
     }
-    let ignore = IgnoreSet::compile(&options.session_ignores)
-        .map_err(|e| format!("session ignore filter: {}", e))?;
+    let mut cx = Cx::new(conn, query, options, generation, latest_gen, sink)?;
 
-    let mut cx = Cx {
-        conn,
-        query,
-        options,
-        generation,
-        latest_gen,
-        ignore,
-        emitted: IdSet::default(),
-        deferred_path: Deferred::default(),
-        deferred_fuzzy_path: Deferred::default(),
-        total: 0,
-        limited: false,
-        sink,
-    };
-
-    // With no term at all the regex drives its own scans; `Path` still
-    // flushes the deferred rank-10 buffer the name pass sets aside.
+    // With no term at all the regex drives its own scans; the path flush
+    // still emits the rank-10 hits the name pass sets aside.
     let passes: &[Pass] = if query.pattern.is_empty() {
-        &[Pass::RegexName, Pass::RegexContent, Pass::Path]
+        &[
+            Pass::RegexName,
+            Pass::RegexContent,
+            Pass::Flush(DeferSlot::Path),
+        ]
     } else {
         &[
             Pass::Filename,
             Pass::FullText,
             Pass::FuzzyFilename,
             Pass::FuzzyFullText,
-            Pass::Path,
-            Pass::FuzzyPath,
+            Pass::Flush(DeferSlot::Path),
+            Pass::Flush(DeferSlot::FuzzyPath),
         ]
     };
     for pass in passes {
         if cx.cancelled() {
             return Ok(None);
         }
-        // Stop, but do not call it truncation: `remaining() == 0` is also
-        // what an exactly-full result set looks like. `flush_pass` sets
-        // `limited` only when it actually drops rows.
+        // A full set with passes left to run may be missing their matches.
+        // Not probed: finding out costs the scans this break saves.
         if cx.remaining() == 0 {
+            cx.limited = true;
             break;
         }
-        let run_pass = match pass {
+        let run_pass = match *pass {
             Pass::Filename => cx.pass_filename(),
             Pass::FullText => cx.pass_fulltext(),
             Pass::FuzzyFilename => cx.pass_fuzzy_filename(),
             Pass::FuzzyFullText => cx.pass_fuzzy_fulltext(),
             Pass::RegexName => cx.pass_regex_name(),
             Pass::RegexContent => cx.pass_regex_content(),
-            Pass::Path => {
-                let d = std::mem::take(&mut cx.deferred_path);
-                cx.flush_deferred(d);
-                Ok(true)
-            }
-            Pass::FuzzyPath => {
-                let d = std::mem::take(&mut cx.deferred_fuzzy_path);
+            Pass::Flush(slot) => {
+                let d = std::mem::take(cx.deferred_mut(slot));
                 cx.flush_deferred(d);
                 Ok(true)
             }
@@ -188,14 +202,12 @@ pub fn run(
             Ok(true) => {}
             Ok(false) => return Ok(None), // cancelled mid-pass
             Err(e) => {
-                // A kill from `interrupt()` arrives as an ordinary SQL error,
-                // and SQLite's interrupt flag carries no ordering edge to the
-                // generation counter bumped just before it: without this
-                // fence a weakly-ordered CPU could report routine
-                // cancellation as `Search failed: interrupted`.
-                std::sync::atomic::fence(Ordering::Acquire);
+                // The handler's kill arrives as `SQLITE_INTERRUPT`, an
+                // ordinary SQL error. It read the moved generation on this
+                // thread, so this later read sees it too, and routine
+                // cancellation never reads as `Search failed: interrupted`.
                 if cx.cancelled() {
-                    return Ok(None); // interrupt() killed the statement
+                    return Ok(None);
                 }
                 return Err(e);
             }
@@ -217,9 +229,16 @@ enum Pass {
     RegexName,
     /// Regex-only: content hits at rank 6.
     RegexContent,
-    /// Flush of the rank 9–10 hits pass A set aside.
+    /// Emit the hits the earlier scans set aside in this slot.
+    Flush(DeferSlot),
+}
+
+/// Which [`Deferred`] buffer a scan's held-back hits go to.
+#[derive(Clone, Copy)]
+enum DeferSlot {
+    /// Ranks 9–10, set aside by pass A and the regex name pass.
     Path,
-    /// Flush of the rank 11 hits pass C set aside.
+    /// Rank 11, set aside by pass C.
     FuzzyPath,
 }
 
@@ -232,7 +251,7 @@ fn col<T: rusqlite::types::FromSql>(row: &rusqlite::Row<'_>, idx: usize) -> Resu
     row.get(idx).map_err(|e| e.to_string())
 }
 
-/// Rank, then name, then path — the path tiebreak makes the order total.
+/// Rank, then name, then path; the path tiebreak makes the order total.
 fn rank_order(a: &SearchHit, b: &SearchHit) -> std::cmp::Ordering {
     a.rank
         .total_cmp(&b.rank)
@@ -255,7 +274,7 @@ fn size_and_mtime(row: &rusqlite::Row<'_>) -> Result<(u64, i64), String> {
 
 /// Same specificity floor as the trigram pass; wildcards count only literals.
 fn path_tiers_enabled(pattern: &crate::query::pattern::TermPattern) -> bool {
-    pattern.literal_char_count() >= 3
+    pattern.literal_char_count() >= prefilter::TRIGRAM_FLOOR
 }
 
 /// Hits ranked below later scans, held back until every better stage emitted.
@@ -265,12 +284,12 @@ struct Deferred {
     overflowed: bool,
 }
 
-/// Longest a pass may sit on hits: draining on a clock keeps a sparse query
-/// painting; short enough to land 2–3 batches inside the GUI's 250 ms fade.
+/// Longest a pass may sit on hits. Draining on a clock keeps a sparse query
+/// painting, and this lands 2–3 batches inside the GUI's 250 ms fade.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(80);
 
-/// Multiplicative hasher (odd constant — a bijection) for SQLite rowids.
-/// Measured ~5% of a fuzzy search over SipHash; don't put SipHash back.
+/// Multiplicative hasher for SQLite rowids (an odd constant, so a bijection).
+/// SipHash measured ~5% of a fuzzy search.
 #[derive(Default)]
 struct IdHasher(u64);
 
@@ -302,6 +321,10 @@ struct Cx<'a> {
     conn: &'a Connection,
     query: &'a CascadeQuery,
     options: &'a SearchOptions,
+    /// Whether the full-text index keeps positions, read from the index each
+    /// search: it decides how every `MATCH` is phrased
+    /// ([`prefilter::fts_literal`]).
+    positions: bool,
     generation: u64,
     latest_gen: &'a AtomicU64,
     ignore: IgnoreSet,
@@ -310,6 +333,9 @@ struct Cx<'a> {
     deferred_path: Deferred,
     /// Rank 11, filled by pass C.
     deferred_fuzzy_path: Deferred,
+    /// Decoder for [`Cx::regex_accepts`]'s per-row content fetches, built once
+    /// per search when the query carries a regex.
+    regex_doc: Option<crate::db::repo::DocDecoder>,
     total: usize,
     limited: bool,
     sink: &'a mut dyn FnMut(Vec<SearchHit>),
@@ -329,10 +355,7 @@ impl FlushClock {
     }
 
     fn due(&self, len: usize, batch: usize) -> bool {
-        if len == 0 {
-            return false;
-        }
-        !self.sent_anything || len >= batch || self.last.elapsed() >= FLUSH_INTERVAL
+        len > 0 && (!self.sent_anything || len >= batch || self.last.elapsed() >= FLUSH_INTERVAL)
     }
 
     fn mark_sent(&mut self) {
@@ -342,6 +365,38 @@ impl FlushClock {
 }
 
 impl<'a> Cx<'a> {
+    fn new(
+        conn: &'a Connection,
+        query: &'a CascadeQuery,
+        options: &'a SearchOptions,
+        generation: u64,
+        latest_gen: &'a AtomicU64,
+        sink: &'a mut dyn FnMut(Vec<SearchHit>),
+    ) -> Result<Cx<'a>, String> {
+        let ignore = IgnoreSet::compile(&options.session_ignores)
+            .map_err(|e| format!("session ignore filter: {}", e))?;
+        Ok(Cx {
+            conn,
+            query,
+            options,
+            positions: crate::db::repo::fts_positions(conn),
+            generation,
+            latest_gen,
+            ignore,
+            emitted: IdSet::default(),
+            deferred_path: Deferred::default(),
+            deferred_fuzzy_path: Deferred::default(),
+            regex_doc: query
+                .regex
+                .as_ref()
+                .map(|_| crate::db::repo::DocDecoder::new())
+                .transpose()?,
+            total: 0,
+            limited: false,
+            sink,
+        })
+    }
+
     fn cancelled(&self) -> bool {
         self.generation != self.latest_gen.load(Ordering::Relaxed)
     }
@@ -351,17 +406,22 @@ impl<'a> Cx<'a> {
     }
 
     /// Headroom so sorting keeps the best candidates, without unbounded growth.
+    /// Saturating, because the CLI's `--limit` has no upper bound.
     fn buffer_cap(&self) -> usize {
-        4096.max(2 * self.remaining())
+        4096.max(self.remaining().saturating_mul(2))
     }
 
-    fn params_with_filters(
-        &self,
-        leading: Vec<rusqlite::types::Value>,
-    ) -> Vec<rusqlite::types::Value> {
+    fn params_with_filters(&self, leading: Vec<Value>) -> Vec<Value> {
         let mut p = leading;
         p.extend(self.query.filter_params.iter().cloned());
         p
+    }
+
+    fn deferred_mut(&mut self, slot: DeferSlot) -> &mut Deferred {
+        match slot {
+            DeferSlot::Path => &mut self.deferred_path,
+            DeferSlot::FuzzyPath => &mut self.deferred_fuzzy_path,
+        }
     }
 
     fn skip(&self, file_id: i64, path: &str) -> bool {
@@ -369,10 +429,25 @@ impl<'a> Cx<'a> {
     }
 
     /// The `regex:` accept-predicate when a regex accompanies a term. The
-    /// path contains the name, so one path check covers both; content is
-    /// fetched only for rows whose path missed.
-    fn regex_accepts(&self, file_id: i64, path: &str, text: Option<&str>) -> Result<bool, String> {
-        let Some(re) = &self.query.regex else {
+    /// path contains the name, so one path check covers both. Content is
+    /// fetched only for rows whose path missed, once per candidate row, so the
+    /// statement is cached, the decoder ([`Cx::regex_doc`]) reused and the
+    /// blob decoded borrowed. Measured (`benches/search_alloc.rs`, "term +
+    /// regex"): 42.6 MiB churned per keystroke → 4.3, and ~1.3x faster, against
+    /// `query_row` plus `decode_all`.
+    fn regex_accepts(
+        &mut self,
+        file_id: i64,
+        path: &str,
+        text: Option<&str>,
+    ) -> Result<bool, String> {
+        let Cx {
+            conn,
+            query,
+            regex_doc,
+            ..
+        } = self;
+        let Some(re) = &query.regex else {
             return Ok(true);
         };
         if re.is_match(path) {
@@ -381,19 +456,23 @@ impl<'a> Cx<'a> {
         if let Some(text) = text {
             return Ok(re.is_match(text));
         }
-        let blob: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT text_zstd FROM documents_text WHERE file_id = ?1",
-                [file_id],
-                |r| r.get(0),
-            )
-            .optional()
+        let doc = regex_doc
+            .as_mut()
+            .expect("built in run() whenever the query carries a regex");
+        let accepted = conn
+            .prepare_cached("SELECT text_zstd FROM documents_text WHERE file_id = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_row([file_id], |r| {
+                    let blob = r.get_ref(0)?.as_blob()?;
+                    // Strict UTF-8 loses nothing: bodies are written from `&str`
+                    // (`repo::store_pending_text`), and `stored_text` also treats
+                    // non-UTF-8 as absent.
+                    Ok(doc.decode(blob).is_some_and(|t| re.is_match(t)))
+                })
+                .optional()
+            })
             .map_err(|e| e.to_string())?;
-        let Some(raw) = blob.and_then(|b| zstd::decode_all(b.as_slice()).ok()) else {
-            return Ok(false);
-        };
-        Ok(re.is_match(&String::from_utf8_lossy(&raw)))
+        Ok(accepted.unwrap_or(false))
     }
 
     /// Hand `buf` over mid-scan if it is due, leaving it empty when it goes.
@@ -407,16 +486,19 @@ impl<'a> Cx<'a> {
         clock.mark_sent();
     }
 
+    /// Sort `buf`, keep what fits under the display limit, and emit it.
+    ///
+    /// Known exception to the "best matches come first" tip: each mid-scan
+    /// flush ([`Cx::flush_if_due`]) spends the limit on the hits found so far,
+    /// so a pass with more than `limit` matches keeps the first `limit` in
+    /// scan order, and an exact name behind `limit` substring matches is not
+    /// shown. Accepted: a query for more of the exact name narrows the pass
+    /// and finds it.
     fn flush_pass(&mut self, mut buf: Vec<SearchHit>, overflowed: bool) {
         buf.sort_by(rank_order);
         let room = self.remaining();
-        if buf.len() > room {
-            buf.truncate(room);
-            self.limited = true;
-        }
-        if overflowed {
-            self.limited = true;
-        }
+        self.limited |= overflowed || buf.len() > room;
+        buf.truncate(room);
         self.total += buf.len();
         for hit in &buf {
             self.emitted.insert(hit.file_id);
@@ -424,7 +506,7 @@ impl<'a> Cx<'a> {
         let batch = self.options.batch.max(1);
         let mut buf = buf.into_iter().peekable();
         while buf.peek().is_some() {
-            // A cancelled search stops emitting — the newer generation owns the UI.
+            // A cancelled search stops emitting: the newer generation owns the UI.
             if self.cancelled() {
                 return;
             }
@@ -439,13 +521,21 @@ impl<'a> Cx<'a> {
         self.flush_pass(deferred.hits, deferred.overflowed);
     }
 
-    /// Sort + cut back to display-limit room once past the cap; true if anything dropped.
+    /// Cut a deferred buffer back to display-limit room once past the cap;
+    /// true if anything dropped. Partitioned, not sorted: [`Cx::flush_pass`]
+    /// sorts what is left. Measured against a full sort (`searchtime`, cargo
+    /// registry, terms every path holds): `1949cf` 25–30 → 21–22 ms, `src`
+    /// 40–42 → 37–39, `crates` 89–99 → 86–87.
     fn enforce_cap(&self, buf: &mut Vec<SearchHit>) -> bool {
         if buf.len() <= self.buffer_cap() {
             return false;
         }
-        buf.sort_by(rank_order);
-        buf.truncate(self.remaining());
+        let keep = self.remaining();
+        if keep > 0 {
+            // In bounds: past the cap, `buf` holds more than `keep` hits.
+            buf.select_nth_unstable_by(keep - 1, rank_order);
+        }
+        buf.truncate(keep);
         true
     }
 }

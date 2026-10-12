@@ -11,7 +11,7 @@ use super::{ExtractError, Extractor, Scratch};
 /// emitted by some MIME source and map to a [`crate::mime::FileType`]
 /// containing TEXT; the cross-check tests in `mime.rs` enforce both. The
 /// `audio/*` and `image/*` entries rely on this extractor registering before
-/// the audio and image extractors — first match wins.
+/// the audio and image extractors; first match wins.
 pub(crate) const EXTRA_TEXT_MIMES: &[&str] = &[
     "application/geo+json",
     "application/javascript",
@@ -38,21 +38,17 @@ pub(crate) const EXTRA_TEXT_MIMES: &[&str] = &[
     "message/rfc822",
 ];
 
-/// Decode into `out`, moving rather than copying where the class allows it.
-///
-/// This extractor is the one place a read buffer *becomes* the answer: a
-/// UTF-8 file's bytes are its text, so consuming the buffer turns the read
-/// into the output with no copy at all. That is why plaintext reads into a
-/// fresh buffer instead of the worker's scratch — a reused buffer here would
-/// trade one allocation for one full-length `memcpy` per file, on the format
-/// that dominates every corpus.
-fn decode_into(bytes: Vec<u8>, path: &Path, out: &mut String) -> Result<(), ExtractError> {
-    let text = crate::textenc::decode_text(bytes, path)?;
-    if out.is_empty() {
-        *out = text;
-    } else {
-        out.push_str(&text);
-    }
+/// Decode `bytes`, a prefix of the file when `truncated`, into `out`. Valid
+/// UTF-8 is moved, not copied, which is why plaintext reads into a fresh
+/// buffer rather than the worker's scratch: reusing one would trade an
+/// allocation for a full-length `memcpy` per file.
+fn decode_into(
+    bytes: Vec<u8>,
+    path: &Path,
+    truncated: bool,
+    out: &mut String,
+) -> Result<(), ExtractError> {
+    super::append(out, crate::textenc::decode_text(bytes, path, truncated)?);
     Ok(())
 }
 
@@ -60,6 +56,11 @@ pub struct PlaintextExtractor;
 
 /// Read `size` bytes from `f`, never more than `cap`. A short read is not an
 /// error: a file that shrank keeps its prefix.
+///
+/// Zero-filled, and still the faster shape: `take(size).read_to_end` into a
+/// reserved `Vec` skips the fill but starts at 8 KiB reads and doubles, so
+/// over `/usr/include` it made 18,431 `read` calls against 15,419 here and
+/// ran 8% slower (`extractprobe`). Measured and rejected.
 fn read_sized(f: &mut File, size: usize, cap: usize, path: &Path) -> Result<Vec<u8>, ExtractError> {
     let size = size.min(cap);
     let mut buf = vec![0u8; size];
@@ -81,24 +82,24 @@ impl Extractor for PlaintextExtractor {
         mime.starts_with("text/") || EXTRA_TEXT_MIMES.contains(&mime)
     }
 
-    /// A file that shrank since the `fstat` keeps its prefix; one that grew is
-    /// read to the sized length — its mtime moved, so the next run re-extracts.
+    /// A file over the read cap fails; one that shrank since the `fstat`
+    /// keeps its prefix; one that grew is read to the sized length; its mtime
+    /// moved, so the next run re-extracts.
     fn extract(
         &self,
         path: &Path,
+        _mime: &str,
         out: &mut String,
         scratch: &mut Scratch,
     ) -> Result<(), ExtractError> {
-        // `read`, not a constant of this module's own: the content pass never
-        // offers a file above it, so the only readers that reach the cap are
-        // the two below — a file that grew, and one whose size is a lie.
-        let cap = scratch.limits().read;
-        let mut f =
-            File::open(path).map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
-        let size = f
-            .metadata()
-            .map_err(|e| format!("plaintext read {}: {}", path.display(), e))?
-            .len() as usize;
+        // Only the prefix that can survive truncation to `limits().text` is
+        // read: UTF-16 is the widest input per byte of UTF-8 output (2:1), so
+        // no file contributes more than twice the limit. Reading a 40 MiB log
+        // whole to keep 256 KiB of it was the content pass's peak memory.
+        let limits = scratch.limits();
+        let cap = limits.read.min(limits.text.saturating_mul(2));
+        let (mut f, meta) = super::open_for_extract(path, limits.read)?;
+        let size = meta.len() as usize;
 
         // procfs/sysfs/some FUSE mounts report zero size for files with content;
         // only they pay the read-to-EOF probe, capped against endless streams.
@@ -107,10 +108,12 @@ impl Extractor for PlaintextExtractor {
             f.take(cap as u64)
                 .read_to_end(&mut buf)
                 .map_err(|e| format!("plaintext read {}: {}", path.display(), e))?;
-            return decode_into(buf, path, out);
+            let truncated = buf.len() == cap;
+            return decode_into(buf, path, truncated, out);
         }
 
-        decode_into(read_sized(&mut f, size, cap, path)?, path, out)
+        let buf = read_sized(&mut f, size, cap, path)?;
+        decode_into(buf, path, size > cap, out)
     }
 
     /// The head belongs to the walk worker and is reused for the next file,
@@ -121,15 +124,7 @@ impl Extractor for PlaintextExtractor {
         head: &[u8],
         out: &mut String,
     ) -> Option<Result<(), ExtractError>> {
-        Some(
-            crate::textenc::decode_borrowed_text(head, path).map(|text| {
-                if out.is_empty() {
-                    *out = text;
-                } else {
-                    out.push_str(&text);
-                }
-            }),
-        )
+        Some(crate::textenc::decode_borrowed_text(head, path).map(|text| super::append(out, text)))
     }
 }
 
@@ -141,25 +136,19 @@ mod tests {
         Scratch::new(&crate::config::Config::default())
     }
 
-    /// The default `maximum_text_file_size`, which is what bounds a read now.
+    /// The default `maximum_text_file_size`, which bounds a read.
     fn max_read() -> usize {
         scratch().limits().read
     }
 
     fn extract(path: &Path) -> Result<String, ExtractError> {
-        let mut out = String::new();
-        PlaintextExtractor
-            .extract(path, &mut out, &mut scratch())
-            .map(|()| out)
+        crate::extract::extract_text(&PlaintextExtractor, path)
     }
 
     fn extract_from_head(path: &Path, head: &[u8]) -> Option<Result<String, ExtractError>> {
         let mut out = String::new();
-        match PlaintextExtractor.extract_from_head(path, head, &mut out) {
-            Some(Ok(())) => Some(Ok(out)),
-            Some(Err(e)) => Some(Err(e)),
-            None => None,
-        }
+        let outcome = PlaintextExtractor.extract_from_head(path, head, &mut out);
+        outcome.map(|r| r.map(|()| out))
     }
 
     fn tmp(tag: &str, body: &[u8]) -> std::path::PathBuf {
@@ -323,6 +312,36 @@ mod tests {
         let mut f = File::open(&p).unwrap();
         let out = read_sized(&mut f, 1_000_000, max_read(), &p).unwrap();
         assert_eq!(out, b"only ten!!");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Twice the text limit: the most any file can contribute to stored text.
+    fn prefix_cap() -> usize {
+        scratch().limits().text * 2
+    }
+
+    #[test]
+    fn a_file_far_over_the_text_limit_reads_only_the_keepable_prefix() {
+        let body = vec![b'z'; prefix_cap() * 3];
+        let p = tmp("prefix", &body);
+        let out = extract(&p).unwrap();
+        assert_eq!(out.len(), prefix_cap(), "read past what can be kept");
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// A read that cuts a multibyte character must not demote a UTF-8 file to
+    /// a legacy charset, which would decode the whole prefix as mojibake.
+    #[test]
+    fn a_character_cut_by_the_prefix_read_is_dropped_not_misdecoded() {
+        let mut body = vec![b'a'; prefix_cap() - 1];
+        body.extend_from_slice("é and more after the cut".as_bytes());
+        let p = tmp("cutchar", &body);
+        let out = extract(&p).unwrap();
+        assert_eq!(out.len(), prefix_cap() - 1, "the cut é's stub is dropped");
+        assert!(
+            out.bytes().all(|b| b == b'a'),
+            "decoded as UTF-8, not legacy"
+        );
         std::fs::remove_file(&p).ok();
     }
 

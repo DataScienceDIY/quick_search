@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn a_stale_draft_cannot_revert_the_indexing_mode_or_security() {
     // The draft as it was when the editor last synced: automatic
-    // indexing, no password — plus one real edit the user staged.
+    // indexing, no password, plus one real edit the user staged.
     let mut draft = Config::default();
     draft.indexing.auto_index = true;
     draft.indexing.reindex_interval_minutes = 60;
@@ -29,40 +29,63 @@ fn a_stale_draft_cannot_revert_the_indexing_mode_or_security() {
     );
 }
 
-/// The guard decision table for leaving a tab, however it is asked for.
-/// Both draft-backed tabs guard their own departure, and neither answers for
-/// the other.
+/// The watch-cap OK and the tour's dismissal are written straight to the
+/// config; an older draft applied afterwards must not bring either back.
 #[test]
-fn leaving_a_dirty_editor_tab_is_guarded_however_it_is_asked_for() {
-    // (the tab, whether *its* editor is the dirty one in the pair below)
-    for (tab, manage_dirty, settings_dirty) in
-        [(Tab::Manage, true, false), (Tab::Settings, false, true)]
-    {
-        assert!(
-            switch_needs_guard(tab, manage_dirty, settings_dirty, false),
-            "{tab:?} must guard its own unapplied edits"
-        );
-        assert!(
-            !switch_needs_guard(tab, false, false, false),
-            "{tab:?}: a clean editor has nothing to ask about"
-        );
-        assert!(
-            !switch_needs_guard(tab, manage_dirty, settings_dirty, true),
-            "{tab:?}: one held navigation at a time"
-        );
-        assert!(
-            !switch_needs_guard(tab, !manage_dirty, !settings_dirty, false),
-            "{tab:?} must not answer for the other editor"
-        );
-    }
-    for tab in [Tab::Search, Tab::Duplicates, Tab::Logs, Tab::Help] {
-        assert!(
-            !switch_needs_guard(tab, true, true, false),
-            "{tab:?} holds no unapplied edits of its own"
-        );
-    }
+fn a_stale_draft_cannot_revert_acknowledgements() {
+    // Staged on a first start, before the warning or the tour was answered,
+    // plus one real edit.
+    let mut draft = Config::default();
+    draft.paths.indexing_paths = vec!["/data".to_string(), "/home".to_string()];
+    assert_eq!(draft.ui.tutorial_seen, Some(false));
+    draft.search.debounce_ms += 100;
+
+    // Since then: OK on the warning, and the tour dismissed.
+    let mut live = draft.clone();
+    live.search.debounce_ms = Config::default().search.debounce_ms;
+    live.ui.watch_cap_warned_roots = live.paths.indexing_paths.clone();
+    live.ui.tutorial_seen = Some(true);
+
+    let mut applied = draft.clone();
+    pin_live_fields(&mut applied, &live);
+    assert_eq!(
+        applied.ui.watch_cap_warned_roots, live.ui.watch_cap_warned_roots,
+        "applying the draft would warn about the same roots again"
+    );
+    assert_eq!(
+        applied.ui.tutorial_seen,
+        Some(true),
+        "applying the draft would bring the tour back"
+    );
+    assert_eq!(applied.search.debounce_ms, draft.search.debounce_ms);
+
+    // Live wins both ways: an acknowledgement the live config no longer
+    // holds is not restored from the draft, and an upgrade's `None` stays.
+    let mut stale = live.clone();
+    live.ui.watch_cap_warned_roots.clear();
+    live.ui.tutorial_seen = None;
+    pin_live_fields(&mut stale, &live);
+    assert!(stale.ui.watch_cap_warned_roots.is_empty());
+    assert_eq!(stale.ui.tutorial_seen, None);
 }
 
+/// A navigation on hold wins: a later request, from a click, the tour or the
+/// search shortcut, leaves the tab and the held navigation as they are, and
+/// does not even ask the guard.
+#[test]
+fn a_held_navigation_drops_a_later_tab_request() {
+    assert_eq!(
+        route_tab_request(true, || panic!("the guard was asked")),
+        TabRoute::Drop
+    );
+    // With nothing held, the guard decides.
+    assert_eq!(route_tab_request(false, || true), TabRoute::Hold);
+    assert_eq!(route_tab_request(false, || false), TabRoute::Switch);
+}
+
+/// The one decision both `request_tab` and the prompt make. Both
+/// draft-backed tabs guard their own departure, and neither answers for the
+/// other.
 #[test]
 fn guard_source_orders_quit_prompts_settings_first() {
     use super::NavIntent::*;
@@ -122,20 +145,6 @@ fn guard_source_orders_quit_prompts_settings_first() {
     }
 }
 
-/// Only a Quit during a running reconcile warns; a tab switch does not end
-/// the pass.
-#[test]
-fn only_quitting_during_a_reconcile_warns() {
-    use super::NavIntent::*;
-    assert!(quit_needs_reconcile_warning(Quit, true));
-    assert!(!quit_needs_reconcile_warning(Quit, false));
-    assert!(!quit_needs_reconcile_warning(SwitchTab(Tab::Search), true));
-    assert!(!quit_needs_reconcile_warning(
-        SwitchTab(Tab::Settings),
-        true
-    ));
-}
-
 /// Every tab is placed on exactly one side of the guard, so a tab added
 /// later cannot quietly inherit "stages nothing".
 #[test]
@@ -157,7 +166,7 @@ fn only_an_empty_duplicates_tab_scans_on_arrival() {
     ));
     for held in [
         DupState::Loading,
-        DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(Vec::new())),
+        DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(Vec::new(), None)),
         DupState::Error("boom".into()),
     ] {
         assert!(
@@ -181,7 +190,7 @@ fn only_an_empty_duplicates_tab_scans_on_arrival() {
 /// index can change out from under it has to reach the tab.
 #[test]
 fn an_index_that_changed_invalidates_what_the_tab_holds() {
-    let loaded = || DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(Vec::new()));
+    let loaded = || DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(Vec::new(), None));
 
     // On screen: the user is looking at it, so redo it now.
     assert_eq!(
@@ -201,9 +210,25 @@ fn an_index_that_changed_invalidates_what_the_tab_holds() {
     );
 
     // Nothing to invalidate.
+    for tab in [
+        Tab::Search,
+        Tab::Manage,
+        Tab::Logs,
+        Tab::Help,
+        Tab::Settings,
+    ] {
+        assert_eq!(
+            dup_invalidation(tab, &DupState::NotLoaded),
+            DupInvalidation::Nothing,
+            "{tab:?}"
+        );
+    }
+
+    // On screen but empty: a rebuild, clear or security change dropped it
+    // without a scan (`drop_duplicates`), and the end of the run refills it.
     assert_eq!(
-        dup_invalidation(Tab::Search, &DupState::NotLoaded),
-        DupInvalidation::Nothing
+        dup_invalidation(Tab::Duplicates, &DupState::NotLoaded),
+        DupInvalidation::Rescan
     );
 
     // In flight: its answer already predates the change, but racing a second
@@ -214,6 +239,12 @@ fn an_index_that_changed_invalidates_what_the_tab_holds() {
             DupInvalidation::WhenItLands
         );
     }
+}
+
+#[test]
+fn the_holder_s_pid_is_named_when_known() {
+    assert_eq!(held_by(Some(4242)), " (process 4242)");
+    assert_eq!(held_by(None), "");
 }
 
 /// The two values the Settings tab's color-scheme box writes, plus

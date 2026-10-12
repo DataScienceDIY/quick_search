@@ -1,13 +1,14 @@
-//! Build identity: bakes the commit into `QS_COMMIT`, and on Windows
-//! compiles a VERSIONINFO resource so Explorer's Properties shows a version.
-//! No dependencies on purpose — a build-script crate would land in
+//! Build identity: bakes the commit into `QS_COMMIT`, and for windows-gnu
+//! (the release target) compiles a VERSIONINFO resource so Explorer's
+//! Properties shows a version.
+//! No dependencies on purpose: a build-script crate would land in
 //! Cargo.lock, and every build here runs `--locked`.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-/// What the version reads as when there is no git and no `QS_COMMIT` — an
-/// unpacked source tarball, say. Never a build failure.
+/// What the version reads as when there is no git and no `QS_COMMIT` (an
+/// unpacked source tarball, say). Never a build failure.
 const UNKNOWN: &str = "unknown";
 
 /// Abbreviated-hash length, matching `git rev-parse --short=7` and the hashes
@@ -25,9 +26,9 @@ fn main() {
 
 // ------------------------------------------------------------- commit ----
 
-/// The short commit hash: `QS_COMMIT` first (CI sets it — `actions/checkout`
-/// leaves a shallow clone owned by another user, so git can't be trusted
-/// there), then git, then [`UNKNOWN`].
+/// The short commit hash: `QS_COMMIT` first (CI sets it, since
+/// `actions/checkout` leaves a shallow clone owned by another user that git
+/// won't trust), then git, then [`UNKNOWN`].
 fn resolve_commit() -> String {
     println!("cargo::rerun-if-env-changed=QS_COMMIT");
     watch_git_head();
@@ -61,17 +62,15 @@ fn git_commit() -> Option<String> {
     short_hash(out.trim())
 }
 
-/// Rebuild when HEAD moves.
-///
-/// Without this cargo only reruns the script when a file in the package
-/// changes, so committing anything outside this crate would leave the previous
-/// hash baked into the binary.
+/// Reruns the script when HEAD moves. Otherwise cargo only reruns it when a
+/// file in the package changes, so a commit outside this crate would leave
+/// the previous hash baked into the binary.
 fn watch_git_head() {
     let Some(git_dir) = git_dir() else { return };
 
     let head = git_dir.join("HEAD");
     watch(&head);
-    // On a branch, HEAD itself only changes on checkout — the ref it names is
+    // On a branch, HEAD itself only changes on checkout; the ref it names is
     // what moves on commit. A detached HEAD holds the hash directly and needs
     // nothing more. The reflog covers the case where the branch ref is packed
     // and so has no loose file to watch.
@@ -83,7 +82,7 @@ fn watch_git_head() {
     watch(&git_dir.join("logs").join("HEAD"));
 }
 
-/// Watch `path`, but only if it exists: cargo treats a `rerun-if-changed` path
+/// Watches `path`, but only if it exists: cargo treats a `rerun-if-changed` path
 /// it cannot stat as permanently dirty, which would recompile this crate on
 /// every single build.
 fn watch(path: &std::path::Path) {
@@ -97,7 +96,7 @@ fn git_dir() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-/// Run git in the crate directory, `None` on any failure — a missing git, a
+/// Runs git in the crate directory; `None` on any failure: a missing git, a
 /// tree that is not a repository, and a repository git refuses to trust all
 /// mean the same thing here.
 fn git(args: &[&str]) -> Option<String> {
@@ -108,10 +107,10 @@ fn git(args: &[&str]) -> Option<String> {
         .args(args)
         .output()
         .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8(out.stdout).ok())
-        .flatten()
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
 }
 
 // ------------------------------------------------ windows VERSIONINFO ----
@@ -217,9 +216,9 @@ fn compile_resource(rc: &std::path::Path, res: &std::path::Path) {
             Err(e) => attempts.push(format!("{tool}: {e}")),
         }
     }
-    // A hard error, not a warning. A Windows build already needs mingw for the
-    // linker, so this only fires on a genuinely broken toolchain — and silently
-    // shipping an .exe with no version is exactly what this exists to prevent.
+    // A hard error, not a warning: a Windows build already needs mingw for the
+    // linker, so this only fires on a broken toolchain, and silently shipping
+    // an .exe with no version is what this exists to prevent.
     panic!(
         "could not compile the Windows version resource. Install \
          binutils-mingw-w64-x86-64 (or set QS_WINDRES to a resource compiler). \

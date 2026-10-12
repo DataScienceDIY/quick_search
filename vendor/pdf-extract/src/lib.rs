@@ -1,15 +1,13 @@
 extern crate lopdf;
 
-use adobe_cmap_parser::{ByteMapping, CodeRange, CIDRange};
 use encoding_rs::UTF_16BE;
-use lopdf::content::Content;
+use lopdf::content::{Content, Operation};
 pub use lopdf::*;
 use euclid::*;
 use lopdf::encryption::DecryptionError;
 use std::fmt::{Debug, Formatter};
 extern crate encoding_rs;
 extern crate euclid;
-extern crate adobe_cmap_parser;
 extern crate type1_encoding_parser;
 extern crate unicode_normalization;
 use euclid::vec2;
@@ -19,7 +17,6 @@ use std::str;
 use std::fs::File;
 use std::slice::Iter;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::marker::PhantomData;
 use std::result::Result;
@@ -37,7 +34,10 @@ pub enum OutputError
 {
     FormatError(std::fmt::Error),
     IoError(std::io::Error),
-    PdfError(lopdf::Error)
+    PdfError(lopdf::Error),
+    /// LOCAL PATCH (QuickSearch): the document spent [`MAX_PDF_WORK`] and
+    /// rendering stopped. Whatever was output before the stop stands.
+    Budget,
 }
 
 impl std::fmt::Display for OutputError
@@ -46,7 +46,8 @@ impl std::fmt::Display for OutputError
         match self {
             OutputError::FormatError(e) => write!(f, "Formating error: {}", e),
             OutputError::IoError(e) => write!(f, "IO error: {}", e),
-            OutputError::PdfError(e) => write!(f, "PDF error: {}", e)
+            OutputError::PdfError(e) => write!(f, "PDF error: {}", e),
+            OutputError::Budget => write!(f, "work budget of {} bytes spent", MAX_PDF_WORK),
         }
     }
 }
@@ -215,28 +216,6 @@ impl<'a, T: FromObj<'a>> FromObj<'a> for Vec<T> {
     }
 }
 
-// XXX: These will panic if we don't have the right number of items
-// we don't want to do that
-impl<'a, T: FromObj<'a>> FromObj<'a> for [T; 4] {
-    fn from_obj(doc: &'a Document, obj: &'a Object) -> Option<Self> {
-        maybe_deref(doc, obj).as_array().map(|x| {
-            let mut all = x.iter()
-                .map(|x| T::from_obj(doc, x).expect("wrong type"));
-            [all.next().unwrap(), all.next().unwrap(), all.next().unwrap(), all.next().unwrap()]
-        }).ok()
-    }
-}
-
-impl<'a, T: FromObj<'a>> FromObj<'a> for [T; 3] {
-    fn from_obj(doc: &'a Document, obj: &'a Object) -> Option<Self> {
-        maybe_deref(doc, obj).as_array().map(|x| {
-            let mut all = x.iter()
-                .map(|x| T::from_obj(doc, x).expect("wrong type"));
-            [all.next().unwrap(), all.next().unwrap(), all.next().unwrap()]
-        }).ok()
-    }
-}
-
 impl<'a> FromObj<'a> for f64 {
     fn from_obj(_doc: &Document, obj: &Object) -> Option<Self> {
         match obj {
@@ -304,9 +283,30 @@ struct PdfSimpleFont<'a> {
     font: &'a Dictionary,
     doc: &'a Document,
     encoding: Option<Vec<u16>>,
-    unicode_map: Option<HashMap<u32, String>>,
+    unicode_map: Option<UnicodeMap>,
     widths: HashMap<CharCode, f64>, // should probably just use i32 here
     missing_width: f64,
+}
+
+/// LOCAL PATCH (QuickSearch): a simple font's unicode map in layers, looked
+/// up in this order: its ToUnicode CMap, its CFF font file's glyph names,
+/// then what its `Differences` add for codes neither maps. The first two are
+/// shared with every font naming the same stream (see [`FontParts`]).
+/// Upstream merged the three into one map per font, so each font sharing a
+/// large CMap copied it; the order keeps the merge's precedence.
+#[derive(Clone, Debug)]
+struct UnicodeMap {
+    to_unicode: Option<Rc<HashMap<u32, String>>>,
+    cff: Option<Rc<HashMap<u32, String>>>,
+    differences: HashMap<u32, String>,
+}
+
+impl UnicodeMap {
+    fn get(&self, code: &u32) -> Option<&String> {
+        self.to_unicode.as_ref().and_then(|map| map.get(code))
+            .or_else(|| self.cff.as_ref().and_then(|map| map.get(code)))
+            .or_else(|| self.differences.get(code))
+    }
 }
 
 #[derive(Clone)]
@@ -314,20 +314,20 @@ struct PdfType3Font<'a> {
     font: &'a Dictionary,
     doc: &'a Document,
     encoding: Option<Vec<u16>>,
-    unicode_map: Option<HashMap<CharCode, String>>,
+    unicode_map: Option<Rc<HashMap<CharCode, String>>>,
     widths: HashMap<CharCode, f64>, // should probably just use i32 here
 }
 
 
-fn make_font<'a>(doc: &'a Document, font: &'a Dictionary) -> Rc<dyn PdfFont + 'a> {
+fn make_font<'a>(doc: &'a Document, font: &'a Dictionary, parts: &mut FontParts) -> Rc<dyn PdfFont + 'a> {
     let subtype = get_name_string(doc, font, b"Subtype");
     dlog!("MakeFont({})", subtype);
     if subtype == "Type0" {
-        Rc::new(PdfCIDFont::new(doc, font))
+        Rc::new(PdfCIDFont::new(doc, font, parts))
     } else if subtype == "Type3" {
-        Rc::new(PdfType3Font::new(doc, font))
+        Rc::new(PdfType3Font::new(doc, font, parts))
     } else {
-        Rc::new(PdfSimpleFont::new(doc, font))
+        Rc::new(PdfSimpleFont::new(doc, font, parts))
     }
 }
 
@@ -371,71 +371,61 @@ fn encoding_to_unicode_table(name: &[u8]) -> Vec<u16> {
     described in Section 5.5.5, “Character Encoding.”
 */
 impl<'a> PdfSimpleFont<'a> {
-    fn new(doc: &'a Document, font: &'a Dictionary) -> PdfSimpleFont<'a> {
+    fn new(doc: &'a Document, font: &'a Dictionary, parts: &mut FontParts) -> PdfSimpleFont<'a> {
         let base_name = get_name_string(doc, font, b"BaseFont");
         let subtype = get_name_string(doc, font, b"Subtype");
 
         let encoding: Option<&Object> = get(doc, font, b"Encoding");
         dlog!("base_name {} {} enc:{:?} {:?}", base_name, subtype, encoding, font);
         let descriptor: Option<&Dictionary> = get(doc, font, b"FontDescriptor");
-        let mut type1_encoding = None;
-        let mut unicode_map = None;
+        let mut type1_file = None;
+        let mut cff = None;
         if let Some(descriptor) = descriptor {
             dlog!("descriptor {:?}", descriptor);
             if subtype == "Type1" {
                 let file = maybe_get_obj(doc, descriptor, b"FontFile");
                 match file {
-                    Some(&Object::Stream(ref s)) => {
-                        let s = get_contents(s);
-                        //dlog!("font contents {:?}", pdf_to_utf8(&s));
-                        type1_encoding = Some(type1_encoding_parser::get_encoding_map(&s).expect("encoding"));
-                    }
-                    _ => { dlog!("font file {:?}", file) }
-                }
-            } else if subtype == "TrueType" {
-                let file = maybe_get_obj(doc, descriptor, b"FontFile2");
-                match file {
-                    Some(&Object::Stream(ref s)) => {
-                        let _s = get_contents(s);
-                        //File::create(format!("/tmp/{}", base_name)).unwrap().write_all(&s);
-                    }
+                    // LOCAL PATCH (QuickSearch): read below, only if the font
+                    // has no `/Encoding` of its own; it was parsed here
+                    // whether or not anything used it.
+                    Some(&Object::Stream(ref s)) => { type1_file = Some(s); }
                     _ => { dlog!("font file {:?}", file) }
                 }
             }
+            // LOCAL PATCH (QuickSearch): a TrueType `FontFile2` was inflated
+            // here and dropped unread.
 
             let font_file3 = get::<Option<&Object>>(doc, descriptor, b"FontFile3");
             match font_file3 {
                 Some(&Object::Stream(ref s)) => {
                     let subtype = get_name_string(doc, &s.dict, b"Subtype");
                     dlog!("font file {}, {:?}", subtype, s);
-                    let s = get_contents(s);
+                    // LOCAL PATCH (QuickSearch): parsed once per font file
+                    // (see FontParts); a file of another subtype was inflated
+                    // here and dropped unread.
                     if subtype == "Type1C" {
-                        let table = cff_parser::Table::parse(&s).unwrap();
-                        //use std::io::Write;
-                        //File::create(format!("/tmp/{}", base_name)).unwrap().write_all(&s);
-                        
-                        let encoding = table.encoding.get_code_to_sid_table(&table.charset);
+                        cff = Some(parse_once(&mut parts.cff, &mut parts.parsed, s, |s| {
+                            let table = cff_parser::Table::parse(s).unwrap();
+                            let encoding = table.encoding.get_code_to_sid_table(&table.charset);
 
-                        let mapping: HashMap<u32, String> = encoding.into_iter().filter_map(|(cid, sid)| {
-                            let name = cff_parser::string_by_id(&table, sid).unwrap();
-                            if name == ".notdef" {
-                                return None;
-                            }
-                            let unicode = glyphnames::name_to_unicode(&name).or_else(|| {
-                                zapfglyphnames::zapfdigbats_names_to_unicode(name)
-                            });
-                            if unicode.is_none() {
-                                warn!("Couldn't find unicode for {}", name);
-                                return None;
-                            }
-                            let str = String::from_utf16(&[unicode.unwrap()]).unwrap();
-                            Some((cid as u32, str))
-                        }).collect();
-                        unicode_map = Some(mapping);
+                            let mapping: HashMap<u32, String> = encoding.into_iter().filter_map(|(cid, sid)| {
+                                let name = cff_parser::string_by_id(&table, sid).unwrap();
+                                if name == ".notdef" {
+                                    return None;
+                                }
+                                let unicode = glyphnames::name_to_unicode(&name).or_else(|| {
+                                    zapfglyphnames::zapfdigbats_names_to_unicode(name)
+                                });
+                                if unicode.is_none() {
+                                    warn!("Couldn't find unicode for {}", name);
+                                    return None;
+                                }
+                                let str = String::from_utf16(&[unicode.unwrap()]).unwrap();
+                                Some((cid as u32, str))
+                            }).collect();
+                            Rc::new(mapping)
+                        }));
                     }
-
-                    //
-                    //File::create(format!("/tmp/{}", base_name)).unwrap().write_all(&s);
                 }
                 None => {}
                 _ => { dlog!("unexpected") }
@@ -449,14 +439,12 @@ impl<'a> PdfSimpleFont<'a> {
             //dlog!("charset {:?}", charset);
         }
 
-        let mut unicode_map = match unicode_map {
-            Some(mut unicode_map) => {
-                unicode_map.extend(get_unicode_map(doc, font).unwrap_or(HashMap::new()));
-                Some(unicode_map)
-            }
-            None => {
-                get_unicode_map(doc, font)
-            }
+        // LOCAL PATCH (QuickSearch): layered, not merged; see UnicodeMap.
+        let to_unicode = get_unicode_map(doc, font, parts);
+        let mut unicode_map = if to_unicode.is_some() || cff.is_some() {
+            Some(UnicodeMap { to_unicode, cff, differences: HashMap::new() })
+        } else {
+            None
         };
 
 
@@ -491,14 +479,14 @@ impl<'a> PdfSimpleFont<'a> {
                                     table[code as usize] = unicode;
                                     if let Some(ref mut unicode_map) = unicode_map {
                                         let be = [unicode];
-                                        match unicode_map.entry(code as u32) {
+                                        match unicode_map.get(&(code as u32)) {
                                             // If there's a unicode table entry missing use one based on the name
-                                            Entry::Vacant(v) => { v.insert(String::from_utf16(&be).unwrap()); }
-                                            Entry::Occupied(e) => {
-                                                if e.get() != &String::from_utf16(&be).unwrap() {
-                                                    let normal_match  = e.get().nfkc().eq(String::from_utf16(&be).unwrap().nfkc());
+                                            None => { unicode_map.differences.insert(code as u32, String::from_utf16(&be).unwrap()); }
+                                            Some(e) => {
+                                                if e != &String::from_utf16(&be).unwrap() {
+                                                    let normal_match  = e.nfkc().eq(String::from_utf16(&be).unwrap().nfkc());
                                                     if !normal_match {
-                                                        warn!("Unicode mismatch {} {} {:?} {:?} {:?}", normal_match, name, e.get(), String::from_utf16(&be), be);
+                                                        warn!("Unicode mismatch {} {} {:?} {:?} {:?}", normal_match, name, e, String::from_utf16(&be), be);
                                                     }
                                                 }
                                             }
@@ -509,9 +497,9 @@ impl<'a> PdfSimpleFont<'a> {
                                         Some(ref mut unicode_map) if base_name.contains("FontAwesome") => {
                                             // the fontawesome tex package will use glyph names that don't have a corresponding unicode
                                             // code point, so we'll use an empty string instead. See issue #76
-                                            match unicode_map.entry(code as u32) {
-                                                Entry::Vacant(v) => { v.insert("".to_owned()); }
-                                                Entry::Occupied(e) => {
+                                            match unicode_map.get(&(code as u32)) {
+                                                None => { unicode_map.differences.insert(code as u32, "".to_owned()); }
+                                                Some(_) => {
                                                     panic!("unexpected entry in unicode map")
                                                 }
                                             }
@@ -542,18 +530,24 @@ impl<'a> PdfSimpleFont<'a> {
                 encoding_table = Some(table);
             }
             None => {
-                if let Some(type1_encoding) = type1_encoding {
-                    let mut table = Vec::from(PDFDocEncoding);
-                    dlog!("type1encoding");
-                    for (code, name) in type1_encoding {
-                        let unicode = glyphnames::name_to_unicode(&pdf_to_utf8(&name));
-                        if let Some(unicode) = unicode {
-                            table[code as usize] = unicode;
-                        } else {
-                            dlog!("unknown character {}", pdf_to_utf8(&name));
+                if let Some(type1_file) = type1_file {
+                    // LOCAL PATCH (QuickSearch): the table, not the parse, is
+                    // what is kept per font file (see FontParts), so a font
+                    // sharing the file costs no pass over its glyph names.
+                    encoding_table = Some(parse_once(&mut parts.type1, &mut parts.parsed, type1_file, |s| {
+                        let type1_encoding = type1_encoding_parser::get_encoding_map(s).expect("encoding");
+                        let mut table = Vec::from(PDFDocEncoding);
+                        dlog!("type1encoding");
+                        for (code, name) in type1_encoding {
+                            let unicode = glyphnames::name_to_unicode(&pdf_to_utf8(&name));
+                            if let Some(unicode) = unicode {
+                                table[code as usize] = unicode;
+                            } else {
+                                dlog!("unknown character {}", pdf_to_utf8(&name));
+                            }
                         }
-                    }
-                    encoding_table = Some(table)
+                        table
+                    }))
                 } else if subtype == "TrueType" {
                     encoding_table = Some(encodings::WIN_ANSI_ENCODING.iter()
                         .map(|x| if let &Some(x) = x { glyphnames::name_to_unicode(x).unwrap() } else { 0 })
@@ -690,9 +684,9 @@ impl<'a> PdfSimpleFont<'a> {
 
 
 impl<'a> PdfType3Font<'a> {
-    fn new(doc: &'a Document, font: &'a Dictionary) -> PdfType3Font<'a> {
+    fn new(doc: &'a Document, font: &'a Dictionary, parts: &mut FontParts) -> PdfType3Font<'a> {
 
-        let unicode_map = get_unicode_map(doc, font);
+        let unicode_map = get_unicode_map(doc, font, parts);
         let encoding: Option<&Object> = get(doc, font, b"Encoding");
 
         let encoding_table;
@@ -805,15 +799,9 @@ impl<'a> dyn PdfFont + 'a {
 
 impl<'a> PdfFont for PdfSimpleFont<'a> {
     fn get_width(&self, id: CharCode) -> f64 {
-        let width = self.widths.get(&id);
-        if let Some(width) = width {
-            return *width;
-        } else {
-            let mut widths = self.widths.iter().collect::<Vec<_>>();
-            widths.sort_by_key(|x| x.0);
-            dlog!("missing width for {} len(widths) = {}, {:?} falling back to missing_width {:?}", id, self.widths.len(), widths, self.font);
-            return self.missing_width;
-        }
+        // LOCAL PATCH (QuickSearch): a miss collected and sorted every width
+        // to feed a `dlog!` that expands to nothing.
+        self.widths.get(&id).copied().unwrap_or(self.missing_width)
     }
     /*fn decode(&self, chars: &[u8]) -> String {
         let encoding = self.encoding.as_ref().map(|x| &x[..]).unwrap_or(&PDFDocEncoding);
@@ -911,65 +899,244 @@ struct PdfCIDFont<'a> {
     #[allow(dead_code)]
     doc: &'a Document,
     #[allow(dead_code)]
-    encoding: ByteMapping,
-    to_unicode: Option<HashMap<u32, String>>,
+    encoding: Rc<ByteMapping>,
+    to_unicode: Option<Rc<HashMap<u32, String>>>,
     widths: HashMap<CharCode, f64>, // should probably just use i32 here
     default_width: Option<f64>, // only used for CID fonts and we should probably brake out the different font types
 }
 
-fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary) -> Option<HashMap<u32, String>> {
-    let to_unicode = maybe_get_obj(doc, font, b"ToUnicode");
-    dlog!("ToUnicode: {:?}", to_unicode);
-    let mut unicode_map = None;
-    match to_unicode {
-        Some(&Object::Stream(ref stream)) => {
-            let contents = get_contents(stream);
-            dlog!("Stream: {}", String::from_utf8(contents.clone()).unwrap());
+/// LOCAL PATCH (QuickSearch): the code-to-CID mapping of a Type0 font's
+/// `/Encoding`, which adobe-cmap-parser used to supply. `width` is in bytes;
+/// that parser stored half of it, so an embedded two-byte CMap was read one
+/// byte at a time.
+struct ByteMapping {
+    /// Scanned for every character shown, up to four times (once per code
+    /// width), so at most [`MAX_CODESPACE_RANGES`].
+    codespace: Vec<CodeRange>,
+    /// Sorted by `src_code_lo`, so a code's range is found by binary search.
+    cid: Vec<CIDRange>,
+}
 
-            let cmap = adobe_cmap_parser::get_unicode_map(&contents).unwrap();
-            let mut unicode = HashMap::new();
-            // "It must use the beginbfchar, endbfchar, beginbfrange, and endbfrange operators to
-            // define the mapping from character codes to Unicode character sequences expressed in
-            // UTF-16BE encoding."
-            for (&k, v) in cmap.iter() {
-                let mut be: Vec<u16> = Vec::new();
-                let mut i = 0;
-                assert!(v.len() % 2 == 0);
-                while i < v.len() {
-                    be.push(((v[i] as u16) << 8) | v[i+1] as u16);
-                    i += 2;
+struct CodeRange {
+    width: u32,
+    start: u32,
+    end: u32,
+}
+
+struct CIDRange {
+    src_code_lo: u32,
+    src_code_hi: u32,
+    dst_cid_lo: u32,
+    /// LOCAL PATCH (QuickSearch): the highest `src_code_hi` of this range and
+    /// of every range sorted before it (see PdfCIDFont::cid).
+    reach: u32,
+}
+
+/// LOCAL PATCH (QuickSearch): the widest `beginbfrange` range read, in codes;
+/// a wider one is skipped. A full two-byte range is exactly this wide.
+const MAX_CMAP_RANGE: u32 = 1 << 16;
+
+/// LOCAL PATCH (QuickSearch): the most entries one CMap defines, or CID
+/// ranges an `/Encoding` defines. Reading stops there and keeps what it has.
+const MAX_CMAP_ENTRIES: usize = 1 << 17;
+
+/// LOCAL PATCH (QuickSearch): the most codespace ranges an `/Encoding`
+/// defines; later ones are dropped. The spec allows 100 per
+/// `begincodespacerange` block, and real CMaps define a handful.
+const MAX_CODESPACE_RANGES: usize = 256;
+
+/// LOCAL PATCH (QuickSearch): the longest ToUnicode destination string read,
+/// in bytes, the PDF spec's limit; an entry mapping to a longer one is
+/// skipped.
+const MAX_CMAP_DST: usize = 512;
+
+/// LOCAL PATCH (QuickSearch): the most text one ToUnicode CMap maps, in
+/// destination bytes summed over its entries. A range copies its destination
+/// for every code it spans, so the caps on entries and on a destination's
+/// length still admit 64 MiB. Reading stops there and keeps what it has, as
+/// at [`MAX_CMAP_ENTRIES`].
+const MAX_CMAP_TEXT: usize = 16 << 20;
+
+/// LOCAL PATCH (QuickSearch): a CMap's operations, tokenized by lopdf's
+/// content parser, which replaces adobe-cmap-parser: that one panicked on a
+/// CMap it could not parse and expanded `beginbfrange` code by code, so a
+/// 4-byte full range was 2^32 inserts. Each `end...` operator receives the
+/// entries before it as operands. `None` if the tokenizer rejects the
+/// stream; one it reads only partway yields what it read.
+fn cmap_operations(content: &[u8]) -> Option<Vec<Operation>> {
+    Content::decode(content).ok().map(|c| c.operations)
+}
+
+/// A CMap code: the string's bytes, big-endian.
+fn cmap_code(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0, |code, &b| (code << 8) | b as u32)
+}
+
+/// A CMap destination string as UTF-16 code units. An odd last byte is a
+/// unit of its own. `None` past [`MAX_CMAP_DST`] bytes.
+fn cmap_utf16(bytes: &[u8]) -> Option<Vec<u16>> {
+    if bytes.len() > MAX_CMAP_DST {
+        return None;
+    }
+    Some(bytes.chunks(2).map(|unit| cmap_code(unit) as u16).collect())
+}
+
+/// Map `code` to the UTF-16 text `units`, spending one of the `left` entries
+/// and the text's bytes from `text_left`; false once either is spent.
+/// Invalid UTF-16, such as a lone surrogate, maps nothing.
+fn put_unicode(map: &mut HashMap<u32, String>, left: &mut usize, text_left: &mut usize, code: u32, units: &[u16]) -> bool {
+    let bytes = 2 * units.len();
+    if *left == 0 || *text_left < bytes {
+        return false;
+    }
+    *left -= 1;
+    *text_left -= bytes;
+    if let Ok(s) = String::from_utf16(units) {
+        map.insert(code, s);
+    }
+    true
+}
+
+// "It must use the beginbfchar, endbfchar, beginbfrange, and endbfrange operators to
+// define the mapping from character codes to Unicode character sequences expressed in
+// UTF-16BE encoding."
+fn to_unicode_map(content: &[u8]) -> Option<HashMap<u32, String>> {
+    let mut map = HashMap::new();
+    let mut left = MAX_CMAP_ENTRIES;
+    let mut text_left = MAX_CMAP_TEXT;
+    'cmap: for op in cmap_operations(content)? {
+        match op.operator.as_str() {
+            "endbfchar" => {
+                for entry in op.operands.chunks_exact(2) {
+                    if let (Ok(code), Ok(Some(dst))) = (entry[0].as_str(), entry[1].as_str().map(cmap_utf16)) {
+                        if !put_unicode(&mut map, &mut left, &mut text_left, cmap_code(code), &dst) {
+                            break 'cmap;
+                        }
+                    }
                 }
-                match &be[..] {
-                    [0xd800 ..= 0xdfff] => {
-                        // this range is not specified as not being encoded
-                        // we ignore them so we don't an error from from_utt16
+            }
+            "endbfrange" => {
+                for entry in op.operands.chunks_exact(3) {
+                    let (Ok(lo), Ok(hi)) = (entry[0].as_str(), entry[1].as_str()) else { continue };
+                    let (lo, hi) = (cmap_code(lo), cmap_code(hi));
+                    if hi < lo || hi - lo >= MAX_CMAP_RANGE {
                         continue;
                     }
-                    _ => {}
+                    match &entry[2] {
+                        // Each code after the first advances the last unit by one.
+                        Object::String(dst, _) => {
+                            let Some(mut units) = cmap_utf16(dst) else { continue };
+                            for code in lo..=hi {
+                                if !put_unicode(&mut map, &mut left, &mut text_left, code, &units) {
+                                    break 'cmap;
+                                }
+                                if let Some(last) = units.last_mut() {
+                                    *last = last.wrapping_add(1);
+                                }
+                            }
+                        }
+                        Object::Array(dsts) => {
+                            for (code, dst) in (lo..=hi).zip(dsts) {
+                                if let Ok(Some(dst)) = dst.as_str().map(cmap_utf16) {
+                                    if !put_unicode(&mut map, &mut left, &mut text_left, code, &dst) {
+                                        break 'cmap;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                let s = String::from_utf16(&be).unwrap();
-
-                unicode.insert(k, s);
             }
-            unicode_map = Some(unicode);
-
-            dlog!("map: {:?}", unicode_map);
+            _ => {}
         }
-        None => { }
+    }
+    Some(map)
+}
+
+/// A Type0 font's `/Encoding` CMap. One the tokenizer rejects maps no codes,
+/// so the font's strings decode to nothing.
+fn byte_mapping(content: &[u8]) -> ByteMapping {
+    let mut mapping = ByteMapping { codespace: Vec::new(), cid: Vec::new() };
+    for op in cmap_operations(content).unwrap_or_default() {
+        match op.operator.as_str() {
+            "endcodespacerange" => {
+                for entry in op.operands.chunks_exact(2) {
+                    if let (Ok(start), Ok(end)) = (entry[0].as_str(), entry[1].as_str()) {
+                        mapping.codespace.push(CodeRange { width: start.len() as u32, start: cmap_code(start), end: cmap_code(end) });
+                    }
+                }
+            }
+            "endcidrange" => {
+                for entry in op.operands.chunks_exact(3) {
+                    if let (Ok(lo), Ok(hi), Ok(cid)) = (entry[0].as_str(), entry[1].as_str(), entry[2].as_i64()) {
+                        mapping.cid.push(CIDRange { src_code_lo: cmap_code(lo), src_code_hi: cmap_code(hi), dst_cid_lo: cid as u32, reach: 0 });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    mapping.codespace.truncate(MAX_CODESPACE_RANGES);
+    mapping.cid.truncate(MAX_CMAP_ENTRIES);
+    mapping.cid.sort_by_key(|range| range.src_code_lo);
+    let mut reach = 0;
+    for range in &mut mapping.cid {
+        reach = reach.max(range.src_code_hi);
+        range.reach = reach;
+    }
+    mapping
+}
+
+/// LOCAL PATCH (QuickSearch): what fonts parse out of their sub-streams,
+/// keyed by the stream's address as `Processor.font_table` keys fonts, so
+/// font dictionaries naming one ToUnicode CMap, `/Encoding` CMap or font file
+/// parse it once per document and share the result. Upstream parsed it again
+/// for each font dictionary, uncharged. `parsed` adds up the decoded bytes of
+/// the parses since the `Tf` that last built a font, which charges them.
+#[derive(Default)]
+struct FontParts {
+    to_unicode: HashMap<usize, Option<Rc<HashMap<u32, String>>>>,
+    encodings: HashMap<usize, Rc<ByteMapping>>,
+    /// A Type1 font file's built-in encoding, as the table it gives.
+    type1: HashMap<usize, Vec<u16>>,
+    /// A Type1C font file's glyph names, as unicode.
+    cff: HashMap<usize, Rc<HashMap<u32, String>>>,
+    parsed: u64,
+}
+
+/// LOCAL PATCH (QuickSearch): `parse` of `stream`'s decoded content, from
+/// `cache` or parsed now, adding the decoded length to `parsed`.
+fn parse_once<T: Clone>(cache: &mut HashMap<usize, T>, parsed: &mut u64, stream: &Stream, parse: impl FnOnce(&[u8]) -> T) -> T {
+    cache.entry(std::ptr::from_ref::<Stream>(stream) as usize).or_insert_with(|| {
+        let content = get_contents(stream);
+        *parsed += content.len() as u64;
+        parse(&content)
+    }).clone()
+}
+
+fn get_unicode_map<'a>(doc: &'a Document, font: &'a Dictionary, parts: &mut FontParts) -> Option<Rc<HashMap<u32, String>>> {
+    let to_unicode = maybe_get_obj(doc, font, b"ToUnicode");
+    dlog!("ToUnicode: {:?}", to_unicode);
+    match to_unicode {
+        Some(&Object::Stream(ref stream)) => {
+            parse_once(&mut parts.to_unicode, &mut parts.parsed, stream, |s| to_unicode_map(s).map(Rc::new))
+        }
+        None => None,
         Some(&Object::Name(ref name)) => {
             let name = pdf_to_utf8(name);
             if name != "Identity-H" {
                 todo!("unsupported ToUnicode name: {:?}", name);
             }
+            None
         }
         _ => { panic!("unsupported cmap {:?}", to_unicode)}
     }
-    unicode_map
 }
 
 
 impl<'a> PdfCIDFont<'a> {
-    fn new(doc: &'a Document, font: &'a Dictionary) -> PdfCIDFont<'a> {
+    fn new(doc: &'a Document, font: &'a Dictionary, parts: &mut FontParts) -> PdfCIDFont<'a> {
         let base_name = get_name_string(doc, font, b"BaseFont");
         let descendants = maybe_get_array(doc, font, b"DescendantFonts").expect("Descendant fonts required");
         let ciddict = maybe_deref(doc, &descendants[0]).as_dict().expect("should be CID dict");
@@ -981,15 +1148,13 @@ impl<'a> PdfCIDFont<'a> {
                 let name = pdf_to_utf8(name);
                 dlog!("encoding {:?}", name);
                 if name == "Identity-H" || name == "Identity-V" {
-                    ByteMapping { codespace: vec![CodeRange{width: 2, start: 0, end: 0xffff }], cid: vec![CIDRange{ src_code_lo: 0, src_code_hi: 0xffff, dst_CID_lo: 0 }]}
+                    Rc::new(ByteMapping { codespace: vec![CodeRange{width: 2, start: 0, end: 0xffff }], cid: vec![CIDRange{ src_code_lo: 0, src_code_hi: 0xffff, dst_cid_lo: 0, reach: 0xffff }]})
                 } else {
                     panic!("unsupported encoding {}", name);
                 }
             }
             &Object::Stream(ref stream) => {
-                let contents = get_contents(stream);
-                dlog!("Stream: {}", String::from_utf8(contents.clone()).unwrap());
-                adobe_cmap_parser::get_byte_mapping(&contents).unwrap()
+                parse_once(&mut parts.encodings, &mut parts.parsed, stream, |s| Rc::new(byte_mapping(s)))
             }
             _ => { panic!("unsupported encoding {:?}", encoding)}
         };
@@ -999,7 +1164,7 @@ impl<'a> PdfCIDFont<'a> {
         // We should also look inside the truetype data to see if there's a cmap table. It will help us convert as well.
         // This won't work if the cmap has been subsetted. A better approach might be to hash glyph contents and use that against
         // a global library of glyph hashes
-        let unicode_map = get_unicode_map(doc, font);
+        let unicode_map = get_unicode_map(doc, font, parts);
 
         dlog!("descendents {:?} {:?}", descendants, ciddict);
 
@@ -1037,9 +1202,34 @@ impl<'a> PdfCIDFont<'a> {
     }
 }
 
+impl<'a> PdfCIDFont<'a> {
+    /// LOCAL PATCH (QuickSearch): the CID `/Encoding` maps `code` to: its
+    /// offset into its range from the range's first CID. Upstream added the
+    /// code itself to that CID, which only an Identity CMap (every range from
+    /// code 0 to CID 0) gets right. The ranges are sorted (see byte_mapping),
+    /// so the one to try is the last starting at or below the code; upstream
+    /// scanned every range for every character. When that range ends below
+    /// the code, an earlier, wider one may still hold it (`<0000> <FFFF>`
+    /// around a nested `<0020> <007E>`): the first whose `reach` gets there
+    /// does, since `reach` only grows.
+    fn cid(&self, code: u32) -> Option<u32> {
+        let cid = &self.encoding.cid;
+        let below = &cid[..cid.partition_point(|range| range.src_code_lo <= code)];
+        let last = below.last()?;
+        let range = if code <= last.src_code_hi {
+            last
+        } else {
+            below.get(below.partition_point(|range| range.reach < code))?
+        };
+        (code - range.src_code_lo).checked_add(range.dst_cid_lo)
+    }
+}
+
 impl<'a> PdfFont for PdfCIDFont<'a> {
+    /// LOCAL PATCH (QuickSearch): `id` is the character code (see
+    /// next_char); `/W` is keyed by CID.
     fn get_width(&self, id: CharCode) -> f64 {
-        let width = self.widths.get(&id);
+        let width = self.cid(id).and_then(|cid| self.widths.get(&cid));
         if let Some(width) = width {
             dlog!("GetWidth {} -> {}", id, *width);
             return *width;
@@ -1071,12 +1261,13 @@ impl<'a> PdfFont for PdfCIDFont<'a> {
             c = ((c as u32) << 8) | next as u32;
         }
         let code = code?;
-        for range in &self.encoding.cid {
-            if code.0 >= range.src_code_lo && code.0 <= range.src_code_hi {
-                return Some((code.0 + range.dst_CID_lo, code.1 as u8));
-            }
-        }
-        None
+        // LOCAL PATCH (QuickSearch): the code itself, not its CID: ToUnicode
+        // maps codes, and the word-spacing test in show_text reads code 32.
+        // Upstream returned the CID, so a font whose `/Encoding` is not an
+        // Identity CMap looked its ToUnicode entries up under the wrong key.
+        // A code no CID range maps still ends the string, as upstream.
+        self.cid(code.0)?;
+        Some((code.0, code.1 as u8))
     }
     fn decode_char(&self, char: CharCode) -> String {
         let s = self.to_unicode.as_ref().and_then(|x| x.get(&char));
@@ -1116,120 +1307,6 @@ impl<'a> fmt::Debug for PdfFontDescriptor<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
-struct Type0Func {
-    domain: Vec<f64>,
-    range: Vec<f64>,
-    contents: Vec<u8>,
-    size: Vec<i64>,
-    bits_per_sample: i64,
-    encode: Vec<f64>,
-    decode: Vec<f64>,
-}
-
-#[allow(dead_code)]
-fn interpolate(x: f64, x_min: f64, _x_max: f64, y_min: f64, y_max: f64) -> f64 {
-    let divisor = x - x_min;
-    if divisor != 0. {
-        y_min + (x - x_min) * ((y_max - y_min) / divisor)
-    } else {
-        // (x - x_min) will be 0 which means we want to discard the interpolation
-        // and arbitrarily choose y_min to match pdfium
-        y_min
-    }
-}
-
-impl Type0Func {
-    #[allow(dead_code)]
-    fn eval(&self, _input: &[f64], _output: &mut [f64]) {
-        let _n_inputs = self.domain.len() / 2;
-        let _n_ouputs = self.range.len() / 2;
-
-    }
-}
-
-#[derive(Clone, Debug)]
-struct Type2Func {
-    c0: Option<Vec<f64>>,
-    c1: Option<Vec<f64>>,
-    n: f64,
-}
-
-#[derive(Clone, Debug)]
-enum Function {
-    Type0(Type0Func),
-    Type2(Type2Func),
-    #[allow(dead_code)]
-    Type3,
-    #[allow(dead_code)]
-    Type4(Vec<u8>)
-}
-
-impl Function {
-    fn new(doc: &Document, obj: &Object) -> Function {
-        let dict = match obj {
-            &Object::Dictionary(ref dict) => dict,
-            &Object::Stream(ref stream) => &stream.dict,
-            _ => panic!()
-        };
-        let function_type: i64 = get(doc, dict, b"FunctionType");
-        let f = match function_type {
-            0 => {
-                // Sampled function
-                let stream = match obj {
-                    &Object::Stream(ref stream) => stream,
-                    _ => panic!()
-                };
-                let range: Vec<f64> = get(doc, dict, b"Range");
-                let domain: Vec<f64> = get(doc, dict, b"Domain");
-                let contents = get_contents(stream);
-                let size: Vec<i64> = get(doc, dict, b"Size");
-                let bits_per_sample = get(doc, dict, b"BitsPerSample");
-                // We ignore 'Order' like pdfium, poppler and pdf.js
-
-                let encode = get::<Option<Vec<f64>>>(doc, dict, b"Encode");
-                // maybe there's some better way to write this.
-                let encode = encode.unwrap_or_else(|| {
-                    let mut default = Vec::new();
-                    for i in &size {
-                        default.extend([0., (i - 1) as f64].iter());
-                    }
-                    default
-                });
-                let decode = get::<Option<Vec<f64>>>(doc, dict, b"Decode").unwrap_or_else(|| range.clone());
-
-                Function::Type0(Type0Func { domain, range, size, contents, bits_per_sample, encode, decode })
-            }
-            2 => {
-                // Exponential interpolation function
-                let c0 = get::<Option<Vec<f64>>>(doc, dict, b"C0");
-                let c1 = get::<Option<Vec<f64>>>(doc, dict, b"C1");
-                let n = get::<f64>(doc, dict, b"N");
-                Function::Type2(Type2Func { c0, c1, n})
-            }
-            3 => {
-                // Stitching function
-                Function::Type3
-            }
-            4 => {
-                // PostScript calculator function
-                let contents = match obj {
-                    &Object::Stream(ref stream) => {
-                        let contents = get_contents(stream);
-                        warn!("unhandled type-4 function");
-                        warn!("Stream: {}", String::from_utf8(contents.clone()).unwrap());
-                        contents
-                    }
-                    _ => { panic!("type 4 functions should be streams") }
-                };
-                Function::Type4(contents)
-            }
-            _ => { panic!("unhandled function type {}", function_type) }
-        };
-        f
-    }
-}
-
 fn as_num(o: &Object) -> f64 {
     match o {
         &Object::Integer(i) => { i as f64 }
@@ -1260,16 +1337,15 @@ fn get_contents(contents: &Stream) -> Vec<u8> {
     }
 }
 
+/// LOCAL PATCH (QuickSearch): colour, colour space and soft mask are gone,
+/// with everything that resolved them. Nothing read them, and resolving them
+/// panicked on legitimate documents (an Indexed colour space, a `gs` naming
+/// no ExtGState), which lost the whole document's text.
 #[derive(Clone)]
 struct GraphicsState<'a>
 {
     ctm: Transform,
     ts: TextState<'a>,
-    smask: Option<Dictionary>,
-    fill_colorspace: ColorSpace,
-    fill_color: Vec<f64>,
-    stroke_colorspace: ColorSpace,
-    stroke_color: Vec<f64>,
     line_width: f64,
 }
 
@@ -1334,35 +1410,6 @@ pub struct MediaBox {
     pub ury: f64
 }
 
-fn apply_state(doc: &Document, gs: &mut GraphicsState, state: &Dictionary) {
-    for (k, v) in state.iter() {
-        let k : &[u8] = k.as_ref();
-        match k {
-            b"SMask" => { match maybe_deref(doc, v)  {
-                &Object::Name(ref name) => {
-                    if name == b"None" {
-                        gs.smask = None;
-                    } else {
-                        panic!("unexpected smask name")
-                    }
-                }
-                &Object::Dictionary(ref dict) => {
-                    gs.smask = Some(dict.clone());
-                }
-                _ => { panic!("unexpected smask type {:?}", v) }
-            }}
-            b"Type" => { match v {
-                &Object::Name(ref name) => {
-                    assert_eq!(name, b"ExtGState")
-                }
-                _ => { panic!("unexpected type") }
-            }}
-            _ => {  dlog!("unapplied state: {:?} {:?}", k, v); }
-        }
-    }
-
-}
-
 #[derive(Debug)]
 pub enum PathOp {
     MoveTo(f64, f64),
@@ -1392,195 +1439,87 @@ impl Path {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct CalGray {
-    white_point: [f64; 3],
-    black_point: Option<[f64; 3]>,
-    gamma: Option<f64>,
-}
-
-#[derive(Clone, Debug)]
-pub struct CalRGB {
-    white_point: [f64; 3],
-    black_point: Option<[f64; 3]>,
-    gamma: Option<[f64; 3]>,
-    matrix: Option<Vec<f64>>
-}
-
-#[derive(Clone, Debug)]
-pub struct Lab {
-    white_point: [f64; 3],
-    black_point: Option<[f64; 3]>,
-    range: Option<[f64; 4]>,
-}
-
-#[derive(Clone, Debug)]
-pub enum AlternateColorSpace {
-    DeviceGray,
-    DeviceRGB,
-    DeviceCMYK,
-    CalRGB(CalRGB),
-    CalGray(CalGray),
-    Lab(Lab),
-    ICCBased(Vec<u8>)
-}
-
-#[derive(Clone)]
-pub struct Separation {
-    name: String,
-    alternate_space: AlternateColorSpace,
-    tint_transform: Box<Function>,
-}
-
-#[derive(Clone)]
-pub enum ColorSpace {
-    DeviceGray,
-    DeviceRGB,
-    DeviceCMYK,
-    DeviceN,
-    Pattern,
-    CalRGB(CalRGB),
-    CalGray(CalGray),
-    Lab(Lab),
-    Separation(Separation),
-    ICCBased(Vec<u8>)
-}
-
-fn make_colorspace<'a>(doc: &'a Document, name: &[u8], resources: &'a Dictionary) -> ColorSpace {
-    match name {
-        b"DeviceGray" => ColorSpace::DeviceGray,
-        b"DeviceRGB" => ColorSpace::DeviceRGB,
-        b"DeviceCMYK" => ColorSpace::DeviceCMYK,
-        b"Pattern" => ColorSpace::Pattern,
-        _ => {
-            let colorspaces: &Dictionary = get(&doc, resources, b"ColorSpace");
-            let cs: &Object = maybe_get_obj(doc, colorspaces, &name[..]).unwrap_or_else(|| panic!("missing colorspace {:?}", &name[..]));
-            if let Ok(cs) = cs.as_array() {
-                let cs_name = pdf_to_utf8(cs[0].as_name().expect("first arg must be a name"));
-                match cs_name.as_ref() {
-                    "Separation" => {
-                        let name = pdf_to_utf8(cs[1].as_name().expect("second arg must be a name"));
-                        let alternate_space = match &maybe_deref(doc, &cs[2]) {
-                            Object::Name(name) => {
-                                match &name[..] {
-                                    b"DeviceGray" => AlternateColorSpace::DeviceGray,
-                                    b"DeviceRGB" => AlternateColorSpace::DeviceRGB,
-                                    b"DeviceCMYK" => AlternateColorSpace::DeviceCMYK,
-                                    _ => panic!("unexpected color space name")
-                                }
-                            }
-                            Object::Array(cs) => {
-                                let cs_name = pdf_to_utf8(cs[0].as_name().expect("first arg must be a name"));
-                                match cs_name.as_ref() {
-                                    "ICCBased" => {
-                                        let stream = maybe_deref(doc, &cs[1]).as_stream().unwrap();
-                                        dlog!("ICCBased {:?}", stream);
-                                        // XXX: we're going to be continually decompressing everytime this object is referenced
-                                        AlternateColorSpace::ICCBased(get_contents(stream))
-                                    }
-                                    "CalGray" => {
-                                        let dict = cs[1].as_dict().expect("second arg must be a dict");
-                                        AlternateColorSpace::CalGray(CalGray {
-                                            white_point: get(&doc, dict, b"WhitePoint"),
-                                            black_point: get(&doc, dict, b"BackPoint"),
-                                            gamma: get(&doc, dict, b"Gamma"),
-                                        })
-                                    }
-                                    "CalRGB" => {
-                                        let dict = cs[1].as_dict().expect("second arg must be a dict");
-                                        AlternateColorSpace::CalRGB(CalRGB {
-                                            white_point: get(&doc, dict, b"WhitePoint"),
-                                            black_point: get(&doc, dict, b"BackPoint"),
-                                            gamma: get(&doc, dict, b"Gamma"),
-                                            matrix: get(&doc, dict, b"Matrix"),
-                                        })
-                                    }
-                                    "Lab" => {
-                                        let dict = cs[1].as_dict().expect("second arg must be a dict");
-                                        AlternateColorSpace::Lab(Lab {
-                                            white_point: get(&doc, dict, b"WhitePoint"),
-                                            black_point: get(&doc, dict, b"BackPoint"),
-                                            range: get(&doc, dict, b"Range"),
-                                        })
-                                    }
-                                    _ => panic!("Unexpected color space name")
-                                }
-                            }
-                            _ => panic!("Alternate space should be name or array {:?}", cs[2])
-                        };
-                        let tint_transform = Box::new(Function::new(doc, maybe_deref(doc, &cs[3])));
-
-                        dlog!("{:?} {:?} {:?}", name, alternate_space, tint_transform);
-                        ColorSpace::Separation(Separation{ name, alternate_space, tint_transform})
-                    }
-                    "ICCBased" => {
-                        let stream = maybe_deref(doc, &cs[1]).as_stream().unwrap();
-                        dlog!("ICCBased {:?}", stream);
-                        // XXX: we're going to be continually decompressing everytime this object is referenced
-                        ColorSpace::ICCBased(get_contents(stream))
-                    }
-                    "CalGray" => {
-                        let dict = cs[1].as_dict().expect("second arg must be a dict");
-                        ColorSpace::CalGray(CalGray {
-                            white_point: get(&doc, dict, b"WhitePoint"),
-                            black_point: get(&doc, dict, b"BackPoint"),
-                            gamma: get(&doc, dict, b"Gamma"),
-                        })
-                    }
-                    "CalRGB" => {
-                        let dict = cs[1].as_dict().expect("second arg must be a dict");
-                        ColorSpace::CalRGB(CalRGB {
-                            white_point: get(&doc, dict, b"WhitePoint"),
-                            black_point: get(&doc, dict, b"BackPoint"),
-                            gamma: get(&doc, dict, b"Gamma"),
-                            matrix: get(&doc, dict, b"Matrix"),
-                        })
-                    }
-                    "Lab" => {
-                        let dict = cs[1].as_dict().expect("second arg must be a dict");
-                        ColorSpace::Lab(Lab {
-                            white_point: get(&doc, dict, b"WhitePoint"),
-                            black_point: get(&doc, dict, b"BackPoint"),
-                            range: get(&doc, dict, b"Range"),
-                        })
-                    }
-                    "Pattern" => {
-                        ColorSpace::Pattern
-                    },
-                    "DeviceGray" => ColorSpace::DeviceGray,
-                    "DeviceRGB" => ColorSpace::DeviceRGB,
-                    "DeviceCMYK" => ColorSpace::DeviceCMYK,
-                    "DeviceN" => ColorSpace::DeviceN,
-                    _ => {
-                        panic!("color_space {:?} {:?} {:?}", name, cs_name, cs)
-                    }
-                }
-            } else if let Ok(cs) = cs.as_name() {
-                match pdf_to_utf8(cs).as_ref() {
-                    "DeviceRGB" => ColorSpace::DeviceRGB,
-                    "DeviceGray" => ColorSpace::DeviceGray,
-                    _ => panic!()
-                }
-            } else {
-                panic!();
-            }
-        }
-    }
-}
+/// LOCAL PATCH (QuickSearch): the saved graphics states one content stream
+/// holds. A `q` past this is counted instead of saved, and the `Q` matching
+/// it only uncounts, so `q` and `Q` stay balanced; upstream saved a clone of
+/// the state for every `q`, without limit.
+const MAX_GS_STACK: usize = 256;
 
 struct Processor<'a> {
-    font_table: HashMap<Vec<u8>, Rc<dyn PdfFont + 'a>>,
+    /// LOCAL PATCH (QuickSearch): fonts keyed by their dictionary's address,
+    /// which is stable while the document is borrowed, not by resource name.
+    /// Names are per resource dictionary: keyed by name, a later page's `/F1`
+    /// decoded with an earlier page's, and every alias parsed its font again.
+    font_table: HashMap<usize, Rc<dyn PdfFont + 'a>>,
+    /// LOCAL PATCH (QuickSearch): what those fonts parsed out of their
+    /// sub-streams.
+    parts: FontParts,
     /// LOCAL PATCH (QuickSearch): nesting of `Do` (Form XObject) recursion.
     xobject_depth: u32,
+    /// LOCAL PATCH (QuickSearch): the work this document has spent; see
+    /// [`MAX_PDF_WORK`].
+    work: u64,
     _none: PhantomData<&'a ()>,
 }
 
 impl<'a> Processor<'a> {
     fn new() -> Processor<'a> {
-        Processor { font_table: HashMap::new(), xobject_depth: 0, _none: PhantomData }
+        Processor { font_table: HashMap::new(), parts: FontParts::default(), xobject_depth: 0, work: 0, _none: PhantomData }
+    }
+
+    /// LOCAL PATCH (QuickSearch): spend `work` of the document's budget; past
+    /// [`MAX_PDF_WORK`], rendering stops with [`OutputError::Budget`].
+    fn charge(&mut self, work: u64) -> Result<(), OutputError> {
+        self.work += work;
+        if self.work > MAX_PDF_WORK {
+            return Err(OutputError::Budget);
+        }
+        Ok(())
+    }
+
+    /// LOCAL PATCH (QuickSearch): `Document::get_page_content` within the
+    /// budget. The page's streams are concatenated newline-separated as lopdf
+    /// does, so graphics and text state carry from one stream into the next.
+    /// `/Contents` may name one stream any number of times, and lopdf inflated
+    /// every copy: here each copy is charged its encoded bytes before it is
+    /// inflated, and the buffer ends the document once `process_stream`
+    /// could not afford it.
+    fn page_content(&mut self, doc: &Document, page_id: ObjectId) -> Result<Vec<u8>, OutputError> {
+        let mut content = Vec::new();
+        for id in doc.get_page_contents(page_id) {
+            if let Ok(stream) = doc.get_object(id).and_then(Object::as_stream) {
+                self.charge(stream.content.len() as u64)?;
+                content.extend_from_slice(&get_contents(stream));
+                content.push(b'\n');
+                if self.work + content.len() as u64 > MAX_PDF_WORK {
+                    return Err(OutputError::Budget);
+                }
+            }
+        }
+        Ok(content)
+    }
+
+    /// LOCAL PATCH (QuickSearch): the font for `font_dict`, from the table or
+    /// built now. Building is charged what the font reads before it is built
+    /// (see [`font_work`]), then the decoded bytes of the sub-streams it was
+    /// first to parse (see [`FontParts`]). Kept out of `process_stream`,
+    /// whose frame every nested `Do` stacks again.
+    fn font(&mut self, doc: &'a Document, font_dict: &'a Dictionary) -> Result<Rc<dyn PdfFont + 'a>, OutputError> {
+        let key = std::ptr::from_ref::<Dictionary>(font_dict) as usize;
+        if let Some(font) = self.font_table.get(&key) {
+            return Ok(font.clone());
+        }
+        self.charge(font_work(doc, font_dict))?;
+        let font = make_font(doc, font_dict, &mut self.parts);
+        self.font_table.insert(key, font.clone());
+        let parsed = std::mem::take(&mut self.parts.parsed);
+        self.charge(parsed)?;
+        Ok(font)
     }
 
     fn process_stream(&mut self, doc: &'a Document, content: Vec<u8>, resources: &'a Dictionary, media_box: &MediaBox, output: &mut dyn OutputDev, page_num: u32) -> Result<(), OutputError> {
+        // LOCAL PATCH (QuickSearch): charge the stream before decoding it.
+        self.charge(content.len() as u64 + MIN_STREAM_WORK)?;
         let content = Content::decode(&content).unwrap();
         let mut gs: GraphicsState = GraphicsState {
             ts: TextState {
@@ -1593,16 +1532,13 @@ impl<'a> Processor<'a> {
                 rise: 0.,
                 tm: Transform2D::identity(),
             },
-            fill_color: Vec::new(),
-            fill_colorspace: ColorSpace::DeviceGray,
-            stroke_color: Vec::new(),
-            stroke_colorspace: ColorSpace::DeviceGray,
             line_width: 1.,
             ctm: Transform2D::identity(),
-            smask: None
         };
         //let mut ts = &mut gs.ts;
         let mut gs_stack = Vec::new();
+        // LOCAL PATCH (QuickSearch): `q`s past MAX_GS_STACK not yet matched.
+        let mut gs_overflow = 0usize;
         let mut mc_stack = Vec::new();
         // XXX: replace tlm with a point for text start
         let mut tlm = Transform2D::identity();
@@ -1632,27 +1568,8 @@ impl<'a> Processor<'a> {
                     gs.ctm = gs.ctm.pre_transform(&m);
                     dlog!("matrix {:?}", gs.ctm);
                 }
-                "CS" => {
-                    let name = operation.operands[0].as_name().unwrap();
-                    gs.stroke_colorspace = make_colorspace(doc, name, resources);
-                }
-                "cs" => {
-                    let name = operation.operands[0].as_name().unwrap();
-                    gs.fill_colorspace = make_colorspace(doc, name, resources);
-                }
-                "SC" | "SCN" => {
-                    gs.stroke_color = match gs.stroke_colorspace {
-                        ColorSpace::Pattern => { dlog!("unhandled pattern color"); Vec::new() }
-                        _ => { operation.operands.iter().map(|x| as_num(x)).collect() }
-                    };
-                }
-                "sc" | "scn" => {
-                    gs.fill_color = match gs.fill_colorspace {
-                        ColorSpace::Pattern => { dlog!("unhandled pattern color"); Vec::new() }
-                        _ => { operation.operands.iter().map(|x| as_num(x)).collect() }
-                    };
-                }
-                "G" | "g" | "RG" | "rg" | "K" | "k" => {
+                // LOCAL PATCH (QuickSearch): colour is not tracked; see GraphicsState.
+                "CS" | "cs" | "SC" | "SCN" | "sc" | "scn" | "G" | "g" | "RG" | "rg" | "K" | "k" => {
                     dlog!("unhandled color operation {:?}", operation);
                 }
                 "TJ" => {
@@ -1711,7 +1628,8 @@ impl<'a> Processor<'a> {
                 "Tf" => {
                     let fonts: &Dictionary = get(&doc, resources, b"Font");
                     let name = operation.operands[0].as_name().unwrap();
-                    let font = self.font_table.entry(name.to_owned()).or_insert_with(|| make_font(doc, get::<&Dictionary>(doc, fonts, name))).clone();
+                    let font_dict: &Dictionary = get(doc, fonts, name);
+                    let font = self.font(doc, font_dict)?;
                     {
                         /*let file = font.get_descriptor().and_then(|desc| desc.get_file());
                     if let Some(file) = file {
@@ -1782,24 +1700,25 @@ impl<'a> Processor<'a> {
                     dlog!("T* matrix {:?}", gs.ts.tm);
                     output.end_line()?;
                 }
-                "q" => { gs_stack.push(gs.clone()); }
+                "q" => {
+                    if gs_stack.len() < MAX_GS_STACK {
+                        gs_stack.push(gs.clone());
+                    } else {
+                        gs_overflow += 1;
+                    }
+                }
                 "Q" => {
-                    let s = gs_stack.pop();
-                    if let Some(s) = s {
+                    if gs_overflow > 0 {
+                        gs_overflow -= 1;
+                    } else if let Some(s) = gs_stack.pop() {
                         gs = s;
                     } else {
                         warn!("No state to pop");
                     }
                 }
-                "gs" => {
-                    let ext_gstate: &Dictionary = get(doc, resources, b"ExtGState");
-                    let name = operation.operands[0].as_name().unwrap();
-                    let state: &Dictionary = get(doc, ext_gstate, name);
-                    apply_state(doc, &mut gs, state);
-                }
                 "i" => { dlog!("unhandled graphics state flattness operator {:?}", operation); }
                 "w" => { gs.line_width = as_num(&operation.operands[0]); }
-                "J" | "j" | "M" | "d" | "ri"  => { dlog!("unknown graphics state operator {:?}", operation); }
+                "J" | "j" | "M" | "d" | "ri" | "gs" => { dlog!("unknown graphics state operator {:?}", operation); }
                 "m" => { path.ops.push(PathOp::MoveTo(as_num(&operation.operands[0]), as_num(&operation.operands[1]))) }
                 "l" => { path.ops.push(PathOp::LineTo(as_num(&operation.operands[0]), as_num(&operation.operands[1]))) }
                 "c" => {
@@ -1841,11 +1760,11 @@ impl<'a> Processor<'a> {
                     dlog!("unhandled path op {:?}", operation);
                 }
                 "S" => {
-                    output.stroke(&gs.ctm, &gs.stroke_colorspace, &gs.stroke_color, &path)?;
+                    output.stroke(&gs.ctm, &path)?;
                     path.ops.clear();
                 }
                 "F" | "f" => {
-                    output.fill(&gs.ctm, &gs.fill_colorspace, &gs.fill_color, &path)?;
+                    output.fill(&gs.ctm, &path)?;
                     path.ops.clear();
                 }
                 "W" | "w*" => { dlog!("unhandled clipping operation {:?}", operation); }
@@ -1865,16 +1784,25 @@ impl<'a> Processor<'a> {
                     let xobject: &Dictionary = get(&doc, resources, b"XObject");
                     let name = operation.operands[0].as_name().unwrap();
                     let xf: &Stream = get(&doc, xobject, name);
-                    let resources = maybe_get_obj(&doc, &xf.dict, b"Resources").and_then(|n| n.as_dict().ok()).unwrap_or(resources);
-                    let contents = get_contents(xf);
-                    // LOCAL PATCH (QuickSearch): a Form XObject that draws
-                    // itself, directly or through a ring, recursed here
-                    // without bound. The same counter also caps the branching
-                    // case, where each level draws the next twice and a
-                    // shallow document costs 2^depth calls.
-                    if self.xobject_depth >= MAX_PDF_RECURSION_DEPTH {
+                    // LOCAL PATCH (QuickSearch): only a Form XObject is
+                    // content; an image's samples were inflated and parsed as
+                    // operators. A form that draws itself, directly or
+                    // through a ring, recursed here without bound: the depth
+                    // counter bounds the stack; Processor.work (MAX_PDF_WORK)
+                    // bounds the branching case, where each level draws the
+                    // next twice. Both tests come before anything is inflated.
+                    if maybe_get_name(doc, &xf.dict, b"Subtype") != Some(&b"Form"[..]) {
+                        dlog!("skipping Do: not a Form XObject");
+                    } else if self.xobject_depth >= MAX_PDF_RECURSION_DEPTH {
                         dlog!("skipping Do: XObject nesting past {}", MAX_PDF_RECURSION_DEPTH);
                     } else {
+                        let resources = maybe_get_obj(&doc, &xf.dict, b"Resources").and_then(|n| n.as_dict().ok()).unwrap_or(resources);
+                        // LOCAL PATCH (QuickSearch): inflating costs the
+                        // encoded bytes, which process_stream's charge of the
+                        // decoded ones misses: a form of empty deflate blocks
+                        // decodes to almost nothing, however often it is drawn.
+                        self.charge(xf.content.len() as u64)?;
+                        let contents = get_contents(xf);
                         self.xobject_depth += 1;
                         let r = self.process_stream(&doc, contents, resources, &media_box, output, page_num);
                         self.xobject_depth -= 1;
@@ -1897,8 +1825,9 @@ pub trait OutputDev {
     fn begin_word(&mut self)-> Result<(), OutputError>;
     fn end_word(&mut self)-> Result<(), OutputError>;
     fn end_line(&mut self)-> Result<(), OutputError>;
-    fn stroke(&mut self, _ctm: &Transform, _colorspace: &ColorSpace, _color: &[f64], _path: &Path)-> Result<(), OutputError> {Ok(())}
-    fn fill(&mut self, _ctm: &Transform, _colorspace: &ColorSpace, _color: &[f64], _path: &Path)-> Result<(), OutputError> {Ok(())}
+    // LOCAL PATCH (QuickSearch): no colour arguments; see GraphicsState.
+    fn stroke(&mut self, _ctm: &Transform, _path: &Path)-> Result<(), OutputError> {Ok(())}
+    fn fill(&mut self, _ctm: &Transform, _path: &Path)-> Result<(), OutputError> {Ok(())}
 }
 
 
@@ -2059,7 +1988,7 @@ impl<'a> OutputDev for SVGOutput<'a> {
     fn begin_word(&mut self) -> Result<(), OutputError> {Ok(())}
     fn end_word(&mut self) -> Result<(), OutputError> {Ok(())}
     fn end_line(&mut self) -> Result<(), OutputError> {Ok(())}
-    fn fill(&mut self, ctm: &Transform, _colorspace: &ColorSpace, _color: &[f64], path: &Path) -> Result<(), OutputError>{
+    fn fill(&mut self, ctm: &Transform, path: &Path) -> Result<(), OutputError>{
         write!(self.file, "<g transform='matrix({}, {}, {}, {}, {}, {})'>",
                ctm.m11,
                ctm.m12,
@@ -2369,9 +2298,76 @@ pub fn extract_text_from_mem_by_pages_encrypted(buffer: &[u8], password: &str) -
 /// document and can be a cycle in a crafted one, and a Form XObject may draw
 /// itself. Both recursions were unbounded, so a few hundred bytes of PDF
 /// could exhaust the stack — which is not a catchable panic: Rust's handler
-/// aborts the process, taking the indexer and the GUI with it. Real documents
-/// nest nothing here more than a handful deep.
-pub const MAX_PDF_RECURSION_DEPTH: u32 = 64;
+/// aborts the process, which under the sandbox is the PDF child and without
+/// it the indexer and the GUI. Real documents nest nothing here more than a
+/// handful deep. The depth bounds the stack, not the work: a form drawing the
+/// next level twice costs 2^depth calls, which [`MAX_PDF_WORK`] bounds.
+///
+/// That this depth fits the worker stack is tested, over the deepest shape
+/// these recursions reach: `extract::pdf`'s
+/// `pdf_recursion_bounds_fit_the_worker_stack`. It was 64, which fit a
+/// release build but overflowed an unoptimized one, where a
+/// `process_stream` frame measures about 7 KB and lopdf's content tokenizer
+/// adds its own nesting inside each. lopdf's own recursions (an indirect
+/// `/Length` chain, a `/Length` inside its own object stream) are not
+/// bounded at all, which is why PDFs are parsed in a child process.
+pub const MAX_PDF_RECURSION_DEPTH: u32 = 32;
+
+/// LOCAL PATCH (QuickSearch): the work one document may spend rendering,
+/// counted in bytes; past it, rendering stops with [`OutputError::Budget`].
+/// Each content stream inflated is charged its encoded length (a page's
+/// `/Contents` entries, a form each time it is drawn), each content stream
+/// entered its decoded length plus [`MIN_STREAM_WORK`], and each font built
+/// what [`font_work`] says it reads plus the decoded length of the font
+/// streams it was first to parse. The 2^depth branching shape is the reason:
+/// a text-free form never fills the caller's text sink, so nothing else stops
+/// it. Here it stops after about half a million streams, measured at 0.3 to
+/// 0.5 s in an optimized build (2026-10-10), or 0.8 s when the form is a tiny
+/// FlateDecode stream, inflated afresh for each draw; an indexer thread
+/// holding a write transaction can afford that. It also bounds what a page's
+/// `/Contents` concatenates, however often one stream repeats.
+pub const MAX_PDF_WORK: u64 = 256 << 20;
+
+/// LOCAL PATCH (QuickSearch): the least a content stream entered costs
+/// against [`MAX_PDF_WORK`], however small, so the budget bounds how many
+/// there are as well as how many bytes are decoded.
+const MIN_STREAM_WORK: u64 = 512;
+
+/// LOCAL PATCH (QuickSearch): the least a font built costs against
+/// [`MAX_PDF_WORK`]. Building a base-14 font's tables takes about 93 µs in an
+/// optimized build, so the budget allows 16,384 fonts, about 1.5 s of them.
+const FONT_WORK: u64 = 16 << 10;
+
+/// LOCAL PATCH (QuickSearch): what a font built costs for each element of the
+/// width and encoding arrays it reads; see [`font_work`].
+const FONT_ELEMENT_WORK: u64 = 8;
+
+/// LOCAL PATCH (QuickSearch): what building `font` costs against
+/// [`MAX_PDF_WORK`], charged before it is built: [`FONT_WORK`], plus
+/// [`FONT_ELEMENT_WORK`] for each element of the `/Widths`, `/W` (nested
+/// arrays included) and `/Differences` arrays it reads. Any number of font
+/// dictionaries may share one such array, and each reads it afresh. A lookup
+/// that fails costs nothing, and does not panic: the build reports it.
+fn font_work(doc: &Document, font: &Dictionary) -> u64 {
+    fn deref<'a>(doc: &'a Document, o: &'a Object) -> Option<&'a Object> {
+        doc.dereference(o).ok().map(|(_, o)| o)
+    }
+    fn array<'a>(doc: &'a Document, dict: &'a Dictionary, key: &[u8]) -> &'a [Object] {
+        let array = dict.get(key).ok().and_then(|o| deref(doc, o)?.as_array().ok());
+        array.map_or(&[][..], Vec::as_slice)
+    }
+    let dict = |o| deref(doc, o).and_then(|o| o.as_dict().ok());
+    let mut elements = array(doc, font, b"Widths").len();
+    if let Some(encoding) = font.get(b"Encoding").ok().and_then(dict) {
+        elements += array(doc, encoding, b"Differences").len();
+    }
+    if let Some(cid) = array(doc, font, b"DescendantFonts").first().and_then(dict) {
+        let w = array(doc, cid, b"W");
+        elements += w.len();
+        elements += w.iter().filter_map(|o| deref(doc, o)?.as_array().ok()).map(Vec::len).sum::<usize>();
+    }
+    FONT_WORK + FONT_ELEMENT_WORK * elements as u64
+}
 
 fn get_inherited<'a, T: FromObj<'a>>(doc: &'a Document, dict: &'a Dictionary, key: &[u8], depth: u32) -> Option<T> {
     let o: Option<T> = get(doc, dict, key);
@@ -2440,7 +2436,8 @@ fn output_doc_inner<'a>(page_num: u32, object_id: ObjectId, doc: &'a Document, p
     let art_box = get::<Option<Vec<f64>>>(&doc, page_dict, b"ArtBox")
         .map(|x| (x[0], x[1], x[2], x[3]));
     output.begin_page(page_num, &media_box, art_box)?;
-    p.process_stream(&doc, doc.get_page_content(object_id).unwrap(), resources, &media_box, output, page_num)?;
+    let content = p.page_content(doc, object_id)?;
+    p.process_stream(&doc, content, resources, &media_box, output, page_num)?;
     output.end_page()?;
     Ok(())
 }

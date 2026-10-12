@@ -71,8 +71,8 @@ VIAddVersionKey "FileDescription" "${APP} ${VERSION} installer"
 !define MUI_FINISHPAGE_TEXT "Installed into $INSTDIR:$\r$\n\
     quicksearch.exe (the app), quicksearch-cli.exe (terminal search),$\r$\n\
     README.md, LICENSE.txt and config_example.toml.$\r$\n$\r$\n\
-    Your settings and search index are created on first run, under your \
-    own account. Upgrading and uninstalling leave both alone."
+    Your settings and index are created on first run, under your own \
+    account; upgrading and uninstalling leave both alone."
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "Run ${APP}"
 !define MUI_FINISHPAGE_RUN_FUNCTION LaunchAsUser
@@ -118,22 +118,36 @@ FunctionEnd
 
 ; -------------------------------------------------------------- sections ----
 
+; Windows will not replace or delete a running executable, and the File or
+; Delete commands that follow would stop halfway through with a write error.
+; Opening a running exe for writing fails, which makes FileOpen a plugin-free
+; "is it still running?" probe that changes nothing: mode a keeps the contents
+; (w would truncate them), and the FileExists test keeps it from creating a
+; missing file. Both exes are probed before either is touched, and a failed
+; open leaves the error flag set for the test at the end.
+!macro AbortIfRunning MSG
+    ClearErrors
+    ${If} ${FileExists} "$INSTDIR\quicksearch.exe"
+        FileOpen $0 "$INSTDIR\quicksearch.exe" a
+        ${IfThen} $0 != "" ${|} FileClose $0 ${|}
+    ${EndIf}
+    ${If} ${FileExists} "$INSTDIR\quicksearch-cli.exe"
+        FileOpen $0 "$INSTDIR\quicksearch-cli.exe" a
+        ${IfThen} $0 != "" ${|} FileClose $0 ${|}
+    ${EndIf}
+    ${If} ${Errors}
+        MessageBox MB_OK|MB_ICONSTOP "${MSG}" /SD IDOK
+        Abort
+    ${EndIf}
+!macroend
+
 Section "!${APP}" SecApp
     SectionIn RO
     SetOutPath "$INSTDIR"
 
-    ; Windows will not replace a running executable, and the File commands below
-    ; would stop halfway through with a write error. Delete fails on a mapped
-    ; image and succeeds quietly when there is nothing there, which makes it a
-    ; plugin-free "is it still running?" test.
-    ClearErrors
-    Delete "$INSTDIR\quicksearch.exe"
-    Delete "$INSTDIR\quicksearch-cli.exe"
-    ${If} ${Errors}
-        MessageBox MB_OK|MB_ICONSTOP \
-            "${APP} is still running. Close it and start this installer again." /SD IDOK
-        Abort
-    ${EndIf}
+    ; File overwrites in place, so nothing is deleted first.
+    !insertmacro AbortIfRunning \
+        "${APP} is still running. Close it and start this installer again."
 
     File "${STAGE}/quicksearch.exe"
     File "${STAGE}/quicksearch-cli.exe"
@@ -169,26 +183,32 @@ Section "Start Menu shortcut" SecStartMenu
     ; One shortcut, no program folder: a single-application folder is noise in
     ; the Windows 10/11 Start menu, and the uninstaller lives in Add/Remove
     ; Programs rather than next to it.
-    ; --toggle rather than a bare launch: it raises the running window
-    ; instead of a second copy refusing to start on the held index lock.
+    ; --toggle hands the activation straight to a running window, where a
+    ; bare launch would first load the config and try the index lock.
     CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\quicksearch.exe" "--toggle" "$INSTDIR\quicksearch.ico"
 SectionEnd
 
-Section "Search hotkey (Ctrl+Alt+F)" SecHotkey
+Section "Search hotkey (Ctrl+Shift+F)" SecHotkey
     ; The .lnk "shortcut key" field is the only thing on Windows that binds a
     ; key to a command, and it is what makes the shortcut work while
     ; QuickSearch is closed - nothing an application registers for itself can
     ; fire when it is not running. Windows only honours the field on a
-    ; shortcut in the Start menu or on the desktop, and only for combinations
-    ; including Ctrl+Alt, which is why this is Ctrl+Alt+F and not the
-    ; Ctrl+Shift+F the Settings tab offers. The in-application shortcut takes
-    ; any combination but only answers while the window is already open, so
-    ; the two are complementary rather than duplicates.
+    ; shortcut in the Start menu or on the desktop. Modifier combinations
+    ; like Ctrl+Shift are accepted as-is; only a bare key gets Ctrl+Alt added
+    ; for it. Ctrl+Shift+F matches the in-application default, which answers
+    ; the key instantly while the window is open; this .lnk binding is the
+    ; slower launch path Explorer takes when it is not. The Settings tab
+    ; rewrites the hotkey of a per-user .lnk only; this all-users one needs
+    ; elevation, so it keeps Ctrl+Shift+F.
+    ;
+    ; Explorer registers this key at logon, so the app's own RegisterHotKey
+    ; for the same combination loses; either way the press works — directly,
+    ; or by Explorer launching `--toggle`, which relays to a running window.
     ;
     ; Rewrites the same shortcut the section above creates: NSIS cannot add a
     ; hotkey to an existing .lnk, and creating it twice is harmless.
     CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\quicksearch.exe" "--toggle" \
-        "$INSTDIR\quicksearch.ico" 0 SW_SHOWNORMAL ALT|CONTROL|F \
+        "$INSTDIR\quicksearch.ico" 0 SW_SHOWNORMAL CONTROL|SHIFT|F \
         "Search your files with ${APP}"
 SectionEnd
 
@@ -203,8 +223,8 @@ SectionEnd
 ; writing it back, and NSIS strings in the standard build are capped at
 ; NSIS_MAX_STRLEN (1024 characters, `makensis -HDRINFO`). ReadRegStr truncates
 ; silently at that cap, so on any machine with a long PATH the write-back would
-; destroy the rest of it - a spectacular failure for an optional checkbox. The
-; README tells people to add the directory themselves.
+; destroy the rest of it - a spectacular failure for an optional checkbox.
+; Anyone who wants quicksearch-cli on PATH adds the directory themselves.
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
     !insertmacro MUI_DESCRIPTION_TEXT ${SecApp} \
@@ -212,9 +232,8 @@ SectionEnd
     !insertmacro MUI_DESCRIPTION_TEXT ${SecStartMenu} \
         "Add ${APP} to the Start menu for all users."
     !insertmacro MUI_DESCRIPTION_TEXT ${SecHotkey} \
-        "Press Ctrl+Alt+F anywhere to search, starting ${APP} if it is not \
-         already running. Windows allows this only on Ctrl+Alt combinations; \
-         the Settings tab has one that takes any keys while ${APP} is open."
+        "Press Ctrl+Shift+F anywhere to search, starting ${APP} if it is not \
+         already running."
     !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} \
         "Add a ${APP} shortcut to the desktop."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
@@ -231,15 +250,10 @@ FunctionEnd
 Section "Uninstall"
     ; Same running-process test as the install side. Stopping here leaves the
     ; installation intact rather than gutted.
-    ClearErrors
+    !insertmacro AbortIfRunning "${APP} is still running. Close it and try again."
+
     Delete "$INSTDIR\quicksearch.exe"
     Delete "$INSTDIR\quicksearch-cli.exe"
-    ${If} ${Errors}
-        MessageBox MB_OK|MB_ICONSTOP \
-            "${APP} is still running. Close it and try again." /SD IDOK
-        Abort
-    ${EndIf}
-
     Delete "$INSTDIR\quicksearch.ico"
     Delete "$INSTDIR\README.md"
     Delete "$INSTDIR\LICENSE.txt"

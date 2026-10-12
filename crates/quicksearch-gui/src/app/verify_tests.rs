@@ -4,7 +4,7 @@ use quicksearch_core::verify::MemberVerdict::{
     DiffersAt, Identical, LengthDiffers, Unreadable as CannotRead,
 };
 
-use crate::test_ui::{click_at, painted_text, painted_text_center, raw_input};
+use crate::test_ui::{click_at, painted_text, painted_text_center, two_pass};
 
 const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
 
@@ -30,20 +30,14 @@ fn report(verdicts: Vec<MemberVerdict>, bytes_read: u64) -> VerifyState {
     }))
 }
 
-/// Two passes: an `egui::Window` is measured on its first frame and placed on
-/// the next, so a single pass paints nothing to read back.
+/// The modal, and whether the frame that painted it closed it.
 fn frame(
     ctx: &egui::Context,
     m: &VerifyModal,
     events: Vec<egui::Event>,
 ) -> (egui::FullOutput, bool) {
-    let _ = ctx.run(raw_input(SCREEN, Vec::new()), |ctx| {
-        verify_modal(ctx, m);
-    });
     let mut closed = false;
-    let out = ctx.run(raw_input(SCREEN, events), |ctx| {
-        closed = verify_modal(ctx, m);
-    });
+    let out = two_pass(ctx, SCREEN, events, |ctx| closed = verify_modal(ctx, m));
     (out, closed)
 }
 

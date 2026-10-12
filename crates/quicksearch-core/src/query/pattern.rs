@@ -3,15 +3,22 @@
 //! A term with an unquoted `*` compiles to a small regex; star-free terms
 //! stay on the [`Literal`](TermPattern::Literal) path.
 //!
-//! `.` never matches `\n`, so a star cannot span lines of extracted text —
-//! a `*` bridging a whole document would produce page-sized snippets.
+//! The two fold case differently. A literal folds ASCII case only: `cafe`
+//! finds `CAFE`, and `café` never finds `CAFÉ`. A `*` pattern and `regex:`
+//! fold Unicode case by the regex crate's simple folds, so `résumé*` finds
+//! `RÉSUMÉ` and `kilo*` a name spelled with U+212A KELVIN SIGN. Every
+//! prefilter in front of them must fold at least as much; see
+//! [`crate::search::prefilter`], and its exception for file contents.
+//!
+//! `.` never matches `\n`, so a star cannot span lines of extracted text; a
+//! `*` bridging a whole document would produce page-sized snippets.
 
 use std::ops::Range;
 
 use regex::{Regex, RegexBuilder};
 
 use super::translator::TranslateError;
-use crate::snippet;
+use crate::search::prefilter::Required;
 
 /// Keeps a hostile pattern (`a{1000000}{1000}`) from ballooning the program.
 const REGEX_SIZE_LIMIT: usize = 4 << 20;
@@ -22,8 +29,8 @@ const COUNT_CAP: usize = 1000;
 /// The cascade term, compiled once at split time.
 #[derive(Debug, Clone, Default)]
 pub enum TermPattern {
-    /// Empty or stars-only. Matches nothing — a bare `*` must not become a
-    /// scan of everything.
+    /// Empty or stars-only. Matches nothing: a bare `*` must not become a scan
+    /// of everything.
     #[default]
     Empty,
     Literal(LiteralPattern),
@@ -41,7 +48,7 @@ pub struct WildcardPattern {
     /// Literal chunks between stars, in order. Never empty and no chunk is
     /// empty: edge stars fold into the regexes, doubled stars collapse.
     segments: Vec<String>,
-    /// Unanchored, non-greedy joins — leftmost-shortest, what a snippet wants.
+    /// Unanchored, non-greedy joins: leftmost-shortest, what a snippet wants.
     search_cs: Regex,
     search_ci: Regex,
     /// Anchored (`^…$`) regexes for whole-field matching (rank tiers 1/2).
@@ -50,7 +57,7 @@ pub struct WildcardPattern {
 }
 
 /// One piece of the search phrase. `glob` is true only for plain unquoted
-/// words — quoted phrases and `key:value` text keep their stars literal.
+/// words; quoted phrases and `key:value` text keep their stars literal.
 #[derive(Debug, Clone)]
 pub struct TermPart {
     pub text: String,
@@ -60,6 +67,39 @@ pub struct TermPart {
 enum Chunk {
     Lit(String),
     Star,
+}
+
+impl WildcardPattern {
+    fn search(&self, case_insensitive: bool) -> &Regex {
+        if case_insensitive {
+            &self.search_ci
+        } else {
+            &self.search_cs
+        }
+    }
+
+    fn anchored(&self, case_insensitive: bool) -> &Regex {
+        if case_insensitive {
+            &self.anchored_ci
+        } else {
+            &self.anchored_cs
+        }
+    }
+
+    /// Non-overlapping occurrences in `text`, stopping at 1000 where the
+    /// cascade's `count_frac` saturates, and the first of them, in one sweep.
+    pub fn count_and_first(
+        &self,
+        text: &str,
+        case_insensitive: bool,
+    ) -> (usize, Option<Range<usize>>) {
+        let mut found = self
+            .search(case_insensitive)
+            .find_iter(text)
+            .take(COUNT_CAP);
+        let first = found.next().map(|m| m.range());
+        (first.as_ref().map_or(0, |_| 1 + found.count()), first)
+    }
 }
 
 impl TermPattern {
@@ -110,9 +150,8 @@ impl TermPattern {
             return Ok(TermPattern::Empty);
         }
         if !has_star {
-            let Some(text) = segments.into_iter().next() else {
-                return Ok(TermPattern::Empty);
-            };
+            // Star-free chunks merge into one segment.
+            let text = segments.into_iter().next().expect("segments is non-empty");
             let folded = text.to_ascii_lowercase();
             return Ok(TermPattern::Literal(LiteralPattern { text, folded }));
         }
@@ -159,7 +198,7 @@ impl TermPattern {
         }
     }
 
-    /// [`literal`](Self::literal), ASCII-folded — the form every
+    /// [`literal`](Self::literal), ASCII-folded: the form every
     /// case-insensitive scan searches with.
     pub fn literal_folded(&self) -> Option<&str> {
         match self {
@@ -192,32 +231,34 @@ impl TermPattern {
                     text == l.text
                 }
             }
-            TermPattern::Wildcard(w) => {
-                let re = if case_insensitive {
-                    &w.anchored_ci
-                } else {
-                    &w.anchored_cs
-                };
-                re.is_match(text)
-            }
+            TermPattern::Wildcard(w) => w.anchored(case_insensitive).is_match(text),
         }
     }
 
     /// ASCII-case-insensitive [`str::find`] without folding the haystack;
-    /// `needle` must already be lowercased. The returned index is always a
-    /// `char` boundary: a `&str`'s first byte is never a continuation byte,
-    /// and ASCII-only case differences keep the end a boundary too.
+    /// `needle` must already be lowercased. `memchr2` jumps to each spelling
+    /// of the needle's first byte, and only those candidates are compared:
+    /// 1.18x faster than testing every byte (`benches/search.rs`,
+    /// `filename_ladder`). The returned index is always a `char` boundary: a
+    /// `&str`'s first byte is never a continuation byte, and ASCII-only case
+    /// differences keep the end a boundary too.
     fn find_ascii_ci(hay: &str, needle: &str) -> Option<usize> {
-        if needle.is_empty() {
-            return Some(0);
-        }
         let (h, n) = (hay.as_bytes(), needle.as_bytes());
-        let first = n[0];
-        h.len().checked_sub(n.len()).and_then(|last| {
-            (0..=last).find(|&i| {
-                h[i].to_ascii_lowercase() == first && h[i..i + n.len()].eq_ignore_ascii_case(n)
-            })
-        })
+        let Some(&first) = n.first() else {
+            return Some(0);
+        };
+        // Equal to `first` when it has no ASCII case partner.
+        let upper = first.to_ascii_uppercase();
+        let last = h.len().checked_sub(n.len())?;
+        let mut at = 0;
+        while at <= last {
+            let i = at + memchr::memchr2(first, upper, &h[at..=last])?;
+            if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+                return Some(i);
+            }
+            at = i + 1;
+        }
+        None
     }
 
     /// Leftmost match as a byte range; folded offsets are valid in the original.
@@ -232,52 +273,7 @@ impl TermPattern {
                 };
                 Some(pos..pos + l.text.len())
             }
-            TermPattern::Wildcard(w) => {
-                let re = if case_insensitive {
-                    &w.search_ci
-                } else {
-                    &w.search_cs
-                };
-                re.find(text).map(|m| m.range())
-            }
-        }
-    }
-
-    /// [`TermPattern::find_first`], case-insensitive, on a pre-folded haystack.
-    pub fn find_first_folded(&self, folded: &str) -> Option<Range<usize>> {
-        match self {
-            TermPattern::Empty => None,
-            TermPattern::Literal(l) => {
-                let pos = folded.find(&l.folded)?;
-                Some(pos..pos + l.text.len())
-            }
-            TermPattern::Wildcard(w) => w.search_ci.find(folded).map(|m| m.range()),
-        }
-    }
-
-    /// Case-insensitive [`TermPattern::count`] against an already-folded haystack.
-    pub fn count_folded(&self, folded: &str) -> usize {
-        match self {
-            TermPattern::Empty => 0,
-            TermPattern::Literal(l) => snippet::count_occurrences(folded, &l.folded, true),
-            TermPattern::Wildcard(w) => w.search_ci.find_iter(folded).take(COUNT_CAP).count(),
-        }
-    }
-
-    /// Non-overlapping occurrence count. Wildcards stop at 1000 — the
-    /// cascade's `count_frac` saturates there anyway.
-    pub fn count(&self, text: &str, case_insensitive: bool) -> usize {
-        match self {
-            TermPattern::Empty => 0,
-            TermPattern::Literal(l) => snippet::count_occurrences(text, &l.text, !case_insensitive),
-            TermPattern::Wildcard(w) => {
-                let re = if case_insensitive {
-                    &w.search_ci
-                } else {
-                    &w.search_cs
-                };
-                re.find_iter(text).take(COUNT_CAP).count()
-            }
+            TermPattern::Wildcard(w) => w.search(case_insensitive).find(text).map(|m| m.range()),
         }
     }
 }
@@ -288,16 +284,19 @@ impl TermPattern {
 pub struct RegexQuery {
     pub source: String,
     re: Regex,
-    required: Option<crate::search::prefilter::Required>,
+    required: Option<Required>,
 }
 
 /// Extract a set of literals at least one of which occurs in every match.
 /// Sound because every match begins (prefix set) or ends (suffix set) with
 /// one of the literals; an unbounded set yields `None`. Parsed
-/// case-sensitively on purpose: case-insensitive extraction explodes
-/// combinatorially, and both consumers fold anyway, so a case-sensitive set
-/// stays sound — `(?i)` yields `None`, a lost optimisation, never a lost row.
-fn required_literals(source: &str) -> Option<crate::search::prefilter::Required> {
+/// case-sensitively, because case-insensitive extraction explodes
+/// combinatorially. Sound because FTS folds case (up to the exception in
+/// [`crate::search::prefilter`]) and `like_predicate(true)` turns every
+/// character with a non-ASCII case partner into `_`. An explicit `(?i)` in
+/// the pattern still yields literals: the extractor expands classes of 10
+/// characters or fewer, so `(?i)abc` gives its 8 case variants.
+fn required_literals(source: &str) -> Option<Required> {
     use regex_syntax::hir::literal::{ExtractKind, Extractor};
 
     let hir = regex_syntax::ParserBuilder::new()
@@ -305,36 +304,32 @@ fn required_literals(source: &str) -> Option<crate::search::prefilter::Required>
         .build()
         .parse(source)
         .ok()?;
-
-    let mut best: Option<(usize, crate::search::prefilter::Required)> = None;
-    for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
-        let seq = Extractor::new().kind(kind).extract(&hir);
-        let Some(literals) = seq.literals() else {
-            continue; // unbounded: no constraint to be had from this direction
-        };
-        // The extractor can split a multi-byte character; invalid UTF-8 cannot
-        // be handed to FTS5 or bound as SQL text, so the whole direction is
-        // abandoned — dropping one literal from an OR would drop rows.
-        let strings: Option<Vec<String>> = literals
-            .iter()
-            .map(|l| std::str::from_utf8(l.as_bytes()).ok().map(str::to_owned))
-            .collect();
-        let Some(strings) = strings else { continue };
-        let Some(required) = crate::search::prefilter::Required::new(strings) else {
-            continue;
-        };
-        // The OR is only as selective as its shortest arm.
-        let weakest = required
-            .literals()
-            .iter()
-            .map(|l| l.chars().count())
-            .min()
-            .unwrap_or(0);
-        if best.as_ref().is_none_or(|(w, _)| weakest > *w) {
-            best = Some((weakest, required));
-        }
-    }
-    best.map(|(_, required)| required)
+    // The OR is only as selective as its shortest arm.
+    let weakest = |r: &Required| r.literals().iter().map(|l| l.chars().count()).min();
+    [ExtractKind::Prefix, ExtractKind::Suffix]
+        .into_iter()
+        .filter_map(|kind| {
+            // `None` when unbounded: no constraint from this direction.
+            let seq = Extractor::new().kind(kind).extract(&hir);
+            // The extractor can split a multi-byte character, and invalid
+            // UTF-8 cannot be handed to FTS5 or bound as SQL text; dropping
+            // one literal from an OR would drop rows, so the whole direction
+            // goes.
+            let strings = seq
+                .literals()?
+                .iter()
+                .map(|l| std::str::from_utf8(l.as_bytes()).ok().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?;
+            Required::new(strings)
+        })
+        // On a tie the earlier direction, the prefix set, wins.
+        .reduce(|best, next| {
+            if weakest(&next) > weakest(&best) {
+                next
+            } else {
+                best
+            }
+        })
 }
 
 impl RegexQuery {
@@ -363,7 +358,7 @@ impl RegexQuery {
     /// Literals of which at least one occurs in anything this matches; `None`
     /// means nothing usable (`\d+`) and the pass scans everything. See
     /// [`crate::search::prefilter`] for the rule to obey.
-    pub fn required(&self) -> Option<&crate::search::prefilter::Required> {
+    pub fn required(&self) -> Option<&Required> {
         self.required.as_ref()
     }
 
@@ -375,19 +370,26 @@ impl RegexQuery {
         self.re.find(text).map(|m| m.range())
     }
 
-    /// Non-overlapping occurrence count, capped at 1000.
-    pub fn count(&self, text: &str) -> usize {
-        self.re.find_iter(text).take(COUNT_CAP).count()
+    /// Non-overlapping occurrences, capped at 1000, and the first of them,
+    /// in one sweep. Against a count and then a second search for the first
+    /// (`searchtime`, cargo registry): within noise to 3% faster.
+    pub fn count_and_first(&self, text: &str) -> (usize, Option<Range<usize>>) {
+        let mut found = self.re.find_iter(text).take(COUNT_CAP);
+        let first = found.next().map(|m| m.range());
+        (first.as_ref().map_or(0, |_| 1 + found.count()), first)
     }
 }
 
-/// Cap a match range at `max_len` bytes, aligned back to a char boundary: a
-/// greedy regex can match megabytes; the snippet window wants the start.
+/// Cap a match range at `max_len` bytes, aligned back to a char boundary but
+/// never below its start: a greedy regex can match megabytes, and the snippet
+/// window wants the start.
 pub fn clamp_match_range(text: &str, range: Range<usize>, max_len: usize) -> Range<usize> {
-    let mut end = range.end.min(range.start + max_len);
-    while end > range.start && !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = range.end.min(range.start + max_len);
+    let end = if end > range.start {
+        text.floor_char_boundary(end).max(range.start)
+    } else {
+        end
+    };
     range.start..end
 }
 
@@ -428,7 +430,6 @@ mod tests {
             assert!(p.is_empty(), "{:?}", parts);
             assert!(!p.whole_match("anything", true));
             assert!(p.find_first("anything", true).is_none());
-            assert_eq!(p.count("anything", true), 0);
         }
     }
 
@@ -515,10 +516,14 @@ mod tests {
 
     #[test]
     fn count_is_nonoverlapping_and_capped() {
-        let p = TermPattern::build(&[part("a*b", true)]).unwrap();
-        assert_eq!(p.count("ab ab ab", false), 3);
+        let TermPattern::Wildcard(w) = TermPattern::build(&[part("a*b", true)]).unwrap() else {
+            panic!("a star makes a wildcard");
+        };
+        assert_eq!(w.count_and_first("xx ab ab ab", false), (3, Some(3..5)));
         let many = "ab ".repeat(2000);
-        assert_eq!(p.count(&many, false), 1000);
+        assert_eq!(w.count_and_first(&many, false).0, 1000);
+        assert_eq!(w.count_and_first("AB aB", false), (0, None), "exact case");
+        assert_eq!(w.count_and_first("AB aB", true), (2, Some(0..2)));
     }
 
     #[test]
@@ -530,8 +535,162 @@ mod tests {
         assert_eq!(p.find_first("my Report.pdf", false), Some(3..9));
         assert_eq!(p.find_first("my report.pdf", true), Some(3..9));
         assert_eq!(p.find_first("my report.pdf", false), None);
-        assert_eq!(p.count("report Report", false), 1);
-        assert_eq!(p.count("report Report", true), 2);
+    }
+
+    /// What a literal's `find_first(text, true)` must return: the leftmost
+    /// match in the ASCII-folded haystack. Folding keeps byte length, so the
+    /// offsets carry over.
+    fn folded_reference(folded_hay: &str, folded_needle: &str) -> Option<Range<usize>> {
+        folded_hay
+            .find(folded_needle)
+            .map(|at| at..at + folded_needle.len())
+    }
+
+    fn literal(term: &str) -> TermPattern {
+        TermPattern::build(&[part(term, false)]).unwrap()
+    }
+
+    /// Every string of up to `max` characters over `alphabet`.
+    fn strings_over(alphabet: &[char], max: usize) -> Vec<String> {
+        let mut all = vec![String::new()];
+        let mut level = vec![String::new()];
+        for _ in 0..max {
+            level = level
+                .iter()
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            all.extend(level.iter().cloned());
+        }
+        all
+    }
+
+    /// The candidate scan against the reference over every short string: both
+    /// cases of letters, separators, `é`/`É` (one lead byte, different
+    /// continuations), and KELVIN SIGN and long s, which fold to `k` and `s`
+    /// under Unicode rules only and so must not match here.
+    #[test]
+    fn ascii_fold_find_agrees_with_a_folded_reference() {
+        const ALPHABET: [char; 12] = [
+            'a', 'A', 'b', 'B', 'k', 's', '-', '/', 'é', 'É', '\u{212A}', 'ſ',
+        ];
+        let patterns: Vec<(TermPattern, String)> = strings_over(&ALPHABET, 2)
+            .into_iter()
+            .skip(1)
+            .map(|n| (literal(&n), n.to_ascii_lowercase()))
+            .collect();
+        for hay in strings_over(&ALPHABET, 4) {
+            let folded = hay.to_ascii_lowercase();
+            for (p, needle) in &patterns {
+                assert_eq!(
+                    p.find_first(&hay, true),
+                    folded_reference(&folded, needle),
+                    "{needle:?} in {hay:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_fold_find_edges() {
+        let find = |term: &str, hay: &str| literal(term).find_first(hay, true);
+        // An empty field, and a term longer than the field.
+        assert_eq!(find("a", ""), None);
+        assert_eq!(find("quartzite", "QUARTZ"), None);
+        assert_eq!(find("quartz", "QuArTz"), Some(0..6));
+        // The last start a scan may take.
+        assert_eq!(find("txt", "notes.TXT"), Some(6..9));
+        assert_eq!(find("ab", "aaaa"), None);
+        // A failed candidate resumes one byte on, inside the repeat.
+        assert_eq!(find("aab", "aaaab"), Some(2..5));
+        assert_eq!(find("AAB", "aAaAb"), Some(2..5));
+        // The leftmost of several spellings.
+        assert_eq!(find("Report", "x-REPORT-report"), Some(2..8));
+        // First bytes with no case partner.
+        assert_eq!(find("-01", "x-A-01"), Some(3..6));
+        assert_eq!(find(".txt", "a.TXT"), Some(1..5));
+        assert_eq!(find("/q", r"C:\Users/Q"), Some(8..10));
+        // ASCII folding only: `É` is not `é`, and KELVIN SIGN is not `k`.
+        assert_eq!(find("été", "ÉTÉ été"), Some(6..11));
+        assert_eq!(find("café", "CAFÉ"), None);
+        assert_eq!(find("café", "CAFé"), Some(0..5));
+        assert_eq!(find("kilo", "\u{212A}ILO"), None);
+        assert_eq!(find("é", "aÉé"), Some(3..5));
+        assert_eq!(find("b", "éB"), Some(2..3));
+        // Unreachable through `find_first` (an empty term is `Empty`).
+        assert_eq!(TermPattern::find_ascii_ci("abc", ""), Some(0));
+    }
+
+    /// The ladder in `search/cascade/passes.rs` `pass_filename` (ranks 1–4 on
+    /// the name, 9–10 on the path), with the case-insensitive find swappable.
+    fn ladder(
+        p: &TermPattern,
+        name: &str,
+        path: &str,
+        find_ci: &dyn Fn(&str) -> Option<Range<usize>>,
+    ) -> Option<(u8, Range<usize>)> {
+        let with_paths = p.literal_char_count() >= crate::search::prefilter::TRIGRAM_FLOOR;
+        if p.whole_match(name, false) {
+            Some((1, 0..name.len()))
+        } else if p.whole_match(name, true) {
+            Some((2, 0..name.len()))
+        } else if let Some(r) = p.find_first(name, false) {
+            Some((3, r))
+        } else if let Some(r) = find_ci(name) {
+            Some((4, r))
+        } else if !with_paths {
+            None
+        } else if let Some(r) = p.find_first(path, false) {
+            Some((9, r))
+        } else {
+            find_ci(path).map(|r| (10, r))
+        }
+    }
+
+    #[test]
+    fn filename_tiers_agree_with_a_folded_reference() {
+        let rows = [
+            ("report.txt", "/home/u/report.txt"),
+            ("REPORT.TXT", "/home/u/REPORT.TXT"),
+            ("Report", "/home/u/Report"),
+            ("my-report-2024.pdf", "/data/my-report-2024.pdf"),
+            ("MY_REPORT.pdf", "/data/MY_REPORT.pdf"),
+            ("notes.txt", "/srv/Report/notes.txt"),
+            ("notes.txt", "/srv/REPORT/notes.txt"),
+            ("notes.txt", r"C:\Users\u\Report\notes.txt"),
+            ("résumé-report.odt", "/home/u/résumé-report.odt"),
+            ("RÉSUMÉ.odt", "/home/u/RÉSUMÉ.odt"),
+            ("rrreport", "/x/rrreport"),
+            ("rep", "/rep"),
+            ("", "/"),
+        ];
+        let terms = [
+            "report",
+            "Report",
+            "REPORT",
+            "rep",
+            "rrep",
+            "résumé",
+            "Résumé",
+            "RÉSUMÉ",
+            "report/notes",
+            r"Report\notes",
+            ".txt",
+            "t",
+        ];
+        let mut ranks = std::collections::BTreeSet::new();
+        for term in terms {
+            let p = literal(term);
+            let needle = term.to_ascii_lowercase();
+            for (name, path) in rows {
+                let shipped = ladder(&p, name, path, &|f| p.find_first(f, true));
+                let reference = ladder(&p, name, path, &|f| {
+                    folded_reference(&f.to_ascii_lowercase(), &needle)
+                });
+                assert_eq!(shipped, reference, "{term:?} against {path:?}");
+                ranks.extend(shipped.map(|(rank, _)| rank));
+            }
+        }
+        assert_eq!(ranks.into_iter().collect::<Vec<_>>(), [1, 2, 3, 4, 9, 10]);
     }
 
     #[test]
@@ -584,11 +743,25 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_case_flag_still_yields_literals() {
+        let r = RegexQuery::new("(?i)abc").unwrap();
+        let mut literals = r.required().expect("a bounded set").literals().to_vec();
+        literals.sort();
+        assert_eq!(literals.len(), 8, "{literals:?}");
+        assert_eq!((literals[0].as_str(), literals[7].as_str()), ("ABC", "abc"));
+        // Without the flag the set is the literal as typed; the folding is
+        // the consumers' job.
+        let r = RegexQuery::new("Café").unwrap();
+        assert_eq!(r.required().unwrap().literals(), ["Café"]);
+    }
+
+    #[test]
     fn find_and_count_on_regex() {
         let r = RegexQuery::new("b[aeiou]d").unwrap();
         let hay = "bad bed bodkin";
         assert_eq!(r.find_first(hay), Some(0..3));
-        assert_eq!(r.count(hay), 3);
+        assert_eq!(r.count_and_first(hay), (3, Some(0..3)));
+        assert_eq!(r.count_and_first("nothing here"), (0, None));
     }
 
     #[test]

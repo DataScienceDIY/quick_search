@@ -7,6 +7,13 @@ fn tmp_dir() -> Scratch {
     Scratch::dir("config")
 }
 
+/// A copy of `base` with `f` applied.
+fn edited(base: &Config, f: impl FnOnce(&mut Config)) -> Config {
+    let mut c = base.clone();
+    f(&mut c);
+    c
+}
+
 #[test]
 fn fresh_install_defaults_to_home_as_only_root() {
     let dir = tmp_dir();
@@ -27,6 +34,33 @@ fn fresh_install_defaults_to_home_as_only_root() {
     fs::write(&path, "[paths]\ndatabase_path = \"x.sqlite\"\n").unwrap();
     let partial = Config::load_from(&path).unwrap();
     assert_eq!(partial.paths.indexing_paths, cfg.paths.indexing_paths);
+}
+
+/// Only head and tail identities survive a load: the head hash alone that
+/// earlier versions saved, and anything malformed, would match no group yet
+/// still count as hidden.
+#[test]
+fn hidden_groups_that_are_not_identities_are_dropped_on_load() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
+    let identity = "ab".repeat(32) + &"cd".repeat(32);
+    let stale = [
+        "ab".repeat(32),       // head hash alone, as saved before
+        "AB".repeat(64),       // uppercase
+        "zz".repeat(64),       // not hex
+        "ab".repeat(64) + "a", // one digit too many
+        String::new(),
+    ];
+    let mut entries: Vec<String> = stale.to_vec();
+    entries.insert(2, identity.clone());
+    let list = entries
+        .iter()
+        .map(|e| format!("\"{e}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    fs::write(&path, format!("[duplicates]\nhidden_groups = [{list}]\n")).unwrap();
+    let cfg = Config::load_from(&path).unwrap();
+    assert_eq!(cfg.duplicates.hidden_groups, [identity]);
 }
 
 #[test]
@@ -91,6 +125,141 @@ fn save_keeps_relative_paths_portable() {
     );
 }
 
+/// A `config.toml` beside the binary is adopted only when it is
+/// QuickSearch's: another program's in the same folder (an AppImage's
+/// `~/Downloads`, say) is passed over rather than read, and then overwritten
+/// by the next save.
+#[test]
+fn only_a_quicksearch_config_is_taken_as_portable() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
+    // Every section a save writes is one of ours.
+    Config {
+        source: Some(path.clone()),
+        ..Config::default()
+    }
+    .save()
+    .unwrap();
+    assert!(is_quicksearch_config(&path), "a saved config");
+
+    let example =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config_example.toml"))
+            .expect("config_example.toml");
+    for (text, ours) in [
+        ("", true),
+        ("# a comment only\n", true),
+        (
+            "[paths]\nindexing_paths = [\"~\"]\n[ui]\nscale = 1.5\n",
+            true,
+        ),
+        (example.as_str(), true),
+        ("[server]\nport = 8080\n", false),
+        (
+            "[paths]\nindexing_paths = []\n[server]\nport = 8080\n",
+            false,
+        ),
+        ("name = \"other\"\n", false),
+    ] {
+        fs::write(&path, text).unwrap();
+        assert_eq!(is_quicksearch_config(&path), ours, "{text:?}");
+    }
+    assert!(!is_quicksearch_config(&dir.join("absent.toml")));
+    // A directory by the name reads as no config, not ours.
+    fs::create_dir(dir.join("folder.toml")).unwrap();
+    assert!(!is_quicksearch_config(&dir.join("folder.toml")));
+}
+
+/// A portable config the user broke with a typo is still theirs: passing it
+/// over would silently swap their settings for the per-user ones. Its load
+/// fails instead, so the GUI runs on the inert fallback with the error
+/// banner, and the file is left as the user wrote it.
+#[test]
+fn a_portable_config_that_fails_to_parse_is_still_ours() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
+    for bytes in [
+        &b"[paths\nindexing_paths = [\"/data\"]\n"[..],
+        b"[ui]\nscale = 1.5,\n",
+        b"[paths]\nindexing_paths = []\n[paths]\n",
+        // Not UTF-8, so not even read as text.
+        b"\xff\xfe[paths]\n",
+    ] {
+        let shown = String::from_utf8_lossy(bytes);
+        fs::write(&path, bytes).unwrap();
+        assert!(is_quicksearch_config(&path), "{shown:?}");
+        let err = Config::load_from(&path).expect_err("the load fails");
+        assert!(
+            err.contains(&path.display().to_string()),
+            "{shown:?}: {err}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{shown:?} is untouched");
+    }
+}
+
+/// What the GUI runs on when the config fails to load. Never calls `save()`:
+/// a regression there would write over the developer's real config.
+#[test]
+fn fallback_is_inert_and_unsaveable() {
+    let cfg = Config::fallback();
+    assert_eq!(cfg.source, None);
+    assert!(!cfg.can_save());
+    let loaded = Config {
+        source: Some(PathBuf::from("config.toml")),
+        ..Config::default()
+    };
+    assert!(loaded.can_save());
+    assert!(
+        !cfg.indexing.auto_index,
+        "the fallback must never index on its own"
+    );
+    assert_eq!(cfg.ui.tutorial_seen, None, "dismissing the tour would save");
+    assert!(cfg.paths.indexing_paths.is_empty(), "no made-up $HOME root");
+    assert_eq!(
+        cfg.paths.database_path,
+        Config::default().paths.database_path,
+        "search still answers from the index at the default path"
+    );
+    let err = cfg
+        .save_target()
+        .expect_err("the fallback has no file to write");
+    assert!(
+        err.contains(&Config::config_path().display().to_string()),
+        "the refusal names the file that did not load: {err}"
+    );
+}
+
+/// Writes `bytes` as a config file and loads it. The load must fail and leave
+/// the directory exactly as it was: the same bytes, no temp file beside them.
+fn load_fails_untouched(bytes: &[u8]) -> (String, PathBuf) {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
+    fs::write(&path, bytes).unwrap();
+    let err = Config::load_from(&path).expect_err("must not load");
+    assert_eq!(fs::read(&path).unwrap(), bytes, "the file was modified");
+    assert_eq!(
+        fs::read_dir(&*dir).unwrap().count(),
+        1,
+        "something was written"
+    );
+    (err, path)
+}
+
+#[test]
+fn malformed_files_are_left_byte_identical() {
+    let cases: [&[u8]; 5] = [
+        b"[paths\nindexing_paths = [\"/x\"]\n",
+        // A string where the field takes a number (`scale = 1` is a valid
+        // float and loads).
+        b"[ui]\nscale = \"1\"\n",
+        b"[paths]\ndatabase_path = \"\xff\xfe.sqlite\"\n",
+        b"\xef\xbb\xbf\x00garbage = = [",
+        b"[paths]\ndatabase_path = \"\"\"/var/lib/qs\n",
+    ];
+    for bytes in cases {
+        load_fails_untouched(bytes);
+    }
+}
+
 #[test]
 fn tilde_expansion() {
     if std::env::var_os("HOME").is_none() {
@@ -144,13 +313,15 @@ fn content_allowed_extensionless_sentinel() {
     assert!(!content_allowed(Path::new("/a/x.(none)"), &cfg));
 
     for spelling in ["(none)", "(NONE)", "(NonE)", "(nOnE)"] {
-        let mut c = Config::default();
-        c.indexing.content_extensions = vec![spelling.to_string()];
+        let c = edited(&Config::default(), |c| {
+            c.indexing.content_extensions = vec![spelling.to_string()]
+        });
         assert!(content_allowed(Path::new("/a/README"), &c), "{spelling}");
     }
 
-    let mut only_txt = Config::default();
-    only_txt.indexing.content_extensions = vec!["txt".into()];
+    let only_txt = edited(&Config::default(), |c| {
+        c.indexing.content_extensions = vec!["txt".into()]
+    });
     assert!(!content_allowed(Path::new("/a/Makefile"), &only_txt));
 }
 
@@ -180,9 +351,10 @@ fn content_allowed_comments() {
     assert!(!content_allowed(Path::new("/a/b.docs"), &cfg));
 
     // Nothing but comments = same as an empty list.
-    let mut all_comments = Config::default();
-    all_comments.indexing.content_extensions =
-        vec!["# nothing enabled yet".into(), "  ".into(), "#".into()];
+    let all_comments = edited(&Config::default(), |c| {
+        c.indexing.content_extensions =
+            vec!["# nothing enabled yet".into(), "  ".into(), "#".into()]
+    });
     assert!(content_allowed(Path::new("/a/b.pdf"), &all_comments));
     assert!(content_allowed(Path::new("/a/Makefile"), &all_comments));
 }
@@ -199,35 +371,78 @@ fn comment_only_edit_is_no_work_at_all() {
         vec!["md".into(), "txt".into()],
         vec![".TXT".into(), ".Md".into()],
     ] {
-        let mut new = old.clone();
-        new.indexing.content_extensions = cosmetic;
+        let new = edited(&old, |c| c.indexing.content_extensions = cosmetic);
         let a = diff_actions(&old, &new);
         assert_eq!(a, ConfigActions::default(), "cosmetic edit is not a change");
     }
 
     // Widening: files already indexed by name need a run to extract text.
-    let mut widened = old.clone();
-    widened.indexing.content_extensions = vec!["txt".into(), "md".into(), "(none)".into()];
+    let widened = edited(&old, |c| {
+        c.indexing.content_extensions = vec!["txt".into(), "md".into(), "(none)".into()]
+    });
     let a = diff_actions(&old, &widened);
     assert!(!a.requires_rebuild);
     assert!(a.work.reconcile_content && a.work.reindex);
 
     // Narrowing: the stored text goes, and nothing needs walking.
-    let mut narrowed = old.clone();
-    narrowed.indexing.content_extensions = vec!["txt".into(), "# md".into()];
+    let narrowed = edited(&old, |c| {
+        c.indexing.content_extensions = vec!["txt".into(), "# md".into()]
+    });
     let a = diff_actions(&old, &narrowed);
     assert!(!a.requires_rebuild);
     assert!(a.work.reconcile_content && !a.work.reindex);
 }
 
-/// An empty list means "everything allowed" — a superset of every other
-/// list, the case plain set arithmetic reads backwards.
+/// The size cap decides what gets read exactly as the extension filter does
+/// (see `IndexWork::reconcile_content`), so a raised cap must re-decide the
+/// files already written off as too large: nothing else re-asks about a file
+/// until the file itself changes.
+#[test]
+fn changing_the_text_file_size_cap_re_decides_the_stored_rows() {
+    let old = Config::default();
+    let cap = old.processing.maximum_text_file_size;
+
+    let raised = edited(&old, |c| c.processing.maximum_text_file_size = cap * 2);
+    let a = diff_actions(&old, &raised);
+    assert!(
+        !a.requires_rebuild,
+        "no rebuild: the rows are all still right"
+    );
+    assert!(
+        a.work.reconcile_content,
+        "rows written off as too large must be re-decided"
+    );
+    assert!(
+        a.work.reindex,
+        "widening needs a run: the content pass is what reads the newly eligible files"
+    );
+
+    let lowered = edited(&old, |c| c.processing.maximum_text_file_size = cap / 2);
+    let a = diff_actions(&old, &lowered);
+    assert!(
+        a.work.reconcile_content,
+        "rows now over the cap must give up their text"
+    );
+    assert!(
+        !a.work.reindex,
+        "narrowing finds nothing new on disk, so there is nothing to walk for"
+    );
+
+    assert_eq!(
+        diff_actions(&old, &old.clone()),
+        ConfigActions::default(),
+        "an unchanged cap is not work"
+    );
+}
+
+/// An empty list means "everything allowed", a superset of every other list:
+/// the case plain set arithmetic reads backwards.
 #[test]
 fn an_empty_content_filter_is_the_widest_one() {
-    let mut listed = Config::default();
-    listed.indexing.content_extensions = vec!["txt".into()];
-    let mut unfiltered = listed.clone();
-    unfiltered.indexing.content_extensions = vec![];
+    let listed = edited(&Config::default(), |c| {
+        c.indexing.content_extensions = vec!["txt".into()]
+    });
+    let unfiltered = edited(&listed, |c| c.indexing.content_extensions = vec![]);
 
     let widening = diff_actions(&listed, &unfiltered).work;
     assert!(widening.reconcile_content && widening.reindex);
@@ -277,7 +492,7 @@ fn directory_patterns_with_trailing_slash() {
 }
 
 /// A drive-root pattern must survive the trailing-separator trim as a path
-/// pattern — trimmed to "D:" it would land in the component set.
+/// pattern: trimmed to "D:" it would land in the component set.
 #[test]
 fn drive_root_patterns_are_not_component_patterns() {
     let set = IgnoreSet::compile(&[r"D:\".to_string(), "E:/".to_string()]).unwrap();
@@ -310,6 +525,117 @@ fn bare_drive_letter_stays_a_component_pattern() {
 fn ignore_set_invalid_pattern_errors() {
     let err = IgnoreSet::compile(&["[".to_string()]).unwrap_err();
     assert!(err.contains("invalid ignore pattern"), "{}", err);
+}
+
+/// A pattern built from a name matches that name, in either matcher, and
+/// nothing its glob syntax would otherwise have reached.
+#[test]
+fn a_literal_glob_matches_exactly_its_name() {
+    let names = [
+        "Music [FLAC]",
+        "a*b",
+        "what?",
+        "{x}",
+        "{a,b}",
+        "[x",
+        "x]",
+        "[!x]",
+        "Café {1}",
+        " lead",
+        "trail ",
+        " ",
+        "plain",
+    ];
+    // A backslash is a name character only off Windows.
+    #[cfg(unix)]
+    let names = [&names[..], &[r"a\b", r"x\", r"\", r"\*", r"[\]"][..]].concat();
+    for name in names {
+        let pattern = glob_literal(name);
+        let set = IgnoreSet::compile(&[pattern.clone()])
+            .unwrap_or_else(|e| panic!("{name:?} as {pattern:?}: {e}"));
+        assert!(set.matches_component(name), "{name:?} as {pattern:?}");
+        let below = Path::new("/r").join(name).join("f");
+        assert!(set.matches_path(&below), "{name:?} as {pattern:?}");
+    }
+
+    let reaches = |name: &str, other: &str| {
+        IgnoreSet::compile(&[glob_literal(name)])
+            .unwrap()
+            .matches_component(other)
+    };
+    assert!(!reaches("Music [FLAC]", "Music F"));
+    assert!(!reaches("a*b", "aXb"));
+    assert!(!reaches("what?", "whats"));
+    assert!(!reaches("{a,b}", "a"));
+    assert!(!reaches(" lead", "lead"), "the space was trimmed away");
+    #[cfg(unix)]
+    {
+        assert!(!reaches(r"a\b", "ab"), "the backslash escaped the b");
+        assert!(!reaches(r"x\", "x"), "the backslash was trimmed away");
+    }
+}
+
+#[test]
+fn glob_literal_wraps_only_what_a_glob_would_read() {
+    for name in ["plain", "node_modules", ".git", "a-b,c!d", "Café"] {
+        assert_eq!(glob_literal(name), name);
+    }
+    assert_eq!(glob_literal("Music [FLAC]"), "Music [[]FLAC[]]");
+    assert_eq!(glob_literal(" x "), "[ ]x[ ]");
+    #[cfg(unix)]
+    assert_eq!(glob_literal(r"a\b"), r"a[\]b");
+    #[cfg(windows)]
+    assert_eq!(glob_literal(r"C:\a [b]"), r"C:\a [[]b[]]");
+}
+
+/// On Unix a backslash is the glob escape, not a separator: a pattern using
+/// one is still a component pattern.
+#[cfg(unix)]
+#[test]
+fn an_escaped_unix_pattern_stays_a_component_pattern() {
+    let set = IgnoreSet::compile(&[r"\*.tmp".to_string()]).unwrap();
+    assert!(set.matches_component("*.tmp"));
+    assert!(!set.matches_component("x.tmp"));
+    assert!(set.matches_path(Path::new("/r/*.tmp/f")));
+}
+
+/// `ignore_patterns` as a TOML array of literal strings.
+fn ignore_section(patterns: &[&str]) -> String {
+    let quoted: Vec<String> = patterns.iter().map(|p| format!("'{}'", p)).collect();
+    format!("[indexing]\nignore_patterns = [{}]\n", quoted.join(", "))
+}
+
+/// A bad glob is a load error like a TOML one; left to the indexer, it would
+/// fail the app's start instead.
+#[test]
+fn an_invalid_ignore_glob_fails_the_load() {
+    for bad in ["[abc", "{a,b", "[z-a]", "{a,b}}"] {
+        let (err, path) = load_fails_untouched(ignore_section(&[".git", bad]).as_bytes());
+        assert!(err.contains("Invalid ignore pattern"), "{bad}: {err}");
+        assert!(err.contains(&path.display().to_string()), "{bad}: {err}");
+    }
+}
+
+#[test]
+fn an_ignore_glob_past_the_regex_size_limit_fails_the_load() {
+    let p = "*a".repeat(500_000);
+    assert!(
+        IgnoreSet::compile(&[p.clone()]).is_err(),
+        "precondition: the pattern is past globset's regex size limit"
+    );
+    load_fails_untouched(ignore_section(&[&p]).as_bytes());
+}
+
+#[test]
+fn valid_edge_patterns_still_load() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
+    // A drive root, one that trims to nothing, and nested alternates, which
+    // globset accepts.
+    let patterns = ["D:/", " / ", "{a,{b}}"];
+    fs::write(&path, ignore_section(&patterns)).unwrap();
+    let cfg = Config::load_from(&path).unwrap();
+    assert_eq!(cfg.indexing.ignore_patterns, patterns, "loaded verbatim");
 }
 
 #[test]
@@ -408,13 +734,45 @@ fn overlong_names_still_fold_correctly() {
     assert!(!set.matches_component(&"a".repeat(FOLD_BUF + 9)));
 }
 
-/// Literal patterns must be visible on the whole-path route too — otherwise
-/// the watcher indexes exactly what the walker prunes.
+/// Literal patterns must be visible on the whole-path route too, or the
+/// watcher indexes exactly what the walker prunes.
 #[test]
 fn full_path_matching_sees_literal_component_patterns() {
     let set = IgnoreSet::compile(&["node_modules".to_string()]).unwrap();
     assert!(set.matches_path(Path::new("/home/me/proj/node_modules/pkg/index.js")));
     assert!(!set.matches_path(Path::new("/home/me/proj/src/index.js")));
+}
+
+/// The walk tests names below its root only, so a root inside an ignored
+/// name keeps its files; a full-path pattern still reaches past the root.
+#[test]
+fn matches_below_tests_names_only_below_the_root() {
+    let set = IgnoreSet::compile(&["venv".to_string(), "/srv/archive".to_string()]).unwrap();
+    let roots = [PathBuf::from("/home/me/venv/proj")];
+    assert!(!set.matches_below(Path::new("/home/me/venv/proj/main.py"), &roots));
+    assert!(!set.matches_below(Path::new("/home/me/venv/proj"), &roots));
+    assert!(set.matches_below(Path::new("/home/me/venv/proj/venv/lib.py"), &roots));
+    // Under no root every name is tested, as `matches_path` tests them.
+    assert!(set.matches_below(Path::new("/home/me/venv/other.py"), &roots));
+
+    let roots = [PathBuf::from("/srv/archive/2020")];
+    assert!(
+        set.matches_below(Path::new("/srv/archive/2020/a.txt"), &roots),
+        "a path pattern matching an ancestor of the root still excludes"
+    );
+}
+
+#[test]
+fn matches_below_measures_from_the_innermost_root() {
+    let set = IgnoreSet::compile(&["node_modules".to_string()]).unwrap();
+    let roots = [
+        PathBuf::from("/data"),
+        PathBuf::from("/data/node_modules/pkg"),
+    ];
+    assert!(!set.matches_below(Path::new("/data/node_modules/pkg/index.js"), &roots));
+    assert!(set.matches_below(Path::new("/data/node_modules/other/index.js"), &roots));
+    // By whole components: `pkg2` is not under `pkg`.
+    assert!(set.matches_below(Path::new("/data/node_modules/pkg2/index.js"), &roots));
 }
 
 #[test]
@@ -437,18 +795,25 @@ fn default_ignore_patterns_cover_the_platform() {
     }
 }
 
+/// [`nested_roots`] over a config with no file, listing `roots`.
+fn nested(roots: &[&str]) -> Vec<(String, String)> {
+    let mut cfg = Config::default();
+    cfg.paths.indexing_paths = roots.iter().map(|r| r.to_string()).collect();
+    nested_roots(&cfg)
+}
+
 #[test]
 fn nested_roots_matrix() {
     assert_eq!(
-        nested_roots(&["/qs-x/b".into(), "/qs-x/b/c".into()]),
+        nested(&["/qs-x/b", "/qs-x/b/c"]),
         vec![("/qs-x/b/c".to_string(), "/qs-x/b".to_string())]
     );
     // Component boundary: /a/bc is NOT under /a/b.
-    assert!(nested_roots(&["/qs-x/b".into(), "/qs-x/bc".into()]).is_empty());
-    assert!(nested_roots(&["/qs-x/b".into(), "/qs-x/c".into()]).is_empty());
-    assert_eq!(nested_roots(&["/qs-x".into(), "/qs-x".into()]).len(), 1);
-    assert!(nested_roots(&[]).is_empty());
-    assert!(nested_roots(&["/qs-x".into()]).is_empty());
+    assert!(nested(&["/qs-x/b", "/qs-x/bc"]).is_empty());
+    assert!(nested(&["/qs-x/b", "/qs-x/c"]).is_empty());
+    assert_eq!(nested(&["/qs-x", "/qs-x"]).len(), 1);
+    assert!(nested(&[]).is_empty());
+    assert!(nested(&["/qs-x"]).is_empty());
     // Symlinked spellings of the same real directory are caught.
     #[cfg(unix)]
     {
@@ -457,12 +822,79 @@ fn nested_roots_matrix() {
         fs::create_dir_all(&real).unwrap();
         let link = dir.join("alias");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        let pairs = nested_roots(&[
-            real.to_string_lossy().into_owned(),
-            link.to_string_lossy().into_owned(),
-        ]);
+        let pairs = nested(&[real.to_str().unwrap(), link.to_str().unwrap()]);
         assert_eq!(pairs.len(), 1, "alias of the same dir counts as duplicate");
     }
+}
+
+/// A child that does not exist yet compares as the existing root it sits
+/// under does: canonicalized (`\\?\C:\` on Windows), and through the link
+/// its parent is spelled with.
+#[test]
+fn a_missing_child_of_an_existing_root_is_nested() {
+    let dir = tmp_dir();
+    let real = dir.join("real");
+    fs::create_dir_all(&real).unwrap();
+    let parent = real.to_str().unwrap().to_string();
+    let child = real.join("later/deeper").to_str().unwrap().to_string();
+    assert_eq!(
+        nested(&[&parent, &child]),
+        vec![(child.clone(), parent.clone())]
+    );
+    assert!(nested(&[&parent, dir.join("elsewhere").to_str().unwrap()]).is_empty());
+    #[cfg(unix)]
+    {
+        let link = dir.join("alias");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let parent = link.to_str().unwrap().to_string();
+        let child = link.join("later").to_str().unwrap().to_string();
+        assert_eq!(
+            nested(&[&parent, &child]),
+            vec![(child.clone(), parent.clone())],
+            "both through the link"
+        );
+        let real_child = real.join("later").to_str().unwrap().to_string();
+        assert_eq!(
+            nested(&[&parent, &real_child]).len(),
+            1,
+            "child spelled real"
+        );
+        let real_parent = real.to_str().unwrap();
+        assert_eq!(
+            nested(&[real_parent, &child]).len(),
+            1,
+            "parent spelled real"
+        );
+    }
+    // Missing up to the filesystem root, both: still compared by components.
+    assert_eq!(nested(&["/qs-gone/b", "/qs-gone/b/c"]).len(), 1);
+    assert!(nested(&["/qs-gone/b", "/qs-gone/bc"]).is_empty());
+}
+
+/// A relative root is where the walk looks for it, under the config file's
+/// directory, not wherever the process happens to run.
+#[test]
+fn nested_roots_resolve_relative_roots_against_the_config_dir() {
+    let dir = tmp_dir();
+    fs::create_dir_all(dir.join("docs/inner")).unwrap();
+    let docs = dir.join("docs").to_string_lossy().into_owned();
+    let mut cfg = Config::default();
+    cfg.source = Some(dir.join("config.toml"));
+
+    cfg.paths.indexing_paths = vec![docs.clone(), "docs".into()];
+    assert_eq!(
+        nested_roots(&cfg),
+        vec![("docs".to_string(), docs.clone())],
+        "the same folder spelled relative is a duplicate, reported as spelled"
+    );
+    cfg.paths.indexing_paths = vec![docs.clone(), "docs/inner".into()];
+    assert_eq!(
+        nested_roots(&cfg).len(),
+        1,
+        "relative child of an absolute root"
+    );
+    cfg.paths.indexing_paths = vec![docs, "elsewhere".into()];
+    assert!(nested_roots(&cfg).is_empty());
 }
 
 #[test]
@@ -476,6 +908,44 @@ fn removed_precount_key_still_parses() {
     .unwrap();
     let cfg = Config::load_from(&path).unwrap();
     assert_eq!(cfg.processing.batch_size, 42, "known keys still load");
+}
+
+/// Links are no longer followed: a config that still sets the old key loads,
+/// and the next save drops it.
+#[test]
+fn removed_follow_symlinks_key_still_parses_and_is_dropped_on_save() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
+    fs::write(
+        &path,
+        "[indexing]\nfollow_symlinks = true\ninclude_hidden = true\n",
+    )
+    .unwrap();
+    let cfg = Config::load_from(&path).unwrap();
+    assert!(cfg.indexing.include_hidden, "known keys still load");
+    cfg.save().unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("follow_symlinks"), "{saved}");
+    assert!(saved.contains("include_hidden = true"), "{saved}");
+}
+
+/// Trigram is the only tokenizer: a config that still names one, even a word
+/// tokenizer, loads, and the next save drops the key.
+#[test]
+fn removed_tokenize_key_still_parses_and_is_dropped_on_save() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
+    fs::write(
+        &path,
+        "[processing]\ntokenize = \"unicode61\"\nbatch_size = 42\n",
+    )
+    .unwrap();
+    let cfg = Config::load_from(&path).unwrap();
+    assert_eq!(cfg.processing.batch_size, 42, "known keys still load");
+    cfg.save().unwrap();
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains("tokenize"), "{saved}");
+    assert!(saved.contains("batch_size = 42"), "{saved}");
 }
 
 #[test]
@@ -498,23 +968,19 @@ fn root_workers_round_trip() {
     );
 }
 
-/// Only three settings may wipe the index: the FTS tokenizer, the hash
+/// Only three settings may wipe the index: the FTS position setting, the hash
 /// length and the encryption key. Anything else reaching `requires_rebuild`
 /// is a bug.
 #[test]
 fn only_unreadable_data_forces_a_rebuild() {
     let base = Config::default();
 
-    let mut tokenizer = base.clone();
-    tokenizer.processing.tokenize = "unicode61".into();
-    let mut hash = base.clone();
-    hash.processing.hash_length = base.processing.hash_length + 1;
-    let mut protect = base.clone();
-    protect.security.password_protected = true;
-    let mut salt = base.clone();
-    salt.security.salt = Some("00".repeat(16));
+    let positions = edited(&base, |c| c.processing.compact_text_index = false);
+    let hash = edited(&base, |c| c.processing.hash_length += 1);
+    let protect = edited(&base, |c| c.security.password_protected = true);
+    let salt = edited(&base, |c| c.security.salt = Some("00".repeat(16)));
 
-    for c in [&tokenizer, &hash, &protect, &salt] {
+    for c in [&positions, &hash, &protect, &salt] {
         let a = diff_actions(&base, c);
         assert!(a.requires_rebuild, "must wipe");
         assert!(
@@ -525,14 +991,22 @@ fn only_unreadable_data_forces_a_rebuild() {
     }
 
     // The keychain only decides where the key is remembered.
-    let mut keychain = base.clone();
-    keychain.security.use_keychain = true;
+    let keychain = edited(&base, |c| c.security.use_keychain = true);
     assert_eq!(diff_actions(&base, &keychain), ConfigActions::default());
 }
 
-/// Narrowing deletes; widening walks. Nothing here may wipe.
+/// A base with every narrowable setting at its widest: one ignore pattern,
+/// and hidden files on.
+fn wide_base() -> Config {
+    edited(&Config::default(), |c| {
+        c.indexing.ignore_patterns = vec!["node_modules".into()];
+        c.indexing.include_hidden = true;
+    })
+}
+
+/// Removing a root deletes its rows by range; adding one walks. Neither wipes.
 #[test]
-fn diff_actions_matrix() {
+fn a_removed_root_is_dropped_and_an_added_one_walked() {
     let dir = tmp_dir();
     let kept = dir.join("kept");
     let dropped = dir.join("dropped");
@@ -543,17 +1017,13 @@ fn diff_actions_matrix() {
         dropped.to_string_lossy().into_owned(),
     );
 
-    let mut base = Config::default();
-    base.paths.indexing_paths = vec![kept.clone(), dropped.clone()];
-    base.indexing.ignore_patterns = vec!["node_modules".into()];
-    base.indexing.include_hidden = true;
-    base.indexing.follow_symlinks = true;
-
+    let base = edited(&wide_base(), |c| {
+        c.paths.indexing_paths = vec![kept.clone(), dropped.clone()]
+    });
     assert_eq!(diff_actions(&base, &base.clone()), ConfigActions::default());
 
     // Removing a root: rows deleted by range, no walk needed.
-    let mut c = base.clone();
-    c.paths.indexing_paths = vec![kept.clone()];
+    let c = edited(&base, |c| c.paths.indexing_paths = vec![kept.clone()]);
     let a = diff_actions(&base, &c);
     assert!(!a.requires_rebuild);
     assert_eq!(a.work.drop_roots, vec![dropped.clone()]);
@@ -563,27 +1033,20 @@ fn diff_actions_matrix() {
     let a = diff_actions(&c, &base);
     assert!(!a.requires_rebuild);
     assert!(a.work.drop_roots.is_empty() && a.work.reindex && !a.work.prune_scope);
+}
 
+/// Narrowing the walk prunes stored rows; widening it walks. Neither wipes.
+#[test]
+fn narrowing_the_walk_prunes_and_widening_it_walks() {
+    let base = wide_base();
     for (narrow, widen, what) in [
         (
-            {
-                let mut c = base.clone();
-                c.indexing.ignore_patterns.push("*.log".into());
-                c
-            },
-            {
-                let mut c = base.clone();
-                c.indexing.ignore_patterns.clear();
-                c
-            },
+            edited(&base, |c| c.indexing.ignore_patterns.push("*.log".into())),
+            edited(&base, |c| c.indexing.ignore_patterns.clear()),
             "ignore patterns",
         ),
         (
-            {
-                let mut c = base.clone();
-                c.indexing.include_hidden = false;
-                c
-            },
+            edited(&base, |c| c.indexing.include_hidden = false),
             base.clone(),
             "hidden files",
         ),
@@ -603,46 +1066,36 @@ fn diff_actions_matrix() {
             what
         );
     }
+}
 
-    // Symlinks take their own route: turning them off strands the rows
-    // *outside* every root, which no per-root scan would ever revisit.
-    let mut no_links = base.clone();
-    no_links.indexing.follow_symlinks = false;
-    let a = diff_actions(&base, &no_links);
-    assert!(!a.requires_rebuild);
-    assert!(
-        a.work.drop_aliases && !a.work.prune_scope && !a.work.reindex,
-        "turning links off sweeps outside the roots and nothing else"
-    );
-    let a = diff_actions(&no_links, &base);
-    assert!(
-        a.work.reindex && !a.work.drop_aliases && !a.work.prune_scope,
-        "turning links on only adds"
-    );
+/// The position setting is part of the FTS table definition, so a change
+/// either way rebuilds.
+#[test]
+fn the_compact_index_flag_rebuilds_either_way() {
+    let base = wide_base();
+    let full = edited(&base, |c| c.processing.compact_text_index = false);
+    assert!(diff_actions(&base, &full).requires_rebuild);
+    assert!(diff_actions(&full, &base).requires_rebuild);
+}
 
-    // Stored text: on = re-extract, off = drop the blobs; never a rebuild.
-    let mut off = base.clone();
-    off.processing.store_text_for_snippets = false;
-    let mut on = base.clone();
-    on.processing.store_text_for_snippets = true;
-    let a = diff_actions(&on, &off);
-    assert!(a.work.drop_text && !a.work.restore_text && !a.work.reindex);
-    let a = diff_actions(&off, &on);
-    assert!(a.work.restore_text && !a.work.drop_text && a.work.reindex);
-
-    let mut c = base.clone();
-    c.paths.database_path = "/elsewhere.sqlite".into();
-    let a = diff_actions(&base, &c);
+#[test]
+fn soft_knobs_are_not_index_work() {
+    let base = wide_base();
+    let moved = edited(&base, |c| {
+        c.paths.database_path = "/elsewhere.sqlite".into()
+    });
+    let a = diff_actions(&base, &moved);
     assert!(a.search_db_changed && !a.requires_rebuild && a.work.is_empty());
 
-    let mut c = base.clone();
-    c.search.display_limit = 5000;
-    c.processing.batch_size = 999;
-    c.processing.maximum_wal_size = 0;
-    c.indexing.auto_index = false;
-    c.indexing.reindex_interval_minutes = 5;
+    let tuned = edited(&base, |c| {
+        c.search.display_limit = 5000;
+        c.processing.batch_size = 999;
+        c.processing.maximum_wal_size = 0;
+        c.indexing.auto_index = false;
+        c.indexing.reindex_interval_minutes = 5;
+    });
     assert_eq!(
-        diff_actions(&base, &c),
+        diff_actions(&base, &tuned),
         ConfigActions::default(),
         "soft knobs are not index work"
     );
@@ -655,7 +1108,6 @@ fn merging_two_plans_loses_nothing() {
     let first = IndexWork {
         drop_roots: vec!["/gone".into(), "/shared".into()],
         prune_scope: true,
-        drop_text: true,
         ..IndexWork::default()
     };
     let second = IndexWork {
@@ -672,11 +1124,11 @@ fn merging_two_plans_loses_nothing() {
         vec!["/shared", "/also-gone", "/gone"],
         "every root from both, each once"
     );
-    assert!(merged.prune_scope && merged.drop_text);
+    assert!(merged.prune_scope);
     assert!(merged.reconcile_content && merged.reindex);
 
-    // Empty merge is a no-op and self-merge is the identity — both are what
-    // make a restart safe.
+    // Empty merge is a no-op and self-merge is the identity; both make a
+    // restart safe.
     let mut untouched = first.clone();
     untouched.merge_from(&IndexWork::default());
     assert_eq!(untouched, first);
@@ -693,31 +1145,42 @@ fn respelling_a_list_is_not_a_change() {
     fs::create_dir_all(&a_dir).unwrap();
     fs::create_dir_all(&b_dir).unwrap();
 
-    let mut base = Config::default();
-    base.paths.indexing_paths = vec![
-        a_dir.to_string_lossy().into_owned(),
-        b_dir.to_string_lossy().into_owned(),
-    ];
-    base.indexing.ignore_patterns = vec!["node_modules".into(), "*.tmp".into()];
+    let base = edited(&Config::default(), |c| {
+        c.paths.indexing_paths = vec![
+            a_dir.to_string_lossy().into_owned(),
+            b_dir.to_string_lossy().into_owned(),
+        ];
+        c.indexing.ignore_patterns = vec!["node_modules".into(), "*.tmp".into()];
+    });
 
-    let mut reordered = base.clone();
-    reordered.paths.indexing_paths.reverse();
-    reordered.indexing.ignore_patterns.reverse();
+    let reordered = edited(&base, |c| {
+        c.paths.indexing_paths.reverse();
+        c.indexing.ignore_patterns.reverse();
+    });
     assert_eq!(diff_actions(&base, &reordered), ConfigActions::default());
 
     // A trailing separator, a `.` hop and a duplicate all name the same roots.
-    let mut respelled = base.clone();
-    respelled.paths.indexing_paths = vec![
-        format!("{}{}", a_dir.to_string_lossy(), std::path::MAIN_SEPARATOR),
-        b_dir.join(".").to_string_lossy().into_owned(),
-        a_dir.to_string_lossy().into_owned(),
-    ];
+    let respelled = edited(&base, |c| {
+        c.paths.indexing_paths = vec![
+            format!("{}{}", a_dir.to_string_lossy(), std::path::MAIN_SEPARATOR),
+            b_dir.join(".").to_string_lossy().into_owned(),
+            a_dir.to_string_lossy().into_owned(),
+        ]
+    });
     assert_eq!(diff_actions(&base, &respelled), ConfigActions::default());
 
     // Whitespace around an ignore pattern is trimmed before it compiles.
-    let mut padded = base.clone();
-    padded.indexing.ignore_patterns = vec!["  node_modules ".into(), "*.tmp".into()];
+    let padded = edited(&base, |c| {
+        c.indexing.ignore_patterns = vec!["  node_modules ".into(), "*.tmp".into()]
+    });
     assert_eq!(diff_actions(&base, &padded), ConfigActions::default());
+
+    // So is a trailing separator, and an empty pattern compiles to nothing:
+    // neither may cost a prune and a full reindex.
+    let slashed = edited(&base, |c| {
+        c.indexing.ignore_patterns = vec!["node_modules/".into(), "*.tmp".into(), " / ".into()]
+    });
+    assert_eq!(diff_actions(&base, &slashed), ConfigActions::default());
 }
 
 #[test]
@@ -777,7 +1240,7 @@ fn salt_bytes_validates_hostile_configs() {
     assert!(sec.salt_bytes().is_ok());
 }
 
-/// Pure UI bookkeeping must never cost a rebuild or a watcher restart —
+/// Pure UI bookkeeping must never cost a rebuild or a watcher restart:
 /// restarting the watcher would re-trip the very warning being dismissed.
 #[test]
 fn ui_bookkeeping_fields_are_soft_knobs() {
@@ -796,20 +1259,17 @@ fn ui_bookkeeping_fields_are_soft_knobs() {
             c.duplicates.exclude_patterns = vec!["*.iso".to_string()]
         }),
         ("duplicates.hidden_groups", |c| {
-            c.duplicates.hidden_groups = vec!["ab".repeat(32)]
+            c.duplicates.hidden_groups = vec!["ab".repeat(64)]
         }),
     ];
     for (label, mutate) in cases {
-        let mut c = base.clone();
-        mutate(&mut c);
+        let c = edited(&base, mutate);
         assert_eq!(diff_actions(&base, &c), ConfigActions::default(), "{label}");
     }
 }
 
-/// Newer fields round-trip and default correctly in configs written before
-/// they existed; existing keys keep parsing either way.
 #[test]
-fn newer_fields_round_trip_and_default_when_absent() {
+fn newer_fields_round_trip() {
     let dir = tmp_dir();
     let path = dir.join("config.toml");
 
@@ -822,7 +1282,8 @@ fn newer_fields_round_trip_and_default_when_absent() {
     cfg.ui.color_scheme = "light".to_string();
     cfg.search.fuzzy_max_edits = 4;
     cfg.duplicates.exclude_patterns = vec!["*.iso".to_string()];
-    cfg.duplicates.hidden_groups = vec!["ab".repeat(32)];
+    // A group's identity: its head hash, then its tail digest.
+    cfg.duplicates.hidden_groups = vec!["ab".repeat(32) + &"cd".repeat(32)];
     cfg.save().unwrap();
     let loaded = Config::load_from(&path).unwrap();
     assert_eq!(
@@ -832,12 +1293,18 @@ fn newer_fields_round_trip_and_default_when_absent() {
     assert_eq!(loaded.ui.color_scheme, "light");
     assert_eq!(loaded.search.fuzzy_max_edits, 4);
     assert_eq!(loaded.duplicates, cfg.duplicates);
+}
 
-    assert_eq!(Config::default().ui.color_scheme, "dark");
+/// A config written before the newer fields existed gets their defaults, and
+/// its existing keys still parse.
+#[test]
+fn newer_fields_default_when_absent() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
     fs::write(
         &path,
         "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n\
-         [ui]\nscale=1.25\n[search]\nfuzzy_default=true\ndisplay_limit=250\n",
+         [ui]\nscale=1.25\n[search]\nfuzzy_default=false\ndisplay_limit=250\n",
     )
     .unwrap();
     let cfg = Config::load_from(&path).unwrap();
@@ -850,10 +1317,19 @@ fn newer_fields_round_trip_and_default_when_absent() {
     assert_eq!(cfg.ui.color_scheme, "dark");
     assert_eq!(cfg.search.fuzzy_max_edits, 2);
     assert_eq!(cfg.ui.scale, 1.25, "existing ui keys still parse");
-    assert!(cfg.search.fuzzy_default, "existing search keys still parse");
+    // `false` is the non-default value, so this only passes if the key parsed.
+    assert!(
+        !cfg.search.fuzzy_default,
+        "existing search keys still parse"
+    );
     assert_eq!(cfg.search.display_limit, 250);
+}
 
-    // A value nobody recognises is not a broken config file.
+/// A value nobody recognises is not a broken config file.
+#[test]
+fn an_unknown_color_scheme_still_loads() {
+    let dir = tmp_dir();
+    let path = dir.join("config.toml");
     fs::write(
         &path,
         "[paths]\nindexing_paths=[\"/x\"]\ndatabase_path=\"db.sqlite\"\n\
@@ -861,6 +1337,7 @@ fn newer_fields_round_trip_and_default_when_absent() {
     )
     .unwrap();
     assert_eq!(Config::load_from(&path).unwrap().ui.color_scheme, "drak");
+    assert_eq!(Config::default().ui.color_scheme, "dark");
 }
 
 #[test]
@@ -927,8 +1404,8 @@ fn only_a_freshly_written_config_asks_for_the_tour() {
 fn the_search_table_ships_without_size_or_modified() {
     let cols = ColumnsConfig::default();
     assert!(cols.name && cols.content_match && cols.rank);
-    assert!(!cols.size, "the size column is on by default");
-    assert!(!cols.modified, "the modified column is on by default");
+    assert!(!cols.size, "size must default off");
+    assert!(!cols.modified, "modified must default off");
 
     let older: Config = toml::from_str("[search]\ndisplay_limit = 500\n").expect("parses");
     assert_eq!(older.search.columns, cols);
@@ -936,7 +1413,7 @@ fn the_search_table_ships_without_size_or_modified() {
     assert!(older.search.live_results, "live results default to on");
 }
 
-/// The guard consulted before opening a path that came from a `files` row —
+/// The guard consulted before opening a path that came from a `files` row;
 /// see [`crate::file_handling::index_file_set`] for what opening one costs.
 #[test]
 fn the_index_and_every_sidecar_are_recognised() {
@@ -984,6 +1461,84 @@ fn a_tilde_database_path_still_matches_the_real_file() {
     assert!(!c.is_index_file(&absolute.with_file_name("other.sqlite")));
 }
 
+/// Pushed as it stands, the rest after `~/` is absolute when it starts with
+/// another separator, and replaces the home directory. On Unix a backslash
+/// is part of a name, not a separator.
+#[test]
+fn a_doubled_separator_after_the_tilde_stays_under_home() {
+    let Some(home) = crate::platform::home_dir() else {
+        return;
+    };
+    let home = PathBuf::from(home);
+    assert_eq!(expand_tilde("~//x"), home.join("x"));
+    assert_eq!(expand_tilde("~///x/y"), home.join("x").join("y"));
+    assert_eq!(expand_tilde("~/x"), home.join("x"));
+    assert_eq!(expand_tilde("~/"), home);
+    #[cfg(unix)]
+    assert_eq!(expand_tilde("~/\\x"), home.join("\\x"));
+    #[cfg(windows)]
+    assert_eq!(expand_tilde("~\\/\\x"), home.join("x"));
+}
+
+/// The home is passed in, so no test touches this process's `HOME`.
+#[cfg(unix)]
+#[test]
+fn a_home_that_is_not_utf8_gives_no_default_root() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let odd = OsString::from_vec(b"/home/\xffme".to_vec());
+    assert!(default_roots(Some(odd)).is_empty(), "never a lossy root");
+    assert_eq!(default_roots(Some("/home/me".into())), ["/home/me"]);
+    assert_eq!(default_roots(None), ["."]);
+}
+
+/// The data folder is passed in, so no test touches this process's
+/// environment. A non-Unicode one puts the index beside the config file.
+#[cfg(unix)]
+#[test]
+fn a_data_dir_that_is_not_utf8_gives_a_relative_database_path() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let odd = PathBuf::from(OsString::from_vec(
+        b"/data/\xffme/quicksearch/index.sqlite".to_vec(),
+    ));
+    assert_eq!(database_path_setting(odd.clone()), "index.sqlite");
+    assert_eq!(database_path_setting(odd), "index.sqlite", "every call");
+    assert_eq!(
+        database_path_setting(PathBuf::from("/data/me/quicksearch/index.sqlite")),
+        "/data/me/quicksearch/index.sqlite"
+    );
+
+    let dir = tmp_dir();
+    let cfg = Config {
+        source: Some(dir.join("config.toml")),
+        paths: PathConfig {
+            database_path: "index.sqlite".into(),
+            ..PathConfig::default()
+        },
+        ..Config::default()
+    };
+    assert_eq!(cfg.resolved_database_path(), dir.join("index.sqlite"));
+}
+
+/// Zero would panic `chunks`; the top is the settings form's own maximum.
+#[test]
+fn batch_is_held_between_one_and_the_gui_maximum() {
+    let batch = |batch_size| {
+        ProcessingConfig {
+            batch_size,
+            ..ProcessingConfig::default()
+        }
+        .batch()
+    };
+    assert_eq!(batch(0), 1);
+    assert_eq!(batch(usize::MAX), 100_000);
+    assert_eq!(batch(MAX_BATCH_SIZE), MAX_BATCH_SIZE);
+    assert_eq!(batch(500), 500);
+}
+
 /// `display_limit = 0` would make *every* search return nothing; a
 /// hand-editable file must not be able to do that.
 #[test]
@@ -1011,18 +1566,9 @@ fn in_range_numbers_are_left_exactly_alone() {
     let before = cfg.clone();
     let warnings = cfg.clamp_out_of_range();
     assert!(warnings.is_empty(), "defaults must not warn: {warnings:?}");
-    assert_eq!(cfg.search.display_limit, before.search.display_limit);
-    assert_eq!(cfg.processing.hash_length, before.processing.hash_length);
-    assert_eq!(
-        cfg.processing.maximum_text_file_size,
-        before.processing.maximum_text_file_size
-    );
-    assert_eq!(
-        cfg.processing.writer_turn_slice_ms,
-        before.processing.writer_turn_slice_ms
-    );
+    assert_eq!(cfg, before);
 
-    // Zero is a legal turn slice — one quantum per turn.
+    // Zero is a legal turn slice: one batch per turn.
     cfg.processing.writer_turn_slice_ms = 0;
     assert!(cfg.clamp_out_of_range().is_empty());
     assert_eq!(cfg.processing.writer_turn_slice_ms, 0);

@@ -18,6 +18,7 @@ impl QuickSearchApp {
             return;
         };
         let changes = changes.clone();
+        let db_path = self.cfg.resolved_database_path();
         let mut close = false;
         // Not `centered_modal`: the columns below need `default_width`.
         egui::Window::new("Rebuild index?")
@@ -42,11 +43,12 @@ impl QuickSearchApp {
                     ui.add_space(6.0);
                 }
                 ui.label(hint(
-                    "Unlike folders, filters and hidden files — which are applied \
-                     to the existing index in place — these cannot be, so the \
-                     index has to be built again. Until it is, existing entries \
-                     keep the old settings.",
+                    "These settings cannot be applied to the existing index, so it \
+                     must be rebuilt, which deletes the index database below. With \
+                     Later, the next indexing run rebuilds it; until then, existing \
+                     entries keep the old settings.",
                 ));
+                ui.monospace(db_path.display().to_string());
                 ui.horizontal(|ui| {
                     if ui.button("Rebuild now").clicked() {
                         self.backend.rebuild_index();
@@ -69,8 +71,8 @@ impl QuickSearchApp {
         let pairs = pairs.clone();
         let close = centered_modal(ctx, "Indexed folders may not be nested", |ui| {
             ui.label(
-                "Each root is indexed by its own worker pool, so one root \
-                 may not contain another. Fix the folder list below:",
+                "Each indexed folder is indexed on its own, so one may not \
+                 contain another. These overlap:",
             );
             for (child, parent) in &pairs {
                 ui.monospace(format!("{}  ⊂  {}", child, parent));
@@ -87,8 +89,8 @@ impl QuickSearchApp {
         }
     }
 
-    /// The button starts the rebuild rather than merely dismissing — in
-    /// manual mode nothing else would.
+    /// The button also starts the rebuild when nothing else will (see
+    /// [`stale_prompt_should_command`]).
     pub(super) fn stale_index_prompt_ui(&mut self, ctx: &egui::Context) {
         if !self.stale_index_prompt {
             return;
@@ -103,7 +105,7 @@ impl QuickSearchApp {
                 self.backend.rebuild_index();
             }
             // Either way the index is being replaced under the tab.
-            self.dups.state = DupState::NotLoaded;
+            self.drop_duplicates();
         }
     }
 
@@ -148,9 +150,9 @@ impl QuickSearchApp {
             match &reason {
                 WatchError::TooManyDirectories { cap, .. } => {
                     ui.label(format!(
-                        "Your indexed folders contain more than {} directories. The \
-                         system limits how many folders can be watched for changes at \
-                         once, so QuickSearch cannot update the index as files change.",
+                        "Your indexed folders contain more than {} directories, more \
+                         than can be watched for changes at once, so QuickSearch \
+                         cannot update the index as files change.",
                         group_thousands(*cap as u64),
                     ));
                 }
@@ -161,9 +163,9 @@ impl QuickSearchApp {
                         group_thousands(*registered as u64),
                     ));
                 }
-                // Not reachable today: an overflow schedules a full run
-                // instead of disabling live updates. Spelled out so a future
-                // variant is a compile error here.
+                // Unreachable: an overflow schedules a full run instead of
+                // disabling live updates. Matched so a new variant is a
+                // compile error here.
                 WatchError::Overflowed => {
                     ui.label(
                         "The system dropped some change notifications, so the index \
@@ -176,13 +178,13 @@ impl QuickSearchApp {
             }
             ui.add_space(4.0);
             ui.label(format!(
-                "The index is rebuilt every {} instead. Searches keep working; \
-                 recent changes may take that long to appear.",
+                "Instead, a full reindex runs every {}. Searches keep working, \
+                 but recent changes can take that long to appear.",
                 fmt_interval(self.cfg.indexing.reindex_interval_minutes),
             ));
             ui.label(hint(
                 "To restore live updates, index fewer folders or exclude large \
-                 subfolders under Filters on the Manage Index tab.",
+                 subfolders under Content filters on the Manage Index tab.",
             ));
             ui.button("OK").clicked()
         });
@@ -204,7 +206,7 @@ impl QuickSearchApp {
         };
         let roots = self.cfg.paths.indexing_paths.clone();
         let hotkey = self.cfg.ui.search_hotkey.clone();
-        let actions = tour.ui(ctx, &roots, &hotkey);
+        let actions = tour.ui(ctx, &roots, &hotkey, &self.search.query);
         // Through the same path a keystroke takes: `seed` arms the debounce,
         // so the demonstration search runs once the typing stops.
         if let Some(query) = actions.set_query {
@@ -213,20 +215,19 @@ impl QuickSearchApp {
         if actions.focus_search {
             self.search.request_focus();
         }
-        // Live, like the Settings slider on Apply — but saved only when the
-        // drag ends, so crossing the slider does not rewrite the config file
-        // on every frame.
+        // Sent only by the page's Apply button, so it applies and saves
+        // together, as the Settings tab's Apply does.
         if let Some(scale) = actions.set_scale {
             self.cfg.ui.scale = scale;
             ctx.set_zoom_factor(super::clamp_scale(scale));
-            if actions.save_scale {
-                self.save_cfg();
-            }
+            self.save_cfg();
         }
-        // Registered as it is captured, not on an Apply the tour has no
-        // button for — the page says it takes effect at once.
+        // Registered as it is captured: the tour has no Apply, and the page
+        // says it takes effect at once.
         if let Some(hotkey) = actions.set_hotkey {
             crate::hotkey::apply(&hotkey);
+            // The system-wide binding follows, where one is written.
+            crate::shortcut_setup::hotkey_changed(&hotkey);
             self.cfg.ui.search_hotkey = hotkey;
             self.save_cfg();
         }
@@ -243,15 +244,17 @@ impl QuickSearchApp {
 
     /// Re-open the tour from the Help tab.
     pub(crate) fn show_tutorial(&mut self) {
-        self.tutorial = Some(crate::tutorial::Tutorial::new());
+        self.tutorial = Some(crate::tutorial::Tutorial::default());
     }
 
     pub(super) fn clear_prompt_ui(&mut self, ctx: &egui::Context) {
         if !self.clear_prompt {
             return;
         }
+        let db_path = self.cfg.resolved_database_path();
         let close = centered_modal(ctx, "Clear index?", |ui| {
-            ui.label("This deletes the search index database. Your files are not touched.");
+            ui.label("This deletes the search index database below. Your files are not touched.");
+            ui.monospace(db_path.display().to_string());
             ui.label(hint(
                 "Indexing switches to manual until you start it again or return \
                  to automatic mode.",
@@ -263,7 +266,7 @@ impl QuickSearchApp {
                     // resurrect what was just deleted.
                     self.set_index_mode(false);
                     self.backend.clear_index();
-                    self.dups.state = DupState::NotLoaded;
+                    self.drop_duplicates();
                     return true;
                 }
                 ui.button("Cancel").clicked()
@@ -276,8 +279,8 @@ impl QuickSearchApp {
     }
 
     /// Each frame the pending intent picks the editor to ask about; Apply
-    /// and Discard clean one editor and the next frame moves on. Cancel —
-    /// button, Esc, or backdrop click — drops the intent.
+    /// and Discard clean one editor and the next frame moves on. Cancel
+    /// (button, Esc, or backdrop click) drops the intent.
     pub(super) fn unsaved_prompt_ui(&mut self, ctx: &egui::Context) {
         let Some(intent) = self.pending_nav else {
             return;
@@ -286,7 +289,9 @@ impl QuickSearchApp {
         let Some(source) = guard_source(intent, self.tab, dirty.0, dirty.1) else {
             // Inside the guard: the Discard-then-quit path never returns to
             // the close-request check, so a warning only there is skipped.
-            if quit_needs_reconcile_warning(intent, self.backend.coordinator.reconciling()) {
+            // Quitting mid-reconcile leaves excluded entries in the index; a
+            // tab switch does not end the pass.
+            if intent == NavIntent::Quit && self.backend.coordinator.reconciling() {
                 ctx.request_repaint_after(Duration::from_millis(250));
                 match reconcile_quit_modal(ctx) {
                     None => return,
@@ -307,31 +312,18 @@ impl QuickSearchApp {
                 UnsavedSource::Settings => self.settings.discard(),
             },
             Some(UnsavedChoice::Apply) => {
-                let ok = match source {
-                    UnsavedSource::Manage => match self.manage.take_apply_config(&self.cfg) {
-                        Some(cfg) => {
-                            let ok = self.apply_new_config(ctx, cfg);
-                            if ok {
-                                self.manage.mark_applied();
-                            }
-                            ok
-                        }
-                        None => true,
-                    },
-                    UnsavedSource::Settings => match self.settings.draft_config() {
-                        Some(cfg) => {
-                            let ok = self.apply_new_config(ctx, cfg);
-                            if ok {
-                                self.settings.discard();
-                            }
-                            ok
-                        }
-                        None => true,
-                    },
+                let draft = match source {
+                    UnsavedSource::Manage => self.manage.take_apply_config(&self.cfg),
+                    UnsavedSource::Settings => self.settings.draft_config(),
                 };
-                if !ok {
+                match draft.map(|cfg| self.apply_new_config(ctx, cfg)) {
+                    None => {}
+                    Some(true) => match source {
+                        UnsavedSource::Manage => self.manage.mark_applied(),
+                        UnsavedSource::Settings => self.settings.discard(),
+                    },
                     // Rejected: stay put, keep the staged edits.
-                    self.pending_nav = None;
+                    Some(false) => self.pending_nav = None,
                 }
             }
         }
@@ -421,15 +413,15 @@ fn reconcile_quit_modal(ctx: &egui::Context) -> Option<bool> {
         ui.set_max_width(460.0);
         ui.heading("Settings are still being applied");
         ui.label(
-            "QuickSearch is still applying your indexing settings to the index. If you \
-             quit now it stops part-way, and entries you excluded can still turn up in \
-             search results.",
+            "QuickSearch is still applying your indexing settings. If you quit now \
+             it stops part-way, and entries you excluded can still turn up in \
+             results.",
         );
         ui.add_space(4.0);
         ui.label(
-            "Nothing is lost: the next indexing run picks the work up again. In manual \
-             mode, choose \"Start indexing now\" on the Manage Index tab after the next \
-             launch.",
+            "Nothing is lost: the next indexing run finishes the job. In manual \
+             mode, click \"Start indexing now\" on the Manage Index tab after you \
+             reopen QuickSearch.",
         );
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -470,9 +462,8 @@ fn stale_index_window(ctx: &egui::Context, key_source: KeySource, command: bool)
     centered_modal(ctx, "Index reset for this version", |ui| {
         ui.set_max_width(440.0);
         ui.label(
-            "Your search index was created by an older version of QuickSearch, \
-             which this version cannot read. It is being reset and rebuilt from \
-             scratch. Don't worry, this is very Quick!",
+            "This version of QuickSearch cannot read your existing index, so it \
+             is being rebuilt from scratch.",
         );
         let reassurance = match key_source {
             KeySource::Unprotected => None,
@@ -513,23 +504,47 @@ fn display_value(value: &str) -> String {
 mod tests {
     use super::*;
 
-    fn frame(
-        ctx: &egui::Context,
-        source: KeySource,
-        command: bool,
-        events: Vec<egui::Event>,
-    ) -> bool {
-        let input = crate::test_ui::raw_input(SCREEN, events);
-        let mut clicked = false;
-        let _ = ctx.run(input, |ctx| {
-            clicked = stale_index_window(ctx, source, command)
-        });
-        clicked
-    }
-
-    use crate::test_ui::click_at;
+    use crate::test_ui::{click_at, key_press, painted_text_center, two_pass};
 
     const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
+
+    /// One frame of `show`: what was painted, and what it decided.
+    fn frame<T: Default>(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        mut show: impl FnMut(&egui::Context) -> T,
+    ) -> (egui::FullOutput, T) {
+        let mut decided = T::default();
+        let out = ctx.run(crate::test_ui::raw_input(SCREEN, events), |ctx| {
+            decided = show(ctx)
+        });
+        (out, decided)
+    }
+
+    /// Clicks `label` once the prompt has settled (a window is measured on
+    /// its first frame and placed on the next) and returns what the click
+    /// decided. Neither settling frame may decide anything.
+    fn click<T: Default + PartialEq + std::fmt::Debug>(
+        label: &str,
+        mut show: impl FnMut(&egui::Context) -> T,
+    ) -> T {
+        let ctx = crate::test_ui::ctx();
+        let out = two_pass(&ctx, SCREEN, Vec::new(), |ctx| {
+            let decided = show(ctx);
+            assert_eq!(decided, T::default(), "an untouched frame must not decide");
+        });
+        let pos = painted_text_center(&out, label).unwrap_or_else(|| panic!("no {label:?}"));
+        frame(&ctx, click_at(pos), &mut show).1
+    }
+
+    /// What Esc decides once the prompt has settled.
+    fn escape<T: Default>(mut show: impl FnMut(&egui::Context) -> T) -> T {
+        let ctx = crate::test_ui::ctx();
+        frame(&ctx, Vec::new(), &mut show);
+        frame(&ctx, Vec::new(), &mut show);
+        let esc = key_press(egui::Key::Escape, egui::Modifiers::NONE);
+        frame(&ctx, esc, &mut show).1
+    }
 
     #[test]
     fn the_stale_index_modal_renders_and_its_button_fires() {
@@ -538,159 +553,59 @@ mod tests {
             KeySource::Prompt,
             KeySource::Keychain,
         ] {
-            // Both button labels: "Rebuild now" when the click starts the
-            // rebuild, "Continue" when one is already running.
-            for command in [true, false] {
-                let ctx = crate::test_ui::ctx();
+            // "Rebuild now" when the click starts the rebuild, "Continue"
+            // when one is already running.
+            for (command, label) in [(true, "Rebuild now"), (false, "Continue")] {
                 assert!(
-                    !frame(&ctx, source, command, Vec::new()),
-                    "an untouched frame must not request a rebuild"
-                );
-
-                // The window's height depends on which sentence is shown; sweep.
-                let mut fired = None;
-                'sweep: for y in (230..480).step_by(3) {
-                    for x in (250..760).step_by(6) {
-                        let pos = egui::pos2(x as f32, y as f32);
-                        if frame(&ctx, source, command, click_at(pos)) {
-                            fired = Some(pos);
-                            break 'sweep;
-                        }
-                    }
-                }
-                assert!(
-                    fired.is_some(),
-                    "no clickable button for {source:?} (command: {command})"
+                    click(label, |ctx| stale_index_window(ctx, source, command)),
+                    "{label:?} did not fire for {source:?}"
                 );
             }
         }
-    }
-
-    fn modal_frame(
-        ctx: &egui::Context,
-        source: UnsavedSource,
-        events: Vec<egui::Event>,
-    ) -> Option<UnsavedChoice> {
-        let input = crate::test_ui::raw_input(SCREEN, events);
-        let mut choice = None;
-        let _ = ctx.run(input, |ctx| choice = unsaved_changes_modal(ctx, source));
-        choice
     }
 
     #[test]
     fn the_unsaved_modal_reports_each_choice() {
         for source in [UnsavedSource::Manage, UnsavedSource::Settings] {
-            let ctx = crate::test_ui::ctx();
-            assert_eq!(
-                modal_frame(&ctx, source, Vec::new()),
-                None,
-                "an untouched frame must not decide"
-            );
-
-            let mut seen = std::collections::HashSet::new();
-            for y in (250..450).step_by(3) {
-                for x in (250..760).step_by(6) {
-                    let pos = egui::pos2(x as f32, y as f32);
-                    if let Some(choice) = modal_frame(&ctx, source, click_at(pos)) {
-                        seen.insert(choice);
-                    }
-                }
-            }
-            for expected in [
-                UnsavedChoice::Apply,
-                UnsavedChoice::Discard,
-                UnsavedChoice::Cancel,
+            for (label, expected) in [
+                ("Apply & Save", UnsavedChoice::Apply),
+                ("Discard changes", UnsavedChoice::Discard),
+                ("Cancel", UnsavedChoice::Cancel),
             ] {
-                assert!(
-                    seen.contains(&expected),
-                    "{expected:?} never fired ({source:?})"
+                assert_eq!(
+                    click(label, |ctx| unsaved_changes_modal(ctx, source)),
+                    Some(expected),
+                    "{label:?} ({source:?})"
                 );
             }
-
-            let esc = modal_frame(
-                &ctx,
-                source,
-                vec![egui::Event::Key {
-                    key: egui::Key::Escape,
-                    physical_key: None,
-                    pressed: true,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                }],
+            assert_eq!(
+                escape(|ctx| unsaved_changes_modal(ctx, source)),
+                Some(UnsavedChoice::Cancel),
+                "Esc must cancel"
             );
-            assert_eq!(esc, Some(UnsavedChoice::Cancel), "Esc must cancel");
         }
-    }
-
-    fn reconcile_modal_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> Option<bool> {
-        let input = crate::test_ui::raw_input(SCREEN, events);
-        let mut choice = None;
-        let _ = ctx.run(input, |ctx| choice = reconcile_quit_modal(ctx));
-        choice
     }
 
     #[test]
     fn the_quit_warning_reports_both_answers() {
-        let ctx = crate::test_ui::ctx();
+        assert_eq!(click("Quit anyway", reconcile_quit_modal), Some(true));
+        assert_eq!(click("Cancel", reconcile_quit_modal), Some(false));
         assert_eq!(
-            reconcile_modal_frame(&ctx, Vec::new()),
-            None,
-            "an untouched frame must not decide"
+            escape(reconcile_quit_modal),
+            Some(false),
+            "Esc must keep the app open"
         );
-
-        let mut seen = std::collections::HashSet::new();
-        for y in (250..450).step_by(3) {
-            for x in (250..760).step_by(6) {
-                if let Some(choice) =
-                    reconcile_modal_frame(&ctx, click_at(egui::pos2(x as f32, y as f32)))
-                {
-                    seen.insert(choice);
-                }
-            }
-        }
-        assert!(seen.contains(&true), "\"Quit anyway\" never fired");
-        assert!(seen.contains(&false), "Cancel never fired");
-
-        let esc = reconcile_modal_frame(
-            &ctx,
-            vec![egui::Event::Key {
-                key: egui::Key::Escape,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }],
-        );
-        assert_eq!(esc, Some(false), "Esc must keep the app open");
-    }
-
-    fn banner_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> Option<ReconcileOwedChoice> {
-        let input = crate::test_ui::raw_input(SCREEN, events);
-        let mut choice = None;
-        let _ = ctx.run(input, |ctx| choice = reconcile_owed_banner(ctx));
-        choice
     }
 
     #[test]
     fn the_reconcile_banner_reports_both_buttons() {
-        let ctx = crate::test_ui::ctx();
-        assert_eq!(banner_frame(&ctx, Vec::new()), None);
-
-        let mut seen = std::collections::HashSet::new();
-        for y in (0..60).step_by(2) {
-            for x in (0..1000).step_by(4) {
-                if let Some(choice) = banner_frame(&ctx, click_at(egui::pos2(x as f32, y as f32))) {
-                    seen.insert(choice);
-                }
-            }
-        }
-        assert!(
-            seen.contains(&ReconcileOwedChoice::StartIndexing),
-            "\"Start indexing now\" never fired"
+        assert_eq!(
+            click("Start indexing now", reconcile_owed_banner),
+            Some(ReconcileOwedChoice::StartIndexing)
         );
-        assert!(
-            seen.contains(&ReconcileOwedChoice::Dismiss),
-            "Dismiss never fired"
+        assert_eq!(
+            click("Dismiss", reconcile_owed_banner),
+            Some(ReconcileOwedChoice::Dismiss)
         );
     }
 }

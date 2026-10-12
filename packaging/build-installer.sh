@@ -19,7 +19,6 @@
 # what goes into it.
 
 set -euo pipefail
-umask 022
 
 readonly PKG=quicksearch
 readonly TARGET=x86_64-pc-windows-gnu
@@ -41,8 +40,10 @@ version_quad="${version%%[-+]*}"
 case "$version_quad" in
     *[!0-9.]*) die "cannot build a Windows version number from '$version'" ;;
 esac
-while [ "$(printf '%s' "$version_quad" | tr -cd . | wc -c)" -lt 3 ]; do
-    version_quad="$version_quad.0"
+dots="${version_quad//[!.]/}"
+while [ "${#dots}" -lt 3 ]; do
+    version_quad+=.0
+    dots+=.
 done
 
 installer="$out_dir/$PKG-$version-windows-x86_64-setup.exe"

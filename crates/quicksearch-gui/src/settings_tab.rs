@@ -1,30 +1,25 @@
 //! The Settings tab. Edits happen on a draft; Apply validates, saves, and
 //! hands the new config to the app.
 
+use crate::format;
 use crate::keychain;
 use crate::tips::{self, tip_row, Tipped};
-use crate::ui_util::hint;
-use quicksearch_core::config::{ColumnsConfig, Config};
+use crate::ui_util::{hint, hint_colored};
+use quicksearch_core::config::{ColumnsConfig, Config, MAX_BATCH_SIZE};
+use quicksearch_core::search::fuzzy::MAX_FUZZY_EDITS;
 
-/// Who a row is for.
-///
-/// [`Level::Advanced`] means one of two things, and usually both: a person who
-/// indexed their home folder and nothing else will never need to change it, or
-/// they could not tell what it does without already knowing how the indexer
-/// works. A byte budget over the writer's batching is both. Password
-/// protection is neither, however technical it sounds.
+/// Who a row is for. `Advanced` rows are ones a typical user never needs to
+/// change or cannot judge without knowing how the indexer works (e.g. byte
+/// budgets). Password protection is `Everyday`, however technical it sounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Level {
     Everyday,
     Advanced,
 }
 
-/// The settings form's render context: which rows are on screen.
-///
-/// Every row goes through [`Form`], which is what keeps the two lists from
-/// drifting — a setting cannot be added to the tab without saying who it is
-/// for, and it cannot be shown without a tooltip either, because
-/// [`tips::tip_row`] is the only way through.
+/// Which rows the settings form shows. Every row goes through it and on to
+/// [`tips::tip_row`], so a setting cannot be added without saying who it is
+/// for or without a tooltip.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Form {
     pub advanced: bool,
@@ -61,14 +56,38 @@ impl Form {
             ui.add(egui::DragValue::new(value).range(range))
         });
     }
+
+    /// [`Form::drag`] for a byte count, shown as `52,428,800` and read back
+    /// with or without the separators ([`format::parse_grouped`]). Only the
+    /// byte fields get this: their values run to eight and ten digits, where
+    /// a misplaced zero is invisible.
+    fn drag_bytes<N: egui::emath::Numeric>(
+        self,
+        level: Level,
+        ui: &mut egui::Ui,
+        label: impl Into<egui::WidgetText>,
+        tip: &'static tips::Tip,
+        value: &mut N,
+        range: std::ops::RangeInclusive<N>,
+    ) {
+        self.row(level, ui, label, tip, |ui| {
+            ui.add(
+                egui::DragValue::new(value)
+                    .range(range)
+                    // `DragValue` renders and parses through `f64`. Byte
+                    // counts here are bounded by the config's own clamps (8
+                    // GiB at the largest), far inside the 2^53 an `f64`
+                    // holds exactly, so the round trip cannot lose a digit.
+                    .custom_formatter(|n, _| format::group_thousands(n.max(0.0) as u64))
+                    .custom_parser(|s| format::parse_grouped(s).map(|n| n as f64)),
+            )
+        });
+    }
 }
 
-/// A label ruled underneath in the palette's orange.
-///
-/// For the advanced toggle, which sits in the same two-column form as the
-/// settings but is not one of them — it decides which of them are on screen.
-/// The rule marks that difference without a second type size or a box: the
-/// text keeps the ordinary label color, so it reads as part of the form.
+/// A label ruled underneath in the palette's orange, for the advanced toggle:
+/// it sits in the form but decides which rows are on screen. The text keeps
+/// the ordinary label color, so it still reads as part of the form.
 fn accented_label(ui: &egui::Ui, text: &str) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -112,6 +131,7 @@ pub struct SettingsOutput {
     pub show_advanced: Option<bool>,
 }
 
+#[derive(Default)]
 pub struct SettingsTab {
     /// Staged the first frame the tab is shown; dropped when it is left.
     draft: Option<Config>,
@@ -123,15 +143,6 @@ pub struct SettingsTab {
 }
 
 impl SettingsTab {
-    pub fn new() -> SettingsTab {
-        SettingsTab {
-            draft: None,
-            keychain_probed_for: None,
-            keychain_active: false,
-            capturing_hotkey: false,
-        }
-    }
-
     /// Whether the shortcut button is reading a key press, so the app can
     /// hold the shortcut it is about to replace.
     pub fn capturing_hotkey(&self) -> bool {
@@ -168,13 +179,21 @@ impl SettingsTab {
     }
 
     /// True when the key really is in the OS keychain: the preference is on
-    /// *and* the keychain answers (a dead daemon or locked keyring reads as
-    /// "no"). Probed sparingly — a keychain read is an IPC round trip.
+    /// *and* the keychain answers (a dead daemon reads as "no") with a key
+    /// for the salt in force, not a stale one. Probed only when the
+    /// preference changes, since a keychain read is an IPC round trip on the
+    /// UI thread, and a locked keyring prompts to unlock and blocks the frame
+    /// until the prompt is answered.
     fn keychain_active(&mut self, current: &Config) -> bool {
         if self.keychain_probed_for != Some(current.security.use_keychain) {
             let db_path = current.resolved_database_path();
             self.keychain_active = current.security.use_keychain
-                && matches!(keychain::load_key(&db_path.to_string_lossy()), Ok(Some(_)));
+                && current.security.salt_bytes().is_ok_and(|salt| {
+                    matches!(
+                        keychain::load_entry(&db_path.to_string_lossy()),
+                        Ok(Some(text)) if keychain::remembered_key(&text, &salt).is_ok()
+                    )
+                });
             self.keychain_probed_for = Some(current.security.use_keychain);
         }
         self.keychain_active
@@ -208,10 +227,8 @@ impl SettingsTab {
                 // A maximized window would stretch every hint into one line.
                 ui.set_max_width(620.0);
 
-                // The same two-column shape as every settings row — label
-                // left, control right — so it reads as part of the form; the
-                // orange rule is what says it governs the form rather than
-                // belonging to it.
+                // The same two-column shape as every settings row; the orange
+                // rule says it governs the form (see `accented_label`).
                 let label = accented_label(ui, "Show advanced settings");
                 egui::Grid::new("opt-advanced")
                     .num_columns(2)
@@ -264,7 +281,7 @@ impl SettingsTab {
                 ui.heading(egui::RichText::new("Search").strong());
                 config_editor_ui(ui, draft, Section::Search, indexed_files, form);
                 ui.add_space(6.0);
-                // Live, not drafted — see `columns_ui`.
+                // Live, not drafted: see `columns_ui`.
                 out.columns = columns_ui(ui, &current.search.columns);
                 ui.separator();
 
@@ -293,7 +310,7 @@ impl SettingsTab {
                     );
                 });
                 hotkey_note(ui, &draft.ui.search_hotkey, &current.ui.search_hotkey);
-                shortcut_note(ui);
+                shortcut_note(ui, &current.ui.search_hotkey);
                 ui.separator();
 
                 // Security acts on the live config, not the draft; the KDF
@@ -306,37 +323,19 @@ impl SettingsTab {
                 config_editor_ui(ui, draft, Section::Processing, indexed_files, form);
                 ui.separator();
 
-                let p = crate::color::palette(ui.visuals().dark_mode);
-                ui.horizontal(|ui| {
-                    let apply = ui
-                        .add(crate::ui_util::bordered_button(
-                            "Apply & Save",
-                            if dirty { p.orange } else { p.blue },
-                        ))
-                        .tip(&tips::APPLY_SAVE);
-                    if apply.clicked() {
-                        out.applied = Some(draft.clone());
-                    }
-                    // Comes and goes with the dirty state.
-                    crate::ui_util::stable_section(ui, |ui| {
-                        if dirty {
-                            ui.label(
-                                egui::RichText::new("Unsaved changes")
-                                    .small()
-                                    .color(p.orange),
-                            );
-                        }
-                    });
-                });
-                // The second sentence names two rows that are only on screen
-                // with advanced settings shown.
+                if crate::ui_util::apply_save_row(ui, dirty).clicked() {
+                    out.applied = Some(draft.clone());
+                }
+                // The second sentence names a row that is only on screen with
+                // advanced settings shown.
                 ui.label(hint(if form.advanced {
                     "Narrowing a filter removes the entries it excludes; widening \
-                     one reindexes to find what it now allows. Only the tokenizer \
-                     and hash length require a full rebuild."
+                     one reindexes to find what it now allows. Only the compact \
+                     text index and the hash sample size require a full rebuild."
                 } else {
                     "Narrowing a filter removes the entries it excludes; widening \
-                     one reindexes to find what it now allows."
+                     one reindexes to find what it now allows. Changing the \
+                     compact text index rebuilds the index."
                 }));
             });
         crate::ui_util::more_below_hint(ui, &scroll);
@@ -366,10 +365,8 @@ fn color_scheme_edit(ui: &mut egui::Ui, setting: &mut String) -> egui::Response 
         .response
 }
 
-/// A button showing the current binding that turns into a key-press reader
-/// when clicked, and a Clear beside it.
-/// The shortcut button: click it, press a combination, or Clear. Shared with
-/// the tour's shortcut page, which offers the same setting.
+/// The shortcut button: click it and press a combination, or Clear. Shared
+/// with the tour's shortcut page, which offers the same setting.
 pub(crate) fn hotkey_edit(
     ui: &mut egui::Ui,
     setting: &mut String,
@@ -378,7 +375,7 @@ pub(crate) fn hotkey_edit(
     let p = crate::color::palette(ui.visuals().dark_mode);
     ui.horizontal(|ui| {
         let label = if *capturing {
-            "Press a key combination...".to_string()
+            "Press a key combination…".to_string()
         } else if setting.trim().is_empty() {
             "None".to_string()
         } else {
@@ -393,12 +390,12 @@ pub(crate) fn hotkey_edit(
             *capturing = !*capturing;
         } else if *capturing {
             match read_capture(ui) {
-                Some(Some(binding)) => {
+                Capture::Bound(binding) => {
                     *setting = binding.to_string();
                     *capturing = false;
                 }
-                Some(None) => *capturing = false,
-                None => {}
+                Capture::Cancelled => *capturing = false,
+                Capture::Waiting => {}
             }
         }
         if ui
@@ -416,11 +413,17 @@ pub(crate) fn hotkey_edit(
     .inner
 }
 
-/// One frame of capture: `Some(Some(binding))` for a press worth binding,
-/// `Some(None)` for a cancel, `None` while nothing usable arrived. Raw
-/// events, because egui's shortcut matching cannot report an arbitrary
-/// combination; invalid presses are ignored, not treated as a cancel.
-fn read_capture(ui: &egui::Ui) -> Option<Option<crate::hotkey::Binding>> {
+/// What one frame of key capture read.
+enum Capture {
+    /// Nothing bindable arrived; an invalid press is ignored, not a cancel.
+    Waiting,
+    Cancelled,
+    Bound(crate::hotkey::Binding),
+}
+
+/// Reads raw events, because egui's shortcut matching cannot report an
+/// arbitrary combination.
+fn read_capture(ui: &egui::Ui) -> Capture {
     ui.input(|i| {
         for event in &i.events {
             let egui::Event::Key {
@@ -433,81 +436,121 @@ fn read_capture(ui: &egui::Ui) -> Option<Option<crate::hotkey::Binding>> {
                 continue;
             };
             if *key == egui::Key::Escape {
-                return Some(None);
+                return Capture::Cancelled;
             }
             if let Some(binding) = crate::hotkey::Binding::from_egui(*key, modifiers) {
-                return Some(Some(binding));
+                return Capture::Bound(binding);
             }
         }
-        None
+        Capture::Waiting
     })
 }
 
 /// Silent while registered and working; a line appears only when what is on
 /// the button is not what is in force.
 fn hotkey_note(ui: &mut egui::Ui, draft: &str, live: &str) {
-    use crate::hotkey::Status;
-    let (text, color) = if draft.trim() != live.trim() {
-        ("Not registered until Apply and Save.".to_string(), None)
+    let line = if draft.trim() != live.trim() {
+        Some(("Not registered until Apply & Save.".to_string(), false))
     } else {
-        match crate::hotkey::status() {
-            Status::Disabled | Status::Active => (String::new(), None),
-            Status::Pending => (
-                "Waiting for your desktop to accept the shortcut.".to_string(),
-                None,
-            ),
-            Status::PortalBound(trigger) => (
-                format!(
-                    "Your desktop registered this as {}. It has the final say; \
-                     change it in its own keyboard settings. On Wayland it also \
-                     decides whether the window comes forward, so a minimised \
-                     window may stay minimised.",
-                    trigger
-                ),
-                None,
-            ),
-            Status::Error(why) => (
-                format!("The shortcut is not active: {}.", why),
-                Some(crate::color::palette(ui.visuals().dark_mode).orange),
-            ),
-        }
+        hotkey_status_line(crate::hotkey::status())
     };
+    let orange = crate::color::palette(ui.visuals().dark_mode).orange;
     crate::ui_util::stable_section(ui, |ui| {
-        if text.is_empty() {
-            return;
+        if let Some((text, is_error)) = line {
+            ui.label(if is_error {
+                hint_colored(text, orange)
+            } else {
+                hint(text)
+            });
         }
-        let rich = egui::RichText::new(text).small();
-        ui.label(match color {
-            Some(color) => rich.color(color),
-            None => rich.weak(),
-        });
     });
 }
 
-/// How to get a shortcut that also *starts* QuickSearch.
-///
-/// The shortcut above is ours and needs no setup, but it cannot fire while
-/// QuickSearch is not running — see `crate::activate`. Only the desktop can
-/// bind a key that launches something, so this says what to bind and opens
-/// the place to bind it. Writing the desktop's own configuration instead was
-/// considered and rejected: it differs per desktop and between versions of
-/// the same one, and a shortcut we wrote and the user cannot see is worse
-/// than one they created.
-///
-/// Shared with the tour's shortcut page, which puts it under the same
-/// shortcut button this sentence says is "above".
-pub(crate) fn shortcut_note(ui: &mut egui::Ui) {
+/// The sentence for a registration state, if it needs one, and whether it
+/// is an error worth the warning colour.
+fn hotkey_status_line(status: crate::hotkey::Status) -> Option<(String, bool)> {
+    use crate::hotkey::Status;
+    match status {
+        Status::Disabled | Status::Active => None,
+        Status::SystemOwned => Some((
+            "Your desktop delivers this key: it starts QuickSearch when \
+             closed and brings it forward when running."
+                .to_string(),
+            false,
+        )),
+        Status::DesktopOnly => Some((
+            "On Wayland only your desktop can hold a global key. Use \
+             \"Set up system shortcut\" below, or bind the command shown \
+             there by hand."
+                .to_string(),
+            false,
+        )),
+        // On Windows a failed registration is expected whenever the
+        // Start-menu shortcut owns the same key: Explorer registers it at
+        // logon, wins, and every press still reaches us through the
+        // `--toggle` relay. An error colour would cry wolf on every
+        // installed copy.
+        Status::Error(why) if cfg!(windows) => Some((
+            format!(
+                "Another program holds this key ({}), usually QuickSearch's own \
+                 Start menu shortcut, which also brings it forward. If the key \
+                 does nothing, pick another combination.",
+                why
+            ),
+            false,
+        )),
+        Status::Error(why) => Some((format!("The shortcut is not active: {}.", why), true)),
+    }
+}
+
+/// How to get a shortcut that also *starts* QuickSearch, which only the
+/// desktop can bind: ours cannot fire while QuickSearch is closed (see
+/// `crate::activate`). Where `crate::shortcut_setup` knows the desktop's home
+/// for such a binding, one button writes it there, where the desktop's own
+/// settings list it; elsewhere this names the command and opens the place to
+/// bind it. `hotkey_setting` is the shortcut in force, which the binding
+/// mirrors. Shared with the tour's shortcut page, under the same button.
+pub(crate) fn shortcut_note(ui: &mut egui::Ui, hotkey_setting: &str) {
+    // Tests reach this through the tour's shortcut page, where probing the
+    // real desktop would spawn `gsettings`; tests that want a desktop pin one
+    // through `shortcut_note_for`.
+    let desktop = if cfg!(test) {
+        crate::shortcut_setup::Desktop::Unsupported
+    } else {
+        crate::shortcut_setup::detect()
+    };
+    shortcut_note_for(ui, hotkey_setting, desktop);
+}
+
+/// One frame's answer from [`crate::shortcut_setup`], cached: `installed`
+/// probes the desktop with a subprocess, which must not run per frame.
+#[derive(Clone)]
+struct SystemShortcutState {
+    installed: bool,
+    /// The last install/remove outcome, as the line to show.
+    feedback: Option<Result<String, String>>,
+}
+
+/// The desktop split out of the environment so tests can pick one.
+fn shortcut_note_for(
+    ui: &mut egui::Ui,
+    hotkey_setting: &str,
+    desktop: crate::shortcut_setup::Desktop,
+) {
     let command = format!("{} --toggle", crate::activate::command_name());
     crate::ui_util::stable_section(ui, |ui| {
-        ui.label(
-            egui::RichText::new(
-                "The shortcut above works while QuickSearch is open. To have a key \
-                 start it as well, bind this command in your desktop's keyboard \
-                 settings:",
-            )
-            .small()
-            .weak(),
-        );
+        // One-click only with a key to write: an unset or unparseable
+        // shortcut leaves nothing to bind system-wide.
+        let binding = crate::hotkey::parse_setting(hotkey_setting).ok().flatten();
+        match binding.filter(|_| desktop != crate::shortcut_setup::Desktop::Unsupported) {
+            Some(binding) => one_click_controls(ui, &binding, hotkey_setting),
+            None => {
+                ui.label(hint(
+                    "The shortcut above works while QuickSearch is open. To have a key \
+                     start it too, bind this command in your desktop's keyboard settings:",
+                ));
+            }
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(&command).small().monospace());
             if ui.add(egui::Button::new("Copy").small()).clicked() {
@@ -520,23 +563,75 @@ pub(crate) fn shortcut_note(ui: &mut egui::Ui) {
             }
         });
         if crate::activate::raise::is_wayland() {
-            ui.label(
-                egui::RichText::new(
-                    "On Wayland a window that is already open cannot be raised by \
-                     another process, so the shortcut will highlight QuickSearch in \
-                     the task bar rather than bring it to the front.",
-                )
-                .small()
-                .weak(),
-            );
+            ui.label(hint(
+                "On Wayland the window comes forward only if the launcher passes an \
+                 activation token. The binding set up above does; one made by hand \
+                 may only highlight QuickSearch in the task bar.",
+            ));
         }
     });
 }
 
+/// The one-click install or removal of the desktop binding, then the lead-in
+/// to the manual command.
+fn one_click_controls(ui: &mut egui::Ui, binding: &crate::hotkey::Binding, hotkey_setting: &str) {
+    // One id for the settings tab and the tour: they show one fact.
+    let id = egui::Id::new("system-shortcut-state");
+    let mut state = ui
+        .data_mut(|d| d.get_temp::<SystemShortcutState>(id))
+        .unwrap_or_else(|| SystemShortcutState {
+            installed: crate::shortcut_setup::installed(),
+            feedback: None,
+        });
+    ui.label(hint(
+        "The shortcut above works while QuickSearch is open. Your desktop can \
+         also bind it to start QuickSearch when it is not:",
+    ));
+    ui.horizontal_wrapped(|ui| {
+        if state.installed {
+            ui.label(egui::RichText::new("The system shortcut is set up.").small());
+            if ui.add(egui::Button::new("Remove").small()).clicked() {
+                let result = crate::shortcut_setup::remove();
+                if result.is_ok() {
+                    state.installed = false;
+                    // Take the key back in-app now, not at the next save.
+                    crate::hotkey::apply(hotkey_setting);
+                }
+                state.feedback = Some(result.map(|()| "System shortcut removed.".to_string()));
+            }
+        } else if ui
+            .add(egui::Button::new(format!("Set up {} system-wide", binding)).small())
+            .clicked()
+        {
+            let result = crate::shortcut_setup::install(binding);
+            if result.is_ok() {
+                state.installed = true;
+                // Stand the in-app registration down at once so the desktop's
+                // binding is not fought for the key.
+                crate::hotkey::apply(hotkey_setting);
+            }
+            state.feedback = Some(result.map(|when| when.message().to_string()));
+        }
+    });
+    match &state.feedback {
+        Some(Ok(text)) => {
+            ui.label(hint(text));
+        }
+        Some(Err(text)) => {
+            ui.label(hint_colored(
+                text,
+                crate::color::palette(ui.visuals().dark_mode).orange,
+            ));
+        }
+        None => {}
+    }
+    ui.data_mut(|d| d.insert_temp(id, state));
+    ui.label(hint("Or bind this command there yourself:"));
+}
+
 /// The Search-tab column picker, mirroring the header right-click menu.
-/// Acts on the **live** config: the header menu writes columns the instant
-/// they change, and a draft-backed copy here would silently revert that on
-/// the next Apply.
+/// Acts on the live config: the header menu writes columns the instant they
+/// change, and a draft-backed copy here would revert that on the next Apply.
 fn columns_ui(ui: &mut egui::Ui, current: &ColumnsConfig) -> Option<ColumnsConfig> {
     let mut next = current.clone();
     ui.label("Search columns").on_hover_text(tips::COLUMNS.body);
@@ -544,8 +639,7 @@ fn columns_ui(ui: &mut egui::Ui, current: &ColumnsConfig) -> Option<ColumnsConfi
         ui.checkbox(&mut next.name, "Name").tip(&tips::COLUMNS);
         ui.add_enabled(false, egui::Checkbox::new(&mut true, "Path"))
             .on_disabled_hover_text(
-                "The path is always shown — it is the only column that \
-                 identifies a result on its own.",
+                "The path is always shown.",
             );
         ui.checkbox(&mut next.content_match, "Content Match")
             .tip(&tips::COLUMNS);
@@ -571,39 +665,36 @@ fn security_ui(
     let mut action = None;
     if current.security.password_protected {
         if keychain_active {
-            ui.label(
-                "The index is encrypted; its password is securely stored by \
-                 your Operating System.",
-            );
+            ui.label("The index is encrypted and its key is kept in your system's keychain.");
         } else {
             ui.label("The index is encrypted; a password is required at startup.");
         }
         ui.horizontal(|ui| {
             if ui
-                .button("Change password…")
+                .button("Change password")
                 .tip(&tips::CHANGE_PASSWORD)
                 .clicked()
             {
                 action = Some(SecurityAction::ChangePassword);
             }
             if ui
-                .button("Disable protection…")
+                .button("Disable protection")
                 .tip(&tips::DISABLE_PASSWORD)
                 .clicked()
             {
                 action = Some(SecurityAction::Disable);
             }
+            // The raw key is for someone recovering the file by hand; the
+            // password controls beside it are for everyone.
+            if form.advanced
+                && ui
+                    .button("Show database key")
+                    .tip(&tips::SHOW_KEY)
+                    .clicked()
+            {
+                action = Some(SecurityAction::ShowKey);
+            }
         });
-        // The raw key is for someone recovering the file by hand; the password
-        // controls above it are for everyone.
-        if form.advanced
-            && ui
-                .button("Show database key…")
-                .tip(&tips::SHOW_KEY)
-                .clicked()
-        {
-            action = Some(SecurityAction::ShowKey);
-        }
         let mut remember = current.security.use_keychain;
         if ui
             .checkbox(&mut remember, "Remember on this device")
@@ -615,7 +706,7 @@ fn security_ui(
     } else {
         ui.label("The index is not encrypted.");
         if ui
-            .button("Enable password protection…")
+            .button("Enable password protection")
             .tip(&tips::ENABLE_PASSWORD)
             .clicked()
         {
@@ -644,35 +735,33 @@ fn search_cache_hint(config: &Config, indexed_files: Option<i64>) -> Option<Stri
     let mib = recommended_search_cache_mib(files, keyed);
     if !keyed {
         return Some(format!(
-            "Automatic: {} MiB. An unencrypted index reads a cache miss \
-             straight from the operating system, so a larger cache measures no \
-             faster.",
+            "Automatic: {} MiB, kept small to save memory. An unencrypted index \
+             reads a cache miss straight from the operating system, so a larger \
+             cache is at most about a quarter faster.",
             mib
         ));
     }
     let counted = crate::format::group_thousands(files.max(0) as u64);
-    // Past ~800k files the automatic value is capped below what the index
-    // wants. Saying so is the only way the override is discoverable in the one
-    // case that needs it.
+    // Past ~1.3M files the automatic value is capped below what the index
+    // wants; saying so makes the override discoverable.
     let wanted = files.max(0).saturating_mul(SEARCH_CACHE_BYTES_PER_FILE) / (1024 * 1024);
     if wanted > SEARCH_CACHE_MAX_MIB {
         return Some(format!(
-            "Automatic: {} MiB, the most it will choose on its own. This \
-             index's {} files want about {} MiB to search at full speed — set \
-             that here if you would rather spend the memory than the time.",
+            "Automatic: {} MiB, the most it chooses on its own. This index's \
+             {} files need about {} MiB to search at full speed; set that here \
+             to spend the memory instead of the time.",
             mib, counted, wanted
         ));
     }
     Some(format!(
-        "Automatic: {} MiB, sized to hold this index's {} file records — an \
-         encrypted index re-decrypts them on every keystroke when they do not \
-         fit.",
+        "Automatic: {} MiB, enough to hold this index's {} file records. An \
+         encrypted index decrypts them again on every keystroke when they do \
+         not fit.",
         mib, counted
     ))
 }
 
-/// Every row goes through [`Form`], so a setting cannot arrive here without a
-/// tooltip or without saying who it is for.
+/// One section's rows, each through [`Form`].
 fn config_editor_ui(
     ui: &mut egui::Ui,
     config: &mut Config,
@@ -707,14 +796,6 @@ fn config_editor_ui(
                     );
 
                     form.row(
-                        Level::Advanced,
-                        ui,
-                        "Follow symlinks",
-                        &tips::FOLLOW_SYMLINKS,
-                        |ui| ui.checkbox(&mut config.indexing.follow_symlinks, ""),
-                    );
-
-                    form.row(
                         Level::Everyday,
                         ui,
                         "Include hidden files",
@@ -727,33 +808,7 @@ fn config_editor_ui(
             egui::Grid::new("cfg-processing")
                 .num_columns(2)
                 .show(ui, |ui| {
-                    form.row(Level::Advanced, ui, "Tokenizer", &tips::TOKENIZER, |ui| {
-                        egui::ComboBox::from_id_salt("cfg-tokenize")
-                            .selected_text(&config.processing.tokenize)
-                            .show_ui(ui, |ui| {
-                                for opt in ["trigram", "unicode61", "porter"] {
-                                    ui.selectable_value(
-                                        &mut config.processing.tokenize,
-                                        opt.to_string(),
-                                        opt,
-                                    );
-                                }
-                            })
-                            .response
-                    });
-
-                    // Not a row, so it needs its own guard: it documents the
-                    // tokenizer above and makes no sense without it.
-                    if form.advanced {
-                        ui.label("");
-                        ui.hyperlink_to(
-                            "Tokenizer documentation",
-                            "https://www.sqlite.org/fts5.html#tokenizers",
-                        );
-                        ui.end_row();
-                    }
-
-                    form.drag(
+                    form.drag_bytes(
                         Level::Advanced,
                         ui,
                         "Hash sample size (bytes)",
@@ -762,7 +817,7 @@ fn config_editor_ui(
                         512..=1_048_576,
                     );
 
-                    form.drag(
+                    form.drag_bytes(
                         Level::Advanced,
                         ui,
                         "Max stored text (bytes)",
@@ -771,7 +826,7 @@ fn config_editor_ui(
                         1024..=16_777_216,
                     );
 
-                    form.drag(
+                    form.drag_bytes(
                         Level::Advanced,
                         ui,
                         "Max text file size (bytes)",
@@ -786,10 +841,10 @@ fn config_editor_ui(
                         "Batch size",
                         &tips::BATCH_SIZE,
                         &mut config.processing.batch_size,
-                        10..=100_000,
+                        10..=MAX_BATCH_SIZE,
                     );
 
-                    form.drag(
+                    form.drag_bytes(
                         Level::Advanced,
                         ui,
                         "Max WAL size (bytes)",
@@ -801,9 +856,9 @@ fn config_editor_ui(
                     form.row(
                         Level::Everyday,
                         ui,
-                        "Store text for snippets",
-                        &tips::STORE_TEXT,
-                        |ui| ui.checkbox(&mut config.processing.store_text_for_snippets, ""),
+                        "Compact text index",
+                        &tips::COMPACT_INDEX,
+                        |ui| ui.checkbox(&mut config.processing.compact_text_index, ""),
                     );
                 });
         }
@@ -823,7 +878,7 @@ fn config_editor_ui(
                     "Fuzzy edit distance",
                     &tips::FUZZY_EDITS,
                     &mut config.search.fuzzy_max_edits,
-                    0..=8,
+                    0..=MAX_FUZZY_EDITS,
                 );
 
                 form.drag(
@@ -873,7 +928,7 @@ fn config_editor_ui(
                 );
             });
             // Both come and go as their values are edited, and both explain
-            // advanced rows — there is nothing to say when those are hidden.
+            // advanced rows, so there is nothing to say when those are hidden.
             if form.advanced {
                 crate::ui_util::stable_section(ui, |ui| {
                     if let Some(warning) = config.search.fuzzy_edits_warning() {

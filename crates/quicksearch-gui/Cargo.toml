@@ -11,28 +11,28 @@ description = "Fast full-text search across your files: desktop app and terminal
 name = "quicksearch"
 path = "src/main.rs"
 
-# Terminal search is its own binary because the two need opposite Windows
-# subsystems: a GUI console app flashes a console on launch; a console tool
-# built as a GUI app cannot write to the invoking shell. On Unix the
-# distinction does not exist and `quicksearch` still does both.
+# Terminal search is its own binary because Windows needs opposite subsystems
+# for the two: a console-subsystem GUI flashes a console on launch, and a
+# window-subsystem tool cannot write to the invoking shell. On Unix
+# `quicksearch` does both.
 [[bin]]
 name = "quicksearch-cli"
 path = "src/cli_main.rs"
 
 [features]
-# Scripted self-capture driver used by packaging/capture.sh to regenerate the
-# website screenshots and screencasts. Adds no dependencies and is inert
-# unless QS_CAPTURE_SCRIPT is set at runtime.
+# Scripted self-capture driver that packaging/capture.sh uses to regenerate
+# the website screenshots and screencasts. Adds no dependencies and is inert
+# unless QS_CAPTURE_SCRIPT is set.
 capture = []
 
 [dependencies]
 quicksearch-core = { path = "../quicksearch-core" }
 
-# Index-password support: OS keychain for "remember on this device"
-# (Secret Service on Linux, Credential Manager on Windows), hidden terminal
-# prompt, and best-effort scrubbing of password buffers.
-# `vendored` compiles libdbus statically, so neither the build machine nor
-# the .deb needs a dbus development/runtime package.
+# Index-password support: the OS keychain for "remember on this device"
+# (Secret Service on Linux, Credential Manager on Windows), a hidden terminal
+# prompt, and best-effort scrubbing of password buffers. `vendored` links
+# libdbus statically, so neither the build machine nor the .deb needs a dbus
+# package.
 keyring = { version = "3", features = ["sync-secret-service", "vendored", "windows-native"] }
 rpassword = "7"
 zeroize = "1"
@@ -41,23 +41,35 @@ eframe = { version = "0.32", default-features = false, features = [
     "glow",
     "persistence",
 ] }
-# `default-features = false` for one feature, `default_fonts` (~1.4 MB of
-# embedded TTFs; `src/fonts.rs` installs the faces actually painted). eframe's
-# `default-features = false` above does NOT cover this: feature resolution
-# unions the declarations, so naming egui plainly switches it back on.
+# Drops `default_fonts` (~1.4 MB of embedded TTFs; `src/fonts.rs` installs
+# the faces we paint). eframe's `default-features = false` does not cover it:
+# feature resolution unions the declarations, so naming egui plainly would
+# switch it back on.
 egui = { version = "0.32", default-features = false }
-# Only `Column`/`TableBuilder` are used; the lone default feature is an image
-# loader that is never registered, so this compiles one crate less.
+# Vets a system fallback font before epaint loads it, since epaint panics on
+# a face it cannot parse (`src/fonts.rs`). epaint's own font parser, with
+# its features, so nothing new compiles.
+ab_glyph = "0.2"
+# Maps those system fonts rather than reading them into the heap, so only the
+# pages their glyphs touch cost memory (`src/fonts.rs`). Already in the Linux
+# tree through winit and sctk.
+memmap2 = "0.9"
+# Only `Column`/`TableBuilder` are used; the one default feature is an image
+# loader we never register.
 egui_extras = { version = "0.32", default-features = false }
 rfd = "0.15"
 open = "5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# The shortcut QuickSearch claims for itself while running, where the display
-# server lets an application claim keys: `RegisterHotKey` on Windows,
-# `XGrabKey` on X11. Wayland does not, and is handled by the portal below.
-# This is the zero-setup path; `--toggle` covers the app not running.
+# The shortcut QuickSearch claims while running: `RegisterHotKey` on Windows,
+# `XGrabKey` on X11. Wayland lets no application claim keys; there, and
+# whenever the app is not running, the desktop's binding of `--toggle` does it.
 global-hotkey = "0.8"
+
+# The window handle both native raise paths in `activate::raise` need (X11
+# `_NET_ACTIVE_WINDOW`, Win32 `SetForegroundWindow`). eframe depends on it on
+# every target, so it adds no crate.
+raw-window-handle = "0.6"
 
 # Display backends, which only exist on Linux/BSD. `default-features = false`
 # has to be repeated: feature resolution unions the two stanzas, so a single
@@ -68,45 +80,35 @@ eframe = { version = "0.32", default-features = false, features = [
     "x11",
 ] }
 
-# The Wayland half of the in-application shortcut:
-# `org.freedesktop.portal.GlobalShortcuts`, the only way a Wayland application
-# can be told about a key it does not own. `rfd` already pulls all four in (it
-# uses the file-chooser portal), so the versions here are the ones already
-# resolved and nothing extra is compiled. `default-features = false` matters:
-# ashpd defaults to Tokio, which would add a second async runtime and switch
-# `zbus` over to it underneath `rfd`.
-ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
-futures-channel = "0.3"
-futures-util = "0.3"
-pollster = "0.4"
-
-# Raising the window from either shortcut on X11, which winit cannot
-# do: it asks with a source indication of "application", and every mainstream
-# window manager refuses that from a window that is not already focused. See
-# `activate::raise`. Both are already in the tree (winit's own X11 backend,
-# and eframe's window handle), so neither adds a crate.
+# Raises the window on X11, which winit cannot do (see `activate::raise`).
+# Already in the tree as winit's X11 backend.
 x11rb = "0.13"
-raw-window-handle = "0.6"
 
-# XTEST, for `examples/raiseprobe.rs` only: it synthesises the global key
-# press that proves the shortcut path end to end, which no command-line tool
-# here can do. A dev-dependency feature, so the shipped binary never gets it —
-# `cargo build --bin quicksearch` does not build dev-dependencies at all.
-[target.'cfg(all(unix, not(target_os = "macos")))'.dev-dependencies]
-x11rb = { version = "0.13", features = ["xtest"] }
+# The Wayland half of `activate::raise`: a guest connection over winit's
+# wl_display that hands the compositor an xdg-activation token for our
+# surface. winit and sctk already enable all three with these features, so
+# nothing new compiles.
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
-# Console attachment for the GUI binary (which has no stdio when launched from
-# Explorer) and VT-mode enabling for the CLI binary. 0.59 matches what eframe
-# and rfd already resolve, so no extra crate is compiled.
+# NUL stdio for the GUI binary (which has no standard handles when launched
+# from Explorer) and VT mode for the CLI binary. 0.59 matches what eframe and
+# rfd resolve, so no extra crate compiles.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Console",
-    # The `--toggle` named pipe in `activate`. `Win32_System_IO` and
-    # `Win32_Security` are not used directly: they carry the `OVERLAPPED` and
-    # `SECURITY_ATTRIBUTES` types naming the pointers we pass as null.
+    # The `--toggle` named pipe in `activate`. `Win32_System_IO` carries the
+    # overlapped calls that time out the server's reads; `Win32_Security`
+    # only the `SECURITY_ATTRIBUTES` type of pointers we pass as null.
     "Win32_System_Pipes",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_Security",
+    # The foreground handshake (`activate`) and native raise (`activate::raise`):
+    # GetCurrentProcessId, AllowSetForegroundWindow / SetForegroundWindow; and
+    # the event the pipe's timed waits use (CreateEventW, WaitForSingleObject).
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }

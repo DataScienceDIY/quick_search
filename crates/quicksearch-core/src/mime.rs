@@ -95,9 +95,8 @@ fn extension_override(path: &Path) -> Option<&'static str> {
         .map(|(_, mime)| *mime)
 }
 
-/// The essence of a raw MIME — everything before any `;` parameter — as a
-/// borrow of the same static. `Mime::essence_str` would do this too, but only
-/// off an owned `Mime`, which is why the raw form is what gets asked for.
+/// The essence of a raw MIME (everything before any `;` parameter), borrowed
+/// from the same static; `Mime::essence_str` needs an owned `Mime`.
 fn essence(raw: &'static str) -> &'static str {
     match raw.split_once(';') {
         Some((essence, _)) => essence.trim_end(),
@@ -113,10 +112,9 @@ fn essence(raw: &'static str) -> &'static str {
 /// A `None` result is a real answer, not a "don't know": the content pass
 /// stores it and never re-derives it.
 ///
-/// `&'static str` rather than `String`: every answer comes from one of three
-/// static tables ([`EXTENSION_OVERRIDES`], `mime_guess`'s, `infer`'s) or is a
-/// literal, and this runs once per indexed file — an owned copy here was a
-/// heap allocation per file for a string nobody mutates.
+/// Every answer comes from a static table ([`EXTENSION_OVERRIDES`],
+/// `mime_guess`'s, `infer`'s) or is a literal, so this runs once per indexed
+/// file without allocating.
 pub fn guess_mime_from_head(path: &Path, head: &[u8]) -> Option<&'static str> {
     if let Some(m) = extension_override(path) {
         return Some(m);
@@ -138,6 +136,11 @@ pub fn guess_mime_from_head(path: &Path, head: &[u8]) -> Option<&'static str> {
         if magic == "application/x-ole-storage" && by_extension.is_some() {
             return by_extension;
         }
+        if magic == "application/zip" && by_extension.is_none() {
+            if let Some(ooxml) = ooxml_by_entries(head) {
+                return Some(ooxml);
+            }
+        }
         return Some(magic);
     }
     if crate::textenc::looks_like_text(head) {
@@ -147,48 +150,77 @@ pub fn guess_mime_from_head(path: &Path, head: &[u8]) -> Option<&'static str> {
     by_extension
 }
 
+/// The OOXML MIME of a zip whose first part under `word/`, `xl/` or `ppt/`
+/// has its local header in `head`. `infer` decides by the first entry, or
+/// past a `_rels/` or `docProps/` one by the third, where LibreOffice writes
+/// a second `docProps/` part, so an extensionless LibreOffice document would
+/// sniff as a plain zip. The data between headers is skipped by searching
+/// for the next signature: an entry written with a data descriptor records
+/// no size up front.
+fn ooxml_by_entries(head: &[u8]) -> Option<&'static str> {
+    const PARTS: [(&[u8], &str); 3] = [
+        (
+            b"word/",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+        (
+            b"xl/",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ),
+        (
+            b"ppt/",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+    ];
+    let mut at = 0;
+    while let Some(found) = head.get(at..)?.windows(4).position(|w| w == b"PK\x03\x04") {
+        let header = at + found;
+        let len = head.get(header + 26..header + 28)?;
+        let name_end = header + 30 + usize::from(u16::from_le_bytes([len[0], len[1]]));
+        let name = head.get(header + 30..name_end)?;
+        if let Some((_, mime)) = PARTS.iter().find(|(prefix, _)| name.starts_with(prefix)) {
+            return Some(*mime);
+        }
+        at = name_end;
+    }
+    None
+}
+
 /// The longest MIME any table here holds is 73 bytes; 128 leaves room and
 /// keeps [`LowerMime`] a stack value. Anything longer names no format this
 /// classifies, so it is matched as it came rather than growing a heap copy.
 const MAX_MIME_LEN: usize = 128;
 
-/// A MIME lowercased without allocating.
-///
-/// Nearly every MIME reaching the classifiers is already lowercase —
-/// [`guess_mime_from_head`] answers from static tables — so the common path
-/// borrows and only a genuinely mixed-case string is copied into the buffer.
-/// This runs a few times per indexed file; `to_ascii_lowercase` there was a
-/// heap allocation apiece.
-pub(crate) struct LowerMime {
-    buf: [u8; MAX_MIME_LEN],
-    len: usize,
-    /// Set when the input was already lowercase (or too long to copy), in
-    /// which case [`LowerMime::as_str`] hands the original straight back.
-    borrowed: bool,
+/// A MIME lowercased without allocating; it runs a few times per indexed
+/// file. Nearly every MIME reaching the classifiers is already lowercase
+/// ([`guess_mime_from_head`] answers from static tables), so the common path
+/// borrows and only a mixed-case string is copied.
+pub(crate) enum LowerMime<'a> {
+    /// Already lowercase, or too long to copy.
+    Borrowed(&'a str),
+    /// The folded copy, in the buffer's first `usize` bytes.
+    Folded([u8; MAX_MIME_LEN], usize),
 }
 
-impl LowerMime {
-    pub(crate) fn new(mime: &str) -> LowerMime {
-        let mut lower = LowerMime {
-            buf: [0; MAX_MIME_LEN],
-            len: mime.len(),
-            borrowed: true,
-        };
-        if mime.len() <= MAX_MIME_LEN && mime.bytes().any(|b| b.is_ascii_uppercase()) {
-            lower.buf[..mime.len()].copy_from_slice(mime.as_bytes());
-            // ASCII-only folding: a multi-byte sequence is left untouched, so
-            // what comes out is still the UTF-8 that went in.
-            lower.buf[..mime.len()].make_ascii_lowercase();
-            lower.borrowed = false;
+impl<'a> LowerMime<'a> {
+    pub(crate) fn new(mime: &'a str) -> LowerMime<'a> {
+        if mime.len() > MAX_MIME_LEN || !mime.bytes().any(|b| b.is_ascii_uppercase()) {
+            return LowerMime::Borrowed(mime);
         }
-        lower
+        let mut buf = [0; MAX_MIME_LEN];
+        buf[..mime.len()].copy_from_slice(mime.as_bytes());
+        buf[..mime.len()].make_ascii_lowercase();
+        LowerMime::Folded(buf, mime.len())
     }
 
-    pub(crate) fn as_str<'a>(&'a self, original: &'a str) -> &'a str {
-        if self.borrowed {
-            return original;
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            LowerMime::Borrowed(s) => s,
+            // ASCII-only folding leaves multi-byte sequences untouched.
+            LowerMime::Folded(buf, len) => {
+                std::str::from_utf8(&buf[..*len]).expect("ASCII folding keeps UTF-8 valid")
+            }
         }
-        std::str::from_utf8(&self.buf[..self.len]).unwrap_or(original)
     }
 }
 
@@ -196,50 +228,55 @@ impl LowerMime {
 /// `basicindexingjob.cpp:typesForMimeType`.
 pub fn mime_to_type(mime: &str) -> FileType {
     let lower = LowerMime::new(mime);
-    let lower = lower.as_str(mime);
-    let (top, sub) = match lower.split_once('/') {
-        Some(pair) => pair,
-        None => return FileType::EMPTY,
+    let Some((top, sub)) = lower.as_str().split_once('/') else {
+        return FileType::EMPTY;
     };
-    let mut t = FileType::EMPTY;
-    match top {
-        "audio" => t |= FileType::AUDIO,
-        "image" => t |= FileType::IMAGE,
-        "video" => t |= FileType::VIDEO,
-        "text" => {
-            t |= FileType::TEXT;
-            // HTML counts as a document too in Baloo.
-            if sub == "html" {
-                t |= FileType::DOCUMENT;
-            }
-        }
-        _ => {}
-    }
+    let t = match top {
+        "audio" => FileType::AUDIO,
+        "image" => FileType::IMAGE,
+        "video" => FileType::VIDEO,
+        // HTML counts as a document too in Baloo.
+        "text" if sub == "html" => FileType::TEXT | FileType::DOCUMENT,
+        "text" => FileType::TEXT,
+        _ => FileType::EMPTY,
+    };
     // Subtype-based classification for the `application/*` grab bag.
-    match sub {
-        // Office formats
+    t | match sub {
+        // Office formats, with their template and macro-enabled names so the
+        // type filter finds every one. Outlook saved messages and compiled
+        // HTML help are documents too.
         "msword"
         | "vnd.openxmlformats-officedocument.wordprocessingml.document"
+        | "vnd.openxmlformats-officedocument.wordprocessingml.template"
+        | "vnd.ms-word.document.macroenabled.12"
+        | "vnd.ms-word.template.macroenabled.12"
         | "vnd.oasis.opendocument.text"
+        | "vnd.oasis.opendocument.text-template"
         | "rtf"
         | "pdf"
         | "epub+zip"
-        | "x-mobipocket-ebook" => {
-            t |= FileType::DOCUMENT;
-        }
+        | "x-mobipocket-ebook"
+        | "vnd.ms-outlook"
+        | "vnd.ms-htmlhelp" => FileType::DOCUMENT,
         "vnd.ms-excel"
         | "vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        | "vnd.oasis.opendocument.spreadsheet" => {
-            t |= FileType::DOCUMENT | FileType::SPREADSHEET;
+        | "vnd.openxmlformats-officedocument.spreadsheetml.template"
+        | "vnd.ms-excel.sheet.macroenabled.12"
+        | "vnd.ms-excel.template.macroenabled.12"
+        | "vnd.oasis.opendocument.spreadsheet"
+        | "vnd.oasis.opendocument.spreadsheet-template" => {
+            FileType::DOCUMENT | FileType::SPREADSHEET
         }
         "vnd.ms-powerpoint"
         | "vnd.openxmlformats-officedocument.presentationml.presentation"
-        | "vnd.oasis.opendocument.presentation" => {
-            t |= FileType::DOCUMENT | FileType::PRESENTATION;
-        }
-        // Outlook saved messages and compiled HTML help are documents.
-        "vnd.ms-outlook" | "vnd.ms-htmlhelp" => {
-            t |= FileType::DOCUMENT;
+        | "vnd.openxmlformats-officedocument.presentationml.slideshow"
+        | "vnd.openxmlformats-officedocument.presentationml.template"
+        | "vnd.ms-powerpoint.presentation.macroenabled.12"
+        | "vnd.ms-powerpoint.slideshow.macroenabled.12"
+        | "vnd.ms-powerpoint.template.macroenabled.12"
+        | "vnd.oasis.opendocument.presentation"
+        | "vnd.oasis.opendocument.presentation-template" => {
+            FileType::DOCUMENT | FileType::PRESENTATION
         }
         // Archives, including the Windows installer/cabinet formats.
         "zip"
@@ -254,86 +291,109 @@ pub fn mime_to_type(mime: &str) -> FileType {
         | "vnd.debian.binary-package"
         | "x-rpm"
         | "vnd.ms-cab-compressed"
-        | "x-msi" => {
-            t |= FileType::ARCHIVE;
-        }
+        | "x-msi" => FileType::ARCHIVE,
         // XHTML is text and a document, whichever top level it arrives under.
-        "xhtml+xml" => {
-            t |= FileType::TEXT | FileType::DOCUMENT;
-        }
+        "xhtml+xml" => FileType::TEXT | FileType::DOCUMENT,
         // Everything the plaintext extractor claims beyond `text/*` (see
         // `EXTRA_TEXT_MIMES` and the cross-check test below). Keyed on the
         // subtype alone, so playlists stay AUDIO|TEXT and SVG IMAGE|TEXT.
         "xml" | "json" | "json5" | "geo+json" | "javascript" | "mbox" | "rfc822" | "vnd.dart"
         | "x-csh" | "x-httpd-php" | "x-perl" | "x-sh" | "x-sql" | "x-subrip" | "x-tcl"
         | "x-tex" | "x-texinfo" | "x-troff" | "x-troff-man" | "x-mpegurl" | "scpls" | "svg+xml" => {
-            t |= FileType::TEXT;
+            FileType::TEXT
         }
-        _ => {}
+        _ => FileType::EMPTY,
     }
-    t
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn audio_mime() {
-        assert!(mime_to_type("audio/mpeg").contains(FileType::AUDIO));
-        assert!(mime_to_type("audio/flac").contains(FileType::AUDIO));
+    fn guess(name: &str, head: &[u8]) -> Option<&'static str> {
+        guess_mime_from_head(Path::new(name), head)
     }
 
     #[test]
-    fn image_mime() {
-        assert!(mime_to_type("image/jpeg").contains(FileType::IMAGE));
-        assert!(mime_to_type("image/png").contains(FileType::IMAGE));
-    }
-
-    #[test]
-    fn docx_is_document_and_office() {
-        let t =
-            mime_to_type("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
-        assert!(t.contains(FileType::DOCUMENT));
-    }
-
-    #[test]
-    fn xlsx_is_spreadsheet_and_document() {
-        let t = mime_to_type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-        assert!(t.contains(FileType::DOCUMENT));
-        assert!(t.contains(FileType::SPREADSHEET));
-    }
-
-    #[test]
-    fn pptx_is_presentation() {
-        let t = mime_to_type(
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        );
-        assert!(t.contains(FileType::PRESENTATION));
-    }
-
-    #[test]
-    fn html_is_text_and_document() {
-        let t = mime_to_type("text/html");
-        assert!(t.contains(FileType::TEXT));
-        assert!(t.contains(FileType::DOCUMENT));
-    }
-
-    #[test]
-    fn plain_text() {
-        let t = mime_to_type("text/plain");
-        assert!(t.contains(FileType::TEXT));
-        assert!(!t.contains(FileType::DOCUMENT));
-    }
-
-    #[test]
-    fn zip_is_archive() {
-        assert!(mime_to_type("application/zip").contains(FileType::ARCHIVE));
-    }
-
-    #[test]
-    fn unknown_mime_is_empty() {
+    fn mimes_classify_by_top_level_and_subtype() {
+        let cases: &[(&str, FileType)] = &[
+            ("audio/mpeg", FileType::AUDIO),
+            ("audio/flac", FileType::AUDIO),
+            ("image/jpeg", FileType::IMAGE),
+            ("image/png", FileType::IMAGE),
+            (
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                FileType::DOCUMENT,
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                FileType::DOCUMENT | FileType::SPREADSHEET,
+            ),
+            (
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                FileType::PRESENTATION,
+            ),
+            ("text/html", FileType::TEXT | FileType::DOCUMENT),
+            ("application/zip", FileType::ARCHIVE),
+            ("application/vnd.ms-cab-compressed", FileType::ARCHIVE),
+            ("application/x-msi", FileType::ARCHIVE),
+            ("application/vnd.ms-outlook", FileType::DOCUMENT),
+            ("application/vnd.ms-htmlhelp", FileType::DOCUMENT),
+        ];
+        for (mime, expected) in cases {
+            assert!(mime_to_type(mime).contains(*expected), "{mime}");
+        }
+        // Exact where an absent bit matters.
+        assert_eq!(mime_to_type("text/plain"), FileType::TEXT);
         assert_eq!(mime_to_type("weird/blob"), FileType::EMPTY);
+    }
+
+    /// Every name an office suite writes classifies as the format it is, or
+    /// the type filter hides a deck the extractor happily read. Case is the
+    /// registered spelling, `macroEnabled`, because that spelling reaches the
+    /// classifier from [`guess_mime_from_head`].
+    #[test]
+    fn template_and_macro_enabled_names_classify_as_their_format() {
+        let cases: &[(FileType, &[&str])] = &[
+            (
+                FileType::PRESENTATION,
+                &[
+                    "application/vnd.ms-powerpoint.presentation.macroEnabled.12",
+                    "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+                    "application/vnd.openxmlformats-officedocument.presentationml.template",
+                    "application/vnd.ms-powerpoint.slideshow.macroEnabled.12",
+                    "application/vnd.ms-powerpoint.template.macroEnabled.12",
+                    "application/vnd.oasis.opendocument.presentation-template",
+                ],
+            ),
+            (
+                FileType::SPREADSHEET,
+                &[
+                    "application/vnd.ms-excel.sheet.macroEnabled.12",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+                    "application/vnd.ms-excel.template.macroEnabled.12",
+                    "application/vnd.oasis.opendocument.spreadsheet-template",
+                ],
+            ),
+            (
+                FileType::DOCUMENT,
+                &[
+                    "application/vnd.ms-word.document.macroEnabled.12",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
+                    "application/vnd.ms-word.template.macroEnabled.12",
+                    "application/vnd.oasis.opendocument.text-template",
+                ],
+            ),
+        ];
+        for (expected, mimes) in cases {
+            for mime in *mimes {
+                let t = mime_to_type(mime);
+                assert!(t.contains(*expected), "{} is not classified", mime);
+                // Presentations and spreadsheets are documents as well, the
+                // way Baloo counts them.
+                assert!(t.contains(FileType::DOCUMENT), "{} is not a document", mime);
+            }
+        }
     }
 
     #[test]
@@ -356,18 +416,15 @@ mod tests {
 
     #[test]
     fn guess_mime_by_extension() {
-        use std::path::PathBuf;
-        let by_ext = |n: &str| guess_mime_from_head(&PathBuf::from(n), b"").unwrap_or_default();
-        assert_eq!(by_ext("a.txt"), "text/plain");
-        assert_eq!(by_ext("a.png"), "image/png");
-        assert_eq!(by_ext("a.mp3"), "audio/mpeg");
+        assert_eq!(guess("a.txt", b""), Some("text/plain"));
+        assert_eq!(guess("a.png", b""), Some("image/png"));
+        assert_eq!(guess("a.mp3", b""), Some("audio/mpeg"));
     }
 
     /// Every override must land on a type the plaintext extractor accepts.
     #[test]
     fn windows_script_types_reach_the_plaintext_extractor() {
         use crate::extract::{plaintext::PlaintextExtractor, Extractor};
-        use std::path::PathBuf;
 
         for name in [
             "deploy.ps1",
@@ -378,8 +435,7 @@ mod tests {
             "driver.inf",
             "bookmark.url",
         ] {
-            let mime = guess_mime_from_head(&PathBuf::from(name), b"")
-                .unwrap_or_else(|| panic!("{} has no MIME", name));
+            let mime = guess(name, b"").unwrap_or_else(|| panic!("{} has no MIME", name));
             assert!(
                 PlaintextExtractor.supports(mime),
                 "{} -> {} is not extractable as text",
@@ -391,45 +447,30 @@ mod tests {
 
     #[test]
     fn extension_overrides_are_case_insensitive() {
-        use std::path::PathBuf;
-        assert_eq!(
-            guess_mime_from_head(&PathBuf::from("DEPLOY.PS1"), b""),
-            Some("text/plain")
-        );
-        assert_eq!(
-            guess_mime_from_head(&PathBuf::from("Build.Bat"), b""),
-            Some("text/plain")
-        );
+        assert_eq!(guess("DEPLOY.PS1", b""), Some("text/plain"));
+        assert_eq!(guess("Build.Bat", b""), Some("text/plain"));
     }
 
     /// A `.ps1` holding something `infer` would recognise is still a script.
     #[test]
     fn extension_overrides_beat_magic_bytes() {
-        use std::path::PathBuf;
-        assert_eq!(
-            guess_mime_from_head(&PathBuf::from("a.ps1"), b"Write-Host hi"),
-            Some("text/plain")
-        );
-        assert_eq!(
-            guess_mime_from_head(&PathBuf::from("a.ps1"), b"%PDF-1.7"),
-            Some("text/plain")
-        );
+        assert_eq!(guess("a.ps1", b"Write-Host hi"), Some("text/plain"));
+        assert_eq!(guess("a.ps1", b"%PDF-1.7"), Some("text/plain"));
     }
 
     #[test]
     fn sql_dumps_are_extractable() {
         use crate::extract::{plaintext::PlaintextExtractor, Extractor};
-        use std::path::PathBuf;
-        let mime = guess_mime_from_head(&PathBuf::from("schema.sql"), b"").unwrap();
+        let mime = guess("schema.sql", b"").unwrap();
         assert!(PlaintextExtractor.supports(mime), "{}", mime);
     }
 
-    /// The content pass trusts the stored MIME and never reopens the file —
-    /// sound only if a `hash_length`-sized head recognises a format from its
-    /// magic bytes. Pinned for extensionless files, where bytes are all.
+    /// The content pass trusts the stored MIME and never reopens the file,
+    /// which is sound only if a `hash_length`-sized head recognises a format
+    /// from its magic bytes. Pinned for extensionless files, where bytes are
+    /// all there is.
     #[test]
     fn a_default_sized_head_is_enough_for_magic_byte_detection() {
-        use std::path::PathBuf;
         let head_bytes = crate::config::ProcessingConfig::default().hash_length;
 
         let samples: &[(&str, &[u8], &str)] = &[
@@ -445,11 +486,10 @@ mod tests {
         ];
 
         for (tag, magic, expected) in samples {
-            let path = PathBuf::from(format!("/tmp/qs-sniff-{}", tag));
             let mut body = magic.to_vec();
             body.resize(head_bytes, 0);
             assert_eq!(
-                guess_mime_from_head(&path, &body),
+                guess(&format!("/tmp/qs-sniff-{}", tag), &body),
                 Some(*expected),
                 "{} must be detectable from a default-sized head",
                 tag
@@ -457,35 +497,51 @@ mod tests {
         }
     }
 
-    /// A head starved below `infer`'s longest signature legitimately degrades
-    /// — but a binary head must stay `None` rather than become a wrong guess.
+    /// A LibreOffice deck with no extension: `infer` stops at its
+    /// `docProps/` parts and says zip, so the entries name the format. A zip
+    /// whose entries name no OOXML part stays a zip.
+    #[test]
+    fn an_extensionless_ooxml_file_sniffs_by_its_entries() {
+        let head_bytes = crate::config::ProcessingConfig::default().hash_length;
+        let deck = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/legacy/sample.pptx"
+        ))
+        .unwrap();
+        assert_eq!(
+            guess("deck", &deck[..deck.len().min(head_bytes)]),
+            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        );
+
+        let mut zip = b"PK\x03\x04".to_vec();
+        // Versions, flags, method, time, date, CRC and sizes.
+        zip.extend_from_slice(&[0; 22]);
+        zip.extend_from_slice(&9u16.to_le_bytes()); // name length
+        zip.extend_from_slice(&[0, 0]); // extra length
+        zip.extend_from_slice(b"notes.txt");
+        assert_eq!(guess("archive", &zip), Some("application/zip"));
+    }
+
+    /// A head starved below `infer`'s longest signature legitimately
+    /// degrades, but a binary head must stay `None` rather than become a
+    /// wrong guess.
     #[test]
     fn a_head_shorter_than_the_signature_declines_rather_than_guessing() {
-        use std::path::PathBuf;
-        let path = PathBuf::from("/tmp/qs-sniff-truncated");
-        assert_eq!(guess_mime_from_head(&path, b""), None);
+        let name = "/tmp/qs-sniff-truncated";
+        assert_eq!(guess(name, b""), None);
         // A PNG magic truncated to two bytes: no magic match, no text guess.
-        assert_eq!(guess_mime_from_head(&path, &[0x89, 0x00]), None);
+        assert_eq!(guess(name, &[0x89, 0x00]), None);
         assert_eq!(
-            guess_mime_from_head(&path, &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
+            guess(name, &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]),
             Some("image/png")
         );
     }
 
-    #[test]
-    fn windows_container_and_document_types_classify() {
-        assert!(mime_to_type("application/vnd.ms-cab-compressed").contains(FileType::ARCHIVE));
-        assert!(mime_to_type("application/x-msi").contains(FileType::ARCHIVE));
-        assert!(mime_to_type("application/vnd.ms-outlook").contains(FileType::DOCUMENT));
-        assert!(mime_to_type("application/vnd.ms-htmlhelp").contains(FileType::DOCUMENT));
-    }
-
     /// Real dispatch (`extract_complete_head`, not `supports`), so the
-    /// svg/m3u/pls cases prove the plaintext-first registration *order*.
+    /// svg/m3u/pls cases prove the plaintext-first registration order.
     #[test]
     fn newly_claimed_extensions_reach_the_plaintext_extractor() {
         use crate::extract::Registry;
-        use std::path::PathBuf;
 
         let registry = Registry::default_set();
         let samples: &[(&str, &[u8])] = &[
@@ -511,11 +567,9 @@ mod tests {
             ("radio.pls", b"[playlist]"),
         ];
         for (name, head) in samples {
-            let path = PathBuf::from(name);
-            let mime =
-                guess_mime_from_head(&path, head).unwrap_or_else(|| panic!("{} has no MIME", name));
+            let mime = guess(name, head).unwrap_or_else(|| panic!("{} has no MIME", name));
             let extracted = registry
-                .extract_head_to_string(&path, mime, head)
+                .extract_head_to_string(Path::new(name), mime, head)
                 .unwrap_or_else(|| {
                     panic!(
                         "{} -> {} not claimed by a head-capable extractor",
@@ -534,99 +588,69 @@ mod tests {
 
     #[test]
     fn extensionless_files_sniff_by_content() {
-        use std::path::PathBuf;
-        let readme = PathBuf::from("README");
         assert_eq!(
-            guess_mime_from_head(&readme, b"QuickSearch indexes your files.\n"),
+            guess("README", b"QuickSearch indexes your files.\n"),
             Some("text/plain")
         );
-        let makefile = PathBuf::from("Makefile");
         assert_eq!(
-            guess_mime_from_head(&makefile, b"all:\n\tcargo build\n"),
+            guess("Makefile", b"all:\n\tcargo build\n"),
             Some("text/plain")
         );
-        let blob = PathBuf::from("blob");
-        assert_eq!(
-            guess_mime_from_head(&blob, &[0x00, 0x01, 0x02, 0xFF]),
-            None
-        );
+        assert_eq!(guess("blob", &[0x00, 0x01, 0x02, 0xFF]), None);
     }
 
-    /// Formats made of high bytes clear the binary guard yet are not text;
-    /// before the strict sniff they were stored as mojibake.
+    /// Formats made of high bytes clear the binary guard yet are not text.
     #[test]
     fn high_byte_binary_is_not_sniffed_as_text() {
-        use std::path::PathBuf;
-
         // Head of a real protobuf-framed GPS log; nothing else claims `.pb`,
         // so this reaches the sniff.
         let mut pb = b"\x10\n\x02v1\x10\x01\x18\xe2\xe3\xfc\xd3\x9d\xca\x97\xe4\x189\x08".to_vec();
         pb.extend_from_slice(b"\x12*$GNGGA,181558.00,,,,,0,00,99.99,,,,,,*78\r\n");
-        assert_eq!(guess_mime_from_head(&PathBuf::from("rtk.pb"), &pb), None);
+        assert_eq!(guess("rtk.pb", &pb), None);
 
         // An extension the MIME table knows never reaches the sniff, so
         // legacy-encoded documents still type as text.
         let latin1 = b"Le caf\xe9 pr\xe8s de la fen\xeatre est agr\xe9able en \xe9t\xe9.";
-        assert_eq!(
-            guess_mime_from_head(&PathBuf::from("notes.txt"), latin1),
-            Some("text/plain")
-        );
+        assert_eq!(guess("notes.txt", latin1), Some("text/plain"));
 
         // A `.pb` that really is UTF-8 text still indexes.
-        assert_eq!(
-            guess_mime_from_head(&PathBuf::from("notes.pb"), b"just some words\n"),
-            Some("text/plain")
-        );
+        assert_eq!(guess("notes.pb", b"just some words\n"), Some("text/plain"));
     }
 
     #[test]
     fn ambiguous_extensions_resolve_by_content_both_ways() {
-        use std::path::PathBuf;
-
         let ts_source = b"export function hi(): string { return 'hi'; }\n";
-        assert_eq!(
-            guess_mime_from_head(&PathBuf::from("app.ts"), ts_source),
-            Some("text/plain")
-        );
-        assert_eq!(
-            guess_mime_from_head(&PathBuf::from("APP.TS"), ts_source),
-            Some("text/plain")
-        );
+        assert_eq!(guess("app.ts", ts_source), Some("text/plain"));
+        assert_eq!(guess("APP.TS", ts_source), Some("text/plain"));
         // An MPEG transport stream: no magic matcher, fails the text sniff,
         // so the extension answers.
         let mut ts_video = vec![0u8; 376];
         ts_video[0] = 0x47;
         ts_video[188] = 0x47;
-        assert_eq!(
-            guess_mime_from_head(&PathBuf::from("clip.ts"), &ts_video),
-            Some("video/vnd.dlna.mpeg-tts")
-        );
+        assert_eq!(guess("clip.ts", &ts_video), Some("video/vnd.dlna.mpeg-tts"));
 
         assert_eq!(
-            guess_mime_from_head(
-                &PathBuf::from("go.mod"),
-                b"module example.com/x\n\ngo 1.22\n"
-            ),
+            guess("go.mod", b"module example.com/x\n\ngo 1.22\n"),
             Some("text/plain")
         );
 
         // gettext template vs PowerPoint template.
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("app.pot"), b"msgid \"hello\"\nmsgstr \"\"\n"),
+            guess("app.pot", b"msgid \"hello\"\nmsgstr \"\"\n"),
             Some("text/plain")
         );
         let ole = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1, 0x00, 0x00];
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("slides.pot"), &ole),
+            guess("slides.pot", &ole),
             Some("application/vnd.ms-powerpoint")
         );
 
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("cpu.vhd"), b"entity cpu is\nend cpu;\n"),
+            guess("cpu.vhd", b"entity cpu is\nend cpu;\n"),
             Some("text/plain")
         );
         assert_eq!(
-            guess_mime_from_head(&PathBuf::from("disk.vhd"), &[0x00, 0x01, 0x02, 0x03]),
+            guess("disk.vhd", &[0x00, 0x01, 0x02, 0x03]),
             Some("application/x-virtualbox-vhd")
         );
     }

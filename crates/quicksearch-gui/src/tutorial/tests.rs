@@ -1,6 +1,9 @@
 use super::*;
 
-use crate::test_ui::{click_at, painted, painted_rects, painted_spans, painted_text, raw_input_at};
+use crate::test_ui::{
+    button, click_at, key_press, painted_rect, painted_rects, painted_spans, painted_text,
+    raw_input_at, run_panel,
+};
 
 const SCREEN: egui::Vec2 = egui::vec2(1000.0, 700.0);
 /// Deliberately not the real home directory: the folders page's fallback
@@ -13,15 +16,13 @@ fn roots() -> Vec<String> {
     vec![ROOT.to_string()]
 }
 
-/// A tour parked on `page` with that page's arrival already dealt with —
+/// A tour parked on `page` with that page's arrival already dealt with:
 /// what every test about the *rendering* of a page wants.
 fn at(page: usize) -> Tutorial {
     Tutorial {
         page,
-        shown: Some(page),
-        typing: None,
-        moved: false,
-        capturing_hotkey: false,
+        entered_page: Some(page),
+        ..Default::default()
     }
 }
 
@@ -30,26 +31,82 @@ fn at(page: usize) -> Tutorial {
 fn entering(page: usize) -> Tutorial {
     Tutorial {
         page,
-        shown: None,
-        typing: None,
-        moved: false,
-        capturing_hotkey: false,
+        ..Default::default()
     }
 }
 
-/// One pass, and what the tour asked for during it.
+fn page_titled(title: &str) -> usize {
+    PAGES
+        .iter()
+        .position(|p| p.title == title)
+        .unwrap_or_else(|| panic!("no page titled {title:?}"))
+}
+
+fn window_rect(ctx: &egui::Context) -> egui::Rect {
+    ctx.memory(|m| m.area_rect(egui::Id::new(WINDOW_ID)))
+        .expect("the tour's window")
+}
+
+/// One pass with the search box empty, and what the tour asked for during it.
 fn pass(
     ctx: &egui::Context,
     tour: &mut Tutorial,
     events: Vec<egui::Event>,
     time: f64,
 ) -> (egui::FullOutput, TourActions) {
+    pass_holding(ctx, tour, events, time, "")
+}
+
+/// [`pass`] with `query` in the search box.
+fn pass_holding(
+    ctx: &egui::Context,
+    tour: &mut Tutorial,
+    events: Vec<egui::Event>,
+    time: f64,
+    query: &str,
+) -> (egui::FullOutput, TourActions) {
     let roots = roots();
     let mut actions = TourActions::default();
     let out = ctx.run(raw_input_at(SCREEN, events, time), |ctx| {
-        actions = tour.ui(ctx, &roots, HOTKEY);
+        actions = tour.ui(ctx, &roots, HOTKEY, query);
     });
     (out, actions)
+}
+
+/// [`pass`] with `spot` marked at `rect`, as the widget it names would mark
+/// itself while laying out.
+fn marked_pass(
+    ctx: &egui::Context,
+    tour: &mut Tutorial,
+    spot: Spot,
+    rect: egui::Rect,
+    time: f64,
+) -> egui::FullOutput {
+    let roots = roots();
+    ctx.run(raw_input_at(SCREEN, Vec::new(), time), |ctx| {
+        crate::spotlight::set_active(ctx, true);
+        crate::spotlight::mark(ctx, spot, rect);
+        tour.ui(ctx, &roots, HOTKEY, "");
+    })
+}
+
+/// How long the pass asked egui to wait before the next one;
+/// `Duration::MAX` is not at all.
+fn repaint_delay(out: &egui::FullOutput) -> Duration {
+    out.viewport_output
+        .values()
+        .map(|v| v.repaint_delay)
+        .min()
+        .expect("a viewport")
+}
+
+/// Eight passes a quarter second apart from `from`, the last returned:
+/// egui's own work (sizing, placing and fading in the window) is over by then.
+fn settle(ctx: &egui::Context, tour: &mut Tutorial, from: f64) -> egui::FullOutput {
+    (0..8)
+        .map(|n| pass(ctx, tour, Vec::new(), from + f64::from(n) * 0.25).0)
+        .last()
+        .expect("passes ran")
 }
 
 fn merge(a: TourActions, b: TourActions) -> TourActions {
@@ -59,7 +116,6 @@ fn merge(a: TourActions, b: TourActions) -> TourActions {
         set_query: b.set_query.or(a.set_query),
         focus_search: a.focus_search || b.focus_search,
         set_scale: b.set_scale.or(a.set_scale),
-        save_scale: a.save_scale || b.save_scale,
         set_hotkey: b.set_hotkey.or(a.set_hotkey),
     }
 }
@@ -115,16 +171,12 @@ fn every_page_paints_its_own_title_and_body() {
 #[test]
 fn every_keyword_has_a_spot_to_point_at() {
     for (page, spec) in PAGES.iter().enumerate() {
-        let keywords: Vec<&str> = paragraphs(spec, &roots())
+        let prose = paragraphs(spec, &roots());
+        let keywords: Vec<&str> = prose
             .iter()
-            .flat_map(|p| {
-                runs(p)
-                    .into_iter()
-                    .filter(|(_, keyword)| *keyword)
-                    .map(|(run, _)| run.to_string())
-                    .collect::<Vec<_>>()
-            })
-            .map(|s| Box::leak(s.into_boxed_str()) as &str)
+            .flat_map(|p| runs(p))
+            .filter(|(_, keyword)| *keyword)
+            .map(|(run, _)| run)
             .collect();
         assert_eq!(
             keywords.len(),
@@ -162,12 +214,8 @@ fn brackets_mark_keywords_and_survive_being_unbalanced() {
 /// same colour, and different words are different colours.
 #[test]
 fn each_keyword_is_painted_in_the_colour_of_the_spot_it_names() {
-    let input = PAGES
-        .iter()
-        .position(|p| p.title == "Search: Input")
-        .expect("the input page");
     let ctx = crate::test_ui::ctx();
-    let mut tour = at(input);
+    let mut tour = at(page_titled("Search: Input"));
     let (out, _) = frame(&ctx, &mut tour, Vec::new());
     let dark_mode = ctx.style().visuals.dark_mode;
     let spans = painted_spans(&out);
@@ -186,77 +234,137 @@ fn each_keyword_is_painted_in_the_colour_of_the_spot_it_names() {
     );
 }
 
-/// Both halves of the effect move together, and they move at all.
+/// A page that points at a widget rings it and tints its keyword once, then
+/// waits for input. The two used to pulse, asking for a frame every 50 ms for
+/// as long as the tour was up, which a software-rendered desktop pays for in
+/// CPU while nothing on screen needs to change.
 #[test]
-fn the_keyword_and_its_ring_pulse_in_step() {
-    let status = PAGES
-        .iter()
-        .position(|p| p.title == "The status bar")
-        .expect("the status bar page");
+fn a_settled_tour_page_asks_for_no_frames() {
+    let ctx = crate::test_ui::ctx();
+    let mut tour = entering(page_titled("The status bar"));
     let target = egui::Rect::from_min_size(egui::pos2(0.0, 660.0), egui::vec2(1000.0, 24.0));
+    let out = (0..8)
+        .map(|n| {
+            marked_pass(
+                &ctx,
+                &mut tour,
+                Spot::StatusBar,
+                target,
+                f64::from(n) * 0.25,
+            )
+        })
+        .last()
+        .expect("passes ran");
 
-    // The tint behind a keyword and the rings around its widget, at one time.
-    let sample = |time: f64| {
-        let ctx = crate::test_ui::ctx();
-        let mut tour = at(status);
-        let roots = roots();
-        let mut run = || {
-            ctx.run(raw_input_at(SCREEN, Vec::new(), time), |ctx| {
-                crate::spotlight::set_active(ctx, true);
-                crate::spotlight::mark(ctx, Spot::StatusBar, target);
-                tour.ui(ctx, &roots, HOTKEY);
-            })
-        };
-        run();
-        let out = run();
-        let tint = crate::test_ui::painted_backgrounds(&out)
-            .into_iter()
-            .find(|(text, _)| text == "status bar")
-            .map(|(_, color)| color.a())
-            .expect("the keyword is tinted");
-        let rings: Vec<u8> = painted_rects(&out)
-            .into_iter()
-            .filter(|r| r.stroke.width > 0.0 && r.rect.contains_rect(target))
-            .map(|r| r.stroke.color.a())
-            .collect();
-        (tint, rings)
-    };
-
-    // A quarter period apart: the dimmest sample against the brightest.
-    let (dim_tint, dim_rings) = sample(PULSE_PERIOD * 0.75);
-    let (bright_tint, bright_rings) = sample(PULSE_PERIOD * 0.25);
-
+    // Still lit: settled, not switched off.
     assert!(
-        !dim_rings.is_empty(),
-        "the marked widget was not ringed at all"
+        painted_rects(&out)
+            .into_iter()
+            .any(|r| r.stroke.width > 0.0 && r.rect.contains_rect(target)),
+        "the settled page stopped ringing its widget"
+    );
+    assert!(
+        crate::test_ui::painted_backgrounds(&out)
+            .iter()
+            .any(|(text, _)| text == "status bar"),
+        "the settled page stopped tinting its keyword"
     );
     assert_eq!(
-        dim_rings.len(),
-        bright_rings.len(),
-        "the ring count must not depend on the phase"
+        repaint_delay(&out),
+        Duration::MAX,
+        "a settled page repaints"
     );
-    assert!(
-        bright_tint > dim_tint,
-        "the keyword's tint does not pulse ({dim_tint} → {bright_tint})"
-    );
-    for (dim, bright) in dim_rings.iter().zip(&bright_rings) {
-        assert!(
-            bright > dim,
-            "a ring does not pulse with the keyword ({dim} → {bright})"
-        );
-    }
 }
 
-/// A spot nothing marked this pass — a hidden column, another tab — is not
+/// The tab a page switches to is drawn, and the widgets its rings point at
+/// mark themselves, only on the frame after its arrival, and no input is
+/// coming to bring that frame about. One frame, though, not a stream.
+#[test]
+fn entering_a_page_requests_one_frame() {
+    let ctx = crate::test_ui::ctx();
+    let duplicates = PAGES
+        .iter()
+        .position(|p| p.tab == Tab::Duplicates)
+        .expect("the duplicates page");
+    let mut tour = at(duplicates);
+    let out = settle(&ctx, &mut tour, 0.0);
+    assert_eq!(repaint_delay(&out), Duration::MAX, "the page never settled");
+
+    // Arriving again on the same page, so the window keeps its size and
+    // nothing of egui's own asks for a frame.
+    tour.entered_page = None;
+    let (out, actions) = pass(&ctx, &mut tour, Vec::new(), 3.0);
+    assert_eq!(actions.goto_tab, Some(Tab::Duplicates));
+    assert_eq!(
+        repaint_delay(&out),
+        Duration::ZERO,
+        "the arrival waits for input to be drawn"
+    );
+    let out = settle(&ctx, &mut tour, 3.25);
+    assert_eq!(
+        repaint_delay(&out),
+        Duration::MAX,
+        "the page went on asking after its arrival"
+    );
+}
+
+/// The typing page asks for a frame per character, since nothing else will
+/// type the next one, and stops asking once the query is typed.
+#[test]
+fn a_typing_page_repaints_only_until_typed() {
+    let input = PAGES
+        .iter()
+        .position(|p| p.type_query.is_some())
+        .expect("a page that types");
+    let chars = PAGES[input]
+        .type_query
+        .expect("checked above")
+        .chars()
+        .count();
+    let ctx = crate::test_ui::ctx();
+    // Settled first, so any frame asked for below is the typing's.
+    let mut tour = at(input);
+    let out = settle(&ctx, &mut tour, 0.0);
+    assert_eq!(repaint_delay(&out), Duration::MAX, "the page never settled");
+
+    tour.entered_page = None;
+    let start = 3.0;
+    let mut time = start;
+    loop {
+        let (out, _) = pass(&ctx, &mut tour, Vec::new(), time);
+        let typed = tour.typing.as_ref().expect("the page is typing").emitted;
+        if typed == chars {
+            assert_eq!(
+                repaint_delay(&out),
+                Duration::MAX,
+                "still asking for frames once the query is typed"
+            );
+            break;
+        }
+        assert!(
+            repaint_delay(&out) <= Duration::from_secs_f64(TYPE_INTERVAL),
+            "{typed} of {chars} typed, and no frame is coming for the next"
+        );
+        time += TYPE_INTERVAL / 2.0;
+        assert!(
+            time < start + TYPE_INTERVAL * (chars as f64 + 4.0),
+            "the typing never finished"
+        );
+    }
+    let (out, _) = pass(&ctx, &mut tour, Vec::new(), time + 1.0);
+    assert_eq!(
+        repaint_delay(&out),
+        Duration::MAX,
+        "the typed page repaints"
+    );
+}
+
+/// A spot nothing marked this pass (a hidden column, another tab) is not
 /// worth painting a ring in the middle of nowhere for.
 #[test]
 fn an_unmarked_spot_is_not_ringed() {
-    let status = PAGES
-        .iter()
-        .position(|p| p.title == "The status bar")
-        .expect("the status bar page");
     let ctx = crate::test_ui::ctx();
-    let mut tour = at(status);
+    let mut tour = at(page_titled("The status bar"));
     let (out, _) = frame(&ctx, &mut tour, Vec::new());
     let dark_mode = ctx.style().visuals.dark_mode;
     let ring = accent(0, dark_mode);
@@ -276,7 +384,7 @@ fn page_with(extra: Extra) -> usize {
         .unwrap_or_else(|| panic!("no page carries {extra:?}"))
 }
 
-/// A press, a move and a release, one frame each — a slider only follows a
+/// A press, a move and a release, one frame each: a slider only follows a
 /// pointer that is already down, so a drag cannot be squeezed into one pass.
 fn drag(
     ctx: &egui::Context,
@@ -284,60 +392,53 @@ fn drag(
     from: egui::Pos2,
     to: egui::Pos2,
 ) -> [TourActions; 3] {
-    let button = |pos, pressed| egui::Event::PointerButton {
-        pos,
-        button: egui::PointerButton::Primary,
-        pressed,
-        modifiers: egui::Modifiers::NONE,
-    };
-    let (_, press) = pass(
-        ctx,
-        tour,
-        vec![egui::Event::PointerMoved(from), button(from, true)],
-        1.0,
-    );
+    let primary = egui::PointerButton::Primary;
+    let press = vec![egui::Event::PointerMoved(from), button(from, primary, true)];
+    let (_, press) = pass(ctx, tour, press, 1.0);
     let (_, moved) = pass(ctx, tour, vec![egui::Event::PointerMoved(to)], 1.1);
-    let (_, release) = pass(ctx, tour, vec![button(to, false)], 1.2);
+    let (_, release) = pass(ctx, tour, vec![button(to, primary, false)], 1.2);
     [press, moved, release]
 }
 
 /// The whole point of putting it on the first page: someone who cannot read
-/// the window can fix that without finding the Settings tab first.
+/// the window can fix that without finding the Settings tab first. Staged
+/// until Apply: applying mid-drag would rescale the slider under the
+/// pointer, and the handle would chase its own tail.
 #[test]
-fn the_welcome_page_slider_sets_the_ui_scale() {
+fn the_welcome_page_slider_applies_only_on_its_button() {
     let ctx = crate::test_ui::ctx();
     let scale_page = page_with(Extra::Scale);
     let mut tour = at(scale_page);
     let (out, _) = frame(&ctx, &mut tour, Vec::new());
-    let label = painted(&out)
-        .into_iter()
-        .find(|(text, _)| text == "UI scale")
-        .expect("the slider is labelled")
-        .1;
+    let label = painted_rect(&out, "UI scale");
     // The rail runs to the right of its label, on the same row.
     let from = egui::pos2(label.right() + 30.0, label.center().y);
-    let [_, moved, release] = drag(&ctx, &mut tour, from, from + egui::vec2(120.0, 0.0));
-
-    let dragged = moved
-        .set_scale
-        .expect("dragging the slider changed nothing");
+    let [press, moved, release] = drag(&ctx, &mut tour, from, from + egui::vec2(120.0, 0.0));
+    for (what, actions) in [("press", &press), ("move", &moved), ("release", &release)] {
+        assert_eq!(
+            actions.set_scale, None,
+            "the {what} applied the scale without Apply being clicked"
+        );
+    }
+    let staged = tour.staged_scale.expect("the drag staged nothing");
     assert!(
-        crate::app::SCALE_RANGE.contains(&dragged),
-        "{dragged} is outside the range the slider offers"
+        crate::app::SCALE_RANGE.contains(&staged),
+        "{staged} is outside the range the slider offers"
     );
-    assert_ne!(dragged, 1.0, "the drag did not move the value");
-    assert!(!moved.save_scale, "the config was written mid-drag");
-    assert_eq!(
-        release.set_scale,
-        Some(dragged),
-        "the release did not hand the settled value over to be saved"
-    );
-    assert!(release.save_scale, "the drag ended without being saved");
+    assert_ne!(staged, 1.0, "the drag did not move the value");
 
-    // And nothing happens on a frame nobody touched it.
-    let (_, quiet) = pass(&ctx, &mut tour, Vec::new(), 2.0);
+    // The staged value survives idle frames, then Apply hands it over once.
+    let (out, quiet) = pass(&ctx, &mut tour, Vec::new(), 2.0);
     assert_eq!(quiet.set_scale, None);
-    assert!(!quiet.save_scale);
+    assert_eq!(tour.staged_scale, Some(staged));
+    let apply = painted_rect(&out, "Apply");
+    let (_, applied) = pass(&ctx, &mut tour, click_at(apply.center()), 2.1);
+    assert_eq!(
+        applied.set_scale,
+        Some(staged),
+        "Apply did not hand the staged value over"
+    );
+    assert_eq!(tour.staged_scale, None, "Apply left the value staged");
 }
 
 /// The slider shows the size the window is already at — the config's, or
@@ -375,7 +476,7 @@ fn only_the_welcome_page_offers_the_slider() {
     }
 }
 
-/// The command has to be the one that would actually work — a wrong one is
+/// The command has to be the one that would actually work: a wrong one is
 /// worse than none, because the key it is bound to fails silently.
 #[test]
 fn the_shortcut_page_offers_the_command_to_bind() {
@@ -392,13 +493,10 @@ fn the_shortcut_page_offers_the_command_to_bind() {
         actions.set_hotkey.is_none(),
         "nothing was pressed, but the tour asked to rebind the shortcut"
     );
-    // The command is a full path when the app is not installed — this test
-    // binary's own, which is as long as it gets. It has to wrap inside the
-    // window rather than be what decides how wide the window is.
-    let width = ctx
-        .memory(|m| m.area_rect(egui::Id::new(WINDOW_ID)))
-        .expect("the tour's window")
-        .width();
+    // The command is a full path when the app is not installed (this test
+    // binary's own, which is as long as it gets). It has to wrap inside the
+    // window rather than decide how wide the window is.
+    let width = window_rect(&ctx).width();
     assert!(
         width <= 560.0,
         "the command ({} points long) stretched the window to {width}",
@@ -421,8 +519,8 @@ fn the_shortcut_page_offers_the_command_to_bind() {
 }
 
 /// The other half of the page: the same button the Settings tab uses to
-/// claim a key while QuickSearch is running, acting the moment it is pressed
-/// — the tour has no Apply to wait for.
+/// claim a key while QuickSearch is running, acting the moment it is pressed,
+/// since the tour has no Apply to wait for.
 #[test]
 fn the_shortcut_page_rebinds_the_shortcut_it_shows() {
     let ctx = crate::test_ui::ctx();
@@ -451,13 +549,7 @@ fn the_shortcut_page_rebinds_the_shortcut_it_shows() {
     );
 
     // And the combination pressed next is the one handed back.
-    let press = vec![egui::Event::Key {
-        key: egui::Key::J,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: egui::Modifiers::CTRL | egui::Modifiers::ALT,
-    }];
+    let press = key_press(egui::Key::J, egui::Modifiers::CTRL | egui::Modifiers::ALT);
     let (_, actions) = pass(&ctx, &mut tour, press, 1.1);
     assert_eq!(actions.set_hotkey.as_deref(), Some("Ctrl+Alt+J"));
     assert!(
@@ -502,32 +594,39 @@ fn the_notes_read_larger_than_the_page_counter() {
     let body = size_of(PAGES[page].body[0]);
     assert!(
         note < body,
-        "the note is {note}, no smaller than the body's {body} — it stops \
+        "the note is {note}, no smaller than the body's {body}, so it stops \
          reading as an aside"
     );
 }
 
+/// The machine's real home, which is what a default install indexes.
 #[test]
-fn the_folders_page_says_which_folders_those_are() {
-    // The machine's real home, which is what a default install indexes.
-    if let Some(home) = quicksearch_core::platform::home_dir() {
-        let home = home.to_string_lossy().into_owned();
-        let line = folders_line(std::slice::from_ref(&home));
-        assert!(
-            line.contains(&home),
-            "{line:?} does not name the home folder"
-        );
-        assert!(line.contains("[here]"), "{line:?} points nowhere");
-        // A trailing separator in the config is the same folder.
-        assert_eq!(folders_line(&[format!("{home}/")]), line);
-    }
+fn the_folders_page_names_the_home_folder() {
+    let home = quicksearch_core::platform::home_dir()
+        .expect("a home directory")
+        .to_string_lossy()
+        .into_owned();
+    let line = folders_line(std::slice::from_ref(&home));
+    assert!(
+        line.contains(&home),
+        "{line:?} does not name the home folder"
+    );
+    assert!(line.contains("[here]"), "{line:?} points nowhere");
+    // A trailing separator in the config is the same folder.
+    assert_eq!(folders_line(&[format!("{home}/")]), line);
+}
 
-    // Anything else: say what is actually indexed rather than claim home is.
+/// Anything else: say what is actually indexed rather than claim home is.
+#[test]
+fn the_folders_page_names_other_folders_as_they_are() {
     let line = folders_line(&[ROOT.to_string()]);
     assert!(line.contains(ROOT), "{line:?} does not name the root");
     assert!(line.contains("[here]"), "{line:?} points nowhere");
+}
 
-    // And with nothing indexed at all, which a reopened tour can find.
+/// Nothing indexed at all, which a reopened tour can find.
+#[test]
+fn the_folders_page_with_nothing_indexed_still_points_at_the_list() {
     let line = folders_line(&[]);
     assert!(line.contains("[here]"), "{line:?} points nowhere");
 }
@@ -553,10 +652,8 @@ fn the_folders_page_paints_the_configured_folder() {
 #[test]
 fn the_last_page_names_the_help_tab_button() {
     let ctx = crate::test_ui::ctx();
-    let out = ctx.run(raw_input_at(SCREEN, Vec::new(), 0.0), |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            crate::help_tab::ui(ui);
-        });
+    let out = run_panel(&ctx, SCREEN, Vec::new(), |ui| {
+        crate::help_tab::ui(ui);
     });
     let buttons = painted_text(&out);
     let last = PAGES.last().expect("pages");
@@ -570,14 +667,14 @@ fn the_last_page_names_the_help_tab_button() {
     );
 }
 
-/// Entering a page moves to the tab it is about — once. Repeating it every
+/// Entering a page moves to the tab it is about, once. Repeating it every
 /// frame would drag back a user who clicked somewhere else mid-page.
 #[test]
 fn a_page_asks_for_its_tab_once_on_arrival() {
     let ctx = crate::test_ui::ctx();
     let duplicates = PAGES
         .iter()
-        .position(|p| p.tab == Some(Tab::Duplicates))
+        .position(|p| p.tab == Tab::Duplicates)
         .expect("the duplicates page");
     let mut tour = entering(duplicates);
 
@@ -595,7 +692,7 @@ fn a_page_asks_for_its_tab_once_on_arrival() {
     assert_eq!(tour.page, duplicates + 1);
     assert_eq!(actions.goto_tab, None, "the click frame is still this page");
     let (out, actions) = pass(&ctx, &mut tour, Vec::new(), 0.3);
-    assert_eq!(actions.goto_tab, PAGES[duplicates + 1].tab);
+    assert_eq!(actions.goto_tab, Some(PAGES[duplicates + 1].tab));
 
     let back = crate::test_ui::painted_text_center(&out, "Back").expect("a Back button");
     pass(&ctx, &mut tour, click_at(back), 0.4);
@@ -606,19 +703,6 @@ fn a_page_asks_for_its_tab_once_on_arrival() {
         Some(Tab::Duplicates),
         "going back re-asks"
     );
-}
-
-/// Every page is explicit about the tab it wants, so no page can inherit
-/// whatever the last one happened to leave on screen.
-#[test]
-fn every_page_names_the_tab_it_belongs_on() {
-    for (page, spec) in PAGES.iter().enumerate() {
-        assert!(
-            spec.tab.is_some(),
-            "page {page} ({}) does not say where it should be read",
-            spec.title
-        );
-    }
 }
 
 #[test]
@@ -686,20 +770,83 @@ fn leaving_the_typing_page_and_returning_types_it_again() {
     assert_eq!(actions.set_query.as_deref(), Some(""), "it starts over");
 }
 
+/// `button` clicked on `page` with `query` in the search box. Every
+/// dismissal returns to the Search tab, whatever the box holds.
+fn dismiss_holding(page: usize, button: &str, query: &str) -> TourActions {
+    let ctx = crate::test_ui::ctx();
+    let mut tour = at(page);
+    pass_holding(&ctx, &mut tour, Vec::new(), 0.0, query);
+    let (out, _) = pass_holding(&ctx, &mut tour, Vec::new(), 0.0, query);
+    let pos = crate::test_ui::painted_text_center(&out, button)
+        .unwrap_or_else(|| panic!("page {page} offers no {button}"));
+    let (_, actions) = pass_holding(&ctx, &mut tour, click_at(pos), 1.0, query);
+    assert!(actions.dismissed, "{button} did not dismiss page {page}");
+    assert_eq!(actions.goto_tab, Some(Tab::Search));
+    actions
+}
+
+/// The box is cleared of what the tour typed into it and nothing else: a
+/// query the user wrote is theirs, whichever page they leave from.
 #[test]
-fn dismissing_returns_to_search_with_an_empty_box() {
-    for page in [0, PAGES.len() - 1] {
+fn dismissing_clears_only_the_query_the_tour_typed() {
+    let demo = PAGES
+        .iter()
+        .find_map(|p| p.type_query)
+        .expect("a page that types");
+    let last = PAGES.len() - 1;
+
+    // The user's own query, an empty box, and the demonstration typed over:
+    // longer than it, or in another case, is no longer the tour's.
+    let longer = format!("{demo} report");
+    let lower = demo.to_lowercase();
+    for query in ["invoice 2024", "", longer.as_str(), lower.as_str()] {
+        for (page, button) in [(0, "Skip"), (last, "Skip"), (last, "Finish")] {
+            assert_eq!(
+                dismiss_holding(page, button, query).set_query,
+                None,
+                "{button} on page {page} rewrote {query:?}"
+            );
+        }
+    }
+
+    // The demonstration, whole or as far as it got.
+    let partial: String = demo.chars().take(5).collect();
+    for query in [demo, partial.as_str()] {
+        for (page, button) in [(0, "Skip"), (last, "Finish")] {
+            assert_eq!(
+                dismiss_holding(page, button, query).set_query.as_deref(),
+                Some(""),
+                "{button} on page {page} left the tour's {query:?} in the box"
+            );
+        }
+    }
+}
+
+/// A Skip while the demonstration is still being typed, with a letter due on
+/// the very frame of the click: the dismissal decides what the box ends up
+/// holding, not the typing.
+#[test]
+fn skipping_mid_typing_clears_only_the_tour_s_text() {
+    let input = PAGES
+        .iter()
+        .position(|p| p.type_query.is_some())
+        .expect("a page that types");
+    let demo = PAGES[input].type_query.expect("checked above");
+    let so_far: String = demo.chars().take(2).collect();
+    for (query, want) in [(so_far.as_str(), Some("")), ("my notes", None)] {
         let ctx = crate::test_ui::ctx();
-        let mut tour = at(page);
-        let (out, _) = frame(&ctx, &mut tour, Vec::new());
+        let mut tour = entering(input);
+        pass(&ctx, &mut tour, Vec::new(), 0.0);
+        let (out, _) = pass(&ctx, &mut tour, Vec::new(), 0.0);
         let skip = crate::test_ui::painted_text_center(&out, "Skip").expect("a Skip button");
-        let (_, actions) = pass(&ctx, &mut tour, click_at(skip), 1.0);
-        assert!(actions.dismissed, "page {page} would not skip");
-        assert_eq!(actions.goto_tab, Some(Tab::Search));
+        // Three letters are due by the click, none emitted yet.
+        let time = TYPE_INTERVAL * 3.5;
+        let (_, actions) = pass_holding(&ctx, &mut tour, click_at(skip), time, query);
+        assert!(actions.dismissed, "Skip did not dismiss the typing page");
         assert_eq!(
             actions.set_query.as_deref(),
-            Some(""),
-            "the demonstration query is not the user's"
+            want,
+            "Skip over {query:?} mid-typing"
         );
     }
 }
@@ -713,38 +860,14 @@ fn the_window_can_be_dragged_out_of_the_way() {
     let title = PAGES[0].title;
 
     let (out, _) = frame(&ctx, &mut tour, Vec::new());
-    let where_is = |out: &egui::FullOutput| {
-        painted(out)
-            .into_iter()
-            .find(|(text, _)| text == title)
-            .map(|(_, rect)| rect.min)
-            .expect("the title is painted")
-    };
-    let before = where_is(&out);
+    let before = painted_rect(&out, title).min;
 
     let grab = crate::test_ui::painted_text_center(&out, title).expect("the title bar");
     let delta = egui::vec2(-180.0, -120.0);
-    let button = |pos, pressed| egui::Event::PointerButton {
-        pos,
-        button: egui::PointerButton::Primary,
-        pressed,
-        modifiers: egui::Modifiers::NONE,
-    };
-    pass(
-        &ctx,
-        &mut tour,
-        vec![egui::Event::PointerMoved(grab), button(grab, true)],
-        0.0,
-    );
-    pass(
-        &ctx,
-        &mut tour,
-        vec![egui::Event::PointerMoved(grab + delta)],
-        0.1,
-    );
-    let (out, _) = pass(&ctx, &mut tour, vec![button(grab + delta, false)], 0.2);
+    drag(&ctx, &mut tour, grab, grab + delta);
+    let (out, _) = pass(&ctx, &mut tour, Vec::new(), 1.3);
 
-    let after = where_is(&out);
+    let after = painted_rect(&out, title).min;
     assert!(
         (after - before - delta).length() < 2.0,
         "dragged by {delta:?} but the window went from {before:?} to {after:?}"
@@ -753,19 +876,14 @@ fn the_window_can_be_dragged_out_of_the_way() {
     // And it stays there when the page changes, rather than snapping back.
     // Measured on the window itself: the next page is a different width, so
     // where its title starts says nothing about where the window is.
-    let centre = |ctx: &egui::Context| {
-        ctx.memory(|m| m.area_rect(egui::Id::new(WINDOW_ID)))
-            .expect("the tour's window")
-            .center()
-    };
-    let dragged_to = centre(&ctx);
+    let dragged_to = window_rect(&ctx).center();
     let next = crate::test_ui::painted_text_center(&out, "Next").expect("a Next button");
-    pass(&ctx, &mut tour, click_at(next), 0.3);
-    pass(&ctx, &mut tour, Vec::new(), 0.4);
+    pass(&ctx, &mut tour, click_at(next), 1.4);
+    pass(&ctx, &mut tour, Vec::new(), 1.5);
+    let now = window_rect(&ctx).center();
     assert!(
-        (centre(&ctx) - dragged_to).length() < 2.0,
-        "the next page put the window back at {:?}, not {dragged_to:?}",
-        centre(&ctx)
+        (now - dragged_to).length() < 2.0,
+        "the next page put the window back at {now:?}, not {dragged_to:?}"
     );
 }
 
@@ -835,8 +953,7 @@ fn footer_spans(ctx: &egui::Context, page: usize) -> [Option<Span>; 3] {
 }
 
 /// `Ui::columns` lays a column out justified, so a button dropped
-/// straight into one comes out as wide as the whole third — which is
-/// what Back was until it was given a layout of its own.
+/// straight into one comes out as wide as the whole third.
 #[test]
 fn the_footer_runs_back_then_skip_then_next_at_the_same_size() {
     let ctx = crate::test_ui::ctx();
@@ -882,50 +999,24 @@ fn the_first_page_cannot_go_back() {
     }
 }
 
-fn sweep(ctx: &egui::Context, page: usize) -> Vec<usize> {
-    let mut seen = Vec::new();
-    for y in (150..560).step_by(4) {
-        for x in (240..760).step_by(8) {
-            let mut t = at(page);
-            let (_, actions) = frame(ctx, &mut t, click_at(egui::pos2(x as f32, y as f32)));
-            if actions.dismissed {
-                seen.push(t.page);
-            }
-        }
-    }
-    seen
-}
-
+/// Skip is on every page; Finish only on the last, where it replaces Next.
 #[test]
 fn skip_and_finish_both_dismiss() {
-    let ctx = crate::test_ui::ctx();
-
-    // Skip is on every page.
-    assert!(
-        !sweep(&ctx, 0).is_empty(),
-        "Skip never fired on the first page"
-    );
-
-    // Finish only on the last, where it replaces Next.
-    let last = PAGES.len() - 1;
-    assert!(
-        !sweep(&ctx, last).is_empty(),
-        "Finish never fired on the last page"
-    );
-    let ctx = crate::test_ui::ctx();
-    let mut tour = at(last);
-    let (out, _) = frame(&ctx, &mut tour, Vec::new());
-    assert!(
-        painted_text(&out).contains(&"Finish".to_string()),
-        "the last page still offers Next"
-    );
+    for (page, button) in [(0, "Skip"), (PAGES.len() - 1, "Finish")] {
+        let ctx = crate::test_ui::ctx();
+        let mut tour = at(page);
+        let (out, _) = frame(&ctx, &mut tour, Vec::new());
+        let pos = crate::test_ui::painted_text_center(&out, button)
+            .unwrap_or_else(|| panic!("page {page} offers no {button}"));
+        let (_, actions) = pass(&ctx, &mut tour, click_at(pos), 1.0);
+        assert!(actions.dismissed, "{button} did not dismiss page {page}");
+    }
 }
 
-/// The window is measured on its first frame, and on that frame the viewport
-/// is not necessarily the size it settles at — the real app opened the tour
-/// pinned to the bottom-right corner because a position picked once was
-/// picked against the wrong screen. Until the user drags it, it belongs in
-/// the middle of whatever the window currently is.
+/// The window is measured on its first frame, when the viewport may not have
+/// its final size, so a position picked once can be picked against the wrong
+/// screen. Until the user drags it, it belongs in the middle of whatever the
+/// window currently is.
 #[test]
 fn the_window_centres_itself_on_the_window_it_is_in() {
     let ctx = crate::test_ui::ctx();
@@ -933,13 +1024,10 @@ fn the_window_centres_itself_on_the_window_it_is_in() {
     let roots = roots();
     let mut run = |size: egui::Vec2| {
         let _ = ctx.run(raw_input_at(size, Vec::new(), 0.0), |ctx| {
-            tour.ui(ctx, &roots, HOTKEY);
+            tour.ui(ctx, &roots, HOTKEY, "");
         });
-        let rect = ctx
-            .memory(|m| m.area_rect(egui::Id::new(WINDOW_ID)))
-            .expect("the tour's window");
         (
-            rect.center(),
+            window_rect(&ctx).center(),
             egui::Rect::from_min_size(egui::Pos2::ZERO, size).center(),
         )
     };

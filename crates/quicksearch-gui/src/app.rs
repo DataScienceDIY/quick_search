@@ -24,9 +24,9 @@ use crate::duplicates_tab::{DupState, DuplicatesTab};
 use crate::format::{fmt_interval, group_thousands};
 use crate::keychain;
 use crate::logs_tab::LogsTab;
-use crate::manage_tab::ManageTab;
-use crate::search_tab::SearchTab;
-use crate::settings_tab::{SecurityAction, SettingsTab};
+use crate::manage_tab::{IndexCommand, ManageActions, ManageTab};
+use crate::search_tab::{SearchActions, SearchTab};
+use crate::settings_tab::{SecurityAction, SettingsOutput, SettingsTab};
 use crate::spotlight::{Spot, Spotlit};
 use crate::unlock::KeySource;
 
@@ -70,7 +70,7 @@ fn dirty_editor(from: Tab, manage_dirty: bool, settings_dirty: bool) -> Option<U
 }
 
 /// A tab switch asks only about the tab being left; Quit asks Settings
-/// before Manage, one prompt at a time — each draft is a full `Config`
+/// before Manage, one prompt at a time, since each draft is a full `Config`
 /// snapshot and applying both at once would revert the first.
 fn guard_source(
     intent: NavIntent,
@@ -86,14 +86,34 @@ fn guard_source(
     }
 }
 
-/// Leaving mid-reconcile leaves entries the user excluded still in the index.
-fn quit_needs_reconcile_warning(intent: NavIntent, reconciling: bool) -> bool {
-    intent == NavIntent::Quit && reconciling
+/// How a tab request goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabRoute {
+    /// Dropped: the tab and the navigation on hold stay as they are.
+    Drop,
+    /// Put on hold for the guard's prompt.
+    Hold,
+    /// Switched to at once.
+    Switch,
+}
+
+/// How a tab request goes: dropped while a navigation is `held`, which wins,
+/// so a second request neither replaces the answer the guard is waiting for
+/// nor switches past it; otherwise held when `guarded` says a dirty draft
+/// must answer first, and switched to when not.
+fn route_tab_request(held: bool, guarded: impl FnOnce() -> bool) -> TabRoute {
+    if held {
+        TabRoute::Drop
+    } else if guarded() {
+        TabRoute::Hold
+    } else {
+        TabRoute::Switch
+    }
 }
 
 /// Whether arriving at `to` should start a duplicates scan. Only the first
 /// visit does: the scan reads every entry in the hash index, and
-/// [`QuickSearchApp::invalidate_duplicates`] is what makes a later visit pay
+/// [`QuickSearchApp::invalidate_duplicates`] makes a later visit pay
 /// for it again.
 fn arrival_starts_dup_scan(to: Tab, state: &DupState) -> bool {
     to == Tab::Duplicates && matches!(state, DupState::NotLoaded)
@@ -108,30 +128,20 @@ enum DupInvalidation {
     /// A scan is in flight, and its answer predates the change. Redo it when it
     /// lands, rather than racing a second scan against it.
     WhenItLands,
-    /// The listing is on screen; redo it now.
+    /// The tab is on screen; list it now. That includes a tab left empty by
+    /// [`QuickSearchApp::drop_duplicates`], which the end of the run refills.
     Rescan,
-    /// Cached but out of sight — drop it and let the next visit pay.
+    /// Cached but out of sight: drop it and let the next visit pay.
     Drop,
 }
 
 fn dup_invalidation(tab: Tab, state: &DupState) -> DupInvalidation {
     match state {
-        DupState::NotLoaded => DupInvalidation::Nothing,
         DupState::Loading => DupInvalidation::WhenItLands,
         _ if tab == Tab::Duplicates => DupInvalidation::Rescan,
+        DupState::NotLoaded => DupInvalidation::Nothing,
         _ => DupInvalidation::Drop,
     }
-}
-
-/// A navigation already on hold wins: a second intent would replace the
-/// answer the guard is waiting for.
-fn switch_needs_guard(
-    from: Tab,
-    manage_dirty: bool,
-    settings_dirty: bool,
-    nav_pending: bool,
-) -> bool {
-    !nav_pending && dirty_editor(from, manage_dirty, settings_dirty).is_some()
 }
 
 pub struct QuickSearchApp {
@@ -160,12 +170,12 @@ pub struct QuickSearchApp {
     reconcile_owed_since: Option<u64>,
     /// The watcher gave up on the directory budget; live updates are off.
     watch_cap_prompt: Option<WatchError>,
-    /// Whether a run was under way last frame; the falling edge is what
+    /// Whether a run was under way last frame; the falling edge
     /// invalidates the cached duplicate listing.
     was_indexing: bool,
     /// The duplicates scan in flight was invalidated before it finished; see
     /// [`DupInvalidation::WhenItLands`].
-    dups_stale: bool,
+    rescan_when_dups_land: bool,
     verify: Option<VerifyModal>,
     security_prompt: Option<SecurityPrompt>,
     key_prompt: Option<KeyPrompt>,
@@ -210,8 +220,8 @@ impl QuickSearchApp {
         let stale_index_prompt =
             db::index_needs_rebuild(&cfg.resolved_database_path().to_string_lossy());
 
-        // Also before the backend: the first run can reconcile — and clear
-        // the answer — before the first frame.
+        // Also before the backend: the first run can reconcile, and clear
+        // the answer, before the first frame.
         let db_path = cfg.resolved_database_path().to_string_lossy().into_owned();
         let reconcile_owed = quicksearch_core::scope::outstanding_work(&db_path, &cfg)
             .map(|work| work.touches_index())
@@ -222,15 +232,16 @@ impl QuickSearchApp {
         let reconcile_owed_since = backend.coordinator.state().last_full_index;
         let fuzzy = cfg.search.fuzzy_default;
         // A hand-edited config can nest roots; the coordinator refuses to run.
-        let nested = nested_roots(&cfg.paths.indexing_paths);
+        let nested = nested_roots(&cfg);
         let (tab, nested_prompt) = if nested.is_empty() {
             (Tab::Search, None)
         } else {
             (Tab::Manage, Some(nested))
         };
-        // `Some(false)` means a config file *this version wrote* — the only
-        // thing that counts as a first start; `None` is an upgrade.
-        let tutorial = (cfg.ui.tutorial_seen == Some(false)).then(crate::tutorial::Tutorial::new);
+        // Only `Some(false)`, a config file this version wrote, counts as a
+        // first start; `None` is an upgrade.
+        let tutorial =
+            (cfg.ui.tutorial_seen == Some(false)).then(crate::tutorial::Tutorial::default);
         let mut search = SearchTab::new(fuzzy, cfg.search.columns.clone(), cfg.search.live_results);
         if let Some(query) = initial_query {
             search.seed(query);
@@ -243,10 +254,10 @@ impl QuickSearchApp {
             backend,
             tab,
             search,
-            manage: ManageTab::new(),
+            manage: ManageTab::default(),
             dups,
             logs: LogsTab::new(),
-            settings: SettingsTab::new(),
+            settings: SettingsTab::default(),
             rebuild_prompt: None,
             tutorial,
             clear_prompt: false,
@@ -257,7 +268,7 @@ impl QuickSearchApp {
             reconcile_owed_since,
             watch_cap_prompt: None,
             was_indexing: false,
-            dups_stale: false,
+            rescan_when_dups_land: false,
             verify: None,
             security_prompt: None,
             key_prompt: None,
@@ -280,11 +291,12 @@ impl QuickSearchApp {
     }
 
     fn start_search(&mut self) {
+        // The single funnel every search goes through: drop old watches here,
+        // and with them any update not yet delivered for the old rows.
+        self.backend.clear_live();
         let Some(search) = self.backend.search() else {
             return;
         };
-        // The single funnel every search goes through: drop old watches here.
-        self.backend.clear_live();
         let generation = search.search(&self.search.query, self.search_options());
         self.search.on_search_started(generation);
     }
@@ -292,23 +304,42 @@ impl QuickSearchApp {
     fn start_duplicates_scan(&mut self, ctx: &egui::Context) {
         self.dups.state = DupState::Loading;
         let cfg = self.cfg.clone();
-        let limit = self.backend.start_duplicates(&cfg, ctx.clone());
-        // 0 means a scan was already running, whose limit still stands.
-        if limit > 0 {
-            self.dups.scan_limit = limit;
-        }
+        self.backend.start_duplicates(&cfg, ctx.clone());
     }
 
-    /// Drop a duplicate listing the index has moved out from under — a finished
-    /// run, or a different database. The scan reads the whole hash index, so it
-    /// is only paid again when the tab is actually being looked at.
+    /// Drops a duplicate listing the index has moved out from under (a finished
+    /// run, or a different database). The scan reads the whole hash index, so
+    /// it is only paid again when the tab is being looked at.
     fn invalidate_duplicates(&mut self, ctx: &egui::Context) {
         match dup_invalidation(self.tab, &self.dups.state) {
             DupInvalidation::Nothing => {}
-            DupInvalidation::WhenItLands => self.dups_stale = true,
+            DupInvalidation::WhenItLands => self.rescan_after_dup_scan(),
             DupInvalidation::Rescan => self.start_duplicates_scan(ctx),
             DupInvalidation::Drop => self.dups.state = DupState::NotLoaded,
         }
+    }
+
+    /// [`Self::invalidate_duplicates`] for an index about to be deleted (a
+    /// rebuild, a clear, a security change), minus the scan: one started now
+    /// would open the index while the coordinator deletes it (on Windows the
+    /// delete then fails). A visible tab is left empty until the end of the
+    /// run refills it. These two are the only writers of `NotLoaded` after
+    /// construction.
+    fn drop_duplicates(&mut self) {
+        match dup_invalidation(self.tab, &self.dups.state) {
+            DupInvalidation::Nothing => {}
+            DupInvalidation::WhenItLands => self.rescan_after_dup_scan(),
+            DupInvalidation::Rescan | DupInvalidation::Drop => {
+                self.dups.state = DupState::NotLoaded
+            }
+        }
+    }
+
+    /// The running scan's answer is stale: cut its tail check short, and scan
+    /// again once it lands.
+    fn rescan_after_dup_scan(&mut self) {
+        self.rescan_when_dups_land = true;
+        self.backend.cancel_duplicates();
     }
 
     /// Every switch goes through here, including guard-delayed ones.
@@ -335,8 +366,15 @@ impl QuickSearchApp {
     /// Save + route an edited config to the running services. `false` means
     /// nothing was saved and the caller must keep any staged edits alive.
     fn apply_new_config(&mut self, ctx: &egui::Context, mut new: Config) -> bool {
+        // Mid security change, an edit could start the rebuild before the new
+        // key is in, or move the index out from under the delete.
+        if self.security_busy() {
+            self.config_error =
+                Some("Not applied: the index is being deleted for a security change".to_string());
+            return false;
+        }
         pin_live_fields(&mut new, &self.cfg);
-        if let Some((child, parent)) = nested_roots(&new.paths.indexing_paths).first() {
+        if let Some((child, parent)) = nested_roots(&new).first() {
             self.config_error = Some(format!(
                 "Not applied: indexed folder {} is nested under {}",
                 child, parent
@@ -348,29 +386,12 @@ impl QuickSearchApp {
             .watch_cap_warned_roots
             .retain(|root| new.paths.indexing_paths.contains(root));
         let actions = diff_actions(&self.cfg, &new);
-        // The lock must move before the change is written: a `database_path`
-        // another instance holds must never reach the config file, or the
-        // next launch refuses to start. `move_to` takes the new lock before
-        // dropping the old, so a rejection leaves us holding what we had.
+        // Before the save: a `database_path` another instance holds must
+        // never reach the config file, or the next launch refuses to start.
         if actions.search_db_changed {
-            match IndexLock::move_to(&new.resolved_database_path()) {
-                Ok(()) => {}
-                Err(LockError::Held { pid }) => {
-                    let who = match pid {
-                        Some(pid) => format!(" (process {})", pid),
-                        None => String::new(),
-                    };
-                    self.config_error = Some(format!(
-                        "Not applied: another QuickSearch{} is using that index.",
-                        who
-                    ));
-                    return false;
-                }
-                // Same rule as at startup: a convenience guard is never a
-                // good enough reason to refuse.
-                Err(LockError::Unsupported(why)) => {
-                    quicksearch_core::log_warn!("cannot lock the index ({}); continuing", why);
-                }
+            if let Err(e) = move_index_lock(&new.resolved_database_path()) {
+                self.config_error = Some(e);
+                return false;
             }
         }
         // A config that could not be written must not take effect: it would
@@ -384,33 +405,7 @@ impl QuickSearchApp {
             self.config_error = Some(e);
             return false;
         }
-        if (new.ui.scale - self.cfg.ui.scale).abs() > f32::EPSILON {
-            ctx.set_zoom_factor(clamp_scale(new.ui.scale));
-        }
-        if new.ui.search_hotkey != self.cfg.ui.search_hotkey {
-            // Only when moved: on Wayland re-registering opens a new portal
-            // session, which some desktops confirm with the user.
-            crate::hotkey::apply(&new.ui.search_hotkey);
-        }
-        if new.ui.color_scheme != self.cfg.ui.color_scheme {
-            apply_theme(ctx, &new.ui.color_scheme);
-        }
-        if actions.search_db_changed {
-            if let Some(search) = self.backend.search() {
-                search.set_db_path(new.resolved_database_path());
-            }
-        }
-        // The ceiling is a property of the connection, so it only takes effect
-        // on the next open — release the one being held rather than leaving
-        // the setting to appear ignored until the next idle timeout.
-        if new.search.cache_size_mib != self.cfg.search.cache_size_mib {
-            quicksearch_core::db::set_search_cache_override(
-                (new.search.cache_size_mib != 0).then_some(new.search.cache_size_mib as i64),
-            );
-            if let Some(search) = self.backend.search() {
-                search.release_connection();
-            }
-        }
+        self.apply_runtime_changes(ctx, &new, actions.search_db_changed);
         // Only settings that leave the stored file unreadable need a rebuild.
         self.backend.coordinator.apply_config(new.clone());
         if actions.requires_rebuild {
@@ -428,14 +423,12 @@ impl QuickSearchApp {
             }
         }
         self.search.live_enabled = new.search.live_results;
-        if new.search.live_results {
-            // The watcher holds a copy of the config, so a config edit has
-            // to re-arm; dropping the tab-side state makes the next frame do it.
-            self.search.reset_live();
-        } else {
+        if !new.search.live_results {
             self.backend.clear_live();
-            self.search.reset_live();
         }
+        // The watcher holds a copy of the config, so a config edit has to
+        // re-arm; dropping the tab-side state makes the next frame do it.
+        self.search.reset_live();
         self.cfg = new;
         // After the swap, or a rescan would read the index we just left:
         // groups listed from the old one say nothing about the new one.
@@ -445,18 +438,55 @@ impl QuickSearchApp {
         true
     }
 
-    /// Ask for a tab from code rather than from a click: the same guard, so a
-    /// dirty draft still gets its say.
+    /// Pushes what takes effect without a restart, compared against the
+    /// config still in force: zoom, shortcut, theme, and the search
+    /// connection's database and cache.
+    fn apply_runtime_changes(&self, ctx: &egui::Context, new: &Config, db_changed: bool) {
+        if (new.ui.scale - self.cfg.ui.scale).abs() > f32::EPSILON {
+            ctx.set_zoom_factor(clamp_scale(new.ui.scale));
+        }
+        if new.ui.search_hotkey != self.cfg.ui.search_hotkey {
+            // Only when moved: re-registering an unchanged key would still
+            // release and re-grab it, a window in which a press is lost.
+            crate::hotkey::apply(&new.ui.search_hotkey);
+            // And the system-wide binding follows, where one is written.
+            crate::shortcut_setup::hotkey_changed(&new.ui.search_hotkey);
+        }
+        if new.ui.color_scheme != self.cfg.ui.color_scheme {
+            apply_theme(ctx, &new.ui.color_scheme);
+        }
+        if db_changed {
+            if let Some(search) = self.backend.search() {
+                search.set_db_path(new.resolved_database_path());
+            }
+        }
+        // The ceiling is a property of the connection, so it only takes effect
+        // on the next open: release the one being held rather than leave the
+        // setting to appear ignored until the next idle timeout.
+        if new.search.cache_size_mib != self.cfg.search.cache_size_mib {
+            quicksearch_core::db::set_search_cache_override(
+                (new.search.cache_size_mib != 0).then_some(new.search.cache_size_mib as i64),
+            );
+            if let Some(search) = self.backend.search() {
+                search.release_connection();
+            }
+        }
+    }
+
+    /// Every tab request goes through here, a click or one from code (the
+    /// tour, the search shortcut), so a dirty draft always gets its say. A
+    /// navigation already on hold wins ([`route_tab_request`]).
     pub(crate) fn request_tab(&mut self, ctx: &egui::Context, to: Tab) {
-        if switch_needs_guard(
-            self.tab,
-            self.manage.is_dirty(),
-            self.settings.is_dirty(&self.cfg),
-            self.pending_nav.is_some(),
-        ) {
-            self.pending_nav = Some(NavIntent::SwitchTab(to));
-        } else {
-            self.switch_tab(ctx, to);
+        let intent = NavIntent::SwitchTab(to);
+        let route = route_tab_request(self.pending_nav.is_some(), || {
+            let manage_dirty = self.manage.is_dirty();
+            let settings_dirty = self.settings.is_dirty(&self.cfg);
+            guard_source(intent, self.tab, manage_dirty, settings_dirty).is_some()
+        });
+        match route {
+            TabRoute::Drop => {}
+            TabRoute::Hold => self.pending_nav = Some(intent),
+            TabRoute::Switch => self.switch_tab(ctx, to),
         }
     }
 
@@ -503,23 +533,28 @@ impl QuickSearchApp {
             self.search
                 .apply_update(update, self.cfg.search.display_limit);
         }
-        // Handing live-update paths back to the indexer keeps the index from
-        // drifting away from the rows on screen, even while indexing is stopped.
+        // Handing live-update paths back to the indexer refreshes the rows of
+        // files that changed, even while indexing is stopped. It removes
+        // none: a row shown as gone stays in the index until the index's
+        // watcher or the next run finds the file gone.
         let mut touched: Vec<PathBuf> = Vec::new();
-        while let Ok(update) = self.backend.live_rx.try_recv() {
-            touched.push(PathBuf::from(update.path()));
-            if let quicksearch_core::live::LiveUpdate::Renamed { to, .. } = &update {
-                touched.push(PathBuf::from(to));
+        if let Some(rx) = &self.backend.live_rx {
+            while let Ok(update) = rx.try_recv() {
+                touched.push(PathBuf::from(update.path()));
+                if let quicksearch_core::live::LiveUpdate::Renamed { to, .. } = &update {
+                    touched.push(PathBuf::from(to));
+                }
+                self.search.apply_live(update);
             }
-            self.search.apply_live(update);
         }
         self.backend.reindex_live_paths(touched);
         // Duplicates worker.
-        if let Some(rx) = &self.backend.dup_job {
+        if let Some(job) = &self.backend.dup_job {
             use std::sync::mpsc::TryRecvError;
-            let done = match rx.try_recv() {
-                Ok(Ok(groups)) => Some(DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(
-                    groups,
+            let done = match job.rx.try_recv() {
+                Ok(Ok(scan)) => Some(DupState::Loaded(crate::duplicates_tab::LoadedGroups::new(
+                    scan.groups,
+                    scan.limited_to,
                 ))),
                 Ok(Err(e)) => Some(DupState::Error(e)),
                 Err(TryRecvError::Empty) => None,
@@ -532,12 +567,110 @@ impl QuickSearchApp {
                 self.backend.dup_job = None;
                 // The index moved while this was running; the answer describes
                 // an index that no longer exists.
-                if std::mem::take(&mut self.dups_stale) {
+                if std::mem::take(&mut self.rescan_when_dups_land) {
                     self.invalidate_duplicates(ctx);
                 }
             }
         }
         self.drain_verify();
+    }
+
+    fn handle_search_actions(&mut self, ctx: &egui::Context, actions: SearchActions) {
+        if let Some(fuzzy) = actions.save_fuzzy_default {
+            self.cfg.search.fuzzy_default = fuzzy;
+            self.save_cfg();
+        }
+        // Live state, saved the moment it changes; the Settings tab's column
+        // controls take this same path.
+        if let Some(columns) = actions.save_columns {
+            self.cfg.search.columns = columns;
+            self.save_cfg();
+        }
+        if let Some(pattern) = actions.persist_ignore {
+            let mut new_cfg = self.cfg.clone();
+            if !new_cfg.indexing.ignore_patterns.contains(&pattern) {
+                new_cfg.indexing.ignore_patterns.push(pattern);
+                self.apply_new_config(ctx, new_cfg);
+            }
+        }
+        if let Some(targets) = actions.live_targets {
+            self.backend
+                .watch_live(&self.search.query, targets, &self.cfg);
+        }
+        if let Some(path) = actions.open_file {
+            crate::platform::open_file(&path);
+        }
+        if let Some(path) = actions.reveal {
+            crate::platform::reveal_in_folder(&path);
+        }
+        if actions.rerun {
+            self.start_search();
+        }
+    }
+
+    fn handle_manage_actions(&mut self, ctx: &egui::Context, actions: ManageActions) {
+        if let Some(command) = actions.command {
+            match command {
+                IndexCommand::StartNow => self.backend.coordinator.reindex_now(),
+                IndexCommand::Stop => self.set_index_mode(false),
+                IndexCommand::Auto => self.set_index_mode(true),
+                IndexCommand::Clear => self.clear_prompt = true,
+            }
+            if command != IndexCommand::Clear {
+                // Keep repainting while the command lands.
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+        if let Some(new_cfg) = actions.apply_config {
+            if self.apply_new_config(ctx, new_cfg) {
+                self.manage.mark_applied();
+            }
+        }
+    }
+
+    fn handle_dup_actions(
+        &mut self,
+        ctx: &egui::Context,
+        actions: crate::duplicates_tab::DuplicatesActions,
+    ) {
+        if actions.refresh {
+            self.start_duplicates_scan(ctx);
+        }
+        // Live state, written the moment it changes, like the search tab's
+        // column picker. Nothing here changes what is indexed, so there is no
+        // reconciliation to run.
+        if let Some(filters) = actions.save_filters {
+            self.cfg.duplicates = filters;
+            self.save_cfg();
+        }
+        if let Some(paths) = actions.verify {
+            let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+            self.backend
+                .start_verify(paths.clone(), &self.cfg, ctx.clone());
+            self.verify = Some(VerifyModal::new(paths));
+        }
+    }
+
+    fn handle_settings_output(&mut self, ctx: &egui::Context, out: SettingsOutput) {
+        if let Some(new_cfg) = out.applied {
+            self.apply_new_config(ctx, new_cfg);
+        }
+        if let Some(action) = out.security {
+            self.handle_security_action(action);
+        }
+        // Same live path the table header's picker takes.
+        if let Some(columns) = out.columns {
+            self.cfg.search.columns = columns.clone();
+            self.search.columns = columns;
+            self.search.mark_sort_dirty();
+            self.save_cfg();
+        }
+        // Likewise: revealing a setting is not an edit to one, so it takes
+        // effect and is remembered without an Apply.
+        if let Some(show_advanced) = out.show_advanced {
+            self.cfg.ui.show_advanced_settings = show_advanced;
+            self.save_cfg();
+        }
     }
 
     fn tick_debounce(&mut self, ctx: &egui::Context) {
@@ -593,20 +726,44 @@ impl QuickSearchApp {
     }
 }
 
-/// Overwrite the fields a config draft must never carry back: live state
-/// saved the moment it changes, which a stale draft would silently revert.
+/// Copies into a draft the fields that are saved the moment they change
+/// (security, index mode, search columns, advanced toggle, duplicates
+/// filters, the watch-cap acknowledgements, the tour's dismissal), so
+/// applying an older draft cannot revert them and changing them never makes
+/// a draft read as dirty.
 pub(crate) fn pin_live_fields(new: &mut Config, live: &Config) {
     new.security = live.security.clone();
     new.indexing.auto_index = live.indexing.auto_index;
-    // The column picker writes straight to the live config; pinning stops a
-    // draft taken before a header-menu change from undoing it on Apply. The
-    // advanced-settings toggle is written the same way and needs the same
-    // protection — Apply must not put the rows away again.
     new.search.columns = live.search.columns.clone();
     new.ui.show_advanced_settings = live.ui.show_advanced_settings;
-    // Likewise the duplicates tab's own filters: hiding a group is a live
-    // edit, and a Settings draft taken before it must not bring the group back.
+    new.ui.watch_cap_warned_roots = live.ui.watch_cap_warned_roots.clone();
+    new.ui.tutorial_seen = live.ui.tutorial_seen;
     new.duplicates = live.duplicates.clone();
+}
+
+/// " (process N)" when the holder's pid is known, for the already-running
+/// messages.
+pub(crate) fn held_by(pid: Option<u32>) -> String {
+    pid.map(|pid| format!(" (process {})", pid))
+        .unwrap_or_default()
+}
+
+/// Moves the index lock to `to`. `move_to` takes the new lock before
+/// dropping the old, so a refusal leaves us holding what we had.
+fn move_index_lock(to: &std::path::Path) -> Result<(), String> {
+    match IndexLock::move_to(to) {
+        Ok(()) => Ok(()),
+        Err(LockError::Held { pid }) => Err(format!(
+            "Not applied: another QuickSearch{} is using that index.",
+            held_by(pid)
+        )),
+        // Same rule as at startup: a convenience guard is never a good
+        // enough reason to refuse.
+        Err(LockError::Unsupported(why)) => {
+            quicksearch_core::log_warn!("cannot lock the index ({}); continuing", why);
+            Ok(())
+        }
+    }
 }
 
 /// The zoom factors the GUI offers, and the range a hand-edited config is
@@ -648,8 +805,8 @@ impl eframe::App for QuickSearchApp {
         self.drain_events(ctx);
         self.tick_debounce(ctx);
 
-        // The close must be cancelled *this* frame — once the window is gone
-        // there is nothing left to ask; `complete_nav` re-sends it.
+        // The close must be cancelled this frame, since once the window is
+        // gone there is nothing left to ask; `complete_nav` re-sends it.
         if ctx.input(|i| i.viewport().close_requested())
             && !self.quit_confirmed
             && (self.manage.is_dirty()
@@ -681,26 +838,15 @@ impl eframe::App for QuickSearchApp {
             });
         });
         if requested != self.tab {
-            if switch_needs_guard(
-                self.tab,
-                self.manage.is_dirty(),
-                self.settings.is_dirty(&self.cfg),
-                self.pending_nav.is_some(),
-            ) {
-                self.pending_nav = Some(NavIntent::SwitchTab(requested));
-            } else {
-                self.switch_tab(ctx, requested);
-            }
+            self.request_tab(ctx, requested);
         }
 
         if let Some(err) = &self.config_error {
             let err = err.clone();
             egui::TopBottomPanel::top("config-error").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!("Config problem: {} (using defaults)", err),
-                    );
+                    // Bare: every source of this message says what failed.
+                    ui.colored_label(ui.visuals().error_fg_color, err);
                     if ui.small_button("Dismiss").clicked() {
                         self.config_error = None;
                     }
@@ -712,77 +858,17 @@ impl eframe::App for QuickSearchApp {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Search => {
                 let actions = self.search.ui(ui);
-                if let Some(fuzzy) = actions.save_fuzzy_default {
-                    self.cfg.search.fuzzy_default = fuzzy;
-                    self.save_cfg();
-                }
-                // Live state, saved the moment it changes; the Settings tab's
-                // column controls take this same path.
-                if let Some(columns) = actions.save_columns {
-                    self.cfg.search.columns = columns;
-                    self.save_cfg();
-                }
-                if let Some(pattern) = actions.persist_ignore {
-                    let mut new_cfg = self.cfg.clone();
-                    if !new_cfg.indexing.ignore_patterns.contains(&pattern) {
-                        new_cfg.indexing.ignore_patterns.push(pattern);
-                        self.apply_new_config(ctx, new_cfg);
-                    }
-                }
-                if let Some(targets) = actions.live_targets {
-                    self.backend
-                        .watch_live(&self.search.query, targets, &self.cfg);
-                }
-                if actions.rerun {
-                    self.start_search();
-                }
+                self.handle_search_actions(ctx, actions);
             }
             Tab::Manage => {
                 let state = self.backend.coordinator.state();
                 let actions = self.manage.ui(ui, &state, &self.cfg);
-                if actions.start_now {
-                    self.backend.coordinator.reindex_now();
-                }
-                if actions.stop {
-                    self.set_index_mode(false);
-                }
-                if actions.auto {
-                    self.set_index_mode(true);
-                }
-                if actions.clear_index {
-                    self.clear_prompt = true;
-                }
-                if actions.start_now || actions.stop || actions.auto {
-                    // Keep repainting while the command lands.
-                    ui.ctx().request_repaint_after(Duration::from_millis(100));
-                }
-                if let Some(new_cfg) = actions.apply_config {
-                    if self.apply_new_config(ctx, new_cfg) {
-                        self.manage.mark_applied();
-                    }
-                }
+                self.handle_manage_actions(ctx, actions);
             }
             Tab::Duplicates => {
-                let actions =
-                    self.dups
-                        .ui(ui, self.verify.is_some(), self.cfg.processing.hash_length);
-                if actions.refresh {
-                    self.start_duplicates_scan(ctx);
-                }
-                // Live state, written the moment it changes — the same path
-                // the search tab's column picker takes. Nothing here changes
-                // what is indexed, so there is no reconciliation to run.
-                if let Some(filters) = actions.save_filters {
-                    self.cfg.duplicates = filters;
-                    self.save_cfg();
-                }
-                if let Some(paths) = actions.verify {
-                    let paths: Vec<std::path::PathBuf> =
-                        paths.into_iter().map(std::path::PathBuf::from).collect();
-                    self.backend
-                        .start_verify(paths.clone(), &self.cfg, ctx.clone());
-                    self.verify = Some(VerifyModal::new(paths));
-                }
+                let hash_length = self.cfg.processing.hash_length;
+                let actions = self.dups.ui(ui, self.verify.is_some(), hash_length);
+                self.handle_dup_actions(ctx, actions);
             }
             Tab::Logs => self.logs.ui(ui),
             Tab::Help => {
@@ -793,25 +879,7 @@ impl eframe::App for QuickSearchApp {
             Tab::Settings => {
                 let indexed_files = self.backend.coordinator.state().files;
                 let out = self.settings.ui(ui, &self.cfg, indexed_files);
-                if let Some(new_cfg) = out.applied {
-                    self.apply_new_config(ctx, new_cfg);
-                }
-                if let Some(action) = out.security {
-                    self.handle_security_action(action);
-                }
-                // Same live path the table header's picker takes.
-                if let Some(columns) = out.columns {
-                    self.cfg.search.columns = columns.clone();
-                    self.search.columns = columns;
-                    self.search.mark_sort_dirty();
-                    self.save_cfg();
-                }
-                // Likewise: revealing a setting is not an edit to one, so it
-                // takes effect and is remembered without an Apply.
-                if let Some(show_advanced) = out.show_advanced {
-                    self.cfg.ui.show_advanced_settings = show_advanced;
-                    self.save_cfg();
-                }
+                self.handle_settings_output(ctx, out);
             }
         });
 

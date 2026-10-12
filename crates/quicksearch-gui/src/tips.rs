@@ -1,4 +1,5 @@
-//! Plain-language tooltips: every configuration control explains itself on hover.
+//! Plain-language tooltips: every configuration control, and any status line
+//! whose wait needs explaining, explains itself on hover.
 
 const TIP_WIDTH: f32 = 420.0;
 
@@ -65,17 +66,14 @@ pub fn tip_row(
 
 pub static SHOW_ADVANCED: Tip = Tip {
     title: "Show advanced settings",
-    body: "Reveals the rest of the Settings tab: where the index file lives, \
-           how text is broken into searchable pieces, how much of a file is \
-           read, how much memory searching may use, and similar.\n\n\
-           They are hidden by default because their defaults are right for \
-           almost every installation, and because a wrong value can make \
-           indexing slower, searching worse, or a rebuild necessary. Nothing \
-           is lost by leaving this off — every setting behind it keeps working \
-           at its default.",
+    body: "Shows the rest of the Settings tab: the index location, how text \
+           is split for searching, how much of each file is read, search \
+           memory, and more.\n\n\
+           They are hidden because the defaults suit almost every \
+           installation and a wrong value can slow indexing, worsen searching \
+           or force a rebuild. Hidden settings keep working at their defaults.",
     examples: &[
-        "on when you want the index kept on a different drive, or are tuning \
-         a very large collection.",
+        "on to move the index to another drive, or to tune a very large collection.",
         "off for everyday use.",
     ],
     caution: None,
@@ -85,16 +83,14 @@ pub static SHOW_ADVANCED: Tip = Tip {
 
 pub static DATABASE_PATH: Tip = Tip {
     title: "Database file",
-    body: "Where QuickSearch keeps its index: a single file holding the \
-           names, locations and text of everything it has indexed. It grows \
-           with the number of files indexed, so it wants a drive with room \
-           to spare.\n\n\
-           Pointing this somewhere else switches to the index at the new \
-           location, building a fresh one there if nothing exists yet. The \
-           old file stays on disk until you delete it. Keep it off a folder \
-           that syncs to the cloud, such as OneDrive or Dropbox: it is far \
-           too large and too busy to synchronise.",
-    examples: &["a path on a second, larger drive when the system drive is tight on space."],
+    body: "The single file holding the index: the names, locations and text \
+           of everything indexed. It grows with your files, so put it on a \
+           drive with room to spare.\n\n\
+           Changing this switches to the index at the new location, building \
+           one if none exists; the old file stays until you delete it. Keep \
+           it out of cloud-synced folders such as OneDrive or Dropbox, which \
+           cannot keep up with it.",
+    examples: &["a path on a second, larger drive when the system drive is short of space."],
     caution: None,
 };
 
@@ -102,195 +98,156 @@ pub static DATABASE_PATH: Tip = Tip {
 
 pub static REINDEX_INTERVAL: Tip = Tip {
     title: "Full reindex every",
-    body: "Indexed folders are watched, so ordinary changes appear within \
-           seconds. This is the safety net behind that: a full sweep that \
-           picks up anything the watching missed, such as changes made while \
-           QuickSearch was closed, or on a drive that does not report them.\n\n\
-           A sweep costs some disk activity for a few minutes, and searching \
-           keeps working throughout.",
+    body: "Indexed folders are watched, so most changes appear within \
+           seconds. This full sweep is the safety net: it picks up what \
+           watching missed, such as changes made while QuickSearch was closed \
+           or on a drive that does not report them.\n\n\
+           A sweep costs a few minutes of disk activity; searching keeps \
+           working throughout.",
     examples: &[
         "1440, once a day, suits an ordinary laptop.",
-        "60 when you work on a network share, or a drive other machines write to.",
+        "60 on a network share, or a drive other machines write to.",
         "10080, once a week, for an archive that barely changes.",
-    ],
-    caution: None,
-};
-
-pub static FOLLOW_SYMLINKS: Tip = Tip {
-    title: "Follow symlinks",
-    body: "Symlinks are entries that stand in for a file or folder living \
-           somewhere else. Off, QuickSearch steps over them, so nothing is \
-           indexed twice under two names. On, it looks through them and \
-           indexes what they point at, stored under the real location rather \
-           than the link's.\n\n\
-           Turning this off removes the entries that are no longer in scope; \
-           turning it on indexes whatever it now reaches. Neither rebuilds \
-           the index.",
-    examples: &[
-        "on when a folder you search lives outside your indexed folders and is reached \
-         through a link.",
     ],
     caution: None,
 };
 
 pub static INCLUDE_HIDDEN: Tip = Tip {
     title: "Include hidden files",
-    body: "Files and folders the system keeps out of sight: names beginning \
-           with a dot on Linux and macOS, plus anything carrying the Hidden \
+    body: "Files and folders the system keeps out of sight: names starting \
+           with a dot on Linux and macOS, and anything with the Hidden \
            attribute on Windows, such as AppData and $RECYCLE.BIN. They are \
            mostly program settings and caches, so leaving them out keeps the \
            index smaller and the results cleaner.\n\n\
-           Folders marked System but not Hidden are indexed either way. Cloud \
-           sync folders and folders given a custom icon carry that mark only \
-           to get the icon, and are ordinary folders otherwise.",
-    examples: &["on when you want to find configuration files such as .bashrc or .gitconfig."],
+           Folders marked System but not Hidden are always indexed: cloud \
+           sync folders and folders with a custom icon carry that mark only \
+           for the icon.",
+    examples: &["on to find configuration files such as .bashrc or .gitconfig."],
     caution: None,
 };
 
 // --- Settings: Processing -------------------------------------------------
 
-pub static TOKENIZER: Tip = Tip {
-    title: "Tokenizer",
-    body: "How the text inside your files is cut up so that it can be \
-           searched.\n\n\
-           trigram indexes every run of three characters, so a search for \
-           \"port\" also finds \"airport\", and it works for languages that \
-           do not put spaces between words. The other two index whole words \
-           instead: the index is smaller and faster, but a search matches \
-           only from the start of a word.",
-    examples: &[
-        "trigram, the default, for finding a fragment anywhere inside a word.",
-        "unicode61 when you only ever search whole words and want the smallest, \
-         fastest index.",
-        "porter to also match English word endings, so \"running\" finds \"run\".",
-    ],
-    caution: Some("Changing this builds the whole index again from scratch."),
-};
-
 pub static HASH_LENGTH: Tip = Tip {
     title: "Hash sample size",
-    body: "How much of the start of each file QuickSearch reads in order to \
-           recognise it. Those first bytes give the file its fingerprint, \
-           which is how the Duplicates tab knows two files are identical; \
-           they also say what kind of file it is, and for a small text file \
-           they are the whole text.\n\n\
-           Reading more is more reliable and slower, particularly over a \
+    body: "How many bytes from the start of each file QuickSearch reads to \
+           recognise it. They make the fingerprint the Duplicates tab groups \
+           files by, tell what kind of file it is, and for a small text file \
+           are the whole text. The Duplicates tab also reads as many bytes \
+           from the end of each file it lists, and splits apart files that \
+           only start alike.\n\n\
+           Reading more is more reliable but slower, especially over a \
            network.",
     examples: &[
         "8192, the default, is right for almost everyone.",
         "higher when the Duplicates tab groups files that are not really identical, \
-         which happens with disk images and other formats that begin with a lot of \
+         as happens with disk images and other formats that start with a lot of \
          empty space.",
     ],
-    caution: Some("Changing this builds the whole index again from scratch."),
+    caution: Some("Changing this rebuilds the index from scratch."),
 };
 
 pub static MAX_STORED_TEXT: Tip = Tip {
     title: "Max stored text",
-    body: "How much text QuickSearch keeps out of any one file. Text past \
-           this point is not stored, so a search will not find a word that \
-           appears only deep inside a very long document. File names, sizes \
-           and dates are unaffected.\n\n\
-           Along with the two settings below it, this is one of the largest \
-           influences on how big the index becomes.",
+    body: "The most text QuickSearch keeps from any one file. Text past this \
+           point is not stored, so a word that appears only deep inside a \
+           very long document is not found. Names, sizes and dates are \
+           unaffected.\n\n\
+           With the two settings below it, this has the most effect on how \
+           big the index grows.",
     examples: &[
-        "262144, 256 KB, covers the whole of most documents.",
-        "65536, 64 KB, to shrink the index when you mostly search the opening pages.",
-        "higher when you search long books, transcripts or logs and expect to find \
-         words near the end.",
+        "262144, 256 KiB, covers the whole of most documents.",
+        "65536, 64 KiB, to shrink the index when you mostly search the opening pages.",
+        "higher for long books, transcripts or logs you expect to search to the end.",
     ],
     caution: None,
 };
 
 pub static MAX_TEXT_FILE_SIZE: Tip = Tip {
     title: "Max text file size",
-    body: "Files larger than this are indexed by name only: QuickSearch does \
-           not open them to read the text inside. It keeps one stray huge \
-           file from holding up an indexing run.\n\n\
-           Those files still appear in results, found by their name, size or \
-           date.",
+    body: "Files larger than this are indexed without their text, so one \
+           huge file cannot hold up an indexing run. They are still found by \
+           name, size or date.",
     examples: &[
-        "2097152, 2 MB, skips very few ordinary documents.",
-        "52428800, 50 MB, when you search inside large log files or scanned PDFs.",
+        "52428800, 50 MiB, the default, reads inside large logs, scanned PDFs and \
+         presentations that are mostly pictures.",
+        "2097152, 2 MiB, to read ordinary documents only and leave anything larger \
+         to be found by name.",
     ],
     caution: None,
 };
 
 pub static BATCH_SIZE: Tip = Tip {
     title: "Batch size",
-    body: "How many files QuickSearch handles per write to the index while \
-           indexing. Larger batches mean fewer, bigger writes, which is a \
-           little faster and uses more memory.\n\n\
-           A speed setting only: it changes nothing about what you can find, \
-           and most people never need to touch it.",
+    body: "How many files go into each write to the index while indexing. \
+           Larger batches mean fewer, bigger writes: a little faster, and \
+           more memory.\n\n\
+           It changes only speed, never what you can find.",
     examples: &[
         "500, the default, balances speed against memory.",
-        "lower, around 50, on a machine with very little memory to spare.",
+        "about 50 on a machine with very little memory to spare.",
     ],
     caution: None,
 };
 
 pub static MAX_WAL_SIZE: Tip = Tip {
     title: "Max WAL size",
-    body: "While indexing, changes are written to a companion file beside \
-           the index and folded in afterwards. That normally happens by \
-           itself, but during a long run with searches going on at the same \
-           time the companion file keeps growing, often past the size of the \
-           index itself: it records every version of every page the run \
-           touches, where the index keeps only the last. This is the point at \
-           which QuickSearch pauses and folds it in regardless.\n\n\
-           Folding in less often makes indexing faster and makes searching \
-           during it slower.",
+    body: "Indexing writes changes to a companion file (the WAL) and later \
+           folds them into the index. During a long run with searches going \
+           on, that file can outgrow the index itself. At this size \
+           QuickSearch pauses indexing and folds it in.\n\n\
+           A larger value makes indexing faster and searching during it \
+           slower.",
     examples: &[
-        "2147483648, 2 GB, is the default.",
-        "67108864, 64 MB, to favour searching while indexing runs.",
-        "0 to never force it and let the database decide. Any other value below 16 MB \
-         is treated as 16 MB.",
+        "2147483648, 2 GiB, the default.",
+        "67108864, 64 MiB, to favour searching while indexing runs.",
+        "0 to leave it to the database. Other values under 16 MiB count as 16 MiB.",
     ],
     caution: None,
 };
 
-pub static STORE_TEXT: Tip = Tip {
-    title: "Store text for snippets",
-    body: "Keeps the text QuickSearch reads out of your files, rather than \
-           only the index needed to search it. It is what makes the preview \
-           line underneath a result possible.\n\n\
-           Off, searching inside files still works, but there are no \
-           previews, no ranking by how often a word appears, no telling \
-           Report from report, and no allowance for typos inside file \
-           contents. The index shrinks considerably.\n\n\
-           Turning it off discards the stored text at once; turning it back \
-           on reads your files again.",
+pub static COMPACT_INDEX: Tip = Tip {
+    title: "Compact text index",
+    body: "Builds the index of your files' text without recording where in \
+           each file every word sits, which makes it several times smaller \
+           and quicker to build.\n\n\
+           Searches find exactly the same files either way, this simply trades \
+           reduced index size and faster indexing speed for slower searches.",
     examples: &[
-        "off when the index has grown larger than you want and you can do without previews.",
+        "on, the default: 1.1 GiB of text documents went from a 1.3 GiB index to 219 MiB, built in a third less time.",
+        "off when disk space is plentiful and you often search for phrases of common words.",
     ],
-    caution: None,
+    caution: Some("Changing this rebuilds the index from scratch."),
 };
 
 // --- Settings: Search -----------------------------------------------------
 
 pub static FUZZY_DEFAULT: Tip = Tip {
     title: "Fuzzy search ON by default",
-    body: "Whether the Fuzzy box on the Search tab starts ticked each time \
-           QuickSearch opens. Fuzzy search also finds matches with typos in \
-           them, at some cost in speed. Either way you can tick and untick \
-           it whenever you like.",
+    body: "Whether the Fuzzy box on the Search tab starts ticked when \
+           QuickSearch opens. Fuzzy search also finds matches with typos, at \
+           some cost in speed. You can tick or untick it at any time.",
     examples: &["on when you often look for names you are not sure how to spell."],
     caution: None,
 };
 
 pub static FUZZY_EDITS: Tip = Tip {
     title: "Fuzzy edit distance",
-    body: "How far a word may sit from what you typed and still count as a \
-           match while Fuzzy is on. One edit is one letter added, removed or \
-           changed, so \"reciept\" is one edit away from \"receipt\".\n\n\
-           The allowance grows with the length of what you type, one edit per \
-           three characters, up to the value set here. Short searches stay \
-           strict, so that three letters do not match half the index.",
+    body: "How far a word may be from what you typed and still match while \
+           Fuzzy is on. One edit is one letter added, removed or changed, so \
+           \"repot\" is one edit from \"report\".\n\n\
+           The allowance grows with what you type, one edit per three \
+           letters (bytes, for non-ASCII text), up to this value. Short \
+           searches still match loosely: letters may drop off either end, so \
+           \"report\" also matches \"port\", and a three-letter search \
+           matches any two of its letters.\n\n\
+           At the default of 2, fuzzy content search reads every stored \
+           document for searches under 9 letters, and each edit above 2 adds \
+           three letters to that.",
     examples: &[
-        "2, the default, allows one edit for short words and two for longer ones.",
-        "0 turns typo matching off altogether, even with the Fuzzy box ticked.",
-        "3 or more is allowed, but searches get slower and pull in a lot of \
+        "2, the default: one edit for words of three to five letters, two for longer ones.",
+        "0 turns typo matching off, even with the Fuzzy box ticked.",
+        "3 up to the maximum of 8 is allowed, but searches slow down and pull in many \
          unrelated files.",
     ],
     caution: None,
@@ -298,49 +255,42 @@ pub static FUZZY_EDITS: Tip = Tip {
 
 pub static DISPLAY_LIMIT: Tip = Tip {
     title: "Display limit",
-    body: "The most results one search will gather and show. A search \
-           matching thousands of files stops here, which keeps the list quick \
-           to scroll and cheap to hold in memory.\n\n\
+    body: "The most results one search gathers and shows. A search matching \
+           more stops here, which keeps the list quick to scroll and cheap to \
+           hold.\n\n\
            The best matches come first, so a lower limit rarely hides what \
-           you were looking for.",
+           you are looking for.",
     examples: &[
         "1000, the default, is more than anyone scrolls through.",
-        "higher when you use QuickSearch to list every file of a kind, such as \
-         type:Image, and want them all at once.",
+        "higher to list every file of a kind, such as type:Image, all at once.",
     ],
     caution: None,
 };
 
 pub static SEARCH_CACHE: Tip = Tip {
     title: "Search cache",
-    body: "The size of the memory-backed cache for the Indexing database.\n\n\
-           When set to 0, QuickSearch automatically sizes it for your index, capped at 128 MiB. \
-           The recommended value is shown below the setting. It matters most on an \
-           encrypted index, which has to decrypt anything the cache does not \
-           already hold. If this is smaller than the recommended value it will \
-           make search results four times slower.\n\n\
-           An unencrypted index doesn't need much cache so we give it \
-           a small amount which doesn't change with index size.",
+    body: "Memory, in MiB, that searching keeps index pages in. 0 sizes it \
+           for your index automatically, up to 192 MiB; the value it picks is \
+           shown below.\n\n\
+           It matters on an encrypted index, which must decrypt every page the \
+           cache misses: a cache smaller than the one shown can make searches \
+           about one and a half times slower. An unencrypted index gets a small fixed \
+           cache to save memory; a larger one makes its searches at most about a \
+           quarter faster. The memory is released after a long idle.",
     examples: &[
-        "0 sizes it automatically, and is right unless your folders are \
-         nested unusually deep.",
-        "a fixed value when you would rather cap what QuickSearch keeps \
-         resident, at the cost of slower searching on a large index.",
+        "0, the default, is right unless your folders are nested unusually deep.",
+        "a fixed value to cap the memory QuickSearch holds, at the cost of slower \
+         searches on a large index.",
     ],
-    caution: Some(
-        "This memory is held for as long as the search stays open, and \
-         released after a long idle.",
-    ),
+    caution: None,
 };
 
 pub static RESULTS_PER_PAGE: Tip = Tip {
     title: "Stream batch size",
-    body: "Results arrive in batches while a search runs, and this is how \
-           many are in each one. Smaller batches put the first results on \
-           screen sooner and update the list more often; larger ones do less \
-           work in total.\n\n\
-           This is not a page size: scrolling the results does not go back \
-           for more.",
+    body: "How many results arrive in each batch while a search runs. Smaller \
+           batches show the first results sooner and update the list more \
+           often; larger ones do less work in total.\n\n\
+           This is not a page size: scrolling does not fetch more.",
     examples: &[
         "100, the default, feels immediate on most machines.",
         "25 when the first results are slow to appear on a large index.",
@@ -350,50 +300,43 @@ pub static RESULTS_PER_PAGE: Tip = Tip {
 
 pub static DEBOUNCE: Tip = Tip {
     title: "Debounce",
-    body: "How long QuickSearch waits after your last keystroke before it \
-           searches, so that typing a word does not fire off a search for \
-           every letter in it. 1000 milliseconds is one second.",
+    body: "How long QuickSearch waits after your last keystroke before \
+           searching, so typing a word does not start a search for every \
+           letter. In milliseconds: 1000 is one second.",
     examples: &[
         "150, the default, keeps up with ordinary typing.",
-        "0 to chase every keystroke on a fast machine with a modest index.",
-        "300 or more when the results flicker or stutter as you type.",
+        "0 to search on every keystroke on a fast machine with a modest index.",
+        "300 or more when results flicker or stutter as you type.",
     ],
     caution: None,
 };
 
 pub static LIVE_RESULTS: Tip = Tip {
     title: "Live results",
-    body: "Watches the results currently on screen and updates them as the \
-           files change, so a file you rename or edit in another window does \
-           not sit there showing its old name or its old text.\n\n\
-           Only the rows you can actually see are watched, and every one of \
-           them is dropped the moment you change the search. Nothing is ever \
-           added, removed or re-sorted while you read — a file that stops \
-           matching stays where it is until you search again.",
+    body: "Keeps the rows on screen current as their files change. A rename, \
+           edit or deletion made elsewhere shows here, read from the file \
+           itself rather than from the index. Each row is also checked \
+           against the disk as it scrolls into view, which corrects a stale \
+           index; on a network share that check is all you get.\n\n\
+           Only visible rows are watched, and only until you change the \
+           search. Nothing is added, removed or re-sorted while you read.",
     examples: &[
-        "Renames, deletions and edited contents all show up within a second, \
-         whatever the indexer is doing — what a row says is read from the \
-         file, not from the index.",
-        "A row is also checked against the disk as it comes on screen, so one \
-         the index was out of date about puts itself right. That check is all \
-         you get over a network share, where the system does not report other \
-         machines' writes.",
+        "off if a stopped index must mean nothing is written to it, since the files \
+         on screen are otherwise updated in the index even while indexing is stopped.",
     ],
-    caution: Some(
-        "The files behind the rows you are looking at are kept up to date in \
-         the index too, even while indexing is stopped. Turn this off if a \
-         stopped index must mean nothing is written at all.",
-    ),
+    caution: None,
 };
 
 pub static COLUMNS: Tip = Tip {
     title: "Search columns",
-    body: "Which columns the results table shows. The path is always there — \
-           it is the only column that identifies a result on its own.\n\n\
-           Size and modified date start switched off: the width they take is \
-           usually better spent on the path and the matched text. Turning a \
-           column on also makes it available to sort by.",
-    examples: &["Right-clicking any column header on the Search tab does the same thing."],
+    body: "Which columns the results table shows. The path is always shown, \
+           because it is the only column that identifies a result on its \
+           own.\n\n\
+           Size and Modified start off: their width is usually better spent \
+           on the path and the matched text. Turning a column on also lets \
+           you sort by it. Right-clicking a column header on the Search tab \
+           does the same.",
+    examples: &[],
     caution: None,
 };
 
@@ -403,47 +346,37 @@ pub static UI_SCALE: Tip = Tip {
     title: "UI scale",
     body: "Zooms the whole window: text, spacing and controls together. 1.00 \
            is the ordinary size for your screen.\n\n\
-           Ctrl with + or - changes it for the moment without saving, and \
-           Ctrl 0 puts it back. This slider is the size QuickSearch starts \
-           at.",
+           Ctrl with + or - changes it for now without saving, and Ctrl 0 \
+           puts it back. This slider sets the size QuickSearch starts at.",
     examples: &[
-        "1.40 or more on a high resolution screen where the text looks small.",
-        "0.80 to fit more results on screen at once.",
+        "1.40 or more on a high-resolution screen where text looks small.",
+        "0.80 to fit more results on screen.",
     ],
     caution: None,
 };
 
 pub static SEARCH_HOTKEY: Tip = Tip {
     title: "Search shortcut",
-    body: "One key combination that brings QuickSearch to the front from \
-           anywhere, whatever you were doing, and puts the cursor in the \
-           search box with the previous search selected, so you can simply \
-           start typing.\n\n\
-           Click the button and press the keys you want. Combine Ctrl, Alt \
-           and Shift with one other key. Clear switches the shortcut off.\n\n\
-           This works whenever QuickSearch is running and needs no setting \
-           up, but it cannot start QuickSearch. For a shortcut that opens it \
-           too, bind the command shown below in your desktop's own keyboard \
-           settings.\n\n\
-           On Wayland your desktop registers the shortcut, so it may pick a \
-           different key and owns it afterwards, and it decides whether the \
-           window comes forward.",
-    examples: &[
-        "Ctrl+Shift+F, the default, which few other programs use."
-    ],
+    body: "Brings QuickSearch to the front from anywhere, with the previous \
+           search selected so you can start typing.\n\n\
+           Click the button, then press a key together with any of Ctrl, Alt \
+           and Shift. Clear turns the shortcut off.\n\n\
+           While running, QuickSearch holds the key itself on Windows and \
+           X11. For the key to also start QuickSearch, your desktop must bind \
+           it; the set-up button below does that where it can. On Wayland the \
+           desktop binding is the only option.",
+    examples: &["Ctrl+Shift+F, the default, which few other programs use."],
     caution: None,
 };
 
 pub static COLOR_SCHEME: Tip = Tip {
     title: "Color scheme",
-    body: "Whether QuickSearch is dark or light. It takes effect as soon as \
-           you apply it, with no restart.\n\n\
-           QuickSearch does not follow your desktop's own light and dark \
-           setting: on Linux the only way to read that is to connect to your \
-           desktop over the message bus and listen to your settings as they \
-           change, which is more of your session than a search tool should \
-           be in. So it is asked here instead, once.",
-    examples: &["Light for a bright room, or to match the rest of a light desktop."],
+    body: "Dark or light. Takes effect when you apply it, with no \
+           restart.\n\n\
+           QuickSearch does not follow your desktop's theme: on Linux that \
+           would mean listening to your session's settings over the message \
+           bus, which a search tool has no business doing.",
+    examples: &["Light for a bright room, or to match a light desktop."],
     caution: None,
 };
 
@@ -451,63 +384,65 @@ pub static COLOR_SCHEME: Tip = Tip {
 
 pub static ENABLE_PASSWORD: Tip = Tip {
     title: "Enable password protection",
-    body: "Encrypts the index with a password of your choosing. The index \
-           holds the names and the text of your files, so anyone who can \
-           read that file can read those; encrypting it means they cannot.\n\n\
-           QuickSearch then asks for the password each time it starts, unless \
-           you let it remember.",
+    body: "Encrypts the index with a password you choose. The index holds the \
+           names and text of your files, so without encryption anyone who can \
+           read it can read those.\n\n\
+           QuickSearch then asks for the password at every start, unless you \
+           let it remember.",
     examples: &[],
     caution: Some(
-        "Turning protection on deletes the index and builds it again. Your files are \
-         not touched.",
+        "Turning protection on deletes and rebuilds the index. Your files are not touched. \
+         The unencrypted index is not securely erased; parts can remain recoverable in \
+         freed disk space.",
     ),
 };
 
 pub static CHANGE_PASSWORD: Tip = Tip {
     title: "Change password",
-    body: "Replaces the password the index is encrypted with. You are asked \
-           for a new one, and the index is encrypted again under it.",
+    body: "Replaces the index password. You are asked for a new one, and the \
+           index is encrypted again with it.",
     examples: &[],
     caution: Some(
-        "Changing the password deletes the index and builds it again. Your files are \
-         not touched.",
+        "Changing the password deletes and rebuilds the index. Your files are not touched. \
+         The old index is not securely erased; recoverable parts of it still open with the \
+         old password.",
     ),
 };
 
 pub static DISABLE_PASSWORD: Tip = Tip {
     title: "Disable protection",
-    body: "Removes the password and leaves the index unencrypted on disk. \
-           Anyone able to read that file can then see the names of your files \
-           and the text inside them.",
+    body: "Removes the password and stores the index unencrypted. Anyone who \
+           can read that file can then see your file names and the text \
+           inside them.",
     examples: &[],
     caution: Some(
-        "Turning protection off deletes the index and builds it again. Your files are \
-         not touched.",
+        "Turning protection off deletes and rebuilds the index. Your files are not touched.",
     ),
 };
 
 pub static SHOW_KEY: Tip = Tip {
     title: "Show database key",
-    body: "Reveals the raw SQLCipher key the index is encrypted with, once you \
-           have confirmed your password. Tools such as DB Browser for SQLCipher \
-           accept it in the 0x form shown and can then open the index file \
-           directly.\n\n\
-           The key is worked out from your password and the salt in the config \
-           file, so it stays the same until the password changes.",
+    body: "Shows the raw SQLCipher key the index is encrypted with, after you \
+           confirm your password. Tools such as DB Browser for SQLCipher \
+           accept it in the 0x form shown and can then open the index \
+           file.\n\n\
+           The key is derived from your password and the salt in the config \
+           file, so it stays the same until the password changes. Anyone \
+           holding it can read the index without the password, so guard a \
+           copy as you would the password itself. Changing the password \
+           does not retire it: copies of the index made before the change \
+           still open with it.",
     examples: &[],
-    caution: Some(
-        "Anyone holding this key can read the index without the password. Treat a copy \
-         of it as carefully as the password itself.",
-    ),
+    caution: None,
 };
 
 pub static REMEMBER_KEYCHAIN: Tip = Tip {
     title: "Remember on this device",
-    body: "Hands the key to the password store your system already has, such \
-           as GNOME Keyring, KWallet, or Windows Credential Manager, so that \
+    body: "Stores the index key in your system's password store, such as \
+           GNOME Keyring, KWallet or Windows Credential Manager, so \
            QuickSearch can unlock the index without asking at startup.\n\n\
-           The password itself is never stored, only the key worked out from \
-           it, and only on this machine. Off, you type the password each time \
+           The password itself is never stored, only a key derived from it, \
+           and only on this machine. Off, you type the password each time \
            QuickSearch starts.",
     examples: &[],
     caution: None,
@@ -517,12 +452,11 @@ pub static REMEMBER_KEYCHAIN: Tip = Tip {
 
 pub static START_NOW: Tip = Tip {
     title: "Start indexing now",
-    body: "Runs a full pass over your indexed folders straight away instead \
-           of waiting for the next scheduled one. Worth doing after adding a \
-           folder, after changing a filter, or when the computer has been off \
-           for a while.\n\n\
-           Searching carries on working while it runs. Unavailable while a \
-           run is already under way.",
+    body: "Runs a full pass over your indexed folders now instead of at the \
+           next scheduled time. Worth doing after adding a folder or changing \
+           a filter, or when the computer has been off for a while.\n\n\
+           Searching keeps working meanwhile. Unavailable while a run is \
+           under way.",
     examples: &[],
     caution: None,
 };
@@ -530,11 +464,10 @@ pub static START_NOW: Tip = Tip {
 pub static STOP_INDEXING: Tip = Tip {
     title: "Stop",
     body: "Stops the run in progress and switches to manual, so QuickSearch \
-           no longer watches for changes or reindexes on a schedule. The \
-           index stays as it is and searching still works, but it drifts out \
-           of date as your files change.\n\n\
-           Saved immediately: QuickSearch is still in manual the next time it \
-           starts.",
+           stops watching for changes and reindexing on a schedule. The index \
+           stays as it is and searching still works, but it falls behind as \
+           your files change.\n\n\
+           Saved at once: QuickSearch starts in manual next time too.",
     examples: &[],
     caution: None,
 };
@@ -542,46 +475,59 @@ pub static STOP_INDEXING: Tip = Tip {
 pub static RETURN_TO_AUTO: Tip = Tip {
     title: "Return to Automatic",
     body: "Goes back to watching your folders and reindexing on a schedule, \
-           catching up on everything that changed while indexing was manual.\n\n\
-           Also saved, so this is how QuickSearch starts from now on.",
+           first catching up on everything that changed while indexing was \
+           manual.\n\n\
+           Also saved, so QuickSearch starts this way from now on.",
     examples: &[],
     caution: None,
 };
 
 pub static CLEAR_INDEX: Tip = Tip {
     title: "Clear index",
-    body: "Deletes the index database. Searching finds nothing until it is \
-           built again, which for a large folder takes a while. Your own \
-           files are never touched.\n\n\
-           QuickSearch asks for confirmation first, then drops to manual so \
-           that it does not immediately rebuild what you just deleted.",
+    body: "Deletes the index database. Searches find nothing until it is \
+           built again, which takes a while for large folders. Your own files \
+           are never touched.\n\n\
+           QuickSearch asks first, then switches to manual so it does not \
+           rebuild what you just deleted.",
     examples: &[],
-    caution: Some("This cannot be undone: the index has to be built from scratch again."),
+    caution: Some("This cannot be undone: the index has to be built again from scratch."),
+};
+
+// --- Index status --------------------------------------------------------
+
+pub static REBUILDING_FTS: Tip = Tip {
+    title: "Rebuilding the full-text search cache",
+    body: "A setting that decides which text is searchable changed, so \
+           QuickSearch is updating the search index. On a large index this \
+           takes several minutes and the progress can look frozen. Searching \
+           keeps working meanwhile.",
+    examples: &[],
+    caution: None,
 };
 
 // --- Manage Index tab: indexed folders -----------------------------------
 
 pub static ADD_ROOT: Tip = Tip {
     title: "Add an indexed folder",
-    body: "Adds a folder for QuickSearch to index, along with everything \
-           inside it. Choose it with the browser, or type the path and press \
-           Add.\n\n\
-           Adding a folder does not replace the current index, it adds to it: \
-           an indexing pass picks up the new folder and the rest of the index \
-           is left alone. Nothing is rebuilt.\n\n\
-           Indexed folders may not overlap, so a folder already inside \
-           another one is refused.",
+    body: "Adds a folder and everything inside it to the index. Choose it \
+           with the browser, or type the path and press Add.\n\n\
+           An indexing pass adds the new folder to the current index; the \
+           rest of the index is left alone and nothing is rebuilt.\n\n\
+           Indexed folders may not overlap, so a folder inside another \
+           indexed folder, or containing one, is refused, and so is a file. \
+           A typed relative path starts from the config file's folder. A \
+           path that does not exist yet, such as a drive not plugged in, is \
+           added with a notice, and the first indexing run after it \
+           appears indexes it.",
     examples: &["a second drive, or a network share you search often."],
     caution: None,
 };
 
 pub static REMOVE_ROOT: Tip = Tip {
     title: "Remove this folder",
-    body: "Stops indexing the folder named on this line, and removes that \
-           folder's entries from the index.\n\n\
-           Removing a folder does not affect the whole index, only its own \
-           entries; everything else stays searchable and nothing is rebuilt. \
-           Your files themselves are never touched.\n\n\
+    body: "Stops indexing the folder on this line and removes its entries \
+           from the index. Everything else stays searchable and nothing is \
+           rebuilt; your files are never touched.\n\n\
            Takes effect when you click Apply & Save.",
     examples: &[],
     caution: None,
@@ -589,30 +535,25 @@ pub static REMOVE_ROOT: Tip = Tip {
 
 pub static ROOT_WORKERS: Tip = Tip {
     title: "Workers",
-    body: "How many folders QuickSearch explores at once inside this indexed \
-           folder. More of them finish sooner on storage that answers many \
-           requests at a time, which network drives do especially well, but \
-           they compete for the same disk.\n\n\
-           auto reads 4 on local storage and 16 on a network mount. Takes \
-           effect on the next indexing run.",
-    examples: &[
-        "auto unless indexing is slower than you would expect.",
-        "16 or more for a network share that is slow to answer each request.",
-        "2 to keep indexing out of the way on an older machine.",
-    ],
+    body: "How many folders QuickSearch reads at once inside this indexed \
+           folder. More workers finish sooner on fast storage and network \
+           shares, but compete for the same disk and can slow your \
+           system.\n\n\
+           auto means 4 on local storage and 16 on a network mount. Some \
+           Linux shares (WebDAV, rclone, GVfs) look local to auto; set a \
+           number for those. Takes effect on the next indexing run.",
+    examples: &["1 or 2 to keep indexing low-priority."],
     caution: None,
 };
 
 pub static ROOT_COUNTS: Tip = Tip {
     title: "What this folder holds",
-    body: "How many files under this folder are in the index, and how many of \
-           those had their text extracted and so can be found by their \
-           contents rather than only by name. The gap between the two is the \
-           files nothing could read text from (images, videos, archives, \
-           program binaries) plus anything the extension whitelist \
-           excludes.\n\n\
-           Both are counted when an indexing run finishes, so they do not \
-           move as live updates apply single changes in between.",
+    body: "How many files under this folder are in the index, and how many \
+           of those had their text extracted, so they can be found by content \
+           and not only by name. The difference is files with no readable \
+           text (images, videos, archives, programs) plus whatever the \
+           extensions whitelist excludes.\n\n\
+           Both update when an indexing run finishes.",
     examples: &[],
     caution: None,
 };
@@ -621,17 +562,15 @@ pub static ROOT_COUNTS: Tip = Tip {
 
 pub static EXT_WHITELIST: Tip = Tip {
     title: "Full-text extensions whitelist",
-    body: "Which kinds of file QuickSearch is allowed to read the text out \
-           of. It limits contents only: every file is still indexed and still \
-           found by its name and its path, whatever you put here. A file left \
-           off the list simply cannot be found by the words inside it.\n\n\
+    body: "Which kinds of file QuickSearch reads the text of. It limits \
+           contents only: every file is still indexed and found by name and \
+           path, but a file left off the list cannot be found by the text \
+           inside it.\n\n\
            Empty, the default, means every kind QuickSearch understands. To \
-           narrow it, enter one extension per line, the leading dot optional. \
-           A non-empty list also leaves out files with no extension at all, \
-           such as Makefile or README, unless you add the line (none). \
-           Anything after a # is a comment.\n\n\
-           Narrowing the list discards the text it now excludes; widening it \
-           reads those files again.",
+           narrow it, enter one extension per line, leading dot optional. A \
+           non-empty list also leaves out files with no extension, such as \
+           Makefile or README, unless you add the line (none). Anything after \
+           a # is a comment.",
     examples: &[
         "txt, md and pdf to keep the stored text small and focused on documents, \
          with everything else still findable by name.",
@@ -642,22 +581,17 @@ pub static EXT_WHITELIST: Tip = Tip {
 
 pub static IGNORE_PATTERNS: Tip = Tip {
     title: "Ignore patterns",
-    body: "Whole files and folders kept out of the index. A pattern is \
-           compared against names and paths, never against what is inside a \
-           file: nothing is excluded for the words it holds, and a file \
-           excluded here loses its text along with its name. Type one pattern \
-           and click Add.\n\n\
-           A pattern with no slash matches a file or folder name anywhere \
-           under your indexed folders, and must match that name in full. A \
-           pattern with a slash is matched against the whole path, and skips \
-           everything under it. * is any run of characters, ? exactly one.\n\n\
-           Adding a pattern removes the entries it matches; deleting a \
-           pattern from this list indexes those files again. Worked examples \
-           are on the Help tab.",
+    body: "Files and folders kept out of the index entirely, name and text \
+           alike. Patterns match names and paths, never file contents.\n\n\
+           Without a slash, a pattern must match a whole file or folder name, \
+           anywhere. With a slash, it matches a whole path and everything \
+           under it. * is any run of characters, ? exactly one.\n\n\
+           Adding a pattern removes what it matches; deleting it indexes \
+           those files again. The Help tab has worked examples.",
     examples: &[
-        "node_modules to skip that folder wherever it turns up.",
-        "*.log to skip every file ending in .log, whatever it is called.",
-        "a full path such as the Videos folder to skip it and everything inside it.",
+        "node_modules skips that folder wherever it appears.",
+        "*.log skips every file ending in .log.",
+        "a full path, such as your Videos folder, skips it and everything inside.",
     ],
     caution: None,
 };
@@ -666,13 +600,13 @@ pub static IGNORE_PATTERNS: Tip = Tip {
 
 pub static APPLY_SAVE: Tip = Tip {
     title: "Apply & Save",
-    body: "Writes these settings to the configuration file and puts them to \
-           work straight away. Until you click here, your edits are only \
-           staged.\n\n\
+    body: "Saves these settings to the configuration file and applies them at \
+           once. Until then, your edits are only staged.\n\n\
            Narrowing a setting removes the entries it now excludes; widening \
-           one indexes whatever it now allows. Only the tokenizer, the hash \
-           sample size and password protection need the index built again \
-           from scratch, and those ask first.",
+           one indexes what it now allows. Only the compact text index and \
+           the hash sample size rebuild the index from scratch: at once in \
+           automatic mode, otherwise after you confirm, or at the next run if \
+           you choose Later.",
     examples: &[],
     caution: None,
 };
@@ -681,24 +615,27 @@ pub static APPLY_SAVE: Tip = Tip {
 mod tests {
     use super::*;
 
-    /// Keep in step when adding a tip: one missing here skips the checks below.
+    /// Every tip, in file order. `all_lists_every_tip` catches one left out,
+    /// which would otherwise skip every check below.
     const ALL: &[&Tip] = &[
+        &SHOW_ADVANCED,
         &DATABASE_PATH,
         &REINDEX_INTERVAL,
-        &FOLLOW_SYMLINKS,
         &INCLUDE_HIDDEN,
-        &TOKENIZER,
         &HASH_LENGTH,
         &MAX_STORED_TEXT,
         &MAX_TEXT_FILE_SIZE,
         &BATCH_SIZE,
         &MAX_WAL_SIZE,
-        &STORE_TEXT,
+        &COMPACT_INDEX,
         &FUZZY_DEFAULT,
         &FUZZY_EDITS,
         &DISPLAY_LIMIT,
+        &SEARCH_CACHE,
         &RESULTS_PER_PAGE,
         &DEBOUNCE,
+        &LIVE_RESULTS,
+        &COLUMNS,
         &UI_SCALE,
         &SEARCH_HOTKEY,
         &COLOR_SCHEME,
@@ -711,6 +648,7 @@ mod tests {
         &STOP_INDEXING,
         &RETURN_TO_AUTO,
         &CLEAR_INDEX,
+        &REBUILDING_FTS,
         &ADD_ROOT,
         &REMOVE_ROOT,
         &ROOT_WORKERS,
@@ -719,6 +657,15 @@ mod tests {
         &IGNORE_PATTERNS,
         &APPLY_SAVE,
     ];
+
+    #[test]
+    fn all_lists_every_tip() {
+        // Split so this line does not count itself.
+        let defined = include_str!("tips.rs")
+            .matches(concat!(": Tip = ", "Tip {"))
+            .count();
+        assert_eq!(defined, ALL.len(), "a tip is missing from ALL");
+    }
 
     fn all_text(tip: &Tip) -> String {
         let mut text = format!("{}\n{}", tip.title, tip.body);
@@ -808,16 +755,15 @@ mod tests {
     #[test]
     fn show_paints_every_part() {
         let ctx = crate::test_ui::ctx();
-        let input = crate::test_ui::raw_input(egui::vec2(800.0, 600.0), vec![]);
-        let full = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| TOKENIZER.show(ui));
+        let full = crate::test_ui::run_panel(&ctx, egui::vec2(800.0, 600.0), vec![], |ui| {
+            HASH_LENGTH.show(ui)
         });
         let painted = crate::test_ui::painted_text(&full).join("\n");
-        assert!(painted.contains(TOKENIZER.title), "no title: {painted}");
-        assert!(painted.contains("trigram indexes every run"), "no body");
-        assert!(painted.contains("•  trigram, the default"), "no examples");
+        assert!(painted.contains(HASH_LENGTH.title), "no title: {painted}");
+        assert!(painted.contains("How many bytes from the start"), "no body");
+        assert!(painted.contains("•  8192, the default"), "no examples");
         assert!(
-            painted.contains(TOKENIZER.caution.unwrap()),
+            painted.contains(HASH_LENGTH.caution.unwrap()),
             "no caution line"
         );
     }
@@ -825,9 +771,8 @@ mod tests {
     #[test]
     fn a_single_example_is_prefixed_with_example() {
         let ctx = crate::test_ui::ctx();
-        let input = crate::test_ui::raw_input(egui::vec2(800.0, 600.0), vec![]);
-        let full = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| INCLUDE_HIDDEN.show(ui));
+        let full = crate::test_ui::run_panel(&ctx, egui::vec2(800.0, 600.0), vec![], |ui| {
+            INCLUDE_HIDDEN.show(ui)
         });
         let painted = crate::test_ui::painted_text(&full).join("\n");
         assert!(
@@ -841,17 +786,11 @@ mod tests {
     #[test]
     fn a_disabled_control_still_explains_itself() {
         let ctx = crate::test_ui::ctx();
-        ctx.style_mut(|s| {
-            s.interaction.tooltip_delay = 0.0;
-            s.interaction.show_tooltips_only_when_still = false;
-        });
+        crate::test_ui::instant_tooltips(&ctx);
         let run = |events: Vec<egui::Event>| {
-            let input = crate::test_ui::raw_input(egui::vec2(600.0, 400.0), events);
-            ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.add_enabled(false, egui::Button::new("Stop"))
-                        .tip(&STOP_INDEXING);
-                });
+            crate::test_ui::run_panel(&ctx, egui::vec2(600.0, 400.0), events, |ui| {
+                ui.add_enabled(false, egui::Button::new("Stop"))
+                    .tip(&STOP_INDEXING);
             })
         };
 
@@ -859,16 +798,9 @@ mod tests {
         let settled = run(vec![]);
         let pos = crate::test_ui::painted_text_center(&settled, "Stop").expect("button painted");
         let opening: String = STOP_INDEXING.body.chars().take(40).collect();
-        let mut out = run(vec![egui::Event::PointerMoved(pos)]);
-        for _ in 0..3 {
-            if crate::test_ui::painted_text(&out)
-                .join("\n")
-                .contains(&opening)
-            {
-                return;
-            }
-            out = run(vec![]);
-        }
-        panic!("a disabled control said nothing on hover");
+        assert!(
+            crate::test_ui::hover_shows(run, pos, &opening),
+            "a disabled control said nothing on hover"
+        );
     }
 }

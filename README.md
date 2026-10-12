@@ -1,14 +1,14 @@
 # QuickSearch
 
-A fast local file search tool. QuickSearch indexes the folders you choose,
-keeps that index fresh automatically. It finds files by name or by text
-content as fast as you type.
+A fast local file search tool. QuickSearch indexes the folders you choose and
+keeps that index fresh automatically, so it finds files by name or by content
+as fast as you type.
 
 ## AI Disclaimer
 
-QuickSearch has a core designed by its developer and built by hand, however
-the majority of its codebase including its GUI was designed by a human and
-built using AI agents with human review, improvements, and testing.
+QuickSearch's core was designed and built by hand by its developer. Most of
+the rest, including the GUI, was designed by a human and built with AI agents,
+under human review, improvement and testing.
 
 ## Home & GitHub Mirror
 
@@ -22,32 +22,34 @@ tracking: https://github.com/DataScienceDIY/quick_search
 
 ## Features
 
-- **Search as you type** — ranked results appear instantly and update with
-  every keystroke, matching file names, folder paths, and file contents.
-- **Typo tolerance** — an optional fuzzy mode finds `repot` when you meant
+- **Search as you type**: ranked results update with every keystroke,
+  matching file names, folder paths and file contents.
+- **Typo tolerance**: an optional fuzzy mode finds `repot` when you meant
   `report`.
-- **Query filters** — narrow a search by kind, date, or location, e.g.
-  `budget type:Document modified:>=2024-01-01`, with wildcards and regular
-  expressions for power users. The in-app "?" popup documents the syntax.
-- **Live results** — results on screen notice renames, edits, and deletions
-  within a second, even while indexing is paused.
-- **Duplicate finder** — groups files that appear identical, and can verify
-  any group byte for byte on request. It only reports; it never deletes.
-- **Always fresh** — folders are watched for changes and reindexed
-  periodically, or switch to manual mode and index only when you say so.
-- **Password protection** — optionally encrypt the index, since it contains
-  the names and text of everything indexed. The password can be remembered
-  in your system keychain.
-- **Global shortcut** — Ctrl+Shift+F brings up the window from anywhere
-  while QuickSearch is running, and `quicksearch --toggle` can be bound in
-  your desktop's keyboard settings to also start it.
-- **Terminal search** — `quicksearch <query>` prints ranked, pipe-friendly
-  paths; `--long` adds sizes, dates, and highlighted snippets.
-- **Portable mode** — keep the program, its config, and its index together
-  in one folder that can be moved between devices.
+- **Query filters**: narrow a search by kind, date or location, e.g.
+  `budget type:Document modified:>=2024-01-01`, plus wildcards and regular
+  expressions. The in-app "?" window lists the syntax.
+- **Live results**: results on screen pick up renames, edits and deletions,
+  even while indexing is paused.
+- **Duplicate finder**: groups files that look identical and verifies a group
+  byte for byte on request. It never deletes.
+- **Always fresh**: folders are watched and periodically reindexed, or, in
+  manual mode, indexed only when you say so.
+- **Password protection**: optionally encrypt the index, which holds the
+  names and text of everything indexed; your system keychain can remember
+  the key.
+- **Global shortcut**: Ctrl+Shift+F brings up the window from anywhere,
+  starting QuickSearch if it is closed. The Settings tab binds it in one
+  click on KDE and GNOME; elsewhere, bind `quicksearch --toggle` in your
+  desktop's keyboard settings.
+- **Terminal search**: `quicksearch <query>` prints ranked, pipe-friendly
+  paths; `--long` adds sizes, dates and highlighted snippets.
+- **Portable mode**: keep the program, config and index in one folder that
+  moves between devices.
 
-The in-app Help tab and first-start tour cover usage; every setting is
-explained on hover in the Settings tab.
+The Help tab and first-start tour cover usage, and every setting explains
+itself on hover. `man quicksearch` (from the .deb, or
+`packaging/quicksearch.1`) documents terminal search and the query syntax.
 
 ## Build & run
 
@@ -57,12 +59,13 @@ build.bat           # Windows
 ```
 
 These take a fresh machine to a running app: they install missing build
-dependencies (with your permission), build a release binary, and launch it.
+dependencies (via sudo or winget, and Rust via rustup), build a release binary,
+and launch it. `--check` lists what is missing and installs nothing.
 
 ```sh
 cargo build --release -p quicksearch-gui   # binaries: target/release/quicksearch{,-cli}
 cargo run -p quicksearch-gui               # or just run it
-cargo test -p quicksearch-core             # test suite
+cargo test --release --workspace           # test suite (release: debug Argon2 takes minutes)
 ```
 
 ## Install
@@ -80,8 +83,9 @@ cargo test -p quicksearch-core             # test suite
 Settings live in `~/.config/quicksearch/config.toml` (Windows:
 `%APPDATA%\quicksearch\config.toml`), created on first run and edited live
 by the GUI. [config_example.toml](config_example.toml) is the full
-reference for every key. A `config.toml` placed next to the binary enables
-portable mode.
+reference for every key. A QuickSearch `config.toml` placed next to the
+binary (or the `.AppImage`) enables portable mode; another program's file of
+that name is ignored.
 
 ## More
 

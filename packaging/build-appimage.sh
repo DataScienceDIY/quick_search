@@ -13,7 +13,7 @@
 # dynamic section names only libgcc_s, libm and libc, because SQLCipher, OpenSSL
 # and libdbus are linked statically, and winit and glutin dlopen the whole
 # display stack at runtime. Those dlopened libraries - libGL, libEGL, libX11,
-# libxcb, libXcursor, libXi, libXrender, libxkbcommon{,-x11} and
+# libX11-xcb, libxcb, libXcursor, libXi, libXrender, libxkbcommon{,-x11} and
 # libwayland-{client,egl} - are exactly the ones an AppImage must take from the
 # host, since they have to match the user's graphics driver and compositor.
 # Bundling them is how AppImages break on other people's machines.
@@ -23,16 +23,10 @@
 # builds happen in a 22.04 container to keep that at 2.35.
 
 set -euo pipefail
-# Directories created along the way must be 0755, not whatever the caller's
-# umask happens to be, matching build-deb.sh.
-umask 022
 
 readonly PKG=quicksearch
 . "$(dirname -- "${BASH_SOURCE[0]}")/common.sh"
 parse_args "$@"
-readonly ICON_SRC="$REPO_ROOT/crates/quicksearch-gui/assets/icons"
-readonly ICON_SVG="$ICON_SRC/quicksearch_icon.svg"
-readonly METAINFO=com.karsttech.quicksearch.metainfo.xml
 
 # Pinned rather than tracking the `continuous` tag, so a rebuild of an old
 # commit uses the tool that commit was tested with. Bump the version and the
@@ -61,6 +55,12 @@ readonly RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/downloa
 # /releases/latest/download/<asset> form is not implemented and 404s. The .zsync
 # name therefore carries no version, while the AppImage it points at does; zsync
 # resolves that from the sidecar's own headers, relative to this URL.
+#
+# Both are the forge's behaviour, which neither this script nor CI checks, and
+# which cannot be checked offline: after publishing a release,
+# `curl -fsSIL -o /dev/null "$UPDATE_URL"` must succeed. Nor may a tag ever be
+# named `latest`: the lookup would then hinge on which of the two the forge
+# prefers.
 readonly UPDATE_URL="https://code.karsttech.com/jeremy/quick_search/releases/download/latest/$PKG-x86_64.AppImage.zsync"
 
 # zsyncmake comes from the zsync package. appimagetool looks it up in PATH
@@ -69,10 +69,7 @@ readonly UPDATE_URL="https://code.karsttech.com/jeremy/quick_search/releases/dow
 # the appstream package. Unlike build-deb.sh, which is deliberately buildable
 # with nothing but a stock Debian install, this script already downloads
 # appimagetool, so a couple more packages cost nothing in reach.
-for tool in curl sha256sum desktop-file-validate zsyncmake appstreamcli readelf; do
-    command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
-done
-[ "$do_strip" -eq 0 ] || command -v strip >/dev/null 2>&1 || die "missing strip (install binutils, or pass --no-strip)"
+require_tools curl sha256sum desktop-file-validate zsyncmake appstreamcli readelf
 
 # Absolute from here on: appimagetool is run from a scratch directory below, and
 # -o could well have been given a relative path.
@@ -125,8 +122,7 @@ fetch_pinned "$runtime" "$RUNTIME_URL" "$RUNTIME_SHA256"
 # ---------------------------------------------------------------- build ----
 
 if [ "$do_build" -eq 1 ]; then
-    say "Building quicksearch $version (release)"
-    ( cd "$REPO_ROOT" && cargo build --release -p quicksearch-gui )
+    build_host_release
 fi
 
 [ -x "$REPO_ROOT/target/release/$PKG" ] \
@@ -149,35 +145,9 @@ mkdir -p "$appdir"
 # something on PATH and not for a self-contained file the user runs directly.
 install -Dm755 "$REPO_ROOT/target/release/$PKG"    "$appdir/usr/bin/$PKG"
 install -Dm644 "$REPO_ROOT/packaging/$PKG.desktop" "$appdir/usr/share/applications/$PKG.desktop"
-install -Dm644 "$ICON_SVG"                         "$appdir/usr/share/icons/hicolor/scalable/apps/$PKG.svg"
-install -Dm644 "$REPO_ROOT/packaging/copyright"    "$appdir/usr/share/doc/$PKG/copyright"
-install -Dm644 "$REPO_ROOT/config_example.toml"    "$appdir/usr/share/doc/$PKG/config_example.toml"
-install -Dm644 "$REPO_ROOT/README.md"              "$appdir/usr/share/doc/$PKG/README.md"
-
-# Same glob-driven discovery as build-deb.sh, including the guard: the glob
-# would also catch a non-size name like quicksearch-cli.png.
-shopt -s nullglob
-icons=("$ICON_SRC"/$PKG-*.png)
-shopt -u nullglob
-[ "${#icons[@]}" -gt 0 ] || die "no icons in $ICON_SRC"
-for png in "${icons[@]}"; do
-    n="$(basename "$png" .png)"; n="${n#$PKG-}"
-    case "$n" in ''|*[!0-9]*) die "unexpected icon name: $(basename "$png")" ;; esac
-    install -Dm644 "$png" "$appdir/usr/share/icons/hicolor/${n}x${n}/apps/$PKG.png"
-done
-say "Installed ${#icons[@]} icon sizes plus the scalable SVG"
-
-# @VERSION@/@DATE@ substitution, as build-deb.sh does for the man page .TH line,
-# so [workspace.package] version stays the only place a release is bumped.
-if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
-    metainfo_date="$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y-%m-%d)"
-else
-    metainfo_date="$(date -u +%Y-%m-%d)"
-fi
-install -dm755 "$appdir/usr/share/metainfo"
-sed -e "s/@VERSION@/$version/" -e "s/@DATE@/$metainfo_date/" \
-    "$REPO_ROOT/packaging/$METAINFO" > "$appdir/usr/share/metainfo/$METAINFO"
-chmod 644 "$appdir/usr/share/metainfo/$METAINFO"
+install_docs "$appdir"
+install_icons "$appdir"
+install_metainfo "$appdir"
 
 # Validated here rather than in CI so a local build fails the same way, and on
 # the substituted file rather than the @VERSION@ template. build-deb.sh ships

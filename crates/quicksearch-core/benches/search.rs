@@ -10,8 +10,7 @@
 //! cargo bench -p quicksearch-core --bench search
 //! ```
 //!
-//! Sizes come from `corpus::SIZES` — 1 KiB, 16 KiB and 256 KiB, the last
-//! being `maximum_text_size`, the worst case a full-text row can present.
+//! Sizes come from `corpus::SIZES`.
 
 mod corpus;
 
@@ -32,9 +31,9 @@ fn literal(term: &str) -> TermPattern {
     .expect("literal patterns always compile")
 }
 
-/// Decompressing the stored body — the first thing every full-text row does.
-/// Reusing one context and pre-sizing the output is ~4x at 1 KiB, the size
-/// most documents are; why `DocDecoder` exists.
+/// Decompressing the stored body, the first thing every full-text row does.
+/// Reusing one context and pre-sizing the output is 5.1x faster at 1 KiB, the
+/// size most documents are; `DocDecoder` exists for that.
 mod zstd_decode {
     use super::*;
 
@@ -55,7 +54,7 @@ mod zstd_decode {
 
 /// Turning decompressed bytes into a `&str`: `from_utf8_lossy` copies and
 /// scan-validates; `String::from_utf8` vector-validates and *moves*. A
-/// 16-28x gap; `DocDecoder` borrows instead.
+/// 14-16x gap; `DocDecoder` borrows instead.
 mod utf8 {
     use super::*;
 
@@ -75,7 +74,7 @@ mod utf8 {
     }
 
     /// The decompressed `Vec` is unshared, so `from_utf8` can move it;
-    /// the lossy fallback keeps corrupt-row behaviour exactly.
+    /// the lossy fallback keeps corrupt-row behaviour unchanged.
     #[divan::bench(args = corpus::SIZES)]
     fn from_utf8_move(bencher: Bencher, size: usize) {
         let raw = corpus::text(size, 4).as_bytes();
@@ -88,9 +87,9 @@ mod utf8 {
     }
 }
 
-/// ASCII-folding the document. Folding into a reused buffer is *not* faster:
-/// `fold_into` is chosen for what it does to the allocator, not the clock —
-/// do not "optimize" the other direction.
+/// ASCII-folding the document. Folding into a reused buffer is not faster;
+/// `fold_into` is chosen for what it does to the allocator, not the clock, so
+/// do not "optimize" it back.
 mod fold {
     use super::*;
 
@@ -107,8 +106,8 @@ mod fold {
         bencher.bench_local(move || {
             buf.clear();
             buf.push_str(divan::black_box(text));
-            // `make_ascii_lowercase` is byte-length preserving — the same
-            // invariant the cascade relies on for folded offsets.
+            // `make_ascii_lowercase` preserves byte length, the invariant
+            // the cascade's folded offsets rely on.
             buf.make_ascii_lowercase();
             buf.len()
         });
@@ -117,8 +116,8 @@ mod fold {
 
 /// Substring search: std's Two-Way against `memmem`'s SIMD prefilter. The
 /// miss case matters most (a pass verifies far more rows than it accepts):
-/// 111 µs against 2.4 µs at 256 KiB. `match_indices` stays as the guard —
-/// convergence means the SIMD path stopped being selected.
+/// 92 µs against 4.7 µs at 256 KiB (20x). `match_indices` stays as the
+/// guard: if the two converge, the SIMD path has stopped being selected.
 mod substring {
     use super::*;
 
@@ -135,8 +134,9 @@ mod substring {
         bencher.bench(|| finder.find_iter(divan::black_box(text)).count());
     }
 
-    /// Hoisted `memmem::Finder`: measured, indistinguishable — the
-    /// precompute is O(needle) and a term is a handful of bytes.
+    /// A `Finder` built per call: +14 ns against a hoisted one at 1 KiB and
+    /// indistinguishable from 16 KiB up, since the precompute is O(needle)
+    /// and a term is a few bytes.
     #[divan::bench(args = corpus::SIZES)]
     fn memmem_per_call_miss(bencher: Bencher, size: usize) {
         let text = corpus::text(size, 0).as_bytes();
@@ -166,45 +166,46 @@ mod substring {
         bencher.bench(|| finder.find_iter(divan::black_box(text)).count());
     }
 
-    /// What `pass_fulltext` runs per row on the literal path: a
-    /// case-sensitive count, then one folded extraction yielding both.
+    /// What `pass_fulltext` runs per row on the literal path: one folded
+    /// extraction yielding the window and both counts.
     #[divan::bench(args = corpus::SIZES)]
     fn cascade_row_sweeps(bencher: Bencher, size: usize) {
-        let pattern = literal(corpus::NEEDLE);
         let text = corpus::text_mixed(size, 4);
         let folded = corpus::text_folded(size, 4);
-        let opts = snippet::Options { approx_chars: 600 };
+        let term = corpus::NEEDLE.to_ascii_lowercase();
+        let budget = 600;
         bencher.bench(|| {
-            let (s, b) = snippet::extract_folded(
+            snippet::extract_folded(
                 divan::black_box(text),
                 divan::black_box(folded),
-                &[corpus::NEEDLE],
-                &opts,
-            );
-            let a = pattern.count(text, false);
-            (a, b, s.ranges.len())
+                &term,
+                corpus::NEEDLE,
+                budget,
+            )
+            .map(|f| (f.count, f.exact, f.snippet.ranges.len()))
         });
     }
 
-    /// The shape it replaced: a separate folded count sweeps the document a
-    /// third time for a number the extraction already knew.
+    /// The replaced shape: a separate case-sensitive count sweeps the
+    /// document a second time for a number the extraction now has.
     #[divan::bench(args = corpus::SIZES)]
     fn cascade_row_sweeps_separate_count(bencher: Bencher, size: usize) {
-        let pattern = literal(corpus::NEEDLE);
         let text = corpus::text_mixed(size, 4);
         let folded = corpus::text_folded(size, 4);
-        let opts = snippet::Options { approx_chars: 600 };
+        let term = corpus::NEEDLE.to_ascii_lowercase();
+        let budget = 600;
         bencher.bench(|| {
-            let a = pattern.count(divan::black_box(text), false);
-            let b = pattern.count_folded(divan::black_box(folded));
-            let (s, _) = snippet::extract_folded(text, folded, &[corpus::NEEDLE], &opts);
-            (a, b, s.ranges.len())
+            let exact =
+                memchr::memmem::find_iter(divan::black_box(text).as_bytes(), corpus::NEEDLE)
+                    .count();
+            let f = snippet::extract_folded(text, folded, &term, corpus::NEEDLE, budget);
+            (exact, f.map(|f| (f.count, f.snippet.ranges.len())))
         });
     }
 }
 
-/// Snippet extraction against a pre-folded haystack — now the only folded
-/// sweep of a row, and the source of its count.
+/// Snippet extraction against a pre-folded haystack: the only folded sweep
+/// of a row, and the source of its count.
 mod snippet_extract {
     use super::*;
 
@@ -212,22 +213,33 @@ mod snippet_extract {
     fn extract_folded(bencher: Bencher, size: usize) {
         let text = corpus::text_mixed(size, 64);
         let folded = corpus::text_folded(size, 64);
-        let opts = snippet::Options { approx_chars: 600 };
+        let term = corpus::NEEDLE.to_ascii_lowercase();
+        let budget = 600;
         bencher.bench(|| {
             snippet::extract_folded(
                 divan::black_box(text),
                 divan::black_box(folded),
-                &[corpus::NEEDLE],
-                &opts,
+                &term,
+                corpus::NEEDLE,
+                budget,
             )
         });
     }
 }
 
-/// The filename pass's per-row ladder over 2000 realistic rows. The two
-/// obvious fixes each measure *worse* alone (reused fold buffer, prebuilt
-/// `Finder`); only together do they win, and only by ~1.2x — short strings
-/// do not behave like document bodies.
+/// The filename pass's per-row ladder over 2000 realistic rows. `current` is
+/// the shipped `find_first`, which jumps between spellings of the term's
+/// first byte with `memchr2`. Adopting that took it from 53.4 µs to 45.4 µs,
+/// 1.18x (2026-10-11, mimalloc, fastest sample, median of 3 runs), with the
+/// other arms within 4%. Folding first does not catch up: the two obvious
+/// fixes each measure *worse* alone (reused fold buffer, prebuilt `Finder`),
+/// and together they only tie it. Short strings do not behave like document
+/// bodies.
+///
+/// The other arms are local copies, which skip `find_first`'s per-call cost
+/// (about 1.5 ns, 6 µs a run). The `memchr2` copy that prompted the change
+/// measured 1.39x where the shipped call gained 1.18x, so gate a change on
+/// `current` before and after it, not on a copy.
 mod filename_ladder {
     use super::*;
 
@@ -250,7 +262,6 @@ mod filename_ladder {
 
     #[divan::bench]
     fn find_first_ci_scratch(bencher: Bencher) {
-        let pattern = literal("quartzite");
         let rows = corpus::rows();
         let mut scratch = String::new();
         bencher.bench_local(move || {
@@ -259,14 +270,14 @@ mod filename_ladder {
                 scratch.clear();
                 scratch.push_str(&row.name);
                 scratch.make_ascii_lowercase();
-                if pattern.find_first_folded(&scratch).is_some() {
+                if memchr::memmem::find(scratch.as_bytes(), b"quartzite").is_some() {
                     found += 1;
                     continue;
                 }
                 scratch.clear();
                 scratch.push_str(&row.path);
                 scratch.make_ascii_lowercase();
-                if pattern.find_first_folded(&scratch).is_some() {
+                if memchr::memmem::find(scratch.as_bytes(), b"quartzite").is_some() {
                     found += 1;
                 }
             }
@@ -323,26 +334,22 @@ mod filename_ladder {
         });
     }
 
-    /// memchr2 candidate scan: measured, not worth it on short haystacks.
+    /// The per-byte scan `find_first` ran until 2026-10-11: every start
+    /// tested, `needle` already lowercased. The `memchr2` scan that replaced
+    /// it was first rejected under glibc as not worth it on short haystacks;
+    /// re-measured under mimalloc, its copy here ran 38.5 µs against
+    /// `current`'s 53.4 µs. This copy runs 47.9 µs.
     #[divan::bench]
-    fn find_first_ci_memchr2(bencher: Bencher) {
+    fn find_first_ci_bytewise(bencher: Bencher) {
         let rows = corpus::rows();
         let needle = corpus::NEEDLE.as_bytes();
         fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-            let (lo, up) = (
-                needle[0].to_ascii_lowercase(),
-                needle[0].to_ascii_uppercase(),
-            );
+            let first = needle[0];
             let last = hay.len().checked_sub(needle.len())?;
-            let mut at = 0usize;
-            while at <= last {
-                let i = at + memchr::memchr2(lo, up, &hay[at..=last])?;
-                if hay[i..i + needle.len()].eq_ignore_ascii_case(needle) {
-                    return Some(i);
-                }
-                at = i + 1;
-            }
-            None
+            (0..=last).find(|&i| {
+                hay[i].to_ascii_lowercase() == first
+                    && hay[i..i + needle.len()].eq_ignore_ascii_case(needle)
+            })
         }
         bencher.bench(|| {
             let mut found = 0usize;
@@ -358,9 +365,9 @@ mod filename_ladder {
     }
 }
 
-/// Bitap, the fuzzy passes' inner loop — whole-table scans, so it runs over
-/// every row when fuzzy is on. `step` takes `&mut [u64]`, so indices are
-/// bounds-checked and the trip count is opaque to the optimizer.
+/// Bitap, the fuzzy passes' inner loop, run over every candidate row when
+/// fuzzy is on. `step` takes `&mut [u64]`, so indices are bounds-checked and
+/// the trip count is opaque to the optimizer.
 mod bitap {
     use super::*;
 

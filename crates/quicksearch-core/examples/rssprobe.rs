@@ -1,7 +1,7 @@
-//! [`memprobe`](memprobe.rs) answers "how much RAM does a run peak at";
-//! this answers "how much is the process still holding once idle". It
-//! reads another process's `/proc`, so the measured binary was built
-//! without knowing it would be measured.
+//! Samples another process's memory from its `/proc`, so the measured binary
+//! needs no instrumentation. [`memprobe`](memprobe.rs) answers "how much RAM
+//! does a run peak at"; this answers "how much does the process still hold
+//! once idle".
 //!
 //! ```text
 //! cargo build -p quicksearch-core --example rssprobe --release
@@ -10,24 +10,24 @@
 //! ./target/release/examples/rssprobe $(pgrep -x quicksearch) 60 250
 //! ```
 //!
-//! **`VmRSS` is the wrong number to optimise** — mostly `Shared_Clean`,
-//! shared and droppable, yet it is what every monitor shows. Act on
-//! **`RssAnon`** (heap and thread stacks — what this codebase allocates)
-//! and **`Private_Dirty`** (what the process costs the machine). The
-//! `glibc arenas` line says whether an anonymous figure is live data or
-//! retention that `malloc_trim(3)` could return.
+//! Do not optimise `VmRSS`, the figure every monitor shows: it is mostly
+//! `Shared_Clean`, shared and droppable. Act on `RssAnon` (heap and thread
+//! stacks, what this codebase allocates) and `Private_Dirty` (what the
+//! process costs the machine). The `glibc heap` line says whether an
+//! anonymous figure is live data or retention that `malloc_trim(3)` could
+//! return.
 
-// The GUI's idle footprint is an allocator property too; see `memprobe`.
-#[global_allocator]
-static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
+mod common;
 
-use quicksearch_core::testutil::{mib, size_class};
+use quicksearch_core::testutil::mib;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Default gap between samples; `smaps` — proportional to the mapping
-/// count — is read once at the end, not per sample.
+use common::Region;
+
+/// Default gap between samples. Each sample also reads `smaps`, whose cost
+/// grows with the mapping count.
 const DEFAULT_SAMPLE_MS: u64 = 500;
 
 /// The size glibc reserves per non-main arena (`HEAP_MAX_SIZE` on 64-bit).
@@ -80,8 +80,8 @@ fn main() {
 }
 
 /// Sample until `duration` elapses; zero still takes one sample. The
-/// per-mapping breakdown rides the last *live* sample: a process exiting
-/// mid-run would otherwise report "nothing resident".
+/// per-mapping breakdown comes from the last live sample, so a process
+/// exiting mid-run does not report "nothing resident".
 fn sample_for(pid: u32, duration: Duration, interval: Duration) -> (Vec<Sample>, Breakdown) {
     let start = Instant::now();
     let mut samples = Vec::new();
@@ -112,8 +112,8 @@ fn sample_for(pid: u32, duration: Duration, interval: Duration) -> (Vec<Sample>,
 
 fn sample(pid: u32, at: Duration) -> Option<Sample> {
     let status = proc_kv(pid, "status")?;
-    // smaps_rollup is the kernel's own sum — one read, not one per mapping;
-    // missing only on ancient kernels, treated as zero.
+    // `smaps_rollup` is the kernel's own sum, one read instead of one per
+    // mapping; kernels without it read as zero.
     let rollup = proc_kv(pid, "smaps_rollup").unwrap_or_default();
     Some(Sample {
         at,
@@ -151,42 +151,17 @@ fn comm(pid: u32) -> String {
         .unwrap_or_default()
 }
 
-/// Resident bytes per mapping from smaps, summed by name, arenas
-/// identified; anonymous mappings are bucketed by size class —
-/// individually unnamed, and there can be hundreds.
+/// Resident bytes per mapping from `smaps`, summed by name, with glibc's
+/// arenas identified.
 fn breakdown(pid: u32) -> Breakdown {
     let Ok(smaps) = std::fs::read_to_string(format!("/proc/{}/smaps", pid)) else {
         return Breakdown::default();
     };
-
-    // Two passes over one parse: by-name totals, then arenas — which need
-    // the raw address ranges the names throw away.
-    let mut by_name: HashMap<String, u64> = HashMap::new();
-    let mut regions: Vec<Region> = Vec::new();
-    let mut current = String::new();
-
-    for line in smaps.lines() {
-        if let Some(rss_kib) = line.strip_prefix("Rss:") {
-            let kib: u64 = rss_kib
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            *by_name.entry(current.clone()).or_default() += kib * 1024;
-            if let Some(r) = regions.last_mut() {
-                r.rss = kib * 1024;
-            }
-        } else if let Some(region) = parse_map_header(line) {
-            current = region.name.clone();
-            regions.push(region);
-        }
-    }
-
-    let mut entries: Vec<(String, u64)> = by_name.into_iter().filter(|(_, b)| *b > 0).collect();
-    entries.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
-
+    // Totals by name, and arenas, which need the address ranges the names
+    // drop.
+    let regions: Vec<Region> = common::smaps_regions(&smaps).collect();
     Breakdown {
-        entries,
+        entries: common::resident_by_name(regions.iter().map(|r| (r.name.clone(), r.rss))),
         arenas: find_arenas(&regions),
         main_heap: regions
             .iter()
@@ -196,19 +171,11 @@ fn breakdown(pid: u32) -> Breakdown {
     }
 }
 
-struct Region {
-    lo: u64,
-    hi: u64,
-    anonymous: bool,
-    name: String,
-    rss: u64,
-}
-
-/// Count glibc's non-main arenas: one aligned `mmap` of [`ARENA_SPAN`] that
-/// glibc commits piecewise, so by `smaps` it is usually split — contiguous
-/// anonymous runs are coalesced first, and a run spanning exactly one
-/// aligned span is an arena. Could collide with a deliberate aligned 64 MiB
-/// mmap; nothing here does.
+/// Count glibc's non-main arenas and their resident bytes. An arena is one
+/// aligned `mmap` of [`ARENA_SPAN`] that glibc commits piecewise, so `smaps`
+/// usually shows it split: contiguous anonymous runs are coalesced first, and
+/// a run spanning exactly one aligned span counts. A deliberate aligned
+/// 64 MiB `mmap` would count too.
 fn find_arenas(regions: &[Region]) -> (usize, u64) {
     let mut count = 0;
     let mut resident = 0;
@@ -238,28 +205,6 @@ fn find_arenas(regions: &[Region]) -> (usize, u64) {
         }
     }
     (count, resident)
-}
-
-/// Parse one `smaps` header line; anonymous mappings are named by size
-/// class so a hundred 8 MiB regions read as one line.
-fn parse_map_header(line: &str) -> Option<Region> {
-    let mut fields = line.split_whitespace();
-    let range = fields.next()?;
-    let (lo, hi) = range.split_once('-')?;
-    let lo = u64::from_str_radix(lo, 16).ok()?;
-    let hi = u64::from_str_radix(hi, 16).ok()?;
-    let path = fields.nth(4).unwrap_or("");
-    Some(Region {
-        lo,
-        hi,
-        anonymous: path.is_empty(),
-        name: if path.is_empty() {
-            format!("anon {}", size_class(hi.saturating_sub(lo)))
-        } else {
-            path.to_string()
-        },
-        rss: 0,
-    })
 }
 
 fn report(samples: &[Sample], at_end: &Breakdown, interval: Duration) {

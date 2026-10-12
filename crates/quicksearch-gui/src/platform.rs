@@ -3,7 +3,7 @@
 
 use std::process::Command;
 
-/// Give the process somewhere to write when it has no stdio.
+/// Gives the process somewhere to write when it has no stdio.
 ///
 /// A window-subsystem binary launched from Explorer has NULL standard
 /// handles, and `println!`/`eprintln!` *panic* on a failed write. Pointing
@@ -29,17 +29,68 @@ pub fn redirect_null_stdio() {
     }
 }
 
-/// Open a file with the desktop's default application, detached.
+/// Opens a file with the desktop's default application. On unix the first
+/// launcher that starts is reaped ([`spawn_reaped`]); Windows starts its
+/// launcher detached, which leaves no zombie there.
 pub fn open_file(path: &str) {
+    #[cfg(unix)]
+    {
+        // The next launcher only when this one could not start, never on its
+        // exit status: xdg-open runs the app in the foreground and returns
+        // the app's status, so falling through on one would open it twice.
+        let mut failure = None;
+        for mut launcher in open::commands(path) {
+            match spawn_reaped(&mut launcher) {
+                Ok(_) => return,
+                Err(e) => failure = Some(e),
+            }
+        }
+        if let Some(e) = failure {
+            quicksearch_core::log_warn!("open {}: {}", path, e);
+        }
+    }
+    #[cfg(not(unix))]
     if let Err(e) = open::that_detached(path) {
         quicksearch_core::log_warn!("open {}: {}", path, e);
     }
 }
 
-/// Reveal a file in the system file manager with the file selected.
+/// `cmd` with no stdio and a process group of its own: what it launches
+/// neither writes to the terminal we were started from nor receives its
+/// Ctrl+C or Ctrl+Z.
+#[cfg(unix)]
+fn detached(cmd: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+}
+
+/// Starts `cmd` [`detached`] and waits for it on a thread of its own, for as
+/// long as it runs: a child nobody waits for stays a zombie for the life of
+/// the app. Gives the child's pid. Should the thread not start, the child is
+/// dropped unwaited.
+#[cfg(unix)]
+fn spawn_reaped(cmd: &mut Command) -> std::io::Result<u32> {
+    let mut child = detached(cmd).spawn()?;
+    let pid = child.id();
+    let _ = std::thread::Builder::new()
+        .name("quicksearch-reap".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+    Ok(pid)
+}
+
+/// Reveals a file in the system file manager with the file selected.
 ///
 /// Linux goes through `dbus-send` (no D-Bus library for one call), falling
-/// back to opening the parent directory.
+/// back to opening the parent directory, both on a thread of their own: a
+/// file manager that D-Bus has to start replies only once it is up, which
+/// the UI thread must not wait for.
 pub fn reveal_in_folder(path: &str) {
     #[cfg(target_os = "windows")]
     {
@@ -49,9 +100,9 @@ pub fn reveal_in_folder(path: &str) {
 
         // explorer.exe parses its own command line: `/select,` must be glued
         // to the path in one token with quotes around the path only, which
-        // only `raw_arg` can express — as two arguments it silently ignores
-        // the selection. Forward slashes are invalid here alone, and the exit
-        // code is meaningless (explorer returns 1 on success).
+        // only `raw_arg` can express (as two arguments the selection is
+        // silently ignored). Forward slashes are invalid here alone, and the
+        // exit code is meaningless (explorer returns 1 on success).
         let native = path.replace('/', "\\");
         let _ = Command::new("explorer.exe")
             .raw_arg(format!("/select,\"{}\"", native))
@@ -61,30 +112,38 @@ pub fn reveal_in_folder(path: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = Command::new("open").arg("-R").arg(path).spawn();
+        let _ = spawn_reaped(Command::new("open").arg("-R").arg(path));
         return;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         use std::path::Path;
-        let uri = format!("file://{}", uri_escape_path(path));
-        let ok = Command::new("dbus-send")
-            .args([
-                "--session",
-                "--print-reply",
-                "--dest=org.freedesktop.FileManager1",
-                "/org/freedesktop/FileManager1",
-                "org.freedesktop.FileManager1.ShowItems",
-                &format!("array:string:{}", uri),
-                "string:",
-            ])
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false);
-        if !ok {
-            let parent = Path::new(path).parent().unwrap_or(Path::new("/"));
-            let _ = Command::new("xdg-open").arg(parent).spawn();
-        }
+        let items = format!("array:string:file://{}", uri_escape_path(path));
+        let parent = Path::new(path)
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .to_owned();
+        // `status` waits for each, so both are reaped where they ran.
+        let _ = std::thread::Builder::new()
+            .name("quicksearch-reveal".to_string())
+            .spawn(move || {
+                // `--print-reply` makes the exit status the reply's; its
+                // printout goes nowhere.
+                let shown = detached(Command::new("dbus-send").args([
+                    "--session",
+                    "--print-reply",
+                    "--dest=org.freedesktop.FileManager1",
+                    "/org/freedesktop/FileManager1",
+                    "org.freedesktop.FileManager1.ShowItems",
+                    &items,
+                    "string:",
+                ]))
+                .status()
+                .is_ok_and(|status| status.success());
+                if !shown {
+                    let _ = detached(Command::new("xdg-open").arg(parent)).status();
+                }
+            });
     }
 }
 
@@ -103,61 +162,21 @@ fn uri_escape_path(path: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod keyboard_settings_tests {
-    /// The first entry that is recognised wins, so a desktop that lists
-    /// itself ahead of a generic fallback gets its own settings application.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn the_most_specific_desktop_wins() {
-        let (program, args, _) = super::keyboard_settings_for("KDE").expect("KDE is known");
-        assert_eq!(program, "systemsettings");
-        assert_eq!(args, ["kcm_keys"]);
-
-        let (program, _, _) =
-            super::keyboard_settings_for("ubuntu:GNOME").expect("GNOME after a vendor prefix");
-        assert_eq!(program, "gnome-control-center");
-    }
-
-    /// The spec does not pin the case and desktops disagree.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn the_match_ignores_case() {
-        assert!(super::keyboard_settings_for("kde").is_some());
-        assert!(super::keyboard_settings_for("Kde").is_some());
-    }
-
-    /// An unknown or absent desktop offers no button rather than a broken one.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn an_unknown_desktop_offers_nothing() {
-        assert!(super::keyboard_settings_for("").is_none());
-        assert!(super::keyboard_settings_for("i3:sway").is_none());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn uri_escaping() {
-        use super::uri_escape_path;
-        assert_eq!(uri_escape_path("/plain/path.txt"), "/plain/path.txt");
-        assert_eq!(
-            uri_escape_path("/with space/ünïcode&.txt"),
-            "/with%20space/%C3%BCn%C3%AFcode%26.txt"
-        );
-    }
+/// A desktop's keyboard-shortcut settings application.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct KeyboardSettings {
+    program: &'static str,
+    args: &'static [&'static str],
+    /// The label of the button that opens it.
+    label: &'static str,
 }
 
 /// The desktop's keyboard-shortcut settings, when this is a desktop whose
-/// settings application we know how to name.
-///
-/// A pair with [`open_keyboard_settings`]: the Settings tab only offers the
-/// button when there is something to open, rather than showing one that may
-/// do nothing.
+/// settings application we know how to name. A pair with
+/// [`open_keyboard_settings`]: the Settings tab only offers the button when
+/// there is something to open.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn keyboard_settings_command() -> Option<(&'static str, &'static [&'static str], &'static str)> {
+fn keyboard_settings_command() -> Option<KeyboardSettings> {
     keyboard_settings_for(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
 }
 
@@ -166,34 +185,26 @@ fn keyboard_settings_command() -> Option<(&'static str, &'static [&'static str],
 /// most specific first, and matched case-insensitively because the spec does
 /// not pin the case and desktops disagree in practice.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn keyboard_settings_for(
-    desktops: &str,
-) -> Option<(&'static str, &'static [&'static str], &'static str)> {
-    for desktop in desktops.split(':') {
-        let found = match desktop.to_ascii_uppercase().as_str() {
-            "KDE" => Some((
-                "systemsettings",
-                &["kcm_keys"][..],
-                "Open Shortcuts settings",
-            )),
-            "GNOME" | "UNITY" => Some((
-                "gnome-control-center",
-                &["keyboard"][..],
-                "Open Keyboard settings",
-            )),
-            "XFCE" => Some(("xfce4-keyboard-settings", &[][..], "Open Keyboard settings")),
-            "CINNAMON" => Some((
-                "cinnamon-settings",
-                &["keyboard"][..],
-                "Open Keyboard settings",
-            )),
-            _ => None,
-        };
-        if found.is_some() {
-            return found;
-        }
-    }
-    None
+fn keyboard_settings_for(desktops: &str) -> Option<KeyboardSettings> {
+    desktops.split(':').find_map(|desktop| {
+        let (program, args, label): (_, &'static [&'static str], _) =
+            match desktop.to_ascii_uppercase().as_str() {
+                "KDE" => ("systemsettings", &["kcm_keys"], "Open Shortcuts settings"),
+                "GNOME" | "UNITY" => (
+                    "gnome-control-center",
+                    &["keyboard"],
+                    "Open Keyboard settings",
+                ),
+                "XFCE" => ("xfce4-keyboard-settings", &[], "Open Keyboard settings"),
+                "CINNAMON" => ("cinnamon-settings", &["keyboard"], "Open Keyboard settings"),
+                _ => return None,
+            };
+        Some(KeyboardSettings {
+            program,
+            args,
+            label,
+        })
+    })
 }
 
 /// The button label for [`open_keyboard_settings`], or `None` when this
@@ -203,8 +214,8 @@ pub fn keyboard_settings_label() -> Option<&'static str> {
     {
         // Naming it is not enough; it also has to be installed, or the button
         // would promise something that silently fails.
-        let (program, _, label) = keyboard_settings_command()?;
-        which(program).then_some(label)
+        let settings = keyboard_settings_command()?;
+        which(settings.program).then_some(settings.label)
     }
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     {
@@ -222,13 +233,98 @@ fn which(program: &str) -> bool {
     std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
 }
 
-/// Open the desktop's keyboard settings, detached, so the user can bind
-/// `quicksearch --toggle` without hunting for the page.
+/// Open the desktop's keyboard settings, reaped ([`spawn_reaped`]), so the
+/// user can bind `quicksearch --toggle` without hunting for the page.
 pub fn open_keyboard_settings() {
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some((program, args, _)) = keyboard_settings_command() {
-        if let Err(e) = Command::new(program).args(args).spawn() {
-            quicksearch_core::log_warn!("opening {}: {}", program, e);
+    if let Some(settings) = keyboard_settings_command() {
+        if let Err(e) = spawn_reaped(Command::new(settings.program).args(settings.args)) {
+            quicksearch_core::log_warn!("opening {}: {}", settings.program, e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn uri_escaping() {
+        use super::uri_escape_path;
+        assert_eq!(uri_escape_path("/plain/path.txt"), "/plain/path.txt");
+        assert_eq!(
+            uri_escape_path("/with space/ünïcode&.txt"),
+            "/with%20space/%C3%BCn%C3%AFcode%26.txt"
+        );
+    }
+
+    /// The first entry that is recognised wins, so a desktop that lists
+    /// itself ahead of a generic fallback gets its own settings application.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_most_specific_desktop_wins() {
+        let kde = super::keyboard_settings_for("KDE").expect("KDE is known");
+        assert_eq!(kde.program, "systemsettings");
+        assert_eq!(kde.args, ["kcm_keys"]);
+
+        let gnome =
+            super::keyboard_settings_for("ubuntu:GNOME").expect("GNOME after a vendor prefix");
+        assert_eq!(gnome.program, "gnome-control-center");
+    }
+
+    /// The spec does not pin the case and desktops disagree.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_match_ignores_case() {
+        assert!(super::keyboard_settings_for("kde").is_some());
+        assert!(super::keyboard_settings_for("Kde").is_some());
+    }
+
+    /// An unknown or absent desktop offers no button rather than a broken one.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn an_unknown_desktop_offers_nothing() {
+        assert!(super::keyboard_settings_for("").is_none());
+        assert!(super::keyboard_settings_for("i3:sway").is_none());
+    }
+
+    /// Whether `/proc/<pid>` is gone within `secs`: a zombie keeps its entry
+    /// until it is waited for.
+    #[cfg(target_os = "linux")]
+    fn reaped_within(pid: u32, secs: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if !std::path::Path::new(&format!("/proc/{}", pid)).exists() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// An exited launcher is waited for, not left a zombie for the life of
+    /// the app.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn spawn_reaped_leaves_no_zombie() {
+        let pid = super::spawn_reaped(&mut std::process::Command::new("true")).expect("spawn");
+        assert!(reaped_within(pid, 2), "pid {} was never reaped", pid);
+    }
+
+    /// A launched app has no stdio of ours and leads its own process group,
+    /// so the terminal's Ctrl+C never reaches it; it is reaped all the same
+    /// once it exits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launched_app_has_no_terminal_and_its_own_group() {
+        let pid = super::spawn_reaped(std::process::Command::new("sleep").arg("1")).expect("spawn");
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).expect("stat");
+        // `pid (comm) state ppid pgrp ...`; comm is `sleep`, free of spaces.
+        let pgrp = stat.split_whitespace().nth(4).expect("pgrp");
+        assert_eq!(pgrp, pid.to_string(), "not its own process group");
+        for fd in 0..3 {
+            let target = std::fs::read_link(format!("/proc/{}/fd/{}", pid, fd)).expect("fd");
+            assert_eq!(target, std::path::Path::new("/dev/null"), "fd {}", fd);
+        }
+        assert!(reaped_within(pid, 5), "pid {} was never reaped", pid);
     }
 }

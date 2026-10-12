@@ -1,18 +1,21 @@
 //! The Duplicates tab: groups of files sharing a content hash.
 //!
-//! Grouping is a *suspicion*, not a verdict — the hash covers each file's size
-//! and its first `processing.hash_length` bytes and nothing else. The tab says
+//! Grouping is a suspicion, not a verdict: the hash covers each file's size
+//! and its first `processing.hash_length` bytes, and the scan then splits
+//! groups whose members end differently and leaves out any member it cannot
+//! read (`search::split_by_tail`); nothing in between is read. The tab says
 //! so where someone about to delete something will read it, and offers the
 //! byte-for-byte verification that settles it.
 //!
 //! Two ways to stop seeing a group again: exclude paths by glob (a folder that
-//! is *meant* to hold copies), or hide one group by its hash (a head-hash
-//! false positive). Both are persisted, and both are applied to the listing
-//! already in hand rather than by going back to the database.
+//! is *meant* to hold copies), or hide one group by its identity, head hash
+//! and tail digest (a false positive that differs only in between). Both are
+//! persisted, and both are applied to the listing already in hand rather than
+//! by going back to the database.
 
 use std::collections::HashSet;
 
-use quicksearch_core::config::{DuplicatesConfig, IgnoreSet};
+use quicksearch_core::config::{glob_literal, DuplicatesConfig, IgnoreSet};
 use quicksearch_core::search::DuplicateGroup;
 
 use crate::format::{group_thousands, human_size};
@@ -55,18 +58,24 @@ fn extension_of(name: &str) -> String {
 }
 
 /// What [`LoadedGroups::rebuild`] orders an extension listing by: no extension
-/// last, then the extension, then the biggest waste, then the hash to settle
-/// whatever is left.
-type ExtensionKey<'a> = (bool, &'a str, std::cmp::Reverse<i64>, &'a [u8]);
+/// last, then the extension, then the biggest waste, then the identity to
+/// settle whatever is left.
+type ExtensionKey<'a> = (
+    bool,
+    &'a str,
+    std::cmp::Reverse<i64>,
+    (&'a [u8], &'a [u8; 32]),
+);
 
 fn extension_key<'a>(row: &'a Row, groups: &'a [DuplicateGroup]) -> ExtensionKey<'a> {
+    let group = &groups[row.group];
     (
         // Extensionless groups last: a category of their own, and not an
         // interesting one.
         row.extension.is_empty(),
         row.extension.as_str(),
         std::cmp::Reverse(row.redundant),
-        groups[row.group].hash.as_slice(),
+        (group.hash.as_slice(), &group.tail),
     )
 }
 
@@ -79,9 +88,9 @@ pub struct DupFilters {
     config: DuplicatesConfig,
     exclude: IgnoreSet,
     /// Why `exclude` is empty when it should not be. Only a hand-edited config
-    /// can get here — the editor refuses an invalid glob — and it is painted
-    /// rather than swallowed: silently dropping the pattern would list files
-    /// the user asked never to see again.
+    /// gets here (the editor refuses an invalid glob), and it is painted rather
+    /// than swallowed: silently dropping the pattern would list files the user
+    /// asked never to see again.
     error: Option<String>,
     hidden: HashSet<String>,
     /// Bumped by every edit; [`LoadedGroups`] rebuilds when it moves.
@@ -92,7 +101,7 @@ impl DupFilters {
     pub fn new(config: &DuplicatesConfig) -> DupFilters {
         let mut filters = DupFilters {
             config: config.clone(),
-            exclude: IgnoreSet::compile(&[]).expect("an empty pattern set compiles"),
+            exclude: no_exclusions(),
             error: None,
             hidden: HashSet::new(),
             revision: 0,
@@ -109,16 +118,10 @@ impl DupFilters {
             .iter()
             .map(|h| h.trim().to_ascii_lowercase())
             .collect();
-        match IgnoreSet::compile(&self.config.exclude_patterns) {
-            Ok(set) => {
-                self.exclude = set;
-                self.error = None;
-            }
-            Err(e) => {
-                self.exclude = IgnoreSet::compile(&[]).expect("an empty pattern set compiles");
-                self.error = Some(e);
-            }
-        }
+        (self.exclude, self.error) = match IgnoreSet::compile(&self.config.exclude_patterns) {
+            Ok(set) => (set, None),
+            Err(e) => (no_exclusions(), Some(e)),
+        };
     }
 
     fn add_pattern(&mut self, pattern: &str) {
@@ -137,18 +140,18 @@ impl DupFilters {
         }
     }
 
-    fn hide(&mut self, hash_hex: String) {
-        if self.hidden.contains(&hash_hex) {
+    fn hide(&mut self, identity: String) {
+        if self.hidden.contains(&identity) {
             return;
         }
-        self.config.hidden_groups.push(hash_hex);
+        self.config.hidden_groups.push(identity);
         self.recompile();
     }
 
-    fn unhide(&mut self, hash_hex: &str) {
+    fn unhide(&mut self, identity: &str) {
         self.config
             .hidden_groups
-            .retain(|h| !h.trim().eq_ignore_ascii_case(hash_hex));
+            .retain(|h| !h.trim().eq_ignore_ascii_case(identity));
         self.recompile();
     }
 
@@ -162,14 +165,18 @@ impl DupFilters {
     }
 
     fn is_hidden(&self, group: &DuplicateGroup) -> bool {
-        !self.hidden.is_empty() && self.hidden.contains(&group.hash_hex())
+        !self.hidden.is_empty() && self.hidden.contains(&group.identity())
     }
+}
+
+fn no_exclusions() -> IgnoreSet {
+    IgnoreSet::compile(&[]).expect("an empty pattern set compiles")
 }
 
 // --- The loaded listing ----------------------------------------------------
 
 /// One group as listed: which of its members survived the exclusions, and the
-/// totals recomputed from them.
+/// totals priced from them.
 struct Row {
     group: usize,
     /// Indices into the group's members, path-ordered.
@@ -180,11 +187,10 @@ struct Row {
     extension: String,
 }
 
-/// The group's totals from the members that survived, as the scan prices them:
-/// every member of a hash group shares a size — the hash covers it (see
-/// [`quicksearch_core::search::find_duplicate_groups`]) — so the first one
-/// speaks for all of them. An unfiltered group therefore reads exactly as the
-/// scan ranked it, and saturates on absurd sizes the same way.
+/// `(count, total, reclaimable)` for the surviving members. Every member
+/// shares one size (it is part of the hash, see
+/// [`quicksearch_core::search::find_duplicate_groups`]), so the first one's
+/// size is used; an unfiltered group prices exactly as the scan did.
 fn totals(group: &DuplicateGroup, members: &[usize]) -> (i64, i64, i64) {
     let count = members.len() as i64;
     let size = members
@@ -203,6 +209,9 @@ fn totals(group: &DuplicateGroup, members: &[usize]) -> (i64, i64, i64) {
 /// frame, on a list that repaints at 20 Hz for as long as the tab is open.
 pub struct LoadedGroups {
     groups: Vec<DuplicateGroup>,
+    /// The scan's fetch came back full at this many groups: there may be
+    /// more. See [`crate::backend::DupScan`].
+    limited_to: Option<u32>,
     /// The visible groups, in display order.
     rows: Vec<Row>,
     /// Groups the filters kept off screen, for the line that says so.
@@ -212,9 +221,10 @@ pub struct LoadedGroups {
 }
 
 impl LoadedGroups {
-    pub fn new(groups: Vec<DuplicateGroup>) -> LoadedGroups {
+    pub fn new(groups: Vec<DuplicateGroup>, limited_to: Option<u32>) -> LoadedGroups {
         LoadedGroups {
             groups,
+            limited_to,
             rows: Vec::new(),
             filtered_out: 0,
             built_for: None,
@@ -252,8 +262,7 @@ impl LoadedGroups {
             }
             let (count, total, redundant) = totals(group, &members);
             // Copies of one file can be filed under different names, so the
-            // group is named — and filed under the extension of — the member
-            // its title names.
+            // group is named, and filed by extension, after its first member.
             let name = group.members[members[0]].1.as_str();
             let title = format!(
                 "{}{} × {}: {} reclaimable ({} total)",
@@ -291,9 +300,6 @@ pub struct DuplicatesTab {
     pub filters: DupFilters,
     /// List the groups the filters hid, so hiding one is reversible.
     show_hidden: bool,
-    /// What the last scan was asked for; a result of exactly this many groups
-    /// is a truncated one. See [`crate::backend::Backend::start_duplicates`].
-    pub scan_limit: u32,
     /// The exclusion being typed.
     draft: String,
 }
@@ -303,7 +309,7 @@ pub struct DuplicatesTab {
 pub struct DuplicatesActions {
     pub refresh: bool,
     /// Every surviving member of one group, whichever row it was asked for
-    /// from — excluded members are not what anyone is looking at.
+    /// from; excluded members are not what anyone is looking at.
     pub verify: Option<Vec<String>>,
     /// The exclusions or the hidden groups changed; write them to the config.
     pub save_filters: Option<DuplicatesConfig>,
@@ -311,13 +317,23 @@ pub struct DuplicatesActions {
 
 const VERIFY_LABEL: &str = "Verify copies are identical…";
 const VERIFY_TIP: &str = "Reads every file in the group in full and compares them byte for \
-                          byte. Grouping only reads each file's size and how it begins.";
+                          byte. Grouping only reads each file's size and how it begins \
+                          and ends.";
 const HIDE_LABEL: &str = "Hide this group";
 const UNHIDE_LABEL: &str = "Unhide this group";
 const NO_GROUPS: &str = "No duplicate files found.";
 const ALL_FILTERED: &str = "Every duplicate group is hidden by your filters.";
 /// Prose wraps to this, rather than to a maximised window's full width.
 const PROSE_WIDTH: f32 = 720.0;
+
+/// What a context menu asked for. The listing borrows the filters, so it is
+/// applied after the listing is drawn; egui reports one click per frame.
+enum Pick {
+    Verify(Vec<String>),
+    Hide(String),
+    Unhide(String),
+    Exclude(String),
+}
 
 impl DuplicatesTab {
     pub fn new(filters: &DuplicatesConfig) -> DuplicatesTab {
@@ -326,14 +342,13 @@ impl DuplicatesTab {
             sort: DupSort::default(),
             filters: DupFilters::new(filters),
             show_hidden: false,
-            scan_limit: 0,
             draft: String::new(),
         }
     }
 
     /// `verify_open` greys the verify entry out: there is only one verify
-    /// window. `hash_length` is what the banner quotes as the amount of each
-    /// file the grouping actually read.
+    /// window. `hash_length` is how much of each file the grouping read,
+    /// which the banner quotes.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -373,10 +388,8 @@ impl DuplicatesTab {
             }
         });
 
-        // Everything from here to the exclusion editor appears and disappears
-        // with the state, and egui names a widget by how many precede it in
-        // the same `Ui` — an unstable count would rename the editor below and
-        // drop its focus mid-word. One id each, whatever they hold.
+        // Everything from here to the exclusion editor comes and goes with the
+        // state, so it takes one id whatever it holds (see `stable_section`).
         let listing = matches!(&self.state, DupState::Loaded(l) if !l.groups.is_empty());
         stable_section(ui, |ui| {
             if listing {
@@ -392,16 +405,11 @@ impl DuplicatesTab {
             loaded.rebuild(self.sort, &self.filters, self.show_hidden);
         }
 
-        // The menus mutate the filters, which the listing below is borrowed
-        // from; they report what they were asked for and it is applied after.
-        let mut hide: Option<String> = None;
-        let mut unhide: Option<String> = None;
-        let mut exclude: Option<String> = None;
-
+        let mut picked: Option<Pick> = None;
         match &self.state {
-            // `NotLoaded` survives at most the one frame before the app starts
-            // the scan (`switch_tab`), and `Loading` has its spinner and label
-            // in the header row above.
+            // `NotLoaded` paints nothing: arriving (`switch_tab`), Refresh, or
+            // the end of the next run starts the scan; `Loading` has its
+            // spinner and label in the header row above.
             DupState::NotLoaded | DupState::Loading => {}
             DupState::Error(e) => {
                 ui.colored_label(ui.visuals().error_fg_color, e);
@@ -417,19 +425,19 @@ impl DuplicatesTab {
             }
             DupState::Loaded(loaded) => {
                 // "Limited to", not "showing": the scan asks for extra to
-                // cover the hidden set, so the number it found is not always
-                // the number on screen. The filtered-out line below accounts
-                // for the difference.
-                if loaded.groups.len() as u32 >= self.scan_limit && self.scan_limit > 0 {
+                // cover the hidden set, and the tail check dissolves some of
+                // what it found, so the number is not the number on screen.
+                // The filtered-out line below accounts for the hidden ones.
+                if let Some(limit) = loaded.limited_to {
                     ui.label(hint(match self.sort {
                         DupSort::Reclaimable => {
-                            format!("Limited to the {} largest groups.", self.scan_limit)
+                            format!("Limited to the {} largest groups.", limit)
                         }
                         // Said plainly: this is not every .raw file you own,
                         // it is the biggest groups put in that order.
                         DupSort::Extension => format!(
                             "Limited to the {} largest groups, then ordered by extension.",
-                            self.scan_limit
+                            limit
                         ),
                     }));
                 }
@@ -445,66 +453,19 @@ impl DuplicatesTab {
                     .show(ui, |ui| {
                         for row in &loaded.rows {
                             let group = &loaded.groups[row.group];
+                            // Keyed by identity, so a group stays open
+                            // through a rescan that lists it elsewhere.
                             let header = egui::CollapsingHeader::new(&row.title)
-                                .id_salt(row.group)
+                                .id_salt((&group.hash, &group.tail))
                                 .show(ui, |ui| {
                                     for &j in &row.members {
-                                        let (_, _, path, size, _) = &group.members[j];
-                                        ui.horizontal(|ui| {
-                                            ui.label(human_size(*size));
-                                            let response = ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(path).monospace(),
-                                                )
-                                                .sense(egui::Sense::click()),
-                                            );
-                                            if response.double_clicked() {
-                                                platform::open_file(path);
-                                            }
-                                            response.context_menu(|ui| {
-                                                if ui.button("Open File").clicked() {
-                                                    platform::open_file(path);
-                                                    ui.close();
-                                                }
-                                                if ui.button("Open containing folder").clicked() {
-                                                    platform::reveal_in_folder(path);
-                                                    ui.close();
-                                                }
-                                                ui.separator();
-                                                if verify_entry(ui, verify_open) {
-                                                    actions.verify = Some(member_paths(group, row));
-                                                }
-                                                ui.separator();
-                                                if hide_entry(ui, row.hidden) {
-                                                    let hex = group.hash_hex();
-                                                    if row.hidden {
-                                                        unhide = Some(hex);
-                                                    } else {
-                                                        hide = Some(hex);
-                                                    }
-                                                }
-                                                if let Some(p) = exclude_entries(ui, path) {
-                                                    exclude = Some(p);
-                                                }
-                                            });
-                                        });
+                                        member_row(ui, group, row, j, verify_open, &mut picked);
                                     }
                                 });
                             // Also on the group's own row, whose members are
                             // behind a collapsed header until they are not.
                             header.header_response.context_menu(|ui| {
-                                if verify_entry(ui, verify_open) {
-                                    actions.verify = Some(member_paths(group, row));
-                                }
-                                ui.separator();
-                                if hide_entry(ui, row.hidden) {
-                                    let hex = group.hash_hex();
-                                    if row.hidden {
-                                        unhide = Some(hex);
-                                    } else {
-                                        hide = Some(hex);
-                                    }
-                                }
+                                group_menu(ui, group, row, verify_open, &mut picked);
                             });
                         }
                     });
@@ -512,17 +473,21 @@ impl DuplicatesTab {
             }
         }
 
-        if let Some(hex) = hide {
-            self.filters.hide(hex);
-            edited = true;
-        }
-        if let Some(hex) = unhide {
-            self.filters.unhide(&hex);
-            edited = true;
-        }
-        if let Some(pattern) = exclude {
-            self.filters.add_pattern(&pattern);
-            edited = true;
+        match picked {
+            Some(Pick::Verify(paths)) => actions.verify = Some(paths),
+            Some(Pick::Hide(identity)) => {
+                self.filters.hide(identity);
+                edited = true;
+            }
+            Some(Pick::Unhide(identity)) => {
+                self.filters.unhide(&identity);
+                edited = true;
+            }
+            Some(Pick::Exclude(pattern)) => {
+                self.filters.add_pattern(&pattern);
+                edited = true;
+            }
+            None => {}
         }
         if edited {
             actions.save_filters = Some(self.filters.config.clone());
@@ -616,8 +581,8 @@ impl DuplicatesTab {
 }
 
 /// The tab's standing caution, painted above the list rather than left to a
-/// right-click nobody has performed yet: the group is a suspicion, and the way
-/// to settle it is right here.
+/// right-click nobody has made yet: the group is a suspicion, and the way to
+/// settle it is right here.
 fn caution_banner(ui: &mut egui::Ui, hash_length: usize) {
     let p = crate::color::palette(ui.visuals().dark_mode);
     egui::Frame::new()
@@ -625,24 +590,81 @@ fn caution_banner(ui: &mut egui::Ui, hash_length: usize) {
         .corner_radius(4)
         .inner_margin(egui::Margin::symmetric(8, 5))
         .show(ui, |ui| {
-            // Only ever a cap, never a floor: `set_max_width` widens a `Ui` as
-            // readily as it narrows one, and a column set wider than the panel
-            // lays its text out past the clip rect, where the ends of the
-            // lines are simply cut off.
+            // A cap only: `set_max_width` widens as readily as it narrows, and
+            // text laid out past the panel is clipped.
             ui.set_max_width(ui.available_width().min(PROSE_WIDTH));
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.label(egui::RichText::new("These are suspected duplicates. ").color(p.orange));
                 ui.label(format!(
-                    "Files are grouped on their size and their first {}, which is all \
-                     indexing reads, and why it can be so fast. This is not proof that they are identical! \
-                     Right-click any group and choose \"{}\" to compare every byte before \
-                     you delete anything.",
+                    "Files are grouped by their size and their first {0}, which is all \
+                     indexing reads, then split apart where their last {0} differ. That \
+                     is not proof that they are identical: right-click a group and \
+                     choose \"{1}\" to compare every byte before you delete anything.",
                     human_size(hash_length as u64),
                     VERIFY_LABEL.trim_end_matches('…'),
                 ));
             });
         });
+}
+
+/// One member line: its size, then its path, which opens on a double-click
+/// and carries the member's menu.
+fn member_row(
+    ui: &mut egui::Ui,
+    group: &DuplicateGroup,
+    row: &Row,
+    j: usize,
+    verify_open: bool,
+    picked: &mut Option<Pick>,
+) {
+    let (_, _, path, size, _) = &group.members[j];
+    ui.horizontal(|ui| {
+        ui.label(human_size(*size));
+        let response = ui.add(
+            egui::Label::new(egui::RichText::new(path).monospace()).sense(egui::Sense::click()),
+        );
+        if response.double_clicked() {
+            platform::open_file(path);
+        }
+        response.context_menu(|ui| {
+            if ui.button("Open File").clicked() {
+                platform::open_file(path);
+                ui.close();
+            }
+            if ui.button("Open containing folder").clicked() {
+                platform::reveal_in_folder(path);
+                ui.close();
+            }
+            ui.separator();
+            group_menu(ui, group, row, verify_open, picked);
+            if let Some(pattern) = exclude_entries(ui, path) {
+                *picked = Some(Pick::Exclude(pattern));
+            }
+        });
+    });
+}
+
+/// The entries every menu in a group shares: verify, then hide or unhide.
+fn group_menu(
+    ui: &mut egui::Ui,
+    group: &DuplicateGroup,
+    row: &Row,
+    verify_open: bool,
+    picked: &mut Option<Pick>,
+) {
+    if verify_entry(ui, verify_open) {
+        *picked = Some(Pick::Verify(member_paths(group, row)));
+    }
+    ui.separator();
+    if hide_entry(ui, row.hidden) {
+        let identity = group.identity();
+        *picked = Some(if row.hidden {
+            Pick::Unhide(identity)
+        } else {
+            Pick::Hide(identity)
+        });
+    }
 }
 
 /// Whether the shared entry was clicked; closes the menu when it was.
@@ -683,7 +705,7 @@ fn exclude_entries(ui: &mut egui::Ui, path: &str) -> Option<String> {
     let path = std::path::Path::new(path);
     let mut chosen: Option<String> = None;
     if let Some(ext) = path.extension() {
-        let pattern = format!("*.{}", ext.to_string_lossy());
+        let pattern = format!("*.{}", glob_literal(&ext.to_string_lossy()));
         if ui
             .button(format!("Exclude {pattern} from duplicates"))
             .on_hover_text("Files of this type are left out of the listing; they stay indexed.")
@@ -708,7 +730,7 @@ fn exclude_entries(ui: &mut egui::Ui, path: &str) -> Option<String> {
     chosen
 }
 
-/// The members of `group` that survived the exclusions — verifying files
+/// The members of `group` that survived the exclusions: verifying files
 /// nobody is being shown would answer a question nobody asked.
 fn member_paths(group: &DuplicateGroup, row: &Row) -> Vec<String> {
     row.members

@@ -5,14 +5,14 @@ members = [
     "crates/quicksearch-gui",
 ]
 # The `vendor/` crates are deliberately NOT members: they are third-party code which we patched
-exclude = ["vendor/pdf-extract", "vendor/rtf-parser"]
+exclude = ["vendor/pdf-extract", "vendor/notify"]
 
 [patch.crates-io]
-pdf-extract = { path = "vendor/pdf-extract" } # Patched unbounded reads which could blow up on malformed files
-rtf-parser = { path = "vendor/rtf-parser" } # Patched a parsing error which occurs on UTF-16 characters
+pdf-extract = { path = "vendor/pdf-extract" } # Bounds a crafted PDF's recursion depth and total work; drops colour handling and adobe-cmap-parser; decodes CID fonts whose Encoding CMap is not Identity
+notify = { path = "vendor/notify" } # The Windows backend reports a change buffer that overflowed as a rescan, rather than losing the burst silently
 
 [workspace.package]
-version = "1.1.7"
+version = "1.2.1"
 edition = "2021"
 license = "GPL-3.0-or-later"
 authors = ["Jeremy <jeremy@karsttech.com>"]

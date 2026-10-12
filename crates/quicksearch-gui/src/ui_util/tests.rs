@@ -1,6 +1,6 @@
 use super::{
-    ignore_pattern_valid, middle_elide, palette, pattern_border, pattern_hint, wipe_mesh, Cow,
-    WIPE_BAND_MIN,
+    dir_ignore_pattern, grow_balanced, ignore_pattern_valid, middle_elide, palette, pattern_border,
+    pattern_hint, wipe_mesh, Cow, IgnoreSet, WIPE_BAND_MIN,
 };
 use crate::test_ui::with_ui;
 
@@ -86,6 +86,35 @@ fn multi_byte_paths_split_on_character_boundaries() {
     });
 }
 
+/// Unit-width characters on both sides: the sides alternate, the left first,
+/// until the next character would pass the budget.
+#[test]
+fn the_sides_grow_in_turn_from_the_left() {
+    let endless = |_: usize, _: usize| (Some('a'), Some('b'));
+    assert_eq!(grow_balanced(5.0, 0.0, |_| 1.0, endless), (3, 2));
+    // What is already spent between the ends comes off the budget.
+    assert_eq!(grow_balanced(5.0, 2.0, |_| 1.0, endless), (2, 1));
+    assert_eq!(grow_balanced(0.5, 0.0, |_| 1.0, endless), (0, 0));
+}
+
+/// A side that runs out, or whose next character does not fit, hands its
+/// turns to the other.
+#[test]
+fn a_blocked_side_yields_to_the_other() {
+    let left_ends_after_one = |l: usize, _: usize| ((l < 1).then_some('a'), Some('b'));
+    assert_eq!(
+        grow_balanced(4.0, 0.0, |_| 1.0, left_ends_after_one),
+        (1, 3)
+    );
+    // A wide character on the left stops it; the narrow right keeps going.
+    let width = |c: char| if c == 'W' { 10.0 } else { 1.0 };
+    let wide_left = |_: usize, _: usize| (Some('W'), Some('i'));
+    assert_eq!(grow_balanced(4.0, 0.0, width, wide_left), (0, 4));
+    // Byte counts, not characters.
+    let multibyte = |_: usize, _: usize| (Some('é'), Some('日'));
+    assert_eq!(grow_balanced(2.0, 0.0, |_| 1.0, multibyte), (2, 3));
+}
+
 /// The trap behind "my ignore filters don't work": ".jpg" is an exact name.
 #[test]
 fn extension_like_patterns_get_a_hint() {
@@ -153,6 +182,35 @@ fn usual_patterns_are_valid() {
     assert!(ignore_pattern_valid("/home/x/docs/*")); // directory
     assert!(ignore_pattern_valid("C:\\Windows\\Temp\\*"));
     assert!(ignore_pattern_valid("cache-??")); // wildcards
+}
+
+/// A folder named like a character class matches only itself, not the
+/// folders its brackets would reach unescaped.
+#[test]
+fn dir_ignore_pattern_escapes_glob_syntax() {
+    use std::path::Path;
+    let under = |dir: &str| IgnoreSet::compile(&[dir_ignore_pattern(Path::new(dir))]).unwrap();
+    let flac = under("/m/Music [FLAC]");
+    assert!(flac.matches_path(Path::new("/m/Music [FLAC]/x.flac")));
+    assert!(!flac.matches_path(Path::new("/m/Music F/x.flac")));
+    let star = under("/m/a*b");
+    assert!(star.matches_path(Path::new("/m/a*b/x")));
+    assert!(!star.matches_path(Path::new("/m/aXb/x")));
+    #[cfg(unix)]
+    {
+        let slash = under(r"/m/back\slash");
+        assert!(slash.matches_path(Path::new(r"/m/back\slash/x")));
+        assert!(!slash.matches_path(Path::new("/m/backslash/x")));
+    }
+    #[cfg(windows)]
+    {
+        assert_eq!(dir_ignore_pattern(Path::new(r"C:\")), r"C:\*");
+        assert_eq!(
+            dir_ignore_pattern(Path::new(r"D:\Music [FLAC]")),
+            r"D:\Music [[]FLAC[]]\*"
+        );
+        assert!(under(r"C:\").matches_path(Path::new(r"C:\x\y")));
+    }
 }
 
 #[test]

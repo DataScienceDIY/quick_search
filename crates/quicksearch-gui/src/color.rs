@@ -1,7 +1,7 @@
 //! Every color the GUI paints with, declared in OKLCH and converted to sRGB
-//! at compile time. `sqrt`, `cbrt`, `powf`, `sin` and `cos` are still
-//! non-const, hence the numerics below — exact enough to match `std`'s
-//! output to the last bit of every channel (see the tests).
+//! at compile time. `std`'s roots, `powf`, `sin` and `cos` are not const, so
+//! the numerics below stand in for them, matching `std` to the last bit of
+//! every channel (see the tests).
 
 use egui::Color32;
 
@@ -12,44 +12,23 @@ const PI: f64 = std::f64::consts::PI;
 /// Each Newton step doubles the correct digits; far past f64's 53 bits.
 const NEWTON_STEPS: usize = 60;
 
-// Newton: x <- (x + a/x) / 2.
-const fn sqrt(a: f64) -> f64 {
+/// The `n`-th root by Newton: x <- ((n-1)x + a/x^(n-1)) / n. It starts at
+/// 1 for `a <= 1`: starting at `a/n` there overshoots to a huge first step
+/// that 60 steps cannot bring back. `x^(n-1)` multiplies left to right.
+const fn nth_root(a: f64, n: u32) -> f64 {
     if a <= 0.0 {
         return 0.0;
     }
-    let mut x = if a > 1.0 { a / 2.0 } else { 1.0 };
+    let mut x = if a > 1.0 { a / n as f64 } else { 1.0 };
     let mut i = 0;
     while i < NEWTON_STEPS {
-        x = 0.5 * (x + a / x);
-        i += 1;
-    }
-    x
-}
-
-// Newton: x <- (2x + a/x²) / 3.
-const fn cbrt(a: f64) -> f64 {
-    if a <= 0.0 {
-        return 0.0;
-    }
-    let mut x = if a > 1.0 { a / 3.0 } else { 1.0 };
-    let mut i = 0;
-    while i < NEWTON_STEPS {
-        x = (2.0 * x + a / (x * x)) / 3.0;
-        i += 1;
-    }
-    x
-}
-
-// Newton: x <- (4x + a/x⁴) / 5.
-const fn fifth_root(a: f64) -> f64 {
-    if a <= 0.0 {
-        return 0.0;
-    }
-    let mut x = if a > 1.0 { a / 5.0 } else { 1.0 };
-    let mut i = 0;
-    while i < NEWTON_STEPS {
-        let x4 = x * x * x * x;
-        x = (4.0 * x + a / x4) / 5.0;
+        let mut p = x;
+        let mut k = 2;
+        while k < n {
+            p *= x;
+            k += 1;
+        }
+        x = ((n - 1) as f64 * x + a / p) / n as f64;
         i += 1;
     }
     x
@@ -88,18 +67,18 @@ const fn encode(x: f64) -> f64 {
     if x <= 0.003_130_8 {
         12.92 * x
     } else {
-        1.055 * cbrt(sqrt(sqrt(x * x * x * x * x))) - 0.055
+        1.055 * nth_root(nth_root(nth_root(x * x * x * x * x, 2), 2), 3) - 0.055
     }
 }
 
-/// Inverted: the exponent `2.4` is `2 + 2/5` — a square and a fifth root of it.
+/// Inverted: the exponent `2.4` is `2 + 2/5`, a square and a fifth root of it.
 const fn decode(x: f64) -> f64 {
     if x <= 0.040_45 {
         x / 12.92
     } else {
         let y = (x + 0.055) / 1.055;
         let y2 = y * y;
-        y2 * fifth_root(y2)
+        y2 * nth_root(y2, 5)
     }
 }
 
@@ -113,7 +92,12 @@ const fn channel(v: f64) -> u8 {
     } else {
         v
     };
-    let s = encode(v) * 255.0 + 0.5;
+    round_u8(encode(v) * 255.0)
+}
+
+/// Rounds to the nearest byte, pinning at 0 and 255.
+const fn round_u8(v: f64) -> u8 {
+    let s = v + 0.5;
     if s <= 0.0 {
         0
     } else if s >= 255.0 {
@@ -159,9 +143,18 @@ pub const fn to_oklab(color: Color32) -> (f64, f64, f64) {
     let r = decode(sr);
     let g = decode(sg);
     let b = decode(sb);
-    let l = cbrt(0.412_221_470_8 * r + 0.536_332_536_3 * g + 0.051_445_992_9 * b);
-    let m = cbrt(0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b);
-    let s = cbrt(0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b);
+    let l = nth_root(
+        0.412_221_470_8 * r + 0.536_332_536_3 * g + 0.051_445_992_9 * b,
+        3,
+    );
+    let m = nth_root(
+        0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b,
+        3,
+    );
+    let s = nth_root(
+        0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b,
+        3,
+    );
     (
         0.210_454_255_3 * l + 0.793_617_785_0 * m - 0.004_072_046_8 * s,
         1.977_998_495_1 * l - 2.428_592_205_0 * m + 0.450_593_709_9 * s,
@@ -194,22 +187,11 @@ pub const fn oklab_lerp(from: Color32, to: Color32, t: f32) -> Color32 {
 
 const fn premultiply(c: Color32, alpha: f64) -> Color32 {
     Color32::from_rgba_premultiplied(
-        scale_channel(c.r(), alpha),
-        scale_channel(c.g(), alpha),
-        scale_channel(c.b(), alpha),
-        scale_channel(255, alpha),
+        round_u8(c.r() as f64 * alpha),
+        round_u8(c.g() as f64 * alpha),
+        round_u8(c.b() as f64 * alpha),
+        round_u8(255.0 * alpha),
     )
-}
-
-const fn scale_channel(v: u8, alpha: f64) -> u8 {
-    let s = v as f64 * alpha + 0.5;
-    if s <= 0.0 {
-        0
-    } else if s >= 255.0 {
-        255
-    } else {
-        s as u8
-    }
 }
 
 macro_rules! oklch_colors {
@@ -230,7 +212,7 @@ macro_rules! oklch_colors {
 const DARK_L: f64 = 0.75;
 const DARK_C: f64 = 0.12;
 
-/// Light theme: yellow binds — brighter cannot clear 4.5:1 contrast.
+/// Light-theme text: yellow binds, since brighter cannot clear 4.5:1 contrast.
 const LIGHT_L: f64 = 0.52;
 const LIGHT_C: f64 = 0.11;
 
@@ -259,10 +241,9 @@ oklch_colors! {
     const LIGHT_BLUE = (LIGHT_L, LIGHT_C, HUE_BLUE);
 }
 
-/// One theme's colors, named by hue rather than by job — each carries
-/// several: red = keyword/invalid, orange = manual idle/caution/staged,
-/// yellow = indexing, green = extracting/operator/valid, blue =
-/// done/argument/commit controls.
+/// One theme's colors, named by hue because each has several jobs: red =
+/// keyword/invalid, orange = manual idle/caution/staged, yellow = indexing,
+/// green = extracting/operator/valid, blue = done/argument/commit controls.
 pub struct Palette {
     pub red: Color32,
     pub orange: Color32,
@@ -295,10 +276,10 @@ pub fn palette(dark_mode: bool) -> Palette {
 
 // --- Plain text ---
 
-/// egui's stock text greys read thin on its own panel fills: 5.1:1 in dark,
-/// 7.6:1 in light. Both themes get a step, applied to *both* styles at once —
-/// styling only the live theme reverts to egui's the moment the color scheme
-/// is switched.
+/// Darkens (light theme) or lightens (dark theme) egui's text greys, which
+/// read thin on its own panel fills (5.1:1 in dark, 7.6:1 in light). Applied
+/// to both styles at once: styling only the live theme reverts to egui's the
+/// moment the color scheme is switched.
 pub fn apply_text_contrast(ctx: &egui::Context) {
     ctx.all_styles_mut(|style| {
         // Body text is the noninteractive stroke; button and widget labels

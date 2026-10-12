@@ -4,19 +4,10 @@ use crate::config::Config;
 use crate::extract::{Registry, Scratch};
 use crate::mime::guess_mime_from_head;
 
+#[cfg(windows)]
+use super::counting::{count_tree_entries_walkdir, count_tree_entries_win32};
 use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-/// The removed `extract_scope_prepare`: the oversize sweep, then the count.
-fn extract_scope_prepare(
-    conn_mutex: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
-    cursor: &ExtractCursor,
-    config: &Config,
-) -> Result<ExtractScope, String> {
-    let conn = crate::lock_ok(conn_mutex);
-    super::mark_oversize_pending_na(&conn, cursor, config)?;
-    super::count_extract_scope(&conn, cursor, config)
-}
 
 fn tmp(tag: &str) -> std::path::PathBuf {
     crate::testutil::scratch_dir(tag).join("tree")
@@ -50,14 +41,71 @@ fn the_bulk_directory_read_agrees_with_a_plain_walk() {
         std::fs::write(root.join(&name), b"x").unwrap();
         std::fs::write(root.join("a/b/c").join(&name), b"x").unwrap();
     }
+    // The longest name NTFS allows, read past the struct's `[u16; 1]`.
+    std::fs::write(root.join(format!("{}.txt", "n".repeat(251))), b"x").unwrap();
 
     let cancel = AtomicBool::new(false);
     let path = root.to_str().unwrap();
     let fast = count_tree_entries_win32(path, &cancel).unwrap();
     let plain = count_tree_entries_walkdir(path, &cancel).unwrap();
     assert_eq!(fast, plain, "the fast count must match a plain walk");
-    // 1200 files + `empty` + `a` + `a/b` + `a/b/c`.
-    assert_eq!(fast, 1204);
+    // 1201 files + `empty` + `a` + `a/b` + `a/b/c`.
+    assert_eq!(fast, 1205);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A junction back to the root is counted, not descended: following it
+/// loops. Windows-only, and not run in CI.
+#[cfg(windows)]
+#[test]
+fn a_junction_cycle_is_counted_but_not_descended() {
+    let root = tmp("count-junction");
+    std::fs::create_dir_all(root.join("real")).unwrap();
+    std::fs::write(root.join("real").join("target.txt"), b"x").unwrap();
+    // Junctions need no privileges, unlike Windows symlinks.
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(root.join("real").join("loop"))
+        .arg(&root)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !made {
+        std::fs::remove_dir_all(&root).ok();
+        return;
+    }
+
+    let cancel = AtomicBool::new(false);
+    let path = root.to_str().unwrap();
+    let fast = count_tree_entries_win32(path, &cancel).unwrap();
+    // `real`, `real/target.txt` and the junction itself.
+    assert_eq!(fast, 3);
+    assert_eq!(fast, count_tree_entries_walkdir(path, &cancel).unwrap());
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A directory whose path is past MAX_PATH opens through the verbatim form.
+/// Windows-only, and not run in CI.
+#[cfg(windows)]
+#[test]
+fn entries_past_max_path_are_counted() {
+    let root = tmp("count-long");
+    let deep = root
+        .join("a".repeat(120))
+        .join("b".repeat(120))
+        .join("c".repeat(120));
+    // std adds the verbatim prefix itself to a path this long.
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("leaf.txt"), b"x").unwrap();
+
+    let cancel = AtomicBool::new(false);
+    let path = root.to_str().unwrap();
+    let fast = count_tree_entries_win32(path, &cancel).unwrap();
+    // Three directories and the file in the deepest.
+    assert_eq!(fast, 4);
+    assert_eq!(fast, count_tree_entries_walkdir(path, &cancel).unwrap());
 
     std::fs::remove_dir_all(&root).ok();
 }
@@ -95,14 +143,14 @@ fn count_cancelled_returns_promptly() {
         "cancellation took {:?}",
         elapsed
     );
-    // The token is observational only — nothing resets it.
+    // The token is observational only: nothing resets it.
     assert!(cancel.load(Ordering::Relaxed));
 }
 
 /// If these two ever disagree, a file the walk wrote off as NA would
 /// silently never be full-text indexed.
 #[test]
-fn content_extractable_is_decide_contents_not_applicable() {
+fn content_extractable_agrees_with_decide_content() {
     let root = tmp("extractable");
     std::fs::create_dir_all(&root).unwrap();
     let mut cfg = Config::default();
@@ -155,6 +203,37 @@ fn content_extractable_is_decide_contents_not_applicable() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The walk writes a dehydrated file's row NA, but a content reconcile, a
+/// retry or an interrupted run can make it pending again, so the content
+/// pass asks the disk too. Windows-only, and not run in CI.
+#[cfg(windows)]
+#[test]
+fn a_file_marked_offline_is_never_read_by_the_content_pass() {
+    let root = tmp("offline");
+    std::fs::create_dir_all(&root).unwrap();
+    let p = root.join("notes.txt");
+    std::fs::write(&p, b"sphinx of black quartz").unwrap();
+    let path = p.to_str().unwrap();
+    let cfg = Config::default();
+    let registry = Registry::default_set();
+    let mime = Some("text/plain");
+    let decide = || decide_content(path, mime, &registry, &cfg, &mut Scratch::new(&cfg));
+    assert!(
+        matches!(decide(), ContentOutcome::Done { .. }),
+        "hydrated, the same file extracts"
+    );
+
+    crate::testutil::mark_offline(&p).unwrap();
+    let meta = std::fs::metadata(&p).unwrap();
+    let record = prepare_file_record(path, &meta, &cfg, &registry, &mut Scratch::new(&cfg))
+        .expect("a placeholder is still a regular file");
+    assert!(!record.needs_content, "the walk writes it NA");
+    assert!(record.hash.is_none(), "and never opens it to hash");
+    assert_eq!(decide(), ContentOutcome::NotApplicable);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn prepare_file_record_marks_only_claimable_files() {
     let root = tmp("claimable");
@@ -203,8 +282,8 @@ fn prepare_file_record_marks_only_claimable_files() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The number the manage-index tab shows as the extraction denominator,
-/// measured where `indexing.rs` measures it.
+/// The number the manage-index tab shows as the extraction denominator, as a
+/// run measures it: the writer's oversize sweep, then the pass's count.
 #[test]
 fn extract_scope_counts_only_files_an_extractor_claims() {
     let root = tmp("denominator");
@@ -213,7 +292,7 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
     db.set_extension("sqlite");
 
     // 4 files an extractor claims (README via the text sniff), 5 it never
-    // will — the unclaimed set gets NUL bodies.
+    // will: the unclaimed set gets NUL bodies.
     let claimed = ["a.txt", "b.json", "c.mp3", "README"];
     let unclaimed = ["d.mp4", "e.zip", "f.bin", "g.exe", "h"];
     for name in claimed.iter() {
@@ -237,13 +316,19 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
         .collect();
 
     let conn_mutex = Arc::new(Mutex::new(
-        crate::db::open_or_recreate(db.to_str().unwrap(), "trigram").unwrap(),
+        crate::db::open_or_recreate(db.to_str().unwrap(), &Default::default()).unwrap(),
     ));
     let stop = Arc::new(AtomicBool::new(false));
-    process_batch_inserts(&conn_mutex, &records, &stop, &config).unwrap();
+    process_batch_inserts(
+        &conn_mutex,
+        &records,
+        &stop,
+        &mut crate::db::repo::DocEncoder::new().unwrap(),
+    )
+    .unwrap();
 
-    let cursor = ExtractCursor::for_root(root.to_str().unwrap());
-    let scope = extract_scope_prepare(&conn_mutex, &cursor, &config).unwrap();
+    let range = RootRange::for_root(root.to_str().unwrap());
+    let scope = extract_scope_prepare(&conn_mutex, &range, &config).unwrap();
 
     // The three small text files were finished inline by the walk; the mp3
     // needs the disk pass. Either way the denominator is the claimed set.
@@ -265,9 +350,9 @@ fn extract_scope_counts_only_files_an_extractor_claims() {
     std::fs::remove_file(&db).ok();
 }
 
-/// A `find` that fails writes nothing, and `wc -l` prints `0` and exits
-/// *successfully* — checking only the terminal process reported a tree of
-/// zero entries and kept the non-GNU `-printf` fallback from ever running.
+/// A `find` that fails writes nothing and `wc -l` prints `0`. That zero is
+/// the error, since `find` always prints its start point, and on Linux it is
+/// what sends a `find` without `-printf` to the plain listing.
 #[test]
 #[cfg(unix)]
 fn a_failing_find_is_an_error_not_a_count_of_zero() {
@@ -281,8 +366,35 @@ fn a_failing_find_is_an_error_not_a_count_of_zero() {
     );
 }
 
-/// An empty directory really does count zero — the error above must not be
-/// bought by calling every small answer a failure.
+/// GNU `find` exits 1 after one unreadable subdirectory, having listed the
+/// rest of the tree: that is a count, not a failure.
+#[test]
+fn an_unreadable_subdirectory_costs_only_its_own_entries() {
+    let root = tmp("count-unreadable");
+    let sealed = root.join("sealed");
+    std::fs::create_dir_all(sealed.join("inner")).unwrap();
+    std::fs::write(root.join("a.txt"), b"x").unwrap();
+    std::fs::write(sealed.join("b.txt"), b"x").unwrap();
+
+    match crate::platform::deny_read(&sealed) {
+        // Root reads it anyway, and then there is nothing to prove.
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+        denied => denied.unwrap(),
+    }
+    let cancel = AtomicBool::new(false);
+    let result = count_tree_entries_fast(root.to_str().unwrap(), &cancel);
+    crate::platform::restore_read(&sealed).unwrap();
+    std::fs::remove_dir_all(&root).ok();
+
+    // `a.txt` and `sealed` itself; Unix's `find` also lists the root.
+    assert_eq!(result, Ok(if cfg!(windows) { 2 } else { 3 }));
+}
+
+/// An empty directory is a count, not the error above: Unix's `find` lists
+/// the root itself, and Windows counts only the entries inside it.
 #[test]
 fn an_empty_tree_still_counts() {
     let root = tmp("count-empty");

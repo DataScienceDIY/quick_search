@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 fn a_fresh_draft_is_not_dirty() {
-    let mut w = SettingsTab::new();
+    let mut w = SettingsTab::default();
     let cfg = Config::default();
     assert!(!w.is_dirty(&cfg), "no draft at all");
     w.stage(&cfg);
@@ -14,7 +14,7 @@ fn a_fresh_draft_is_not_dirty() {
 
 #[test]
 fn an_edited_draft_is_dirty_until_discarded() {
-    let mut w = SettingsTab::new();
+    let mut w = SettingsTab::default();
     let cfg = Config::default();
     w.stage(&cfg);
     w.draft.as_mut().unwrap().search.debounce_ms += 100;
@@ -27,7 +27,7 @@ fn an_edited_draft_is_dirty_until_discarded() {
 /// The stale copies of live-config fields in the draft are not edits.
 #[test]
 fn live_security_and_mode_changes_are_not_dirty() {
-    let mut w = SettingsTab::new();
+    let mut w = SettingsTab::default();
     let mut cfg = Config::default();
     w.stage(&cfg);
     cfg.security.use_keychain = !cfg.security.use_keychain;
@@ -35,11 +35,37 @@ fn live_security_and_mode_changes_are_not_dirty() {
     assert!(!w.is_dirty(&cfg));
 }
 
+/// The watch-cap modal's OK and the tour's dismissal can land while the tab
+/// is open; neither is an edit, and the draft must not carry them back.
+#[test]
+fn a_watch_cap_acknowledgement_does_not_dirty_the_draft() {
+    let mut w = SettingsTab::default();
+    let mut cfg = Config::default();
+    cfg.paths.indexing_paths = vec!["/data".to_string()];
+    w.stage(&cfg);
+
+    cfg.ui.watch_cap_warned_roots.push("/data".to_string());
+    assert!(!w.is_dirty(&cfg), "the OK read as an unsaved edit");
+    cfg.ui.tutorial_seen = Some(true);
+    assert!(
+        !w.is_dirty(&cfg),
+        "the tour's dismissal read as an unsaved edit"
+    );
+
+    // A real edit still counts, with both acknowledgements standing.
+    w.draft.as_mut().unwrap().search.debounce_ms += 100;
+    assert!(w.is_dirty(&cfg));
+    let mut applied = w.draft_config().expect("a draft");
+    crate::app::pin_live_fields(&mut applied, &cfg);
+    assert_eq!(applied.ui.watch_cap_warned_roots, ["/data"]);
+    assert_eq!(applied.ui.tutorial_seen, Some(true));
+}
+
 /// Without the restage, an edit made on Manage Index in between would be
-/// reverted by a later Apply — `pin_live_fields` does not cover the filters.
+/// reverted by a later Apply: `pin_live_fields` does not cover the filters.
 #[test]
 fn a_draft_is_restaged_from_the_live_config_after_leaving() {
-    let mut w = SettingsTab::new();
+    let mut w = SettingsTab::default();
     let mut cfg = Config::default();
     w.stage(&cfg);
     w.discard();
@@ -57,7 +83,7 @@ fn a_draft_is_restaged_from_the_live_config_after_leaving() {
 /// A key capture in progress cannot outlive the tab.
 #[test]
 fn leaving_the_tab_ends_a_shortcut_capture() {
-    let mut w = SettingsTab::new();
+    let mut w = SettingsTab::default();
     let cfg = Config::default();
     w.stage(&cfg);
     w.capturing_hotkey = true;
@@ -65,7 +91,22 @@ fn leaving_the_tab_ends_a_shortcut_capture() {
     assert!(!w.capturing_hotkey());
 }
 
-use crate::test_ui::{click_at, painted_text, painted_text_center};
+use crate::test_ui::{
+    click_at, hover_shows, instant_tooltips, key_press, painted_text, painted_text_center,
+    run_panel,
+};
+
+/// One frame of `draw` at `size`, with the no-tofu check every test here gets.
+fn run(
+    ctx: &egui::Context,
+    size: egui::Vec2,
+    events: Vec<egui::Event>,
+    draw: impl FnMut(&mut egui::Ui),
+) -> egui::FullOutput {
+    let out = run_panel(ctx, size, events, draw);
+    crate::test_ui::assert_no_tofu(ctx, &out);
+    out
+}
 
 /// Outside the tab's scroll area so it is never below the fold.
 fn run_hotkey_edit(
@@ -74,14 +115,9 @@ fn run_hotkey_edit(
     capturing: &mut bool,
     events: Vec<egui::Event>,
 ) -> egui::FullOutput {
-    let input = crate::test_ui::raw_input(egui::vec2(600.0, 200.0), events);
-    let out = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            hotkey_edit(ui, setting, capturing);
-        });
-    });
-    crate::test_ui::assert_no_tofu(ctx, &out);
-    out
+    run(ctx, egui::vec2(600.0, 200.0), events, |ui| {
+        hotkey_edit(ui, setting, capturing);
+    })
 }
 
 fn run_color_scheme_edit(
@@ -89,14 +125,9 @@ fn run_color_scheme_edit(
     setting: &mut String,
     events: Vec<egui::Event>,
 ) -> egui::FullOutput {
-    let input = crate::test_ui::raw_input(egui::vec2(600.0, 200.0), events);
-    let out = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            color_scheme_edit(ui, setting);
-        });
-    });
-    crate::test_ui::assert_no_tofu(ctx, &out);
-    out
+    run(ctx, egui::vec2(600.0, 200.0), events, |ui| {
+        color_scheme_edit(ui, setting);
+    })
 }
 
 /// What the dropdown shows and what it stores are not the same string.
@@ -133,16 +164,6 @@ fn an_unknown_scheme_reads_as_dark() {
     }
 }
 
-fn press(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
-    vec![egui::Event::Key {
-        key,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers,
-    }]
-}
-
 const CTRL_ALT: egui::Modifiers = egui::Modifiers {
     alt: true,
     ctrl: true,
@@ -175,7 +196,7 @@ fn the_shortcut_button_binds_what_was_pressed() {
         &ctx,
         &mut setting,
         &mut capturing,
-        press(egui::Key::G, CTRL_ALT),
+        key_press(egui::Key::G, CTRL_ALT),
     );
     assert_eq!(setting, "Ctrl+Alt+G");
     assert!(!capturing, "a bound press ends the capture");
@@ -192,7 +213,7 @@ fn capture_ignores_what_it_cannot_bind_and_escape_cancels() {
         &ctx,
         &mut setting,
         &mut capturing,
-        press(egui::Key::G, egui::Modifiers::NONE),
+        key_press(egui::Key::G, egui::Modifiers::NONE),
     );
     assert_eq!(setting, "Ctrl+Shift+F", "a bare key binds nothing");
     assert!(capturing, "and does not end the capture");
@@ -201,7 +222,7 @@ fn capture_ignores_what_it_cannot_bind_and_escape_cancels() {
         &ctx,
         &mut setting,
         &mut capturing,
-        press(egui::Key::Escape, egui::Modifiers::NONE),
+        key_press(egui::Key::Escape, egui::Modifiers::NONE),
     );
     assert_eq!(setting, "Ctrl+Shift+F", "Escape leaves the shortcut alone");
     assert!(!capturing);
@@ -227,123 +248,36 @@ fn clear_switches_the_shortcut_off() {
 #[test]
 fn an_unapplied_shortcut_says_it_is_not_in_force_yet() {
     let ctx = crate::test_ui::ctx();
-    let run = |draft: &str, live: &str| {
-        let input = crate::test_ui::raw_input(egui::vec2(600.0, 200.0), vec![]);
-        let out = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| hotkey_note(ui, draft, live));
+    let note = |draft: &str, live: &str| {
+        let out = run(&ctx, egui::vec2(600.0, 200.0), vec![], |ui| {
+            hotkey_note(ui, draft, live)
         });
         painted_text(&out).join("\n")
     };
-    assert!(run("Ctrl+Alt+K", "Ctrl+Shift+F").contains("Apply and Save"));
+    assert!(note("Ctrl+Alt+K", "Ctrl+Shift+F").contains("Apply & Save"));
     // Matching, and nothing registered in a test process.
-    assert_eq!(run("Ctrl+Shift+F", "Ctrl+Shift+F"), "");
+    assert_eq!(note("Ctrl+Shift+F", "Ctrl+Shift+F"), "");
 }
 
 /// Every row with the tip it must show and who it is for, so a wrong tooltip
 /// is impossible and the everyday/advanced split is written down once.
+#[rustfmt::skip]
 const ROWS: &[(Section, &str, &tips::Tip, Level)] = &[
-    (
-        Section::Indexing,
-        "Full reindex every",
-        &tips::REINDEX_INTERVAL,
-        Level::Advanced,
-    ),
-    (
-        Section::Indexing,
-        "Follow symlinks",
-        &tips::FOLLOW_SYMLINKS,
-        Level::Advanced,
-    ),
-    (
-        Section::Indexing,
-        "Include hidden files",
-        &tips::INCLUDE_HIDDEN,
-        Level::Everyday,
-    ),
-    (
-        Section::Processing,
-        "Tokenizer",
-        &tips::TOKENIZER,
-        Level::Advanced,
-    ),
-    (
-        Section::Processing,
-        "Hash sample size (bytes)",
-        &tips::HASH_LENGTH,
-        Level::Advanced,
-    ),
-    (
-        Section::Processing,
-        "Max stored text (bytes)",
-        &tips::MAX_STORED_TEXT,
-        Level::Advanced,
-    ),
-    (
-        Section::Processing,
-        "Max text file size (bytes)",
-        &tips::MAX_TEXT_FILE_SIZE,
-        Level::Advanced,
-    ),
-    (
-        Section::Processing,
-        "Batch size",
-        &tips::BATCH_SIZE,
-        Level::Advanced,
-    ),
-    (
-        Section::Processing,
-        "Max WAL size (bytes)",
-        &tips::MAX_WAL_SIZE,
-        Level::Advanced,
-    ),
-    (
-        Section::Processing,
-        "Store text for snippets",
-        &tips::STORE_TEXT,
-        Level::Everyday,
-    ),
-    (
-        Section::Search,
-        "Fuzzy search ON by default",
-        &tips::FUZZY_DEFAULT,
-        Level::Everyday,
-    ),
-    (
-        Section::Search,
-        "Fuzzy edit distance",
-        &tips::FUZZY_EDITS,
-        Level::Advanced,
-    ),
-    (
-        Section::Search,
-        "Display limit",
-        &tips::DISPLAY_LIMIT,
-        Level::Advanced,
-    ),
-    (
-        Section::Search,
-        "Stream batch size",
-        &tips::RESULTS_PER_PAGE,
-        Level::Advanced,
-    ),
-    (
-        Section::Search,
-        "Debounce (ms)",
-        &tips::DEBOUNCE,
-        Level::Advanced,
-    ),
-    (
-        Section::Search,
-        "Live results",
-        &tips::LIVE_RESULTS,
-        Level::Everyday,
-    ),
-    (
-        Section::Search,
-        "Search cache MiB (0 = auto)",
-        &tips::SEARCH_CACHE,
-        Level::Advanced,
-    ),
+    (Section::Indexing, "Full reindex every", &tips::REINDEX_INTERVAL, Level::Advanced),
+    (Section::Indexing, "Include hidden files", &tips::INCLUDE_HIDDEN, Level::Everyday),
+    (Section::Processing, "Hash sample size (bytes)", &tips::HASH_LENGTH, Level::Advanced),
+    (Section::Processing, "Max stored text (bytes)", &tips::MAX_STORED_TEXT, Level::Advanced),
+    (Section::Processing, "Max text file size (bytes)", &tips::MAX_TEXT_FILE_SIZE, Level::Advanced),
+    (Section::Processing, "Batch size", &tips::BATCH_SIZE, Level::Advanced),
+    (Section::Processing, "Max WAL size (bytes)", &tips::MAX_WAL_SIZE, Level::Advanced),
+    (Section::Processing, "Compact text index", &tips::COMPACT_INDEX, Level::Everyday),
+    (Section::Search, "Fuzzy search ON by default", &tips::FUZZY_DEFAULT, Level::Everyday),
+    (Section::Search, "Fuzzy edit distance", &tips::FUZZY_EDITS, Level::Advanced),
+    (Section::Search, "Display limit", &tips::DISPLAY_LIMIT, Level::Advanced),
+    (Section::Search, "Stream batch size", &tips::RESULTS_PER_PAGE, Level::Advanced),
+    (Section::Search, "Debounce (ms)", &tips::DEBOUNCE, Level::Advanced),
+    (Section::Search, "Live results", &tips::LIVE_RESULTS, Level::Everyday),
+    (Section::Search, "Search cache MiB (0 = auto)", &tips::SEARCH_CACHE, Level::Advanced),
 ];
 
 /// Rendered without the tab's scroll area so nothing sits below the fold, and
@@ -352,38 +286,23 @@ const ROWS: &[(Section, &str, &tips::Tip, Level)] = &[
 fn every_row_shows_its_own_tip() {
     for (section, label, tip, _) in ROWS {
         let ctx = crate::test_ui::ctx();
-        ctx.style_mut(|s| {
-            s.interaction.tooltip_delay = 0.0;
-            s.interaction.show_tooltips_only_when_still = false;
-        });
+        instant_tooltips(&ctx);
         let mut cfg = Config::default();
-        let form = Form { advanced: true };
-        let mut run = |events: Vec<egui::Event>| {
-            let input = crate::test_ui::raw_input(egui::vec2(600.0, 800.0), events);
-            ctx.run(input, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    config_editor_ui(ui, &mut cfg, *section, None, form)
-                });
+        let mut frame = |events| {
+            run_panel(&ctx, egui::vec2(600.0, 800.0), events, |ui| {
+                config_editor_ui(ui, &mut cfg, *section, None, Form { advanced: true })
             })
         };
 
-        let first = run(vec![]);
-        let pos =
-            painted_text_center(&first, label).unwrap_or_else(|| panic!("{label} was not painted"));
-
+        let pos = painted_text_center(&frame(vec![]), label)
+            .unwrap_or_else(|| panic!("{label} was not painted"));
         // Enough of the body to be unique.
         let opening: String = tip.body.chars().take(40).collect();
-        let mut out = run(vec![egui::Event::PointerMoved(pos)]);
-        let mut found = false;
-        for _ in 0..3 {
-            // The tooltip is its own area, so it can land a frame late.
-            if painted_text(&out).join("\n").contains(&opening) {
-                found = true;
-                break;
-            }
-            out = run(vec![]);
-        }
-        assert!(found, "hovering {label:?} did not show {:?}", tip.title);
+        assert!(
+            hover_shows(&mut frame, pos, &opening),
+            "hovering {label:?} did not show {:?}",
+            tip.title
+        );
     }
 }
 
@@ -391,11 +310,9 @@ fn every_row_shows_its_own_tip() {
 #[test]
 fn hovering_a_setting_label_explains_it() {
     let ctx = crate::test_ui::ctx();
-    ctx.style_mut(|s| {
-        s.interaction.tooltip_delay = 0.0;
-        s.interaction.show_tooltips_only_when_still = false;
-    });
-    // Tokenizer is an advanced row, so the whole tab has to be showing them.
+    instant_tooltips(&ctx);
+    // Hash sample size is an advanced row, so the whole tab has to be
+    // showing them.
     let cfg = Config {
         ui: quicksearch_core::config::UiConfig {
             show_advanced_settings: true,
@@ -403,66 +320,42 @@ fn hovering_a_setting_label_explains_it() {
         },
         ..Config::default()
     };
-    let mut w = SettingsTab::new();
-
-    let run = |w: &mut SettingsTab, events: Vec<egui::Event>| {
-        let input = crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), events);
-        ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                w.ui(ui, &cfg, None);
-            });
+    let mut w = SettingsTab::default();
+    let mut frame = |events| {
+        run_panel(&ctx, egui::vec2(1000.0, 900.0), events, |ui| {
+            w.ui(ui, &cfg, None);
         })
     };
 
-    let full = run(&mut w, vec![]);
-    let target =
-        painted_text_center(&full, "Tokenizer").expect("the Tokenizer label was not painted");
-
-    let mut out = run(&mut w, vec![egui::Event::PointerMoved(target)]);
-    for _ in 0..3 {
-        let painted = painted_text(&out).join("\n");
-        if painted.contains(crate::tips::TOKENIZER.title)
-            && painted.contains("cut up so that it can be")
-        {
-            return;
-        }
-        out = run(&mut w, vec![]);
-    }
-    panic!("no tooltip appeared over the Tokenizer label");
+    let target = painted_text_center(&frame(vec![]), "Hash sample size (bytes)")
+        .expect("the Hash sample size label was not painted");
+    assert!(
+        hover_shows(&mut frame, target, "How many bytes from the start"),
+        "no tooltip appeared over the Hash sample size label"
+    );
 }
 
 #[test]
 fn the_tab_renders_and_apply_reports_the_draft() {
     let ctx = crate::test_ui::ctx();
     let cfg = Config::default();
-    let mut w = SettingsTab::new();
+    let mut w = SettingsTab::default();
     w.stage(&cfg);
     w.draft.as_mut().unwrap().search.debounce_ms += 100;
 
-    let run = |w: &mut SettingsTab, events: Vec<egui::Event>| {
-        let input = crate::test_ui::raw_input(egui::vec2(1000.0, 900.0), events);
+    let frame = |w: &mut SettingsTab, events| {
         let mut out = SettingsOutput::default();
-        let full = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| out = w.ui(ui, &cfg, None));
+        let full = run(&ctx, egui::vec2(1000.0, 900.0), events, |ui| {
+            out = w.ui(ui, &cfg, None)
         });
-        crate::test_ui::assert_no_tofu(&ctx, &full);
         (out, full)
     };
 
-    let (untouched, full) = run(&mut w, vec![]);
+    let (untouched, full) = frame(&mut w, vec![]);
     assert!(untouched.applied.is_none());
     let target = painted_text_center(&full, "Apply & Save")
         .expect("the Apply & Save button was not painted");
-    let clicks = [true, false]
-        .into_iter()
-        .map(|pressed| egui::Event::PointerButton {
-            pos: target,
-            button: egui::PointerButton::Primary,
-            pressed,
-            modifiers: egui::Modifiers::default(),
-        })
-        .collect();
-    let (clicked, _) = run(&mut w, clicks);
+    let (clicked, _) = frame(&mut w, click_at(target));
     let applied = clicked.applied.expect("the click did not report a config");
     assert_eq!(
         applied.search.debounce_ms,
@@ -476,14 +369,10 @@ fn run_columns(
     current: &ColumnsConfig,
     events: Vec<egui::Event>,
 ) -> (Option<ColumnsConfig>, egui::FullOutput) {
-    let input = crate::test_ui::raw_input(egui::vec2(700.0, 200.0), events);
     let mut picked = None;
-    let full = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            picked = columns_ui(ui, current);
-        });
+    let full = run(ctx, egui::vec2(700.0, 200.0), events, |ui| {
+        picked = columns_ui(ui, current);
     });
-    crate::test_ui::assert_no_tofu(ctx, &full);
     (picked, full)
 }
 
@@ -536,14 +425,10 @@ fn run_security(
     current: &Config,
     events: Vec<egui::Event>,
 ) -> (Option<SecurityAction>, egui::FullOutput) {
-    let input = crate::test_ui::raw_input(egui::vec2(700.0, 300.0), events);
     let mut action = None;
-    let full = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            action = security_ui(ui, current, false, Form { advanced: true });
-        });
+    let full = run(ctx, egui::vec2(700.0, 300.0), events, |ui| {
+        action = security_ui(ui, current, false, Form { advanced: true });
     });
-    crate::test_ui::assert_no_tofu(ctx, &full);
     (action, full)
 }
 
@@ -559,7 +444,7 @@ fn the_key_button_appears_only_while_the_index_is_encrypted() {
 
     let (_, full) = run_security(&ctx, &cfg, vec![]);
     assert!(
-        painted_text_center(&full, "Show database key…").is_none(),
+        painted_text_center(&full, "Show database key").is_none(),
         "offered the key of an unencrypted index: {:?}",
         painted_text(&full)
     );
@@ -567,7 +452,7 @@ fn the_key_button_appears_only_while_the_index_is_encrypted() {
     cfg.security.password_protected = true;
     let (_, full) = run_security(&ctx, &cfg, vec![]);
     assert!(
-        painted_text_center(&full, "Show database key…").is_some(),
+        painted_text_center(&full, "Show database key").is_some(),
         "no key button while encrypted: {:?}",
         painted_text(&full)
     );
@@ -587,7 +472,7 @@ fn clicking_the_key_button_reports_show_key() {
 
     let (quiet, full) = run_security(&ctx, &cfg, vec![]);
     assert!(quiet.is_none(), "reported an action nobody clicked");
-    let target = painted_text_center(&full, "Show database key…").expect("no key button");
+    let target = painted_text_center(&full, "Show database key").expect("no key button");
 
     let (action, _) = run_security(&ctx, &cfg, click_at(target));
     assert_eq!(action, Some(SecurityAction::ShowKey));
@@ -596,7 +481,7 @@ fn clicking_the_key_button_reports_show_key() {
 /// The assertion that `app::pin_live_fields` covers the columns field.
 #[test]
 fn a_stale_draft_cannot_revert_the_columns() {
-    let mut w = SettingsTab::new();
+    let mut w = SettingsTab::default();
     let mut cfg = Config::default();
     w.stage(&cfg);
 
@@ -639,14 +524,14 @@ fn the_search_cache_hint_explains_the_automatic_value() {
     // came from.
     cfg.security.password_protected = true;
     let keyed = search_cache_hint(&cfg, Some(200_000)).expect("a hint");
-    assert!(keyed.contains("32 MiB"), "{}", keyed);
+    assert!(keyed.contains("28 MiB"), "{}", keyed);
     assert!(keyed.contains("200,000"), "{}", keyed);
 
     // Encrypted and past it: says so, and says what the index actually wants,
     // or the override cannot be found by the people who need it.
     let capped = search_cache_hint(&cfg, Some(2_000_000)).expect("a hint");
     assert!(
-        capped.contains("128 MiB") && capped.contains("320 MiB"),
+        capped.contains("192 MiB") && capped.contains("286 MiB"),
         "the capped hint must name both the cap and the want: {}",
         capped
     );
@@ -663,14 +548,9 @@ fn advanced_rows_are_hidden_until_asked_for() {
         let form = Form { advanced };
         let mut shown = Vec::new();
         for section in [Section::Indexing, Section::Processing, Section::Search] {
-            let out = ctx.run(
-                crate::test_ui::raw_input(egui::vec2(600.0, 800.0), vec![]),
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        config_editor_ui(ui, &mut cfg, section, None, form)
-                    });
-                },
-            );
+            let out = run_panel(&ctx, egui::vec2(600.0, 800.0), vec![], |ui| {
+                config_editor_ui(ui, &mut cfg, section, None, form)
+            });
             let text = painted_text(&out).join("\n");
             for (row_section, label, _, _) in ROWS {
                 if *row_section == section && text.contains(*label) {
@@ -706,12 +586,47 @@ fn advanced_rows_are_hidden_until_asked_for() {
     );
 }
 
+/// The byte fields are shown grouped: their values run to eight and ten
+/// digits, where a misplaced zero is invisible. Everything else in the form
+/// counts files or milliseconds and stays plain, the other half of the
+/// assertion: the grouping is scoped to the fields that needed it.
+#[test]
+fn only_the_byte_fields_are_shown_with_thousands_separators() {
+    let ctx = crate::test_ui::ctx();
+    let mut cfg = Config::default();
+    // The top of its range, so the plain rendering is long enough that a
+    // separator would show up if one were being inserted.
+    cfg.processing.batch_size = 100_000;
+    let out = run_panel(&ctx, egui::vec2(600.0, 800.0), vec![], |ui| {
+        config_editor_ui(
+            ui,
+            &mut cfg,
+            Section::Processing,
+            None,
+            Form { advanced: true },
+        )
+    });
+    let text = painted_text(&out).join("\n");
+
+    // Hash sample size, max stored text, max text file size, max WAL size.
+    for grouped in ["8,192", "262,144", "52,428,800", "2,147,483,648"] {
+        assert!(
+            text.contains(grouped),
+            "{grouped} is not on screen; the byte fields read: {text}"
+        );
+    }
+    assert!(
+        text.contains("100000") && !text.contains("100,000"),
+        "batch size counts files, not bytes, and must stay plain: {text}"
+    );
+}
+
 /// Revealing a setting is not editing one: the toggle writes through
 /// `SettingsOutput` and must never make the tab read as dirty, or looking at
 /// an advanced setting would demand an Apply.
 #[test]
 fn showing_advanced_settings_is_not_an_unsaved_edit() {
-    let mut w = SettingsTab::new();
+    let mut w = SettingsTab::default();
     let mut cfg = Config::default();
     assert!(!cfg.ui.show_advanced_settings, "hidden by default");
     w.stage(&cfg);
@@ -729,19 +644,101 @@ fn showing_advanced_settings_is_not_an_unsaved_edit() {
     );
 }
 
+/// Each registration state gets its sentence; only a real failure (and not
+/// Windows' expected .lnk contention) earns the warning colour.
+#[test]
+fn the_hotkey_status_lines_match_their_states() {
+    use crate::hotkey::Status;
+    assert_eq!(super::hotkey_status_line(Status::Active), None);
+    assert_eq!(super::hotkey_status_line(Status::Disabled), None);
+    let (owned, err) = super::hotkey_status_line(Status::SystemOwned).expect("a line");
+    assert!(owned.contains("starts QuickSearch when closed"), "{owned}");
+    assert!(!err, "SystemOwned is the working state, not a warning");
+    let (desktop, err) = super::hotkey_status_line(Status::DesktopOnly).expect("a line");
+    assert!(desktop.contains("Set up system shortcut"), "{desktop}");
+    assert!(!err, "DesktopOnly is a pointer, not a failure");
+    let (error, err) =
+        super::hotkey_status_line(Status::Error("taken".to_string())).expect("a line");
+    assert!(error.contains("taken"));
+    assert_eq!(err, !cfg!(windows), "only non-Windows colours the failure");
+}
+
+/// The painted text of the shortcut note for `setting` on `desktop`.
+fn shortcut_note_text(
+    ctx: &egui::Context,
+    setting: &str,
+    desktop: crate::shortcut_setup::Desktop,
+) -> String {
+    let out = run_panel(ctx, egui::vec2(700.0, 300.0), vec![], |ui| {
+        super::shortcut_note_for(ui, setting, desktop)
+    });
+    painted_text(&out).join("\n")
+}
+
 /// The panel that tells a user how to get a shortcut that also starts
-/// QuickSearch has to actually show the command they must bind.
+/// QuickSearch has to show the command they must bind, with or without a
+/// one-click desktop to lean on.
 #[test]
 fn the_shortcut_note_names_the_command_to_bind() {
     let ctx = crate::test_ui::ctx();
-    let input = crate::test_ui::raw_input(egui::vec2(700.0, 300.0), vec![]);
-    let out = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| super::shortcut_note(ui));
-    });
-    let painted = painted_text(&out).join("\n");
+    let painted = shortcut_note_text(
+        &ctx,
+        "Ctrl+Shift+F",
+        crate::shortcut_setup::Desktop::Unsupported,
+    );
     assert!(
         painted.contains("--toggle"),
         "the command to bind was not shown: {painted}"
     );
     assert!(painted.contains("Copy"), "no way to copy it: {painted}");
+}
+
+/// On a desktop we can write, the note leads with the one-click button (the
+/// probe is skipped by seeding the cached state, so the test stays
+/// hermetic), and the manual command stays as the fallback.
+#[test]
+fn a_supported_desktop_gets_the_one_click_button() {
+    let ctx = crate::test_ui::ctx();
+    let note_when_installed = |installed: bool| {
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new("system-shortcut-state"),
+                super::SystemShortcutState {
+                    installed,
+                    feedback: None,
+                },
+            )
+        });
+        shortcut_note_text(&ctx, "Ctrl+Shift+F", crate::shortcut_setup::Desktop::Gnome)
+    };
+
+    let painted = note_when_installed(false);
+    assert!(
+        painted.contains("Set up Ctrl+Shift+F system-wide"),
+        "no one-click button: {painted}"
+    );
+    assert!(
+        painted.contains("--toggle"),
+        "the fallback vanished: {painted}"
+    );
+
+    // Already installed: the button flips to removal.
+    let painted = note_when_installed(true);
+    assert!(painted.contains("Remove"), "no removal offered: {painted}");
+}
+
+/// No usable binding means nothing to write: the one-click flow bows out
+/// even on a supported desktop.
+#[test]
+fn no_binding_means_no_one_click_button() {
+    let ctx = crate::test_ui::ctx();
+    let painted = shortcut_note_text(&ctx, "", crate::shortcut_setup::Desktop::Gnome);
+    assert!(
+        !painted.contains("system-wide"),
+        "offered to bind nothing: {painted}"
+    );
+    assert!(
+        painted.contains("--toggle"),
+        "the manual flow vanished: {painted}"
+    );
 }

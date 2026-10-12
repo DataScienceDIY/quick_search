@@ -1,6 +1,7 @@
 //! Configuration: TOML file, resolution rules, filter sets, and live-update
-//! classification. A portable `config.toml` beside the executable wins over
-//! the XDG location; relative paths inside it resolve against its directory.
+//! classification. A portable `config.toml` beside the executable, if it is
+//! a QuickSearch config, wins over the XDG location; relative paths inside it
+//! resolve against its directory.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -13,7 +14,7 @@ mod ignore;
 mod tests;
 
 pub use diff::{diff_actions, nested_roots, ConfigActions, IndexWork};
-pub use ignore::IgnoreSet;
+pub use ignore::{glob_literal, IgnoreSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -26,7 +27,8 @@ pub struct Config {
     pub duplicates: DuplicatesConfig,
     pub ui: UiConfig,
     pub security: SecurityConfig,
-    /// File this config was loaded from; `save()` writes back to it.
+    /// File this config was loaded from; `save()` writes back to it, and
+    /// refuses when this is `None` ([`Config::fallback`]).
     #[serde(skip)]
     pub source: Option<PathBuf>,
 }
@@ -34,15 +36,16 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PathConfig {
-    /// Directory roots to index; duplicates and nested roots are de-duplicated
-    /// at run time.
+    /// Directory roots to index. A run is refused if two resolve to the same
+    /// or nested folders ([`nested_roots`]). A root may itself be a link;
+    /// links inside one are never followed.
     pub indexing_paths: Vec<String>,
     /// SQLite index location. Relative values resolve against the config
     /// file's directory; `~` expands to the home directory.
     pub database_path: String,
 }
 
-/// What to index and when — the knobs the coordinator and walker consume.
+/// What to index and when: the knobs the coordinator and walker consume.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct IndexingConfig {
@@ -50,15 +53,14 @@ pub struct IndexingConfig {
     /// `reindex_interval_minutes`. `false`: nothing runs until the user asks.
     pub auto_index: bool,
     pub reindex_interval_minutes: u64,
-    pub follow_symlinks: bool,
     pub include_hidden: bool,
-    /// Empty = extract content from everything supported. Non-empty = only
-    /// these extensions get content extraction/FTS; everything else is still
-    /// listed for filename search. Case-insensitive, leading dot optional;
-    /// [`EXTENSIONLESS`] whitelists extension-less files; `#` starts a
-    /// comment. Applied at walk time, so a change forces a rebuild.
+    /// Empty = extract text from every supported format; otherwise only these
+    /// extensions (case-insensitive, leading dot optional, `#` comments,
+    /// [`EXTENSIONLESS`] for none). Other files stay listed for filename
+    /// search. A change reconciles stored text in place
+    /// ([`IndexWork::reconcile_content`]).
     pub content_extensions: Vec<String>,
-    /// Excluded from the index entirely — never even listed. A pattern
+    /// Excluded from the index entirely, never even listed. A pattern
     /// without `/` matches any single path component (so `.git` prunes
     /// whole subtrees); one containing `/` matches the full path. Glob
     /// syntax (`*`, `?`, `[..]`).
@@ -73,43 +75,53 @@ pub struct IndexingConfig {
 #[serde(default)]
 pub struct ProcessingConfig {
     /// Bytes read from the head of each new or changed file: the identity
-    /// hash window, the MIME sniff window, and the inline-extract cap.
-    /// Changing it invalidates stored hashes and forces a rebuild.
-    /// 8192 is measured (`examples/hashprobe.rs`); don't retune casually.
+    /// hash window, the MIME sniff window, and the inline-extract cap. Also
+    /// the tail the Duplicates tab reads from each listed file
+    /// ([`crate::search::split_by_tail`]): at the default 8 KiB, head alone
+    /// misgroups 3.44% of 86k real files and head and tail 0.10%.
+    /// Changing it invalidates stored hashes and rebuilds the index: at once
+    /// in automatic mode, otherwise when confirmed or at the next run.
+    /// `examples/hashprobe.rs` measures what a different value would trade.
     pub hash_length: usize,
     pub maximum_text_size: usize,
     pub maximum_text_file_size: u64,
+    /// Rows per write batch in the indexer's writer and the reconciliation
+    /// scans. Read through [`ProcessingConfig::batch`], which holds it to
+    /// `1..=`[`MAX_BATCH_SIZE`].
     pub batch_size: usize,
     /// Writer time one root's turn may take before the round moves on, in
-    /// milliseconds — the bound on how long any one root can hold up the
-    /// others. `0` gives each turn one `batch_size` quantum and no more.
+    /// milliseconds: the bound on how long any one root can hold up the
+    /// others. `0` gives each turn one `batch_size` batch and no more.
     pub writer_turn_slice_ms: u64,
-    pub fts_update_batch_size: usize,
     /// How large the WAL may grow during a run before the indexer forces a
-    /// checkpoint, in bytes. `0` disables; else raised to [`MINIMUM_WAL_SIZE`].
-    /// Needed because autocheckpoint can only *reset* the log when no reader
-    /// is mid-query, and a run keeps a reader per root busy throughout.
-    ///
-    /// **Both directions cost something, which is why the default is neither
-    /// end of the range.** A checkpoint blocks the writer for its whole
-    /// copy-back and has to evict every per-root reader first, so a low value
-    /// stalls indexing often. A high one is paid by *readers*: SQLite searches
-    /// the log before every page it fetches from the database file, one hash
-    /// block per 4096 frames, and a page that is not in the log is charged for
-    /// all of them — so a larger log slows the walk prefetchers and every
-    /// search run alongside indexing. It also lengthens WAL recovery after an
-    /// unclean exit, which is read and checksummed frame by frame.
-    ///
-    /// The default trades toward fewer stalls; lower it if searching during a
-    /// run matters more than the run finishing quickly.
+    /// checkpoint, in bytes; `0` disables, else raised to [`MINIMUM_WAL_SIZE`].
+    /// Autocheckpoint alone cannot reset the log while a run keeps a reader
+    /// per root busy. A low value stalls the writer on checkpoints; a high one
+    /// slows every reader, which searches the log (one hash block per 4096
+    /// frames) before each page it fetches, and lengthens crash recovery.
+    /// User-facing guidance is in `config_example.toml`.
     pub maximum_wal_size: u64,
-    pub tokenize: String,
-    /// When `true` (default), extracted text is stored zstd-compressed in
-    /// `documents_text` for snippet previews. When `false` queries return the
-    /// same hits, but results carry no snippets, can't be case-verified or
-    /// occurrence-ranked, and fuzzy full-text search is unavailable.
-    pub store_text_for_snippets: bool,
+    /// When `true` (default), the full-text index keeps no word positions
+    /// (FTS5 `detail=none`): a term is looked up as the AND of its trigrams
+    /// and the full-text pass drops the documents where they are not
+    /// adjacent, against the stored text. Several times smaller and faster
+    /// to build, at the cost of checking more candidates per search; see
+    /// [`crate::db::schema::fts_create_sql`] for the measurements.
+    pub compact_text_index: bool,
 }
+
+impl ProcessingConfig {
+    /// [`ProcessingConfig::batch_size`] held to `1..=`[`MAX_BATCH_SIZE`]:
+    /// zero would panic `chunks`, and each user checks its deadline only once
+    /// per batch, so a hand-edited huge value would be a stall as long.
+    pub fn batch(&self) -> usize {
+        self.batch_size.clamp(1, MAX_BATCH_SIZE)
+    }
+}
+
+/// The largest [`ProcessingConfig::batch_size`] in effect, and the top of the
+/// settings form's range.
+pub const MAX_BATCH_SIZE: usize = 100_000;
 
 /// Floor on a non-zero [`ProcessingConfig::maximum_wal_size`]: a checkpoint
 /// waits on running searches, so a cap that fires every round stalls the
@@ -127,22 +139,23 @@ pub struct SearchConfig {
     /// Whether the fuzzy stages start enabled.
     pub fuzzy_default: bool,
     /// Ceiling on the fuzzy stages' Levenshtein budget, which grows with the
-    /// term (one edit per three characters) up to this cap. 0 disables the
-    /// fuzzy stages; above [`FUZZY_EDITS_WARN_ABOVE`] the GUI and CLI warn.
+    /// term (one edit per three bytes) up to this cap, and never past the hard
+    /// cap of [`crate::search::fuzzy::MAX_FUZZY_EDITS`]. 0 disables the fuzzy
+    /// stages; above [`FUZZY_EDITS_WARN_ABOVE`] the GUI and CLI warn.
     pub fuzzy_max_edits: usize,
     /// Hard cap on buffered/displayed results per search.
     pub display_limit: usize,
-    /// Streaming batch size — how many hits per update event.
+    /// Streaming batch size: how many hits per update event.
     pub results_per_page: usize,
     pub debounce_ms: u64,
     /// Watch the visible search results and show renames, deletions and
     /// content changes as they happen. See [`crate::live`].
     pub live_results: bool,
-    /// Page cache held by the search connection, in MiB. **`0` derives it from
-    /// the index** — see [`crate::db::schema::recommended_search_cache_mib`],
-    /// which sizes it to hold the `files` table because that is what every
-    /// keystroke rescans. Set it only when the derived value is wrong for your
-    /// tree; the GUI shows the recommendation next to the field.
+    /// Page cache held by the search connection, in MiB. `0` derives it from
+    /// the index ([`crate::db::schema::recommended_search_cache_mib`] sizes it
+    /// to hold the `files` table every keystroke rescans). Set it only when
+    /// the derived value is wrong for your tree; the GUI shows the
+    /// recommendation next to the field.
     pub cache_size_mib: usize,
     pub columns: ColumnsConfig,
 }
@@ -174,7 +187,7 @@ impl Default for ColumnsConfig {
 }
 
 /// What the Duplicates tab lists. Nothing here changes what is indexed or
-/// what a search finds — a file excluded from the duplicate listing is still
+/// what a search finds: a file excluded from the duplicate listing is still
 /// in the index and still turns up in results.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -184,13 +197,16 @@ pub struct DuplicatesConfig {
     /// is not counted, and a group left with fewer than two members is not
     /// listed at all.
     pub exclude_patterns: Vec<String>,
-    /// Content hashes of groups dismissed with "Hide this group", lowercase
-    /// hex — see [`crate::search::DuplicateGroup::hash_hex`]. Keyed by hash
-    /// rather than by path so a hidden group stays hidden when its files are
-    /// renamed or moved, and comes back when their contents change.
+    /// Identities of groups dismissed with "Hide this group": head hash then
+    /// tail digest, lowercase hex (see
+    /// [`crate::search::DuplicateGroup::identity`]). Keyed by content rather
+    /// than by path so a hidden group stays hidden when its files are renamed
+    /// or moved, and comes back when their contents change. Anything else,
+    /// such as the head hash alone that earlier versions saved, is dropped
+    /// when the config loads.
     ///
-    /// The hash covers `processing.hash_length` bytes, so changing that
-    /// setting (which rebuilds the index anyway) strands every entry here.
+    /// Both cover `processing.hash_length` bytes, so changing that setting
+    /// (which rebuilds the index anyway) strands every entry here.
     pub hidden_groups: Vec<String>,
 }
 
@@ -212,8 +228,8 @@ impl SearchConfig {
 impl Default for PathConfig {
     fn default() -> Self {
         PathConfig {
-            indexing_paths: vec![default_home_path()],
-            database_path: default_db_path().to_string_lossy().into_owned(),
+            indexing_paths: default_roots(crate::platform::home_dir()),
+            database_path: database_path_setting(default_db_path()),
         }
     }
 }
@@ -223,7 +239,6 @@ impl Default for IndexingConfig {
         IndexingConfig {
             auto_index: true,
             reindex_interval_minutes: 60,
-            follow_symlinks: false,
             include_hidden: false,
             content_extensions: Vec::new(),
             ignore_patterns: default_ignore_patterns(),
@@ -237,13 +252,11 @@ impl Default for ProcessingConfig {
         ProcessingConfig {
             hash_length: 1024 * 8,
             maximum_text_size: 1024 * 256,
-            maximum_text_file_size: 1024 * 1024 * 2,
+            maximum_text_file_size: 1024 * 1024 * 50,
             batch_size: 500,
             writer_turn_slice_ms: 100,
-            fts_update_batch_size: 1000,
             maximum_wal_size: 1024 * 1024 * 1024 * 2,
-            tokenize: "trigram".to_string(),
-            store_text_for_snippets: true,
+            compact_text_index: true,
         }
     }
 }
@@ -264,8 +277,8 @@ impl Default for SearchConfig {
     }
 }
 
-/// Index encryption. The password itself is never stored anywhere — only
-/// the KDF salt lives here, and it is not a secret (it makes the derivation
+/// Index encryption. The password itself is never stored anywhere: only the
+/// KDF salt lives here, and it is not a secret (it makes the derivation
 /// unique per install, nothing more).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -283,8 +296,8 @@ pub struct SecurityConfig {
 }
 
 impl SecurityConfig {
-    /// The decoded salt. An error means the config is unusable for unlocking
-    /// — surfaced to the user, never guessed around.
+    /// The decoded salt. An error means the config is unusable for unlocking,
+    /// and is surfaced to the user, never guessed around.
     pub fn salt_bytes(&self) -> Result<[u8; crate::security::SALT_LEN], String> {
         match &self.salt {
             None => Err(
@@ -319,14 +332,8 @@ pub struct UiConfig {
     /// file down with it.
     pub color_scheme: String,
     /// Whether the Settings tab shows the technical settings as well as the
-    /// everyday ones. Off is the default: most of that tab is byte budgets and
-    /// indexer internals that a person who indexed their home folder will
-    /// never need, and cannot evaluate without already knowing how the indexer
-    /// works.
-    ///
-    /// A view preference, not a setting the rest of the program reads — it is
-    /// written the moment the box is ticked, without an Apply, the way the
-    /// column picker is.
+    /// everyday ones; off by default. A view preference, written the moment
+    /// the box is ticked, without an Apply, like the column picker.
     pub show_advanced_settings: bool,
     /// Whether the first-start tour has been dismissed. `None` means the key
     /// predates the tour, so only a config this version *created* is offered
@@ -334,7 +341,7 @@ pub struct UiConfig {
     ///
     /// The field-level `default` is load-bearing: the struct-level
     /// `#[serde(default)]` would fill a missing field from
-    /// `UiConfig::default()` — `Some(false)`, handing every upgrading
+    /// `UiConfig::default()`, i.e. `Some(false)`, handing every upgrading
     /// installation the tour. This one fills it with `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tutorial_seen: Option<bool>,
@@ -374,68 +381,127 @@ fn default_ignore_patterns() -> Vec<String> {
     patterns.into_iter().map(str::to_string).collect()
 }
 
-fn default_home_path() -> String {
-    if let Some(home) = crate::platform::home_dir() {
-        return home.to_string_lossy().into_owned();
-    }
-    ".".to_string()
+/// Whether `id` is shaped like [`crate::search::DuplicateGroup::identity`]:
+/// two SHA-256 digests, head then tail, as 128 lowercase hex digits.
+fn is_group_identity(id: &str) -> bool {
+    id.len() == 128 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// The home directory, else `.`. A home whose name is not valid Unicode
+/// gives no root: the walk skips such paths silently, and a lossy spelling
+/// must never become a database key.
+fn default_roots(home: Option<std::ffi::OsString>) -> Vec<String> {
+    match home {
+        Some(home) => home.into_string().into_iter().collect(),
+        None => vec![".".to_string()],
+    }
+}
+
+/// Beside the file the user launched, which for an AppImage is the
+/// `.AppImage` and not the binary inside its mount.
 fn portable_config_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
+    let exe = crate::platform::launched_exe()?;
     Some(exe.parent()?.join("config.toml"))
 }
 
-fn config_base_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        if let Some(d) = std::env::var_os("APPDATA") {
-            return PathBuf::from(d);
+/// The top-level tables of a config file, one per section of [`Config`].
+const CONFIG_TABLES: [&str; 7] = [
+    "paths",
+    "indexing",
+    "processing",
+    "search",
+    "duplicates",
+    "ui",
+    "security",
+];
+
+/// Whether the file at `path` is a QuickSearch config. A portable config
+/// sits wherever the binary does, for an AppImage often `~/Downloads`, where
+/// another program's `config.toml` would otherwise be adopted and then
+/// overwritten by the next save. So a file is passed over, with a warning,
+/// only when it is TOML with a top-level key outside [`CONFIG_TABLES`]. One
+/// that can't be read or doesn't parse is still ours: its load fails with
+/// the usual error, so a typo never silently swaps a portable user's
+/// settings for the per-user ones. A missing file, or a directory by the
+/// name, is not one.
+fn is_quicksearch_config(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(table) = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Table>(&text).ok())
+    else {
+        return true;
+    };
+    match table.keys().find(|k| !CONFIG_TABLES.contains(&k.as_str())) {
+        None => true,
+        Some(key) => {
+            crate::log_warn!(
+                "{} is another program's: QuickSearch has no `{}`; using the per-user config instead",
+                path.display(),
+                key
+            );
+            false
         }
     }
-    if let Some(d) = std::env::var_os("XDG_CONFIG_HOME") {
-        let p = PathBuf::from(d);
-        if p.is_absolute() {
-            return p;
-        }
-    }
-    if let Some(home) = crate::platform::home_dir() {
-        return PathBuf::from(home).join(".config");
-    }
-    PathBuf::from(".")
 }
 
-fn data_base_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        if let Some(d) = std::env::var_os("LOCALAPPDATA") {
+/// The per-user base directory: `%win_var%` on Windows, else an absolute
+/// `$xdg_var`, else `home_rel` under the home directory, else `.`.
+fn user_base_dir(win_var: &str, xdg_var: &str, home_rel: &[&str]) -> PathBuf {
+    if cfg!(windows) {
+        if let Some(d) = std::env::var_os(win_var) {
             return PathBuf::from(d);
         }
     }
-    if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
-        let p = PathBuf::from(d);
-        if p.is_absolute() {
-            return p;
-        }
+    if let Some(p) = std::env::var_os(xdg_var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return p;
     }
-    if let Some(home) = crate::platform::home_dir() {
-        return PathBuf::from(home).join(".local").join("share");
+    match crate::platform::home_dir() {
+        Some(home) => home_rel
+            .iter()
+            .fold(PathBuf::from(home), |p, part| p.join(part)),
+        None => PathBuf::from("."),
     }
-    PathBuf::from(".")
 }
 
 /// Default index location when the config doesn't name one.
 pub fn default_db_path() -> PathBuf {
-    data_base_dir().join("quicksearch").join("index.sqlite")
+    user_base_dir("LOCALAPPDATA", "XDG_DATA_HOME", &[".local", "share"])
+        .join("quicksearch")
+        .join("index.sqlite")
+}
+
+/// `path` as the `database_path` setting. A data folder whose name is not
+/// valid Unicode gives the relative `index.sqlite`, which [`Config::resolve`]
+/// puts beside the config file: a lossy spelling would name another file.
+/// Logged once per process, as defaults are built often.
+fn database_path_setting(path: PathBuf) -> String {
+    path.into_os_string().into_string().unwrap_or_else(|raw| {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| {
+            crate::log_warn!(
+                "The data folder in {:?} is not valid Unicode; the index goes beside the config file instead",
+                raw
+            );
+        });
+        "index.sqlite".to_string()
+    })
 }
 
 /// Expand a leading `~` to the home directory; `~user` forms are untouched.
+/// Extra separators after the tilde are dropped: pushed as they are, `~//x`
+/// would be the absolute `/x` and replace the home directory.
 fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" || path.starts_with("~/") || path.starts_with("~\\") {
         if let Some(home) = crate::platform::home_dir() {
             let mut p = PathBuf::from(home);
             if path.len() > 2 {
-                p.push(&path[2..]);
+                p.push(path[2..].trim_start_matches(std::path::is_separator));
             }
             return p;
         }
@@ -444,22 +510,43 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 impl Config {
-    /// The portable override next to the binary when present, else the XDG
-    /// location.
+    /// The portable override next to the binary when that is a QuickSearch
+    /// config ([`is_quicksearch_config`]), else the XDG location. Decided
+    /// once per process, so every caller (the `--toggle` socket is keyed by
+    /// this path) agrees, and a refusal is logged once.
     pub fn config_path() -> PathBuf {
-        if let Some(p) = portable_config_path() {
-            if p.exists() {
-                return p;
-            }
+        static PORTABLE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        let portable =
+            PORTABLE.get_or_init(|| portable_config_path().filter(|p| is_quicksearch_config(p)));
+        match portable {
+            Some(p) => p.clone(),
+            None => user_base_dir("APPDATA", "XDG_CONFIG_HOME", &[".config"])
+                .join("quicksearch")
+                .join("config.toml"),
         }
-        config_base_dir().join("quicksearch").join("config.toml")
     }
 
     pub fn load() -> Result<Self, String> {
         Self::load_from(&Self::config_path())
     }
 
+    /// What runs when the config file fails to load: the defaults, made
+    /// inert. No `source`, so [`Self::save`] refuses and the file stays as
+    /// the user left it. No roots, so every run is refused and nothing
+    /// reconciles the stored index against a root the user never chose. No
+    /// tour, whose dismissal would save. Search still answers from the index
+    /// at the default location.
+    pub fn fallback() -> Config {
+        let mut cfg = Config::default();
+        cfg.indexing.auto_index = false;
+        cfg.paths.indexing_paths.clear();
+        cfg.ui.tutorial_seen = None;
+        cfg
+    }
+
     /// Load from an explicit path; a missing file is created with defaults.
+    /// Ignore patterns are compiled here, so a bad one fails the load like a
+    /// TOML error does, instead of failing the indexer's start later.
     pub fn load_from(path: &Path) -> Result<Self, String> {
         if path.exists() {
             let content = fs::read_to_string(path)
@@ -473,6 +560,17 @@ impl Config {
             for warning in cfg.clamp_out_of_range() {
                 crate::log_warn!("config: {}", warning);
             }
+            let hidden = cfg.duplicates.hidden_groups.len();
+            cfg.duplicates.hidden_groups.retain(|id| is_group_identity(id));
+            if cfg.duplicates.hidden_groups.len() < hidden {
+                crate::log_warn!(
+                    "config: dropped {} hidden duplicate group(s) that are not a head and tail \
+                     identity (saved by an older version); hide them again if they come back",
+                    hidden - cfg.duplicates.hidden_groups.len()
+                );
+            }
+            IgnoreSet::compile(&cfg.indexing.ignore_patterns)
+                .map_err(|e| format!("Invalid ignore pattern in {}: {}", path.display(), e))?;
             Ok(cfg)
         } else {
             let cfg = Config {
@@ -484,76 +582,70 @@ impl Config {
         }
     }
 
-    /// Bring values that would break the program back into range, returning a
-    /// line about each one changed. Clamps, never rejects: a typo must not
-    /// stop the app starting. Only fields *not* already defended at their use
-    /// sites appear here.
+    /// Bring numbers that would break the program back into range, returning
+    /// a line about each one changed. Numeric fields are clamped, never
+    /// rejected: a typo in one must not stop the app starting. Only fields
+    /// *not* already defended at their use sites appear here.
     fn clamp_out_of_range(&mut self) -> Vec<String> {
         let mut warnings = Vec::new();
-        let mut clamp = |name: &str, value: &mut u64, lo: u64, hi: u64| {
-            let bounded = (*value).clamp(lo, hi);
-            if bounded != *value {
-                warnings.push(format!(
-                    "{} is {}, which is out of range; using {}",
-                    name, *value, bounded
-                ));
-                *value = bounded;
-            }
-        };
+        let w = &mut warnings;
 
         // Zero would make every search return nothing: `cascade::run` stops
         // before its first pass.
-        let mut display_limit = self.search.display_limit as u64;
-        clamp("[search] display_limit", &mut display_limit, 1, 1_000_000);
-        self.search.display_limit = display_limit as usize;
+        clamp_field(
+            w,
+            "[search] display_limit",
+            &mut self.search.display_limit,
+            1,
+            1_000_000,
+        );
 
         // 0 is the automatic setting and must survive the clamp; anything else
-        // is held to the range the sweep found useful — under the floor is
+        // is held to the range the sweep found useful: under the floor is
         // slower than automatic would be, over the cap is resident memory for
         // nothing.
         if self.search.cache_size_mib != 0 {
-            let mut cache = self.search.cache_size_mib as u64;
-            clamp(
+            clamp_field(
+                w,
                 "[search] cache_size_mib",
-                &mut cache,
-                crate::db::schema::SEARCH_CACHE_MIN_MIB as u64,
-                crate::db::schema::SEARCH_CACHE_OVERRIDE_MAX_MIB as u64,
+                &mut self.search.cache_size_mib,
+                crate::db::schema::SEARCH_CACHE_MIN_MIB as usize,
+                crate::db::schema::SEARCH_CACHE_OVERRIDE_MAX_MIB as usize,
             );
-            self.search.cache_size_mib = cache as usize;
         }
 
-        clamp(
+        clamp_field(
+            w,
             "[processing] maximum_text_file_size",
             &mut self.processing.maximum_text_file_size,
             1,
             4 * 1024 * 1024 * 1024,
         );
 
-        // Not just the stored text: it is what the extractors size their
-        // buffers from (`extract::Limits`), and those are held per worker
-        // across pools. 16 MiB is far above any document worth full-text
-        // indexing whole and keeps the derived inflation budget sane.
-        let mut text_size = self.processing.maximum_text_size as u64;
-        clamp(
+        // Not just the stored text: the extractors size their buffers from it
+        // (`extract::Limits`), and those are held per worker across pools.
+        // 16 MiB is far above any document worth full-text indexing whole and
+        // keeps the derived inflation budget sane.
+        clamp_field(
+            w,
             "[processing] maximum_text_size",
-            &mut text_size,
+            &mut self.processing.maximum_text_size,
             1,
             16 * 1024 * 1024,
         );
-        self.processing.maximum_text_size = text_size as usize;
 
         // Below 262 bytes `infer`'s longest magic-number matcher cannot run.
-        let mut hash_length = self.processing.hash_length as u64;
-        clamp(
+        clamp_field(
+            w,
             "[processing] hash_length",
-            &mut hash_length,
+            &mut self.processing.hash_length,
             262,
             1024 * 1024,
         );
-        self.processing.hash_length = hash_length as usize;
 
-        // Zero is meaningful (one quantum per turn) and stays legal.
-        clamp(
+        // Zero is meaningful (one batch per turn) and stays legal.
+        clamp_field(
+            w,
             "[processing] writer_turn_slice_ms",
             &mut self.processing.writer_turn_slice_ms,
             0,
@@ -563,11 +655,32 @@ impl Config {
         warnings
     }
 
-    /// Write back to the file this config was loaded from (or the default
-    /// location). Raw values are written verbatim — relative paths in a
-    /// portable config stay relative. Atomic: see the rename below.
+    /// Where [`Self::save`] writes: the file this config was loaded from.
+    /// Without one this is the [`Self::fallback`] for a file that failed to
+    /// load, and writing would replace that file with defaults. The message
+    /// names the file because the GUI shows one error at a time: the first
+    /// refused save replaces the load error there.
+    fn save_target(&self) -> Result<&Path, String> {
+        self.source.as_deref().ok_or_else(|| {
+            format!(
+                "Not saved: {} did not load; fix it and restart",
+                Self::config_path().display()
+            )
+        })
+    }
+
+    /// Whether [`Self::save`] can write at all: `false` for the
+    /// [`Self::fallback`] of a file that failed to load. For callers that must
+    /// not begin what only a save can finish.
+    pub fn can_save(&self) -> bool {
+        self.source.is_some()
+    }
+
+    /// Write back to the file this config was loaded from. Raw values are
+    /// written verbatim, so relative paths in a portable config stay
+    /// relative. Atomic: see the rename below.
     pub fn save(&self) -> Result<(), String> {
-        let path = self.source.clone().unwrap_or_else(Self::config_path);
+        let path = self.save_target()?;
         if let Some(dir) = path.parent() {
             crate::platform::create_dir_private(dir)
                 .map_err(|e| format!("Failed to create config dir {}: {}", dir.display(), e))?;
@@ -578,27 +691,27 @@ impl Config {
         // exists *only* in this file, so a config truncated mid-write is an
         // encrypted index that no password can ever open again. The `sync_all`
         // inside means the bytes are on disk before the name points at them.
-        let tmp = write_private_temp(&path, content.as_bytes()).map_err(|e| {
+        let tmp = write_private_temp(path, content.as_bytes()).map_err(|e| {
             format!(
                 "Failed to write config file beside {}: {}",
                 path.display(),
                 e
             )
         })?;
-        fs::rename(&tmp, &path).map_err(|e| {
+        fs::rename(&tmp, path).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             format!("Failed to replace config file {}: {}", path.display(), e)
         })?;
         // The rename is atomic but not durable: without a directory fsync a
-        // power cut just after can leave *neither* name — the salt loss the
+        // power cut just after can leave *neither* name, the salt loss the
         // whole dance exists to prevent. Best-effort; on Windows opening a
         // directory as a file fails (no `FILE_FLAG_BACKUP_SEMANTICS`) and is
-        // skipped — NTFS journals the rename itself.
+        // skipped, since NTFS journals the rename itself.
         if let Some(dir) = path.parent() {
             if let Ok(handle) = fs::File::open(dir) {
                 let _ = handle.sync_all();
             }
-            sweep_stale_temps(dir, &path);
+            sweep_stale_temps(dir, path);
         }
         Ok(())
     }
@@ -612,9 +725,11 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
-    /// `database_path` with `~` expanded and relative values resolved.
-    pub fn resolved_database_path(&self) -> PathBuf {
-        let p = expand_tilde(&self.paths.database_path);
+    /// `raw` with `~` expanded and a relative value resolved against the
+    /// config file's directory: where the walk looks for a root spelled
+    /// `raw`.
+    pub fn resolve(&self, raw: &str) -> PathBuf {
+        let p = expand_tilde(raw);
         if p.is_absolute() {
             p
         } else {
@@ -622,14 +737,21 @@ impl Config {
         }
     }
 
-    /// Whether `path` is the index itself — the database, one of SQLite's
+    /// `database_path` with `~` expanded and relative values resolved.
+    pub fn resolved_database_path(&self) -> PathBuf {
+        self.resolve(&self.paths.database_path)
+    }
+
+    /// Whether `path` is the index itself: the database, one of SQLite's
     /// `-wal`/`-shm`/`-journal` sidecars, or the instance lock. Guards paths
-    /// that arrive from a stale `files` row, not just from a walk (see
-    /// [`crate::file_handling::index_file_set`] for why opening one is fatal).
+    /// that arrive from a stale `files` row or a watcher event, not from a
+    /// walk (see [`crate::file_handling::index_file_set`] for why opening one
+    /// is fatal): the coordinator drops such events before they queue, and
+    /// `incremental::upsert_file` refuses one before opening it.
     ///
     /// Names are folded where the filesystem folds them
-    /// ([`crate::platform::PATHS_ARE_CASE_INSENSITIVE`]); ASCII only — SQLite's
-    /// `LIKE` folds ASCII only — matching [`IgnoreSet`].
+    /// ([`crate::platform::PATHS_ARE_CASE_INSENSITIVE`]), ASCII only, as
+    /// SQLite's `LIKE` and [`IgnoreSet`] fold.
     pub fn is_index_file(&self, path: &Path) -> bool {
         let db = self.resolved_database_path();
         let (Some(db_name), Some(name)) = (
@@ -645,18 +767,18 @@ impl Config {
                 a == b
             }
         };
-        // `str::get`, not `name[..cut]`: the cut is `db_name`'s *byte* length
-        // in an unrelated string, so it can land inside a multi-byte character
-        // and indexing there panics. A non-boundary is simply not a match.
-        let name_matches = same_name(name, db_name)
-            || crate::file_handling::INDEX_SIDECAR_SUFFIXES
-                .iter()
-                .any(|s| {
-                    let cut = db_name.len();
-                    name.len() == cut + s.len()
-                        && name.get(..cut).is_some_and(|head| same_name(head, db_name))
-                        && name.get(cut..).is_some_and(|tail| same_name(tail, s))
-                });
+        // The empty suffix is the database itself. `str::get`, not
+        // `name[..cut]`: the cut is `db_name`'s *byte* length in an unrelated
+        // string, so it can land inside a multi-byte character and indexing
+        // there panics. A non-boundary is simply not a match.
+        let cut = db_name.len();
+        let name_matches = std::iter::once("")
+            .chain(crate::file_handling::INDEX_SIDECAR_SUFFIXES)
+            .any(|s| {
+                name.len() == cut + s.len()
+                    && name.get(..cut).is_some_and(|head| same_name(head, db_name))
+                    && name.get(cut..).is_some_and(|tail| same_name(tail, s))
+            });
         if !name_matches {
             return false;
         }
@@ -673,15 +795,21 @@ impl Config {
         }
     }
 
-    /// `resolved_indexing_paths` canonicalized and spelled the way stored
-    /// parents are prefixed with them — the form roots must be compared in,
-    /// so a re-spelling is not a configuration change. Duplicates collapse,
-    /// order is not preserved.
+    /// Each configured root as spelled, paired with its normalized form: the
+    /// resolved path canonicalized and spelled the way stored parents are
+    /// prefixed with it, the form roots must be compared in.
+    pub fn indexing_roots(&self) -> impl Iterator<Item = (&String, String)> + '_ {
+        self.paths.indexing_paths.iter().map(|raw| {
+            let resolved = self.resolve(raw);
+            let root = crate::file_handling::normalize_root_string(&resolved.to_string_lossy());
+            (raw, root)
+        })
+    }
+
+    /// The normalized roots of [`Self::indexing_roots`], so a re-spelling is
+    /// not a configuration change. Duplicates collapse, order is not kept.
     pub fn normalized_indexing_paths(&self) -> BTreeSet<String> {
-        self.resolved_indexing_paths()
-            .iter()
-            .map(|p| crate::file_handling::normalize_root_string(&p.to_string_lossy()))
-            .collect()
+        self.indexing_roots().map(|(_, root)| root).collect()
     }
 
     /// `indexing_paths` with `~` expanded and relative values resolved.
@@ -689,14 +817,7 @@ impl Config {
         self.paths
             .indexing_paths
             .iter()
-            .map(|raw| {
-                let p = expand_tilde(raw);
-                if p.is_absolute() {
-                    p
-                } else {
-                    self.base_dir().join(p)
-                }
-            })
+            .map(|raw| self.resolve(raw))
             .collect()
     }
 }
@@ -705,7 +826,7 @@ impl Config {
 /// and return its path for the caller to rename into place.
 ///
 /// `create_new` and a unique name, not a fixed one: `O_NOFOLLOW` refuses a
-/// symlink but not a regular file or hardlink pre-created at the name — the
+/// symlink but not a regular file or hardlink pre-created at the name. The
 /// config directory is not always private (portable installs), and an
 /// attacker who pre-creates the temp file as a hardlink to a file they can
 /// read would be handed `[security].salt`.
@@ -786,14 +907,32 @@ fn sweep_stale_temps(dir: &Path, target: &Path) {
     }
 }
 
-/// Temp-name suffix. Does not need to be unpredictable — `create_new` is what
-/// makes the write safe — only unlikely to collide with a leftover.
+/// Temp-name suffix. Only needs to be unlikely to collide with a leftover,
+/// not unpredictable: `create_new` makes the write safe.
 fn unique_suffix() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     format!("{}-{}", std::process::id(), nanos)
+}
+
+/// Clamp `value` into `lo..=hi`, noting in `warnings` when it moved.
+fn clamp_field<T: Ord + Copy + std::fmt::Display>(
+    warnings: &mut Vec<String>,
+    name: &str,
+    value: &mut T,
+    lo: T,
+    hi: T,
+) {
+    let bounded = (*value).clamp(lo, hi);
+    if bounded != *value {
+        warnings.push(format!(
+            "{} is {}, which is out of range; using {}",
+            name, *value, bounded
+        ));
+        *value = bounded;
+    }
 }
 
 /// Reserved `content_extensions` entry standing for "files with no

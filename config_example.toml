@@ -1,255 +1,232 @@
 # QuickSearch configuration reference.
 #
-# The live config is auto-created at ~/.config/quicksearch/config.toml
-# (Windows: %APPDATA%\quicksearch\config.toml). A config.toml placed next
-# to the quicksearch binary overrides it entirely (portable mode).
-# Relative paths resolve against the directory containing the config
-# file, so a portable folder can be moved wholesale.
+# The live config is created at ~/.config/quicksearch/config.toml
+# (Windows: %APPDATA%\quicksearch\config.toml). A config.toml next to the
+# quicksearch binary, or the .AppImage, overrides it entirely (portable mode),
+# unless it holds a top-level table not listed below: another program's
+# config.toml in the same folder is passed over, with a warning in the log.
+# One that fails to parse is still taken, and shows its error in the app.
+# Relative paths resolve against the config file's directory, so a portable
+# folder can be moved wholesale.
 #
 # Every key is optional; missing keys take the defaults shown here.
 
 [paths]
-# One or more directory roots to index. Walked in order; duplicate and
-# nested roots are de-duplicated automatically. `~` expands to home.
-# Adding a folder reindexes to pick it up; removing one deletes its entries
-# and leaves the rest of the index alone. Order and spelling do not matter:
-# "~/docs", "/home/you/docs" and "/home/you/docs/" are one folder.
+# One or more folders to index; `~` expands to home. No two may be the same
+# folder or nested one inside the other: indexing pauses until the overlap is
+# removed. Adding a folder reindexes to pick it up; removing one deletes only
+# its entries. Order and spelling do not matter: "~/docs", "/home/you/docs"
+# and "/home/you/docs/" are one folder. A folder listed here may itself be a
+# symbolic link, but links inside it are never followed: to index what one
+# points at, list the target as a folder of its own.
 indexing_paths = ["~"]
-# SQLite index location. Default: ~/.local/share/quicksearch/index.sqlite
-# (Windows: %LOCALAPPDATA%\quicksearch\index.sqlite — write Windows paths
-# as TOML *literal* strings, single quotes, and keep the index out of a
-# roaming profile; it is far too large to synchronise). The file here is
-# created if missing, and replaced if it is an index from an older
-# QuickSearch layout; a SQLite database belonging to some other program
-# is refused with an error, and nothing is deleted.
+# The index file. Default: ~/.local/share/quicksearch/index.sqlite (Windows:
+# %LOCALAPPDATA%\quicksearch\index.sqlite). Write Windows paths as TOML
+# literal strings (single quotes), and keep the index out of a roaming
+# profile: it is far too large to sync. Created if missing and replaced if it
+# is an index from an older QuickSearch; a SQLite database belonging to
+# another program is refused with an error, and nothing is deleted.
 database_path = "~/.local/share/quicksearch/index.sqlite"
 
 [indexing]
-# The indexing mode. true = automatic: filesystem watchers apply changes a
-# couple of seconds after they happen, and a full reindex runs every
-# reindex_interval_minutes to cover whatever the watcher missed.
-# false = manual: nothing is indexed until you ask for it. The Stop and
-# Return to Automatic buttons on the Manage Index tab write this value, so
-# the mode you left the app in is the mode it starts in.
+# true = automatic: filesystem watchers apply changes a couple of seconds
+# after they happen, and a full reindex every reindex_interval_minutes
+# catches whatever they missed. false = manual: nothing is indexed until you
+# ask. The Manage Index tab's Stop and Return to Automatic buttons write this,
+# so the app starts in the mode you left it in.
 auto_index = true
 reindex_interval_minutes = 60
-# Follow symbolic links during directory walks. Applies to links pointing
-# at files as well as at directories: off, a symlink is not resolved at
-# all, so its target is never indexed — a target can live outside every
-# root listed above. A resolved target is stored under its own real path,
-# not the link's.
-follow_symlinks = false
-# Index hidden files and directories: dot-files everywhere, and
-# additionally anything carrying the Hidden attribute on Windows (AppData,
-# $RECYCLE.BIN, System Volume Information ...). The System attribute on
-# its own does not count — cloud sync roots carry it purely to get a
-# branded folder icon, and are indexed normally.
+# Index hidden files and directories: dot-files everywhere, plus anything with
+# the Hidden attribute on Windows (AppData, $RECYCLE.BIN, System Volume
+# Information ...). The System attribute alone does not count: cloud sync
+# roots carry it only for a branded folder icon, and are indexed normally.
 include_hidden = false
-# Empty = extract text from every supported format. Non-empty = content
-# indexing only for these extensions; other files are still listed for
-# filename search. Entries are case-insensitive, leading dot optional.
-# The reserved entry "(none)" whitelists files that have no extension at
-# all (Makefile, README, .bashrc); a non-empty list without it skips them.
-# Inside an entry, "#" starts a comment that runs to its end:
-#   content_extensions = ["txt", "md # docs", "# pdf — too slow", "(none)"]
-# Narrowing this drops the stored text of the files it now excludes;
-# widening it reindexes to extract the ones it now allows.
+# Extensions whose text is extracted; empty means every supported format.
+# Other files are still indexed by name. Case-insensitive, leading dot
+# optional; "(none)" includes files with no extension (Makefile, README,
+# .bashrc), which a non-empty list otherwise skips. "#" starts a comment
+# inside an entry:
+#   content_extensions = ["txt", "md # docs", "# pdf, too slow", "(none)"]
+# Narrowing drops stored text for newly excluded files; widening extracts the
+# newly allowed ones.
 content_extensions = []
-# Excluded from the index entirely. A pattern without a separator matches
-# any single path component (so ".git" prunes whole subtrees); patterns
-# containing one match full paths. Glob syntax (*, ?, [..]); a name
-# pattern must match the whole name, so ignoring an extension needs the
-# wildcard ("*.jpg"). Matching is case-insensitive on Windows and macOS.
-# The Windows defaults add "$RECYCLE.BIN", "System Volume Information",
-# "pagefile.sys", "hiberfil.sys", "swapfile.sys", "Thumbs.db" and
-# "desktop.ini"; when indexing a whole Windows drive, adding 'C:\Windows'
-# and 'C:\Windows\WinSxS' by hand is worthwhile. The index's own files
-# are always skipped and need no pattern here.
+# Excluded from the index entirely. A pattern without a separator matches any
+# single path component (so ".git" prunes whole subtrees); one with a
+# separator matches full paths. Glob syntax (*, ?, [..]); a name pattern must
+# match the whole name, so ignoring an extension needs the wildcard ("*.jpg").
+# Matching is case-insensitive on Windows and macOS. The Windows defaults add
+# "$RECYCLE.BIN", "System Volume Information", "pagefile.sys", "hiberfil.sys",
+# "swapfile.sys", "Thumbs.db" and "desktop.ini"; when indexing a whole Windows
+# drive, add 'C:\Windows' and 'C:\Windows\WinSxS' by hand. The index's own
+# files are always skipped.
 ignore_patterns = [".git", "node_modules", "*.tmp", ".venv", "venv"]
 
 # Walker threads per root, keyed by the exact root string from
 # indexing_paths. Absent or 0 = auto (4 on local storage, 16 on network
-# mounts, detected per root). Applies at the start of the next run.
+# mounts, detected per root). Applies from the next run. Set it for a share
+# that auto reads as local: on Linux, WebDAV (davfs2), rclone, GVfs, Ceph and
+# GlusterFS mounts, and a root that is an automount point not yet mounted.
 # root_workers = { "/media/share" = 24 }
 
 [processing]
-# Bytes read from the start of each file for its content hash,
-# `sha256(size || first hash_length bytes)`, which backs duplicate
-# detection; the same bytes are also the detection window for magic-byte
-# matching and the text sniff. Known limitation: files of identical size
-# whose heads match are reported as duplicates when they may not be —
-# verify from the Duplicates tab before deleting anything. 8192 is tuned;
-# raising it to 16384 is defensible, lowering it is not. Clamped to
-# 262..1048576 on load.
+# Bytes read from the start of each file to hash it (with its size) for
+# duplicate detection and to detect its type. Files of equal size with
+# identical heads hash alike: 3.4% of the files on a measured disk at 8192,
+# 1.6% at 16384. The Duplicates tab also reads this many bytes from the end
+# of each file it lists and splits apart files whose ends differ, which
+# brings those to 0.1% and 0.06%. Files that differ only in between are
+# still listed together, so verify on the Duplicates tab before deleting.
+# 8192 is the default; 16384 is also reasonable. Changing it rebuilds the
+# index. Clamped to 262..1048576.
 hash_length = 8192
-# Maximum extracted text stored per file (bytes).
+# Most extracted text stored per file (bytes). Clamped to 1..16777216.
 maximum_text_size = 262144
 # Files larger than this skip text extraction entirely (bytes). Clamped to
-# 1..4294967296 on load.
-maximum_text_file_size = 2097152
-# Files per batch during walks / inserts / extraction.
+# 1..4294967296.
+maximum_text_file_size = 52428800
+# Rows per database write batch when indexing and reconciling. Clamped to
+# 1..100000.
 batch_size = 500
-# Writer time one indexing root's turn may take before the round-robin
-# moves on (milliseconds), so a root extracting large documents cannot
-# leave another root's walkers parked behind it. 0 gives each turn one
-# batch_size quantum and no more. Clamped to 0..10000 on load.
+# Longest one root may hold the index writer per turn (ms), so a root
+# extracting large documents cannot stall another root's walk. 0 = one batch
+# per turn. Clamped to 0..10000.
 writer_turn_slice_ms = 100
-# Files per transaction for incremental FTS updates.
-fts_update_batch_size = 1000
-# How large the write-ahead log (index.sqlite-wal) may grow during an
-# indexing run before the indexer forces a checkpoint (bytes); left
-# alone, the log grows for the whole run. Not a safety knob: on a volume
-# short of space the indexer checkpoints sooner than asked and stops the
-# run with an error before the disk fills (which would kill the process
-# with SIGBUS through SQLite's mmap'd wal-index). 0 disables it; any
-# other value below 16777216 is raised to it.
+# How large the write-ahead log (index.sqlite-wal) may grow during an indexing
+# run before a checkpoint is forced (bytes). 0 disables the limit; any other
+# value below 16777216 is raised to it. On a nearly full volume the indexer
+# checkpoints sooner and stops with an error before the disk fills.
 #
-# Both directions cost. A checkpoint blocks indexing for its whole
-# copy-back, so a low value stalls the run often. A high one is paid by
-# readers instead: SQLite searches the log before every page it fetches
-# from the index, so a larger log slows searches running alongside a
-# run, and it lengthens recovery after a crash or a force-quit. The
-# default trades toward fewer stalls; lower it if searching while
-# indexing matters more than the run finishing quickly.
+# A checkpoint pauses indexing, so a low value stalls runs; a high one slows
+# searches that run alongside indexing and lengthens crash recovery. The
+# default favours faster runs.
 maximum_wal_size = 2147483648
-# FTS5 tokenizer: 'trigram' (substring matching, the default; gets
-# remove_diacritics 1 appended), 'unicode61', 'porter', or a full FTS5
-# option string. See https://www.sqlite.org/fts5.html#tokenizers
-tokenize = "trigram"
-# Store extracted text (zstd-compressed) alongside the FTS index. Off:
-# the index shrinks to roughly stock-Baloo size, but search loses snippet
-# previews, occurrence ranking, case verification, and fuzzy full-text.
-# Turning it off discards the stored text immediately; turning it on
-# re-extracts, because the text of files already indexed was never kept.
-store_text_for_snippets = true
+# Build the full-text index without word positions. Several times smaller
+# and faster to build (1.1 GiB of source code: a 219 MiB index instead of
+# 1.3 GiB, built in a third less time), and searches return exactly the same
+# files, because every candidate is checked against the stored text. The cost
+# is more candidates to check: searching contents for a word can take up to
+# twice as long, for a phrase of common words up to three times. Changing it
+# rebuilds the index.
+compact_text_index = true
 
 [security]
-# Encrypt the index with a password (SQLCipher). The password is asked
-# for every time QuickSearch starts; turning this on or off deletes and
-# rebuilds the index. Change it from the GUI (Settings → Security), not by
-# hand: enabling protection also generates the KDF salt below.
+# Encrypt the index with a password (SQLCipher). The password is asked for at
+# every start; turning this on or off deletes and rebuilds the index. Change
+# it from the GUI (Settings → Security), not by hand: enabling protection also
+# generates the KDF salt below.
 password_protected = false
-# Store the derived key in the OS keychain (Secret Service / KWallet on
-# Linux, Credential Manager on Windows) and skip the startup prompt.
+# Store the derived key in the OS keychain (Secret Service / KWallet on Linux,
+# Credential Manager on Windows) and skip the startup prompt.
 use_keychain = false
-# When a password is set, the app writes a `salt` value here (32 hex
-# digits). It is not a secret, but it is unique to your index: do not
-# create or edit it by hand, and keep it if you copy this file — the
-# password only unlocks the index together with its salt.
+# With a password set, the app writes a `salt` value here (32 hex digits). It
+# is not a secret, but it is unique to your index: do not create or edit it by
+# hand, and keep it if you copy this file, because the password unlocks the
+# index only together with its salt.
 
 [ui]
-# Zoom factor for the whole GUI: fonts, spacing, and widgets scale
-# together (0.5 – 2.5). Ctrl +/- and Ctrl 0 adjust it temporarily at
-# runtime; this value is the persistent baseline.
+# Zoom for the whole window (0.5 to 2.5): text, spacing and controls scale
+# together. Ctrl +/- and Ctrl 0 adjust it until the app closes; this is the
+# size it starts at.
 scale = 1.25
-# Written by QuickSearch, not by you: the folders that have already shown
-# the "more subfolders than the watcher can follow" warning, so restarting
-# does not repeat it. Deleting it just means the warnings come back once
-# each.
+# Written by QuickSearch: the folders that have already shown the "more
+# subfolders than the watcher can follow" warning, so a restart does not
+# repeat it. Deleting it just brings each warning back once.
 watch_cap_warned_roots = []
-# The shortcut QuickSearch claims for itself while it is running: brings it to
-# the front, switches to the Search tab and selects whatever is in the search
-# box. Modifiers are Ctrl, Alt and Shift, joined to one key with "+". Leave it
-# empty ("") for no shortcut. To start QuickSearch when it is closed, bind
-# "quicksearch --toggle" in your desktop's keyboard settings.
+# The shortcut QuickSearch claims while it is running: brings it to the front,
+# switches to the Search tab and selects the search text. Modifiers are Ctrl,
+# Alt and Shift, joined to one key with "+"; "" for none. To also start
+# QuickSearch when it is closed, use "Set up system shortcut" on the Settings
+# tab, or bind "quicksearch --toggle" in your desktop's keyboard settings.
 search_hotkey = "Ctrl+Shift+F"
-# 'dark' or 'light'; anything other than 'light' is dark. Applied as soon
-# as it is changed on the Settings tab. Following the desktop's own
-# light/dark setting would need the session's D-Bus settings portal, so it
-# is deliberately not offered.
+# 'dark' or 'light' (anything else means dark); applies as soon as it is
+# changed on the Settings tab.
 color_scheme = "dark"
-# Written by QuickSearch, not by you: whether the Settings tab shows the
-# technical settings alongside the everyday ones. The checkbox at the top of
-# that tab writes it immediately, without an Apply. Off, the tab hides the
-# byte budgets, the tokenizer, the database path and the other knobs whose
-# defaults suit almost every installation.
+# Written by QuickSearch: whether the Settings tab shows the technical
+# settings (byte budgets, the database path and the like) alongside the
+# everyday ones. The checkbox at the top of that tab writes it at once,
+# without an Apply.
 show_advanced_settings = false
-# Written by QuickSearch, not by you: whether the short introduction shown
-# on a brand-new installation has been dismissed. Absent means this config
-# predates that introduction - an installation that upgraded into this
-# version, which is not offered it. The Help tab can show it again at any
-# time.
+# Written by QuickSearch: whether the introduction shown on a new installation
+# has been dismissed. Absent means the config predates it, so an upgraded
+# installation is not offered it. The Help tab can show it again at any time.
 tutorial_seen = false
 
+# How a search folds case. Plain words match exactly apart from ASCII case:
+# "cafe" does not find "café", and "café" does not find "CAFÉ". '*' patterns
+# and regex: fold Unicode case ("résumé*" finds "RÉSUMÉ"), in file contents
+# only as far as SQLite's full-text case table, which predates some newer
+# case pairs (Georgian Mtavruli capitals, for one).
 [search]
-# Start with the fuzzy passes enabled.
+# Whether the Fuzzy box on the Search tab starts ticked. Off by default: the
+# fuzzy passes cost noticeable time on every keystroke, and most searches do
+# not need them.
 fuzzy_default = false
-# Ceiling on the fuzzy stages' typo budget. The allowance grows with the
-# search term, one edit per three characters, up to this value, so 2
-# means "1 edit for 3-5 character terms, 2 for anything longer". 0 turns
-# the fuzzy stages off. Above 3 is allowed but not recommended: matches
-# become dominated by coincidence and every fuzzy pass slows down.
+# Most typos the fuzzy stages allow: one edit per three letters (bytes, for
+# non-ASCII text) of the search term, up to this value and never more than 8,
+# so 2 means 1 edit for 3-5 letter terms and 2 for longer ones. 0 turns the
+# fuzzy stages off. Above 3 is allowed but not recommended: matches become
+# coincidence and every fuzzy pass slows.
 fuzzy_max_edits = 2
-# Hard cap on results per search (the GUI's scroll list length). Clamped to
-# 1..1000000 on load: at zero the cascade stops before its first pass, so
-# every search returns nothing and calls the empty answer truncated.
+# Most results per search (the length of the GUI's list). Clamped to
+# 1..1000000: at zero every search would return nothing.
 display_limit = 1000
-# Results per streamed batch (latency/overhead knob, not a page size).
+# Results per streamed batch (a latency knob, not a page size).
 results_per_page = 100
 # How long the GUI waits after the last keystroke before searching (ms).
 debounce_ms = 150
-# Watch the visible search results and show renames, deletions and content
-# changes as they happen. What a row shows is read from the file itself,
-# so this works whether or not indexing is running, and the index is
-# brought up to date for those files. Editing the query drops the watches.
+# Watch the visible results and show renames, deletions and content changes as
+# they happen. A row's details are read from the file itself, so this works
+# whether or not indexing is running, and files that changed are refreshed in
+# the index. Editing the query drops the watches.
 live_results = true
-# Memory the search connection keeps database pages in, in MiB, held for the
-# length of a search session and released after a long idle.
+# Memory, in MiB, the search connection keeps index pages in, held while
+# searching and released after a long idle. 0 (recommended) sizes it from the
+# index: about 150 bytes per indexed file, capped at 192 MiB.
 #
-# 0 sizes it from the index and is almost always right. Every keystroke
-# rescans the whole file list, so what has to stay resident is that list:
-# roughly 168 bytes per indexed file, capped at 128 MiB automatically.
+# It matters for an encrypted index, which must decrypt every page the cache
+# misses (at 1M files: 99 ms per keystroke with too small a cache, 59 ms with
+# enough). An unencrypted index gets a flat 16 MiB to save memory, though one
+# large enough to hold its file list measured 10 to 25% faster.
 #
-# It matters on an *encrypted* index, which must decrypt any page the cache
-# does not already hold. Measured at 600k files: 127 ms per keystroke with a
-# cache too small, 34 ms once it fit. An unencrypted index reads a miss
-# straight from the operating system and is given a flat 16 MiB, because
-# sweeping 1 MiB to 256 MiB on one measured no faster than noise.
-#
-# Set it explicitly only when the automatic value is wrong for your tree —
-# deeply nested folders make wider rows and want more — or when your index is
-# over ~800k files, where the automatic cap lands below what it wants. An
-# explicit value may exceed that cap; it is clamped to 16..1024 on load.
+# Set it by hand only for deeply nested folders (wider rows) or indexes over
+# ~1.3M files, where the automatic cap is too low. Clamped to 16..1024.
 cache_size_mib = 0
 
 # Which columns the Search tab shows; the right-click menu of any column
-# header and Settings → Search both write here immediately, without an
-# Apply. There is deliberately no 'path' key: the path is always shown,
-# because it is the only column that identifies a result on its own.
+# header and Settings → Search both write here at once, without an Apply.
+# There is no 'path' key: the path is always shown, because it is the only
+# column that identifies a result on its own.
 [search.columns]
 name = true
 # The excerpt of a file's contents around the match. Rows that matched on
 # their name or path show a dash there instead.
 content_match = true
-# Off by default: the width these take is usually better spent on the path
-# and the matched text. Turning one on also makes it available to sort by;
-# sorting by a column that is hidden falls back to sorting by rank.
+# Off by default: their width is usually better spent on the path and the
+# matched text. Turning one on also makes it sortable; sorting by a hidden
+# column falls back to rank.
 size = false
 modified = false
 rank = true
 
-# What the Duplicates tab lists. Both keys are written by the tab itself, from
-# its exclusion box and its right-click menu; they are here because they are
-# yours to read and edit. Neither changes what is indexed or what a search
-# finds: a file left out of the duplicate listing is still in the index.
+# What the Duplicates tab lists. The tab writes both keys itself, from its
+# exclusion box and its right-click menu. Neither changes what is indexed or
+# found: a file left out of the listing is still in the index.
 [duplicates]
-# Paths left out of the listing. Same syntax and same matcher as
-# indexing.ignore_patterns - a pattern without a separator matches any single
+# Paths left out of the listing. Same syntax and matcher as
+# indexing.ignore_patterns: a pattern without a separator matches any single
 # name ("*.iso"), one with a separator matches a whole path and everything
 # under it ("/home/you/Backups/*").
 #
-# A member whose path matches is not counted, and the group is re-priced
-# around the copies that are left; a group down to one copy is not a duplicate
-# of anything and is not listed at all. For a folder that is *meant* to hold
+# A matching member is not counted, and the group is sized from the copies
+# left; a group down to one copy is not listed. For a folder meant to hold
 # copies, this is the key to use.
 exclude_patterns = []
-# Groups dismissed with "Hide this group", by content hash, lowercase hex.
-# For the other case: a group that is not really a duplicate at all, because
-# grouping only reads each file's size and its first processing.hash_length
-# bytes.
-#
-# Keyed by hash, not by path, so a hidden group stays hidden when its files
-# are renamed or moved, and comes back if their contents change. Changing
-# processing.hash_length rebuilds the index and gives every file a new hash,
-# which strands every entry here; the tab's Clear button empties the list.
+# Groups dismissed with "Hide this group", for groups that only look like
+# duplicates, since grouping reads just each file's size and its first and
+# last processing.hash_length bytes. Stored by content (the head hash, then
+# the tail digest, in lowercase hex), so a hidden group stays hidden when its
+# files move and returns if their contents change. Entries saved by earlier
+# versions hold the head hash alone and no longer match any group. Changing
+# processing.hash_length rebuilds the index and strands these entries; the
+# tab's Clear button empties the list.
 hidden_groups = []

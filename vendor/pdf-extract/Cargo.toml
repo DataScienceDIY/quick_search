@@ -40,9 +40,8 @@ repository = "https://github.com/jrmuizel/pdf-extract"
 name = "pdf_extract"
 path = "src/lib.rs"
 
-[dependencies.adobe-cmap-parser]
-version = "0.4.1"
-
+# LOCAL PATCH (QuickSearch): adobe-cmap-parser is dropped; src/lib.rs reads
+# ToUnicode and Encoding CMaps with lopdf's content tokenizer instead.
 [dependencies.cff-parser]
 version = "0.2.0"
 

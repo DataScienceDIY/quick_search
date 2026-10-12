@@ -23,8 +23,9 @@ pub struct LogsTab {
     /// Indices into `lines` that pass both filters. Measured: rebuilding this
     /// per frame lowercased up to [`log::CAPACITY`] lines on every frame.
     shown: Vec<usize>,
-    /// What `shown` was computed from: refresh counter, filter, warnings-only.
-    shown_key: (u64, String, bool),
+    /// What `shown` was computed from: filter and warnings-only; `None`
+    /// after a refresh.
+    shown_key: Option<(String, bool)>,
 }
 
 impl LogsTab {
@@ -37,37 +38,34 @@ impl LogsTab {
             warnings_only: false,
             follow: true,
             shown: Vec::new(),
-            // `u64::MAX`: the first frame always counts as stale.
-            shown_key: (u64::MAX, String::new(), false),
+            shown_key: None,
         }
     }
 
     fn resync_shown(&mut self) {
-        if self.shown_key.0 == self.seen
-            && self.shown_key.2 == self.warnings_only
-            && self.shown_key.1 == self.filter
-        {
+        if matches!(
+            &self.shown_key,
+            Some((f, w)) if *f == self.filter && *w == self.warnings_only
+        ) {
             return;
         }
         let needle = self.filter.to_lowercase();
-        let warnings_only = self.warnings_only;
-        let mut shown = std::mem::take(&mut self.shown);
-        shown.clear();
-        shown.extend(
+        self.shown.clear();
+        self.shown.extend(
             self.lines
                 .iter()
                 .enumerate()
-                .filter(|(_, l)| keep(l, &needle, warnings_only))
+                .filter(|(_, l)| keep(l, &needle, self.warnings_only))
                 .map(|(i, _)| i),
         );
-        self.shown = shown;
-        self.shown_key = (self.seen, self.filter.clone(), warnings_only);
+        self.shown_key = Some((self.filter.clone(), self.warnings_only));
     }
 
     fn refresh(&mut self) {
         self.lines = log::snapshot();
         self.seen = log::recorded();
         self.dropped = log::dropped();
+        self.shown_key = None;
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -78,9 +76,7 @@ impl LogsTab {
             .request_repaint_after(std::time::Duration::from_millis(REFRESH_MS));
 
         self.resync_shown();
-        let shown = std::mem::take(&mut self.shown);
 
-        let mut cleared = false;
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.follow, "Follow")
                 .on_hover_text("Scroll to the newest line as it arrives");
@@ -91,11 +87,12 @@ impl LogsTab {
                     .hint_text("Filter"),
             );
             if ui
-                .add_enabled(!shown.is_empty(), egui::Button::new("Copy"))
+                .add_enabled(!self.shown.is_empty(), egui::Button::new("Copy"))
                 .on_hover_text("Copy the lines shown below to the clipboard")
                 .clicked()
             {
-                let joined = shown
+                let joined = self
+                    .shown
                     .iter()
                     .map(|&i| self.lines[i].text.as_str())
                     .collect::<Vec<_>>()
@@ -107,39 +104,29 @@ impl LogsTab {
                 .clicked()
             {
                 log::clear();
-                cleared = true;
+                self.refresh();
+                self.resync_shown();
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let count = if shown.len() == self.lines.len() {
+                let count = if self.shown.len() == self.lines.len() {
                     format!("{} lines", group_thousands(self.lines.len() as u64))
                 } else {
                     format!(
                         "{} of {} lines",
-                        group_thousands(shown.len() as u64),
+                        group_thousands(self.shown.len() as u64),
                         group_thousands(self.lines.len() as u64)
                     )
                 };
                 ui.label(hint(count));
             });
         });
-        if cleared {
-            // `shown` indexes lines that no longer exist; `refresh` moves
-            // `seen`, which makes the next frame rebuild it.
-            self.shown = shown;
-            self.refresh();
-            return;
-        }
         if self.dropped > 0 {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{} earlier lines were dropped; the newest {} are kept.",
-                    group_thousands(self.dropped),
-                    group_thousands(log::CAPACITY as u64),
-                ))
-                .small()
-                .weak(),
-            );
+            ui.label(hint(format!(
+                "{} earlier lines were dropped; the newest {} are kept.",
+                group_thousands(self.dropped),
+                group_thousands(log::CAPACITY as u64),
+            )));
         }
         ui.separator();
 
@@ -147,16 +134,14 @@ impl LogsTab {
             ui.label(
                 egui::RichText::new(
                     "Nothing logged yet. Warnings from indexing, watching folders and \
-                     opening files appear here — the same lines the terminal would show.",
+                     opening files appear here, as they would in a terminal.",
                 )
                 .weak(),
             );
-            self.shown = shown;
             return;
         }
-        if shown.is_empty() {
+        if self.shown.is_empty() {
             ui.label(egui::RichText::new("No lines match the filter.").weak());
-            self.shown = shown;
             return;
         }
 
@@ -166,8 +151,8 @@ impl LogsTab {
         let scroll = egui::ScrollArea::both()
             .auto_shrink([false; 2])
             .stick_to_bottom(self.follow)
-            .show_rows(ui, row_height, shown.len(), |ui, range| {
-                for &i in &shown[range] {
+            .show_rows(ui, row_height, self.shown.len(), |ui, range| {
+                for &i in &self.shown[range] {
                     let line = &self.lines[i];
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(fmt_clock(line.at)).monospace().weak());
@@ -184,7 +169,6 @@ impl LogsTab {
                 }
             });
         crate::ui_util::more_below_hint(ui, &scroll);
-        self.shown = shown;
     }
 }
 
@@ -209,8 +193,10 @@ fn fmt_clock(unix_secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_clock, keep};
-    use quicksearch_core::log::{Level, LogLine};
+    use super::{fmt_clock, keep, LogsTab};
+    use crate::format::group_thousands;
+    use crate::test_ui::{click_at, painted_rect, painted_text, run_panel};
+    use quicksearch_core::log::{self, Level, LogLine};
 
     fn line(level: Level, text: &str) -> LogLine {
         LogLine {
@@ -256,5 +242,134 @@ mod tests {
     #[test]
     fn an_out_of_range_stamp_falls_back() {
         assert_eq!(fmt_clock(u64::MAX), "--:--:--");
+    }
+
+    /// The ring is process-wide and these tests clear it, so they take
+    /// turns. Lines other tests log meanwhile are tolerated.
+    static RING_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Ignore poisoning: one failed test must not fail the others.
+    fn ring_guard() -> std::sync::MutexGuard<'static, ()> {
+        RING_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// One frame of the tab. `shown` must never index past `lines`: that
+    /// stale index is what Copy panics on.
+    fn frame(ctx: &egui::Context, tab: &mut LogsTab, events: Vec<egui::Event>) -> egui::FullOutput {
+        let out = run_panel(ctx, egui::vec2(900.0, 400.0), events, |ui| tab.ui(ui));
+        assert!(
+            tab.shown.iter().all(|&i| i < tab.lines.len()),
+            "shown {:?} indexes past {} lines",
+            tab.shown,
+            tab.lines.len()
+        );
+        out
+    }
+
+    /// Click the widget painted as `label`; egui reports it on this frame.
+    fn click(
+        ctx: &egui::Context,
+        tab: &mut LogsTab,
+        out: &egui::FullOutput,
+        label: &str,
+    ) -> egui::FullOutput {
+        let at = painted_rect(out, label).center();
+        frame(ctx, tab, click_at(at))
+    }
+
+    fn holds(tab: &LogsTab, text: &str) -> bool {
+        tab.lines.iter().any(|l| l.text == text)
+    }
+
+    fn shown(tab: &LogsTab) -> Vec<&str> {
+        tab.shown
+            .iter()
+            .map(|&i| tab.lines[i].text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn copy_after_clear_does_not_panic() {
+        let _ring = ring_guard();
+        let text = "logs tab: copy after clear";
+        log::record(Level::Info, text.to_string());
+        let ctx = crate::test_ui::ctx();
+        let mut tab = LogsTab::new();
+
+        let out = frame(&ctx, &mut tab, vec![]);
+        assert!(holds(&tab, text));
+        click(&ctx, &mut tab, &out, "Clear");
+        assert!(!holds(&tab, text), "the click cleared the ring");
+        let out = frame(&ctx, &mut tab, vec![]);
+        click(&ctx, &mut tab, &out, "Copy");
+        frame(&ctx, &mut tab, vec![]);
+    }
+
+    /// The count painted this frame is the one `tab` now holds, never "N of 0".
+    fn assert_count(out: &egui::FullOutput, tab: &LogsTab) {
+        // No filter is set, so every retained line is shown.
+        let want = format!("{} lines", group_thousands(tab.lines.len() as u64));
+        let painted = painted_text(out);
+        assert!(painted.contains(&want), "want {want:?} in {painted:?}");
+        assert!(
+            !painted.iter().any(|t| t.ends_with(" of 0 lines")),
+            "{painted:?}"
+        );
+    }
+
+    #[test]
+    fn after_clear_the_count_is_not_n_of_0() {
+        let _ring = ring_guard();
+        log::record(Level::Info, "logs tab: count, first".to_string());
+        log::record(Level::Info, "logs tab: count, second".to_string());
+        let ctx = crate::test_ui::ctx();
+        let mut tab = LogsTab::new();
+
+        let out = frame(&ctx, &mut tab, vec![]);
+        assert_count(&out, &tab);
+        let clicked = click(&ctx, &mut tab, &out, "Clear");
+        assert!(!holds(&tab, "logs tab: count, second"), "the click cleared");
+        // The label is drawn after the button, so the click frame already
+        // counts what is left.
+        assert_count(&clicked, &tab);
+        let next = frame(&ctx, &mut tab, vec![]);
+        assert_count(&next, &tab);
+    }
+
+    #[test]
+    fn a_filter_edit_after_clear_rebuilds_from_the_new_lines() {
+        let _ring = ring_guard();
+        let before = "logs tab: filter mark, before the clear";
+        let after = "logs tab: filter mark, after the clear";
+        let later = "logs tab: filter mark, under the same filter";
+        log::record(Level::Info, before.to_string());
+        let ctx = crate::test_ui::ctx();
+        let mut tab = LogsTab::new();
+
+        let out = frame(&ctx, &mut tab, vec![]);
+        click(&ctx, &mut tab, &out, "Clear");
+        log::record(Level::Info, after.to_string());
+        let out = frame(&ctx, &mut tab, vec![]);
+        click(&ctx, &mut tab, &out, "Filter");
+        let typed = vec![egui::Event::Text("FILTER MARK".into())];
+        frame(&ctx, &mut tab, typed);
+        assert_eq!(tab.filter, "FILTER MARK", "the typing reached the field");
+        // `shown` follows an edit from the next frame on.
+        frame(&ctx, &mut tab, vec![]);
+        assert!(!holds(&tab, before), "cleared lines stay gone");
+        assert_eq!(
+            tab.shown,
+            (0..tab.lines.len())
+                .filter(|&i| keep(&tab.lines[i], "filter mark", false))
+                .collect::<Vec<_>>()
+        );
+        assert!(shown(&tab).contains(&after), "{:?}", shown(&tab));
+
+        // A refresh rebuilds `shown` even though the filter did not change.
+        log::record(Level::Info, later.to_string());
+        frame(&ctx, &mut tab, vec![]);
+        assert!(shown(&tab).contains(&later), "{:?}", shown(&tab));
     }
 }

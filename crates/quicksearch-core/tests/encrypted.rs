@@ -8,12 +8,12 @@ use quicksearch_core::config::Config;
 use quicksearch_core::db;
 use quicksearch_core::indexing::IndexingService;
 use quicksearch_core::security::{derive_key, salt_from_hex};
+use quicksearch_core::testutil::Scratch;
 
 mod common;
-use common::scratch_dir as tmp_dir;
 
-/// Index `root` and wait for the marker through the keyed open. The marker
-/// is deliberately not cleared: each rebuild starts from a fresh file.
+/// Index `root` and wait for the marker through the keyed open. The marker is
+/// not cleared: each rebuild starts from a fresh file.
 fn index_once(root: &Path, db_path: &Path, config: &Config) {
     common::IndexOnce {
         db: db_path,
@@ -32,18 +32,13 @@ fn header(db_path: &Path) -> [u8; 16] {
 
 fn match_count(db_path: &Path, term: &str) -> i64 {
     let conn = db::open_existing(&db_path.to_string_lossy(), false).unwrap();
-    conn.query_row(
-        "SELECT COUNT(*) FROM searchabletext WHERE searchabletext MATCH ?1",
-        [term],
-        |r| r.get(0),
-    )
-    .unwrap()
+    quicksearch_core::testutil::fts_count(&conn, term)
 }
 
 #[test]
 fn encrypted_index_lifecycle() {
-    let root = tmp_dir("tree");
-    let data = tmp_dir("db");
+    let root = Scratch::dir("tree");
+    let data = Scratch::dir("db");
     let db_path = data.join("index.sqlite");
     std::fs::write(root.join("note.txt"), "the zebrapayload roams the index").unwrap();
     std::fs::write(root.join("other.txt"), "unrelated content here").unwrap();
@@ -90,7 +85,7 @@ fn encrypted_index_lifecycle() {
         .unwrap();
         drop(conn);
 
-        let conn = db::open::open_maintenance(&db_path.to_string_lossy()).unwrap();
+        let conn = db::open_existing(&db_path.to_string_lossy(), true).unwrap();
         assert!(
             quicksearch_core::db::repo::maintain(&conn, &db_path.to_string_lossy()).unwrap(),
             "that much slack should have been reclaimed"
@@ -125,10 +120,10 @@ fn encrypted_index_lifecycle() {
 
     // --- A stale schema must not read as a locked index. ---
     //
-    // After a schema bump the unlock gate rejected the correct password by
-    // opening the index the way a *consumer* does, which insists the schema
-    // be current — that belongs to the indexer; unlocking only answers
-    // "does this key open the file?".
+    // Unlocking only answers "does this key open the file?". Insisting on a
+    // current schema belongs to the indexer, so the unlock gate must not open
+    // the index the way a consumer does, or a schema bump would make the
+    // correct password look wrong.
     {
         db::set_process_key(Some(key.clone()));
         // Age the stored schema, exactly as a version bump would.
@@ -179,6 +174,4 @@ fn encrypted_index_lifecycle() {
     assert!(err.contains("not encrypted"), "got: {err}");
 
     db::set_process_key(None);
-    std::fs::remove_dir_all(&root).ok();
-    std::fs::remove_dir_all(&data).ok();
 }

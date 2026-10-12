@@ -2,35 +2,38 @@
 //! [`IndexingService`], the filesystem [`Watcher`], a periodic-reindex
 //! scheduler, and the mode state machine:
 //!
-//! - **Auto** — watcher running; events apply incrementally between full
-//!   runs; a full reindex triggers whenever `last_full_index` is older
-//!   than the configured interval (or has never happened).
-//! - **ManualStopped** — watcher off, pending events dropped, nothing runs
+//! - `Auto`: watcher running; events apply incrementally between full runs;
+//!   a full reindex triggers whenever `last_full_index` is older than the
+//!   configured interval (or has never happened).
+//! - `ManualStopped`: watcher off, pending events dropped, nothing runs
 //!   until the user acts.
-//! - **ManualRunning** — one user-forced full run; returns to
-//!   `ManualStopped` when it finishes. (A forced run in Auto stays Auto.)
+//! - `ManualRunning`: one user-forced full run; returns to `ManualStopped`
+//!   when it finishes. (A forced run in Auto stays Auto.)
 //!
 //! `indexing.auto_index` persists the mode; writing the file back is the
-//! caller's job — the coordinator's config is a copy, not the source of
+//! caller's job, since the coordinator's config is a copy, not the source of
 //! truth. Single-writer guarantee: incremental writes are deferred while a
 //! full run is active, then the queue drains; overflow collapses into one
 //! full run.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 
 use crate::config::{diff_actions, Config, IgnoreSet, IndexWork};
 use crate::db;
+use crate::extract::sandbox::KillMark;
 use crate::extract::Registry;
-use crate::incremental::{apply_fs_event, Applied, Budget};
+use crate::incremental::{Applied, Budget};
 use crate::indexing::{ConfigChange, IndexingService, IndexingStatus, PrepStep, ReconcileProgress};
-use crate::scope::WorkCursor;
+use crate::log::now_unix;
+use crate::scope::{Scope, WorkCursor};
+use crate::shutdown::{join_within, EXIT_GRACE};
 use crate::watcher::{FsEvent, WatchError, WatchFilters, Watcher, WatcherConfig};
 
 mod inner;
@@ -41,8 +44,6 @@ use inner::Inner;
 
 /// Pending-event ceiling; beyond this a full run is cheaper than replay.
 const PENDING_OVERFLOW: usize = 100_000;
-
-const FILE_COUNT_INTERVAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexMode {
@@ -56,8 +57,8 @@ pub enum IndexMode {
 pub enum WatcherStatus {
     /// Not running: manual mode, or no roots configured.
     Off,
-    /// Registration in flight — it walks every root, so this can last
-    /// minutes on large or networked trees.
+    /// Registration in flight; it walks every root, so this can last minutes
+    /// on large or networked trees.
     Starting,
     Active {
         dirs: usize,
@@ -91,7 +92,7 @@ pub struct IndexerState {
     pub queued_events: usize,
     pub watcher: WatcherStatus,
     /// The between-runs reconciliation, while it runs and briefly after. A
-    /// run's *own* reconciliation is not here — it reads as
+    /// run's *own* reconciliation is not here: it reads as
     /// [`IndexingStatus::Preparing`] with a [`PrepStep::Reconciling`].
     pub reconcile: Option<ReconcileState>,
     /// What each configured root held when indexing last completed. Roots
@@ -115,7 +116,11 @@ enum CoordCmd {
     ConfigChanged(Config),
     RebuildIndex,
     ClearIndex,
+    DeleteIndex(mpsc::Sender<Result<(), String>>),
     UpdatePaths(Vec<PathBuf>),
+    /// Record a reason on the running watcher ([`Watcher::force_degraded`]).
+    #[cfg(test)]
+    DegradeWatcher(WatchError),
     Shutdown,
 }
 
@@ -130,7 +135,7 @@ pub struct IndexCoordinator {
     reconcile_stop: Arc<ReconcileStop>,
 }
 
-/// The two halves of cutting the coordinator's reconciliation short — the pair
+/// The two halves of cutting the coordinator's reconciliation short: the pair
 /// [`db::InterruptSlot`] describes. A command cannot do it: the thread that
 /// would read the command is the thread inside the scan.
 #[derive(Default)]
@@ -161,6 +166,12 @@ struct Shared {
     watcher: WatcherStatus,
     reconcile: Option<ReconcileState>,
     root_counts: Arc<Vec<RootCount>>,
+    /// How many times [`Inner::tick`] has run: tests count ticks, not seconds.
+    #[cfg(test)]
+    ticks: u64,
+    /// How many registrations [`Inner::start_watcher`] has begun.
+    #[cfg(test)]
+    watcher_starts: u64,
 }
 
 impl IndexCoordinator {
@@ -193,6 +204,10 @@ impl IndexCoordinator {
             watcher: WatcherStatus::Off,
             reconcile: None,
             root_counts: Arc::new(Vec::new()),
+            #[cfg(test)]
+            ticks: 0,
+            #[cfg(test)]
+            watcher_starts: 0,
         }));
 
         let reconcile_stop = Arc::new(ReconcileStop::default());
@@ -208,22 +223,22 @@ impl IndexCoordinator {
             watcher: None,
             watcher_config,
             watcher_rx: None,
-            watcher_gen: 0,
-            pending: HashMap::new(),
-            targeted: HashMap::new(),
+            watcher_cancel: Arc::new(AtomicBool::new(false)),
+            overflow_rewatched: None,
+            pending: inner::Debounced::default(),
+            targeted: inner::Debounced::default(),
             resume_from: HashMap::new(),
-            last_event_at: None,
-            pending_since: None,
             needs_full_run: false,
-            run_retry_at: None,
-            run_retry_delay: inner::RUN_RETRY_BASE,
+            run_retry: inner::Backoff::default(),
             pending_work: None,
             reconcile_done: None,
             reconcile_cut_short: false,
-            saw_running: false,
-            files_at: None,
+            run_in_flight: false,
+            files_stale: true,
             was_busy: false,
             write_conn: None,
+            held: false,
+            unreported: None,
             ignore: Arc::new(IgnoreSet::compile(&[]).expect("empty ignore set")),
             registry: Registry::default_set(),
             mode: initial_mode,
@@ -267,6 +282,31 @@ impl IndexCoordinator {
         self.indexing.is_active()
     }
 
+    #[cfg(test)]
+    fn ticks(&self) -> u64 {
+        crate::lock_ok(&self.shared).ticks
+    }
+
+    #[cfg(test)]
+    fn watcher_starts(&self) -> u64 {
+        crate::lock_ok(&self.shared).watcher_starts
+    }
+
+    /// Have the running watcher report `reason`, as if it had hit it; a no-op
+    /// while none runs.
+    #[cfg(test)]
+    fn degrade_watcher(&self, reason: WatchError) {
+        let _ = self.cmd_tx.send(CoordCmd::DegradeWatcher(reason));
+    }
+
+    /// Whether the coordinator thread has ended. Its command receiver lives
+    /// until `Inner::run` returns, so a send fails only after that; the probe
+    /// is a no-op to a running thread.
+    #[cfg(test)]
+    fn thread_ended(&self) -> bool {
+        self.cmd_tx.send(CoordCmd::UpdatePaths(Vec::new())).is_err()
+    }
+
     pub fn set_mode(&self, mode: IndexMode) {
         let _ = self.cmd_tx.send(CoordCmd::SetMode(mode));
     }
@@ -284,24 +324,42 @@ impl IndexCoordinator {
         let _ = self.cmd_tx.send(CoordCmd::ConfigChanged(config));
     }
 
-    /// Delete the index and rebuild from scratch (user confirmed).
+    /// Delete the index and rebuild from scratch (user confirmed). A delete
+    /// that fails is reported in [`IndexerState::activity`] and starts
+    /// nothing.
     pub fn rebuild_index(&self) {
         let _ = self.cmd_tx.send(CoordCmd::RebuildIndex);
     }
 
+    /// Delete the index and start nothing: no full run starts until
+    /// [`Self::rebuild_index`] or [`Self::clear_index`] follows, so the caller
+    /// can change what the next index is built under (the key) in between.
+    /// The receiver gets the outcome; it reads `Disconnected` if the
+    /// coordinator is gone. A failed delete holds nothing.
+    pub fn delete_index(&self) -> mpsc::Receiver<Result<(), String>> {
+        let (tx, rx) = mpsc::channel();
+        // A failed send drops `tx` with the command.
+        let _ = self.cmd_tx.send(CoordCmd::DeleteIndex(tx));
+        rx
+    }
+
     /// Delete the index WITHOUT rebuilding (user confirmed). Indexing
     /// drops to manual-stopped so automatic mode doesn't immediately
-    /// resurrect what the user just deleted.
+    /// resurrect what the user just deleted. A delete that fails is reported
+    /// and keeps the published figures.
     pub fn clear_index(&self) {
         let _ = self.cmd_tx.send(CoordCmd::ClearIndex);
     }
 
-    /// Bring the index up to date for these paths and nothing else.
+    /// Refresh the index's rows for these files from the disk, and nothing
+    /// else.
     ///
-    /// For [`crate::live`]. Deliberately **not** gated on [`IndexMode`] — the
-    /// whole point is that the rows on screen stay honest with indexing
-    /// stopped — but still applied on the coordinator's own thread, so the
-    /// single-writer rule holds. A path that no longer exists is removed.
+    /// For [`crate::live`]. Deliberately not gated on [`IndexMode`], since the
+    /// point is that the rows on screen stay honest with indexing stopped, but
+    /// still applied on the coordinator's own thread, so the single-writer
+    /// rule holds. It never removes a row: a path that is missing, unreadable
+    /// or a directory changes nothing, since a display cannot tell a deletion
+    /// from an unplugged drive. The watcher and the next run remove rows.
     pub fn update_paths(&self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
@@ -321,25 +379,35 @@ impl IndexCoordinator {
     }
 
     /// Stop the watcher, any running index pass, and the coordinator thread.
-    /// Idempotent; usable from a signal handler through an Arc. The
-    /// reconciliation is cancelled *before* the command is sent: the command
-    /// is read by the thread inside the scan, so the join — and the window
-    /// close behind it — would otherwise wait out the scan.
+    /// Idempotent; usable from a signal handler through an Arc. Waits at most
+    /// [`EXIT_GRACE`] for the thread, then leaves it running: one file's
+    /// extraction or a `stat` on a hung mount reaches no flag, and a closing
+    /// window must not wait on either. The reconciliation is cancelled
+    /// *before* the command is sent: the command is read by the thread inside
+    /// the scan, which would otherwise spend the grace there. A file parsing
+    /// in a sandbox child is killed, so that file at least is no wait. That
+    /// cancel also precedes the kill, which a turn's kill mark relies on
+    /// (`Inner::apply_queue`).
     pub fn shutdown(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
         self.reconcile_stop.stop();
         let _ = self.cmd_tx.send(CoordCmd::Shutdown);
+        crate::extract::sandbox::kill_sandbox_children();
         if let Some(handle) = crate::lock_ok(&self.handle).take() {
-            let _ = handle.join();
+            if !join_within(handle, Instant::now() + EXIT_GRACE) {
+                crate::log_warn!(
+                    "the coordinator thread did not stop within {:?}; not waiting for it",
+                    EXIT_GRACE
+                );
+            }
         }
     }
 
     /// Whether a configuration change is being applied to the index right
     /// now, by either of the two places that can be doing it.
     pub fn reconciling(&self) -> bool {
-        // Lock released before asking the service; never hold both at once.
         let between_runs = crate::lock_ok(&self.shared).reconcile;
         matches!(between_runs, Some(ReconcileState::Running(_)))
             || matches!(
@@ -358,64 +426,51 @@ impl Drop for IndexCoordinator {
     }
 }
 
-/// The verb a path submitted through [`IndexCoordinator::update_paths`]
-/// deserves, or `None` to leave the index alone. `is_file()` folds every stat
-/// error into `false`, and a `Remove` costs the row *and everything beneath
-/// it* — so the negative answer, and only it, is confirmed with a second
-/// `stat` that can tell "gone" from "cannot see it just now".
-fn verb_for(path: PathBuf) -> Option<FsEvent> {
-    if path.is_file() {
-        return Some(FsEvent::Modify(path));
-    }
-    // `metadata`, not `symlink_metadata`: it must agree with `is_file()`
-    // above about following links, or the two can disagree about the verb.
-    match std::fs::metadata(&path) {
-        // There, but no longer something the walk would index.
-        Ok(_) => Some(FsEvent::Remove(path)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(FsEvent::Remove(path)),
-        Err(_) => None,
-    }
-}
-
-/// Fold `event` into the last-event-wins pending map. Renames split into
-/// their halves so downstream application never needs pair handling.
-fn enqueue(pending: &mut HashMap<PathBuf, FsEvent>, event: FsEvent) {
+/// Fold `event` into `queue`'s two sets. A `Create` never replaces a queued
+/// removal of the same path, so `mv build build.old; mkdir build` still drops
+/// the old tree's rows, even when a full run holds the queue for minutes
+/// between the two. A `Remove` drops the path's upsert, a `Modify` never
+/// downgrades a `Create` to no walk, and a rename is a `Remove` plus a
+/// `Create`.
+fn enqueue(queue: &mut inner::Debounced, event: FsEvent) {
     match event {
-        FsEvent::Rename { from, to } => {
-            pending.insert(from.clone(), FsEvent::Remove(from));
-            pending.insert(to.clone(), FsEvent::Create(to));
+        FsEvent::Remove(p) => {
+            queue.upserts.remove(&p);
+            queue.removals.insert(p);
         }
-        FsEvent::Create(ref p) | FsEvent::Modify(ref p) | FsEvent::Remove(ref p) => {
-            let key = p.clone();
-            pending.insert(key, event);
+        FsEvent::Create(p) => {
+            queue.upserts.insert(p, true);
+        }
+        FsEvent::Modify(p) => {
+            queue.upserts.entry(p).or_insert(false);
+        }
+        FsEvent::Rename { from, to } => {
+            enqueue(queue, FsEvent::Remove(from));
+            enqueue(queue, FsEvent::Create(to));
         }
     }
-}
-
-fn is_removal(event: &FsEvent) -> bool {
-    matches!(event, FsEvent::Remove(_))
 }
 
 /// Drop queued removals already covered by a queued removal of an ancestor,
-/// keeping `rm -rf` on a large tree under [`PENDING_OVERFLOW`]. Only removals
-/// collapse: a `Create` under a removed directory is a re-creation and must
-/// survive (removals are applied first).
-fn collapse_pending_removals(pending: &mut HashMap<PathBuf, FsEvent>) {
-    if pending.values().filter(|e| is_removal(e)).take(2).count() < 2 {
+/// keeping `rm -rf` on a large tree under [`PENDING_OVERFLOW`]. Upserts are a
+/// set of their own, so a re-creation under a removed directory survives
+/// (removals are applied first).
+fn collapse_pending_removals(removals: &mut HashSet<PathBuf>) {
+    if removals.len() < 2 {
         return;
     }
-    let removed: std::collections::HashSet<PathBuf> = pending
+    let covered: Vec<PathBuf> = removals
         .iter()
-        .filter(|(_, ev)| is_removal(ev))
-        .map(|(p, _)| p.clone())
+        .filter(|path| path.ancestors().skip(1).any(|a| removals.contains(a)))
+        .cloned()
         .collect();
-    pending.retain(|path, ev| {
-        !is_removal(ev) || !path.ancestors().skip(1).any(|a| removed.contains(a))
-    });
+    for path in &covered {
+        removals.remove(path);
+    }
 }
 
-/// How long [`Inner::apply_pending`] may hold the command loop before handing
-/// the rest of the queue to the next tick.
+/// How long one [`Inner::apply_queue`] call, for either queue, may hold the
+/// command loop; the rest of the queue waits for the next tick, 1 s later.
 const APPLY_BUDGET: Duration = Duration::from_millis(250);
 
 /// Wakes the frontend when this thread changes something worth drawing.
@@ -424,5 +479,3 @@ pub type Notify = Arc<dyn Fn() + Send + Sync>;
 fn summary_is_fresh(at: Instant, now: Instant) -> bool {
     now.duration_since(at) < RECONCILE_SUMMARY_LINGER
 }
-
-use crate::log::now_unix;

@@ -77,6 +77,23 @@ fn the_const_conversion_matches_std_across_the_whole_space() {
     }
 }
 
+/// Dark colors decode to inputs far below 1, where a start value of `a/n`
+/// would never converge.
+#[test]
+fn every_root_matches_std_from_tiny_to_large_inputs() {
+    for a in [1e-12f64, 1e-9, 0.008_66, 0.5, 1.0, 2.0, 1e6] {
+        for (n, want) in [(2, a.sqrt()), (3, a.cbrt()), (5, a.powf(0.2))] {
+            let got = nth_root(a, n);
+            assert!(
+                (got - want).abs() <= want * 1e-14,
+                "root {n} of {a}: {got} vs {want}"
+            );
+        }
+    }
+    assert_eq!(nth_root(0.0, 3), 0.0);
+    assert_eq!(nth_root(-1.0, 2), 0.0);
+}
+
 #[test]
 fn the_ends_of_the_scale_are_black_and_white() {
     assert_eq!(oklch(0.0, 0.0, 0.0), Color32::BLACK);
@@ -91,9 +108,14 @@ fn the_ends_of_the_scale_are_black_and_white() {
 #[test]
 fn out_of_gamut_requests_clamp() {
     for (l, c, h) in [(0.9, 0.4, 250.0), (0.5, 0.35, 20.0), (1.2, 0.1, 150.0)] {
-        let color = oklch(l, c, h);
-        let _ = color; // reaching here at all means no panic and no wrap
-        assert_eq!(color, reference(l, c, h), "L={} C={} H={}", l, c, h);
+        assert_eq!(
+            oklch(l, c, h),
+            reference(l, c, h),
+            "L={} C={} H={}",
+            l,
+            c,
+            h
+        );
     }
     assert_eq!(oklch(2.0, 0.0, 0.0), Color32::WHITE);
     assert_eq!(oklch(-1.0, 0.0, 0.0), Color32::BLACK);
@@ -180,7 +202,7 @@ fn no_two_colors_are_closer_than_forty_degrees() {
     }
 }
 
-/// Readability is what fixed each theme's lightness, so it is checked.
+/// Readability fixed each theme's lightness, so it is checked.
 #[test]
 fn every_color_clears_wcag_aa_on_its_own_background() {
     for (dark, bgs) in [

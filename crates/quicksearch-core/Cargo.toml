@@ -27,22 +27,16 @@ probe = []
 # statically links a vendored OpenSSL libcrypto, so encryption support adds
 # no runtime library dependencies. With no `PRAGMA key` applied, SQLCipher
 # behaves identically to stock SQLite, so unencrypted indexes are unaffected.
-rusqlite = { version = "0.39", features = ["bundled-sqlcipher-vendored-openssl"] }
-# The allocator every binary here installs; see `platform::Allocator`.
+# `hooks` (no new dependency) is for the search worker's progress handler,
+# `search::arm_cancel`.
+rusqlite = { version = "0.39", features = ["bundled-sqlcipher-vendored-openssl", "hooks"] }
+# The allocator every shipped binary, bench and timing probe installs; see
+# `platform::Allocator` for why.
 #
-# glibc gives each thread a 64 MiB arena and never shrinks one below its
-# high-water mark, so a multi-million-file run settled at 985 MB RSS with
-# 871 MB of anonymous slack that `malloc_trim` could not coalesce.
-# `glibc.malloc.arena_max=2` cut that to 146 MB but made indexing dramatically
-# slower, because two arenas serialise every worker's allocations. mimalloc
-# has no such trade: per-thread heaps with no lock on the fast path, and freed
-# segments are decommitted rather than parked.
-#
-# `mimalloc` supplies the `GlobalAlloc` type; `libmimalloc-sys` is what links
-# the C library `platform::release_free_heap` calls `mi_collect` from. Both
-# compile C, which this build already needs for SQLCipher and OpenSSL.
+# It supplies the `GlobalAlloc` type, and its `libmimalloc-sys` links the C
+# library `platform::release_free_heap` calls `mi_collect` from. That
+# compiles C, which this build already needs for SQLCipher and OpenSSL.
 mimalloc = "0.1"
-libmimalloc-sys = "0.1"
 argon2 = { version = "0.5", features = ["zeroize"] }
 zeroize = { version = "1", features = ["derive"] }
 getrandom = "0.2"
@@ -65,26 +59,25 @@ toml = "1"
 mime_guess = "2.0"
 infer = "0.15"
 # Charset decoding for non-UTF-8 text (UTF-16 .reg exports, legacy
-# single-byte and CJK encodings). Transitive already (pdf-extract).
+# single-byte and CJK encodings) and for RTF's codepages. Transitive already
+# (pdf-extract).
 encoding_rs = "0.8"
 # Statistical charset detection (Firefox's detector) for text that is neither
 # UTF-8 nor BOM-marked. Its mandatory deps beyond encoding_rs are tiny
 # (cfg-if, memchr, detone).
 chardetng = "1.0"
-# RTF text extraction. Resolves to `vendor/rtf-parser` via the workspace
-# `[patch.crates-io]` (see there for why). 0.4 is what the patch is against;
-# `default-features = false` is redundant against the vendored copy but keeps
-# a registry fallback from pulling wasm-bindgen.
-rtf-parser = { version = "0.4", default-features = false }
 # `lopdf` is deliberately NOT declared here. `pdf-extract` re-exports it
 # (`pub use lopdf::*`), and `extract/pdf.rs` reaches it that way. Naming it
-# directly resolves a *second*, older copy alongside pdf-extract's — which is
-# what used to make every PDF parse twice, and what pulled in rayon (whose
-# global thread pool is never torn down), chrono, time, md5 and a second nom.
+# directly resolves a *second*, older copy alongside pdf-extract's, which
+# parses every PDF twice and pulls in rayon (whose global thread pool is never
+# torn down), chrono, time, md5 and a second nom.
 pdf-extract = "0.12"
 lofty = "0.19"
+# Filesystem events. Resolves to `vendor/notify` via the workspace
+# `[patch.crates-io]` (see there for why); 6.1 is what the patch is against.
 notify = "6.1"
-ctrlc = "3.4"
+# `termination` adds SIGTERM (and SIGHUP, which `shutdown` hands back) to SIGINT on Unix.
+ctrlc = { version = "3.4", features = ["termination"] }
 zstd = "0.13"
 globset = "0.4"
 regex = "1"
@@ -93,12 +86,18 @@ regex = "1"
 # regex passes ever see. Transitive already (regex).
 regex-syntax = "0.8"
 # SIMD substring search for the full-text passes: std's Two-Way searcher has
-# no vector prefilter and measured ~45x slower (`benches/search.rs`,
-# `substring`). Transitive already (regex, globset, chardetng).
+# no vector prefilter (`benches/search.rs`, `substring`). `memchr2` also finds
+# the filename pass's case-insensitive candidates (`filename_ladder`).
+# Transitive already (regex, globset, chardetng).
 memchr = "2"
+# `Local`, for the user's calendar days in `modified:`: the OS zone rules
+# (tzdata on Unix, the Win32 API on Windows) place midnight, DST gaps and
+# folds included. Transitive already (the GUI, with the same features).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# `nice()`, for dropping indexing threads to background scheduling priority.
-# Linux schedules per task, so it affects only the calling thread. Transitive
+# `setpriority`, for dropping indexing threads to background priority (per
+# thread on Linux, which schedules per task); `setrlimit` and `prctl` for the
+# extraction child; `statvfs`, `flock` and signal dispositions. Transitive
 # already (rusqlite, getrandom).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -121,6 +120,8 @@ windows-sys = { version = "0.52", features = [
     # `LockFileEx` and `GetDiskFreeSpaceExW` themselves are in
     # Win32_Storage_FileSystem above.
     "Win32_System_IO",
+    # The extraction sandbox child's job object (`platform::spawn_limited`).
+    "Win32_System_JobObjects",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }
@@ -178,8 +179,8 @@ harness = false
 
 # Plain-main measurement probes, env-gated (QSB_SEARCH_PERF / QSB_SEARCH_ALLOC
 # / QSB_INDEX_ALLOC) so a bare `cargo bench` doesn't pay their seed cost.
-# snippet_perf, which compared the pre-schema-v3 FTS shape against v3, is
-# gone: the question is decided (v3 won on every axis) — don't re-measure it.
+# Schema v3's FTS shape beat the earlier one on every axis measured; that
+# comparison is settled and has no bench.
 [[bench]]
 name = "search_perf"
 harness = false
@@ -195,7 +196,7 @@ name = "index_alloc"
 harness = false
 
 # QSB_PGSZ: the speed half of the page-geometry question that
-# `tests/encrypted_perf.rs` gates the size half of. Sweeps database page size
+# `tests/encrypted_size.rs` gates the size half of. Sweeps database page size
 # against FTS5's record size over corpora up to 1M files, so it is opt-in like
 # the two above — and wants TMPDIR pointed at real storage, not tmpfs.
 [[bench]]

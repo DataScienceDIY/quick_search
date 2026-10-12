@@ -1,16 +1,8 @@
-//! Where the widgets the tour talks about are on screen, this pass.
-//!
-//! The tour's window is drawn last, long after the tabs that own the widgets
-//! it points at, and it has no handle on any of them. So each interesting
-//! widget publishes its rectangle here as it lays itself out, and the tour
-//! reads them back at the end of the same pass to paint its glows.
-//!
-//! Two rules keep the registry honest. Nothing is recorded unless
-//! [`set_active`] was called with `true` earlier in the frame — with the tour
-//! closed, which is nearly always, marking costs one bool read. And every
-//! entry is stamped with the pass that wrote it, so a widget that stopped
-//! being drawn (a hidden column, another tab) stops being highlighted
-//! immediately rather than glowing at a stale position.
+//! Where the widgets the tour talks about are on screen this pass. Widgets
+//! publish their rects here as they lay out, and the tour, drawn last, reads
+//! them to paint its glows. Marking is a no-op unless `set_active(true)` was
+//! called this frame, and every mark is stamped with its pass, so a widget
+//! that stops being drawn stops glowing at once.
 
 use crate::app::Tab;
 
@@ -53,7 +45,7 @@ fn id() -> egui::Id {
 }
 
 /// `data_mut` holds the context's own lock, so everything the closure needs
-/// from `ctx` — the pass number, in practice — must be read before the call:
+/// from `ctx` (the pass number, in practice) must be read before the call:
 /// asking egui a second question from inside it deadlocks.
 fn with<R>(ctx: &egui::Context, f: impl FnOnce(&mut Spots) -> R) -> R {
     ctx.data_mut(|d| f(d.get_temp_mut_or_default::<Spots>(id())))
@@ -69,8 +61,8 @@ pub fn set_active(ctx: &egui::Context, active: bool) {
     });
 }
 
-/// Record where `spot` is. Repeat marks for one spot in a single pass are
-/// unioned — that is how the Rank column adds up from its separate cells.
+/// Records where `spot` is. Repeat marks for one spot in a single pass are
+/// unioned, which is how the Rank column adds up from its separate cells.
 pub fn mark(ctx: &egui::Context, spot: Spot, rect: egui::Rect) {
     let pass = ctx.cumulative_pass_nr();
     with(ctx, |spots| {

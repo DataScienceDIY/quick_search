@@ -65,9 +65,12 @@ Comment:
  but not with GPL version 2, which is why this package is
  GPL-3.0-or-later rather than GPL-2.0-or-later.
  .
- Bundled C sources compiled into the binary: SQLite (public domain, via
- rusqlite), Zstandard (BSD-3-Clause arm of its BSD/GPL-2.0 dual licence,
- via zstd-sys) and bzip2 (BSD-style, via bzip2-sys).
+ Bundled C sources compiled into the binary: SQLCipher, including SQLite
+ (BSD-3-Clause; SQLite is public domain; via libsqlite3-sys), OpenSSL
+ (Apache-2.0, via openssl-src), Zstandard (BSD-3-Clause arm of its
+ BSD/GPL-2.0 dual licence, via zstd-sys), libdbus (AFL-2.1 or
+ GPL-2.0-or-later, via libdbus-sys) and mimalloc (MIT, via
+ libmimalloc-sys).
  .
  The binary also embeds the two font files under
  crates/quicksearch-gui/assets/fonts/, which have their own stanzas above.
@@ -80,13 +83,18 @@ Comment:
  .
  Two dependencies are carried in-tree rather than fetched. vendor/pdf-extract
  is pdf-extract 0.12.0 (MIT, Jeff Muizelaar,
- https://github.com/jrmuizel/pdf-extract) with two unbounded recursions
- given a depth limit. vendor/rtf-parser is rtf-parser 0.4.3 (MIT, Dorian
- Beauchesne, https://github.com/d0rianb/rtf-parser) with its lexer corrected
- to end a control word where the RTF specification ends one, and a panic on
- malformed Unicode escapes replaced by lossy decoding. Both sets of changes
- are marked "LOCAL PATCH" in the source; both licences are unchanged and are
- the MIT stanza below.
+ https://github.com/jrmuizel/pdf-extract), patched to bound what a crafted
+ PDF can cost: a depth limit on its two recursions (/Parent inheritance and
+ Form XObjects), a work budget per document, and caps on CMap sizes and the
+ graphics-state stack. The patches also drop colour handling and the
+ adobe-cmap-parser dependency (CMaps are read with lopdf's tokenizer), cache
+ each font's parsed streams, and decode CID fonts whose Encoding CMap is not
+ Identity. vendor/notify is notify 6.1.1 (CC0-1.0, Felix
+ Saparelli, Daniel Faust and Aron Heinecke,
+ https://github.com/notify-rs/notify) with its Windows backend reporting an
+ overflowed change buffer instead of dropping it. Every change is marked
+ "LOCAL PATCH" in the source and no licence is changed: MIT for pdf-extract
+ and CC0-1.0 for notify, both among the licences listed above.
  .
  Run `cargo metadata --all-features` against the source tree to reproduce
  the per-crate licence list.

@@ -1,7 +1,7 @@
 //! Shared UI helpers: bordered widgets, ignore-pattern validation, text
 //! eliding, and the "more content below" scroll hint.
 
-use quicksearch_core::config::IgnoreSet;
+use quicksearch_core::config::{glob_literal, IgnoreSet};
 use std::borrow::Cow;
 
 use crate::color::palette;
@@ -13,23 +13,28 @@ pub fn bordered_button(
     egui::Button::new(text).stroke(egui::Stroke::new(1.5, color))
 }
 
-/// Render a section whose widget count changes from frame to frame inside
+/// Renders a section whose widget count changes from frame to frame inside
 /// its own child `Ui`. egui derives a widget's id from how many widgets
-/// precede it in the same `Ui`, so a section whose content changes *renames*
-/// every widget below it — and a `DragValue` or `TextEdit` whose id changes
+/// precede it in the same `Ui`, so a section whose content changes renames
+/// every widget below it, and a `DragValue` or `TextEdit` whose id changes
 /// loses keyboard focus and in-progress edits. A child `Ui` costs the parent
-/// exactly one id no matter what goes inside it.
+/// exactly one id, whatever goes inside it.
 pub fn stable_section<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.vertical(contents).inner
 }
 
 /// Glob matching everything under `dir`, spelled with the platform
-/// separator. `Path::join` inserts a separator only where one is needed, so
-/// a drive root yields `C:\*` rather than the never-matching `C:\/*` a
-/// `format!("{}/*")` would produce. Shared by the search tab's ignore dialog
-/// and the duplicates tab's exclusions, which speak the same glob syntax.
+/// separator. The directory is escaped ([`glob_literal`]), so `Music [FLAC]`
+/// matches only itself. `Path::join` inserts a separator only where one is
+/// needed, so a drive root yields `C:\*` rather than the never-matching
+/// `C:\/*` a `format!("{}/*")` would produce. Shared by the search tab's
+/// ignore dialog and the duplicates tab's exclusions, which speak the same
+/// glob syntax.
 pub fn dir_ignore_pattern(dir: &std::path::Path) -> String {
-    dir.join("*").to_string_lossy().into_owned()
+    std::path::Path::new(&glob_literal(&dir.to_string_lossy()))
+        .join("*")
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// `IgnoreSet::compile` silently *skips* patterns that trim to nothing, so
@@ -50,15 +55,15 @@ pub fn pattern_hint(pattern: &str) -> Option<String> {
         ));
     }
     // "D:" can only match a component literally named "D:", which nothing is.
-    let b = p.as_bytes();
-    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+    if matches!(p.as_bytes(), [d, b':'] if d.is_ascii_alphabetic()) {
         return Some(format!(
-            "\"{p}\" never matches anything — use \"{p}\\\" to ignore the whole drive."
+            "\"{p}\" never matches anything; use \"{p}\\\" to ignore the whole drive."
         ));
     }
     None
 }
 
+/// [`pattern_hint`] in the caution colour, inside a [`stable_section`].
 pub fn pattern_hint_label(ui: &mut egui::Ui, pattern: &str) {
     let caution = palette(ui.visuals().dark_mode).orange;
     stable_section(ui, |ui| {
@@ -115,14 +120,44 @@ pub fn pattern_edit(
     (response, valid)
 }
 
-/// Where a middle-elide cuts `text` to fit `max_width` pixels: the byte
-/// offset the head keeps up to and the one the tail resumes from, with one
-/// `…` between; `None` when the whole string fits.
-///
-/// The budget is in pixels from the font's own glyph advances, not a scaled
-/// character count — overshoot and egui elides the result a *second* time,
-/// painting two ellipses. Split from [`middle_elide`] for callers with
-/// ranges to highlight (see `snippet_render::path_cell_job`).
+/// Grows a left and a right side one character at a time, the narrower side
+/// first (the left on a tie), until neither side's next character fits in
+/// `budget` pixels on top of `fixed`. `next(l, r)` gives the characters the
+/// sides would take after taking `l` and `r` bytes; returns the bytes taken.
+pub fn grow_balanced(
+    budget: f32,
+    fixed: f32,
+    width_of: impl Fn(char) -> f32,
+    next: impl Fn(usize, usize) -> (Option<char>, Option<char>),
+) -> (usize, usize) {
+    let (mut l, mut r) = (0, 0);
+    let (mut l_w, mut r_w) = (0.0f32, 0.0f32);
+    loop {
+        let used = l_w + fixed + r_w;
+        let fitting = |c: Option<char>| {
+            c.map(|c| (c.len_utf8(), width_of(c)))
+                .filter(|&(_, w)| used + w <= budget)
+        };
+        let (left, right) = next(l, r);
+        // The preferred side wins when it fits; otherwise the other one.
+        match (l_w <= r_w, fitting(left), fitting(right)) {
+            (true, Some((n, w)), _) | (false, Some((n, w)), None) => {
+                l += n;
+                l_w += w;
+            }
+            (_, _, Some((n, w))) => {
+                r += n;
+                r_w += w;
+            }
+            (_, None, None) => return (l, r),
+        }
+    }
+}
+
+/// Byte offsets `(head_end, tail_start)` for eliding the middle of `text` to
+/// fit `max_width` pixels with one `…`; `None` if it fits. Measured in real
+/// glyph widths: any overshoot and egui elides again, painting two ellipses.
+/// Split from [`middle_elide`] for callers that highlight ranges.
 pub fn middle_elide_cut(
     ui: &egui::Ui,
     text: &str,
@@ -134,41 +169,14 @@ pub fn middle_elide_cut(
         if text.chars().map(width_of).sum::<f32>() <= max_width {
             return None;
         }
-        let budget = max_width - width_of('…');
-
-        // Grow a head and a tail toward each other, feeding whichever side is
-        // narrower; indices advance by whole characters (UTF-8 boundaries).
-        let (mut head, mut tail) = (0usize, text.len());
-        let (mut head_w, mut tail_w) = (0.0f32, 0.0f32);
-        while head < tail {
-            let rest = &text[head..tail];
-            let front = rest.chars().next().expect("head < tail");
-            let back = rest.chars().next_back().expect("head < tail");
-            let (front_w, back_w) = (width_of(front), width_of(back));
-            let used = head_w + tail_w;
-            let (front_fits, back_fits) = (used + front_w <= budget, used + back_w <= budget);
-            if !front_fits && !back_fits {
-                break;
-            }
-            // The preferred side wins when it fits; otherwise the other just did.
-            let take_front = if head_w <= tail_w {
-                front_fits
-            } else {
-                !back_fits
-            };
-            if take_front {
-                head += front.len_utf8();
-                head_w += front_w;
-            } else {
-                tail -= back.len_utf8();
-                tail_w += back_w;
-            }
-        }
-        if head >= tail {
-            // The two halves met without dropping anything.
-            return None;
-        }
-        Some((head, tail))
+        // A head and a tail grow toward each other.
+        let (head, tail_len) = grow_balanced(max_width - width_of('…'), 0.0, width_of, |h, t| {
+            let rest = &text[h..text.len() - t];
+            (rest.chars().next(), rest.chars().next_back())
+        });
+        let tail = text.len() - tail_len;
+        // Meeting means the two halves dropped nothing.
+        (head < tail).then_some((head, tail))
     })
 }
 
@@ -193,7 +201,12 @@ pub fn middle_elide<'a>(
 }
 
 /// A semitransparent down-arrow while more content lies below the fold.
-/// Painter-only, so it never swallows clicks; the fonts have no ▼ glyph.
+/// Painter-only, so it never swallows clicks; the bundled fonts have no ▼.
+///
+/// Static on purpose. It used to pulse, which needed a repaint every 50 ms
+/// for as long as it showed: on an idle Search tab with more results than
+/// rows, that re-laid-out every visible row 20 times a second, measured at
+/// 11.8 s of CPU per idle 30 s (100k-file index, 1000 results).
 pub fn more_below_hint<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutput<R>) {
     let more_below = out.state.offset.y + out.inner_rect.height() < out.content_size.y - 1.0;
     if !more_below {
@@ -203,12 +216,7 @@ pub fn more_below_hint<R>(ui: &egui::Ui, out: &egui::scroll_area::ScrollAreaOutp
     let cx = out.inner_rect.center().x;
     let tip = out.inner_rect.bottom() - 5.0;
     let (half_width, height) = (7.0, 6.0);
-    // A slow opacity pulse; repaints only while visible, at a lazy cadence.
-    let t = ui.ctx().input(|i| i.time);
-    let pulse = 0.35 + 0.10 * ((t * std::f64::consts::TAU / 2.5).sin() as f32);
-    let color = ui.visuals().strong_text_color().gamma_multiply(pulse);
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_millis(50));
+    let color = ui.visuals().strong_text_color().gamma_multiply(0.35);
     painter.add(egui::Shape::convex_polygon(
         vec![
             egui::pos2(cx - half_width, tip - height),
@@ -235,7 +243,7 @@ fn wipe_edges(rect: egui::Rect, wipe: f32) -> (f32, f32) {
 
 /// The scrim hiding the not-yet-revealed part of `rect`. Unlike a per-row
 /// opacity it reaches the parts of an `egui_extras` table the caller never
-/// gets a `Ui` for — the stripes, the selection fill, the scroll bar.
+/// gets a `Ui` for: the stripes, the selection fill, the scroll bar.
 pub fn wipe_mesh(rect: egui::Rect, wipe: f32, fill: egui::Color32) -> Option<egui::Mesh> {
     if wipe <= 0.0 || rect.height() <= 0.0 || rect.width() <= 0.0 {
         return None;
@@ -273,7 +281,7 @@ pub fn wipe_mesh(rect: egui::Rect, wipe: f32, fill: egui::Color32) -> Option<egu
     (!mesh.is_empty()).then_some(mesh)
 }
 
-/// Paint [`wipe_mesh`] through the layer painter, not `ui.painter()`: the
+/// Paints [`wipe_mesh`] through the layer painter, not `ui.painter()`: the
 /// caller's section-wide opacity would otherwise scale the scrim along with
 /// what it is meant to hide.
 pub fn wipe_scrim(ui: &egui::Ui, rect: egui::Rect, wipe: f32) {
@@ -285,6 +293,27 @@ pub fn wipe_scrim(ui: &egui::Ui, rect: egui::Rect, wipe: f32) {
         .add(egui::Shape::mesh(mesh));
 }
 
+/// The Apply & Save button, orange while there are unsaved edits, with an
+/// "Unsaved changes" note beside it that never renames the button.
+pub fn apply_save_row(ui: &mut egui::Ui, dirty: bool) -> egui::Response {
+    use crate::tips::Tipped;
+    let p = palette(ui.visuals().dark_mode);
+    ui.horizontal(|ui| {
+        let color = if dirty { p.orange } else { p.blue };
+        let apply = ui
+            .add(bordered_button("Apply & Save", color))
+            .tip(&crate::tips::APPLY_SAVE);
+        stable_section(ui, |ui| {
+            if dirty {
+                ui.label(hint_colored("Unsaved changes", p.orange));
+            }
+        });
+        apply
+    })
+    .inner
+}
+
+/// Small, weak text for secondary notes.
 pub fn hint(text: impl Into<egui::RichText>) -> egui::RichText {
     text.into().small().weak()
 }

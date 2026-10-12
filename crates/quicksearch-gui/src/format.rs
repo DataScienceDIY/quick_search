@@ -1,13 +1,16 @@
 //! Small display formatters shared across tabs.
 
-use quicksearch_core::indexing::MaintenanceStep;
+use quicksearch_core::indexing::{MaintenanceStep, PrepStep};
 
-/// Human-readable byte size: `999 B`, `1.2 KB`, `4.7 MB`, `1.3 GB`.
+/// Human-readable byte size in decimal units (1 KB = 1000 bytes): `999 B`,
+/// `1.2 KB`, `4.7 MB`, `1.3 GB`.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
+    // 999.95 is the smallest value `{:.1}` rounds to 1000.0, so the unit
+    // moves up before the rounding could print `1000.0 KB`.
+    while value >= 999.95 && unit < UNITS.len() - 1 {
         value /= 1000.0;
         unit += 1;
     }
@@ -65,6 +68,9 @@ pub fn fmt_interval(minutes: u64) -> String {
 }
 
 /// `1,234,567`.
+///
+/// Read as well as written: the byte fields in Settings are *edited* in this
+/// form, so [`parse_grouped`] has to take back whatever this puts out.
 pub fn group_thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -75,6 +81,38 @@ pub fn group_thousands(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// [`group_thousands`] read back, whether or not the separators were typed:
+/// `52,428,800`, `52428800` and `52 428 800` are one number.
+///
+/// `None` for anything that is not a whole number, including the empty
+/// string a half-cleared field holds. A `DragValue` whose parser declines
+/// keeps the value it had, so a number being retyped cannot land in the
+/// config as a zero on its way through.
+pub fn parse_grouped(text: &str) -> Option<u64> {
+    // Every separator someone might type or paste in, including the narrow
+    // no-break space a spreadsheet copies out.
+    let digits: String = text
+        .chars()
+        .filter(|&c| !(c == ',' || c == '_' || c == '\u{202f}' || c.is_whitespace()))
+        .collect();
+    // `parse` alone would take a leading `+`.
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // `parse` turns down the empty string and anything past `u64::MAX`.
+    digits.parse().ok()
+}
+
+/// `1,234 / 5,678 (22%)`; `percent` runs 0..=100.
+pub fn fmt_progress(done: usize, total: usize, percent: impl Into<f64>) -> String {
+    format!(
+        "{} / {} ({:.0}%)",
+        group_thousands(done as u64),
+        group_thousands(total as u64),
+        percent.into()
+    )
 }
 
 /// Files/sec. A nonzero rate never renders as "0.0": slow rates go per-minute.
@@ -132,6 +170,19 @@ pub fn fmt_maintenance(step: MaintenanceStep) -> &'static str {
     }
 }
 
+/// The label of the reconcile pass, in the status bar and the Manage tab.
+pub const REBUILDING_FTS_CACHE: &str = "Rebuilding FTS cache";
+
+/// A run's prologue step, in the words a user reads.
+pub fn fmt_prep_step(step: &PrepStep) -> &'static str {
+    match step {
+        PrepStep::PreviousRun => "Finishing the previous run…",
+        PrepStep::OpeningIndex => "Opening the index…",
+        PrepStep::Reconciling(_) => REBUILDING_FTS_CACHE,
+        PrepStep::Starting => "Getting the index ready…",
+    }
+}
+
 /// What a finished reconciliation did, in one line. A zero clause is left
 /// out, and a pass that changed nothing still reports that it ran.
 pub fn fmt_reconcile_summary(deleted: usize, recontented: usize) -> String {
@@ -176,7 +227,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sizes() {
+    fn sizes_use_decimal_units_with_one_decimal() {
         assert_eq!(human_size(0), "0 B");
         assert_eq!(human_size(999), "999 B");
         assert_eq!(human_size(1200), "1.2 KB");
@@ -184,8 +235,27 @@ mod tests {
         assert_eq!(human_size(1_300_000_000), "1.3 GB");
     }
 
+    /// The unit is chosen after the rounding, so no size reads `1000.0 KB`.
     #[test]
-    fn intervals() {
+    fn sizes_change_unit_where_the_rounding_reaches_1000() {
+        assert_eq!(human_size(1_000), "1.0 KB");
+        assert_eq!(human_size(1_000_000), "1.0 MB");
+        // 999.95 of a unit is the first amount that rounds to 1000.0.
+        for (scale, unit, next) in [
+            (1, "KB", "MB"),
+            (1_000, "MB", "GB"),
+            (1_000_000, "GB", "TB"),
+        ] {
+            assert_eq!(human_size(999_950 * scale - 1), format!("999.9 {unit}"));
+            assert_eq!(human_size(999_950 * scale), format!("1.0 {next}"));
+            assert_eq!(human_size(1_000_000 * scale - 1), format!("1.0 {next}"));
+        }
+        // TB is the last unit, so it alone may pass 1000.
+        assert_eq!(human_size(u64::MAX), "18446744.1 TB");
+    }
+
+    #[test]
+    fn intervals_read_in_the_largest_whole_unit() {
         assert_eq!(fmt_interval(0), "1 min");
         assert_eq!(fmt_interval(1), "1 min");
         assert_eq!(fmt_interval(59), "59 min");
@@ -198,11 +268,78 @@ mod tests {
     }
 
     #[test]
-    fn thousands() {
+    fn thousands_are_grouped_with_commas() {
         assert_eq!(group_thousands(0), "0");
         assert_eq!(group_thousands(999), "999");
         assert_eq!(group_thousands(1000), "1,000");
         assert_eq!(group_thousands(1_234_567), "1,234,567");
+    }
+
+    /// A typed number goes in whether or not it is punctuated: the field
+    /// shows separators, and someone retyping the value will not.
+    #[test]
+    fn grouped_numbers_parse_with_or_without_their_separators() {
+        assert_eq!(parse_grouped("52,428,800"), Some(52_428_800));
+        assert_eq!(parse_grouped("52428800"), Some(52_428_800));
+        assert_eq!(parse_grouped("52 428 800"), Some(52_428_800));
+        assert_eq!(parse_grouped("52\u{202f}428\u{202f}800"), Some(52_428_800));
+        assert_eq!(parse_grouped("52_428_800"), Some(52_428_800));
+        // Separators are stripped, not validated: the field is for entering
+        // a number, not for spelling one correctly.
+        assert_eq!(parse_grouped("5,2,4,2,8,8,0,0"), Some(52_428_800));
+        assert_eq!(parse_grouped("  1024  "), Some(1024));
+        assert_eq!(parse_grouped("0"), Some(0));
+    }
+
+    /// Anything that is not a whole number leaves the field's value alone.
+    #[test]
+    fn a_partial_or_bogus_entry_declines() {
+        // Empty is what a cleared field holds mid-edit; taking it as zero
+        // would write a zero to the config between keystrokes.
+        assert_eq!(parse_grouped(""), None);
+        assert_eq!(parse_grouped("   "), None);
+        assert_eq!(parse_grouped(","), None);
+        assert_eq!(parse_grouped("1.5"), None);
+        assert_eq!(parse_grouped("-1"), None);
+        assert_eq!(parse_grouped("2 MB"), None);
+        assert_eq!(parse_grouped("1e6"), None);
+        assert_eq!(parse_grouped("٤٢"), None);
+        // Past `u64::MAX`, rather than wrapping to something plausible.
+        assert_eq!(parse_grouped("18,446,744,073,709,551,616"), None);
+        assert_eq!(parse_grouped("+5"), None);
+    }
+
+    #[test]
+    fn progress_reads_done_of_total_with_a_whole_percent() {
+        assert_eq!(fmt_progress(1234, 5678, 21.7), "1,234 / 5,678 (22%)");
+        assert_eq!(fmt_progress(0, 0, 100.0f32), "0 / 0 (100%)");
+    }
+
+    /// What the byte fields do every frame: render the stored number, then
+    /// read back exactly it. Every default and clamp bound, plus the widest
+    /// value any of those fields accepts.
+    #[test]
+    fn every_byte_field_value_survives_the_round_trip() {
+        for n in [
+            0,
+            1,
+            512,
+            1024,
+            8192,
+            262_144,
+            2_097_152,
+            52_428_800,
+            1_073_741_824,
+            8_589_934_592,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                parse_grouped(&group_thousands(n)),
+                Some(n),
+                "{} did not survive being displayed",
+                n
+            );
+        }
     }
 
     #[test]
@@ -216,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn elapsed_units() {
+    fn elapsed_time_switches_to_seconds_at_one_second() {
         use std::time::Duration;
         assert_eq!(fmt_elapsed(Duration::from_millis(0)), "0 ms");
         assert_eq!(fmt_elapsed(Duration::from_millis(7)), "7 ms");
@@ -242,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn ago_buckets() {
+    fn ages_read_as_minutes_then_hours_then_a_date() {
         let now = quicksearch_core::log::now_unix();
         assert_eq!(fmt_ago(now), "just now");
         assert_eq!(fmt_ago(now - 59), "just now");
@@ -277,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn truncation() {
+    fn middle_truncation_keeps_both_ends() {
         assert_eq!(middle_truncate("short", 20), "short");
         let t = middle_truncate("/very/long/path/to/some/file.txt", 15);
         assert!(t.chars().count() <= 15);

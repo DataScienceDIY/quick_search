@@ -34,7 +34,7 @@ fn main() {
             panic!("indexing failed: {}", e);
         }
         if let Ok(conn) = db::open_existing(db_path, false) {
-            if db::repo::get_last_full_index(&conn).is_some() {
+            if matches!(db::repo::get_last_full_index(&conn), Ok(Some(_))) {
                 break;
             }
         }

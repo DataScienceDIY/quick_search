@@ -162,35 +162,24 @@ pub(super) fn snippet_job(ui: &egui::Ui, snip: &Snippet, max_rows: usize) -> Lay
 pub(super) fn centered_match_job(ui: &egui::Ui, snip: &Snippet, width_px: f32) -> LayoutJob {
     let fmt = snippet_formats(ui);
 
-    // Newlines force breaks even in a one-row LayoutJob; flatten them to
-    // spaces — byte-for-byte, so the match ranges stay valid.
-    let flattened: Option<String> = snip
-        .window
-        .contains(['\n', '\r', '\t'])
-        .then(|| snip.window.replace(['\n', '\r', '\t'], " "));
-    let window = flattened.as_deref().unwrap_or(&snip.window);
+    let flat = one_line(&snip.window);
+    let window: &str = &flat;
 
     // The budget is in pixels: the centered layout puts egui in Extend mode
-    // (infinite width), and `Column::clip` then trims a *centered* overflow
-    // from both ends at once — silently, taking the match with it.
+    // (infinite width), and `Column::clip` then silently trims a centered
+    // overflow from both ends at once, taking the match with it.
     let (start, end, decorate) = ui.fonts(|f| {
         let font_id = &fmt.normal.font_id;
         let width_of = |c: char| f.glyph_width(font_id, c);
         let ellipsis = width_of('…');
-        let mut marks = 0.0;
-        if snip.truncated_start {
-            marks += ellipsis;
-        }
-        if snip.truncated_end {
-            marks += ellipsis;
-        }
+        let marks = (snip.truncated_start as u8 + snip.truncated_end as u8) as f32 * ellipsis;
         if fits_within(window, width_px - marks, width_of) {
             return (0, window.len(), true);
         }
         // Either end may gain a mark; reserve for both.
         let budget = width_px - 2.0 * ellipsis;
         let Some(&(a, b)) = snip.ranges.first() else {
-            // No ranges (shouldn't happen for match cells) — head trim.
+            // No ranges (shouldn't happen for match cells): head trim.
             return (0, take_forward(window, 0, budget.max(0.0), width_of), true);
         };
         if budget <= 0.0 {
@@ -202,37 +191,14 @@ pub(super) fn centered_match_job(ui: &egui::Ui, snip: &Snippet, width_px: f32) -
             return (a, take_forward(window, a, budget, width_of), true);
         }
         let match_w: f32 = window[a..b].chars().map(width_of).sum();
-
-        // Equal context on both sides, grown outward a character at a time;
-        // the narrower side is fed first.
-        let (mut start, mut end) = (a, b);
-        let (mut before_w, mut after_w) = (0.0f32, 0.0f32);
-        loop {
-            let prev = window[..start].chars().next_back();
-            let next = window[end..].chars().next();
-            let used = before_w + match_w + after_w;
-            let prev_fits = prev.is_some_and(|c| used + width_of(c) <= budget);
-            let next_fits = next.is_some_and(|c| used + width_of(c) <= budget);
-            if !prev_fits && !next_fits {
-                break;
-            }
-            // The preferred side wins when it fits; otherwise the other just did.
-            let take_prev = if before_w <= after_w {
-                prev_fits
-            } else {
-                !next_fits
-            };
-            if take_prev {
-                let c = prev.expect("prev_fits");
-                start -= c.len_utf8();
-                before_w += width_of(c);
-            } else {
-                let c = next.expect("next_fits");
-                end += c.len_utf8();
-                after_w += width_of(c);
-            }
-        }
-        (start, end, true)
+        // Equal context on both sides, grown outward from the match.
+        let (before, after) = crate::ui_util::grow_balanced(budget, match_w, width_of, |l, r| {
+            (
+                window[..a - l].chars().next_back(),
+                window[b + r..].chars().next(),
+            )
+        });
+        (a - before, b + after, true)
     });
 
     let mut job = LayoutJob::default();
@@ -250,8 +216,8 @@ pub(super) fn centered_match_job(ui: &egui::Ui, snip: &Snippet, width_px: f32) -
 
 /// The Path column cell: middle-elided to `width_px`, with whatever of a
 /// path-tier match survives the cut highlighted; only the elision mark is
-/// weak. Returns the job and whether anything was elided — the caller's
-/// trigger for a full-path tooltip.
+/// weak. Returns the job and whether anything was elided, which the caller
+/// answers with a full-path tooltip.
 pub(super) fn path_cell_job(
     ui: &egui::Ui,
     path: &str,
@@ -276,16 +242,10 @@ pub(super) fn path_cell_job(
 }
 
 fn fits_within(text: &str, budget: f32, width_of: impl Fn(char) -> f32) -> bool {
-    let mut used = 0.0;
-    for c in text.chars() {
-        used += width_of(c);
-        if used > budget {
-            return false;
-        }
-    }
-    true
+    take_forward(text, 0, budget, width_of) == text.len()
 }
 
+/// The end of the longest run from `from` that fits in `budget` pixels.
 fn take_forward(text: &str, from: usize, budget: f32, width_of: impl Fn(char) -> f32) -> usize {
     let mut end = from;
     let mut used = 0.0;

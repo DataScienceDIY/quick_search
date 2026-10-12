@@ -1,3 +1,4 @@
+//! Peak and settled memory of a full indexing run.
 //!
 //! [`indexprobe`](indexprobe.rs) answers "how fast"; this answers "how
 //! much RAM", driving the same [`IndexingService`] the GUI drives with no
@@ -11,27 +12,27 @@
 //! ./target/release/examples/memprobe cold ~ /var/tmp/qs-mem/index.db 250 probe.toml
 //! ```
 //!
-//! **Roots are comma-separated**, because per-root state is what multiplies:
-//! a one-root run cannot show the buffers that exist once per pipeline.
+//! Roots are comma-separated: per-root state multiplies, and a one-root run
+//! cannot show the buffers that exist once per pipeline.
 //!
 //! ```text
 //! ./target/release/examples/memprobe cold /media/shared,/home/me,/usr /var/tmp/qs-mem/index.db
 //! ```
 //!
-//! Trailing arguments: sampling interval in ms (default 100) and a config
-//! file. `cold` deletes the database first; `warm` re-runs against the
-//! finished one. Reading the report: **VmHWM** cannot miss a spike — quote
-//! it; the sampled peak only says *when*. `growth per file` is a ratio, not
+//! Trailing arguments: the sampling interval in ms (default 100) and a
+//! config file. `cold` deletes the database first; `warm` re-runs against
+//! the finished one. Reading the report: quote `VmHWM`, which cannot miss a
+//! spike; the sampled peak only says when. `growth per file` is a ratio, not
 //! a per-file cost. Nothing reported is evictable page cache. `settled RSS`
-//! is what a long-lived process keeps — glibc frees to its arena, so
-//! without `release_free_heap` the peak becomes the floor.
+//! is what a long-lived process keeps: what the allocators still hold after
+//! the run's closing `release_free_heap`.
 //!
 //! Built with `--features probe` the indexer also prints a `census` line
 //! naming what its run-scoped structures hold, which is the half `smaps`
 //! cannot answer: a mapping is "heap", never "the stale-candidate list".
 
-// Settled RSS is the whole point of this probe, and it is a property of the
-// allocator, so it must be the one the shipped binaries install.
+// Settled RSS is a property of the allocator, so this must be the one the
+// shipped binaries install.
 #[global_allocator]
 static GLOBAL: quicksearch_core::platform::Allocator = quicksearch_core::platform::Allocator;
 
@@ -40,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use quicksearch_core::config::Config;
 use quicksearch_core::indexing::{IndexingService, IndexingStatus, RootPhase};
-use quicksearch_core::testutil::{mib, size_class};
+use quicksearch_core::testutil::mib;
 
 mod common;
 
@@ -60,13 +61,6 @@ const SETTLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// The writer releases its connection and returns pages *after* setting
 /// `Idle`; sampling the instant it flips would miss the thing measured.
 const SETTLE_QUIET: Duration = Duration::from_secs(2);
-
-/// Resident bytes at the peak, grouped: heap, droppable file-backed cache
-/// and thread stacks each want different fixes — only `smaps` shows which.
-#[derive(Default, Clone)]
-struct Breakdown {
-    entries: Vec<(String, u64)>,
-}
 
 struct Sample {
     at: Duration,
@@ -136,7 +130,7 @@ fn run(mode: &str, roots: &[String], db: &Path, interval: Duration, config_path:
             .expect("clear marker");
     }
 
-    let baseline = rss().expect("read /proc/self/statm");
+    let baseline = common::rss().expect("read /proc/self/status");
     eprintln!(
         "memprobe {}: {} root(s)={} db={}\n  baseline RSS {} (process before indexing starts)",
         mode,
@@ -158,7 +152,7 @@ fn run(mode: &str, roots: &[String], db: &Path, interval: Duration, config_path:
     let mut ticks: u32 = 0;
     let mut done = false;
     let mut high = 0u64;
-    let mut at_peak = Breakdown::default();
+    let mut at_peak = Vec::new();
 
     while Instant::now() < deadline {
         std::thread::sleep(interval);
@@ -169,8 +163,8 @@ fn run(mode: &str, roots: &[String], db: &Path, interval: Duration, config_path:
             panic!("indexing failed: {}", e);
         }
         let (walked, extracted, phase, file) = progress(&status);
-        let now = rss().unwrap_or(0);
-        // Only on a new high: smaps costs far more than statm.
+        let now = common::rss().unwrap_or(0);
+        // Only on a new high: `smaps` costs far more than `status`.
         if now > high {
             high = now;
             at_peak = breakdown();
@@ -186,7 +180,10 @@ fn run(mode: &str, roots: &[String], db: &Path, interval: Duration, config_path:
 
         if ticks.is_multiple_of(marker_every) && db.exists() {
             if let Ok(conn) = rusqlite::Connection::open(db) {
-                if quicksearch_core::db::repo::get_last_full_index(&conn).is_some() {
+                if matches!(
+                    quicksearch_core::db::repo::get_last_full_index(&conn),
+                    Ok(Some(_))
+                ) {
                     done = true;
                     break;
                 }
@@ -206,10 +203,9 @@ fn run(mode: &str, roots: &[String], db: &Path, interval: Duration, config_path:
     );
 }
 
-/// The peak says what indexing needs; this says what it *keeps* — `free`
-/// under glibc returns to the arena, not the kernel, so this is the
-/// process's floor. The final release lands even after `Idle` is published,
-/// hence the wait, and then a little longer.
+/// RSS once the service is idle: what indexing keeps, where the peak says
+/// what it needs. The final release lands after `Idle` is published, hence
+/// the wait and then [`SETTLE_QUIET`].
 fn settle(service: &IndexingService) -> u64 {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     while Instant::now() < deadline {
@@ -219,7 +215,7 @@ fn settle(service: &IndexingService) -> u64 {
         std::thread::sleep(Duration::from_millis(100));
     }
     std::thread::sleep(SETTLE_QUIET);
-    rss().unwrap_or(0)
+    common::rss().unwrap_or(0)
 }
 
 /// Flatten per-root progress into one line: the process has one address
@@ -256,7 +252,7 @@ fn report(
     samples: &[Sample],
     db: &Path,
     interval: Duration,
-    at_peak: &Breakdown,
+    at_peak: &[(String, u64)],
 ) {
     // One line per 5% of the run, so the shape is visible at any duration.
     let step = (samples.len() / 20).max(1);
@@ -325,20 +321,17 @@ fn report(
             );
         }
     }
-    eprintln!(
-        "  database on disk  {} (counts toward RSS as page cache)",
-        mib(db_bytes)
-    );
+    eprintln!("  database on disk  {}", mib(db_bytes));
 
-    if !at_peak.entries.is_empty() {
+    if !at_peak.is_empty() {
         eprintln!("\n  resident bytes at the peak, by mapping:");
-        for (name, bytes) in at_peak.entries.iter().take(8) {
+        for (name, bytes) in at_peak.iter().take(8) {
             eprintln!("    {:>10}  {}", mib(*bytes), name);
         }
     }
 
-    // A transient spike is what a peak figure hides; ranking
-    // sample-to-sample rises names the files that cause it.
+    // A peak figure hides a transient spike; ranking sample-to-sample rises
+    // names the files that cause it.
     let mut jumps: Vec<(u64, &Sample)> = samples
         .windows(2)
         .map(|w| (w[1].rss.saturating_sub(w[0].rss), &w[1]))
@@ -363,64 +356,17 @@ fn report(
     }
 }
 
-/// Resident set size now, from `/proc/self/statm` field 2 (resident pages).
-fn rss() -> Option<u64> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-    Some(pages * page_size())
-}
-
-/// Resident bytes per mapping from `/proc/self/smaps`, summed by name;
-/// anonymous mappings are bucketed by size class — individually unnamed,
-/// and there can be hundreds.
-fn breakdown() -> Breakdown {
+/// Resident bytes per mapping from `/proc/self/smaps`, summed by name: heap,
+/// droppable file-backed cache and thread stacks each want different fixes,
+/// and only `smaps` shows which.
+fn breakdown() -> Vec<(String, u64)> {
     let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") else {
-        return Breakdown::default();
+        return Vec::new();
     };
-    let mut by_name: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let mut current = String::new();
-
-    for line in smaps.lines() {
-        if let Some(rss_kib) = line.strip_prefix("Rss:") {
-            let kib: u64 = rss_kib
-                .split_whitespace()
-                .next()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0);
-            *by_name.entry(current.clone()).or_default() += kib * 1024;
-        } else if let Some(header) = parse_map_header(line) {
-            current = header;
-        }
-    }
-
-    let mut entries: Vec<(String, u64)> = by_name.into_iter().filter(|(_, b)| *b > 0).collect();
-    entries.sort_by_key(|(_, bytes)| std::cmp::Reverse(*bytes));
-    Breakdown { entries }
+    common::resident_by_name(common::smaps_regions(&smaps).map(|r| (r.name, r.rss)))
 }
 
-/// The name for a `smaps` header line, or `None`. Anonymous mappings are
-/// bucketed by size so a hundred 8 MiB regions read as one line.
-fn parse_map_header(line: &str) -> Option<String> {
-    let mut fields = line.split_whitespace();
-    let range = fields.next()?;
-    let (lo, hi) = range.split_once('-')?;
-    let lo = u64::from_str_radix(lo, 16).ok()?;
-    let hi = u64::from_str_radix(hi, 16).ok()?;
-    // Fields 2-5 are perms, offset, dev, inode; anything after is the path.
-    let path = fields.nth(4).unwrap_or("");
-    if !path.is_empty() {
-        return Some(path.to_string());
-    }
-    Some(format!("anon {}", size_class(hi.saturating_sub(lo))))
-}
-
-/// 4 KiB everywhere this runs; `sysconf` would mean a libc dependency for a
-/// constant that never differs where `/proc` exists.
-fn page_size() -> u64 {
-    4096
-}
-
-/// The index plus its WAL — leaving the WAL out understates a run in progress.
+/// The index plus its WAL; leaving the WAL out understates a run in progress.
 fn db_size(db: &Path) -> u64 {
     ["", "-wal"]
         .iter()

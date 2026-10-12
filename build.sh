@@ -18,7 +18,7 @@
 # with the distribution's package manager (via sudo), then the Rust toolchain
 # with rustup. Every stage is skipped when what it provides is already present,
 # so the everyday run costs one `cargo build`.
-# Other Unixes only get the Rust stage — see the README for their toolchains.
+# Other Unixes only get the Rust stage; the C toolchain is theirs to install.
 #
 # --installer adds NSIS and the mingw-w64 cross toolchain to that list and hands
 # off to packaging/build-installer.sh, which cross-compiles and produces
@@ -64,21 +64,17 @@ done
 # cargo may be installed but absent from this shell's PATH, which is the normal
 # state right after rustup runs: it appends to the shell profile, and
 # ~/.cargo/env is what it writes for processes that cannot wait for a new login.
-have_cargo() {
-    if need_cmd cargo; then return 0; fi
-    if [ -r "$HOME/.cargo/env" ]; then
-        . "$HOME/.cargo/env"
-        if need_cmd cargo; then return 0; fi
-    fi
-    return 1
-}
+have_cargo() { need_cmd cargo || { [ -r "$HOME/.cargo/env" ] && . "$HOME/.cargo/env" && need_cmd cargo; }; }
 
 ensure_rust() {
     if have_cargo; then return 0; fi
     need_cmd curl || die "curl is needed to fetch rustup"
     say "Installing the Rust toolchain (rustup, into ~/.rustup and ~/.cargo)"
+    # --default-toolchain none, as in CI: the build below installs the one
+    # rust-toolchain.toml pins, so a default would be a second download. Other
+    # projects then have no default; `rustup default stable` sets one.
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain stable
+        | sh -s -- -y --profile minimal --default-toolchain none
     if [ -r "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
     need_cmd cargo || die "rustup finished but cargo is still not on PATH"
 }
@@ -211,7 +207,7 @@ ensure_system_deps() {
     pkgs="$(printf '%s\n' $pkgs | sort -u | tr '\n' ' ')"
 
     if [ -n "$unmapped" ]; then
-        say "no package for$unmapped in this distribution's repositories — install it yourself, see the README"
+        say "no package for$unmapped in this distribution's repositories; install it yourself"
         # Nothing left to install means there is nothing to say beyond that.
         if [ -z "$pkgs" ]; then
             if [ "$mode" = run ]; then die "cannot continue without$unmapped"; fi
@@ -248,15 +244,22 @@ case "$(uname -s)" in
         ;;
     *)
         # Only Linux package managers are handled; elsewhere the C toolchain is
-        # a manual step (on macOS: xcode-select --install). See the README.
+        # a manual step (on macOS: xcode-select --install).
         check_deps
-        [ -z "$missing" ] || say "not Linux — install these yourself, see the README:$missing"
+        [ -z "$missing" ] || say "not Linux; install these yourself:$missing"
         ;;
 esac
 
 if [ "$mode" = check ]; then
     if have_cargo; then
-        printf '    %s\n' "cargo: $(cargo --version)"
+        # Asked in the repo, so it names the toolchain the build would use.
+        # RUSTUP_AUTO_INSTALL=0 stops rustup downloading that pinned toolchain
+        # to answer, since --check installs nothing.
+        if v="$(cd "$REPO_ROOT" && RUSTUP_AUTO_INSTALL=0 cargo --version 2>/dev/null)"; then
+            printf '    %s\n' "cargo: $v"
+        else
+            printf '    %s\n' "cargo: present; the build installs the pinned toolchain"
+        fi
     else
         printf '    %s\n' "cargo: MISSING (rustup would install it)"
     fi

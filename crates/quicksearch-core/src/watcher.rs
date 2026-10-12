@@ -3,16 +3,17 @@
 //! inotify has no recursive watch, so each surviving directory is registered
 //! `NonRecursive`; `ReadDirectoryChangesW` takes one recursive handle per
 //! root, filtering per event. If the watch budget cannot cover everything,
-//! the whole watcher fails — a half-watched root looks live while going
+//! the whole watcher fails: a half-watched root looks live while going
 //! silently stale.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use notify::event::{ModifyKind, RenameMode};
 use notify::{
     Config as NotifyConfig, ErrorKind as NotifyErrorKind, Event as NotifyEvent, EventKind,
     RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher,
@@ -48,7 +49,6 @@ pub type EventSink = Arc<dyn Fn(FsEvent) + Send + Sync + 'static>;
 #[derive(Debug, Clone)]
 pub struct WatchFilters {
     pub include_hidden: bool,
-    pub follow_symlinks: bool,
     pub ignore: Arc<IgnoreSet>,
 }
 
@@ -59,14 +59,19 @@ pub enum WatchError {
         dirs: usize,
         cap: usize,
     },
-    /// The kernel refused a watch before our own cap — `max_user_watches` is
+    /// The kernel refused a watch before our own cap: `max_user_watches` is
     /// lower, or other processes have consumed the shared budget.
     KernelLimit {
         registered: usize,
     },
-    /// The kernel's event queue overflowed and events were dropped; the
-    /// watcher keeps delivering, but the index is out of step by an unknown
-    /// amount, so a full run is owed.
+    /// The kernel's event queue (on Windows, the root's change buffer)
+    /// overflowed and events were dropped. A one-shot, not a capacity problem
+    /// like the other reasons, but the index is out of step by an unknown
+    /// amount, and so is the watch set: a lost directory `Create` leaves the
+    /// new directory unwatched, a lost `Delete` keeps the old one registered.
+    /// The coordinator answers with a full run and a fresh registration, from
+    /// which a limit that still stands surfaces as itself; during a storm, at
+    /// most once in a few minutes.
     Overflowed,
     Other(String),
 }
@@ -112,20 +117,15 @@ fn fmt_cap(cap: usize) -> String {
     }
 }
 
-/// Tuning for the whole filesystem-event pipeline.
+/// Tuning for the whole filesystem-event pipeline. The watcher forwards
+/// events as they arrive; the coordinator's queue coalesces them by path and
+/// decides when to apply them.
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
     /// How long the coordinator's queue must go quiet before it is applied.
     pub pending_settle: Duration,
     /// Ceiling on how long `pending_settle` may hold the queue back.
     pub pending_max_defer: Duration,
-    /// Per-directory debounce window.
-    pub throttle_window: Duration,
-    pub tick_interval: Duration,
-    /// Directories *selected* per tick; [`FLUSH_BUDGET`] is the real limit.
-    pub max_dirs_per_tick: usize,
-    /// When to garbage-collect stale throttle entries (idle > window * N).
-    pub prune_max_age_multiplier: u32,
     /// Directory budget; see [`DEFAULT_MAX_WATCHED_DIRS`].
     pub max_watched_dirs: usize,
 }
@@ -135,10 +135,6 @@ impl Default for WatcherConfig {
         Self {
             pending_settle: Duration::from_secs(2),
             pending_max_defer: Duration::from_secs(30),
-            throttle_window: Duration::from_secs(30),
-            tick_interval: Duration::from_millis(500),
-            max_dirs_per_tick: 512,
-            prune_max_age_multiplier: 10,
             max_watched_dirs: DEFAULT_MAX_WATCHED_DIRS,
         }
     }
@@ -152,8 +148,6 @@ struct WatchRegistry {
     cap: usize,
 }
 
-/// How long one flush pass may spend handing events to the sink.
-const FLUSH_BUDGET: Duration = Duration::from_millis(50);
 
 const WATCH_MODE: RecursiveMode = if crate::platform::WATCH_ROOTS_RECURSIVELY {
     RecursiveMode::Recursive
@@ -163,7 +157,7 @@ const WATCH_MODE: RecursiveMode = if crate::platform::WATCH_ROOTS_RECURSIVELY {
 
 impl WatchRegistry {
     /// Register `dir` unless already watched. `Ok(false)` means "nothing to
-    /// do" — already watched, or the path vanished mid-walk.
+    /// do": already watched, or the path vanished mid-walk.
     fn add(&mut self, dir: &Path) -> Result<bool, WatchError> {
         if self.dirs.contains(dir) {
             return Ok(false);
@@ -202,7 +196,7 @@ impl WatchRegistry {
             return 0;
         }
         // Descendants sort immediately after their ancestor. `starts_with`
-        // compares whole components — a raw string prefix would take `/a/bc`
+        // compares whole components; a raw string prefix would take `/a/bc`
         // for a child of `/a/b`.
         let doomed: Vec<PathBuf> = self
             .dirs
@@ -236,8 +230,12 @@ fn add_watch(reg: &mut WatchRegistry, dir: &Path) -> Result<(), WatchError> {
 
 /// Handle to a running watcher. Dropping calls [`Self::stop`] implicitly.
 pub struct Watcher {
-    stop_flag: Arc<AtomicBool>,
+    /// The loop's own channel: `None` ends it. The notify handle holds the
+    /// other sender, so the channel never closes while the loop runs.
+    stop_tx: mpsc::Sender<Option<NotifyEvent>>,
     handle: Option<JoinHandle<()>>,
+    /// The flag [`Self::start`] was handed; [`Self::stop`] sets it.
+    cancel: Arc<AtomicBool>,
     dir_count: Arc<AtomicUsize>,
     degraded: Degraded,
     /// Held so the notify handle drops on stop, releasing every watch.
@@ -247,44 +245,53 @@ pub struct Watcher {
 /// Set when the watcher runs out of budget *after* starting.
 type Degraded = Arc<Mutex<Option<WatchError>>>;
 
+/// `Err` once `cancel` is set. Registration checks it per directory, so a
+/// superseded start stops walking, and the dropped registry releases every
+/// watch it took instead of holding them against the user's quota.
+fn not_cancelled(cancel: &AtomicBool) -> Result<(), WatchError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(WatchError::Other("watch registration cancelled".into()));
+    }
+    Ok(())
+}
+
 impl Watcher {
     /// Register watches for every indexable directory under `roots` and start
-    /// the debouncing loop. Registration walks each root — callers run it off
-    /// their main loop.
-    pub fn start<I, P>(
-        roots: I,
+    /// the debouncing loop. Registration walks each root, so callers run it
+    /// off their main loop, and can abandon it by setting `cancel`: the walk
+    /// stops at its next directory (its next root on a recursive backend)
+    /// and returns `Err`. The running watcher keeps the flag, so setting it
+    /// later also ends the loop at its next event.
+    pub fn start(
+        roots: Vec<PathBuf>,
         filters: WatchFilters,
         config: WatcherConfig,
         sink: EventSink,
-    ) -> Result<Self, WatchError>
-    where
-        I: IntoIterator<Item = P>,
-        P: AsRef<Path>,
-    {
-        let (tx, rx) = mpsc::channel::<NotifyEvent>();
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Self, WatchError> {
+        let (tx, rx) = mpsc::channel::<Option<NotifyEvent>>();
+        let stop_tx = tx.clone();
         let degraded: Degraded = Arc::new(Mutex::new(None));
         let degraded_cb = degraded.clone();
         let raw = RecommendedWatcher::new(
             move |res: notify::Result<NotifyEvent>| match res {
                 Ok(ev) => {
-                    // Kernel queue overflow arrives on the *Ok* arm, as
-                    // `EventKind::Other` with the rescan flag and no paths, so
-                    // the error arm below never sees it. The dropped events
-                    // are simply gone — delivery continues, but only a full
-                    // run can find out what was missed.
+                    // inotify, FSEvents and the patched Windows backend (a
+                    // zero-byte completion; see vendor/notify) report overflow
+                    // on the *Ok* arm, as `EventKind::Other` with the rescan
+                    // flag and no paths, so the error arm never sees it.
                     if ev.need_rescan() {
-                        let mut slot = crate::lock_ok(&degraded_cb);
-                        slot.get_or_insert(WatchError::Overflowed);
+                        crate::lock_ok(&degraded_cb).get_or_insert(WatchError::Overflowed);
                         return;
                     }
-                    let _ = tx.send(ev);
+                    let _ = tx.send(Some(ev));
                 }
                 Err(e) => {
                     // The limit can also be hit asynchronously, when notify
                     // reacts to a directory appearing.
                     if matches!(e.kind, NotifyErrorKind::MaxFilesWatch) {
-                        let mut slot = crate::lock_ok(&degraded_cb);
-                        slot.get_or_insert(WatchError::KernelLimit { registered: 0 });
+                        crate::lock_ok(&degraded_cb)
+                            .get_or_insert(WatchError::KernelLimit { registered: 0 });
                     }
                     crate::log_warn!("watcher: notify error: {}", e);
                 }
@@ -300,36 +307,35 @@ impl Watcher {
         }));
 
         // Any error here drops `registry`, which drops the notify handle and
-        // releases every watch already taken — the all-or-nothing guarantee.
+        // releases every watch already taken: the all-or-nothing guarantee.
         // Release is asynchronous, so an immediate retry may briefly see the
         // old descriptors still charged to the user's quota.
-        let roots: Vec<PathBuf> = roots
-            .into_iter()
-            .map(|r| r.as_ref().to_path_buf())
-            .collect();
-
         {
             let failures = UnreadableDirs::default();
             let mut reg = crate::lock_ok(&registry);
             for root in &roots {
+                let before = reg.dirs.len();
                 if crate::platform::WATCH_ROOTS_RECURSIVELY {
                     // Ignored and hidden subtrees have nothing registered to
                     // skip; their events are dropped in `is_event_interesting`.
+                    not_cancelled(&cancel)?;
                     add_watch(&mut reg, root)?;
-                    continue;
+                } else {
+                    let Some(root_str) = root.to_str() else {
+                        crate::log_warn!("watcher: skipping non-UTF-8 root {}", root.display());
+                        continue;
+                    };
+                    for entry in
+                        filtered_dirs(root_str, filters.include_hidden, &filters.ignore, &failures)
+                    {
+                        not_cancelled(&cancel)?;
+                        add_watch(&mut reg, entry.path())?;
+                    }
                 }
-                let Some(root_str) = root.to_str() else {
-                    crate::log_warn!("watcher: skipping non-UTF-8 root {}", root.display());
-                    continue;
-                };
-                for entry in filtered_dirs(
-                    root_str,
-                    filters.follow_symlinks,
-                    filters.include_hidden,
-                    &filters.ignore,
-                    &failures,
-                ) {
-                    add_watch(&mut reg, entry.path())?;
+                // Missing, or refused: this root stays silent while the
+                // status reads Active on the other roots' strength.
+                if reg.dirs.len() == before {
+                    crate::log_warn!("watcher: nothing under {} could be watched", root.display());
                 }
             }
             if reg.dirs.is_empty() {
@@ -338,22 +344,21 @@ impl Watcher {
         }
 
         let dir_count = Arc::new(AtomicUsize::new(crate::lock_ok(&registry).dirs.len()));
-        let stop_flag = Arc::new(AtomicBool::new(false));
         let ctx = LoopCtx {
             sink,
-            config,
-            stop: stop_flag.clone(),
             registry: registry.clone(),
             filters,
             roots,
             dir_count: dir_count.clone(),
             degraded: degraded.clone(),
+            cancel: cancel.clone(),
         };
         let handle = thread::spawn(move || run_loop(rx, ctx));
 
         Ok(Self {
-            stop_flag,
+            stop_tx,
             handle: Some(handle),
+            cancel,
             dir_count,
             degraded,
             _registry: registry,
@@ -365,29 +370,25 @@ impl Watcher {
         self.dir_count.load(Ordering::Relaxed)
     }
 
-    /// Which limit the watcher hit after starting, if any; the coordinator
-    /// polls this and falls back to periodic rescans.
+    /// What went wrong after starting, if anything. The coordinator polls
+    /// this: an overflow re-registers, a limit falls back to periodic rescans.
     pub fn degraded_reason(&self) -> Option<WatchError> {
         crate::lock_ok(&self.degraded).clone()
     }
 
-    /// Whether the watcher ran out of budget after starting.
-    pub fn is_degraded(&self) -> bool {
-        crate::lock_ok(&self.degraded).is_some()
-    }
-
-    /// Forget the recorded reason, so a later one can take its place. For
-    /// [`WatchError::Overflowed`] only: the budget reasons are *standing*,
-    /// while an overflow is a one-shot "you missed some" from a watcher still
-    /// delivering; left in place it would mask a later
-    /// [`WatchError::KernelLimit`].
-    pub fn clear_degraded(&self) {
-        *crate::lock_ok(&self.degraded) = None;
+    /// Record `reason` as if the watcher had hit it after starting.
+    #[cfg(test)]
+    pub(crate) fn force_degraded(&self, reason: WatchError) {
+        *crate::lock_ok(&self.degraded) = Some(reason);
     }
 
     /// Stop the background thread and join it; safe to call multiple times.
+    /// The cancel flag is set first: the `None` queues behind every event
+    /// already sent, and the loop, seeing the flag, ends at the next one
+    /// instead of working through the backlog (or a `register_tree` walk).
     pub fn stop(&mut self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Relaxed);
+        let _ = self.stop_tx.send(None);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -404,85 +405,51 @@ impl std::fmt::Debug for Watcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Watcher")
             .field("watched_dirs", &self.watched_dirs())
-            .field("degraded", &self.is_degraded())
+            .field("degraded", &self.degraded_reason())
             .finish()
     }
 }
 
 struct LoopCtx {
     sink: EventSink,
-    config: WatcherConfig,
-    stop: Arc<AtomicBool>,
     registry: Arc<Mutex<WatchRegistry>>,
     filters: WatchFilters,
-    /// Configured roots; "hidden" is judged relative to them, since a root
-    /// may itself sit under a hidden directory (`~/.config/app`).
+    /// Configured roots, in the spelling events arrive in (through the link,
+    /// for a root that is one). Hidden and ignored names are judged below
+    /// them, since a root may itself sit under one (`~/.config/app`).
     roots: Vec<PathBuf>,
     dir_count: Arc<AtomicUsize>,
     degraded: Degraded,
+    /// The flag [`Watcher::start`] was handed: once set, the loop and any
+    /// [`register_tree`] walk end.
+    cancel: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueuedOp {
+enum Op {
     Create,
     Modify,
     Remove,
 }
 
-#[derive(Debug)]
-struct DirThrottleEntry {
-    record_time: Instant,
-    queue: HashMap<PathBuf, QueuedOp>,
-    /// Flush on the next tick regardless of window age; set for the first
-    /// event in a previously-idle directory so it reacts fast.
-    immediate: bool,
-}
-
-fn run_loop(rx: mpsc::Receiver<NotifyEvent>, ctx: LoopCtx) {
-    let mut throttle: HashMap<PathBuf, DirThrottleEntry> = HashMap::new();
-    let prune_interval_ticks = 20u32;
-    let mut tick_counter: u32 = 0;
-
-    loop {
-        if ctx.stop.load(Ordering::Relaxed) {
+/// Forward each interesting event to the sink as it arrives, blocking in
+/// between; `None` or the cancel flag is [`Watcher::stop`]. Nothing is held
+/// back here: the coordinator's queue coalesces by path and waits for
+/// `pending_settle` (at most `pending_max_defer`). A per-directory throttle
+/// here used to hold a directory's second event for 30 s and woke this
+/// thread twice a second while idle.
+fn run_loop(rx: mpsc::Receiver<Option<NotifyEvent>>, ctx: LoopCtx) {
+    while let Ok(Some(ev)) = rx.recv() {
+        if ctx.cancel.load(Ordering::Relaxed) {
             break;
         }
-
-        let deadline = Instant::now() + ctx.config.tick_interval;
-        loop {
-            if ctx.stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(ev) => handle_notify_event(&ev, &mut throttle, &ctx),
-                Err(mpsc::RecvTimeoutError::Timeout) => break,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-        }
-
-        if ctx.stop.load(Ordering::Relaxed) {
-            break;
-        }
-
-        flush_ready(&mut throttle, &ctx.sink, &ctx.config);
-
-        tick_counter = tick_counter.wrapping_add(1);
-        if tick_counter.is_multiple_of(prune_interval_ticks) {
-            let max_age = ctx
-                .config
-                .throttle_window
-                .saturating_mul(ctx.config.prune_max_age_multiplier);
-            prune_stale(&mut throttle, max_age);
-        }
+        handle_notify_event(&ev, &ctx);
     }
 }
 
 /// Register a directory that appeared after startup, and everything under
-/// it — a whole tree can be moved in with a single event.
+/// it: a whole tree can be moved in with a single event. A stop ends the
+/// walk at the next directory.
 fn register_tree(ctx: &LoopCtx, root: &Path) {
     let Some(root_str) = root.to_str() else {
         return;
@@ -491,16 +458,17 @@ fn register_tree(ctx: &LoopCtx, root: &Path) {
     let mut reg = crate::lock_ok(&ctx.registry);
     for entry in filtered_dirs(
         root_str,
-        ctx.filters.follow_symlinks,
         ctx.filters.include_hidden,
         &ctx.filters.ignore,
         &failures,
     ) {
+        if ctx.cancel.load(Ordering::Relaxed) {
+            break;
+        }
         if let Err(limit) = add_watch(&mut reg, entry.path()) {
             // A partially watched tree would look live while going silently
             // stale; stop and let the coordinator tear us down.
-            let mut slot = crate::lock_ok(&ctx.degraded);
-            slot.get_or_insert(limit);
+            crate::lock_ok(&ctx.degraded).get_or_insert(limit);
             break;
         }
     }
@@ -514,21 +482,15 @@ fn watch_if_new_dir(ctx: &LoopCtx, path: &Path) {
         return;
     }
     // Files are reported through their parent's watch; only directories need
-    // one of their own. A symlink is judged as the link it is: with following
-    // off the walk never descends it, so watching it would spend descriptors
-    // on a subtree that is never indexed.
-    let is_dir = match std::fs::symlink_metadata(path) {
-        Ok(md) if md.file_type().is_symlink() => ctx.filters.follow_symlinks && path.is_dir(),
-        Ok(md) => md.is_dir(),
-        Err(_) => return,
+    // one of their own. A symlink is judged as the link it is, never a
+    // directory: the walk does not descend it, so watching it would spend
+    // descriptors on a subtree that is never indexed.
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return;
     };
-    if !is_dir {
-        return;
+    if md.is_dir() && is_event_interesting(ctx, path) {
+        register_tree(ctx, path);
     }
-    if !is_event_interesting(ctx, path) {
-        return;
-    }
-    register_tree(ctx, path);
 }
 
 /// Drop watches for a directory that went away. Cheap no-op for files.
@@ -544,145 +506,82 @@ fn unwatch_tree(ctx: &LoopCtx, path: &Path) {
     }
 }
 
-/// Whether an event for `path` is worth queueing at all — the same predicate
-/// the walk applies. Under a recursive root watch it is the *only* thing
-/// keeping `node_modules` churn out of the throttle map.
+/// Whether an event for `path` is worth queueing at all: the same predicate
+/// the walk applies, names tested only below the root containing `path`, so
+/// a root inside `node_modules` keeps its events. Under a recursive root
+/// watch it alone keeps `node_modules` churn out of the coordinator's queue.
+/// A path the index cannot spell is dropped (see `path_to_db_string`).
 fn is_event_interesting(ctx: &LoopCtx, path: &Path) -> bool {
-    // A path the index cannot spell is dropped: the incremental side keys on
-    // `path_to_db_string`, which is lossy, so letting the event through means
-    // acting on whichever *different* file owns the lossy spelling.
-    if path.to_str().is_none() {
-        return false;
-    }
-    if ctx.filters.ignore.matches_path(path) {
-        return false;
-    }
-    if !ctx.filters.include_hidden && path_has_hidden_component_under(path, &ctx.roots) {
-        return false;
-    }
-    true
+    path.to_str().is_some()
+        && !ctx.filters.ignore.matches_below(path, &ctx.roots)
+        && (ctx.filters.include_hidden || !path_has_hidden_component_under(path, &ctx.roots))
 }
 
-fn handle_notify_event(
-    ev: &NotifyEvent,
-    throttle: &mut HashMap<PathBuf, DirThrottleEntry>,
-    ctx: &LoopCtx,
-) {
-    if let EventKind::Modify(notify::event::ModifyKind::Name(kind)) = ev.kind {
-        if matches!(kind, notify::event::RenameMode::Both) && ev.paths.len() == 2 {
-            // A rename is only uninteresting when *both* ends are: out of an
-            // ignored directory into a watched one is a real Create.
-            if !is_event_interesting(ctx, &ev.paths[0]) && !is_event_interesting(ctx, &ev.paths[1])
-            {
-                return;
-            }
-            unwatch_tree(ctx, &ev.paths[0]);
-            watch_if_new_dir(ctx, &ev.paths[1]);
-            (ctx.sink)(FsEvent::Rename {
-                from: ev.paths[0].clone(),
-                to: ev.paths[1].clone(),
-            });
+/// What `kind` means for `path`, one of its event's paths, or `None` for
+/// nothing to apply. Split renames degrade to Create/Remove; notify 6.x does
+/// not bundle halves by cookie uniformly across backends. A rename that names
+/// no end (FSEvents reports every rename as `Name(Any)`) is judged by the
+/// disk: a path that is there is where the name went, a `Create`, so a
+/// directory moved in is walked; one that is not is where it left.
+fn op_for(kind: &EventKind, path: &Path) -> Option<Op> {
+    match kind {
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+            Some(Op::Create)
+        }
+        EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+            Some(Op::Remove)
+        }
+        EventKind::Modify(ModifyKind::Name(RenameMode::Any | RenameMode::Other)) => {
+            Some(match std::fs::symlink_metadata(path) {
+                Ok(_) => Op::Create,
+                Err(_) => Op::Remove,
+            })
+        }
+        EventKind::Modify(_) => Some(Op::Modify),
+        _ => None,
+    }
+}
+
+fn handle_notify_event(ev: &NotifyEvent, ctx: &LoopCtx) {
+    let both = EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+    if ev.kind == both && ev.paths.len() == 2 {
+        // A rename is only uninteresting when *both* ends are: out of an
+        // ignored directory into a watched one is a real Create.
+        if !is_event_interesting(ctx, &ev.paths[0]) && !is_event_interesting(ctx, &ev.paths[1]) {
             return;
         }
-        // Split renames degrade to Remove/Create; notify 6.x does not bundle
-        // halves by cookie uniformly across backends.
+        unwatch_tree(ctx, &ev.paths[0]);
+        watch_if_new_dir(ctx, &ev.paths[1]);
+        (ctx.sink)(FsEvent::Rename {
+            from: ev.paths[0].clone(),
+            to: ev.paths[1].clone(),
+        });
+        return;
     }
 
     for p in &ev.paths {
+        // First: for most kinds a match, and for those that mean nothing (a
+        // `Close(Write)` after every write) the end of the event.
+        let Some(op) = op_for(&ev.kind, p) else {
+            return;
+        };
         if !is_event_interesting(ctx, p) {
             continue;
         }
-        let op = match ev.kind {
-            EventKind::Create(_) => QueuedOp::Create,
-            EventKind::Remove(_) => QueuedOp::Remove,
-            EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::From)) => {
-                QueuedOp::Remove
+        // Keep the watch set in step before the event is applied: a
+        // directory created now may be populated at once and needs its watch.
+        let event = match op {
+            Op::Create => {
+                watch_if_new_dir(ctx, p);
+                FsEvent::Create(p.clone())
             }
-            EventKind::Modify(notify::event::ModifyKind::Name(notify::event::RenameMode::To)) => {
-                QueuedOp::Create
+            Op::Remove => {
+                unwatch_tree(ctx, p);
+                FsEvent::Remove(p.clone())
             }
-            EventKind::Modify(_) => QueuedOp::Modify,
-            _ => continue,
+            Op::Modify => FsEvent::Modify(p.clone()),
         };
-        // Keep the watch set in step before debouncing: a directory created
-        // now may be populated before its window expires and needs its watch.
-        match op {
-            QueuedOp::Create => watch_if_new_dir(ctx, p),
-            QueuedOp::Remove => unwatch_tree(ctx, p),
-            QueuedOp::Modify => {}
-        }
-        enqueue(throttle, p.clone(), op);
-    }
-}
-
-fn enqueue(throttle: &mut HashMap<PathBuf, DirThrottleEntry>, path: PathBuf, op: QueuedOp) {
-    let dir = path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| path.clone());
-    let entry = throttle.entry(dir).or_insert_with(|| DirThrottleEntry {
-        record_time: Instant::now(),
-        queue: HashMap::new(),
-        immediate: true,
-    });
-    match (op, entry.queue.get(&path).copied()) {
-        (QueuedOp::Remove, Some(QueuedOp::Create)) => {
-            entry.queue.remove(&path);
-        }
-        _ => {
-            entry.queue.insert(path, op);
-        }
-    }
-}
-
-fn flush_ready(
-    throttle: &mut HashMap<PathBuf, DirThrottleEntry>,
-    sink: &EventSink,
-    config: &WatcherConfig,
-) {
-    let now = Instant::now();
-    let mut ready: Vec<PathBuf> = Vec::new();
-    for (dir, entry) in throttle.iter() {
-        let age = now.saturating_duration_since(entry.record_time);
-        if entry.immediate || (!entry.queue.is_empty() && age >= config.throttle_window) {
-            ready.push(dir.clone());
-            if ready.len() >= config.max_dirs_per_tick {
-                break;
-            }
-        }
-    }
-    let deadline = now + FLUSH_BUDGET;
-    for dir in ready {
-        if Instant::now() >= deadline {
-            break;
-        }
-        if let Some(entry) = throttle.get_mut(&dir) {
-            let drained: Vec<(PathBuf, QueuedOp)> = entry.queue.drain().collect();
-            entry.immediate = false;
-            entry.record_time = now;
-            for (path, op) in drained {
-                let ev = match op {
-                    QueuedOp::Create => FsEvent::Create(path),
-                    QueuedOp::Modify => FsEvent::Modify(path),
-                    QueuedOp::Remove => FsEvent::Remove(path),
-                };
-                sink(ev);
-            }
-        }
-    }
-}
-
-fn prune_stale(throttle: &mut HashMap<PathBuf, DirThrottleEntry>, max_age: Duration) {
-    let now = Instant::now();
-    throttle.retain(|_, entry| {
-        !entry.queue.is_empty()
-            || entry.immediate
-            || now.saturating_duration_since(entry.record_time) < max_age
-    });
-    // `retain` keeps the table sized for the busiest moment this map has ever
-    // seen; a single unpack burst would otherwise hold that memory for days.
-    if throttle.is_empty() {
-        throttle.shrink_to_fit();
+        (ctx.sink)(event);
     }
 }
 
